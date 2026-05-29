@@ -1,5 +1,7 @@
 # Project Layout
 
+This is a design/maintainer document for the current framework foundation. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
+
 The framework repo and user-created agent projects should use different structures.
 
 ## Framework Repo
@@ -70,11 +72,11 @@ support-agent/
 The framework should care about explicit registration, not hardcoded folder names.
 
 ```python
-from cayu import AgentApp
-from domains.billing import billing_module
-from domains.onboarding import onboarding_module
+from cayu import CayuApp
+from domains.billing.agents import billing_agent, billing_tools
+from domains.onboarding.agents import onboarding_agent, onboarding_tools
 
-app = AgentApp("support-agent")
-app.include(billing_module)
-app.include(onboarding_module)
+app = CayuApp()
+app.register_agent(billing_agent, tools=billing_tools)
+app.register_agent(onboarding_agent, tools=onboarding_tools)
 ```

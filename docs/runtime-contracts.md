@@ -1,6 +1,14 @@
 # Runtime Contracts
 
-This document names the first contracts that must stabilize before the framework grows higher-level features.
+This is a design/maintainer document for the current framework foundation. It names the first contracts that must stabilize before the framework grows higher-level features.
+
+## Boundary Data
+
+Framework boundary data should be portable across local processes, remote runners, hosted runtimes, event stores, dashboards, and replay tools.
+
+Payloads, metadata, tool arguments, tool results, model options, checkpoints, and event data are JSON data. They must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are not valid boundary data.
+
+Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state.
 
 ## Event
 
@@ -18,9 +26,12 @@ Events power:
 
 ## SessionStore
 
-Creates sessions, stores events, and checkpoints resumable state.
+Creates sessions, stores events, and checkpoints runtime state.
+
+`RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. Resume, replay, and idempotent continuation should be explicit APIs later, not implied by session creation.
 
 Local default can be SQLite. Hosted use can be Postgres or another durable store.
+`InMemorySessionStore` exists for tests, local examples, and the first runtime slice.
 
 ## EventSink
 
@@ -43,9 +54,32 @@ Turns messages into event streams using:
 - workflows
 - runtime services
 
+The initial `CayuApp` runtime registers agent specs, model providers, and tools, then emits and persists events for one session run. A run may make multiple model requests: model output can request tools, the runtime executes those tools, appends assistant `tool_call` messages and matching `tool_result` messages, and calls the model again until the model completes without tool calls or `RunRequest.max_steps` is exceeded. Multiple tool calls from one model step are grouped into one assistant message and one tool-result message in Cayu's internal transcript. Provider adapters must emit a `completed` stream event for each model step; a stream that ends silently is treated as a failed runtime contract.
+
+`CayuApp.run()` is an event-stream API. Runtime failures are represented as terminal `session.failed` events rather than re-raised exceptions from the iterator. A stricter programmatic API can be added later on top of the same runtime path.
+
+## Provider
+
+Model providers translate model-specific APIs into Cayu runtime contracts.
+
+Provider adapters must:
+
+- receive a copied `ModelRequest`
+- yield `ModelStreamEvent` values
+- emit a `completed` stream event for each model step
+- stop emitting after `completed`
+- convert stream events into `Event` values for the current session
+
+Provider errors should become model error events and failed sessions. Tool calls should be emitted as structured tool-call stream events so the runtime can execute tools and feed structured results back into the next model step.
+
 ## Tool
 
 Runs a capability and returns `ToolResult`.
+
+Tool declarations are captured when an agent is registered with `CayuApp`.
+The registered name, description, and input schema are the public contract shown to the model for that agent.
+Changing `tool.spec` after registration does not update the registered agent or the model-facing tool declaration.
+To change a tool's public contract, create/register a new agent configuration or re-register the tool through an explicit runtime API once one exists.
 
 Tool results must support:
 
@@ -55,6 +89,8 @@ Tool results must support:
 - error state
 
 String-only tool results are not enough for the final framework.
+
+Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
 ## Workflow
 
@@ -71,7 +107,7 @@ Runner commands use `ExecCommand`:
 - `process`: explicit argv list for normal command execution
 - `shell`: explicit shell script for bash-like behavior
 
-The framework should not pass a single ambiguous command string to runners.
+The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 

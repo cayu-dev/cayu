@@ -4,9 +4,20 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictBool,
+    computed_field,
+    field_validator,
+)
+
+from cayu._validation import copy_json_value, require_nonblank
 
 
 @dataclass(frozen=True)
@@ -47,11 +58,21 @@ def _freeze_value(value: Any) -> Any:
 
 
 def _mutable_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
+    if isinstance(value, FrozenMapping):
         return {key: _mutable_value(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_mutable_value(item) for item in value]
-    return deepcopy(value)
+    if type(value) is dict:
+        return {key: _mutable_value(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_mutable_value(item) for item in value]
+    if isinstance(value, Mapping | list):
+        raise ValueError("Tool input_schema must contain JSON-compatible values.")
+    if value is None or type(value) in {str, bool, int}:
+        return value
+    if type(value) is float and isfinite(value):
+        return value
+    raise ValueError("Tool input_schema must contain JSON-compatible values.")
 
 
 class _ToolSpecInput(BaseModel):
@@ -60,6 +81,16 @@ class _ToolSpecInput(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("input_schema", mode="before")
+    @classmethod
+    def copy_input_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "input_schema")
+
+    @field_validator("name")
+    @classmethod
+    def validate_nonblank_name(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
 
 
 class ToolSpec(BaseModel):
@@ -122,7 +153,12 @@ class ToolResult(BaseModel):
     content: str = ""
     structured: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
-    is_error: bool = False
+    is_error: StrictBool = False
+
+    @field_validator("structured", "artifacts", mode="before")
+    @classmethod
+    def copy_result_data(cls, value, info):
+        return copy_json_value(value, info.field_name)
 
 
 class ToolContext(BaseModel):
@@ -132,6 +168,27 @@ class ToolContext(BaseModel):
     agent_name: str | None = None
     workspace_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_nonblank_session_id(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("agent_name", "workspace_id")
+    @classmethod
+    def validate_optional_nonblank_ids(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
 
 
 class Tool(ABC):
@@ -144,7 +201,7 @@ class Tool(ABC):
             self.spec = spec
         else:
             class_spec = getattr(type(self), "spec", None)
-            if isinstance(class_spec, ToolSpec):
+            if type(class_spec) is ToolSpec:
                 self.spec = class_spec.model_copy(deep=True)
         self._validate_spec()
 
@@ -162,12 +219,12 @@ class Tool(ABC):
 
     def _validate_spec(self) -> None:
         spec = getattr(self, "spec", None)
-        if not isinstance(spec, ToolSpec):
+        if type(spec) is not ToolSpec:
             raise TypeError(
                 f"{self.__class__.__name__} must define `spec = ToolSpec(...)` "
                 "or pass a ToolSpec to Tool.__init__()."
             )
-        if not spec.name:
+        if not spec.name.strip():
             raise ValueError("Tool spec name cannot be blank.")
 
     @abstractmethod

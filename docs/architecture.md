@@ -1,5 +1,7 @@
 # Cayu Architecture
 
+This is a design/maintainer document for the current framework foundation. It records architecture decisions and intended direction; it is not a complete end-user guide.
+
 Cayu is a backend/runtime-first Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
 
 The framework should run locally, on a VPS, in Docker, in ECS, or behind any other normal runtime. Hosted deployments should be adapters around the framework, not a requirement for using it.
@@ -42,6 +44,10 @@ RunRequest
 ```
 
 Every important action should produce an event. Events are the shared contract for debugging, dashboards, hosted integrations, replay, and tests.
+
+Runtime inputs are copied at framework boundaries. Framework code should depend on explicit registration and validated contract objects, not on later mutation of user-owned Python objects.
+
+JSON-like contract fields should remain portable across local, hosted, and remote execution. They should contain JSON-compatible values only, without Python-specific object identity, circular references, or special numeric values such as NaN and Infinity.
 
 ## Multi-Agent Shape
 

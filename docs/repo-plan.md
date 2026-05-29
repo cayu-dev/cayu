@@ -1,5 +1,7 @@
 # Repo Plan
 
+This is a design/maintainer document for the current framework foundation. It records near-term implementation direction; it is not a public roadmap or complete end-user guide.
+
 ## Naming
 
 ```text

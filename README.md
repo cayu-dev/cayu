@@ -13,14 +13,22 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase focuses on stable framework contracts before adding higher-level runtime features.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, an in-memory session/event store, event sinks, model-provider contracts, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+
+It does not yet include durable storage, concrete runners, workspace implementations, dashboard UI, hosted deployment adapters, vector search, or production provider adapters.
+
+## Contract Rules
+
+Cayu treats payloads, metadata, tool arguments, tool results, model options, checkpoints, and event data as JSON data. These fields must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are rejected.
+
+Framework objects are copied at runtime boundaries. Mutating an agent or tool object after registration is not part of the public contract. To change a registered agent or tool declaration, register a new configuration or use an explicit update API once one exists.
 
 ## Initial Layout
 
 ```text
 src/cayu/
   core/        framework primitives: events, messages, agents, tools, workflows
-  runtime/     sessions, event sinks, server/runtime contracts
+  runtime/     app runtime, sessions, event sinks
   runners/     command execution backends
   workspaces/  filesystem/artifact workspace contracts
   storage/     session and memory storage contracts

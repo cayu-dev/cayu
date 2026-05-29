@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from cayu.core.events import Event
+from cayu.core.events import Event, copy_event
 
 
 class EventSink(ABC):
@@ -18,4 +18,6 @@ class InMemoryEventSink(EventSink):
         self.events: list[Event] = []
 
     async def emit(self, event: Event) -> None:
-        self.events.append(event)
+        if type(event) is not Event:
+            raise TypeError("Event sinks require Event instances.")
+        self.events.append(copy_event(event))
