@@ -1,0 +1,83 @@
+# Cayu Architecture
+
+Cayu is a backend/runtime-first Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
+
+The framework should run locally, on a VPS, in Docker, in ECS, or behind any other normal runtime. Hosted deployments should be adapters around the framework, not a requirement for using it.
+
+## Core Decisions
+
+- Repo/package/CLI name: `cayu`
+- Language: Python for v1
+- Framework repo structure: horizontal by subsystem
+- Generated user projects: Rails-like default layout, vertical domain modules allowed
+- CLI: developer/admin utility, not the primary product interface
+- Dashboard: optional viewer over runtime events and session storage
+- MCP: interoperability layer, not the required custom tool model
+
+## Dependency Direction
+
+```text
+core
+  providers -> core
+  runners -> core
+  workspaces -> core
+  storage -> core
+  vaults -> core
+  mcp -> core
+  runtime -> core + providers + runners + workspaces + storage + vaults + mcp
+  cli -> runtime + project scaffolding
+  dashboard -> runtime API / event store
+```
+
+`core` should stay small and stable. It defines events, messages, agents, tools, workflows, and shared value objects.
+
+## Runtime Shape
+
+```text
+RunRequest
+  -> SessionStore creates session
+  -> Agent runtime streams provider/tool/workflow events
+  -> EventSink emits to terminal/dashboard/webhook
+  -> SessionStore persists append-only event log
+```
+
+Every important action should produce an event. Events are the shared contract for debugging, dashboards, hosted integrations, replay, and tests.
+
+## Multi-Agent Shape
+
+Cayu must support systems where multiple agents collaborate through shared state.
+
+```text
+Agent A
+  -> writes record/task/event to SharedState
+  -> trigger starts Agent B
+  -> Agent B claims task and writes result
+  -> orchestrator reviews, retries, escalates, or delegates
+```
+
+This requires both deterministic orchestration and LLM orchestrator agents.
+
+## Workspace, Runner, Sandbox
+
+- `Workspace`: files/artifacts an agent can work with.
+- `Runner`: executes explicit `ExecCommand` values in a workspace or sandbox.
+- `Sandbox`: isolated workspace plus runner plus lifecycle and limits.
+
+`LocalRunner` is not a sandbox. It is only a development or already-disposable-environment execution backend.
+
+Process commands should use argv form. Shell execution should be an explicit mode, because hosted runners need to enforce quoting, limits, logging, and security consistently.
+
+## Storage and Memory
+
+Files are good source-of-truth for prompts, instructions, workflows, manuals, skills, and human-reviewed memories.
+
+Databases/indexes are better for sessions, event logs, high-volume memories, permissions, embeddings, search, and hosted multi-user state.
+
+Default local strategy:
+
+```text
+files for human-readable source
+SQLite for sessions and indexes
+SQLite FTS/BM25 for default keyword retrieval
+optional vector search later
+```
