@@ -122,10 +122,12 @@ Runner commands use `ExecCommand`:
 The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
+`LocalRunner` is available for development and trusted local execution. It is not a sandbox. By default it inherits the parent process environment and overlays any explicit `env` values; set `inherit_env=False` when commands should only receive the explicit environment passed to the runner.
 
 ## Workspace
 
 Filesystem/artifact boundary. For coding agents this is often a target repo. For document/data agents this may be uploaded files and generated outputs.
+`LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
 
 ## Vault
 

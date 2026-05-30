@@ -12,7 +12,9 @@ from cayu.core.messages import (
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.runners import ExecCommand, ExecResult, LocalRunner
 from cayu.runtime import CayuApp, RunRequest
+from cayu.workspaces import LocalWorkspace
 
 __all__ = [
     "Agent",
@@ -20,8 +22,12 @@ __all__ = [
     "CayuApp",
     "Environment",
     "EnvironmentSpec",
+    "ExecCommand",
+    "ExecResult",
     "Event",
     "EventType",
+    "LocalRunner",
+    "LocalWorkspace",
     "Message",
     "MessageRole",
     "TextPart",

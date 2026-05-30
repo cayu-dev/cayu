@@ -23,6 +23,7 @@ Important framework capabilities:
 - tool protocol
 - path-safe file tools
 - LocalRunner implementation
+- LocalWorkspace implementation
 - CLI scaffold ideas
 
 Areas that need deliberate design:

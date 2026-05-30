@@ -13,9 +13,9 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, an in-memory session/event store, event sinks, model-provider contracts, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, an in-memory session/event store, event sinks, model-provider contracts, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
 
-It does not yet include durable storage, concrete runners, workspace implementations, dashboard UI, hosted deployment adapters, vector search, or production provider adapters.
+It does not yet include durable storage, dashboard UI, hosted deployment adapters, vector search, isolated runners, or production provider adapters.
 
 ## Contract Rules
 
@@ -63,4 +63,10 @@ Run the deterministic echo-tool runtime example:
 
 ```bash
 PYTHONPATH=src python examples/echo_tool_runtime.py
+```
+
+Run a local environment example with a filesystem workspace and local command runner:
+
+```bash
+PYTHONPATH=src python examples/local_environment_runtime.py
 ```

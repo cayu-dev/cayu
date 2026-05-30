@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
@@ -24,11 +25,12 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
-from cayu.runners import ExecCommand, ExecResult
+from cayu.runners import ExecCommand, ExecResult, LocalRunner
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
 from cayu.runtime import InMemoryEventSink, RunRequest, SessionStore
+from cayu.workspaces import LocalWorkspace
 
 
 class EchoTool(Tool):
@@ -1536,3 +1538,216 @@ def test_mcp_server_allows_non_sensitive_raw_config():
 
     assert spec.env["NODE_ENV"] == "production"
     assert spec.env["KEYBOARD_LAYOUT"] == "us"
+
+
+def test_local_workspace_reads_writes_and_lists_files(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+
+    asyncio.run(workspace.write_bytes("notes/todo.txt", b"ship it"))
+
+    assert workspace.id == "local"
+    assert asyncio.run(workspace.read_bytes("notes/todo.txt")) == b"ship it"
+    assert asyncio.run(workspace.list("**/*.txt")) == ["notes/todo.txt"]
+
+
+def test_local_workspace_rejects_paths_outside_root(tmp_path):
+    workspace = LocalWorkspace(tmp_path)
+
+    with pytest.raises(ValueError, match="relative"):
+        asyncio.run(workspace.read_bytes(str(tmp_path / "file.txt")))
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.read_bytes("../outside.txt"))
+
+    with pytest.raises(ValueError, match="pattern"):
+        asyncio.run(workspace.list("../*"))
+
+
+def test_local_workspace_rejects_symlink_escape(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}_outside.txt"
+    outside.write_bytes(b"secret")
+    (tmp_path / "link.txt").symlink_to(outside)
+    workspace = LocalWorkspace(tmp_path)
+
+    try:
+        with pytest.raises(ValueError, match="escapes"):
+            asyncio.run(workspace.read_bytes("link.txt"))
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_local_workspace_rejects_invalid_inputs(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        LocalWorkspace(tmp_path / "missing")
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("not a directory")
+    with pytest.raises(NotADirectoryError):
+        LocalWorkspace(file_path)
+
+    workspace = LocalWorkspace(tmp_path)
+    with pytest.raises(TypeError, match="bytes"):
+        asyncio.run(workspace.write_bytes("file.txt", "text"))  # type: ignore[arg-type]
+
+
+def test_local_runner_executes_process_and_shell_commands(tmp_path):
+    runner = LocalRunner(tmp_path)
+
+    process_result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os,sys; print(os.getcwd()); print(sys.stdin.read())",
+            ),
+            stdin="hello",
+        )
+    )
+    shell_result = asyncio.run(runner.exec(ExecCommand.bash("printf shell-ok")))
+
+    assert process_result.exit_code == 0
+    assert process_result.timed_out is False
+    assert str(tmp_path) in process_result.stdout
+    assert "hello" in process_result.stdout
+    assert shell_result.stdout == "shell-ok"
+
+
+def test_local_runner_restricts_cwd_to_root(tmp_path):
+    runner = LocalRunner(tmp_path)
+
+    with pytest.raises(ValueError, match="relative"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(tmp_path)))
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="../"))
+
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="missing"))
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("not a directory")
+    with pytest.raises(NotADirectoryError):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="file.txt"))
+
+
+def test_local_runner_supports_cwd_env_and_stdin(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    runner = LocalRunner(tmp_path)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; "
+                    "print(os.path.basename(os.getcwd())); "
+                    "print(os.environ['LOCAL_RUNNER_TEST']); "
+                    "print(sys.stdin.read())"
+                ),
+            ),
+            cwd="work",
+            env={"LOCAL_RUNNER_TEST": "ok"},
+            stdin="input",
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == ["work", "ok", "input"]
+
+
+def test_local_runner_captures_failure_and_timeout(tmp_path):
+    runner = LocalRunner(tmp_path)
+
+    missing = asyncio.run(
+        runner.exec(ExecCommand.process("cayu-command-that-does-not-exist"))
+    )
+    failed = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import sys; print('bad', file=sys.stderr); sys.exit(7)",
+            )
+        )
+    )
+    timed_out = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(5)",
+            ),
+            timeout_s=1,
+        )
+    )
+    shell_timed_out = asyncio.run(
+        runner.exec(
+            ExecCommand.bash("sleep 5"),
+            timeout_s=1,
+        )
+    )
+
+    assert missing.exit_code == 127
+    assert missing.stderr == "Command not found: cayu-command-that-does-not-exist"
+    assert failed.exit_code == 7
+    assert failed.stderr.strip() == "bad"
+    assert timed_out.timed_out is True
+    assert timed_out.exit_code != 0
+    assert shell_timed_out.timed_out is True
+    assert shell_timed_out.exit_code != 0
+
+
+def test_local_runner_can_disable_parent_environment_inheritance(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAYU_LOCAL_RUNNER_SECRET", "secret")
+
+    inherited = asyncio.run(
+        LocalRunner(tmp_path).exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('CAYU_LOCAL_RUNNER_SECRET', ''))",
+            )
+        )
+    )
+    isolated = asyncio.run(
+        LocalRunner(tmp_path, inherit_env=False).exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('CAYU_LOCAL_RUNNER_SECRET', ''))",
+            )
+        )
+    )
+
+    assert inherited.stdout.strip() == "secret"
+    assert isolated.stdout.strip() == ""
+
+
+def test_local_runner_rejects_invalid_inputs(tmp_path):
+    runner = LocalRunner(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        LocalRunner(tmp_path / "missing")
+
+    with pytest.raises(TypeError, match="inherit_env"):
+        LocalRunner(tmp_path, inherit_env="true")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="ExecCommand"):
+        asyncio.run(runner.exec("echo bad"))  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="dictionary"):
+        asyncio.run(runner.exec(ExecCommand.process("env"), env=[]))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="keys"):
+        asyncio.run(runner.exec(ExecCommand.process("env"), env={" ": "bad"}))
+
+    with pytest.raises(ValueError, match="values"):
+        asyncio.run(runner.exec(ExecCommand.process("env"), env={"X": 1}))  # type: ignore[dict-item]
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), timeout_s=0))
+
+    with pytest.raises(TypeError, match="stdin"):
+        asyncio.run(runner.exec(ExecCommand.process("cat"), stdin=b"bad"))  # type: ignore[arg-type]
