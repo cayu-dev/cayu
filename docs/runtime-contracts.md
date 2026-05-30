@@ -104,6 +104,24 @@ String-only tool results are not enough for the final framework.
 
 Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
+Framework-native tools receive runtime services through `ToolContext`: workspace, runner, vault, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects.
+
+The first built-in tools are:
+
+- `read_file`: read UTF-8 text from the active workspace, capped by `max_bytes`
+- `write_file`: write UTF-8 text to the active workspace, capped by `max_bytes`
+- `list_files`: list files in the active workspace, capped by `limit`
+- `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
+
+These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
+
+Default built-in tool caps are intentionally large enough for normal coding work but small enough to protect model context and runtime memory:
+
+- `read_file`: 256 KB by default, 4 MB maximum per call
+- `write_file`: 256 KB by default, 4 MB maximum per call
+- `list_files`: 500 paths by default, 10,000 maximum per call
+- `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
+
 ## Workflow
 
 Coordinates deterministic or agent-assisted multi-step execution.
@@ -120,6 +138,7 @@ Runner commands use `ExecCommand`:
 - `shell`: explicit shell script for bash-like behavior
 
 The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
+Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built.
 
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 `LocalRunner` is available for development and trusted local execution. It is not a sandbox. By default it inherits the parent process environment and overlays any explicit `env` values; set `inherit_env=False` when commands should only receive the explicit environment passed to the runner.
@@ -128,6 +147,13 @@ Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 
 Filesystem/artifact boundary. For coding agents this is often a target repo. For document/data agents this may be uploaded files and generated outputs.
 `LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
+Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
+
+Workspace result objects enforce consistent metadata:
+
+- `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
+- `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
+- `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
 
 ## Vault
 

@@ -166,7 +166,12 @@ class ToolContext(BaseModel):
 
     session_id: str
     agent_name: str | None = None
+    environment_name: str | None = None
     workspace_id: str | None = None
+    workspace: Any = Field(default=None, exclude=True)
+    runner: Any = Field(default=None, exclude=True)
+    vault: Any = Field(default=None, exclude=True)
+    mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata", mode="before")
@@ -179,7 +184,7 @@ class ToolContext(BaseModel):
     def validate_nonblank_session_id(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("agent_name", "workspace_id")
+    @field_validator("agent_name", "environment_name", "workspace_id")
     @classmethod
     def validate_optional_nonblank_ids(
         cls,
@@ -189,6 +194,18 @@ class ToolContext(BaseModel):
         if value is None:
             return None
         return require_nonblank(value, info.field_name)
+
+    @field_validator("mcp_servers", mode="before")
+    @classmethod
+    def copy_mcp_servers(cls, value):
+        if value is None:
+            return ()
+        if isinstance(value, str | bytes):
+            raise TypeError("mcp_servers must be an iterable.")
+        try:
+            return tuple(value)
+        except TypeError as exc:
+            raise TypeError("mcp_servers must be an iterable.") from exc
 
 
 class Tool(ABC):

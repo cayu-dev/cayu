@@ -7,7 +7,12 @@ from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_nonblank
-from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.runners.base import (
+    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ExecCommand,
+    ExecResult,
+    Runner,
+)
 
 
 class LocalRunner(Runner):
@@ -40,6 +45,7 @@ class LocalRunner(Runner):
         env: dict[str, str] | None = None,
         timeout_s: int | None = None,
         stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("LocalRunner command must be an ExecCommand.")
@@ -47,6 +53,7 @@ class LocalRunner(Runner):
         environment = _copy_env(env, inherit_env=self.inherit_env)
         timeout = _validate_timeout(timeout_s)
         standard_input = _validate_stdin(stdin)
+        output_limit = _validate_output_limit(output_limit_bytes)
         process_options = _subprocess_options()
 
         try:
@@ -92,25 +99,48 @@ class LocalRunner(Runner):
             if standard_input is not None
             else None
         )
+        stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
+        stdout_task = asyncio.create_task(_read_limited(process.stdout, output_limit))
+        stderr_task = asyncio.create_task(_read_limited(process.stderr, output_limit))
+        wait_task = asyncio.create_task(process.wait())
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=input_bytes),
-                timeout=timeout,
-            )
-            return ExecResult(
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
-                exit_code=process.returncode if process.returncode is not None else 0,
-            )
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
+            timed_out = False
         except asyncio.TimeoutError:
+            timed_out = True
             _kill_process(process)
-            stdout, stderr = await process.communicate()
+            try:
+                await _await_process_exit(wait_task)
+            except asyncio.CancelledError:
+                await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task)
+                raise
+        except asyncio.CancelledError:
+            _kill_process(process)
+            try:
+                await _await_process_exit(wait_task)
+            finally:
+                await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task)
+            raise
+        finally:
+            await _cleanup_io_tasks(stdin_task)
+
+        stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        if timed_out:
             return ExecResult(
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
+                stdout=stdout.content.decode("utf-8", errors="replace"),
+                stderr=stderr.content.decode("utf-8", errors="replace"),
                 exit_code=process.returncode if process.returncode is not None else -1,
                 timed_out=True,
+                stdout_truncated=stdout.truncated,
+                stderr_truncated=stderr.truncated,
             )
+        return ExecResult(
+            stdout=stdout.content.decode("utf-8", errors="replace"),
+            stderr=stderr.content.decode("utf-8", errors="replace"),
+            exit_code=process.returncode if process.returncode is not None else 0,
+            stdout_truncated=stdout.truncated,
+            stderr_truncated=stderr.truncated,
+        )
 
     def resolve_cwd(self, cwd: str | None = None) -> Path:
         if cwd is None:
@@ -163,6 +193,68 @@ def _kill_process(process: asyncio.subprocess.Process) -> None:
     process.kill()
 
 
+async def _await_process_exit(wait_task: asyncio.Task[int]) -> None:
+    try:
+        await asyncio.shield(wait_task)
+    except asyncio.CancelledError:
+        await asyncio.shield(wait_task)
+        raise
+
+
+async def _cleanup_io_tasks(*tasks: asyncio.Task) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _write_stdin(
+    process: asyncio.subprocess.Process,
+    input_bytes: bytes | None,
+) -> None:
+    if process.stdin is None:
+        return
+    try:
+        if input_bytes is not None:
+            process.stdin.write(input_bytes)
+            await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+    except (BrokenPipeError, ConnectionResetError):
+        return
+
+
+class _CapturedOutput:
+    def __init__(self, content: bytes, *, truncated: bool) -> None:
+        self.content = content
+        self.truncated = truncated
+
+
+async def _read_limited(
+    stream: asyncio.StreamReader | None,
+    limit: int | None,
+) -> _CapturedOutput:
+    if stream is None:
+        return _CapturedOutput(b"", truncated=False)
+    chunks: list[bytes] = []
+    captured = 0
+    truncated = False
+    while True:
+        chunk = await stream.read(8192)
+        if not chunk:
+            break
+        if limit is None:
+            chunks.append(chunk)
+            continue
+        remaining = limit - captured
+        if remaining > 0:
+            chunks.append(chunk[:remaining])
+            captured += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            truncated = True
+    return _CapturedOutput(b"".join(chunks), truncated=truncated)
+
+
 def _validate_timeout(timeout_s: int | None) -> int | None:
     if timeout_s is None:
         return None
@@ -179,3 +271,13 @@ def _validate_stdin(stdin: str | None) -> str | None:
     if type(stdin) is not str:
         raise TypeError("Runner stdin must be a string.")
     return stdin
+
+
+def _validate_output_limit(output_limit_bytes: int | None) -> int | None:
+    if output_limit_bytes is None:
+        return None
+    if type(output_limit_bytes) is not int:
+        raise TypeError("Runner output_limit_bytes must be an integer.")
+    if output_limit_bytes <= 0:
+        raise ValueError("Runner output_limit_bytes must be greater than zero.")
+    return output_limit_bytes

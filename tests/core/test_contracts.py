@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
@@ -26,11 +27,12 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
+import cayu.runners.local as local_runner_module
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
 from cayu.runtime import InMemoryEventSink, RunRequest, SessionStore
-from cayu.workspaces import LocalWorkspace
+from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
 
 class EchoTool(Tool):
@@ -1389,6 +1391,12 @@ def test_exec_result_rejects_coerced_status_fields():
     with pytest.raises(ValidationError):
         ExecResult(cancelled=1)  # type: ignore[arg-type]
 
+    with pytest.raises(ValidationError):
+        ExecResult(stdout_truncated="yes")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        ExecResult(stderr_truncated=1)  # type: ignore[arg-type]
+
 
 def test_secret_ref_does_not_store_raw_value():
     ref = SecretRef(name="github_token", handle="vault://github_token")
@@ -1546,8 +1554,130 @@ def test_local_workspace_reads_writes_and_lists_files(tmp_path):
     asyncio.run(workspace.write_bytes("notes/todo.txt", b"ship it"))
 
     assert workspace.id == "local"
-    assert asyncio.run(workspace.read_bytes("notes/todo.txt")) == b"ship it"
-    assert asyncio.run(workspace.list("**/*.txt")) == ["notes/todo.txt"]
+    read_result = asyncio.run(workspace.read_bytes("notes/todo.txt"))
+    list_result = asyncio.run(workspace.list("**/*.txt"))
+
+    assert read_result.content == b"ship it"
+    assert read_result.total_bytes == 7
+    assert read_result.truncated is False
+    assert list_result.paths == ("notes/todo.txt",)
+    assert list_result.total_count == 1
+    assert list_result.truncated is False
+
+
+def test_workspace_result_types_validate_boundary_values():
+    list_result = WorkspaceListResult(paths=["a.txt", "b.txt"], total_count=2)
+    truncated_read = WorkspaceReadResult(
+        content=b"abc",
+        total_bytes=6,
+        truncated=True,
+    )
+    truncated_list = WorkspaceListResult(
+        paths=["a.txt"],
+        total_count=2,
+        truncated=True,
+    )
+    unknown_total_truncated_list = WorkspaceListResult(
+        paths=["a.txt"],
+        total_count=None,
+        truncated=True,
+    )
+
+    assert list_result.paths == ("a.txt", "b.txt")
+    assert truncated_read.content == b"abc"
+    assert truncated_read.total_bytes == 6
+    assert truncated_read.truncated is True
+    assert truncated_list.paths == ("a.txt",)
+    assert truncated_list.total_count == 2
+    assert truncated_list.truncated is True
+    assert unknown_total_truncated_list.paths == ("a.txt",)
+    assert unknown_total_truncated_list.total_count is None
+    assert unknown_total_truncated_list.truncated is True
+
+    with pytest.raises(TypeError, match="content"):
+        WorkspaceReadResult(content="text", total_bytes=4)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="total_bytes"):
+        WorkspaceReadResult(content=b"", total_bytes=-1)
+
+    with pytest.raises(TypeError, match="truncated"):
+        WorkspaceReadResult(content=b"", total_bytes=0, truncated=1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="smaller than content"):
+        WorkspaceReadResult(content=b"abc", total_bytes=1)
+
+    with pytest.raises(ValueError, match="truncated must match"):
+        WorkspaceReadResult(content=b"abc", total_bytes=3, truncated=True)
+
+    with pytest.raises(ValueError, match="truncated must match"):
+        WorkspaceReadResult(content=b"abc", total_bytes=4, truncated=False)
+
+    with pytest.raises(TypeError, match="paths"):
+        WorkspaceListResult(paths="a.txt", total_count=1)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="paths entries"):
+        WorkspaceListResult(paths=["a.txt", 1], total_count=2)  # type: ignore[list-item]
+
+    with pytest.raises(ValueError, match="total_count"):
+        WorkspaceListResult(paths=[], total_count=-1)
+
+    with pytest.raises(TypeError, match="truncated"):
+        WorkspaceListResult(paths=[], total_count=0, truncated=1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="required"):
+        WorkspaceListResult(paths=["a.txt"], total_count=None, truncated=False)
+
+    with pytest.raises(ValueError, match="must equal paths"):
+        WorkspaceListResult(paths=["a.txt"], total_count=2, truncated=False)
+
+    with pytest.raises(ValueError, match="smaller than paths"):
+        WorkspaceListResult(paths=["a.txt", "b.txt"], total_count=1, truncated=True)
+
+
+def test_local_workspace_enforces_read_and_list_limits(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+
+    asyncio.run(workspace.write_bytes("a.txt", b"abcdef"))
+    asyncio.run(workspace.write_bytes("b.txt", b""))
+
+    read_result = asyncio.run(workspace.read_bytes("a.txt", max_bytes=3))
+    list_result = asyncio.run(workspace.list("*.txt", limit=1))
+
+    assert read_result.content == b"abc"
+    assert read_result.total_bytes == 6
+    assert read_result.truncated is True
+    assert len(list_result.paths) == 1
+    assert list_result.paths[0] in {"a.txt", "b.txt"}
+    assert list_result.total_count is None
+    assert list_result.truncated is True
+
+
+def test_local_workspace_bounded_read_uses_extra_byte_for_truncation(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+
+    asyncio.run(workspace.write_bytes("a.txt", b"abcdef"))
+
+    result = asyncio.run(workspace.read_bytes("a.txt", max_bytes=3))
+    exact_result = asyncio.run(workspace.read_bytes("a.txt", max_bytes=6))
+
+    assert result.content == b"abc"
+    assert result.total_bytes == 6
+    assert result.truncated is True
+    assert exact_result.content == b"abcdef"
+    assert exact_result.total_bytes == 6
+    assert exact_result.truncated is False
+
+
+def test_local_workspace_unbounded_read_reports_returned_content_size(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+
+    asyncio.run(workspace.write_bytes("a.txt", b"abcdef"))
+
+    result = asyncio.run(workspace.read_bytes("a.txt"))
+
+    assert result.content == b"abcdef"
+    assert result.total_bytes == len(result.content)
+    assert result.truncated is False
 
 
 def test_local_workspace_rejects_paths_outside_root(tmp_path):
@@ -1588,6 +1718,12 @@ def test_local_workspace_rejects_invalid_inputs(tmp_path):
     workspace = LocalWorkspace(tmp_path)
     with pytest.raises(TypeError, match="bytes"):
         asyncio.run(workspace.write_bytes("file.txt", "text"))  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="max_bytes"):
+        asyncio.run(workspace.read_bytes("file.txt", max_bytes="1"))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="limit"):
+        asyncio.run(workspace.list("*.txt", limit=0))
 
 
 def test_local_runner_executes_process_and_shell_commands(tmp_path):
@@ -1697,6 +1833,101 @@ def test_local_runner_captures_failure_and_timeout(tmp_path):
     assert timed_out.exit_code != 0
     assert shell_timed_out.timed_out is True
     assert shell_timed_out.exit_code != 0
+
+
+def test_local_runner_enforces_output_limit_while_process_runs(tmp_path):
+    runner = LocalRunner(tmp_path)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('abcdef'); sys.stderr.write('uvwxyz')",
+            ),
+            output_limit_bytes=3,
+        )
+    )
+
+    assert result.stdout == "abc"
+    assert result.stderr == "uvw"
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
+
+
+def test_local_runner_kills_process_on_cancellation(tmp_path):
+    started = tmp_path / "started.txt"
+    marker = tmp_path / "marker.txt"
+    runner = LocalRunner(tmp_path)
+
+    async def run_and_cancel() -> None:
+        task = asyncio.create_task(
+            runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib,time; "
+                        "pathlib.Path('started.txt').write_text('started'); "
+                        "time.sleep(2); "
+                        "pathlib.Path('marker.txt').write_text('alive')"
+                    ),
+                )
+            )
+        )
+        for _ in range(20):
+            if started.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert started.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_and_cancel())
+    time.sleep(2.2)
+    assert not marker.exists()
+
+
+def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypatch):
+    marker = tmp_path / "marker.txt"
+    runner = LocalRunner(tmp_path)
+    original_waiter = local_runner_module._await_process_exit
+
+    async def run_and_cancel() -> None:
+        cleanup_started = asyncio.Event()
+
+        async def delayed_waiter(wait_task):
+            cleanup_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await original_waiter(wait_task)
+                raise
+
+        monkeypatch.setattr(local_runner_module, "_await_process_exit", delayed_waiter)
+        task = asyncio.create_task(
+            runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib,time; "
+                        "time.sleep(2); "
+                        "pathlib.Path('marker.txt').write_text('alive')"
+                    ),
+                ),
+                timeout_s=1,
+            )
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_and_cancel())
+    time.sleep(1.2)
+    assert not marker.exists()
 
 
 def test_local_runner_can_disable_parent_environment_inheritance(tmp_path, monkeypatch):

@@ -16,6 +16,9 @@ from pydantic import (
 from cayu._validation import copy_json_value
 
 
+DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
+
+
 class ExecCommand(BaseModel):
     """Command to execute.
 
@@ -72,6 +75,8 @@ class ExecResult(BaseModel):
     exit_code: StrictInt = 0
     timed_out: StrictBool = False
     cancelled: StrictBool = False
+    stdout_truncated: StrictBool = False
+    stderr_truncated: StrictBool = False
     artifacts: list[dict] = Field(default_factory=list)
 
     @field_validator("artifacts", mode="before")
@@ -94,5 +99,6 @@ class Runner(ABC):
         env: dict[str, str] | None = None,
         timeout_s: int | None = None,
         stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         """Execute a command and return stdout/stderr/exit metadata."""

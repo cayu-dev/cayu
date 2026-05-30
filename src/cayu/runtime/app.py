@@ -476,7 +476,12 @@ class CayuApp:
             ctx=ToolContext(
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
                 workspace_id=_workspace_id(registered_environment),
+                workspace=_workspace(registered_environment),
+                runner=_runner(registered_environment),
+                vault=_vault(registered_environment),
+                mcp_servers=_mcp_servers(registered_environment),
                 metadata={"tool_call_id": tool_call.id},
             ),
             arguments=deepcopy(tool_call.arguments),
@@ -638,12 +643,41 @@ def _with_event_environment(event: Event, environment_name: str | None) -> Event
 
 
 def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str | None:
-    if registered_environment is None or registered_environment.environment.workspace is None:
+    if (
+        registered_environment is None
+        or registered_environment.environment.workspace is None
+    ):
         return None
     workspace_id = getattr(registered_environment.environment.workspace, "id", None)
     if workspace_id is None:
         return None
     return require_nonblank(workspace_id, "workspace.id")
+
+
+def _workspace(registered_environment: RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.workspace
+
+
+def _runner(registered_environment: RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.runner
+
+
+def _vault(registered_environment: RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.vault
+
+
+def _mcp_servers(
+    registered_environment: RegisteredEnvironment | None,
+) -> tuple[Any, ...]:
+    if registered_environment is None:
+        return ()
+    return registered_environment.environment.mcp_servers
 
 
 def _normalize_tool_result(result: ToolResult) -> ToolResult:

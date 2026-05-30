@@ -23,7 +23,7 @@ from cayu.runtime import (
     RunRequest,
     SessionStatus,
 )
-from cayu.workspaces import Workspace
+from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
 class FakeProvider(ModelProvider):
@@ -2684,14 +2684,24 @@ def test_cayu_app_isolates_registered_environment_shell():
         def __init__(self, workspace_id: str) -> None:
             self.id = workspace_id
 
-        async def read_bytes(self, path: str) -> bytes:
-            return b""
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            return WorkspaceReadResult(content=b"", total_bytes=0)
 
         async def write_bytes(self, path: str, content: bytes) -> None:
             return None
 
-        async def list(self, pattern: str = "**/*") -> list[str]:
-            return []
+        async def list(
+            self,
+            pattern: str = "**/*",
+            *,
+            limit: int | None = None,
+        ) -> WorkspaceListResult:
+            return WorkspaceListResult(paths=(), total_count=0)
 
     app = CayuApp()
     original_workspace = MemoryWorkspace("workspace_original")

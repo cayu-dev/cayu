@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -12,15 +13,14 @@ from cayu import (
     EnvironmentSpec,
     Event,
     EventType,
-    ExecCommand,
+    ExecCommandTool,
+    ListFilesTool,
     LocalRunner,
     LocalWorkspace,
     Message,
+    ReadFileTool,
     RunRequest,
-    Tool,
-    ToolContext,
-    ToolResult,
-    ToolSpec,
+    WriteFileTool,
 )
 from cayu.providers import (
     ModelProvider,
@@ -39,8 +39,27 @@ class FakeProvider(ModelProvider):
             [
                 ModelStreamEvent.tool_call(
                     id="call_1",
-                    name="write_and_run",
+                    name="write_file",
                     arguments={"path": "notes/result.txt", "content": "local ok"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="exec_command",
+                    arguments={
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "from pathlib import Path; "
+                                "print(Path('notes/result.txt').read_text())"
+                            ),
+                        ],
+                    },
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_3",
+                    name="list_files",
+                    arguments={"pattern": "**/*.txt"},
                 ),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
@@ -84,48 +103,6 @@ class FakeProvider(ModelProvider):
         )
 
 
-class WriteAndRunTool(Tool):
-    spec = ToolSpec(
-        name="write_and_run",
-        description="Write a file in the local workspace and run a command.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["path", "content"],
-        },
-    )
-
-    def __init__(self, workspace: LocalWorkspace, runner: LocalRunner) -> None:
-        super().__init__()
-        self.workspace = workspace
-        self.runner = runner
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        await self.workspace.write_bytes(args["path"], args["content"].encode("utf-8"))
-        result = await self.runner.exec(
-            ExecCommand.process(
-                "python3",
-                "-c",
-                (
-                    "from pathlib import Path; "
-                    "print(Path('notes/result.txt').read_text())"
-                ),
-            )
-        )
-        return ToolResult(
-            content=result.stdout.strip(),
-            structured={
-                "workspace_id": ctx.workspace_id,
-                "exit_code": result.exit_code,
-                "files": await self.workspace.list("**/*.txt"),
-            },
-            is_error=result.exit_code != 0,
-        )
-
-
 async def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cayu-local-env-") as directory:
         root = Path(directory)
@@ -145,7 +122,12 @@ async def main() -> None:
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            tools=[WriteAndRunTool(workspace, runner)],
+            tools=[
+                WriteFileTool(),
+                ReadFileTool(),
+                ListFilesTool(),
+                ExecCommandTool(),
+            ],
         )
 
         async for event in app.run(
@@ -162,7 +144,7 @@ async def main() -> None:
                 event.payload,
             )
 
-        print("workspace_files", await workspace.list("**/*"))
+        print("workspace_files", list((await workspace.list("**/*")).paths))
 
 
 if __name__ == "__main__":

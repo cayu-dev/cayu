@@ -21,7 +21,8 @@ Important framework capabilities:
 - basic agent loop
 - agent/environment/session separation
 - tool protocol
-- path-safe file tools
+- path-safe framework-native file tools
+- framework-native command execution tool
 - LocalRunner implementation
 - LocalWorkspace implementation
 - CLI scaffold ideas
