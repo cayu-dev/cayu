@@ -55,3 +55,11 @@ Or with `uv`:
 uv sync
 uv run pytest
 ```
+
+## Example
+
+Run the deterministic echo-tool runtime example:
+
+```bash
+PYTHONPATH=src python examples/echo_tool_runtime.py
+```
