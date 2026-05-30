@@ -1,7 +1,7 @@
 """Runtime contracts."""
 
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
-from cayu.runtime.app import CayuApp, RegisteredAgent
+from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.sessions import (
     InMemorySessionStore,
     RunRequest,
@@ -16,6 +16,7 @@ __all__ = [
     "InMemorySessionStore",
     "InMemoryEventSink",
     "RegisteredAgent",
+    "RegisteredEnvironment",
     "RunRequest",
     "Session",
     "SessionStatus",

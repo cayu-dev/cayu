@@ -55,6 +55,7 @@ class Event(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     agent_name: str | None = None
+    environment_name: str | None = None
     workflow_name: str | None = None
     tool_name: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -69,7 +70,7 @@ class Event(BaseModel):
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("agent_name", "workflow_name", "tool_name")
+    @field_validator("agent_name", "environment_name", "workflow_name", "tool_name")
     @classmethod
     def validate_optional_nonblank_names(
         cls,
@@ -108,6 +109,7 @@ def copy_event(event: Event) -> Event:
         id=event.id,
         timestamp=event.timestamp,
         agent_name=event.agent_name,
+        environment_name=event.environment_name,
         workflow_name=event.workflow_name,
         tool_name=event.tool_name,
         payload=copy_json_value(event.payload, "payload"),

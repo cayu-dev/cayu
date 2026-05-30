@@ -12,6 +12,7 @@ from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec, copy_environment
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -48,6 +49,12 @@ class RegisteredTool:
 class RegisteredProvider:
     name: str
     provider: ModelProvider
+
+
+@dataclass(frozen=True)
+class RegisteredEnvironment:
+    spec: EnvironmentSpec
+    environment: Environment
 
 
 @dataclass(frozen=True)
@@ -92,7 +99,9 @@ class CayuApp:
         self._event_sinks = sinks
         self._agents: dict[str, RegisteredAgent] = {}
         self._providers: dict[str, RegisteredProvider] = {}
+        self._environments: dict[str, RegisteredEnvironment] = {}
         self._default_provider_name: str | None = None
+        self._default_environment_name: str | None = None
 
     def register_agent(
         self,
@@ -155,6 +164,29 @@ class CayuApp:
             self._default_provider_name = provider.name
         return provider
 
+    def register_environment(
+        self,
+        environment: Environment,
+        *,
+        default: bool = False,
+    ) -> Environment:
+        if type(environment) is not Environment:
+            raise TypeError("Environment registration requires an Environment.")
+        if not isinstance(default, bool):
+            raise TypeError("Environment default flag must be a bool.")
+        stored_environment = copy_environment(environment)
+        stored_spec = _validate_environment_spec(stored_environment.spec)
+        if stored_spec.name in self._environments:
+            raise ValueError(f"Environment already registered: {stored_spec.name}")
+
+        self._environments[stored_spec.name] = RegisteredEnvironment(
+            spec=stored_spec,
+            environment=stored_environment,
+        )
+        if default or self._default_environment_name is None:
+            self._default_environment_name = stored_spec.name
+        return environment
+
     def get_agent(self, name: str) -> RegisteredAgent:
         agent_name = require_nonblank(name, "agent.name")
         try:
@@ -172,6 +204,15 @@ class CayuApp:
     def get_provider(self, name: str | None = None) -> ModelProvider:
         return self._get_registered_provider(name).provider
 
+    def get_environment(self, name: str | None = None) -> RegisteredEnvironment:
+        registered_environment = self._get_registered_environment(name)
+        if registered_environment is None:
+            raise RuntimeError("No environment registered.")
+        return RegisteredEnvironment(
+            spec=registered_environment.spec.model_copy(deep=True),
+            environment=copy_environment(registered_environment.environment),
+        )
+
     def _get_registered_provider(self, name: str | None = None) -> RegisteredProvider:
         if name is not None:
             provider_name = require_nonblank(name, "provider.name")
@@ -184,12 +225,32 @@ class CayuApp:
         except KeyError as exc:
             raise KeyError(f"Provider not registered: {provider_name}") from exc
 
+    def _get_registered_environment(
+        self,
+        name: str | None = None,
+    ) -> RegisteredEnvironment | None:
+        if name is not None:
+            environment_name = require_nonblank(name, "environment.name")
+        else:
+            environment_name = self._default_environment_name
+        if environment_name is None:
+            return None
+        try:
+            return self._environments[environment_name]
+        except KeyError as exc:
+            raise KeyError(f"Environment not registered: {environment_name}") from exc
+
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
         registered_agent = self.get_agent(request.agent_name)
         registered_provider = self._get_registered_provider()
+        registered_environment = self._get_registered_environment(
+            request.environment_name
+        )
+        if request.environment_name is None and registered_environment is not None:
+            request = _with_environment_name(request, registered_environment.spec.name)
         session = await self.session_store.create(request)
         await self.session_store.update_status(session.id, SessionStatus.RUNNING)
 
@@ -198,6 +259,7 @@ class CayuApp:
             request=request,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
+            registered_environment=registered_environment,
         ):
             yield event
 
@@ -208,14 +270,17 @@ class CayuApp:
         request: RunRequest,
         registered_agent: RegisteredAgent,
         registered_provider: RegisteredProvider,
+        registered_environment: RegisteredEnvironment | None,
     ) -> AsyncIterator[Event]:
         provider = registered_provider.provider
+        environment_name = _environment_name(registered_environment)
         try:
             yield await self._emit(
                 Event(
                     type=EventType.SESSION_STARTED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
                     payload={"agent_name": registered_agent.spec.name},
                 )
             )
@@ -234,6 +299,7 @@ class CayuApp:
                             "provider": registered_provider.name,
                             "step": step,
                         },
+                        environment_name=environment_name,
                     )
                 )
 
@@ -252,6 +318,11 @@ class CayuApp:
                     ],
                     options={
                         "agent_metadata": deepcopy(registered_agent.spec.metadata),
+                        "environment_metadata": (
+                            deepcopy(registered_environment.spec.metadata)
+                            if registered_environment is not None
+                            else {}
+                        ),
                         "step": step,
                     },
                 )
@@ -284,6 +355,7 @@ class CayuApp:
                         ),
                         session_id=session.id,
                     )
+                    event = _with_event_environment(event, environment_name)
                     yield await self._emit(event)
                     if stream_event.type == ModelStreamEventType.ERROR:
                         raise RuntimeError(
@@ -314,6 +386,7 @@ class CayuApp:
                     async for event, outcome in self._execute_tool_call(
                         session=session,
                         registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                         tool_call=tool_call,
                     ):
                         yield event
@@ -330,6 +403,7 @@ class CayuApp:
                     type=EventType.SESSION_COMPLETED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
                 )
             )
         except Exception as exc:
@@ -339,7 +413,11 @@ class CayuApp:
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
-                    payload={"error": str(exc), "error_type": type(exc).__name__},
+                    environment_name=environment_name,
+                    payload={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
                 )
             )
 
@@ -348,14 +426,17 @@ class CayuApp:
         *,
         session: Session,
         registered_agent: RegisteredAgent,
+        registered_environment: RegisteredEnvironment | None,
         tool_call: ToolCallRequest,
     ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
+        environment_name = _environment_name(registered_environment)
         yield (
             await self._emit(
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
                     tool_name=tool_call.name,
                     payload={
                         "tool_call_id": tool_call.id,
@@ -378,6 +459,7 @@ class CayuApp:
                         type=EventType.TOOL_CALL_FAILED,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
                         tool_name=tool_call.name,
                         payload={
                             "tool_call_id": tool_call.id,
@@ -394,6 +476,7 @@ class CayuApp:
             ctx=ToolContext(
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
+                workspace_id=_workspace_id(registered_environment),
                 metadata={"tool_call_id": tool_call.id},
             ),
             arguments=deepcopy(tool_call.arguments),
@@ -409,6 +492,7 @@ class CayuApp:
                     type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
                     tool_name=tool_call.name,
                     payload={
                         "tool_call_id": tool_call.id,
@@ -431,6 +515,7 @@ class CayuApp:
                         type=EventType.RUNTIME_SINK_FAILED,
                         session_id=event.session_id,
                         agent_name=event.agent_name,
+                        environment_name=event.environment_name,
                         payload={
                             "sink": type(sink).__name__,
                             "error": str(exc),
@@ -502,8 +587,63 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
     )
 
 
+def _validate_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
+    if type(spec) is not EnvironmentSpec:
+        raise TypeError("Environment registration requires an EnvironmentSpec.")
+    if type(spec.name) is not str:
+        raise ValueError("`name` must be a string.")
+    return EnvironmentSpec(
+        name=spec.name,
+        metadata=copy_json_value(spec.metadata, "metadata"),
+    )
+
+
 def _validate_run_request(request: RunRequest) -> RunRequest:
     return copy_run_request(request)
+
+
+def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
+    return RunRequest(
+        agent_name=request.agent_name,
+        messages=[message.model_copy(deep=True) for message in request.messages],
+        session_id=request.session_id,
+        environment_name=environment_name,
+        metadata=copy_json_value(request.metadata, "metadata"),
+        max_steps=request.max_steps,
+    )
+
+
+def _environment_name(
+    registered_environment: RegisteredEnvironment | None,
+) -> str | None:
+    if registered_environment is None:
+        return None
+    return registered_environment.spec.name
+
+
+def _with_event_environment(event: Event, environment_name: str | None) -> Event:
+    if type(event) is not Event:
+        raise TypeError("Runtime events must be Event instances.")
+    return Event(
+        type=event.type,
+        session_id=event.session_id,
+        id=event.id,
+        timestamp=event.timestamp,
+        agent_name=event.agent_name,
+        environment_name=environment_name,
+        workflow_name=event.workflow_name,
+        tool_name=event.tool_name,
+        payload=copy_json_value(event.payload, "payload"),
+    )
+
+
+def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str | None:
+    if registered_environment is None or registered_environment.environment.workspace is None:
+        return None
+    workspace_id = getattr(registered_environment.environment.workspace, "id", None)
+    if workspace_id is None:
+        return None
+    return require_nonblank(workspace_id, "workspace.id")
 
 
 def _normalize_tool_result(result: ToolResult) -> ToolResult:

@@ -11,12 +11,15 @@ from cayu.core.messages import (
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.runtime import CayuApp, RunRequest
 
 __all__ = [
     "Agent",
     "AgentSpec",
     "CayuApp",
+    "Environment",
+    "EnvironmentSpec",
     "Event",
     "EventType",
     "Message",

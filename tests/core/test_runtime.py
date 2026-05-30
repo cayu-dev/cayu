@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from cayu.core import AgentSpec, Event, EventType, Message, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -22,6 +23,7 @@ from cayu.runtime import (
     RunRequest,
     SessionStatus,
 )
+from cayu.workspaces import Workspace
 
 
 class FakeProvider(ModelProvider):
@@ -2437,6 +2439,366 @@ def test_cayu_app_rejects_blank_provider_lookup_name():
 
     with pytest.raises(ValueError, match="provider.name"):
         app.get_provider(" ")
+
+
+def test_cayu_app_registers_and_selects_default_environment():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local", metadata={"kind": "dev"})),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_default_environment",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_default_environment"))
+
+    assert events[0].payload == {"agent_name": "assistant"}
+    assert events[0].environment_name == "local"
+    assert events[1].environment_name == "local"
+    assert events[-1].environment_name == "local"
+    assert provider.requests[0].options["environment_metadata"] == {"kind": "dev"}
+    assert session is not None
+    assert session.environment_name == "local"
+    assert app.get_environment().spec.name == "local"
+    assert app.get_environment("local").spec.metadata == {"kind": "dev"}
+
+
+def test_cayu_app_runs_with_explicit_environment():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="docker", metadata={"kind": "isolated"}))
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                environment_name="docker",
+                session_id="sess_explicit_environment",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[0].environment_name == "docker"
+    assert provider.requests[0].options["environment_metadata"] == {
+        "kind": "isolated"
+    }
+
+
+def test_cayu_app_runs_without_environment_when_none_registered():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_no_environment",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[0].environment_name is None
+    assert events[-1].environment_name is None
+    assert "environment_name" not in events[0].payload
+    assert "environment_name" not in events[-1].payload
+    assert provider.requests[0].options["environment_metadata"] == {}
+
+    with pytest.raises(RuntimeError, match="No environment registered"):
+        app.get_environment()
+
+
+def test_cayu_app_rejects_unknown_environment_for_run():
+    app = CayuApp()
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(KeyError, match="Environment not registered"):
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    environment_name="missing",
+                    messages=[Message.text("user", "hi")],
+                ),
+            )
+        )
+
+
+def test_cayu_app_includes_environment_on_failed_session_event():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="echo",
+                arguments={"text": "hello"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                max_steps=1,
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].environment_name == "local"
+    assert events[-1].payload["error_type"] == "RuntimeError"
+
+
+def test_cayu_app_tags_all_runtime_events_with_environment():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "hello"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events
+    assert {event.environment_name for event in events} == {"local"}
+    assert all("environment_name" not in event.payload for event in events)
+
+
+def test_cayu_app_overrides_provider_event_environment():
+    provider = EventReturningProvider(
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_provider_environment",
+            environment_name="provider_wrong",
+            payload={"finish_reason": "stop"},
+        )
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_provider_environment",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events
+    assert {event.environment_name for event in events} == {"local"}
+
+
+def test_cayu_app_rejects_invalid_environment_lookup_name():
+    app = CayuApp()
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+
+    with pytest.raises(ValueError, match="environment.name"):
+        app.get_environment("")
+
+    with pytest.raises(ValueError, match="environment.name"):
+        app.get_environment(" ")
+
+
+def test_cayu_app_isolates_registered_environment_shell():
+    class MemoryWorkspace(Workspace):
+        def __init__(self, workspace_id: str) -> None:
+            self.id = workspace_id
+
+        async def read_bytes(self, path: str) -> bytes:
+            return b""
+
+        async def write_bytes(self, path: str, content: bytes) -> None:
+            return None
+
+        async def list(self, pattern: str = "**/*") -> list[str]:
+            return []
+
+    app = CayuApp()
+    original_workspace = MemoryWorkspace("workspace_original")
+    environment = Environment(
+        EnvironmentSpec(name="local", metadata={"kind": "dev"}),
+        workspace=original_workspace,
+    )
+
+    app.register_environment(environment, default=True)
+
+    environment.spec = EnvironmentSpec(name="mutated", metadata={"kind": "mutated"})
+    environment.workspace = MemoryWorkspace("workspace_mutated")
+
+    registered = app.get_environment()
+    registered.spec.metadata["kind"] = "returned"
+    registered.environment.workspace = MemoryWorkspace("workspace_returned")
+
+    registered_again = app.get_environment()
+
+    assert registered_again.spec.name == "local"
+    assert registered_again.spec.metadata == {"kind": "dev"}
+    assert registered_again.environment.workspace is original_workspace
+
+
+def test_cayu_app_rejects_invalid_environment_registration_inputs():
+    class EnvironmentLike:
+        spec = EnvironmentSpec(name="fake")
+
+    class EnvironmentSubclass(Environment):
+        pass
+
+    class BadString(str):
+        def strip(self):
+            raise RuntimeError("strip should not run")
+
+    class BadMetadata(dict):
+        def items(self):
+            raise RuntimeError("environment metadata traversal should not run")
+
+    app = CayuApp()
+
+    with pytest.raises(TypeError, match="Environment"):
+        app.register_environment(EnvironmentLike())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="Environment"):
+        app.register_environment(EnvironmentSubclass(EnvironmentSpec(name="subclass")))
+
+    with pytest.raises(TypeError, match="bool"):
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local")),
+            default="false",  # type: ignore[arg-type]
+        )
+
+    bad_name_environment = Environment(EnvironmentSpec(name="bad_name"))
+    bad_name_environment.spec = EnvironmentSpec.model_construct(
+        name=BadString("bad"),
+        metadata={},
+    )
+    with pytest.raises(ValueError, match="must be a string"):
+        app.register_environment(bad_name_environment)
+
+    bad_metadata_environment = Environment(EnvironmentSpec(name="bad_metadata"))
+    bad_metadata_environment.spec = EnvironmentSpec.model_construct(
+        name="bad_metadata",
+        metadata=BadMetadata({"bad": "value"}),
+    )
+    with pytest.raises(ValueError, match="JSON-compatible"):
+        app.register_environment(bad_metadata_environment)
+
+    with pytest.raises(ValueError, match="Environment already registered"):
+        app.register_environment(Environment(EnvironmentSpec(name="local")))
+        app.register_environment(Environment(EnvironmentSpec(name="local")))
+
+
+def test_environment_rejects_invalid_bound_services():
+    class WorkspaceLike:
+        id = "workspace"
+
+    class RunnerLike:
+        isolation = "fake"
+
+    class VaultLike:
+        pass
+
+    with pytest.raises(TypeError, match="workspace"):
+        Environment(
+            EnvironmentSpec(name="workspace_like"),
+            workspace=WorkspaceLike(),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="runner"):
+        Environment(
+            EnvironmentSpec(name="runner_like"),
+            runner=RunnerLike(),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="vault"):
+        Environment(
+            EnvironmentSpec(name="vault_like"),
+            vault=VaultLike(),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="mcp_servers"):
+        Environment(
+            EnvironmentSpec(name="bad_mcp_servers"),
+            mcp_servers="not iterable specs",  # type: ignore[arg-type]
+        )
 
 
 def test_cayu_app_isolates_registered_agent_state():

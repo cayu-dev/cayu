@@ -10,6 +10,16 @@ Payloads, metadata, tool arguments, tool results, model options, checkpoints, an
 
 Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state.
 
+## Agent, Environment, Session
+
+Cayu separates agent definition, execution environment, and session state:
+
+- `AgentSpec`: model, system prompt, tool declarations, and metadata.
+- `Environment`: workspace, runner, vault, MCP servers, and execution metadata.
+- `RunRequest` / `Session`: one run of an agent, optionally in a named environment, with messages, status, events, and checkpoints.
+
+This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
+
 ## Event
 
 Append-only event emitted by runtime, providers, tools, workflows, memory, runners, and sessions.
@@ -29,6 +39,8 @@ Events power:
 Creates sessions, stores events, and checkpoints runtime state.
 
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. Resume, replay, and idempotent continuation should be explicit APIs later, not implied by session creation.
+`RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime may use the default registered environment; if no environment is registered, simple runs can still execute without one.
+Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and normalizes provider events before emitting them.
 
 Local default can be SQLite. Hosted use can be Postgres or another durable store.
 `InMemorySessionStore` exists for tests, local examples, and the first runtime slice.

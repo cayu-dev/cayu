@@ -19,6 +19,7 @@ Important framework capabilities:
 
 - event stream shape
 - basic agent loop
+- agent/environment/session separation
 - tool protocol
 - path-safe file tools
 - LocalRunner implementation

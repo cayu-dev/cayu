@@ -21,6 +21,7 @@ from cayu.core import (
 from cayu.core.events import copy_event
 from cayu.core.messages import copy_message, copy_message_part
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand, ExecResult
@@ -57,12 +58,14 @@ def test_event_has_stable_contract_fields():
         type=EventType.SESSION_STARTED,
         session_id="sess_1",
         agent_name="orchestrator",
+        environment_name="local",
         payload={"ok": True},
     )
 
     assert event.type == EventType.SESSION_STARTED
     assert event.session_id == "sess_1"
     assert event.agent_name == "orchestrator"
+    assert event.environment_name == "local"
     assert event.payload == {"ok": True}
     assert event.id
     assert event.timestamp
@@ -79,6 +82,13 @@ def test_event_rejects_blank_identity_fields():
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         Event(type=EventType.SESSION_STARTED, session_id="sess_1", id=" ")
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess_1",
+            environment_name=" ",
+        )
 
 
 def test_event_requires_namespace_for_custom_types():
@@ -133,6 +143,7 @@ def test_core_value_objects_own_mutable_constructor_inputs():
     event = Event(
         type=EventType.SESSION_STARTED,
         session_id="sess_1",
+        environment_name="local",
         payload=payload,
     )
 
@@ -161,6 +172,7 @@ def test_core_value_objects_own_mutable_constructor_inputs():
     tool_result_artifacts[0]["nested"]["value"] = "mutated"
 
     assert event.payload == {"nested": {"value": "original"}}
+    assert event.environment_name == "local"
     assert agent.metadata == {"nested": {"value": "original"}}
     assert workflow.metadata == {"nested": {"value": "original"}}
     assert tool_result.structured == {"nested": {"value": "original"}}
@@ -634,6 +646,20 @@ def test_agent_spec_rejects_blank_identity_fields(kwargs):
         AgentSpec(**kwargs)
 
 
+def test_environment_spec_accepts_name_and_metadata():
+    metadata = {"nested": {"value": "original"}}
+    environment = Environment(EnvironmentSpec(name="local", metadata=metadata))
+
+    metadata["nested"]["value"] = "mutated"
+
+    assert environment.spec.name == "local"
+    assert environment.spec.metadata == {"nested": {"value": "original"}}
+    assert environment.workspace is None
+    assert environment.runner is None
+    assert environment.vault is None
+    assert environment.mcp_servers == ()
+
+
 def test_runtime_identity_models_reject_blank_fields():
     with pytest.raises(ValidationError, match="cannot be blank"):
         RunRequest(agent_name=" ", messages=[Message.text("user", "start")])
@@ -646,7 +672,21 @@ def test_runtime_identity_models_reject_blank_fields():
         )
 
     with pytest.raises(ValidationError, match="cannot be blank"):
+        RunRequest(
+            agent_name="assistant",
+            environment_name=" ",
+            messages=[Message.text("user", "start")],
+        )
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
         Event(type=EventType.SESSION_STARTED, session_id=" ")
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="sess_1",
+            environment_name=" ",
+        )
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         Event(
@@ -665,6 +705,9 @@ def test_framework_spec_models_reject_blank_names():
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         WorkflowSpec(name=" ")
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        EnvironmentSpec(name=" ")
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         ModelRequest(model=" ", messages=[Message.text("user", "start")])

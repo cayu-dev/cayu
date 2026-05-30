@@ -15,6 +15,7 @@ The framework should run locally, on a VPS, in Docker, in ECS, or behind any oth
 - CLI: developer/admin utility, not the primary product interface
 - Dashboard: optional viewer over runtime events and session storage
 - MCP: interoperability layer, not the required custom tool model
+- Runtime model: separate agent, environment, and session concerns
 
 ## Dependency Direction
 
@@ -26,6 +27,7 @@ core
   storage -> core
   vaults -> core
   mcp -> core
+  environments -> workspaces + runners + vaults + mcp
   runtime -> core + providers + runners + workspaces + storage + vaults + mcp
   cli -> runtime + project scaffolding
   dashboard -> runtime API / event store
@@ -38,12 +40,14 @@ core
 ```text
 RunRequest
   -> SessionStore creates session
+  -> Environment provides execution context
   -> Agent runtime streams provider/tool/workflow events
   -> EventSink emits to terminal/dashboard/webhook
   -> SessionStore persists append-only event log
 ```
 
 Every important action should produce an event. Events are the shared contract for debugging, dashboards, hosted integrations, replay, and tests.
+Event identity fields such as agent, environment, workflow, and tool should be top-level event fields so event stores and dashboards can index them without parsing payload JSON.
 
 Runtime inputs are copied at framework boundaries. Framework code should depend on explicit registration and validated contract objects, not on later mutation of user-owned Python objects.
 
@@ -64,6 +68,12 @@ Agent A
 This requires both deterministic orchestration and LLM orchestrator agents.
 
 ## Workspace, Runner, Sandbox
+
+Cayu follows an agent/environment/session separation:
+
+- `Agent`: model, system prompt, tool declarations, and metadata.
+- `Environment`: workspace, runner, vault, MCP servers, and execution metadata.
+- `Session`: one run of an agent in an environment, with messages, status, events, and checkpoints.
 
 - `Workspace`: files/artifacts an agent can work with.
 - `Runner`: executes explicit `ExecCommand` values in a workspace or sandbox.

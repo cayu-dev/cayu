@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 from cayu import (
     AgentSpec,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
     Event,
     EventType,
     Message,
@@ -105,6 +107,10 @@ async def main() -> None:
     provider = FakeProvider()
     app = CayuApp()
     app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local-dev", metadata={"kind": "local"})),
+        default=True,
+    )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[EchoTool()],
@@ -117,7 +123,12 @@ async def main() -> None:
     )
 
     async for event in app.run(request):
-        print(event.type, event.tool_name or "-", event.payload)
+        print(
+            event.type,
+            event.environment_name or "-",
+            event.tool_name or "-",
+            event.payload,
+        )
 
     print("model_requests", len(provider.requests))
     print("second_request_last_message", provider.requests[1].messages[-1].model_dump())

@@ -30,6 +30,7 @@ class RunRequest(BaseModel):
     messages: list[Message]
     # Optional caller-provided id for a new session. It must be unique.
     session_id: str | None = None
+    environment_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
 
@@ -55,6 +56,17 @@ class RunRequest(BaseModel):
             return None
         return require_nonblank(value, info.field_name)
 
+    @field_validator("environment_name")
+    @classmethod
+    def validate_nonblank_environment_name(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
 
 class Session(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -62,6 +74,7 @@ class Session(BaseModel):
     # SessionStore implementations may set this from RunRequest.session_id.
     id: str = Field(default_factory=lambda: str(uuid4()))
     agent_name: str
+    environment_name: str | None = None
     status: SessionStatus = SessionStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -75,6 +88,17 @@ class Session(BaseModel):
     @field_validator("id", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("environment_name")
+    @classmethod
+    def validate_nonblank_environment_name(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
         return require_nonblank(value, info.field_name)
 
 
@@ -132,6 +156,7 @@ class InMemorySessionStore(SessionStore):
             session = Session(
                 id=session_id,
                 agent_name=request.agent_name,
+                environment_name=request.environment_name,
                 status=SessionStatus.PENDING,
                 created_at=now,
                 updated_at=now,
@@ -221,6 +246,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         agent_name=request.agent_name,
         messages=[copy_message(message) for message in messages],
         session_id=request.session_id,
+        environment_name=request.environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
     )
