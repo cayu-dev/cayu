@@ -20,6 +20,7 @@ from cayu.runners import (
     LocalRunner,
 )
 from cayu.runtime import CayuApp, RunRequest
+from cayu.storage import SQLiteSessionStore
 from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -51,6 +52,7 @@ __all__ = [
     "ToolSpec",
     "WriteFileTool",
     "RunRequest",
+    "SQLiteSessionStore",
     "Workflow",
     "WorkflowSpec",
     "WorkspaceListResult",

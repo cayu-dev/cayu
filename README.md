@@ -13,9 +13,9 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, an in-memory session/event store, event sinks, model-provider contracts, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event stores, event sinks, model-provider contracts, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
 
-It does not yet include durable storage, dashboard UI, hosted deployment adapters, vector search, isolated runners, or streaming provider adapters.
+It does not yet include dashboard UI, hosted deployment adapters, vector search, isolated runners, task orchestration, or streaming provider adapters.
 
 ## Contract Rules
 
@@ -78,4 +78,16 @@ Run the live Anthropic example with local tools:
 ```bash
 export ANTHROPIC_API_KEY=...
 PYTHONPATH=src python examples/anthropic_local_tools.py
+```
+
+Use durable local session/event storage:
+
+```python
+from pathlib import Path
+
+from cayu import CayuApp, SQLiteSessionStore
+
+app = CayuApp(
+    session_store=SQLiteSessionStore(Path(".cayu") / "sessions.sqlite"),
+)
 ```

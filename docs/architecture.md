@@ -93,7 +93,9 @@ Default local strategy:
 
 ```text
 files for human-readable source
-SQLite for sessions and indexes
+SQLite for sessions, append-only events, checkpoints, and indexes
 SQLite FTS/BM25 for default keyword retrieval
 optional vector search later
 ```
+
+The local durable session store is `SQLiteSessionStore`. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.

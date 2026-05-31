@@ -42,8 +42,9 @@ Creates sessions, stores events, and checkpoints runtime state.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime may use the default registered environment; if no environment is registered, simple runs can still execute without one.
 Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and normalizes provider events before emitting them.
 
-Local default can be SQLite. Hosted use can be Postgres or another durable store.
-`InMemorySessionStore` exists for tests, local examples, and the first runtime slice.
+`SQLiteSessionStore` is the durable local implementation. It stores sessions, append-only events, and the latest checkpoint in SQLite, while keeping event identity fields such as event type, agent, environment, workflow, and tool queryable as columns. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
+
+JSONL can be added later as an export/debug format. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
 
 ## EventSink
 
