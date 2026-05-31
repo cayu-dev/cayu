@@ -13,6 +13,8 @@ authors = [
   { name = "Cayu" }
 ]
 dependencies = [
+  "certifi>=2024.0",
+  "httpx>=0.27",
   "pydantic>=2.8",
 ]
 

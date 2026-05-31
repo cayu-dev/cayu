@@ -12,6 +12,7 @@ from cayu.core.messages import (
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.providers import AnthropicProvider
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -34,6 +35,7 @@ __all__ = [
     "Event",
     "EventType",
     "ExecCommandTool",
+    "AnthropicProvider",
     "ListFilesTool",
     "LocalRunner",
     "LocalWorkspace",

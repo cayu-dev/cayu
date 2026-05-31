@@ -23,6 +23,7 @@ Important framework capabilities:
 - tool protocol
 - path-safe framework-native file tools
 - framework-native command execution tool
+- initial Anthropic Messages API provider
 - LocalRunner implementation
 - LocalWorkspace implementation
 - CLI scaffold ideas

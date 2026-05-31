@@ -56,22 +56,10 @@ class ExecCommandTool(Tool):
                     "default": DEFAULT_OUTPUT_LIMIT_BYTES,
                 },
             },
-            "oneOf": [
-                {
-                    "required": ["argv"],
-                    "properties": {
-                        "kind": {"const": "process"},
-                    },
-                    "not": {"required": ["shell"]},
-                },
-                {
-                    "required": ["kind", "shell"],
-                    "properties": {
-                        "kind": {"const": "shell"},
-                    },
-                    "not": {"required": ["argv"]},
-                },
-            ],
+            "description": (
+                "Use kind='process' with argv, or kind='shell' with shell. "
+                "Do not provide both argv and shell."
+            ),
         },
     )
 

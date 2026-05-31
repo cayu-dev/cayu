@@ -84,6 +84,8 @@ Provider adapters must:
 
 Provider errors should become model error events and failed sessions. Tool calls should be emitted as structured tool-call stream events so the runtime can execute tools and feed structured results back into the next model step.
 
+The initial `AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks. The first implementation uses complete Messages API responses and yields normalized Cayu stream events from the returned assistant message. Server-sent-event streaming can be added behind the same provider contract later.
+
 ## Tool
 
 Runs a capability and returns `ToolResult`.

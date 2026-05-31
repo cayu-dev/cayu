@@ -177,6 +177,9 @@ def test_builtin_tool_limits_are_model_context_sized():
     }
     assert ExecCommandTool().schema["properties"]["shell"]["minLength"] == 1
     assert ExecCommandTool().schema["properties"]["shell"]["pattern"] == r"\S"
+    assert "oneOf" not in ExecCommandTool().schema
+    assert "anyOf" not in ExecCommandTool().schema
+    assert "allOf" not in ExecCommandTool().schema
 
 
 def test_workspace_tools_read_write_and_list_files(tmp_path):
