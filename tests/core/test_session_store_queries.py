@@ -198,6 +198,69 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
     asyncio.run(run_store_operations())
 
 
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_append_and_load_transcript_messages(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_transcript",
+                messages=[Message.text("user", "build")],
+            )
+        )
+
+        user_message = Message.text("user", "build")
+        assistant_message = Message.tool_call(
+            tool_call_id="call_1",
+            tool_name="read_file",
+            arguments={"path": "README.md"},
+        )
+        tool_message = Message.tool_result(
+            tool_call_id="call_1",
+            tool_name="read_file",
+            content="contents",
+            structured={"bytes": 8},
+        )
+
+        await store.append_transcript_messages(
+            "sess_transcript",
+            [user_message, assistant_message],
+        )
+        user_message.content[0].text = "mutated"
+        await store.append_transcript_messages("sess_transcript", [tool_message])
+
+        transcript = await store.load_transcript("sess_transcript")
+        assert [message.role for message in transcript] == [
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert transcript[0].content[0].text == "build"
+        assert transcript[1].content[0].tool_name == "read_file"
+        assert transcript[2].content[0].structured == {"bytes": 8}
+
+        transcript[0].content[0].text = "changed after load"
+        loaded_again = await store.load_transcript("sess_transcript")
+        assert loaded_again[0].content[0].text == "build"
+
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.append_transcript_messages(
+                "missing_session",
+                [Message.text("user", "hi")],
+            )
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.load_transcript("missing_session")
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
 def _make_store(store_factory: StoreFactory, tmp_path) -> SessionStore:
     if store_factory is SQLiteSessionStore:
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")

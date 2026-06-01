@@ -307,6 +307,7 @@ class CayuApp:
                 system_prompt=registered_agent.spec.system_prompt,
                 request_messages=request.messages,
             )
+            await self.session_store.append_transcript_messages(session.id, messages)
             for step in range(1, request.max_steps + 1):
                 yield await self._emit(
                     Event(
@@ -395,6 +396,10 @@ class CayuApp:
                 )
                 if assistant_message is not None:
                     messages.append(assistant_message)
+                    await self.session_store.append_transcript_messages(
+                        session.id,
+                        [assistant_message],
+                    )
 
                 if not tool_calls:
                     break
@@ -412,7 +417,12 @@ class CayuApp:
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
-                messages.extend(_tool_result_messages(tool_outcomes))
+                tool_result_messages = _tool_result_messages(tool_outcomes)
+                messages.extend(tool_result_messages)
+                await self.session_store.append_transcript_messages(
+                    session.id,
+                    tool_result_messages,
+                )
             else:
                 raise RuntimeError(f"Maximum model steps exceeded: {request.max_steps}")
 

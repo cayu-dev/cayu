@@ -9,6 +9,7 @@ from typing import Any
 
 from cayu._validation import copy_json_object, copy_json_value, require_nonblank
 from cayu.core.events import Event, copy_event
+from cayu.core.messages import Message
 from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
@@ -21,6 +22,7 @@ from cayu.runtime.sessions import (
     copy_event_query,
     copy_run_request,
     copy_session_query,
+    copy_transcript_messages,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -36,7 +38,7 @@ from cayu.runtime.tasks import (
 )
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class SQLiteSessionStore(SessionStore):
@@ -302,6 +304,53 @@ class SQLiteSessionStore(SessionStore):
                 params,
             ).fetchall()
             return [_session_from_row(row) for row in rows]
+
+    async def append_transcript_messages(
+        self,
+        session_id: str,
+        messages: list[Message],
+    ) -> None:
+        session_id = require_nonblank(session_id, "session_id")
+        copied_messages = copy_transcript_messages(messages)
+
+        async with self._lock:
+            if not self._session_exists_unlocked(session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            if not copied_messages:
+                return
+            with self._connection:
+                self._connection.executemany(
+                    """
+                    INSERT INTO transcript_messages (
+                        session_id,
+                        message_json
+                    )
+                    VALUES (?, ?)
+                    """,
+                    [
+                        (
+                            session_id,
+                            _json_dumps(message.model_dump(mode="json")),
+                        )
+                        for message in copied_messages
+                    ],
+                )
+
+    async def load_transcript(self, session_id: str) -> list[Message]:
+        session_id = require_nonblank(session_id, "session_id")
+        async with self._lock:
+            if not self._session_exists_unlocked(session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            rows = self._connection.execute(
+                """
+                SELECT message_json
+                FROM transcript_messages
+                WHERE session_id = ?
+                ORDER BY sequence ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            return [Message(**json.loads(row["message_json"])) for row in rows]
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_nonblank(session_id, "session_id")
@@ -690,6 +739,12 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS transcript_messages (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_json TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
@@ -727,6 +782,8 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
                 ON events(workflow_name);
             CREATE INDEX IF NOT EXISTS idx_events_tool_name
                 ON events(tool_name);
+            CREATE INDEX IF NOT EXISTS idx_transcript_messages_session_sequence
+                ON transcript_messages(session_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_tasks_status
                 ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_type

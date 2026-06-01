@@ -870,6 +870,18 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert tool_result_part.artifacts == []
     assert tool_result_part.is_error is False
 
+    transcript = asyncio.run(store.load_transcript("sess_tool"))
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert transcript[0].content[0].text == "use the tool"
+    assert transcript[1].content[0].type == "tool_call"
+    assert transcript[2].content[0].type == "tool_result"
+    assert transcript[3].content[0].text == "done"
+
 
 def test_cayu_app_sends_agent_system_prompt_as_first_message():
     provider = FakeProvider(
@@ -903,6 +915,12 @@ def test_cayu_app_sends_agent_system_prompt_as_first_message():
     assert provider.requests[0].messages[0].content[0].text == "You are careful."
     assert provider.requests[0].messages[1].content[0].text == "hi"
     assert [message.role for message in request.messages] == ["user"]
+    transcript = asyncio.run(app.session_store.load_transcript("sess_system_prompt"))
+    assert [message.role for message in transcript] == [
+        "system",
+        "user",
+        "assistant",
+    ]
 
 
 @pytest.mark.parametrize("system_prompt", [None, "", "   "])

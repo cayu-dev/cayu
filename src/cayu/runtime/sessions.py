@@ -212,6 +212,18 @@ class SessionStore(ABC):
         """List sessions for dashboard, replay, and orchestration views."""
 
     @abstractmethod
+    async def append_transcript_messages(
+        self,
+        session_id: str,
+        messages: list[Message],
+    ) -> None:
+        """Append provider-neutral transcript messages to a session."""
+
+    @abstractmethod
+    async def load_transcript(self, session_id: str) -> list[Message]:
+        """Load provider-neutral transcript messages for a session."""
+
+    @abstractmethod
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         """Persist a checkpoint for resume/replay."""
 
@@ -230,6 +242,7 @@ class InMemorySessionStore(SessionStore):
         self._event_records: list[EventRecord] = []
         self._event_ids: dict[str, set[str]] = {}
         self._next_event_sequence = 1
+        self._transcripts: dict[str, list[Message]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
 
     async def create(self, request: RunRequest) -> Session:
@@ -254,6 +267,7 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session.id] = session
             self._events[session.id] = []
             self._event_ids[session.id] = set()
+            self._transcripts[session.id] = []
             return session.model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
@@ -365,6 +379,30 @@ class InMemorySessionStore(SessionStore):
             page = sessions[query.offset : query.offset + query.limit]
             return [session.model_copy(deep=True) for session in page]
 
+    async def append_transcript_messages(
+        self,
+        session_id: str,
+        messages: list[Message],
+    ) -> None:
+        session_id = require_nonblank(session_id, "session_id")
+        copied_messages = copy_transcript_messages(messages)
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            if not copied_messages:
+                return
+            self._transcripts[session_id].extend(copied_messages)
+
+    async def load_transcript(self, session_id: str) -> list[Message]:
+        session_id = require_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            return [
+                copy_message(message)
+                for message in self._transcripts.get(session_id, [])
+            ]
+
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
@@ -385,6 +423,12 @@ class InMemorySessionStore(SessionStore):
 
 def _validate_event(event: Event) -> Event:
     return copy_event(event)
+
+
+def copy_transcript_messages(messages: list[Message]) -> list[Message]:
+    if type(messages) is not list:
+        raise TypeError("Transcript messages must be a list.")
+    return [copy_message(message) for message in messages]
 
 
 def copy_run_request(request: RunRequest) -> RunRequest:

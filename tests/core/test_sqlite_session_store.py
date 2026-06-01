@@ -91,6 +91,13 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
                 payload={"finish_reason": "stop"},
             ),
         )
+        await store.append_transcript_messages(
+            "sess_sqlite",
+            [
+                Message.text("user", "hi"),
+                Message.text("assistant", "hello"),
+            ],
+        )
         await store.checkpoint(
             "sess_sqlite",
             {"messages": [{"role": "user", "content": "hi"}], "step": 1},
@@ -104,6 +111,7 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
     async def assert_reopened_state() -> None:
         session = await reopened.load("sess_sqlite")
         events = await reopened.load_events("sess_sqlite")
+        transcript = await reopened.load_transcript("sess_sqlite")
         checkpoint = await reopened.load_checkpoint("sess_sqlite")
 
         assert session is not None
@@ -119,6 +127,8 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
             {"step": 1},
             {"finish_reason": "stop"},
         ]
+        assert [message.role for message in transcript] == ["user", "assistant"]
+        assert [message.content[0].text for message in transcript] == ["hi", "hello"]
         assert checkpoint == {
             "messages": [{"role": "user", "content": "hi"}],
             "step": 1,

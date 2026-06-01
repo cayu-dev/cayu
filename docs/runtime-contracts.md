@@ -36,13 +36,13 @@ Events power:
 
 ## SessionStore
 
-Creates sessions, stores events, and checkpoints runtime state.
+Creates sessions, stores events, stores provider-neutral transcripts, and checkpoints runtime state.
 
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Resume, replay, and idempotent continuation should be explicit APIs later, not implied by session creation.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime may use the default registered environment; if no environment is registered, simple runs can still execute without one.
 Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and normalizes provider events before emitting them.
 
-`SQLiteSessionStore` is the durable local implementation. It stores sessions, append-only events, and the latest checkpoint in SQLite, while keeping event identity fields such as event type, agent, environment, workflow, and tool queryable as columns. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
+`SQLiteSessionStore` is the durable local implementation. It stores sessions, append-only events, provider-neutral transcript messages, and the latest checkpoint in SQLite, while keeping event identity fields such as event type, agent, environment, workflow, and tool queryable as columns. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
 
 JSONL can be added later as an export/debug format. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
 
@@ -51,7 +51,9 @@ Session stores expose two read surfaces:
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
 
-Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Batched appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
+Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation needed by future resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
+
+Transcript persistence is not a full resume API yet. Explicit resume should be added on top of the stored transcript and checkpoint contracts, not by reusing `RunRequest.session_id`.
 
 ## TaskStore
 
