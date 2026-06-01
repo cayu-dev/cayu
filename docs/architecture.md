@@ -98,7 +98,7 @@ SQLite FTS/BM25 for default keyword retrieval
 optional vector search later
 ```
 
-The local durable session store is `SQLiteSessionStore`. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. It also stores the provider-neutral transcript messages needed for future resume and compaction APIs. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.
+The local durable session store is `SQLiteSessionStore`. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. It also stores the provider-neutral transcript messages used by explicit session resume and future compaction APIs. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, atomic status transitions, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.
 
 Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
 

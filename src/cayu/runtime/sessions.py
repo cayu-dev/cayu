@@ -62,6 +62,33 @@ class RunRequest(BaseModel):
         return require_nonblank(value, info.field_name)
 
 
+class ResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    messages: list[Message]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+
+    @field_validator("messages")
+    @classmethod
+    def copy_messages(cls, value):
+        copied_messages = [copy_message(message) for message in value]
+        if not copied_messages:
+            raise ValueError("ResumeRequest messages cannot be empty.")
+        return copied_messages
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_nonblank_session_id(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+
 class Session(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -191,6 +218,16 @@ class SessionStore(ABC):
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         """Update session status and return the updated session."""
 
+    @abstractmethod
+    async def transition_status(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        """Atomically transition a session status when its current status is allowed."""
+
     async def append_event(self, session_id: str, event: Event) -> None:
         """Append one event to a session."""
         await self.append_events(session_id, [event])
@@ -290,6 +327,36 @@ class InMemorySessionStore(SessionStore):
             updated = session.model_copy(
                 update={
                     "status": status,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def transition_status(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        session_id = require_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.status not in allowed_statuses:
+                raise ValueError(
+                    "Session status transition not allowed: "
+                    f"{session.status} -> {to_status}"
+                )
+
+            updated = session.model_copy(
+                update={
+                    "status": to_status,
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
@@ -446,6 +513,34 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
     )
+
+
+def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
+    if type(request) is not ResumeRequest:
+        raise TypeError("Session resume requires a ResumeRequest.")
+    messages = getattr(request, "messages", None)
+    if type(messages) is not list:
+        raise ValueError("ResumeRequest messages must be a list.")
+    return ResumeRequest(
+        session_id=request.session_id,
+        messages=[copy_message(message) for message in messages],
+        metadata=copy_json_value(request.metadata, "metadata"),
+        max_steps=request.max_steps,
+    )
+
+
+def _validate_status_set(
+    statuses: set[SessionStatus],
+    field_name: str,
+) -> set[SessionStatus]:
+    if type(statuses) is not set:
+        raise TypeError(f"{field_name} must be a set of SessionStatus values.")
+    if not statuses:
+        raise ValueError(f"{field_name} cannot be empty.")
+    for status in statuses:
+        if not isinstance(status, SessionStatus):
+            raise ValueError(f"{field_name} must contain SessionStatus values.")
+    return set(statuses)
 
 
 def copy_session_query(query: SessionQuery | None) -> SessionQuery:

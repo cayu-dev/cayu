@@ -13,17 +13,30 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
-from cayu.runtime import CayuApp, RunRequest, SessionStatus
+from cayu.runtime import CayuApp, ResumeRequest, RunRequest, SessionStatus
 
 
 class FakeProvider(ModelProvider):
     name = "fake"
 
-    def __init__(self, events: list[ModelStreamEvent]) -> None:
-        self._events = events
+    def __init__(
+        self,
+        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
+    ) -> None:
+        if events and isinstance(events[0], list):
+            self.event_batches = events  # type: ignore[assignment]
+        else:
+            self.event_batches = [events]  # type: ignore[list-item]
+        self.requests: list[ModelRequest] = []
 
     async def stream(self, request: ModelRequest):
-        for event in self._events:
+        self.requests.append(request)
+        batch_index = len(self.requests) - 1
+        if batch_index >= len(self.event_batches):
+            raise AssertionError(
+                f"No fake provider event batch for request {batch_index}"
+            )
+        for event in self.event_batches[batch_index]:
             yield event
 
     def to_event(
@@ -52,6 +65,10 @@ class FakeProvider(ModelProvider):
 
 async def _close(store: SQLiteSessionStore) -> None:
     await store.close()
+
+
+async def _collect_app_events(events) -> list[Event]:
+    return [event async for event in events]
 
 
 def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path):
@@ -266,6 +283,83 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
             EventType.SESSION_COMPLETED,
         ]
         assert persisted_events == events
+        assert session is not None
+        assert session.status == SessionStatus.COMPLETED
+        await _close(store)
+
+    asyncio.run(run_app())
+
+
+def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run_app() -> None:
+        await _collect_app_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_resume_sqlite",
+                    messages=[Message.text("user", "first request")],
+                )
+            )
+        )
+        resume_events = await _collect_app_events(
+            app.resume(
+                ResumeRequest(
+                    session_id="sess_resume_sqlite",
+                    messages=[Message.text("user", "second request")],
+                )
+            )
+        )
+        transcript = await store.load_transcript("sess_resume_sqlite")
+        persisted_events = await store.load_events("sess_resume_sqlite")
+        session = await store.load("sess_resume_sqlite")
+
+        assert [event.type for event in resume_events] == [
+            EventType.SESSION_RESUMED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+            EventType.SESSION_COMPLETED,
+        ]
+        assert [message.content[0].text for message in provider.requests[1].messages] == [
+            "first request",
+            "first answer",
+            "second request",
+        ]
+        assert [message.content[0].text for message in transcript] == [
+            "first request",
+            "first answer",
+            "second request",
+            "second answer",
+        ]
+        assert [event.type for event in persisted_events] == [
+            EventType.SESSION_STARTED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+            EventType.SESSION_COMPLETED,
+            EventType.SESSION_RESUMED,
+            EventType.MODEL_STARTED,
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+            EventType.SESSION_COMPLETED,
+        ]
         assert session is not None
         assert session.status == SessionStatus.COMPLETED
         await _close(store)

@@ -261,6 +261,46 @@ def test_session_stores_append_and_load_transcript_messages(
     asyncio.run(run_store_operations())
 
 
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_transition_status_atomically(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_transition",
+                messages=[Message.text("user", "build")],
+            )
+        )
+        await store.update_status("sess_transition", SessionStatus.COMPLETED)
+
+        transitioned = await store.transition_status(
+            "sess_transition",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+        assert transitioned.status == SessionStatus.RUNNING
+
+        with pytest.raises(ValueError, match="transition not allowed"):
+            await store.transition_status(
+                "sess_transition",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+
+        loaded = await store.load("sess_transition")
+        assert loaded is not None
+        assert loaded.status == SessionStatus.RUNNING
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
 def _make_store(store_factory: StoreFactory, tmp_path) -> SessionStore:
     if store_factory is SQLiteSessionStore:
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")

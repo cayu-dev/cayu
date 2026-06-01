@@ -23,6 +23,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session_query,
     copy_transcript_messages,
+    _validate_status_set,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -126,6 +127,50 @@ class SQLiteSessionStore(SessionStore):
                 )
             if cursor.rowcount != 1:
                 raise KeyError(f"Session not found: {session_id}")
+
+            loaded = self._load_unlocked(session_id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
+    async def transition_status(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        session_id = require_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+
+        updated_at = datetime.now(timezone.utc)
+        async with self._lock:
+            placeholders = ", ".join("?" for _ in allowed_statuses)
+            params: list[object] = [
+                str(to_status),
+                _format_datetime(updated_at),
+                session_id,
+                *[str(status) for status in allowed_statuses],
+            ]
+            with self._connection:
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE sessions
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status IN ({placeholders})
+                    """,
+                    params,
+                )
+            if cursor.rowcount != 1:
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                raise ValueError(
+                    "Session status transition not allowed: "
+                    f"{loaded.status} -> {to_status}"
+                )
 
             loaded = self._load_unlocked(session_id)
             if loaded is None:

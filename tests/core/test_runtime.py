@@ -23,6 +23,7 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InMemoryTaskStore,
+    ResumeRequest,
     RunRequest,
     SessionStatus,
     TaskCreate,
@@ -331,6 +332,10 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
 
+async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
+    return [event async for event in app.resume(request)]
+
+
 def test_cayu_app_rejects_invalid_runtime_dependencies():
     class StoreLike:
         pass
@@ -482,6 +487,312 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert persisted == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_resumes_completed_session_from_stored_transcript():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[0].payload == {
+        "agent_name": "assistant",
+        "appended_messages": 1,
+    }
+    assert [message.content[0].text for message in provider.requests[1].messages] == [
+        "first request",
+        "first answer",
+        "second request",
+    ]
+
+    transcript = asyncio.run(store.load_transcript("sess_resume"))
+    assert [message.content[0].text for message in transcript] == [
+        "first request",
+        "first answer",
+        "second request",
+        "second answer",
+    ]
+    session = asyncio.run(store.load("sess_resume"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_resume_rejects_active_sessions():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("should not run"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_running_session() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_running",
+                messages=[Message.text("user", "hi")],
+            )
+        )
+        await store.update_status("sess_running", SessionStatus.RUNNING)
+        await store.append_transcript_messages(
+            "sess_running",
+            [Message.text("user", "hi")],
+        )
+
+    asyncio.run(setup_running_session())
+
+    with pytest.raises(ValueError, match="transition not allowed"):
+        asyncio.run(
+            collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="sess_running",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+
+    assert provider.requests == []
+    session = asyncio.run(store.load("sess_running"))
+    assert session is not None
+    assert session.status == SessionStatus.RUNNING
+
+
+def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
+    class BrokenTranscriptStore(InMemorySessionStore):
+        async def load_transcript(self, session_id: str) -> list[Message]:
+            raise RuntimeError("transcript unavailable")
+
+    store = BrokenTranscriptStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("should not run"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_completed_session() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_broken_transcript",
+                messages=[Message.text("user", "hi")],
+            )
+        )
+        await store.update_status("sess_broken_transcript", SessionStatus.COMPLETED)
+
+    asyncio.run(setup_completed_session())
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_broken_transcript",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+
+    assert provider.requests == []
+    assert [event.type for event in events] == [EventType.SESSION_FAILED]
+    assert events[0].payload == {
+        "error": "transcript unavailable",
+        "error_type": "RuntimeError",
+    }
+    session = asyncio.run(store.load("sess_broken_transcript"))
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+
+
+def test_cayu_app_resume_uses_context_policy_and_preserves_full_transcript():
+    class LastMessagePolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.seen_messages: list[list[str]] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.seen_messages.append(
+                [message.content[0].text for message in request.messages]
+            )
+            return [request.messages[-1]]
+
+    store = InMemorySessionStore()
+    policy = LastMessagePolicy()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_context",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_context",
+                messages=[Message.text("user", "second request")],
+                metadata={"source": "resume-test"},
+            ),
+        )
+    )
+
+    assert policy.seen_messages[-1] == [
+        "first request",
+        "first answer",
+        "second request",
+    ]
+    assert [message.content[0].text for message in provider.requests[1].messages] == [
+        "second request"
+    ]
+    transcript = asyncio.run(store.load_transcript("sess_resume_context"))
+    assert [message.content[0].text for message in transcript] == [
+        "first request",
+        "first answer",
+        "second request",
+        "second answer",
+    ]
+
+
+def test_cayu_app_resume_continues_tool_rounds():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("ready"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "from resumed tool"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_tool",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_tool",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert provider.requests[2].messages[-1].role == "tool"
+    assert provider.requests[2].messages[-1].content[0].content == "from resumed tool"
+    transcript = asyncio.run(store.load_transcript("sess_resume_tool"))
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
 
 
 def test_cayu_app_links_successful_run_to_task():

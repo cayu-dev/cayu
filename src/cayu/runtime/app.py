@@ -29,10 +29,12 @@ from cayu.runtime.context import (
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
     InMemorySessionStore,
+    ResumeRequest,
     RunRequest,
     Session,
     SessionStatus,
     SessionStore,
+    copy_resume_request,
     copy_run_request,
 )
 from cayu.runtime.tasks import Task, TaskStore
@@ -82,6 +84,13 @@ class ToolCallRequest:
 class ToolCallOutcome:
     call: ToolCallRequest
     result: ToolResult
+
+
+_RESUMABLE_SESSION_STATUSES = {
+    SessionStatus.COMPLETED,
+    SessionStatus.FAILED,
+    SessionStatus.INTERRUPTED,
+}
 
 
 class CayuApp:
@@ -270,6 +279,14 @@ class CayuApp:
         except KeyError as exc:
             raise KeyError(f"Environment not registered: {environment_name}") from exc
 
+    def _get_registered_environment_for_session(
+        self,
+        name: str | None,
+    ) -> RegisteredEnvironment | None:
+        if name is None:
+            return None
+        return self._get_registered_environment(name)
+
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -283,13 +300,78 @@ class CayuApp:
             request = _with_environment_name(request, registered_environment.spec.name)
         session = await self.session_store.create(request)
         await self.session_store.update_status(session.id, SessionStatus.RUNNING)
+        messages = _initial_messages(
+            system_prompt=registered_agent.spec.system_prompt,
+            request_messages=request.messages,
+        )
 
         async for event in self._run_session(
             session=session,
-            request=request,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            messages=messages,
+            messages_to_append=messages,
+            max_steps=request.max_steps,
+            request_metadata=request.metadata,
+            task_id=request.task_id,
+            start_event_type=EventType.SESSION_STARTED,
+            start_event_payload={"agent_name": registered_agent.spec.name},
+        ):
+            yield event
+
+    async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
+        if type(request) is not ResumeRequest:
+            raise TypeError("Runtime resume requires a ResumeRequest.")
+        request = _validate_resume_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_provider = self._get_registered_provider()
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses=_RESUMABLE_SESSION_STATUSES,
+            to_status=SessionStatus.RUNNING,
+        )
+        try:
+            transcript = await self.session_store.load_transcript(session.id)
+        except Exception as exc:
+            await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            yield await self._emit(
+                Event(
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            )
+            return
+        messages = transcript + request.messages
+
+        async for event in self._run_session(
+            session=session,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            messages=messages,
+            messages_to_append=request.messages,
+            max_steps=request.max_steps,
+            request_metadata=request.metadata,
+            task_id=None,
+            start_event_type=EventType.SESSION_RESUMED,
+            start_event_payload={
+                "agent_name": registered_agent.spec.name,
+                "appended_messages": len(request.messages),
+            },
         ):
             yield event
 
@@ -297,10 +379,16 @@ class CayuApp:
         self,
         *,
         session: Session,
-        request: RunRequest,
         registered_agent: _RegisteredAgentState,
         registered_provider: RegisteredProvider,
         registered_environment: RegisteredEnvironment | None,
+        messages: list[Message],
+        messages_to_append: list[Message],
+        max_steps: int,
+        request_metadata: dict[str, Any],
+        task_id: str | None,
+        start_event_type: EventType,
+        start_event_payload: dict[str, Any],
     ) -> AsyncIterator[Event]:
         provider = registered_provider.provider
         environment_name = _environment_name(registered_environment)
@@ -309,15 +397,15 @@ class CayuApp:
         try:
             yield await self._emit(
                 Event(
-                    type=EventType.SESSION_STARTED,
+                    type=start_event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    payload={"agent_name": registered_agent.spec.name},
+                    payload=start_event_payload,
                 )
             )
-            if request.task_id is not None:
-                task = await self._start_task(task_id=request.task_id, session=session)
+            if task_id is not None:
+                task = await self._start_task(task_id=task_id, session=session)
                 task_started = True
                 yield await self._emit(
                     _task_event(
@@ -328,12 +416,11 @@ class CayuApp:
                         registered_environment=registered_environment,
                     )
                 )
-            messages = _initial_messages(
-                system_prompt=registered_agent.spec.system_prompt,
-                request_messages=request.messages,
+            await self.session_store.append_transcript_messages(
+                session.id,
+                messages_to_append,
             )
-            await self.session_store.append_transcript_messages(session.id, messages)
-            for step in range(1, request.max_steps + 1):
+            for step in range(1, max_steps + 1):
                 context_messages = await _build_context_messages(
                     context_policy=registered_agent.context_policy,
                     session=session,
@@ -341,7 +428,7 @@ class CayuApp:
                     messages=messages,
                     step=step,
                     environment_name=environment_name,
-                    request_metadata=request.metadata,
+                    request_metadata=request_metadata,
                 )
 
                 model_request = ModelRequest(
@@ -457,11 +544,11 @@ class CayuApp:
                     tool_result_messages,
                 )
             else:
-                raise RuntimeError(f"Maximum model steps exceeded: {request.max_steps}")
+                raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
 
-            if request.task_id is not None:
+            if task_id is not None:
                 task = await self._complete_task(
-                    task_id=request.task_id,
+                    task_id=task_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -490,12 +577,12 @@ class CayuApp:
             if (
                 task_started
                 and not task_finished
-                and request.task_id is not None
+                and task_id is not None
                 and self.task_store is not None
             ):
                 try:
                     task = await self.task_store.fail_task(
-                        request.task_id,
+                        task_id,
                         {
                             "message": str(exc),
                             "type": type(exc).__name__,
@@ -744,6 +831,10 @@ def _validate_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
 
 def _validate_run_request(request: RunRequest) -> RunRequest:
     return copy_run_request(request)
+
+
+def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
+    return copy_resume_request(request)
 
 
 async def _build_context_messages(

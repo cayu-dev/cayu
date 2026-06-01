@@ -31,7 +31,7 @@ import cayu.runners.local as local_runner_module
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
-from cayu.runtime import InMemoryEventSink, RunRequest, SessionStore
+from cayu.runtime import InMemoryEventSink, ResumeRequest, RunRequest, SessionStore
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -1211,6 +1211,28 @@ def test_run_request_session_id_is_explicit_unique_session_id():
 
     assert request.session_id == "sess_existing"
     assert request.max_steps == 16
+
+
+def test_resume_request_requires_existing_session_id_and_new_messages():
+    request = ResumeRequest(
+        session_id="sess_existing",
+        messages=[Message.text("user", "continue")],
+        metadata={"source": "test"},
+    )
+
+    assert request.session_id == "sess_existing"
+    assert request.messages[0].content[0].text == "continue"
+    assert request.metadata == {"source": "test"}
+    assert request.max_steps == 16
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        ResumeRequest(
+            session_id=" ",
+            messages=[Message.text("user", "continue")],
+        )
+
+    with pytest.raises(ValidationError, match="cannot be empty"):
+        ResumeRequest(session_id="sess_existing", messages=[])
 
 
 def test_run_request_rejects_coerced_max_steps():

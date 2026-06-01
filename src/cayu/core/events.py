@@ -15,6 +15,7 @@ _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)
 
 class EventType(StrEnum):
     SESSION_STARTED = "session.started"
+    SESSION_RESUMED = "session.resumed"
     SESSION_COMPLETED = "session.completed"
     SESSION_FAILED = "session.failed"
     SESSION_CHECKPOINTED = "session.checkpointed"
