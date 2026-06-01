@@ -19,7 +19,14 @@ from cayu.runners import (
     ExecResult,
     LocalRunner,
 )
-from cayu.runtime import CayuApp, RunRequest
+from cayu.runtime import (
+    CayuApp,
+    EventQuery,
+    EventRecord,
+    RunRequest,
+    SessionOrder,
+    SessionQuery,
+)
 from cayu.storage import SQLiteSessionStore
 from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
@@ -34,6 +41,8 @@ __all__ = [
     "ExecCommand",
     "ExecResult",
     "Event",
+    "EventQuery",
+    "EventRecord",
     "EventType",
     "ExecCommandTool",
     "AnthropicProvider",
@@ -52,6 +61,8 @@ __all__ = [
     "ToolSpec",
     "WriteFileTool",
     "RunRequest",
+    "SessionOrder",
+    "SessionQuery",
     "SQLiteSessionStore",
     "Workflow",
     "WorkflowSpec",

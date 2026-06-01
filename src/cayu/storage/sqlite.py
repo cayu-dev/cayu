@@ -10,11 +10,17 @@ from typing import Any
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.events import Event, copy_event
 from cayu.runtime.sessions import (
+    EventQuery,
+    EventRecord,
     RunRequest,
     Session,
+    SessionOrder,
+    SessionQuery,
     SessionStatus,
     SessionStore,
+    copy_event_query,
     copy_run_request,
+    copy_session_query,
 )
 
 
@@ -113,20 +119,37 @@ class SQLiteSessionStore(SessionStore):
             return loaded
 
     async def append_event(self, session_id: str, event: Event) -> None:
+        await self.append_events(session_id, [event])
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
         session_id = require_nonblank(session_id, "session_id")
-        if type(event) is not Event:
-            raise TypeError("Session events must be Event instances.")
-        event = copy_event(event)
-        if event.session_id != session_id:
-            raise ValueError("Event session_id does not match target session.")
+        if type(events) is not list:
+            raise TypeError("Session events must be a list.")
+
+        copied_events: list[Event] = []
+        seen_event_ids: set[str] = set()
+        for event in events:
+            if type(event) is not Event:
+                raise TypeError("Session events must be Event instances.")
+            copied_event = copy_event(event)
+            if copied_event.session_id != session_id:
+                raise ValueError("Event session_id does not match target session.")
+            if copied_event.id in seen_event_ids:
+                raise ValueError(
+                    f"Event already exists for session {session_id}: {copied_event.id}"
+                )
+            seen_event_ids.add(copied_event.id)
+            copied_events.append(copied_event)
 
         async with self._lock:
             if not self._session_exists_unlocked(session_id):
                 raise KeyError(f"Session not found: {session_id}")
+            if not copied_events:
+                return
 
             try:
                 with self._connection:
-                    self._connection.execute(
+                    self._connection.executemany(
                         """
                         INSERT INTO events (
                             session_id,
@@ -142,23 +165,31 @@ class SQLiteSessionStore(SessionStore):
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (
-                            session_id,
-                            event.id,
-                            str(event.type),
-                            _format_datetime(event.timestamp),
-                            event.agent_name,
-                            event.environment_name,
-                            event.workflow_name,
-                            event.tool_name,
-                            _json_dumps(event.payload),
-                            _json_dumps(event.model_dump(mode="json")),
-                        ),
+                        [
+                            (
+                                session_id,
+                                event.id,
+                                str(event.type),
+                                _format_datetime(event.timestamp),
+                                event.agent_name,
+                                event.environment_name,
+                                event.workflow_name,
+                                event.tool_name,
+                                _json_dumps(event.payload),
+                                _json_dumps(event.model_dump(mode="json")),
+                            )
+                            for event in copied_events
+                        ],
                     )
             except sqlite3.IntegrityError as exc:
-                if self._event_exists_unlocked(session_id, event.id):
+                existing_event_id = self._first_existing_event_id_unlocked(
+                    session_id,
+                    [event.id for event in copied_events],
+                )
+                if existing_event_id is not None:
                     raise ValueError(
-                        f"Event already exists for session {session_id}: {event.id}"
+                        "Event already exists for session "
+                        f"{session_id}: {existing_event_id}"
                     ) from exc
                 raise
 
@@ -177,6 +208,88 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             return [Event(**json.loads(row["event_json"])) for row in rows]
+
+    async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
+        query = copy_event_query(query)
+        clauses: list[str] = []
+        params: list[object] = []
+
+        if query.after_sequence is not None:
+            clauses.append("sequence > ?")
+            params.append(query.after_sequence)
+        if query.session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(query.session_id)
+        if query.event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(str(query.event_type))
+        if query.agent_name is not None:
+            clauses.append("agent_name = ?")
+            params.append(query.agent_name)
+        if query.environment_name is not None:
+            clauses.append("environment_name = ?")
+            params.append(query.environment_name)
+        if query.workflow_name is not None:
+            clauses.append("workflow_name = ?")
+            params.append(query.workflow_name)
+        if query.tool_name is not None:
+            clauses.append("tool_name = ?")
+            params.append(query.tool_name)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(query.limit)
+
+        async with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT sequence, event_json
+                FROM events
+                {where_sql}
+                ORDER BY sequence ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [
+                EventRecord(
+                    sequence=row["sequence"],
+                    event=Event(**json.loads(row["event_json"])),
+                )
+                for row in rows
+            ]
+
+    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+        query = copy_session_query(query)
+        clauses: list[str] = []
+        params: list[object] = []
+
+        if query.status is not None:
+            clauses.append("status = ?")
+            params.append(str(query.status))
+        if query.agent_name is not None:
+            clauses.append("agent_name = ?")
+            params.append(query.agent_name)
+        if query.environment_name is not None:
+            clauses.append("environment_name = ?")
+            params.append(query.environment_name)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = _session_order_sql(query.order_by)
+        params.extend([query.limit, query.offset])
+
+        async with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT id, agent_name, environment_name, status, created_at,
+                       updated_at, metadata_json
+                FROM sessions
+                {where_sql}
+                ORDER BY {order_sql}, id ASC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+            return [_session_from_row(row) for row in rows]
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_nonblank(session_id, "session_id")
@@ -280,6 +393,8 @@ class SQLiteSessionStore(SessionStore):
                     ON sessions(status);
                 CREATE INDEX IF NOT EXISTS idx_sessions_agent_name
                     ON sessions(agent_name);
+                CREATE INDEX IF NOT EXISTS idx_sessions_environment_name
+                    ON sessions(environment_name);
                 CREATE INDEX IF NOT EXISTS idx_events_session_sequence
                     ON events(session_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_events_type_timestamp
@@ -288,6 +403,8 @@ class SQLiteSessionStore(SessionStore):
                     ON events(agent_name);
                 CREATE INDEX IF NOT EXISTS idx_events_environment_name
                     ON events(environment_name);
+                CREATE INDEX IF NOT EXISTS idx_events_workflow_name
+                    ON events(workflow_name);
                 CREATE INDEX IF NOT EXISTS idx_events_tool_name
                     ON events(tool_name);
                 """
@@ -315,12 +432,19 @@ class SQLiteSessionStore(SessionStore):
         ).fetchone()
         return row is not None
 
-    def _event_exists_unlocked(self, session_id: str, event_id: str) -> bool:
-        row = self._connection.execute(
-            "SELECT 1 FROM events WHERE session_id = ? AND event_id = ?",
-            (session_id, event_id),
-        ).fetchone()
-        return row is not None
+    def _first_existing_event_id_unlocked(
+        self,
+        session_id: str,
+        event_ids: list[str],
+    ) -> str | None:
+        for event_id in event_ids:
+            row = self._connection.execute(
+                "SELECT 1 FROM events WHERE session_id = ? AND event_id = ?",
+                (session_id, event_id),
+            ).fetchone()
+            if row is not None:
+                return event_id
+        return None
 
 
 def _session_from_request(request: RunRequest) -> Session:
@@ -365,3 +489,13 @@ def _parse_datetime(value: str) -> datetime:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _session_order_sql(order_by: SessionOrder) -> str:
+    if order_by == SessionOrder.CREATED_AT_ASC:
+        return "created_at ASC"
+    if order_by == SessionOrder.CREATED_AT_DESC:
+        return "created_at DESC"
+    if order_by == SessionOrder.UPDATED_AT_ASC:
+        return "updated_at ASC"
+    return "updated_at DESC"

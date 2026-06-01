@@ -46,6 +46,13 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 JSONL can be added later as an export/debug format. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
 
+Session stores expose two read surfaces:
+
+- `load_events(session_id)` returns the full event list for one session.
+- `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
+
+Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Batched appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
+
 ## EventSink
 
 Receives events and forwards them somewhere:

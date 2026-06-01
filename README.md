@@ -85,9 +85,11 @@ Use durable local session/event storage:
 ```python
 from pathlib import Path
 
-from cayu import CayuApp, SQLiteSessionStore
+from cayu import CayuApp, EventQuery, SQLiteSessionStore
 
-app = CayuApp(
-    session_store=SQLiteSessionStore(Path(".cayu") / "sessions.sqlite"),
-)
+store = SQLiteSessionStore(Path(".cayu") / "sessions.sqlite")
+app = CayuApp(session_store=store)
+
+async def inspect_session(session_id: str):
+    return await store.query_events(EventQuery(session_id=session_id))
 ```
