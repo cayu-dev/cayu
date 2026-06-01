@@ -13,13 +13,13 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event stores, event sinks, model-provider contracts, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event stores, in-memory and SQLite task stores, event sinks, model-provider contracts, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
 
-It does not yet include dashboard UI, hosted deployment adapters, vector search, isolated runners, task orchestration, or streaming provider adapters.
+It does not yet include dashboard UI, hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
 ## Contract Rules
 
-Cayu treats payloads, metadata, tool arguments, tool results, model options, checkpoints, and event data as JSON data. These fields must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are rejected.
+Cayu treats payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data as JSON data. These fields must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are rejected. Task input, result, error, and metadata fields are top-level JSON objects with JSON-compatible nested values.
 
 Framework objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
@@ -34,7 +34,7 @@ src/cayu/
   runtime/     app runtime, sessions, event sinks
   runners/     command execution backends
   workspaces/  filesystem/artifact workspace contracts
-  storage/     session and memory storage contracts
+  storage/     storage contracts and SQLite implementations
   providers/   model provider contracts
   mcp/         MCP client/server integration contracts
   vaults/      secrets access contracts
@@ -92,4 +92,21 @@ app = CayuApp(session_store=store)
 
 async def inspect_session(session_id: str):
     return await store.query_events(EventQuery(session_id=session_id))
+```
+
+Use durable local task storage for optional background work tracking:
+
+```python
+from pathlib import Path
+
+from cayu import SQLiteTaskStore, TaskCreate
+
+tasks = SQLiteTaskStore(Path(".cayu") / "runtime.sqlite")
+task = await tasks.create_task(
+    TaskCreate(
+        type="process_invoice",
+        input={"invoice_id": "inv_123"},
+        assigned_agent_name="invoice_agent",
+    )
+)
 ```

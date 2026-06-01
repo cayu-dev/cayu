@@ -32,6 +32,13 @@ def copy_json_value(value: Any, field_name: str) -> Any:
     return _copy_json_value(value, field_name, set())
 
 
+def copy_json_object(value: Any, field_name: str) -> dict[str, Any]:
+    copied = copy_json_value(value, field_name)
+    if type(copied) is not dict:
+        raise ValueError(f"`{field_name}` must be a JSON object.")
+    return copied
+
+
 def validate_json_value(value: Any, field_name: str) -> None:
     _copy_json_value(value, field_name, set())
 

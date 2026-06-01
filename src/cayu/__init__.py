@@ -23,11 +23,18 @@ from cayu.runtime import (
     CayuApp,
     EventQuery,
     EventRecord,
+    InMemoryTaskStore,
     RunRequest,
     SessionOrder,
     SessionQuery,
+    Task,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
 )
-from cayu.storage import SQLiteSessionStore
+from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -46,6 +53,7 @@ __all__ = [
     "EventType",
     "ExecCommandTool",
     "AnthropicProvider",
+    "InMemoryTaskStore",
     "ListFilesTool",
     "LocalRunner",
     "LocalWorkspace",
@@ -64,6 +72,13 @@ __all__ = [
     "SessionOrder",
     "SessionQuery",
     "SQLiteSessionStore",
+    "SQLiteTaskStore",
+    "Task",
+    "TaskCreate",
+    "TaskOrder",
+    "TaskQuery",
+    "TaskStatus",
+    "TaskStore",
     "Workflow",
     "WorkflowSpec",
     "WorkspaceListResult",

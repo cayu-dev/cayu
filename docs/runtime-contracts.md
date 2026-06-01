@@ -6,7 +6,7 @@ This is a design/maintainer document for the current framework foundation. It na
 
 Framework boundary data should be portable across local processes, remote runners, hosted runtimes, event stores, dashboards, and replay tools.
 
-Payloads, metadata, tool arguments, tool results, model options, checkpoints, and event data are JSON data. They must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are not valid boundary data.
+Payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data are JSON data. They must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are not valid boundary data. Task input, result, error, and metadata fields are top-level JSON objects with JSON-compatible nested values.
 
 Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state.
 
@@ -52,6 +52,33 @@ Session stores expose two read surfaces:
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
 
 Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Batched appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
+
+## TaskStore
+
+Creates and updates optional durable units of work.
+
+A task is not a PM-specific object. It is a generic work item that can represent a webhook job, background agent run, workflow step, orchestrator assignment, coding task, invoice-processing job, report generation job, or external automation. Simple one-off agent calls do not need tasks; they can use only sessions and events.
+
+`Task` values have type, status, optional session/parent-task/assigned-agent identity, JSON-object input, optional JSON-object result/error, JSON-object metadata, and lifecycle timestamps. `TaskStore` exposes:
+
+- `create_task(TaskCreate(...))`
+- `load_task(task_id)`
+- `list_tasks(TaskQuery(...))`
+- `start_task(task_id, session_id=...)`
+- `complete_task(task_id, result)`
+- `fail_task(task_id, error)`
+- `cancel_task(task_id, error=...)`
+
+Valid task lifecycle is intentionally small for the foundation:
+
+```text
+pending -> running
+pending -> completed | failed | cancelled
+running -> completed | failed | cancelled
+terminal statuses do not transition
+```
+
+`InMemoryTaskStore` exists for tests and examples. `SQLiteTaskStore` is the durable local implementation.
 
 ## EventSink
 

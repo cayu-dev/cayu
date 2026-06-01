@@ -19,6 +19,12 @@ class EventType(StrEnum):
     SESSION_FAILED = "session.failed"
     SESSION_CHECKPOINTED = "session.checkpointed"
 
+    TASK_CREATED = "task.created"
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
+    TASK_CANCELLED = "task.cancelled"
+
     MODEL_STARTED = "model.started"
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_COMPLETED = "model.completed"

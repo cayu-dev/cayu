@@ -1,6 +1,12 @@
 """Storage contracts."""
 
 from cayu.storage.memory import KnowledgeHit, KnowledgeItem, KnowledgeStore
-from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
-__all__ = ["KnowledgeHit", "KnowledgeItem", "KnowledgeStore", "SQLiteSessionStore"]
+__all__ = [
+    "KnowledgeHit",
+    "KnowledgeItem",
+    "KnowledgeStore",
+    "SQLiteSessionStore",
+    "SQLiteTaskStore",
+]

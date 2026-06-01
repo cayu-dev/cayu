@@ -13,6 +13,15 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
 )
+from cayu.runtime.tasks import (
+    InMemoryTaskStore,
+    Task,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
+)
 
 __all__ = [
     "CayuApp",
@@ -29,4 +38,11 @@ __all__ = [
     "SessionQuery",
     "SessionStatus",
     "SessionStore",
+    "InMemoryTaskStore",
+    "Task",
+    "TaskCreate",
+    "TaskOrder",
+    "TaskQuery",
+    "TaskStatus",
+    "TaskStore",
 ]
