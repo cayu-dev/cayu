@@ -20,8 +20,11 @@ from cayu.runtime import (
     EventSink,
     InMemoryEventSink,
     InMemorySessionStore,
+    InMemoryTaskStore,
     RunRequest,
     SessionStatus,
+    TaskCreate,
+    TaskStatus,
 )
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -328,12 +331,18 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
     class StoreLike:
         pass
 
+    class TaskStoreLike:
+        pass
+
     class SinkLike:
         async def emit(self, event):
             pass
 
     with pytest.raises(TypeError, match="SessionStore"):
         CayuApp(session_store=StoreLike())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="TaskStore"):
+        CayuApp(task_store=TaskStoreLike())  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="EventSink"):
         CayuApp(event_sinks=[SinkLike()])  # type: ignore[list-item]
@@ -469,6 +478,208 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert persisted == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_links_successful_run_to_task():
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+
+    async def run_task_session() -> tuple[list[Event], object]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="task_runtime_success",
+                type="respond",
+                assigned_agent_name="assistant",
+            )
+        )
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_success",
+                task_id="task_runtime_success",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        task = await task_store.load_task("task_runtime_success")
+        return events, task
+
+    events, task = asyncio.run(run_task_session())
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.TASK_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.TASK_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert task.session_id == "sess_task_success"
+    assert task.result == {
+        "session_id": "sess_task_success",
+        "agent_name": "assistant",
+        "environment_name": None,
+    }
+    assert events[1].payload["task_id"] == "task_runtime_success"
+    assert events[1].payload["task_status"] == "running"
+    assert events[5].payload["task_status"] == "completed"
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_cayu_app_fails_task_when_run_fails():
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    provider = FakeProvider([ModelStreamEvent.error("provider down")])
+
+    async def run_task_session() -> tuple[list[Event], object, object]:
+        await task_store.create_task(
+            TaskCreate(task_id="task_runtime_failure", type="respond")
+        )
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_failure",
+                task_id="task_runtime_failure",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        task = await task_store.load_task("task_runtime_failure")
+        session = await session_store.load("sess_task_failure")
+        return events, task, session
+
+    events, task, session = asyncio.run(run_task_session())
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.TASK_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.TASK_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert task.session_id == "sess_task_failure"
+    assert task.error == {
+        "message": "provider down",
+        "type": "RuntimeError",
+        "session_id": "sess_task_failure",
+    }
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert events[-1].payload == {
+        "error": "provider down",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_cayu_app_fails_session_clearly_when_task_store_is_missing():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_missing_task_store",
+                task_id="task_without_store",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_missing_task_store"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[-1].payload == {
+        "error": "task_store is required when RunRequest.task_id is set.",
+        "error_type": "RuntimeError",
+    }
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert provider.requests == []
+
+
+def test_cayu_app_does_not_fail_task_it_could_not_start():
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+
+    async def run_task_session() -> tuple[list[Event], object]:
+        await task_store.create_task(
+            TaskCreate(task_id="task_claimed_elsewhere", type="respond")
+        )
+        await task_store.start_task(
+            "task_claimed_elsewhere",
+            session_id="other_session",
+        )
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_claim_conflict",
+                task_id="task_claimed_elsewhere",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        task = await task_store.load_task("task_claimed_elsewhere")
+        return events, task
+
+    events, task = asyncio.run(run_task_session())
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert task is not None
+    assert task.status == TaskStatus.RUNNING
+    assert task.session_id == "other_session"
+    assert events[-1].payload == {
+        "error": (
+            "Task task_claimed_elsewhere cannot transition to running "
+            "from running"
+        ),
+        "error_type": "ValueError",
+    }
+    assert provider.requests == []
 
 
 def test_cayu_app_uses_registered_provider_name_after_provider_mutation():

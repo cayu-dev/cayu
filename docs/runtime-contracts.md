@@ -38,7 +38,7 @@ Events power:
 
 Creates sessions, stores events, and checkpoints runtime state.
 
-`RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. Resume, replay, and idempotent continuation should be explicit APIs later, not implied by session creation.
+`RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Resume, replay, and idempotent continuation should be explicit APIs later, not implied by session creation.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime may use the default registered environment; if no environment is registered, simple runs can still execute without one.
 Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and normalizes provider events before emitting them.
 
@@ -79,6 +79,8 @@ terminal statuses do not transition
 ```
 
 `InMemoryTaskStore` exists for tests and examples. `SQLiteTaskStore` is the durable local implementation.
+
+`CayuApp(task_store=...)` can link an agent run to an existing task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and then marks the task completed or failed before emitting the terminal session event. This is a task/session bridge, not a queue worker, retry engine, workflow engine, or agent communication table.
 
 ## EventSink
 

@@ -29,6 +29,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     copy_run_request,
 )
+from cayu.runtime.tasks import Task, TaskStore
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,13 @@ class CayuApp:
         self,
         *,
         session_store: SessionStore | None = None,
+        task_store: TaskStore | None = None,
         event_sinks: Iterable[EventSink] | None = None,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
+        if task_store is not None and not isinstance(task_store, TaskStore):
+            raise TypeError("task_store must be a TaskStore.")
         if event_sinks is None:
             sinks = []
         else:
@@ -96,6 +100,7 @@ class CayuApp:
         self.session_store = (
             session_store if session_store is not None else InMemorySessionStore()
         )
+        self.task_store = task_store
         self._event_sinks = sinks
         self._agents: dict[str, RegisteredAgent] = {}
         self._providers: dict[str, RegisteredProvider] = {}
@@ -274,6 +279,8 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         provider = registered_provider.provider
         environment_name = _environment_name(registered_environment)
+        task_started = False
+        task_finished = False
         try:
             yield await self._emit(
                 Event(
@@ -284,6 +291,18 @@ class CayuApp:
                     payload={"agent_name": registered_agent.spec.name},
                 )
             )
+            if request.task_id is not None:
+                task = await self._start_task(task_id=request.task_id, session=session)
+                task_started = True
+                yield await self._emit(
+                    _task_event(
+                        event_type=EventType.TASK_STARTED,
+                        task=task,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                )
             messages = _initial_messages(
                 system_prompt=registered_agent.spec.system_prompt,
                 request_messages=request.messages,
@@ -397,6 +416,23 @@ class CayuApp:
             else:
                 raise RuntimeError(f"Maximum model steps exceeded: {request.max_steps}")
 
+            if request.task_id is not None:
+                task = await self._complete_task(
+                    task_id=request.task_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+                task_finished = True
+                yield await self._emit(
+                    _task_event(
+                        event_type=EventType.TASK_COMPLETED,
+                        task=task,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                )
             await self.session_store.update_status(session.id, SessionStatus.COMPLETED)
             yield await self._emit(
                 Event(
@@ -407,19 +443,79 @@ class CayuApp:
                 )
             )
         except Exception as exc:
+            task_failure_error: Exception | None = None
+            if (
+                task_started
+                and not task_finished
+                and request.task_id is not None
+                and self.task_store is not None
+            ):
+                try:
+                    task = await self.task_store.fail_task(
+                        request.task_id,
+                        {
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "session_id": session.id,
+                        },
+                    )
+                    yield await self._emit(
+                        _task_event(
+                            event_type=EventType.TASK_FAILED,
+                            task=task,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    )
+                except Exception as task_exc:
+                    task_failure_error = task_exc
             await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            payload: dict[str, Any] = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            if task_failure_error is not None:
+                payload["task_update_error"] = str(task_failure_error)
+                payload["task_update_error_type"] = type(task_failure_error).__name__
             yield await self._emit(
                 Event(
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    payload={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    },
+                    payload=payload,
                 )
             )
+
+    async def _start_task(
+        self,
+        *,
+        task_id: str,
+        session: Session,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        return await self.task_store.start_task(task_id, session_id=session.id)
+
+    async def _complete_task(
+        self,
+        *,
+        task_id: str,
+        session: Session,
+        registered_agent: RegisteredAgent,
+        registered_environment: RegisteredEnvironment | None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        return await self.task_store.complete_task(
+            task_id,
+            {
+                "session_id": session.id,
+                "agent_name": registered_agent.spec.name,
+                "environment_name": _environment_name(registered_environment),
+            },
+        )
 
     async def _execute_tool_call(
         self,
@@ -612,6 +708,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         agent_name=request.agent_name,
         messages=[message.model_copy(deep=True) for message in request.messages],
         session_id=request.session_id,
+        task_id=request.task_id,
         environment_name=environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
@@ -639,6 +736,30 @@ def _with_event_environment(event: Event, environment_name: str | None) -> Event
         workflow_name=event.workflow_name,
         tool_name=event.tool_name,
         payload=copy_json_value(event.payload, "payload"),
+    )
+
+
+def _task_event(
+    *,
+    event_type: EventType,
+    task: Task,
+    session: Session,
+    registered_agent: RegisteredAgent,
+    registered_environment: RegisteredEnvironment | None,
+) -> Event:
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload={
+            "task_id": task.id,
+            "task_type": task.type,
+            "task_status": task.status.value,
+            "task_session_id": task.session_id,
+            "assigned_agent_name": task.assigned_agent_name,
+            "parent_task_id": task.parent_task_id,
+        },
     )
 
 

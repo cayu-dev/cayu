@@ -678,6 +678,13 @@ def test_runtime_identity_models_reject_blank_fields():
     with pytest.raises(ValidationError, match="cannot be blank"):
         RunRequest(
             agent_name="assistant",
+            task_id=" ",
+            messages=[Message.text("user", "start")],
+        )
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        RunRequest(
+            agent_name="assistant",
             environment_name=" ",
             messages=[Message.text("user", "start")],
         )

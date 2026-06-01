@@ -110,3 +110,19 @@ task = await tasks.create_task(
     )
 )
 ```
+
+Link a run to an existing task when runtime status should follow the session:
+
+```python
+from cayu import CayuApp, Message, RunRequest
+
+app = CayuApp(session_store=store, task_store=tasks)
+request = RunRequest(
+    agent_name="invoice_agent",
+    task_id=task.id,
+    messages=[Message.text("user", "Process this invoice.")],
+)
+
+async for event in app.run(request):
+    print(event.type)
+```

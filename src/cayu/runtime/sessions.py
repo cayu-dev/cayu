@@ -30,6 +30,7 @@ class RunRequest(BaseModel):
     messages: list[Message]
     # Optional caller-provided id for a new session. It must be unique.
     session_id: str | None = None
+    task_id: str | None = None
     environment_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
@@ -49,16 +50,9 @@ class RunRequest(BaseModel):
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("session_id")
+    @field_validator("session_id", "task_id", "environment_name")
     @classmethod
-    def validate_nonblank_session_id(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return require_nonblank(value, info.field_name)
-
-    @field_validator("environment_name")
-    @classmethod
-    def validate_nonblank_environment_name(
+    def validate_optional_nonblank_strings(
         cls,
         value: str | None,
         info,
@@ -403,6 +397,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         agent_name=request.agent_name,
         messages=[copy_message(message) for message in messages],
         session_id=request.session_id,
+        task_id=request.task_id,
         environment_name=request.environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
