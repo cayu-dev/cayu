@@ -20,6 +20,12 @@ from cayu.providers import (
     ModelStreamEventType,
     copy_model_stream_event,
 )
+from cayu.runtime.context import (
+    ContextPolicy,
+    ContextRequest,
+    DefaultContextPolicy,
+    copy_context_messages,
+)
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
     InMemorySessionStore,
@@ -36,6 +42,13 @@ from cayu.runtime.tasks import Task, TaskStore
 class RegisteredAgent:
     spec: AgentSpec
     tools: Mapping[str, "RegisteredTool"]
+
+
+@dataclass(frozen=True)
+class _RegisteredAgentState:
+    spec: AgentSpec
+    tools: Mapping[str, "RegisteredTool"]
+    context_policy: ContextPolicy
 
 
 @dataclass(frozen=True)
@@ -102,7 +115,7 @@ class CayuApp:
         )
         self.task_store = task_store
         self._event_sinks = sinks
-        self._agents: dict[str, RegisteredAgent] = {}
+        self._agents: dict[str, _RegisteredAgentState] = {}
         self._providers: dict[str, RegisteredProvider] = {}
         self._environments: dict[str, RegisteredEnvironment] = {}
         self._default_provider_name: str | None = None
@@ -113,12 +126,19 @@ class CayuApp:
         spec: AgentSpec,
         *,
         tools: Iterable[Tool] | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
         stored_spec = _validate_agent_spec(spec)
         if stored_spec.name in self._agents:
             raise ValueError(f"Agent already registered: {stored_spec.name}")
+        if context_policy is None:
+            stored_context_policy = DefaultContextPolicy()
+        elif isinstance(context_policy, ContextPolicy):
+            stored_context_policy = context_policy
+        else:
+            raise TypeError("context_policy must be a ContextPolicy.")
 
         if tools is None:
             agent_tools = []
@@ -141,9 +161,10 @@ class CayuApp:
                 )
             tools_by_name[registered_tool.name] = registered_tool
 
-        self._agents[stored_spec.name] = RegisteredAgent(
+        self._agents[stored_spec.name] = _RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
+            context_policy=stored_context_policy,
         )
         return spec
 
@@ -194,10 +215,7 @@ class CayuApp:
 
     def get_agent(self, name: str) -> RegisteredAgent:
         agent_name = require_nonblank(name, "agent.name")
-        try:
-            registered_agent = self._agents[agent_name]
-        except KeyError as exc:
-            raise KeyError(f"Agent not registered: {agent_name}") from exc
+        registered_agent = self._get_registered_agent(agent_name)
         return RegisteredAgent(
             spec=registered_agent.spec.model_copy(deep=True),
             tools={
@@ -205,6 +223,13 @@ class CayuApp:
                 for name, tool in registered_agent.tools.items()
             },
         )
+
+    def _get_registered_agent(self, name: str) -> _RegisteredAgentState:
+        agent_name = require_nonblank(name, "agent.name")
+        try:
+            return self._agents[agent_name]
+        except KeyError as exc:
+            raise KeyError(f"Agent not registered: {agent_name}") from exc
 
     def get_provider(self, name: str | None = None) -> ModelProvider:
         return self._get_registered_provider(name).provider
@@ -249,7 +274,7 @@ class CayuApp:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
-        registered_agent = self.get_agent(request.agent_name)
+        registered_agent = self._get_registered_agent(request.agent_name)
         registered_provider = self._get_registered_provider()
         registered_environment = self._get_registered_environment(
             request.environment_name
@@ -273,7 +298,7 @@ class CayuApp:
         *,
         session: Session,
         request: RunRequest,
-        registered_agent: RegisteredAgent,
+        registered_agent: _RegisteredAgentState,
         registered_provider: RegisteredProvider,
         registered_environment: RegisteredEnvironment | None,
     ) -> AsyncIterator[Event]:
@@ -309,25 +334,19 @@ class CayuApp:
             )
             await self.session_store.append_transcript_messages(session.id, messages)
             for step in range(1, request.max_steps + 1):
-                yield await self._emit(
-                    Event(
-                        type=EventType.MODEL_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        payload={
-                            "model": registered_agent.spec.model,
-                            "provider": registered_provider.name,
-                            "step": step,
-                        },
-                        environment_name=environment_name,
-                    )
+                context_messages = await _build_context_messages(
+                    context_policy=registered_agent.context_policy,
+                    session=session,
+                    registered_agent=registered_agent,
+                    messages=messages,
+                    step=step,
+                    environment_name=environment_name,
+                    request_metadata=request.metadata,
                 )
 
                 model_request = ModelRequest(
                     model=registered_agent.spec.model,
-                    messages=[
-                        message.model_copy(deep=True) for message in messages
-                    ],
+                    messages=context_messages,
                     tools=[
                         {
                             "name": tool.name,
@@ -345,6 +364,20 @@ class CayuApp:
                         ),
                         "step": step,
                     },
+                )
+
+                yield await self._emit(
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        payload={
+                            "model": registered_agent.spec.model,
+                            "provider": registered_provider.name,
+                            "step": step,
+                        },
+                        environment_name=environment_name,
+                    )
                 )
 
                 assistant_text: list[str] = []
@@ -513,7 +546,7 @@ class CayuApp:
         *,
         task_id: str,
         session: Session,
-        registered_agent: RegisteredAgent,
+        registered_agent: _RegisteredAgentState,
         registered_environment: RegisteredEnvironment | None,
     ) -> Task:
         if self.task_store is None:
@@ -531,7 +564,7 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: RegisteredAgent,
+        registered_agent: _RegisteredAgentState,
         registered_environment: RegisteredEnvironment | None,
         tool_call: ToolCallRequest,
     ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
@@ -713,6 +746,28 @@ def _validate_run_request(request: RunRequest) -> RunRequest:
     return copy_run_request(request)
 
 
+async def _build_context_messages(
+    *,
+    context_policy: ContextPolicy,
+    session: Session,
+    registered_agent: _RegisteredAgentState,
+    messages: list[Message],
+    step: int,
+    environment_name: str | None,
+    request_metadata: dict[str, Any],
+) -> list[Message]:
+    request = ContextRequest(
+        session=session.model_copy(deep=True),
+        agent=registered_agent.spec.model_copy(deep=True),
+        messages=[message.model_copy(deep=True) for message in messages],
+        step=step,
+        environment_name=environment_name,
+        metadata=copy_json_value(request_metadata, "metadata"),
+    )
+    result = await context_policy.build(request)
+    return copy_context_messages(result)
+
+
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
     return RunRequest(
         agent_name=request.agent_name,
@@ -754,7 +809,7 @@ def _task_event(
     event_type: EventType,
     task: Task,
     session: Session,
-    registered_agent: RegisteredAgent,
+    registered_agent: _RegisteredAgentState,
     registered_environment: RegisteredEnvironment | None,
 ) -> Event:
     return Event(

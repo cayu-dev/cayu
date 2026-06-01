@@ -100,4 +100,6 @@ optional vector search later
 
 The local durable session store is `SQLiteSessionStore`. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. It also stores the provider-neutral transcript messages needed for future resume and compaction APIs. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.
 
+Context policies are runtime projections over transcript messages, not storage. They let applications customize the model-facing conversation history by trimming, compacting, replacing bulky tool results, or injecting retrieved context while preserving the raw durable transcript for audit, debugging, resume, and future compaction.
+
 Tasks are optional durable work items, not a required execution model. A simple agent can run with only sessions and events. A background job, orchestrated multi-agent app, webhook processor, or dashboard-visible queue can use `TaskStore` to track work status, inputs, outputs, errors, ownership, and parent/child relationships. `SQLiteTaskStore` is the local durable task implementation.

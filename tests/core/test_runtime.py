@@ -17,6 +17,8 @@ from cayu.providers import (
 )
 from cayu.runtime import (
     CayuApp,
+    ContextPolicy,
+    ContextRequest,
     EventSink,
     InMemoryEventSink,
     InMemorySessionStore,
@@ -25,6 +27,8 @@ from cayu.runtime import (
     SessionStatus,
     TaskCreate,
     TaskStatus,
+    trim_context_messages,
+    trim_context_turns,
 )
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -881,6 +885,396 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert transcript[1].content[0].type == "tool_call"
     assert transcript[2].content[0].type == "tool_result"
     assert transcript[3].content[0].text == "done"
+
+
+def test_cayu_app_context_policy_can_trim_model_facing_messages():
+    class LastMessagePolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.seen: list[ContextRequest] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.seen.append(request)
+            request.messages[0].content[0].text = "mutated inside policy"
+            return [request.messages[-1]]
+
+    policy = LastMessagePolicy()
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("trimmed"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_trim_context",
+                messages=[
+                    Message.text("user", "old context"),
+                    Message.text("user", "current request"),
+                ],
+                metadata={"source": "test"},
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(policy.seen) == 1
+    assert policy.seen[0].session.id == "sess_trim_context"
+    assert policy.seen[0].agent.name == "assistant"
+    assert policy.seen[0].step == 1
+    assert policy.seen[0].metadata == {"source": "test"}
+    assert [message.content[0].text for message in provider.requests[0].messages] == [
+        "current request"
+    ]
+
+    transcript = asyncio.run(store.load_transcript("sess_trim_context"))
+    assert [message.content[0].text for message in transcript] == [
+        "old context",
+        "current request",
+        "trimmed",
+    ]
+
+
+def test_cayu_app_context_policy_can_replace_tool_results_for_model_only():
+    class CompactToolResultPolicy(ContextPolicy):
+        async def build(self, request: ContextRequest) -> list[Message]:
+            compacted: list[Message] = []
+            for message in request.messages:
+                if message.role == "tool":
+                    compacted.append(
+                        Message.tool_result(
+                            tool_call_id=message.content[0].tool_call_id,
+                            tool_name=message.content[0].tool_name,
+                            content="[tool result compacted]",
+                            structured={"compacted": True},
+                        )
+                    )
+                else:
+                    compacted.append(message)
+            return compacted
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "large tool output"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        context_policy=CompactToolResultPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact_tool_result",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    provider_tool_result = provider.requests[1].messages[-1].content[0]
+    assert provider_tool_result.content == "[tool result compacted]"
+    assert provider_tool_result.structured == {"compacted": True}
+
+    transcript = asyncio.run(store.load_transcript("sess_compact_tool_result"))
+    stored_tool_result = transcript[2].content[0]
+    assert stored_tool_result.content == "large tool output"
+    assert stored_tool_result.structured == {
+        "agent": "assistant",
+        "echoed": "large tool output",
+    }
+
+
+def test_cayu_app_fails_cleanly_when_context_policy_returns_invalid_output():
+    class BadPolicy(ContextPolicy):
+        async def build(self, request: ContextRequest):
+            return tuple(request.messages)
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("should not run"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=BadPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_bad_context_policy",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert provider.requests == []
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert (
+        events[-1].payload["error"]
+        == "ContextPolicy.build() must return a list of Message instances."
+    )
+    transcript = asyncio.run(store.load_transcript("sess_bad_context_policy"))
+    assert [message.content[0].text for message in transcript] == ["hi"]
+
+
+def test_cayu_app_rejects_context_policy_that_cuts_through_tool_round():
+    class OrphanToolResultPolicy(ContextPolicy):
+        async def build(self, request: ContextRequest) -> list[Message]:
+            return [request.messages[-1]]
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "large tool output"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        context_policy=OrphanToolResultPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_orphan_tool_result",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    assert "tool results without preceding assistant tool calls" in events[-1].payload[
+        "error"
+    ]
+
+
+def test_trim_context_messages_preserves_complete_tool_rounds():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "old"),
+        Message.tool_call(
+            tool_call_id="call_1",
+            tool_name="echo",
+            arguments={"text": "value"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_1",
+            tool_name="echo",
+            content="value",
+        ),
+        Message.text("assistant", "done"),
+    ]
+
+    trimmed = trim_context_messages(messages, max_messages=2)
+
+    assert [message.role for message in trimmed] == ["system", "assistant"]
+    assert trimmed[0].content[0].text == "You are careful."
+    assert trimmed[1].content[0].text == "done"
+
+
+def test_trim_context_turns_keeps_last_user_turns_with_tool_rounds():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "old one"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "old two"),
+        Message.tool_call(
+            tool_call_id="call_old",
+            tool_name="echo",
+            arguments={"text": "old"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_old",
+            tool_name="echo",
+            content="old",
+        ),
+        Message.text("assistant", "old tool answer"),
+        Message.text("user", "current one"),
+        Message.tool_call(
+            tool_call_id="call_current",
+            tool_name="echo",
+            arguments={"text": "current"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_current",
+            tool_name="echo",
+            content="current",
+        ),
+        Message.text("assistant", "current answer"),
+    ]
+
+    trimmed = trim_context_turns(messages, max_user_turns=1)
+
+    assert [message.role for message in trimmed] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert trimmed[0].content[0].text == "You are careful."
+    assert trimmed[1].content[0].text == "current one"
+    assert trimmed[2].content[0].tool_call_id == "call_current"
+    assert trimmed[3].content[0].tool_call_id == "call_current"
+    assert trimmed[4].content[0].text == "current answer"
+
+
+def test_trim_context_turns_keeps_all_messages_when_there_are_no_user_turns():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("assistant", "hello"),
+    ]
+
+    trimmed = trim_context_turns(messages, max_user_turns=1)
+
+    assert [message.content[0].text for message in trimmed] == [
+        "You are careful.",
+        "hello",
+    ]
+
+
+def test_trim_context_turns_can_drop_system_messages_when_requested():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "old"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current"),
+        Message.text("assistant", "current answer"),
+    ]
+
+    trimmed = trim_context_turns(
+        messages,
+        max_user_turns=1,
+        preserve_system=False,
+    )
+
+    assert [message.role for message in trimmed] == ["user", "assistant"]
+    assert [message.content[0].text for message in trimmed] == [
+        "current",
+        "current answer",
+    ]
+
+
+def test_trim_context_turns_can_drop_system_messages_without_trimming_turns():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "current"),
+        Message.text("assistant", "current answer"),
+    ]
+
+    trimmed = trim_context_turns(
+        messages,
+        max_user_turns=10,
+        preserve_system=False,
+    )
+
+    assert [message.role for message in trimmed] == ["user", "assistant"]
+    assert [message.content[0].text for message in trimmed] == [
+        "current",
+        "current answer",
+    ]
+
+
+def test_trim_context_messages_can_drop_system_messages_without_trimming():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "current"),
+    ]
+
+    trimmed = trim_context_messages(
+        messages,
+        max_messages=10,
+        preserve_system=False,
+    )
+
+    assert [message.role for message in trimmed] == ["user"]
+    assert trimmed[0].content[0].text == "current"
+
+
+def test_trim_context_messages_uses_limit_after_dropping_system_messages():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("system", "Use concise answers."),
+        Message.text("user", "old"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current"),
+    ]
+
+    trimmed = trim_context_messages(
+        messages,
+        max_messages=3,
+        preserve_system=False,
+    )
+
+    assert [message.role for message in trimmed] == ["user", "assistant", "user"]
+    assert [message.content[0].text for message in trimmed] == [
+        "old",
+        "old answer",
+        "current",
+    ]
 
 
 def test_cayu_app_sends_agent_system_prompt_as_first_message():
@@ -2614,6 +3008,12 @@ def test_cayu_app_rejects_invalid_agent_registration_inputs():
             tools="",  # type: ignore[arg-type]
         )
 
+    with pytest.raises(TypeError, match="context_policy"):
+        app.register_agent(
+            AgentSpec(name="bad_context_policy", model="fake-model"),
+            context_policy=object(),  # type: ignore[arg-type]
+        )
+
 
 def test_cayu_app_rejects_blank_agent_lookup_name():
     app = CayuApp()
@@ -3041,17 +3441,22 @@ def test_environment_rejects_invalid_bound_services():
 
 
 def test_cayu_app_isolates_registered_agent_state():
+    class MarkerPolicy(ContextPolicy):
+        async def build(self, request: ContextRequest) -> list[Message]:
+            return request.messages
+
     app = CayuApp()
     spec = AgentSpec(name="assistant", model="fake-model")
     tool = EchoTool()
 
-    app.register_agent(spec, tools=[tool])
+    app.register_agent(spec, tools=[tool], context_policy=MarkerPolicy())
     spec.model = "mutated"
 
     registered = app.get_agent("assistant")
     registered.tools["other"] = tool
 
     assert registered.spec.model == "fake-model"
+    assert not hasattr(registered, "context_policy")
     assert app.get_agent("assistant").tools.keys() == {"echo"}
 
 

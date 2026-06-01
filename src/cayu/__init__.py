@@ -21,6 +21,9 @@ from cayu.runners import (
 )
 from cayu.runtime import (
     CayuApp,
+    ContextPolicy,
+    ContextRequest,
+    DefaultContextPolicy,
     EventQuery,
     EventRecord,
     InMemoryTaskStore,
@@ -33,6 +36,8 @@ from cayu.runtime import (
     TaskQuery,
     TaskStatus,
     TaskStore,
+    trim_context_messages,
+    trim_context_turns,
 )
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tools import ExecCommandTool, ListFilesTool, ReadFileTool, WriteFileTool
@@ -42,7 +47,10 @@ __all__ = [
     "Agent",
     "AgentSpec",
     "CayuApp",
+    "ContextPolicy",
+    "ContextRequest",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
+    "DefaultContextPolicy",
     "Environment",
     "EnvironmentSpec",
     "ExecCommand",
@@ -79,6 +87,8 @@ __all__ = [
     "TaskQuery",
     "TaskStatus",
     "TaskStore",
+    "trim_context_messages",
+    "trim_context_turns",
     "Workflow",
     "WorkflowSpec",
     "WorkspaceListResult",

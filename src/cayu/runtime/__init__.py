@@ -2,6 +2,13 @@
 
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
+from cayu.runtime.context import (
+    ContextPolicy,
+    ContextRequest,
+    DefaultContextPolicy,
+    trim_context_messages,
+    trim_context_turns,
+)
 from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
@@ -25,6 +32,9 @@ from cayu.runtime.tasks import (
 
 __all__ = [
     "CayuApp",
+    "ContextPolicy",
+    "ContextRequest",
+    "DefaultContextPolicy",
     "EventSink",
     "EventQuery",
     "EventRecord",
@@ -45,4 +55,6 @@ __all__ = [
     "TaskQuery",
     "TaskStatus",
     "TaskStore",
+    "trim_context_messages",
+    "trim_context_turns",
 ]
