@@ -75,11 +75,29 @@ class ToolResultPart(BaseModel):
         return _require_nonblank(info.field_name, value)
 
 
+class ProviderStatePart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["provider_state"] = "provider_state"
+    provider: str
+    state: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        return _require_nonblank("provider", value)
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def copy_state(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "state")
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: MessageRole
-    content: list[TextPart | ToolCallPart | ToolResultPart] = Field(
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = Field(
         default_factory=list
     )
 
@@ -95,7 +113,13 @@ class Message(BaseModel):
         if self.role in {MessageRole.USER, MessageRole.SYSTEM}:
             _require_parts(self.role, self.content, TextPart)
         elif self.role == MessageRole.ASSISTANT:
-            _require_parts(self.role, self.content, TextPart, ToolCallPart)
+            _require_parts(
+                self.role,
+                self.content,
+                TextPart,
+                ToolCallPart,
+                ProviderStatePart,
+            )
         elif self.role == MessageRole.TOOL:
             _require_parts(self.role, self.content, ToolResultPart)
         return self
@@ -189,8 +213,13 @@ class Message(BaseModel):
 
 def _require_parts(
     role: MessageRole,
-    content: list[TextPart | ToolCallPart | ToolResultPart],
-    *allowed_types: type[TextPart] | type[ToolCallPart] | type[ToolResultPart],
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart],
+    *allowed_types: (
+        type[TextPart]
+        | type[ToolCallPart]
+        | type[ToolResultPart]
+        | type[ProviderStatePart]
+    ),
 ) -> None:
     invalid_parts = [
         part.type for part in content if not isinstance(part, allowed_types)
@@ -222,8 +251,8 @@ def copy_message(message: Message) -> Message:
 
 
 def copy_message_part(
-    part: TextPart | ToolCallPart | ToolResultPart,
-) -> TextPart | ToolCallPart | ToolResultPart:
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart:
     if type(part) is TextPart:
         return TextPart(text=part.text)
     if type(part) is ToolCallPart:
@@ -240,6 +269,11 @@ def copy_message_part(
             structured=copy_json_value(part.structured, "structured"),
             artifacts=copy_json_value(part.artifacts, "artifacts"),
             is_error=part.is_error,
+        )
+    if type(part) is ProviderStatePart:
+        return ProviderStatePart(
+            provider=part.provider,
+            state=copy_json_value(part.state, "state"),
         )
     raise TypeError("Message content must contain supported message parts.")
 

@@ -14,6 +14,7 @@ from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.messages import (
     Message,
     MessageRole,
+    ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -319,12 +320,16 @@ def _anthropic_message(message: Message) -> dict[str, Any] | None:
             "content": [_text_block(part) for part in message.content],
         }
     if message.role == MessageRole.ASSISTANT:
+        content = [
+            _assistant_block(part)
+            for part in message.content
+            if type(part) is not ProviderStatePart
+        ]
+        if not content:
+            return None
         return {
             "role": "assistant",
-            "content": [
-                _assistant_block(part)
-                for part in message.content
-            ],
+            "content": content,
         }
     if message.role == MessageRole.TOOL:
         return {
@@ -337,13 +342,17 @@ def _anthropic_message(message: Message) -> dict[str, Any] | None:
     raise AnthropicProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
-def _text_block(part: TextPart | ToolCallPart | ToolResultPart) -> dict[str, str]:
+def _text_block(
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+) -> dict[str, str]:
     if type(part) is not TextPart:
         raise AnthropicProtocolError("User messages can only contain text blocks.")
     return {"type": "text", "text": part.text}
 
 
-def _assistant_block(part: TextPart | ToolCallPart | ToolResultPart) -> dict[str, Any]:
+def _assistant_block(
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+) -> dict[str, Any]:
     if type(part) is TextPart:
         return {"type": "text", "text": part.text}
     if type(part) is ToolCallPart:
@@ -359,7 +368,7 @@ def _assistant_block(part: TextPart | ToolCallPart | ToolResultPart) -> dict[str
 
 
 def _tool_result_block(
-    part: TextPart | ToolCallPart | ToolResultPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise AnthropicProtocolError("Tool messages can only contain tool_result blocks.")

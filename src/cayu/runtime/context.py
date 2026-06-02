@@ -9,7 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
-from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart, ToolResultPart, copy_message
+from cayu.core.messages import (
+    Message,
+    MessageRole,
+    ProviderStatePart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+    copy_message,
+)
 from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
@@ -405,7 +413,7 @@ class ModelCompactor(ContextCompactor):
                 "model": self.model,
                 "input_truncated": input_truncated,
                 "max_input_chars": self.max_input_chars,
-                "completed": copy_json_value(completed_payload, "completed"),
+                "completed": _provider_completed_metadata(completed_payload),
             },
         )
 
@@ -781,7 +789,9 @@ def _messages_digest(messages: list[Message]) -> str:
     return "\n".join(lines)
 
 
-def _message_part_digest(part: TextPart | ToolCallPart | ToolResultPart) -> str:
+def _message_part_digest(
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+) -> str:
     if type(part) is TextPart:
         return part.text
     if type(part) is ToolCallPart:
@@ -794,7 +804,17 @@ def _message_part_digest(part: TextPart | ToolCallPart | ToolResultPart) -> str:
             f"[tool_result id={part.tool_call_id} name={part.tool_name} "
             f"error={part.is_error} content={part.content}]"
         )
+    if type(part) is ProviderStatePart:
+        return f"[provider_state provider={part.provider}]"
     raise TypeError("Unsupported message part.")
+
+
+def _provider_completed_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    copied = copy_json_value(payload, "completed")
+    if type(copied) is not dict:
+        raise ValueError("Provider completed payload must be an object.")
+    copied.pop("provider_state", None)
+    return copied
 
 
 def default_compaction_prompt(

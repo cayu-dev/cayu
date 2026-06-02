@@ -10,7 +10,13 @@ from uuid import uuid4
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
+from cayu.core.messages import (
+    Message,
+    ProviderStatePart,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
 from cayu.providers import (
@@ -514,6 +520,7 @@ class CayuApp:
 
                 assistant_text: list[str] = []
                 tool_calls: list[ToolCallRequest] = []
+                provider_state_parts: list[ProviderStatePart] = []
                 model_completed = False
                 async for raw_stream_event in provider.stream(model_request):
                     stream_event = _validate_stream_event(raw_stream_event)
@@ -531,6 +538,9 @@ class CayuApp:
                         assistant_text.append(stream_event.delta)
                     elif stream_event.type == ModelStreamEventType.COMPLETED:
                         model_completed = True
+                        provider_state_parts = _provider_state_parts(
+                            stream_event.payload,
+                        )
 
                     event = _model_stream_event_to_runtime_event(
                         stream_event,
@@ -555,6 +565,7 @@ class CayuApp:
                 assistant_message = _assistant_message(
                     text="".join(assistant_text),
                     tool_calls=tool_calls,
+                    provider_state_parts=provider_state_parts,
                 )
                 if assistant_message is not None:
                     messages.append(assistant_message)
@@ -1079,7 +1090,7 @@ def _model_stream_event_to_runtime_event(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
-            payload=copy_json_value(stream_event.payload, "payload"),
+            payload=_model_completed_event_payload(stream_event.payload),
         )
     if stream_event.type == ModelStreamEventType.ERROR:
         return Event(
@@ -1136,8 +1147,10 @@ def _assistant_message(
     *,
     text: str,
     tool_calls: list[ToolCallRequest],
+    provider_state_parts: list[ProviderStatePart],
 ) -> Message | None:
-    content: list[TextPart | ToolCallPart] = []
+    content: list[TextPart | ToolCallPart | ProviderStatePart] = []
+    content.extend(provider_state_parts)
     if text.strip():
         content.append(TextPart(text=text))
     content.extend(
@@ -1151,6 +1164,32 @@ def _assistant_message(
     if not content:
         return None
     return Message(role="assistant", content=content)
+
+
+def _provider_state_parts(payload: dict[str, Any]) -> list[ProviderStatePart]:
+    raw_parts = payload.get("provider_state", [])
+    if raw_parts is None:
+        return []
+    if type(raw_parts) is not list:
+        raise ValueError("Model completed payload provider_state must be a list.")
+    parts: list[ProviderStatePart] = []
+    for index, raw_part in enumerate(raw_parts):
+        if type(raw_part) is not dict:
+            raise ValueError(
+                f"Model completed payload provider_state[{index}] must be an object."
+            )
+        provider = raw_part.get("provider")
+        state = raw_part.get("state")
+        parts.append(ProviderStatePart(provider=provider, state=state))
+    return parts
+
+
+def _model_completed_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    copied = copy_json_value(payload, "payload")
+    if type(copied) is not dict:
+        raise ValueError("Model completed payload must be an object.")
+    copied.pop("provider_state", None)
+    return copied
 
 
 def _tool_result_messages(outcomes: list[ToolCallOutcome]) -> list[Message]:

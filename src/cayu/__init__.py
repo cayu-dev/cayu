@@ -5,6 +5,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
     MessageRole,
+    ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -12,7 +13,7 @@ from cayu.core.messages import (
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.environments import Environment, EnvironmentSpec
-from cayu.providers import AnthropicProvider
+from cayu.providers import AnthropicProvider, OpenAIProvider
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -77,6 +78,8 @@ __all__ = [
     "EventType",
     "ExecCommandTool",
     "AnthropicProvider",
+    "OpenAIProvider",
+    "ProviderStatePart",
     "InMemoryTaskStore",
     "ListFilesTool",
     "LocalRunner",

@@ -14,6 +14,7 @@ from cayu.core import (
     EventType,
     Message,
     MessageRole,
+    ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -998,6 +999,40 @@ def test_message_supports_structured_tool_call_parts():
     assert part.arguments == {"text": "done"}
 
 
+def test_message_supports_provider_state_parts_on_assistant_messages():
+    message = Message(
+        role="assistant",
+        content=[
+            ProviderStatePart(
+                provider="openai",
+                state={"type": "reasoning", "id": "rs_1", "summary": []},
+            )
+        ],
+    )
+
+    part = message.content[0]
+    assert isinstance(part, ProviderStatePart)
+    assert part.type == "provider_state"
+    assert part.provider == "openai"
+    assert part.state == {"type": "reasoning", "id": "rs_1", "summary": []}
+
+
+def test_provider_state_part_is_copied_and_json_validated():
+    state = {"nested": {"value": "original"}}
+    part = ProviderStatePart(provider="openai", state=state)
+    copied = copy_message_part(part)
+    state["nested"]["value"] = "mutated"
+
+    assert isinstance(copied, ProviderStatePart)
+    assert copied.state == {"nested": {"value": "original"}}
+
+    with pytest.raises(ValueError, match="JSON-compatible"):
+        ProviderStatePart(provider="openai", state={"bad": object()})
+
+    with pytest.raises(ValueError, match="cannot be blank"):
+        ProviderStatePart(provider=" ", state={})
+
+
 def test_message_tool_call_rejects_invalid_explicit_arguments():
     with pytest.raises(ValueError, match="dictionary|JSON-compatible"):
         Message.tool_call(
@@ -1157,6 +1192,12 @@ def test_message_rejects_invalid_role_content_combinations():
                     tool_name="echo",
                 )
             ],
+        )
+
+    with pytest.raises(ValueError, match="system messages only support"):
+        Message(
+            role="system",
+            content=[ProviderStatePart(provider="openai", state={})],
         )
 
     with pytest.raises(ValueError, match="assistant messages only support"):

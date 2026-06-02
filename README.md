@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
 
 It does not yet include dashboard UI, hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
@@ -78,6 +78,13 @@ Run the live Anthropic example with local tools:
 ```bash
 export ANTHROPIC_API_KEY=...
 PYTHONPATH=src python examples/anthropic_local_tools.py
+```
+
+Run the live OpenAI example with local tools:
+
+```bash
+export OPENAI_API_KEY=...
+PYTHONPATH=src python examples/openai_local_tools.py
 ```
 
 Use durable local session/event/transcript storage:

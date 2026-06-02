@@ -5,6 +5,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
     MessageRole,
+    ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -19,6 +20,7 @@ __all__ = [
     "EventType",
     "Message",
     "MessageRole",
+    "ProviderStatePart",
     "TextPart",
     "ToolCallPart",
     "ToolResultPart",
