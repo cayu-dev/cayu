@@ -157,16 +157,37 @@ app.register_agent(
 )
 ```
 
-Use checkpoint-backed compaction for long-running sessions:
+Use checkpoint-backed compaction for long-running sessions. Without an explicit
+compactor, Cayu uses a deterministic transcript digest fallback. For semantic
+summaries, provide a model-backed compactor:
 
 ```python
-from cayu import AgentSpec, CheckpointCompactionContextPolicy
+from cayu import (
+    AgentSpec,
+    AnthropicProvider,
+    CheckpointCompactionContextPolicy,
+    ModelCompactor,
+)
+
+summary_provider = AnthropicProvider()
 
 app.register_agent(
     AgentSpec(name="assistant", model="claude-sonnet-4-6"),
     context_policy=CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(
+            provider=summary_provider,
+            model="claude-sonnet-4-6",
+            system_prompt="Return only a compact continuation summary.",
+            options={"anthropic": {"max_tokens": 2000}},
+        ),
         max_user_turns=10,
         compact_after_messages=40,
     ),
 )
 ```
+
+Advanced users can replace the compaction prompt body with
+`ModelCompactor(prompt_builder=...)`. The built-in checkpoint policy stores the
+summary and transcript cursor in the session checkpoint, then injects the
+summary as model-facing user context. It does not append the summary to the
+durable transcript.

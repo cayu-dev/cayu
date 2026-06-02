@@ -4,6 +4,7 @@ from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
+    CompactionPromptBuilder,
     CompactionRequest,
     CompactionResult,
     ContextCompactor,
@@ -11,8 +12,10 @@ from cayu.runtime.context import (
     ContextRequest,
     DefaultContextPolicy,
     MessageWindowContextPolicy,
+    ModelCompactor,
     RecentTurnsContextPolicy,
     TranscriptDigestCompactor,
+    default_compaction_prompt,
     trim_context_messages,
     trim_context_turns,
 )
@@ -41,6 +44,7 @@ from cayu.runtime.tasks import (
 __all__ = [
     "CayuApp",
     "CheckpointCompactionContextPolicy",
+    "CompactionPromptBuilder",
     "CompactionRequest",
     "CompactionResult",
     "ContextCompactor",
@@ -55,6 +59,7 @@ __all__ = [
     "RegisteredAgent",
     "RegisteredEnvironment",
     "MessageWindowContextPolicy",
+    "ModelCompactor",
     "RecentTurnsContextPolicy",
     "ResumeRequest",
     "RunRequest",
@@ -71,6 +76,7 @@ __all__ = [
     "TaskStatus",
     "TaskStore",
     "TranscriptDigestCompactor",
+    "default_compaction_prompt",
     "trim_context_messages",
     "trim_context_turns",
 ]

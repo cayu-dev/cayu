@@ -31,6 +31,10 @@ class EventType(StrEnum):
     MODEL_COMPLETED = "model.completed"
     MODEL_ERROR = "model.error"
 
+    CONTEXT_COMPACTION_STARTED = "context.compaction.started"
+    CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"
+    CONTEXT_COMPACTION_FAILED = "context.compaction.failed"
+
     TOOL_CALL_STARTED = "tool.call.started"
     TOOL_CALL_COMPLETED = "tool.call.completed"
     TOOL_CALL_FAILED = "tool.call.failed"

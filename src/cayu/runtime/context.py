@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.agents import AgentSpec
+from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart, ToolResultPart, copy_message
+from cayu.providers.base import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEventType,
+    copy_model_stream_event,
+)
 from cayu.runtime.sessions import Session
 
 
@@ -60,6 +68,44 @@ class ContextPolicy(ABC):
         """Return provider-neutral messages for one model request."""
 
 
+class ContextCompactionTelemetry(BaseModel):
+    """Compaction telemetry that the runtime converts into events."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: EventType
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_context_event_type(cls, value: EventType) -> EventType:
+        if value not in {
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.CONTEXT_COMPACTION_COMPLETED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        }:
+            raise ValueError("Context compaction telemetry event_type is not supported.")
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "payload")
+
+
+def copy_context_compaction_telemetry(
+    telemetry: ContextCompactionTelemetry,
+) -> ContextCompactionTelemetry:
+    if type(telemetry) is not ContextCompactionTelemetry:
+        raise TypeError(
+            "Context compaction telemetry must be ContextCompactionTelemetry instances."
+        )
+    return ContextCompactionTelemetry(
+        event_type=telemetry.event_type,
+        payload=copy_json_value(telemetry.payload, "payload"),
+    )
+
+
 class ContextBuildResult(BaseModel):
     """Runtime-managed context result that may include checkpoint updates."""
 
@@ -68,11 +114,17 @@ class ContextBuildResult(BaseModel):
     messages: list[Message]
     checkpoint: dict[str, Any] | None = None
     checkpoint_event_payload: dict[str, Any] | None = None
+    compaction_telemetry: list[ContextCompactionTelemetry] = Field(default_factory=list)
 
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
         return [copy_message(message) for message in value]
+
+    @field_validator("compaction_telemetry")
+    @classmethod
+    def copy_compaction_telemetry(cls, value):
+        return [copy_context_compaction_telemetry(item) for item in value]
 
     @field_validator("checkpoint", "checkpoint_event_payload", mode="before")
     @classmethod
@@ -80,6 +132,24 @@ class ContextBuildResult(BaseModel):
         if value is None:
             return None
         return copy_json_value(value, info.field_name)
+
+
+class ContextBuildError(RuntimeError):
+    """Context build failure with compaction telemetry to emit first."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        compaction_telemetry: list[ContextCompactionTelemetry],
+        cause: Exception,
+    ) -> None:
+        super().__init__(message)
+        self.compaction_telemetry = tuple(
+            copy_context_compaction_telemetry(item)
+            for item in compaction_telemetry
+        )
+        self.cause = cause
 
 
 class RuntimeManagedContextPolicy(ContextPolicy):
@@ -187,6 +257,9 @@ class CompactionRequest(BaseModel):
         return require_nonblank(value, "existing_summary")
 
 
+CompactionPromptBuilder = Callable[[CompactionRequest], str]
+
+
 class CompactionResult(BaseModel):
     """Compacted representation of older model-facing context."""
 
@@ -243,6 +316,100 @@ class TranscriptDigestCompactor(ContextCompactor):
         )
 
 
+class ModelCompactor(ContextCompactor):
+    """Provider-backed compactor that asks a model to summarize older context."""
+
+    def __init__(
+        self,
+        *,
+        provider: ModelProvider,
+        model: str,
+        system_prompt: str = (
+            "You summarize prior agent session context for a future model call. "
+            "Return only the compact summary. Do not call tools."
+        ),
+        options: dict[str, Any] | None = None,
+        max_input_chars: int | None = 120_000,
+        prompt_builder: CompactionPromptBuilder | None = None,
+    ) -> None:
+        if not isinstance(provider, ModelProvider):
+            raise TypeError("provider must be a ModelProvider.")
+        if max_input_chars is not None:
+            if type(max_input_chars) is not int:
+                raise TypeError("max_input_chars must be an integer or None.")
+            if max_input_chars < 1000:
+                raise ValueError("max_input_chars must be at least 1000.")
+        self.provider = provider
+        self.model = require_nonblank(model, "model")
+        self.system_prompt = require_nonblank(system_prompt, "system_prompt")
+        self.options = copy_json_value({} if options is None else options, "options")
+        self.max_input_chars = max_input_chars
+        if prompt_builder is not None and not callable(prompt_builder):
+            raise TypeError("prompt_builder must be callable.")
+        self.prompt_builder = prompt_builder
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        if self.prompt_builder is None:
+            bounded_prompt, input_truncated = _bounded_default_compaction_prompt(
+                request,
+                max_chars=self.max_input_chars,
+            )
+        else:
+            user_prompt = require_nonblank(self.prompt_builder(request), "prompt")
+            bounded_prompt, input_truncated = _bounded_prompt_text(
+                user_prompt,
+                max_chars=self.max_input_chars,
+            )
+        model_request = ModelRequest(
+            model=self.model,
+            messages=[
+                Message.text(MessageRole.SYSTEM, self.system_prompt),
+                Message.text(MessageRole.USER, bounded_prompt),
+            ],
+            tools=[],
+            options=self.options,
+        )
+
+        text_parts: list[str] = []
+        completed_payload: dict[str, Any] | None = None
+        async for raw_event in self.provider.stream(model_request):
+            event = copy_model_stream_event(raw_event)
+            if completed_payload is not None:
+                raise RuntimeError(
+                    f"Compaction provider emitted event after completed: {event.type}"
+                )
+            if event.type == ModelStreamEventType.TEXT_DELTA:
+                text_parts.append(event.delta)
+            elif event.type == ModelStreamEventType.TOOL_CALL:
+                raise RuntimeError("Compaction model must not call tools.")
+            elif event.type == ModelStreamEventType.ERROR:
+                raise RuntimeError(
+                    str(event.payload.get("error") or "Compaction model provider error")
+                )
+            elif event.type == ModelStreamEventType.COMPLETED:
+                completed_payload = event.payload
+            else:
+                raise RuntimeError(
+                    f"Compaction provider emitted unsupported event: {event.type}"
+                )
+
+        if completed_payload is None:
+            raise RuntimeError("Compaction model stream ended without a completed event.")
+
+        summary = require_nonblank("".join(text_parts), "summary")
+        return CompactionResult(
+            summary=summary,
+            metadata={
+                "compactor": type(self).__name__,
+                "provider": require_nonblank(self.provider.name, "provider.name"),
+                "model": self.model,
+                "input_truncated": input_truncated,
+                "max_input_chars": self.max_input_chars,
+                "completed": copy_json_value(completed_payload, "completed"),
+            },
+        )
+
+
 class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     """Checkpoint-backed context policy for long-running sessions.
 
@@ -286,19 +453,33 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         previous = _compaction_checkpoint(checkpoint)
         previous_summary = previous.get("summary") if previous is not None else None
-        previous_count = (
-            previous.get("compacted_message_count") if previous is not None else 0
+        previous_cursor = (
+            previous.get("compacted_transcript_cursor") if previous is not None else None
         )
         if type(previous_summary) is not str:
             previous_summary = None
-        if type(previous_count) is not int or previous_count < 0:
-            previous_count = 0
+            previous_cursor = None
 
-        system_prefix, compactable_messages, recent_messages = _split_recent_turns(
+        (
+            system_prefix,
+            compactable_messages,
+            recent_messages,
+            compactable_cursor,
+        ) = _split_recent_turns(
             request.messages,
             max_user_turns=self.max_user_turns,
         )
-        newly_compactable = compactable_messages[previous_count:]
+        first_compactable_cursor = len(system_prefix)
+        if (
+            previous_summary is None
+            or type(previous_cursor) is not int
+            or previous_cursor < first_compactable_cursor
+            or previous_cursor > compactable_cursor
+        ):
+            previous_cursor = first_compactable_cursor
+            previous_summary = None
+
+        newly_compactable = request.messages[previous_cursor:compactable_cursor]
         should_compact = (
             len(compactable_messages) >= self.compact_after_messages
             and bool(newly_compactable)
@@ -306,43 +487,88 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
 
         checkpoint_update = None
         checkpoint_event_payload = None
+        compaction_telemetry: list[ContextCompactionTelemetry] = []
         summary = previous_summary
-        compacted_count = min(previous_count, len(compactable_messages))
         if should_compact:
-            result = await self.compactor.compact(
-                CompactionRequest(
-                    session=request.session,
-                    agent=request.agent,
-                    messages=newly_compactable,
-                    existing_summary=previous_summary,
-                    metadata=request.metadata,
-                )
+            compaction_started = _compaction_telemetry(
+                event_type=EventType.CONTEXT_COMPACTION_STARTED,
+                compactor=self.compactor,
+                compacted_cursor=compactable_cursor,
+                previous_cursor=previous_cursor,
+                newly_compacted_message_count=len(newly_compactable),
+                recent_message_count=len(recent_messages),
             )
+            compaction_telemetry.append(compaction_started)
+            try:
+                result = await self.compactor.compact(
+                    CompactionRequest(
+                        session=request.session,
+                        agent=request.agent,
+                        messages=newly_compactable,
+                        existing_summary=previous_summary,
+                        metadata=request.metadata,
+                    )
+                )
+            except Exception as exc:
+                compaction_telemetry.append(
+                    _compaction_telemetry(
+                        event_type=EventType.CONTEXT_COMPACTION_FAILED,
+                        compactor=self.compactor,
+                        compacted_cursor=compactable_cursor,
+                        previous_cursor=previous_cursor,
+                        newly_compacted_message_count=len(newly_compactable),
+                        recent_message_count=len(recent_messages),
+                        payload={
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                )
+                raise ContextBuildError(
+                    str(exc),
+                    compaction_telemetry=compaction_telemetry,
+                    cause=exc,
+                ) from exc
             summary = result.summary
-            compacted_count = len(compactable_messages)
             checkpoint_update = copy_json_value(checkpoint, "checkpoint")
             checkpoint_update[_COMPACTION_CHECKPOINT_KEY] = {
                 "version": _COMPACTION_CHECKPOINT_VERSION,
                 "summary": summary,
-                "compacted_message_count": compacted_count,
+                "compacted_transcript_cursor": compactable_cursor,
                 "metadata": result.metadata,
             }
             checkpoint_event_payload = {
                 "checkpoint": _COMPACTION_CHECKPOINT_KEY,
-                "compacted_message_count": compacted_count,
+                "compacted_transcript_cursor": compactable_cursor,
+                "previous_compacted_transcript_cursor": previous_cursor,
                 "newly_compacted_message_count": len(newly_compactable),
                 "recent_message_count": len(recent_messages),
             }
+            compaction_telemetry.append(
+                _compaction_telemetry(
+                    event_type=EventType.CONTEXT_COMPACTION_COMPLETED,
+                    compactor=self.compactor,
+                    compacted_cursor=compactable_cursor,
+                    previous_cursor=previous_cursor,
+                    newly_compacted_message_count=len(newly_compactable),
+                    recent_message_count=len(recent_messages),
+                    payload={
+                        "summary_chars": len(summary),
+                        "metadata": result.metadata,
+                    },
+                )
+            )
 
         messages = [copy_message(message) for message in system_prefix]
         if summary is not None:
-            messages.append(Message.text(MessageRole.SYSTEM, f"{self.summary_prefix}\n{summary}"))
+            messages.append(Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"))
         messages.extend(copy_message(message) for message in recent_messages)
         validate_context_messages(messages)
         return ContextBuildResult(
             messages=messages,
             checkpoint=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
+            compaction_telemetry=compaction_telemetry,
         )
 
 
@@ -499,7 +725,7 @@ def _split_recent_turns(
     messages: list[Message],
     *,
     max_user_turns: int,
-) -> tuple[list[Message], list[Message], list[Message]]:
+) -> tuple[list[Message], list[Message], list[Message], int]:
     copied_messages = [copy_message(message) for message in messages]
     validate_context_messages(copied_messages)
     system_prefix, body = _split_system_prefix(copied_messages, True)
@@ -509,9 +735,10 @@ def _split_recent_turns(
         if message.role == MessageRole.USER
     ]
     if not turn_starts or len(turn_starts) <= max_user_turns:
-        return system_prefix, [], body
+        return system_prefix, [], body, len(system_prefix)
     recent_start = turn_starts[-max_user_turns]
-    return system_prefix, body[:recent_start], body[recent_start:]
+    compactable_cursor = len(system_prefix) + recent_start
+    return system_prefix, body[:recent_start], body[recent_start:], compactable_cursor
 
 
 def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
@@ -521,6 +748,29 @@ def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
     if value.get("version") != _COMPACTION_CHECKPOINT_VERSION:
         return None
     return copy_json_value(value, _COMPACTION_CHECKPOINT_KEY)
+
+
+def _compaction_telemetry(
+    *,
+    event_type: EventType,
+    compactor: ContextCompactor,
+    compacted_cursor: int,
+    previous_cursor: int,
+    newly_compacted_message_count: int,
+    recent_message_count: int,
+    payload: dict[str, Any] | None = None,
+) -> ContextCompactionTelemetry:
+    event_payload = {
+        "checkpoint": _COMPACTION_CHECKPOINT_KEY,
+        "compactor": type(compactor).__name__,
+        "compacted_transcript_cursor": compacted_cursor,
+        "previous_compacted_transcript_cursor": previous_cursor,
+        "newly_compacted_message_count": newly_compacted_message_count,
+        "recent_message_count": recent_message_count,
+    }
+    if payload is not None:
+        event_payload.update(copy_json_value(payload, "payload"))
+    return ContextCompactionTelemetry(event_type=event_type, payload=event_payload)
 
 
 def _messages_digest(messages: list[Message]) -> str:
@@ -545,3 +795,71 @@ def _message_part_digest(part: TextPart | ToolCallPart | ToolResultPart) -> str:
             f"error={part.is_error} content={part.content}]"
         )
     raise TypeError("Unsupported message part.")
+
+
+def default_compaction_prompt(
+    request: CompactionRequest,
+) -> str:
+    """Build the default user prompt for model-backed context compaction."""
+
+    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(
+        request
+    )
+    return f"{prefix}\n\n{transcript_prefix}{transcript_digest}"
+
+
+def _bounded_default_compaction_prompt(
+    request: CompactionRequest,
+    *,
+    max_chars: int | None,
+) -> tuple[str, bool]:
+    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(
+        request
+    )
+    prompt = f"{prefix}\n\n{transcript_prefix}{transcript_digest}"
+    if max_chars is None or len(prompt) <= max_chars:
+        return prompt, False
+
+    marker = "[compaction transcript clipped to latest content]\n"
+    available = max_chars - len(prefix) - 2 - len(transcript_prefix) - len(marker)
+    if available <= 0:
+        raise ValueError(
+            "max_input_chars is too small to preserve compaction instructions "
+            "and existing summary."
+        )
+    return (
+        f"{prefix}\n\n{transcript_prefix}{marker}{transcript_digest[-available:]}",
+        True,
+    )
+
+
+def _default_compaction_prompt_parts(
+    request: CompactionRequest,
+) -> tuple[str, str, str]:
+    sections = [
+        "Summarize the transcript below so a future agent step can continue with the important context.",
+        "Preserve concrete user requests, decisions, files or resources mentioned, tool results, errors, and pending work.",
+        "Do not invent facts. Keep the summary concise but specific.",
+        f"Session: {request.session.id}",
+        f"Agent: {request.agent.name}",
+    ]
+    if request.existing_summary is not None:
+        sections.append("Existing summary:\n" + request.existing_summary)
+    prefix = "\n\n".join(sections)
+    transcript_prefix = "Transcript to compact:\n"
+    transcript_digest = _messages_digest(request.messages)
+    return prefix, transcript_prefix, transcript_digest
+
+
+def _bounded_prompt_text(
+    prompt: str,
+    *,
+    max_chars: int | None,
+) -> tuple[str, bool]:
+    if max_chars is None or len(prompt) <= max_chars:
+        return prompt, False
+    marker = "[compaction input clipped to latest content]\n"
+    keep_chars = max_chars - len(marker)
+    if keep_chars <= 0:
+        raise ValueError("max_chars is too small for compaction prompt marker.")
+    return marker + prompt[-keep_chars:], True
