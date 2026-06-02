@@ -15,7 +15,6 @@ from cayu import (
     TaskStore,
 )
 
-
 StoreFactory = Callable[[object], TaskStore]
 
 
@@ -59,9 +58,7 @@ def test_task_stores_lifecycle_and_terminal_guards(store_factory: StoreFactory, 
     store = _make_store(store_factory, tmp_path)
 
     async def run_store_operations() -> None:
-        await store.create_task(
-            TaskCreate(task_id="task_lifecycle", type="analyze_repository")
-        )
+        await store.create_task(TaskCreate(task_id="task_lifecycle", type="analyze_repository"))
 
         running = await store.start_task("task_lifecycle", session_id="sess_analysis")
         assert running.status == TaskStatus.RUNNING
@@ -133,9 +130,7 @@ def test_task_stores_list_tasks_with_filters_and_pagination(
                 order_by=TaskOrder.CREATED_AT_ASC,
             )
         )
-        completed_tasks = await store.list_tasks(
-            TaskQuery(status=TaskStatus.COMPLETED)
-        )
+        completed_tasks = await store.list_tasks(TaskQuery(status=TaskStatus.COMPLETED))
         child_tasks = await store.list_tasks(TaskQuery(parent_task_id="task_2"))
         paged_tasks = await store.list_tasks(
             TaskQuery(limit=1, offset=1, order_by=TaskOrder.CREATED_AT_ASC)

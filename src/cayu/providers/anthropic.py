@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
-from typing import Any, AsyncIterator, Protocol
+from collections.abc import AsyncIterator, Mapping
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import certifi
@@ -23,7 +23,6 @@ from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
-    ModelStreamEventType,
 )
 
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
@@ -101,9 +100,7 @@ class HttpxAnthropicTransport:
                 f"{_safe_error_response_text(exc.response)}"
             ) from exc
         except httpx.RequestError as exc:
-            raise AnthropicAPIError(
-                f"Anthropic API request failed for {url}: {exc}"
-            ) from exc
+            raise AnthropicAPIError(f"Anthropic API request failed for {url}: {exc}") from exc
 
         try:
             decoded = response.json()
@@ -151,9 +148,7 @@ class AnthropicProvider(ModelProvider):
             raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
         self.timeout_s = float(timeout_s)
-        self.transport = (
-            transport if transport is not None else HttpxAnthropicTransport()
-        )
+        self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
 
     async def stream(
@@ -209,9 +204,7 @@ def build_anthropic_payload(
         payload["system"] = system
 
     messages = [_anthropic_message(message) for message in request.messages]
-    payload["messages"] = [
-        message for message in messages if message is not None
-    ]
+    payload["messages"] = [message for message in messages if message is not None]
     if not payload["messages"]:
         raise ValueError("Anthropic requests require at least one non-system message.")
     tools = [_anthropic_tool(tool) for tool in request.tools]
@@ -233,16 +226,12 @@ def anthropic_response_events(
     events: list[ModelStreamEvent] = []
     for index, block in enumerate(content):
         if not isinstance(block, Mapping):
-            raise AnthropicProtocolError(
-                f"Anthropic content block {index} must be an object."
-            )
+            raise AnthropicProtocolError(f"Anthropic content block {index} must be an object.")
         block_type = block.get("type")
         if block_type == "text":
             text = block.get("text")
             if not isinstance(text, str):
-                raise AnthropicProtocolError(
-                    f"Anthropic text block {index} requires string text."
-                )
+                raise AnthropicProtocolError(f"Anthropic text block {index} requires string text.")
             if text:
                 events.append(ModelStreamEvent.text_delta(text))
         elif block_type == "tool_use":
@@ -334,10 +323,7 @@ def _anthropic_message(message: Message) -> dict[str, Any] | None:
     if message.role == MessageRole.TOOL:
         return {
             "role": "user",
-            "content": [
-                _tool_result_block(part)
-                for part in message.content
-            ],
+            "content": [_tool_result_block(part) for part in message.content],
         }
     raise AnthropicProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
@@ -362,9 +348,7 @@ def _assistant_block(
             "name": part.tool_name,
             "input": copy_json_value(part.arguments, "arguments"),
         }
-    raise AnthropicProtocolError(
-        "Assistant messages can only contain text and tool_call blocks."
-    )
+    raise AnthropicProtocolError("Assistant messages can only contain text and tool_call blocks.")
 
 
 def _tool_result_block(
@@ -388,8 +372,7 @@ def _anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
     name = _require_mapping_string(tool, "name")
     if not _ANTHROPIC_TOOL_NAME_RE.fullmatch(name):
         raise ValueError(
-            "Anthropic tool names must contain 1-64 letters, numbers, "
-            "underscores, or hyphens."
+            "Anthropic tool names must contain 1-64 letters, numbers, underscores, or hyphens."
         )
     description = tool.get("description", "")
     if not isinstance(description, str):

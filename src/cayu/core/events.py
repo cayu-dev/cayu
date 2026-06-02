@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -64,7 +64,7 @@ class Event(BaseModel):
     type: EventType | str
     session_id: str
     id: str = Field(default_factory=lambda: str(uuid4()))
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     agent_name: str | None = None
     environment_name: str | None = None
     workflow_name: str | None = None

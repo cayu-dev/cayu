@@ -4,7 +4,6 @@ from cayu._validation import require_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces import Workspace
 
-
 DEFAULT_READ_LIMIT_BYTES = 256 * 1024
 MAX_READ_LIMIT_BYTES = 4 * 1024 * 1024
 DEFAULT_WRITE_LIMIT_BYTES = 256 * 1024
@@ -151,9 +150,7 @@ class ListFilesTool(Tool):
             maximum=MAX_LIST_LIMIT,
         )
         result = await workspace.list(pattern, limit=limit)
-        result_content = (
-            "\n".join(result.paths) if result.paths else "No files matched."
-        )
+        result_content = "\n".join(result.paths) if result.paths else "No files matched."
         if result.truncated:
             result_content = f"{result_content}\n\n[file list truncated]"
         return ToolResult(

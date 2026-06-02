@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any
@@ -38,7 +37,7 @@ class FrozenMapping(Mapping[str, Any]):
     def __len__(self) -> int:
         return len(self._items)
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> "FrozenMapping":
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenMapping:
         return self
 
     def __repr__(self) -> str:
@@ -49,9 +48,7 @@ def _freeze_value(value: Any) -> Any:
     if isinstance(value, FrozenMapping):
         return value
     if isinstance(value, Mapping):
-        return FrozenMapping(
-            tuple((key, _freeze_value(item)) for key, item in value.items())
-        )
+        return FrozenMapping(tuple((key, _freeze_value(item)) for key, item in value.items()))
     if isinstance(value, list | tuple):
         return tuple(_freeze_value(item) for item in value)
     return value
@@ -120,7 +117,7 @@ class ToolSpec(BaseModel):
         *,
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
-    ) -> "ToolSpec":
+    ) -> ToolSpec:
         data = self.model_dump()
         if update:
             data.update(update)

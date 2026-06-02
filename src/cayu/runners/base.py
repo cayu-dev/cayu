@@ -15,7 +15,6 @@ from pydantic import (
 
 from cayu._validation import copy_json_value
 
-
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 
 
@@ -40,15 +39,15 @@ class ExecCommand(BaseModel):
         return list(value)
 
     @classmethod
-    def process(cls, *argv: str) -> "ExecCommand":
+    def process(cls, *argv: str) -> ExecCommand:
         return cls(kind="process", argv=list(argv))
 
     @classmethod
-    def bash(cls, script: str) -> "ExecCommand":
+    def bash(cls, script: str) -> ExecCommand:
         return cls(kind="shell", shell=script)
 
     @model_validator(mode="after")
-    def validate_shape(self) -> "ExecCommand":
+    def validate_shape(self) -> ExecCommand:
         if self.kind == "process":
             if not self.argv:
                 raise ValueError("Process commands require non-empty argv.")

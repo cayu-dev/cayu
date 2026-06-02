@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any, AsyncIterator
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -68,7 +69,7 @@ class ModelStreamEvent(BaseModel):
         return ModelStreamEventType(require_nonblank(value, "type"))
 
     @classmethod
-    def text_delta(cls, delta: str) -> "ModelStreamEvent":
+    def text_delta(cls, delta: str) -> ModelStreamEvent:
         return cls(type=ModelStreamEventType.TEXT_DELTA, delta=delta)
 
     @classmethod
@@ -78,7 +79,7 @@ class ModelStreamEvent(BaseModel):
         name: str,
         arguments: dict[str, Any],
         id: str | None = None,
-    ) -> "ModelStreamEvent":
+    ) -> ModelStreamEvent:
         if not isinstance(arguments, dict):
             raise ValueError("`arguments` must be a dictionary.")
         payload: dict[str, Any] = {
@@ -90,14 +91,14 @@ class ModelStreamEvent(BaseModel):
         return cls(type=ModelStreamEventType.TOOL_CALL, payload=payload)
 
     @classmethod
-    def completed(cls, payload: dict[str, Any] | None = None) -> "ModelStreamEvent":
+    def completed(cls, payload: dict[str, Any] | None = None) -> ModelStreamEvent:
         return cls(
             type=ModelStreamEventType.COMPLETED,
             payload={} if payload is None else payload,
         )
 
     @classmethod
-    def error(cls, message: str) -> "ModelStreamEvent":
+    def error(cls, message: str) -> ModelStreamEvent:
         return cls(
             type=ModelStreamEventType.ERROR,
             payload={"error": require_nonblank(message, "message")},

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
-from typing import Any, AsyncIterator, Protocol
+from collections.abc import AsyncIterator, Mapping
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import certifi
@@ -95,9 +95,7 @@ class HttpxOpenAITransport:
                 f"{_safe_error_response_text(exc.response)}"
             ) from exc
         except httpx.RequestError as exc:
-            raise OpenAIAPIError(
-                f"OpenAI API request failed for {url}: {exc}"
-            ) from exc
+            raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
 
         try:
             decoded = response.json()
@@ -197,9 +195,7 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
 
     error = response.get("error")
     if error is not None:
-        raise OpenAIProtocolError(
-            f"OpenAI response error: {_safe_error_value(error)}"
-        )
+        raise OpenAIProtocolError(f"OpenAI response error: {_safe_error_value(error)}")
 
     output = response.get("output")
     if not isinstance(output, list):
@@ -208,9 +204,7 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
     events: list[ModelStreamEvent] = []
     for index, item in enumerate(output):
         if not isinstance(item, Mapping):
-            raise OpenAIProtocolError(
-                f"OpenAI output item {index} must be an object."
-            )
+            raise OpenAIProtocolError(f"OpenAI output item {index} must be an object.")
         item_type = item.get("type")
         if item_type == "message":
             events.extend(_message_output_events(item, index))
@@ -219,9 +213,7 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
         elif item_type == "reasoning":
             continue
         else:
-            raise OpenAIProtocolError(
-                f"Unsupported OpenAI output item type: {item_type!r}."
-            )
+            raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
 
     events.append(
         ModelStreamEvent.completed(
@@ -264,20 +256,16 @@ def _message_output_events(
     for content_index, part in enumerate(content):
         if not isinstance(part, Mapping):
             raise OpenAIProtocolError(
-                "OpenAI message output content "
-                f"{item_index}.{content_index} must be an object."
+                f"OpenAI message output content {item_index}.{content_index} must be an object."
             )
         part_type = part.get("type")
         if part_type != "output_text":
             raise OpenAIProtocolError(
-                "Unsupported OpenAI message output content type: "
-                f"{part_type!r}."
+                f"Unsupported OpenAI message output content type: {part_type!r}."
             )
         text = part.get("text")
         if not isinstance(text, str):
-            raise OpenAIProtocolError(
-                "OpenAI output_text content requires string text."
-            )
+            raise OpenAIProtocolError("OpenAI output_text content requires string text.")
         if text:
             events.append(ModelStreamEvent.text_delta(text))
     return events
@@ -295,9 +283,7 @@ def _function_call_event(
             f"OpenAI function_call item {item_index} requires nonblank call_id."
         )
     if not isinstance(name, str) or not name.strip():
-        raise OpenAIProtocolError(
-            f"OpenAI function_call item {item_index} requires nonblank name."
-        )
+        raise OpenAIProtocolError(f"OpenAI function_call item {item_index} requires nonblank name.")
     if not isinstance(arguments, str):
         raise OpenAIProtocolError(
             f"OpenAI function_call item {item_index} requires string arguments."
@@ -359,11 +345,7 @@ def _openai_input_items(message: Message) -> list[dict[str, Any]]:
             return provider_state_items
 
         items: list[dict[str, Any]] = []
-        text_parts = [
-            _output_text_part(part)
-            for part in message.content
-            if type(part) is TextPart
-        ]
+        text_parts = [_output_text_part(part) for part in message.content if type(part) is TextPart]
         if text_parts:
             items.append(
                 {
@@ -378,8 +360,7 @@ def _openai_input_items(message: Message) -> list[dict[str, Any]]:
                 items.append(_function_call_input_item(part))
             elif type(part) not in {TextPart, ProviderStatePart}:
                 raise OpenAIProtocolError(
-                    "Assistant messages can only contain text, tool_call, "
-                    "and provider_state parts."
+                    "Assistant messages can only contain text, tool_call, and provider_state parts."
                 )
         return items
     if message.role == MessageRole.TOOL:
@@ -457,8 +438,7 @@ def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
     name = _require_mapping_string(tool, "name")
     if not _OPENAI_TOOL_NAME_RE.fullmatch(name):
         raise ValueError(
-            "OpenAI tool names must contain 1-64 letters, numbers, "
-            "underscores, or hyphens."
+            "OpenAI tool names must contain 1-64 letters, numbers, underscores, or hyphens."
         )
     description = tool.get("description", "")
     if not isinstance(description, str):

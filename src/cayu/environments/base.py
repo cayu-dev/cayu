@@ -65,9 +65,7 @@ class Environment:
             try:
                 servers = list(mcp_servers)
             except TypeError as exc:
-                raise TypeError(
-                    "mcp_servers must be an iterable of McpServerSpec."
-                ) from exc
+                raise TypeError("mcp_servers must be an iterable of McpServerSpec.") from exc
 
         self.workspace = workspace
         self.runner = runner

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -97,8 +97,8 @@ class Session(BaseModel):
     agent_name: str
     environment_name: str | None = None
     status: SessionStatus = SessionStatus.PENDING
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata", mode="before")
@@ -291,7 +291,7 @@ class InMemorySessionStore(SessionStore):
             if session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             session = Session(
                 id=session_id,
                 agent_name=request.agent_name,
@@ -327,7 +327,7 @@ class InMemorySessionStore(SessionStore):
             updated = session.model_copy(
                 update={
                     "status": status,
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(UTC),
                 }
             )
             self._sessions[session_id] = updated
@@ -350,14 +350,13 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             if session.status not in allowed_statuses:
                 raise ValueError(
-                    "Session status transition not allowed: "
-                    f"{session.status} -> {to_status}"
+                    f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
 
             updated = session.model_copy(
                 update={
                     "status": to_status,
-                    "updated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(UTC),
                 }
             )
             self._sessions[session_id] = updated
@@ -391,9 +390,7 @@ class InMemorySessionStore(SessionStore):
             existing_ids = self._event_ids[session_id]
             for event in copied_events:
                 if event.id in existing_ids:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {event.id}"
-                    )
+                    raise ValueError(f"Event already exists for session {session_id}: {event.id}")
 
             for event in copied_events:
                 stored_event = event.model_copy(deep=True)
@@ -412,10 +409,7 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
-            return [
-                event.model_copy(deep=True)
-                for event in self._events.get(session_id, [])
-            ]
+            return [event.model_copy(deep=True) for event in self._events.get(session_id, [])]
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
@@ -438,9 +432,7 @@ class InMemorySessionStore(SessionStore):
         query = copy_session_query(query)
         async with self._lock:
             sessions = [
-                session
-                for session in self._sessions.values()
-                if _session_matches(session, query)
+                session for session in self._sessions.values() if _session_matches(session, query)
             ]
             sessions = _sort_sessions(sessions, query.order_by)
             page = sessions[query.offset : query.offset + query.limit]
@@ -465,10 +457,7 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
-            return [
-                copy_message(message)
-                for message in self._transcripts.get(session_id, [])
-            ]
+            return [copy_message(message) for message in self._transcripts.get(session_id, [])]
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_nonblank(session_id, "session_id")
@@ -580,12 +569,9 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
         return False
     if query.agent_name is not None and session.agent_name != query.agent_name:
         return False
-    if (
-        query.environment_name is not None
-        and session.environment_name != query.environment_name
-    ):
-        return False
-    return True
+    return not (
+        query.environment_name is not None and session.environment_name != query.environment_name
+    )
 
 
 def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Session]:
@@ -620,13 +606,8 @@ def _event_record_matches(
         return False
     if query.agent_name is not None and event.agent_name != query.agent_name:
         return False
-    if (
-        query.environment_name is not None
-        and event.environment_name != query.environment_name
-    ):
+    if query.environment_name is not None and event.environment_name != query.environment_name:
         return False
     if query.workflow_name is not None and event.workflow_name != query.workflow_name:
         return False
-    if query.tool_name is not None and event.tool_name != query.tool_name:
-        return False
-    return True
+    return not (query.tool_name is not None and event.tool_name != query.tool_name)

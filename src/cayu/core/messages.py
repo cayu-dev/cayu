@@ -107,7 +107,7 @@ class Message(BaseModel):
         return [copy_message_part(part) for part in value]
 
     @model_validator(mode="after")
-    def validate_role_content(self) -> "Message":
+    def validate_role_content(self) -> Message:
         if not self.content:
             raise ValueError("Message content cannot be empty.")
         if self.role in {MessageRole.USER, MessageRole.SYSTEM}:
@@ -125,7 +125,7 @@ class Message(BaseModel):
         return self
 
     @classmethod
-    def text(cls, role: MessageRole | str, text: str) -> "Message":
+    def text(cls, role: MessageRole | str, text: str) -> Message:
         return cls(role=MessageRole(role), content=[TextPart(text=text)])
 
     @classmethod
@@ -136,16 +136,11 @@ class Message(BaseModel):
         tool_name: str | None = None,
         arguments: dict[str, Any] | None = None,
         calls: list[ToolCallPart] | None = None,
-    ) -> "Message":
+    ) -> Message:
         if calls is not None:
-            if (
-                tool_call_id is not None
-                or tool_name is not None
-                or arguments is not None
-            ):
+            if tool_call_id is not None or tool_name is not None or arguments is not None:
                 raise ValueError(
-                    "`calls` cannot be combined with `tool_call_id`, "
-                    "`tool_name`, or `arguments`."
+                    "`calls` cannot be combined with `tool_call_id`, `tool_name`, or `arguments`."
                 )
             if not calls:
                 raise ValueError("`calls` cannot be empty.")
@@ -174,7 +169,7 @@ class Message(BaseModel):
         artifacts: list[dict[str, Any]] | None = None,
         is_error: bool = False,
         results: list[ToolResultPart] | None = None,
-    ) -> "Message":
+    ) -> Message:
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
         if not isinstance(is_error, bool):
@@ -188,9 +183,7 @@ class Message(BaseModel):
                 or artifacts is not None
                 or is_error is not False
             ):
-                raise ValueError(
-                    "`results` cannot be combined with scalar result fields."
-                )
+                raise ValueError("`results` cannot be combined with scalar result fields.")
             if not results:
                 raise ValueError("`results` cannot be empty.")
             result_parts = results
@@ -215,21 +208,14 @@ def _require_parts(
     role: MessageRole,
     content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart],
     *allowed_types: (
-        type[TextPart]
-        | type[ToolCallPart]
-        | type[ToolResultPart]
-        | type[ProviderStatePart]
+        type[TextPart] | type[ToolCallPart] | type[ToolResultPart] | type[ProviderStatePart]
     ),
 ) -> None:
-    invalid_parts = [
-        part.type for part in content if not isinstance(part, allowed_types)
-    ]
+    invalid_parts = [part.type for part in content if not isinstance(part, allowed_types)]
     if invalid_parts:
         allowed = ", ".join(part_type.__name__ for part_type in allowed_types)
         invalid = ", ".join(invalid_parts)
-        raise ValueError(
-            f"{role.value} messages only support {allowed}; got {invalid}."
-        )
+        raise ValueError(f"{role.value} messages only support {allowed}; got {invalid}.")
 
 
 def _require_value(name: str, value: str | None) -> str:

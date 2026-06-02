@@ -1,6 +1,5 @@
 """Runtime contracts."""
 
-from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
@@ -19,6 +18,7 @@ from cayu.runtime.context import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
@@ -51,16 +51,17 @@ __all__ = [
     "ContextPolicy",
     "ContextRequest",
     "DefaultContextPolicy",
-    "EventSink",
     "EventQuery",
     "EventRecord",
-    "InMemorySessionStore",
+    "EventSink",
     "InMemoryEventSink",
-    "RegisteredAgent",
-    "RegisteredEnvironment",
+    "InMemorySessionStore",
+    "InMemoryTaskStore",
     "MessageWindowContextPolicy",
     "ModelCompactor",
     "RecentTurnsContextPolicy",
+    "RegisteredAgent",
+    "RegisteredEnvironment",
     "ResumeRequest",
     "RunRequest",
     "Session",
@@ -68,7 +69,6 @@ __all__ = [
     "SessionQuery",
     "SessionStatus",
     "SessionStore",
-    "InMemoryTaskStore",
     "Task",
     "TaskCreate",
     "TaskOrder",

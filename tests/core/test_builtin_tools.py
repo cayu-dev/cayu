@@ -16,6 +16,7 @@ from cayu.providers import (
 )
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.runtime import CayuApp, RunRequest
+from cayu.tools import ExecCommandTool
 from cayu.tools.commands import (
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
@@ -33,7 +34,6 @@ from cayu.tools.files import (
     ReadFileTool,
     WriteFileTool,
 )
-from cayu.tools import ExecCommandTool
 from cayu.workspaces import LocalWorkspace
 
 
@@ -231,16 +231,10 @@ def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
     file_ctx = ToolContext(session_id="sess_1", workspace=workspace)
     run_ctx = ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path))
 
-    asyncio.run(
-        WriteFileTool().run(file_ctx, {"path": "large.txt", "content": "abcdef"})
-    )
+    asyncio.run(WriteFileTool().run(file_ctx, {"path": "large.txt", "content": "abcdef"}))
     asyncio.run(WriteFileTool().run(file_ctx, {"path": "other.txt", "content": ""}))
-    read_result = asyncio.run(
-        ReadFileTool().run(file_ctx, {"path": "large.txt", "max_bytes": 3})
-    )
-    list_result = asyncio.run(
-        ListFilesTool().run(file_ctx, {"pattern": "*.txt", "limit": 1})
-    )
+    read_result = asyncio.run(ReadFileTool().run(file_ctx, {"path": "large.txt", "max_bytes": 3}))
+    list_result = asyncio.run(ListFilesTool().run(file_ctx, {"pattern": "*.txt", "limit": 1}))
     command_result = asyncio.run(
         ExecCommandTool().run(
             run_ctx,
@@ -278,9 +272,7 @@ def test_write_file_tool_refuses_oversized_content(tmp_path):
     )
 
     assert result.is_error is True
-    assert result.content == (
-        "Write refused: content is 6 bytes, which exceeds max_bytes=3."
-    )
+    assert result.content == ("Write refused: content is 6 bytes, which exceeds max_bytes=3.")
     assert result.structured == {
         "path": "large.txt",
         "bytes": 6,

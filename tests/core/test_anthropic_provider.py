@@ -414,7 +414,7 @@ async def test_httpx_transport_includes_url_in_network_errors(monkeypatch) -> No
         def __init__(self, **kwargs: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "FailingClient":
+        async def __aenter__(self) -> FailingClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -453,7 +453,7 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
         def __init__(self, **kwargs: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "FailingClient":
+        async def __aenter__(self) -> FailingClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -503,8 +503,7 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
 
     message = str(exc_info.value)
     assert (
-        message
-        == 'Anthropic API request failed with HTTP 400: '
+        message == "Anthropic API request failed with HTTP 400: "
         '{"message":"bad request","request_id":"req_123",'
         '"type":"invalid_request_error"}'
     )

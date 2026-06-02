@@ -21,6 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "ruff>=0.11",
+  "ty>=0.0.1a8",
 ]
 server = [
   "fastapi>=0.115",
@@ -37,6 +39,39 @@ cayu = "cayu.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests", "examples"]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E",     # pycodestyle errors
+  "W",     # pycodestyle warnings
+  "F",     # pyflakes
+  "I",     # isort
+  "UP",    # pyupgrade
+  "B",     # flake8-bugbear
+  "SIM",   # flake8-simplify
+  "TCH",   # flake8-type-checking
+  "RUF",   # ruff-specific
+]
+ignore = [
+  "E501",   # line length (handled by formatter)
+  "TC001",  # move app import into TYPE_CHECKING (breaks pydantic)
+  "TC003",  # move stdlib import into TYPE_CHECKING (breaks pydantic)
+  "RUF012", # mutable class attrs (intentional in test fixtures)
+  "RUF043", # regex metachar in pytest match= (intentional)
+  "B017",   # blind Exception in tests (testing frozen attrs)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cayu"]
+
+[tool.ty.environment]
+python-version = "3.11"
+extra-paths = ["src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cayu"]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +19,11 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    _validate_status_set,
     copy_event_query,
     copy_run_request,
     copy_session_query,
     copy_transcript_messages,
-    _validate_status_set,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -37,7 +37,6 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
 )
-
 
 _SCHEMA_VERSION = 3
 
@@ -114,7 +113,7 @@ class SQLiteSessionStore(SessionStore):
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
 
-        updated_at = datetime.now(timezone.utc)
+        updated_at = datetime.now(UTC)
         async with self._lock:
             with self._connection:
                 cursor = self._connection.execute(
@@ -145,7 +144,7 @@ class SQLiteSessionStore(SessionStore):
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
 
-        updated_at = datetime.now(timezone.utc)
+        updated_at = datetime.now(UTC)
         async with self._lock:
             placeholders = ", ".join("?" for _ in allowed_statuses)
             params: list[object] = [
@@ -168,8 +167,7 @@ class SQLiteSessionStore(SessionStore):
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 raise ValueError(
-                    "Session status transition not allowed: "
-                    f"{loaded.status} -> {to_status}"
+                    f"Session status transition not allowed: {loaded.status} -> {to_status}"
                 )
 
             loaded = self._load_unlocked(session_id)
@@ -247,8 +245,7 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if existing_event_id is not None:
                     raise ValueError(
-                        "Event already exists for session "
-                        f"{session_id}: {existing_event_id}"
+                        f"Event already exists for session {session_id}: {existing_event_id}"
                     ) from exc
                 raise
 
@@ -402,7 +399,7 @@ class SQLiteSessionStore(SessionStore):
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         checkpoint = copy_json_value(state, "checkpoint")
-        updated_at = datetime.now(timezone.utc)
+        updated_at = datetime.now(UTC)
 
         async with self._lock:
             if not self._session_exists_unlocked(session_id):
@@ -589,7 +586,7 @@ class SQLiteTaskStore(TaskStore):
         if session_id is not None:
             session_id = require_nonblank(session_id, "session_id")
         async with self._lock:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             with self._connection:
                 cursor = self._connection.execute(
                     """
@@ -612,9 +609,7 @@ class SQLiteTaskStore(TaskStore):
             if cursor.rowcount != 1:
                 task = self._require_task_unlocked(task_id)
                 _ensure_can_transition(task, TaskStatus.RUNNING)
-                raise ValueError(
-                    f"Task {task.id} cannot transition to running from {task.status}"
-                )
+                raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
             updated = self._require_task_unlocked(task_id)
             return updated.model_copy(deep=True)
 
@@ -695,7 +690,7 @@ class SQLiteTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
     ) -> Task:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         with self._connection:
             cursor = self._connection.execute(
                 """
@@ -746,8 +741,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version > _SCHEMA_VERSION:
         raise RuntimeError(
-            "SQLite store database was created by a newer Cayu schema "
-            f"version: {version}"
+            f"SQLite store database was created by a newer Cayu schema version: {version}"
         )
 
     with connection:
@@ -845,7 +839,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
 
 
 def _session_from_request(request: RunRequest) -> Session:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values = {
         "agent_name": request.agent_name,
         "environment_name": request.environment_name,
@@ -917,8 +911,8 @@ def _session_from_row(row: sqlite3.Row) -> Session:
 
 def _format_datetime(value: datetime) -> str:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def _format_optional_datetime(value: datetime | None) -> str | None:
@@ -930,8 +924,8 @@ def _format_optional_datetime(value: datetime | None) -> str | None:
 def _parse_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:

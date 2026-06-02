@@ -7,6 +7,7 @@ import time
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
+import cayu.runners.local as local_runner_module
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core import (
     AgentSpec,
@@ -20,7 +21,6 @@ from cayu.core import (
     ToolResultPart,
     WorkflowSpec,
 )
-
 from cayu.core.events import copy_event
 from cayu.core.messages import copy_message, copy_message_part
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -28,11 +28,10 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
-import cayu.runners.local as local_runner_module
+from cayu.runtime import InMemoryEventSink, ResumeRequest, RunRequest, SessionStore
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
-from cayu.runtime import InMemoryEventSink, ResumeRequest, RunRequest, SessionStore
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -212,9 +211,7 @@ def test_message_parts_own_mutable_constructor_inputs():
 
     assert call_message.content[0].arguments == {"nested": {"value": "original"}}
     assert result_message.content[0].structured == {"nested": {"value": "original"}}
-    assert result_message.content[0].artifacts == [
-        {"nested": {"value": "original"}}
-    ]
+    assert result_message.content[0].artifacts == [{"nested": {"value": "original"}}]
 
 
 def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
@@ -1871,9 +1868,7 @@ def test_local_runner_supports_cwd_env_and_stdin(tmp_path):
 def test_local_runner_captures_failure_and_timeout(tmp_path):
     runner = LocalRunner(tmp_path)
 
-    missing = asyncio.run(
-        runner.exec(ExecCommand.process("cayu-command-that-does-not-exist"))
-    )
+    missing = asyncio.run(runner.exec(ExecCommand.process("cayu-command-that-does-not-exist")))
     failed = asyncio.run(
         runner.exec(
             ExecCommand.process(

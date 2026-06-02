@@ -230,7 +230,7 @@ async def test_openai_provider_emits_tool_call_events() -> None:
                         "name": "echo",
                         "arguments": '{"text":"hello"}',
                         "status": "completed",
-                    }
+                    },
                 ],
             }
         ]
@@ -277,7 +277,7 @@ async def test_openai_provider_round_trips_runtime_tool_results() -> None:
                         "name": "echo",
                         "arguments": '{"text":"hello from openai"}',
                         "status": "completed",
-                    }
+                    },
                 ],
             },
             {
@@ -325,9 +325,7 @@ async def test_openai_provider_round_trips_runtime_tool_results() -> None:
     ]
 
     assert events[-1].type == "session.completed"
-    model_completed_events = [
-        event for event in events if event.type == "model.completed"
-    ]
+    model_completed_events = [event for event in events if event.type == "model.completed"]
     assert "provider_state" not in model_completed_events[0].payload
     assert len(transport.calls) == 2
     assert transport.calls[0]["payload"]["input"] == [
@@ -395,8 +393,7 @@ def test_openai_response_events_sanitizes_response_error() -> None:
 
     message = str(exc_info.value)
     assert (
-        message
-        == 'OpenAI response error: {"code":"bad_request",'
+        message == 'OpenAI response error: {"code":"bad_request",'
         '"message":"bad request","type":"invalid_request_error"}'
     )
     assert "debug" not in message
@@ -602,7 +599,7 @@ async def test_httpx_openai_transport_includes_url_in_network_errors(monkeypatch
         def __init__(self, **kwargs: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "FailingClient":
+        async def __aenter__(self) -> FailingClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -641,7 +638,7 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
         def __init__(self, **kwargs: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "FailingClient":
+        async def __aenter__(self) -> FailingClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -691,8 +688,7 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
 
     message = str(exc_info.value)
     assert (
-        message
-        == 'OpenAI API request failed with HTTP 400: '
+        message == "OpenAI API request failed with HTTP 400: "
         '{"code":"bad_request","message":"bad request",'
         '"request_id":"req_123","type":"invalid_request_error"}'
     )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -50,8 +50,8 @@ class Task(BaseModel):
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -228,9 +228,7 @@ class InMemoryTaskStore(TaskStore):
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         query = copy_task_query(query)
         async with self._lock:
-            tasks = [
-                task for task in self._tasks.values() if _task_matches(task, query)
-            ]
+            tasks = [task for task in self._tasks.values() if _task_matches(task, query)]
             tasks = _sort_tasks(tasks, query.order_by)
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
@@ -247,13 +245,11 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             task = self._require_task(task_id)
             _ensure_can_transition(task, TaskStatus.RUNNING)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
-                    "session_id": (
-                        session_id if session_id is not None else task.session_id
-                    ),
+                    "session_id": (session_id if session_id is not None else task.session_id),
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -314,7 +310,7 @@ class InMemoryTaskStore(TaskStore):
     ) -> Task:
         task = self._require_task(task_id)
         _ensure_can_transition(task, status)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         updated = task.model_copy(
             update={
                 "status": status,
@@ -386,7 +382,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
 
 
 def _task_from_create(request: TaskCreate) -> Task:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values = {
         "type": request.type,
         "title": request.title,
@@ -413,9 +409,7 @@ def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
     }:
         raise ValueError(f"Task {task.id} is already terminal: {task.status}")
     if next_status == TaskStatus.RUNNING and task.status != TaskStatus.PENDING:
-        raise ValueError(
-            f"Task {task.id} cannot transition to running from {task.status}"
-        )
+        raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
 
 def _task_matches(task: Task, query: TaskQuery) -> bool:
@@ -427,12 +421,10 @@ def _task_matches(task: Task, query: TaskQuery) -> bool:
         return False
     if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
         return False
-    if (
+    return not (
         query.assigned_agent_name is not None
         and task.assigned_agent_name != query.assigned_agent_name
-    ):
-        return False
-    return True
+    )
 
 
 def _sort_tasks(tasks: list[Task], order_by: TaskOrder) -> list[Task]:

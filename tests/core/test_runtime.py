@@ -27,15 +27,15 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InMemoryTaskStore,
+    MessageWindowContextPolicy,
+    ModelCompactor,
+    RecentTurnsContextPolicy,
     ResumeRequest,
     RunRequest,
     Session,
     SessionStatus,
     TaskCreate,
     TaskStatus,
-    MessageWindowContextPolicy,
-    ModelCompactor,
-    RecentTurnsContextPolicy,
     default_compaction_prompt,
     trim_context_messages,
     trim_context_turns,
@@ -60,9 +60,7 @@ class FakeProvider(ModelProvider):
         self.requests.append(request)
         batch_index = len(self.requests) - 1
         if batch_index >= len(self.event_batches):
-            raise AssertionError(
-                f"No fake provider event batch for request {batch_index}"
-            )
+            raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
             yield event
 
@@ -637,9 +635,7 @@ def test_cayu_app_resume_uses_context_policy_and_preserves_full_transcript():
             self.seen_messages: list[list[str]] = []
 
         async def build(self, request: ContextRequest) -> list[Message]:
-            self.seen_messages.append(
-                [message.content[0].text for message in request.messages]
-            )
+            self.seen_messages.append([message.content[0].text for message in request.messages])
             return [request.messages[-1]]
 
     store = InMemorySessionStore()
@@ -840,9 +836,7 @@ def test_cayu_app_fails_task_when_run_fails():
     provider = FakeProvider([ModelStreamEvent.error("provider down")])
 
     async def run_task_session() -> tuple[list[Event], object, object]:
-        await task_store.create_task(
-            TaskCreate(task_id="task_runtime_failure", type="respond")
-        )
+        await task_store.create_task(TaskCreate(task_id="task_runtime_failure", type="respond"))
         app = CayuApp(session_store=session_store, task_store=task_store)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -935,9 +929,7 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
     )
 
     async def run_task_session() -> tuple[list[Event], object]:
-        await task_store.create_task(
-            TaskCreate(task_id="task_claimed_elsewhere", type="respond")
-        )
+        await task_store.create_task(TaskCreate(task_id="task_claimed_elsewhere", type="respond"))
         await task_store.start_task(
             "task_claimed_elsewhere",
             session_id="other_session",
@@ -968,10 +960,7 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
     assert task.status == TaskStatus.RUNNING
     assert task.session_id == "other_session"
     assert events[-1].payload == {
-        "error": (
-            "Task task_claimed_elsewhere cannot transition to running "
-            "from running"
-        ),
+        "error": ("Task task_claimed_elsewhere cannot transition to running from running"),
         "error_type": "ValueError",
     }
     assert provider.requests == []
@@ -1039,9 +1028,7 @@ def test_cayu_app_records_sink_failures_without_failing_session():
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
 
-    sink_failures = [
-        event for event in persisted if event.type == EventType.RUNTIME_SINK_FAILED
-    ]
+    sink_failures = [event for event in persisted if event.type == EventType.RUNTIME_SINK_FAILED]
     assert len(sink_failures) == len(events)
     assert sink_failures[0].payload == {
         "sink": "FailingEventSink",
@@ -1397,9 +1384,7 @@ def test_cayu_app_rejects_context_policy_that_cuts_through_tool_round():
         EventType.TOOL_CALL_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert "tool results without preceding assistant tool calls" in events[-1].payload[
-        "error"
-    ]
+    assert "tool results without preceding assistant tool calls" in events[-1].payload["error"]
 
 
 def test_builtin_context_policies_trim_recent_history_safely():
@@ -1555,9 +1540,7 @@ def test_model_compactor_bounds_large_compaction_input():
 
     prompt = provider.requests[0].messages[1].content[0].text
     assert len(prompt) == 1000
-    assert prompt.startswith(
-        "Summarize the transcript below so a future agent step can continue"
-    )
+    assert prompt.startswith("Summarize the transcript below so a future agent step can continue")
     assert "Existing summary:\nimportant previous summary" in prompt
     assert "Transcript to compact:\n[compaction transcript clipped" in prompt
     assert result.metadata["input_truncated"] is True
@@ -1595,9 +1578,7 @@ def test_model_compactor_accepts_custom_prompt_builder():
 
     assert result.summary == "custom summary"
     assert len(seen_requests) == 1
-    assert provider.requests[0].messages[1].content[0].text == (
-        "custom prompt for sess_context"
-    )
+    assert provider.requests[0].messages[1].content[0].text == ("custom prompt for sess_context")
 
 
 def test_model_compactor_accepts_exported_default_prompt_builder():
@@ -1721,8 +1702,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "user",
     ]
     assert provider_context[1].content[0].text == (
-        "Previous session context summary:\n"
-        "old one|old answer one|old two|old answer two"
+        "Previous session context summary:\nold one|old answer one|old two|old answer two"
     )
     assert provider_context[2].content[0].text == "current"
 
@@ -1804,9 +1784,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     assert len(compactor_provider.requests) == 1
     assert compactor_provider.requests[0].model == "summary-model"
     assert compactor_provider.requests[0].tools == []
-    assert compactor_provider.requests[0].options == {
-        "anthropic": {"max_tokens": 512}
-    }
+    assert compactor_provider.requests[0].options == {"anthropic": {"max_tokens": 512}}
     assert events[1].payload == {
         "checkpoint": "context_compaction",
         "compactor": "ModelCompactor",
@@ -2243,8 +2221,7 @@ def test_cayu_app_resume_uses_checkpointed_compaction_summary():
     provider_context = provider.requests[1].messages
     assert [message.role for message in provider_context] == ["user", "user"]
     assert provider_context[0].content[0].text == (
-        "Previous session context summary:\n"
-        "old|old answer|current|first answer"
+        "Previous session context summary:\nold|old answer|current|first answer"
     )
     assert provider_context[1].content[0].text == "follow up"
 
@@ -2597,9 +2574,7 @@ def test_cayu_app_returns_nonblank_tool_failure_when_exception_message_is_blank(
     )
 
     assert events[4].type == EventType.TOOL_CALL_FAILED
-    assert events[4].payload["result"]["content"] == (
-        "RuntimeError: tool execution failed"
-    )
+    assert events[4].payload["result"]["content"] == ("RuntimeError: tool execution failed")
 
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.type == "tool_result"
@@ -2644,9 +2619,7 @@ def test_cayu_app_returns_nonblank_tool_failure_when_tool_error_content_is_blank
     )
 
     assert events[4].type == EventType.TOOL_CALL_FAILED
-    assert events[4].payload["result"]["content"] == (
-        "Tool returned an error without details."
-    )
+    assert events[4].payload["result"]["content"] == ("Tool returned an error without details.")
 
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.type == "tool_result"
@@ -2759,9 +2732,7 @@ def test_cayu_app_returns_clear_tool_failure_for_invalid_constructed_result():
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.type == "tool_result"
     assert tool_result_part.is_error is True
-    assert tool_result_part.content == (
-        "`structured` must contain JSON-compatible values."
-    )
+    assert tool_result_part.content == ("`structured` must contain JSON-compatible values.")
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
 
@@ -3019,12 +2990,8 @@ def test_cayu_app_protects_agent_metadata_from_provider_mutation():
     )
 
     assert events[-1].type == EventType.SESSION_COMPLETED
-    assert provider.requests[0].options["agent_metadata"] == {
-        "nested": {"value": "mutated"}
-    }
-    assert provider.requests[1].options["agent_metadata"] == {
-        "nested": {"value": "original"}
-    }
+    assert provider.requests[0].options["agent_metadata"] == {"nested": {"value": "mutated"}}
+    assert provider.requests[1].options["agent_metadata"] == {"nested": {"value": "original"}}
 
 
 def test_cayu_app_groups_multiple_tool_calls_and_results_in_history():
@@ -3316,9 +3283,7 @@ def test_cayu_app_validates_provider_stream_event_payload_container():
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "ValueError"
-    assert events[-1].payload["error"] == (
-        "Model provider stream event payload must be an object."
-    )
+    assert events[-1].payload["error"] == ("Model provider stream event payload must be an object.")
 
 
 def test_cayu_app_rejects_provider_stream_event_subclasses_before_attribute_access():
@@ -3358,9 +3323,7 @@ def test_cayu_app_rejects_provider_stream_event_subclasses_before_attribute_acce
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "TypeError"
-    assert events[-1].payload["error"] == (
-        "Model providers must yield ModelStreamEvent instances."
-    )
+    assert events[-1].payload["error"] == ("Model providers must yield ModelStreamEvent instances.")
 
 
 def test_cayu_app_runtime_owns_model_event_identity():
@@ -3674,9 +3637,7 @@ def test_cayu_app_fails_session_when_provider_stream_ends_without_completion():
         EventType.MODEL_TEXT_DELTA,
         EventType.SESSION_FAILED,
     ]
-    assert events[-1].payload["error"] == (
-        "Model provider stream ended without a completed event."
-    )
+    assert events[-1].payload["error"] == ("Model provider stream ended without a completed event.")
     assert session is not None
     assert session.status == SessionStatus.FAILED
 
@@ -4206,9 +4167,7 @@ def test_cayu_app_runs_with_explicit_environment():
     )
 
     assert events[0].environment_name == "docker"
-    assert provider.requests[0].options["environment_metadata"] == {
-        "kind": "isolated"
-    }
+    assert provider.requests[0].options["environment_metadata"] == {"kind": "isolated"}
 
 
 def test_cayu_app_runs_without_environment_when_none_registered():

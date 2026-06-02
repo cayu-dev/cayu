@@ -32,9 +32,7 @@ class FakeProvider(ModelProvider):
         self.requests.append(request)
         batch_index = len(self.requests) - 1
         if batch_index >= len(self.event_batches):
-            raise AssertionError(
-                f"No fake provider event batch for request {batch_index}"
-            )
+            raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
             yield event
 

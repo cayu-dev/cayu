@@ -66,7 +66,7 @@ class McpServerSpec(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_transport(self) -> "McpServerSpec":
+    def validate_transport(self) -> McpServerSpec:
         if bool(self.command) == bool(self.url):
             raise ValueError("MCP server must define exactly one of command or url.")
         return self

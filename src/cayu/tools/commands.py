@@ -4,7 +4,6 @@ from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, Runner
 
-
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
 DEFAULT_TIMEOUT_SECONDS = 60

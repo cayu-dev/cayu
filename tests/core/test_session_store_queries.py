@@ -9,7 +9,6 @@ from cayu import EventQuery, SessionOrder, SessionQuery, SQLiteSessionStore
 from cayu.core import Event, EventType, Message
 from cayu.runtime import InMemorySessionStore, RunRequest, SessionStatus, SessionStore
 
-
 StoreFactory = Callable[[object], SessionStore]
 
 
@@ -57,9 +56,7 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         hosted_sessions = await store.list_sessions(
             SessionQuery(environment_name="hosted", order_by=SessionOrder.CREATED_AT_ASC)
         )
-        completed_sessions = await store.list_sessions(
-            SessionQuery(status=SessionStatus.COMPLETED)
-        )
+        completed_sessions = await store.list_sessions(SessionQuery(status=SessionStatus.COMPLETED))
         paged_sessions = await store.list_sessions(
             SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
         )
@@ -146,9 +143,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         all_records = await store.query_events(EventQuery(limit=10))
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
-        started_records = await store.query_events(
-            EventQuery(event_type=EventType.SESSION_STARTED)
-        )
+        started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )

@@ -28,11 +28,7 @@ async def main() -> None:
         return
 
     model = os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
-    root = (
-        Path(__file__).resolve().parents[1]
-        / ".examples-workspaces"
-        / "openai-local-tools"
-    )
+    root = Path(__file__).resolve().parents[1] / ".examples-workspaces" / "openai-local-tools"
     root.mkdir(parents=True, exist_ok=True)
     workspace = LocalWorkspace(root, workspace_id="openai-local-demo")
     runner = LocalRunner(root, inherit_env=False)

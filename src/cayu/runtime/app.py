@@ -52,13 +52,13 @@ from cayu.runtime.tasks import Task, TaskStore
 @dataclass(frozen=True)
 class RegisteredAgent:
     spec: AgentSpec
-    tools: Mapping[str, "RegisteredTool"]
+    tools: Mapping[str, RegisteredTool]
 
 
 @dataclass(frozen=True)
 class _RegisteredAgentState:
     spec: AgentSpec
-    tools: Mapping[str, "RegisteredTool"]
+    tools: Mapping[str, RegisteredTool]
     context_policy: ContextPolicy
 
 
@@ -128,9 +128,7 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
-        self.session_store = (
-            session_store if session_store is not None else InMemorySessionStore()
-        )
+        self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self._event_sinks = sinks
         self._agents: dict[str, _RegisteredAgentState] = {}
@@ -174,9 +172,7 @@ class CayuApp:
                 raise TypeError("Agent tools must be Tool instances.")
             registered_tool = _validate_registered_tool(tool)
             if registered_tool.name in tools_by_name:
-                raise ValueError(
-                    f"Duplicate tool registered for agent: {registered_tool.name}"
-                )
+                raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
 
         self._agents[stored_spec.name] = _RegisteredAgentState(
@@ -237,8 +233,7 @@ class CayuApp:
         return RegisteredAgent(
             spec=registered_agent.spec.model_copy(deep=True),
             tools={
-                name: _copy_registered_tool(tool)
-                for name, tool in registered_agent.tools.items()
+                name: _copy_registered_tool(tool) for name, tool in registered_agent.tools.items()
             },
         )
 
@@ -302,9 +297,7 @@ class CayuApp:
         request = _validate_run_request(request)
         registered_agent = self._get_registered_agent(request.agent_name)
         registered_provider = self._get_registered_provider()
-        registered_environment = self._get_registered_environment(
-            request.environment_name
-        )
+        registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
         session = await self.session_store.create(request)
@@ -526,8 +519,7 @@ class CayuApp:
                     stream_event = _validate_stream_event(raw_stream_event)
                     if model_completed:
                         raise RuntimeError(
-                            "Model provider emitted event after completed: "
-                            f"{stream_event.type}"
+                            f"Model provider emitted event after completed: {stream_event.type}"
                         )
 
                     if stream_event.type == ModelStreamEventType.TOOL_CALL:
@@ -551,16 +543,11 @@ class CayuApp:
                     yield await self._emit(event)
                     if stream_event.type == ModelStreamEventType.ERROR:
                         raise RuntimeError(
-                            str(
-                                stream_event.payload.get("error")
-                                or "Model provider error"
-                            )
+                            str(stream_event.payload.get("error") or "Model provider error")
                         )
 
                 if not model_completed:
-                    raise RuntimeError(
-                        "Model provider stream ended without a completed event."
-                    )
+                    raise RuntimeError("Model provider stream ended without a completed event.")
 
                 assistant_message = _assistant_message(
                     text="".join(assistant_text),
@@ -580,7 +567,7 @@ class CayuApp:
                 tool_outcomes: list[ToolCallOutcome] = []
                 for tool_call in tool_calls:
                     outcome = None
-                    async for event, outcome in self._execute_tool_call(
+                    async for event, outcome in self._execute_tool_call(  # noqa: B007
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -766,9 +753,7 @@ class CayuApp:
             arguments=deepcopy(tool_call.arguments),
         )
         event_type = (
-            EventType.TOOL_CALL_FAILED
-            if result.is_error
-            else EventType.TOOL_CALL_COMPLETED
+            EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
         )
         yield (
             await self._emit(
@@ -925,10 +910,7 @@ async def _build_context(
             context_messages,
             copy_json_value(result.checkpoint, "checkpoint"),
             result.checkpoint_event_payload,
-            [
-                telemetry.model_copy(deep=True)
-                for telemetry in result.compaction_telemetry
-            ],
+            [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
         )
 
     result = await context_policy.build(request)
@@ -1000,10 +982,7 @@ def _task_event(
 
 
 def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str | None:
-    if (
-        registered_environment is None
-        or registered_environment.environment.workspace is None
-    ):
+    if registered_environment is None or registered_environment.environment.workspace is None:
         return None
     workspace_id = getattr(registered_environment.environment.workspace, "id", None)
     if workspace_id is None:
@@ -1039,9 +1018,7 @@ def _mcp_servers(
 
 def _normalize_tool_result(result: ToolResult) -> ToolResult:
     if result.is_error and not result.content.strip():
-        return result.model_copy(
-            update={"content": "Tool returned an error without details."}
-        )
+        return result.model_copy(update={"content": "Tool returned an error without details."})
     return result
 
 
@@ -1175,9 +1152,7 @@ def _provider_state_parts(payload: dict[str, Any]) -> list[ProviderStatePart]:
     parts: list[ProviderStatePart] = []
     for index, raw_part in enumerate(raw_parts):
         if type(raw_part) is not dict:
-            raise ValueError(
-                f"Model completed payload provider_state[{index}] must be an object."
-            )
+            raise ValueError(f"Model completed payload provider_state[{index}] must be an object.")
         provider = raw_part.get("provider")
         state = raw_part.get("state")
         parts.append(ProviderStatePart(provider=provider, state=state))

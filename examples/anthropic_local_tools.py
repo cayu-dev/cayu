@@ -28,11 +28,7 @@ async def main() -> None:
         return
 
     model = os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
-    root = (
-        Path(__file__).resolve().parents[1]
-        / ".examples-workspaces"
-        / "anthropic-local-tools"
-    )
+    root = Path(__file__).resolve().parents[1] / ".examples-workspaces" / "anthropic-local-tools"
     root.mkdir(parents=True, exist_ok=True)
     workspace = LocalWorkspace(root, workspace_id="anthropic-local-demo")
     runner = LocalRunner(root, inherit_env=False)

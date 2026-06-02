@@ -43,20 +43,12 @@ src/cayu/
 
 ## Development
 
-Standard Python:
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-```
-
-Or with `uv`:
-
-```bash
-uv sync
+uv sync --extra dev
 uv run pytest
+uv run ruff check src/ tests/ examples/
+uv run ruff format src/ tests/ examples/
+uv run ty check --exit-zero
 ```
 
 ## Example

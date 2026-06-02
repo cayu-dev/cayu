@@ -26,7 +26,6 @@ from cayu.providers.base import (
 )
 from cayu.runtime.sessions import Session
 
-
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 1
 
@@ -154,8 +153,7 @@ class ContextBuildError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.compaction_telemetry = tuple(
-            copy_context_compaction_telemetry(item)
-            for item in compaction_telemetry
+            copy_context_compaction_telemetry(item) for item in compaction_telemetry
         )
         self.cause = cause
 
@@ -397,9 +395,7 @@ class ModelCompactor(ContextCompactor):
             elif event.type == ModelStreamEventType.COMPLETED:
                 completed_payload = event.payload
             else:
-                raise RuntimeError(
-                    f"Compaction provider emitted unsupported event: {event.type}"
-                )
+                raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
 
         if completed_payload is None:
             raise RuntimeError("Compaction model stream ended without a completed event.")
@@ -488,9 +484,8 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             previous_summary = None
 
         newly_compactable = request.messages[previous_cursor:compactable_cursor]
-        should_compact = (
-            len(compactable_messages) >= self.compact_after_messages
-            and bool(newly_compactable)
+        should_compact = len(compactable_messages) >= self.compact_after_messages and bool(
+            newly_compactable
         )
 
         checkpoint_update = None
@@ -642,11 +637,7 @@ def trim_context_turns(
     validate_context_messages(copied_messages)
 
     system_prefix, body = _split_system_prefix(copied_messages, preserve_system)
-    turn_starts = [
-        index
-        for index, message in enumerate(body)
-        if message.role == MessageRole.USER
-    ]
+    turn_starts = [index for index, message in enumerate(body) if message.role == MessageRole.USER]
     if not turn_starts:
         candidate = system_prefix + body
         validate_context_messages(candidate)
@@ -669,7 +660,7 @@ def validate_context_messages(messages: list[Message]) -> None:
         raise ValueError("Context messages cannot be empty.")
 
     pending_tool_call_ids: set[str] | None = None
-    for index, message in enumerate(messages):
+    for message in messages:
         if type(message) is not Message:
             raise TypeError("Context messages must be Message instances.")
 
@@ -692,15 +683,12 @@ def validate_context_messages(messages: list[Message]) -> None:
 
         if message.role == MessageRole.TOOL:
             raise ValueError(
-                "Context messages contain tool results without preceding assistant "
-                "tool calls."
+                "Context messages contain tool results without preceding assistant tool calls."
             )
 
         if message.role == MessageRole.ASSISTANT:
             tool_call_ids = [
-                part.tool_call_id
-                for part in message.content
-                if type(part) is ToolCallPart
+                part.tool_call_id for part in message.content if type(part) is ToolCallPart
             ]
             if len(tool_call_ids) != len(set(tool_call_ids)):
                 raise ValueError("Context messages contain duplicate tool call ids.")
@@ -709,8 +697,7 @@ def validate_context_messages(messages: list[Message]) -> None:
 
     if pending_tool_call_ids is not None:
         raise ValueError(
-            "Context messages end with assistant tool calls that have no matching "
-            "tool results."
+            "Context messages end with assistant tool calls that have no matching tool results."
         )
 
 
@@ -737,11 +724,7 @@ def _split_recent_turns(
     copied_messages = [copy_message(message) for message in messages]
     validate_context_messages(copied_messages)
     system_prefix, body = _split_system_prefix(copied_messages, True)
-    turn_starts = [
-        index
-        for index, message in enumerate(body)
-        if message.role == MessageRole.USER
-    ]
+    turn_starts = [index for index, message in enumerate(body) if message.role == MessageRole.USER]
     if not turn_starts or len(turn_starts) <= max_user_turns:
         return system_prefix, [], body, len(system_prefix)
     recent_start = turn_starts[-max_user_turns]
@@ -822,9 +805,7 @@ def default_compaction_prompt(
 ) -> str:
     """Build the default user prompt for model-backed context compaction."""
 
-    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(
-        request
-    )
+    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(request)
     return f"{prefix}\n\n{transcript_prefix}{transcript_digest}"
 
 
@@ -833,9 +814,7 @@ def _bounded_default_compaction_prompt(
     *,
     max_chars: int | None,
 ) -> tuple[str, bool]:
-    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(
-        request
-    )
+    prefix, transcript_prefix, transcript_digest = _default_compaction_prompt_parts(request)
     prompt = f"{prefix}\n\n{transcript_prefix}{transcript_digest}"
     if max_chars is None or len(prompt) <= max_chars:
         return prompt, False
@@ -844,8 +823,7 @@ def _bounded_default_compaction_prompt(
     available = max_chars - len(prefix) - 2 - len(transcript_prefix) - len(marker)
     if available <= 0:
         raise ValueError(
-            "max_input_chars is too small to preserve compaction instructions "
-            "and existing summary."
+            "max_input_chars is too small to preserve compaction instructions and existing summary."
         )
     return (
         f"{prefix}\n\n{transcript_prefix}{marker}{transcript_digest[-available:]}",

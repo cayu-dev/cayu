@@ -94,11 +94,7 @@ class LocalRunner(Runner):
                 exit_code=126,
             )
 
-        input_bytes = (
-            standard_input.encode("utf-8")
-            if standard_input is not None
-            else None
-        )
+        input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
         stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
         stdout_task = asyncio.create_task(_read_limited(process.stdout, output_limit))
         stderr_task = asyncio.create_task(_read_limited(process.stderr, output_limit))
@@ -106,7 +102,7 @@ class LocalRunner(Runner):
         try:
             await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
             timed_out = False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timed_out = True
             _kill_process(process)
             try:
