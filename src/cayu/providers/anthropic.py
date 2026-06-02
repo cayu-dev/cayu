@@ -11,7 +11,6 @@ import certifi
 import httpx
 
 from cayu._validation import copy_json_value, require_nonblank
-from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -175,41 +174,6 @@ class AnthropicProvider(ModelProvider):
                 yield event
         except Exception as exc:
             yield ModelStreamEvent.error(_exception_message(exc))
-
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-            return Event(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload={"delta": stream_event.delta},
-            )
-        if stream_event.type == ModelStreamEventType.COMPLETED:
-            return Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        if stream_event.type == ModelStreamEventType.ERROR:
-            return Event(
-                type=EventType.MODEL_ERROR,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        return Event(
-            type=f"custom.provider.{stream_event.type}",
-            session_id=session_id,
-            agent_name=agent_name,
-            payload=stream_event.payload,
-        )
 
     def _headers(self) -> dict[str, str]:
         headers = {

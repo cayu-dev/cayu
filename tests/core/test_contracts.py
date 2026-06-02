@@ -519,6 +519,11 @@ def test_model_stream_event_rejects_blank_type():
         ModelStreamEvent(type=" ")
 
 
+def test_model_stream_event_rejects_unknown_type():
+    with pytest.raises(ValueError, match="not a valid"):
+        ModelStreamEvent(type="custom_provider_event")
+
+
 def test_model_stream_tool_call_rejects_invalid_helper_inputs():
     with pytest.raises(ValueError, match="cannot be blank"):
         ModelStreamEvent.tool_call(name=" ", arguments={})

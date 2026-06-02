@@ -7,7 +7,6 @@ from typing import Any, AsyncIterator
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_nonblank
-from cayu.core.events import Event
 from cayu.core.messages import Message, copy_message
 
 
@@ -52,7 +51,7 @@ class ModelStreamEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    type: ModelStreamEventType | str
+    type: ModelStreamEventType
     delta: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -61,12 +60,12 @@ class ModelStreamEvent(BaseModel):
     def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "payload")
 
-    @field_validator("type")
+    @field_validator("type", mode="before")
     @classmethod
-    def validate_type(cls, value: ModelStreamEventType | str) -> ModelStreamEventType | str:
+    def validate_type(cls, value: object) -> ModelStreamEventType:
         if isinstance(value, ModelStreamEventType):
             return value
-        return require_nonblank(value, "type")
+        return ModelStreamEventType(require_nonblank(value, "type"))
 
     @classmethod
     def text_delta(cls, delta: str) -> "ModelStreamEvent":
@@ -109,8 +108,8 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
     if type(event) is not ModelStreamEvent:
         raise TypeError("Model providers must yield ModelStreamEvent instances.")
     event_type = event.type
-    if type(event_type) is not ModelStreamEventType and type(event_type) is not str:
-        raise ValueError("Model provider stream event type must be a string.")
+    if type(event_type) is not ModelStreamEventType:
+        raise ValueError("Model provider stream event type must be a ModelStreamEventType.")
     if type(event.delta) is not str:
         raise ValueError("Model provider stream event delta must be a string.")
     if type(event.payload) is not dict:
@@ -130,13 +129,3 @@ class ModelProvider(ABC):
     @abstractmethod
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Stream model events for one request."""
-
-    @abstractmethod
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        """Convert a provider-native stream event into a framework event."""

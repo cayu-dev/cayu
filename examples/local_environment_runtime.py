@@ -11,8 +11,6 @@ from cayu import (
     CayuApp,
     Environment,
     EnvironmentSpec,
-    Event,
-    EventType,
     ExecCommandTool,
     ListFilesTool,
     LocalRunner,
@@ -26,7 +24,6 @@ from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
-    ModelStreamEventType,
 )
 
 
@@ -73,34 +70,6 @@ class FakeProvider(ModelProvider):
         self.requests.append(request)
         for event in self._batches[len(self.requests) - 1]:
             yield event
-
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-            return Event(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload={"delta": stream_event.delta},
-            )
-        if stream_event.type == ModelStreamEventType.COMPLETED:
-            return Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        return Event(
-            type=f"custom.provider.{stream_event.type}",
-            session_id=session_id,
-            agent_name=agent_name,
-            payload=stream_event.payload,
-        )
 
 
 async def main() -> None:

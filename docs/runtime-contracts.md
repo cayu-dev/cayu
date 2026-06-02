@@ -38,7 +38,7 @@ This mirrors the useful Managed Agents separation of brain, hands, and durable r
 
 ## Event
 
-Append-only event emitted by runtime, providers, tools, workflows, memory, runners, and sessions.
+Append-only event emitted by the runtime for sessions, model steps, tools, workflows, memory, runners, and storage-visible lifecycle changes.
 Framework event types are enumerated. Extension events must use the `custom.` namespace so typos do not silently become durable event names.
 
 Events power:
@@ -56,7 +56,7 @@ Creates sessions, stores events, stores provider-neutral transcripts, and checkp
 
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Reusing `RunRequest.session_id` never resumes an existing session.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime may use the default registered environment; if no environment is registered, simple runs can still execute without one.
-Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and normalizes provider events before emitting them.
+Events emitted for an environment-backed run carry `environment_name` as a top-level event identity field, not as payload data. Runtime code owns this field and converts provider stream events before emitting runtime events.
 
 `ResumeRequest` explicitly continues an existing session. It loads the stored provider-neutral transcript, appends the new request messages to that same transcript, emits `session.resumed`, and runs the same model/tool loop as a new session. Resume uses the session's stored agent and environment identity; callers do not pass a new agent or environment. A session can be resumed only from `completed`, `failed`, or `interrupted`. `pending` and `running` sessions are rejected so concurrent workers do not continue the same session at the same time. Session stores expose an atomic status transition for this boundary.
 
@@ -135,9 +135,9 @@ Provider adapters must:
 - yield `ModelStreamEvent` values
 - emit a `completed` stream event for each model step
 - stop emitting after `completed`
-- convert stream events into `Event` values for the current session
+- keep provider-specific API payload formatting isolated inside the adapter
 
-Provider errors should become model error events and failed sessions. Tool calls should be emitted as structured tool-call stream events so the runtime can execute tools and feed structured results back into the next model step.
+The runtime owns conversion from `ModelStreamEvent` to durable runtime `Event` records, including `session_id`, `agent_name`, and `environment_name`. Provider errors should be yielded as model error stream events; the runtime records the model error event and fails the session. Tool calls should be emitted as structured tool-call stream events so the runtime can execute tools and feed structured results back into the next model step.
 
 The initial `AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks. The first implementation uses complete Messages API responses and yields normalized Cayu stream events from the returned assistant message. Server-sent-event streaming can be added behind the same provider contract later.
 

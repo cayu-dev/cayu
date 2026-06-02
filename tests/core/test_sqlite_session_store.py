@@ -11,7 +11,6 @@ from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
-    ModelStreamEventType,
 )
 from cayu.runtime import CayuApp, ResumeRequest, RunRequest, SessionStatus
 
@@ -38,29 +37,6 @@ class FakeProvider(ModelProvider):
             )
         for event in self.event_batches[batch_index]:
             yield event
-
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-            return Event(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload={"delta": stream_event.delta},
-            )
-        if stream_event.type == ModelStreamEventType.COMPLETED:
-            return Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        raise AssertionError(f"Unexpected fake stream event: {stream_event.type}")
 
 
 async def _close(store: SQLiteSessionStore) -> None:

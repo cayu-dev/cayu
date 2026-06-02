@@ -66,41 +66,6 @@ class FakeProvider(ModelProvider):
         for event in self.event_batches[batch_index]:
             yield event
 
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-            return Event(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload={"delta": stream_event.delta},
-            )
-        if stream_event.type == ModelStreamEventType.COMPLETED:
-            return Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        if stream_event.type == ModelStreamEventType.ERROR:
-            return Event(
-                type=EventType.MODEL_ERROR,
-                session_id=session_id,
-                agent_name=agent_name,
-                payload=stream_event.payload,
-            )
-        return Event(
-            type=f"custom.provider.{stream_event.type}",
-            session_id=session_id,
-            agent_name=agent_name,
-            payload=stream_event.payload,
-        )
-
 
 class MutatingProvider(FakeProvider):
     def __init__(self) -> None:
@@ -192,26 +157,6 @@ class MetadataMutatingProvider(FakeProvider):
             if len(self.requests) == 1:
                 request.options["agent_metadata"]["nested"]["value"] = "mutated"
             yield event
-
-
-class EventReturningProvider(FakeProvider):
-    def __init__(self, event: object) -> None:
-        super().__init__(
-            [
-                ModelStreamEvent.text_delta("hello"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ]
-        )
-        self.event = event
-
-    def to_event(
-        self,
-        stream_event: ModelStreamEvent,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-    ) -> Event:
-        return self.event  # type: ignore[return-value]
 
 
 class EchoTool(Tool):
@@ -3418,134 +3363,54 @@ def test_cayu_app_rejects_provider_stream_event_subclasses_before_attribute_acce
     )
 
 
-@pytest.mark.parametrize(
-    ("runtime_event", "error_type", "error"),
-    [
-        (
-            {"type": "model.text.delta"},
-            "TypeError",
-            "Model providers must convert stream events to Event instances.",
-        ),
-        (
-            Event.model_construct(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id="wrong_session",
-                payload={"delta": "hello"},
-            ),
-            "ValueError",
-            "Provider event session_id does not match current session.",
-        ),
-    ],
-)
-def test_cayu_app_validates_provider_runtime_events(
-    runtime_event,
-    error_type,
-    error,
-):
+def test_cayu_app_runtime_owns_model_event_identity():
     store = InMemorySessionStore()
-    provider = EventReturningProvider(runtime_event)
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="You are careful.",
+        )
+    )
 
     events = asyncio.run(
         collect_events(
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id=f"sess_bad_runtime_event_{error_type}",
-                messages=[Message.text("user", "bad runtime event")],
+                session_id="sess_model_event_identity",
+                messages=[Message.text("user", "hi")],
             ),
         )
     )
 
-    assert [event.type for event in events] == [
-        EventType.SESSION_STARTED,
-        EventType.MODEL_STARTED,
-        EventType.SESSION_FAILED,
+    model_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.MODEL_STARTED,
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+        }
     ]
-    assert events[-1].payload["error_type"] == error_type
-    assert events[-1].payload["error"] == error
-
-
-def test_cayu_app_validates_provider_runtime_event_payload_container():
-    class BadPayload(dict):
-        def items(self):
-            raise RuntimeError("custom event payload traversal should not run")
-
-    store = InMemorySessionStore()
-    provider = EventReturningProvider(
-        Event.model_construct(
-            type=EventType.MODEL_TEXT_DELTA,
-            session_id="sess_bad_runtime_event_payload",
-            payload=BadPayload({"delta": "hello"}),
-        )
-    )
-    app = CayuApp(session_store=store)
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_bad_runtime_event_payload",
-                messages=[Message.text("user", "bad runtime event payload")],
-            ),
-        )
-    )
-
-    assert [event.type for event in events] == [
-        EventType.SESSION_STARTED,
+    assert [event.type for event in model_events] == [
         EventType.MODEL_STARTED,
-        EventType.SESSION_FAILED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
     ]
-    assert events[-1].payload["error_type"] == "ValueError"
-    assert events[-1].payload["error"] == (
-        "`payload` must contain JSON-compatible values."
-    )
-
-
-def test_cayu_app_rejects_provider_runtime_event_subclasses_before_attribute_access():
-    class BadEvent(Event):
-        def __getattribute__(self, name):
-            if name == "type":
-                raise RuntimeError("runtime event type access should not run")
-            return super().__getattribute__(name)
-
-    store = InMemorySessionStore()
-    provider = EventReturningProvider(
-        BadEvent.model_construct(
-            type=EventType.MODEL_COMPLETED,
-            session_id="sess_bad_runtime_event_subclass",
-            payload={},
-        )
-    )
-    app = CayuApp(session_store=store)
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_bad_runtime_event_subclass",
-                messages=[Message.text("user", "bad runtime event")],
-            ),
-        )
-    )
-
-    assert [event.type for event in events] == [
-        EventType.SESSION_STARTED,
-        EventType.MODEL_STARTED,
-        EventType.SESSION_FAILED,
-    ]
-    assert events[-1].payload["error_type"] == "TypeError"
-    assert events[-1].payload["error"] == (
-        "Model providers must convert stream events to Event instances."
-    )
+    assert {event.session_id for event in model_events} == {"sess_model_event_identity"}
+    assert {event.agent_name for event in model_events} == {"assistant"}
+    assert {event.environment_name for event in model_events} == {"local"}
 
 
 def test_cayu_app_records_failed_session_for_blank_tool_call_name():
@@ -4471,14 +4336,12 @@ def test_cayu_app_tags_all_runtime_events_with_environment():
     assert all("environment_name" not in event.payload for event in events)
 
 
-def test_cayu_app_overrides_provider_event_environment():
-    provider = EventReturningProvider(
-        Event(
-            type=EventType.MODEL_COMPLETED,
-            session_id="sess_provider_environment",
-            environment_name="provider_wrong",
-            payload={"finish_reason": "stop"},
-        )
+def test_cayu_app_model_events_use_runtime_environment():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
     )
     app = CayuApp()
     app.register_provider(provider, default=True)
@@ -4497,7 +4360,17 @@ def test_cayu_app_overrides_provider_event_environment():
     )
 
     assert events
-    assert {event.environment_name for event in events} == {"local"}
+    model_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.MODEL_STARTED,
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+        }
+    ]
+    assert {event.environment_name for event in model_events} == {"local"}
 
 
 def test_cayu_app_rejects_invalid_environment_lookup_name():

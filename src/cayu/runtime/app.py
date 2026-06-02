@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
@@ -532,15 +532,12 @@ class CayuApp:
                     elif stream_event.type == ModelStreamEventType.COMPLETED:
                         model_completed = True
 
-                    event = _validate_runtime_event(
-                        provider.to_event(
-                            stream_event,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                        ),
-                        session_id=session.id,
+                    event = _model_stream_event_to_runtime_event(
+                        stream_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
                     )
-                    event = _with_event_environment(event, environment_name)
                     yield await self._emit(event)
                     if stream_event.type == ModelStreamEventType.ERROR:
                         raise RuntimeError(
@@ -967,22 +964,6 @@ def _context_compaction_telemetry_event(
     )
 
 
-def _with_event_environment(event: Event, environment_name: str | None) -> Event:
-    if type(event) is not Event:
-        raise TypeError("Runtime events must be Event instances.")
-    return Event(
-        type=event.type,
-        session_id=event.session_id,
-        id=event.id,
-        timestamp=event.timestamp,
-        agent_name=event.agent_name,
-        environment_name=environment_name,
-        workflow_name=event.workflow_name,
-        tool_name=event.tool_name,
-        payload=copy_json_value(event.payload, "payload"),
-    )
-
-
 def _task_event(
     *,
     event_type: EventType,
@@ -1075,13 +1056,40 @@ def _validate_stream_event(value: object) -> ModelStreamEvent:
     return copy_model_stream_event(value)
 
 
-def _validate_runtime_event(value: object, *, session_id: str) -> Event:
-    if type(value) is not Event:
-        raise TypeError("Model providers must convert stream events to Event instances.")
-    event = copy_event(value)
-    if event.session_id != session_id:
-        raise ValueError("Provider event session_id does not match current session.")
-    return event
+def _model_stream_event_to_runtime_event(
+    stream_event: ModelStreamEvent,
+    *,
+    session: Session,
+    registered_agent: _RegisteredAgentState,
+    environment_name: str | None,
+) -> Event:
+    if type(stream_event) is not ModelStreamEvent:
+        raise TypeError("Model stream events must be ModelStreamEvent instances.")
+    if stream_event.type == ModelStreamEventType.TEXT_DELTA:
+        return Event(
+            type=EventType.MODEL_TEXT_DELTA,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload={"delta": stream_event.delta},
+        )
+    if stream_event.type == ModelStreamEventType.COMPLETED:
+        return Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=copy_json_value(stream_event.payload, "payload"),
+        )
+    if stream_event.type == ModelStreamEventType.ERROR:
+        return Event(
+            type=EventType.MODEL_ERROR,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=copy_json_value(stream_event.payload, "payload"),
+        )
+    raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
 
 
 def _require_payload_string(payload: dict[str, Any], key: str) -> str:
