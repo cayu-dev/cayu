@@ -24,6 +24,7 @@ from cayu.runtime.context import (
     ContextPolicy,
     ContextRequest,
     DefaultContextPolicy,
+    RuntimeManagedContextPolicy,
     copy_context_messages,
 )
 from cayu.runtime.event_sinks import EventSink
@@ -421,8 +422,9 @@ class CayuApp:
                 messages_to_append,
             )
             for step in range(1, max_steps + 1):
-                context_messages = await _build_context_messages(
+                context_messages, checkpoint_event_payload = await _build_context(
                     context_policy=registered_agent.context_policy,
+                    session_store=self.session_store,
                     session=session,
                     registered_agent=registered_agent,
                     messages=messages,
@@ -430,6 +432,16 @@ class CayuApp:
                     environment_name=environment_name,
                     request_metadata=request_metadata,
                 )
+                if checkpoint_event_payload is not None:
+                    yield await self._emit(
+                        Event(
+                            type=EventType.SESSION_CHECKPOINTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=checkpoint_event_payload,
+                        )
+                    )
 
                 model_request = ModelRequest(
                     model=registered_agent.spec.model,
@@ -837,16 +849,17 @@ def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
     return copy_resume_request(request)
 
 
-async def _build_context_messages(
+async def _build_context(
     *,
     context_policy: ContextPolicy,
+    session_store: SessionStore,
     session: Session,
     registered_agent: _RegisteredAgentState,
     messages: list[Message],
     step: int,
     environment_name: str | None,
     request_metadata: dict[str, Any],
-) -> list[Message]:
+) -> tuple[list[Message], dict[str, Any] | None]:
     request = ContextRequest(
         session=session.model_copy(deep=True),
         agent=registered_agent.spec.model_copy(deep=True),
@@ -855,8 +868,19 @@ async def _build_context_messages(
         environment_name=environment_name,
         metadata=copy_json_value(request_metadata, "metadata"),
     )
+    if isinstance(context_policy, RuntimeManagedContextPolicy):
+        checkpoint = await session_store.load_checkpoint(session.id)
+        result = await context_policy.build_with_checkpoint(
+            request,
+            checkpoint=checkpoint,
+        )
+        context_messages = copy_context_messages(result.messages)
+        if result.checkpoint is not None:
+            await session_store.checkpoint(session.id, result.checkpoint)
+        return context_messages, result.checkpoint_event_payload
+
     result = await context_policy.build(request)
-    return copy_context_messages(result)
+    return copy_context_messages(result), None
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:

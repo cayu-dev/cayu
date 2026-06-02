@@ -17,6 +17,10 @@ from cayu.providers import (
 )
 from cayu.runtime import (
     CayuApp,
+    CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
+    ContextCompactor,
     ContextPolicy,
     ContextRequest,
     EventSink,
@@ -25,9 +29,12 @@ from cayu.runtime import (
     InMemoryTaskStore,
     ResumeRequest,
     RunRequest,
+    Session,
     SessionStatus,
     TaskCreate,
     TaskStatus,
+    MessageWindowContextPolicy,
+    RecentTurnsContextPolicy,
     trim_context_messages,
     trim_context_turns,
 )
@@ -135,6 +142,23 @@ class RecordingEventSink(EventSink):
 
     async def emit(self, event: Event) -> None:
         self.events.append(event)
+
+
+class RecordingCompactor(ContextCompactor):
+    def __init__(self) -> None:
+        self.requests: list[CompactionRequest] = []
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        self.requests.append(request)
+        compacted_text = "|".join(message.content[0].text for message in request.messages)
+        if request.existing_summary is not None:
+            summary = f"{request.existing_summary}|{compacted_text}"
+        else:
+            summary = compacted_text
+        return CompactionResult(
+            summary=summary,
+            metadata={"request_count": len(self.requests)},
+        )
 
 
 class MetadataMutatingProvider(FakeProvider):
@@ -334,6 +358,10 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+def _test_session() -> Session:
+    return Session(id="sess_context", agent_name="assistant")
 
 
 def test_cayu_app_rejects_invalid_runtime_dependencies():
@@ -1419,6 +1447,223 @@ def test_cayu_app_rejects_context_policy_that_cuts_through_tool_round():
     ]
     assert "tool results without preceding assistant tool calls" in events[-1].payload[
         "error"
+    ]
+
+
+def test_builtin_context_policies_trim_recent_history_safely():
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "old"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current"),
+    ]
+
+    turns_policy = RecentTurnsContextPolicy(max_user_turns=1)
+    messages_policy = MessageWindowContextPolicy(max_messages=2)
+
+    async def build_contexts() -> tuple[list[Message], list[Message]]:
+        request = ContextRequest(
+            session=_test_session(),
+            agent=AgentSpec(name="assistant", model="fake-model"),
+            messages=messages,
+            step=1,
+        )
+        return (
+            await turns_policy.build(request),
+            await messages_policy.build(request),
+        )
+
+    turns_context, messages_context = asyncio.run(build_contexts())
+
+    assert [message.role for message in turns_context] == ["system", "user"]
+    assert [message.content[0].text for message in turns_context] == [
+        "You are careful.",
+        "current",
+    ]
+    assert [message.role for message in messages_context] == ["system", "user"]
+    assert [message.content[0].text for message in messages_context] == [
+        "You are careful.",
+        "current",
+    ]
+
+
+def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript():
+    store = InMemorySessionStore()
+    compactor = RecordingCompactor()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="You are careful.",
+        ),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction",
+                messages=[
+                    Message.text("user", "old one"),
+                    Message.text("assistant", "old answer one"),
+                    Message.text("user", "old two"),
+                    Message.text("assistant", "old answer two"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[1].payload == {
+        "checkpoint": "context_compaction",
+        "compacted_message_count": 4,
+        "newly_compacted_message_count": 4,
+        "recent_message_count": 1,
+    }
+    assert len(compactor.requests) == 1
+    assert [message.content[0].text for message in compactor.requests[0].messages] == [
+        "old one",
+        "old answer one",
+        "old two",
+        "old answer two",
+    ]
+
+    provider_context = provider.requests[0].messages
+    assert [message.role for message in provider_context] == [
+        "system",
+        "system",
+        "user",
+    ]
+    assert provider_context[1].content[0].text == (
+        "Previous session context summary:\n"
+        "old one|old answer one|old two|old answer two"
+    )
+    assert provider_context[2].content[0].text == "current"
+
+    transcript = asyncio.run(store.load_transcript("sess_compaction"))
+    assert [message.content[0].text for message in transcript] == [
+        "You are careful.",
+        "old one",
+        "old answer one",
+        "old two",
+        "old answer two",
+        "current",
+        "final answer",
+    ]
+    checkpoint = asyncio.run(store.load_checkpoint("sess_compaction"))
+    assert checkpoint == {
+        "context_compaction": {
+            "version": 1,
+            "summary": "old one|old answer one|old two|old answer two",
+            "compacted_message_count": 4,
+            "metadata": {"request_count": 1},
+        }
+    }
+
+
+def test_cayu_app_resume_uses_checkpointed_compaction_summary():
+    store = InMemorySessionStore()
+    compactor = RecordingCompactor()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_compaction",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_compaction",
+                messages=[Message.text("user", "follow up")],
+            ),
+        )
+    )
+
+    assert [event.type for event in resume_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(compactor.requests) == 2
+    assert [message.content[0].text for message in compactor.requests[1].messages] == [
+        "current",
+        "first answer",
+    ]
+    assert compactor.requests[1].existing_summary == "old|old answer"
+
+    provider_context = provider.requests[1].messages
+    assert [message.role for message in provider_context] == ["system", "user"]
+    assert provider_context[0].content[0].text == (
+        "Previous session context summary:\n"
+        "old|old answer|current|first answer"
+    )
+    assert provider_context[1].content[0].text == "follow up"
+
+    transcript = asyncio.run(store.load_transcript("sess_resume_compaction"))
+    assert [message.content[0].text for message in transcript] == [
+        "old",
+        "old answer",
+        "current",
+        "first answer",
+        "follow up",
+        "second answer",
     ]
 
 

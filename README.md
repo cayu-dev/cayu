@@ -13,9 +13,9 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, an initial Anthropic Messages API provider with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, and validation for framework boundary data.
 
-It does not yet include built-in context compaction policies, dashboard UI, hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
+It does not yet include dashboard UI, hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
 ## Contract Rules
 
@@ -148,18 +148,25 @@ Customize model-facing context without rewriting durable transcript history:
 ```python
 from cayu import (
     AgentSpec,
-    ContextPolicy,
-    ContextRequest,
-    Message,
-    trim_context_turns,
+    RecentTurnsContextPolicy,
 )
-
-class RecentUserTurnsOnly(ContextPolicy):
-    async def build(self, request: ContextRequest) -> list[Message]:
-        return trim_context_turns(request.messages, max_user_turns=10)
 
 app.register_agent(
     AgentSpec(name="assistant", model="claude-sonnet-4-6"),
-    context_policy=RecentUserTurnsOnly(),
+    context_policy=RecentTurnsContextPolicy(max_user_turns=10),
+)
+```
+
+Use checkpoint-backed compaction for long-running sessions:
+
+```python
+from cayu import AgentSpec, CheckpointCompactionContextPolicy
+
+app.register_agent(
+    AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+    context_policy=CheckpointCompactionContextPolicy(
+        max_user_turns=10,
+        compact_after_messages=40,
+    ),
 )
 ```

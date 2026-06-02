@@ -20,6 +20,8 @@ The durable transcript is the source record of what happened in the session. A c
 
 Context output must preserve complete tool rounds: assistant tool calls must be followed by matching tool results, and tool results cannot appear without their preceding assistant tool calls. Policies that trim recent history should use `trim_context_turns(...)` for user-turn based history or `trim_context_messages(...)` for message-count based history instead of slicing blindly. Both helpers preserve leading system messages by default.
 
+Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, and `CheckpointCompactionContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `session.checkpointed`, and sends leading system messages plus the compacted summary plus recent complete turns to the provider. It does not delete or rewrite transcript messages.
+
 ## Agent, Environment, Session
 
 Cayu separates agent definition, execution environment, and session state:
@@ -63,7 +65,7 @@ Session stores expose two read surfaces:
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
 
-Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and future compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
+Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted.
 
 ## TaskStore
 
