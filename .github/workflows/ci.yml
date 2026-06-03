@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install ${{ matrix.python-version }}
-      - run: uv sync --frozen --extra dev --python ${{ matrix.python-version }}
+      - run: uv sync --frozen --extra dev --extra server --python ${{ matrix.python-version }}
       - run: uv run pytest -q
 
   lockfile:
@@ -59,3 +59,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv lock --check
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build:package
+      - name: Check packaged dashboard assets
+        run: test -z "$(git -C .. status --porcelain -- src/cayu/server/dashboard)"

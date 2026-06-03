@@ -10,3 +10,5 @@ build/
 .DS_Store
 .cayu/
 .examples-workspaces/
+node_modules/
+dashboard/dist/
