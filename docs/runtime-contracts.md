@@ -36,6 +36,22 @@ Cayu separates agent definition, execution environment, and session state:
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
 
+## ToolPolicy
+
+Authorizes registered tool calls immediately before execution.
+
+Tool policy is Cayu's first scoped-authority primitive. It is separate from provider formatting and runner isolation:
+
+- providers decide what the model requested
+- tool policy decides whether a registered tool call may execute
+- tools and runners perform the work only after authorization
+
+`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
+
+Denied tool calls are recoverable by default. The runtime emits `tool.call.started`, then `tool.call.blocked`, does not run the tool implementation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. Tool policy implementation errors are not recoverable tool failures; they fail the session because the authority layer itself is broken.
+
+Policy requests receive copied session, agent, tool-call, argument, environment, workspace, and metadata values. Mutating a policy request does not mutate the tool arguments that may later reach the tool.
+
 ## Event
 
 Append-only event emitted by the runtime for sessions, model steps, tools, workflows, memory, runners, and storage-visible lifecycle changes.
@@ -165,7 +181,7 @@ Tool results must support:
 
 String-only tool results are not enough for the final framework.
 
-Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
+Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. Tool policy denials are recorded separately as `tool.call.blocked`, do not execute the tool, and are also returned to the model as structured error `tool_result` message parts. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
 Framework-native tools receive runtime services through `ToolContext`: workspace, runner, vault, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects.
 

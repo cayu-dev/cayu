@@ -28,7 +28,18 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
-from cayu.runtime import InMemoryEventSink, ResumeRequest, RunRequest, SessionStore
+from cayu.runtime import (
+    InMemoryEventSink,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionStatus,
+    SessionStore,
+    StaticToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
@@ -113,6 +124,101 @@ def test_event_requires_namespace_for_custom_types():
     for event_type in malformed_custom_types:
         with pytest.raises(ValidationError, match="dot-separated"):
             Event(type=event_type, session_id="sess_1")
+
+
+def test_static_tool_policy_allows_by_default_and_denies_explicit_names():
+    session = Session(
+        id="sess_policy",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        status=SessionStatus.RUNNING,
+    )
+    request = ToolPolicyRequest(
+        session=session,
+        agent=AgentSpec(name="assistant", model="fake-model"),
+        tool_name="write_file",
+        tool_call_id="call_1",
+        arguments={"path": "notes/result.txt"},
+    )
+
+    default_policy = StaticToolPolicy()
+    default_result = asyncio.run(default_policy.authorize(request))
+    assert default_result.decision == ToolPolicyDecision.ALLOW
+
+    denied_policy = StaticToolPolicy(deny=["write_file"])
+    denied_result = asyncio.run(denied_policy.authorize(request))
+    assert denied_result.decision == ToolPolicyDecision.DENY
+    assert denied_result.reason == "Tool denied by policy: write_file"
+
+
+def test_static_tool_policy_allowlist_blocks_unlisted_tools_and_deny_wins():
+    session = Session(
+        id="sess_policy",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        status=SessionStatus.RUNNING,
+    )
+    request = ToolPolicyRequest(
+        session=session,
+        agent=AgentSpec(name="assistant", model="fake-model"),
+        tool_name="exec_command",
+        tool_call_id="call_1",
+    )
+
+    allowlist_policy = StaticToolPolicy(allow=["read_file"])
+    allowlist_result = asyncio.run(allowlist_policy.authorize(request))
+    assert allowlist_result.decision == ToolPolicyDecision.DENY
+    assert allowlist_result.reason == "Tool not allowed by policy: exec_command"
+
+    deny_wins_policy = StaticToolPolicy(allow=["exec_command"], deny=["exec_command"])
+    deny_wins_result = asyncio.run(deny_wins_policy.authorize(request))
+    assert deny_wins_result.decision == ToolPolicyDecision.DENY
+    assert deny_wins_result.reason == "Tool denied by policy: exec_command"
+
+
+def test_tool_policy_contract_rejects_invalid_boundary_data():
+    session = Session(
+        id="sess_policy",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        status=SessionStatus.RUNNING,
+    )
+    agent = AgentSpec(name="assistant", model="fake-model")
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        ToolPolicyRequest(
+            session=session,
+            agent=agent,
+            tool_name=" ",
+            tool_call_id="call_1",
+        )
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        ToolPolicyRequest(
+            session=session,
+            agent=agent,
+            tool_name="read_file",
+            tool_call_id="call_1",
+            arguments={"bad": object()},
+        )
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        ToolPolicyResult(decision=ToolPolicyDecision.DENY, reason=" ")
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        ToolPolicyResult(
+            decision=ToolPolicyDecision.DENY,
+            metadata={"bad": object()},
+        )
+
+    with pytest.raises(ValueError, match="cannot be blank"):
+        StaticToolPolicy(allow=["read_file", " "])
+
+    with pytest.raises(TypeError, match="iterable"):
+        StaticToolPolicy(deny="read_file")  # type: ignore[arg-type]
 
 
 def test_tool_result_supports_text_structured_and_artifacts():

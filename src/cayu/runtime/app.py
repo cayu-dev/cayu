@@ -49,6 +49,13 @@ from cayu.runtime.sessions import (
     copy_run_request,
 )
 from cayu.runtime.tasks import Task, TaskStore
+from cayu.runtime.tool_policy import (
+    AllowAllToolPolicy,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,7 @@ class _RegisteredAgentState:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
     context_policy: ContextPolicy
+    tool_policy: ToolPolicy
 
 
 @dataclass(frozen=True)
@@ -145,6 +153,7 @@ class CayuApp:
         *,
         tools: Iterable[Tool] | None = None,
         context_policy: ContextPolicy | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -157,6 +166,12 @@ class CayuApp:
             stored_context_policy = context_policy
         else:
             raise TypeError("context_policy must be a ContextPolicy.")
+        if tool_policy is None:
+            stored_tool_policy = AllowAllToolPolicy()
+        elif isinstance(tool_policy, ToolPolicy):
+            stored_tool_policy = tool_policy
+        else:
+            raise TypeError("tool_policy must be a ToolPolicy.")
 
         if tools is None:
             agent_tools = []
@@ -181,6 +196,7 @@ class CayuApp:
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
             context_policy=stored_context_policy,
+            tool_policy=stored_tool_policy,
         )
         return spec
 
@@ -585,6 +601,7 @@ class CayuApp:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         tool_call=tool_call,
+                        request_metadata=request_metadata,
                     ):
                         yield event
                     if outcome is not None:
@@ -707,6 +724,7 @@ class CayuApp:
         registered_agent: _RegisteredAgentState,
         registered_environment: RegisteredEnvironment | None,
         tool_call: ToolCallRequest,
+        request_metadata: dict[str, Any],
     ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         yield (
@@ -749,6 +767,45 @@ class CayuApp:
                 ToolCallOutcome(call=tool_call, result=result),
             )
             return
+
+        policy_result = await registered_agent.tool_policy.authorize(
+            ToolPolicyRequest(
+                session=session.model_copy(deep=True),
+                agent=_validate_agent_spec(registered_agent.spec),
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                arguments=tool_call.arguments,
+                environment_name=environment_name,
+                workspace_id=_workspace_id(registered_environment),
+                metadata=request_metadata,
+            )
+        )
+        policy_result = _validate_tool_policy_result(policy_result)
+        if policy_result.decision == ToolPolicyDecision.DENY:
+            reason = _tool_policy_denial_reason(policy_result)
+            result = _blocked_tool_result(policy_result, reason=reason)
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.TOOL_CALL_BLOCKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=tool_call.name,
+                        payload={
+                            "tool_call_id": tool_call.id,
+                            "decision": policy_result.decision.value,
+                            "reason": reason,
+                            "metadata": policy_result.metadata,
+                            "result": result.model_dump(),
+                        },
+                    )
+                ),
+                ToolCallOutcome(call=tool_call, result=result),
+            )
+            return
+        if policy_result.decision != ToolPolicyDecision.ALLOW:
+            raise ValueError(f"Unsupported tool policy decision: {policy_result.decision}")
 
         result = await _run_tool(
             tool=registered_tool.tool,
@@ -829,6 +886,35 @@ async def _run_tool(
         return _normalize_tool_result(_validate_tool_result(result))
     except Exception as exc:
         return ToolResult(content=_exception_message(exc), is_error=True)
+
+
+def _tool_policy_denial_reason(policy_result: ToolPolicyResult) -> str:
+    return policy_result.reason or "Tool call denied by policy."
+
+
+def _blocked_tool_result(policy_result: ToolPolicyResult, *, reason: str) -> ToolResult:
+    return ToolResult(
+        content=reason,
+        structured={
+            "decision": policy_result.decision.value,
+            "reason": reason,
+            "metadata": policy_result.metadata,
+        },
+        is_error=True,
+    )
+
+
+def _validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
+    if type(result) is not ToolPolicyResult:
+        raise TypeError(
+            "Tool policies must return ToolPolicyResult instances. "
+            f"Received {type(result).__name__}."
+        )
+    return ToolPolicyResult(
+        decision=result.decision,
+        reason=result.reason,
+        metadata=copy_json_value(result.metadata, "metadata"),
+    )
 
 
 def _copy_registered_tool(tool: RegisteredTool) -> RegisteredTool:

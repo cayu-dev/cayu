@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, first-class tool policies for scoped authority, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
@@ -24,6 +24,8 @@ Cayu treats payloads, metadata, tool arguments, tool results, model options, che
 Framework objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
 Framework-native tools receive runtime services through `ToolContext`: workspace, runner, vault, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
+
+Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue.
 
 ## Initial Layout
 
@@ -163,6 +165,18 @@ from cayu import (
 app.register_agent(
     AgentSpec(name="assistant", model="claude-sonnet-4-6"),
     context_policy=RecentTurnsContextPolicy(max_user_turns=10),
+)
+```
+
+Scope tool authority per agent:
+
+```python
+from cayu import AgentSpec, ExecCommandTool, ListFilesTool, ReadFileTool, StaticToolPolicy
+
+app.register_agent(
+    AgentSpec(name="reviewer", model="gpt-5.5"),
+    tools=[ReadFileTool(), ListFilesTool(), ExecCommandTool()],
+    tool_policy=StaticToolPolicy(allow=["read_file", "list_files"]),
 )
 ```
 

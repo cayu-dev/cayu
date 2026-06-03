@@ -35,8 +35,13 @@ from cayu.runtime import (
     Session,
     SessionIdentity,
     SessionStatus,
+    StaticToolPolicy,
     TaskCreate,
     TaskStatus,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
     default_compaction_prompt,
     trim_context_messages,
     trim_context_turns,
@@ -134,6 +139,30 @@ class RecordingCompactor(ContextCompactor):
 class FailingCompactor(ContextCompactor):
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         raise RuntimeError("compaction unavailable")
+
+
+class MemoryWorkspace(Workspace):
+    def __init__(self, workspace_id: str) -> None:
+        self.id = workspace_id
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        return WorkspaceReadResult(content=b"", total_bytes=0)
+
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        return None
+
+    async def list(
+        self,
+        pattern: str = "**/*",
+        *,
+        limit: int | None = None,
+    ) -> WorkspaceListResult:
+        return WorkspaceListResult(paths=(), total_count=0)
 
 
 class MetadataMutatingProvider(FakeProvider):
@@ -1334,6 +1363,511 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert transcript[1].content[0].type == "tool_call"
     assert transcript[2].content[0].type == "tool_result"
     assert transcript[3].content[0].text == "done"
+
+
+def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("blocked handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=StaticToolPolicy(deny=["side_effect"]),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_blocked_tool",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert tool.calls == []
+    blocked_event = events[4]
+    assert blocked_event.tool_name == "side_effect"
+    assert blocked_event.payload == {
+        "tool_call_id": "call_1",
+        "decision": "deny",
+        "reason": "Tool denied by policy: side_effect",
+        "metadata": {},
+        "result": {
+            "content": "Tool denied by policy: side_effect",
+            "structured": {
+                "decision": "deny",
+                "reason": "Tool denied by policy: side_effect",
+                "metadata": {},
+            },
+            "artifacts": [],
+            "is_error": True,
+        },
+    }
+
+    assert provider.requests[1].messages[-1].role == "tool"
+    tool_result_part = provider.requests[1].messages[-1].content[0]
+    assert tool_result_part.type == "tool_result"
+    assert tool_result_part.tool_call_id == "call_1"
+    assert tool_result_part.tool_name == "side_effect"
+    assert tool_result_part.content == "Tool denied by policy: side_effect"
+    assert tool_result_part.is_error is True
+
+
+def test_cayu_app_tool_policy_allowlist_blocks_unlisted_registered_tools():
+    store = InMemorySessionStore()
+    blocked_tool = SideEffectTool()
+    allowed_tool = EchoTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "blocked"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[allowed_tool, blocked_tool],
+        tool_policy=StaticToolPolicy(allow=["echo"]),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_allowlist_tool_policy",
+                messages=[Message.text("user", "use the blocked tool")],
+            ),
+        )
+    )
+
+    assert events[4].type == EventType.TOOL_CALL_BLOCKED
+    assert events[4].payload["reason"] == "Tool not allowed by policy: side_effect"
+    assert blocked_tool.calls == []
+
+
+def test_cayu_app_tool_policy_receives_copied_tool_call_arguments():
+    class RecordingToolPolicy(ToolPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ToolPolicyRequest] = []
+
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            self.requests.append(request)
+            request.arguments["nested"]["value"] = "mutated"
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+    policy = RecordingToolPolicy()
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"nested": {"value": "original"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=policy,
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_argument_copy",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert policy.requests[0].session.id == "sess_policy_argument_copy"
+    assert policy.requests[0].agent.name == "assistant"
+    assert policy.requests[0].tool_name == "side_effect"
+    assert policy.requests[0].tool_call_id == "call_1"
+    assert policy.requests[0].environment_name is None
+    assert policy.requests[0].workspace_id is None
+    assert policy.requests[0].metadata == {}
+    assert tool.calls == [{"nested": {"value": "original"}}]
+
+
+def test_cayu_app_tool_policy_receives_workspace_identity():
+    class RecordingToolPolicy(ToolPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ToolPolicyRequest] = []
+
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            self.requests.append(request)
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+    policy = RecordingToolPolicy()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=MemoryWorkspace("workspace_1"),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=policy,
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_workspace",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert policy.requests[0].environment_name == "local"
+    assert policy.requests[0].workspace_id == "workspace_1"
+
+
+def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
+    class RecordingToolPolicy(ToolPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ToolPolicyRequest] = []
+
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            self.requests.append(request)
+            request.metadata["tenant"]["id"] = "mutated"
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+    policy = RecordingToolPolicy()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=policy,
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_run_metadata",
+                messages=[Message.text("user", "use the tool")],
+                metadata={"tenant": {"id": "tenant_1"}},
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert policy.requests[0].metadata == {"tenant": {"id": "mutated"}}
+    session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
+    assert session is not None
+    assert session.metadata == {"tenant": {"id": "tenant_1"}}
+
+
+def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
+    class RecordingToolPolicy(ToolPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ToolPolicyRequest] = []
+
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            self.requests.append(request)
+            request.metadata["resume"]["id"] = "mutated"
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+    policy = RecordingToolPolicy()
+    tool = SideEffectTool()
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("ready"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_resume_metadata",
+                messages=[Message.text("user", "first")],
+                metadata={"original": {"id": "run"}},
+            ),
+        )
+    )
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_policy_resume_metadata",
+                messages=[Message.text("user", "use the tool")],
+                metadata={"resume": {"id": "resume_1"}},
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert policy.requests[0].metadata == {"resume": {"id": "mutated"}}
+    session = asyncio.run(store.load("sess_policy_resume_metadata"))
+    assert session is not None
+    assert session.metadata == {"original": {"id": "run"}}
+
+
+def test_cayu_app_tool_policy_blocked_event_uses_default_reason_when_omitted():
+    class ReasonlessDenyPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=ReasonlessDenyPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_default_reason",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    blocked_event = events[4]
+    assert blocked_event.type == EventType.TOOL_CALL_BLOCKED
+    assert blocked_event.payload["reason"] == "Tool call denied by policy."
+    assert blocked_event.payload["result"]["content"] == "Tool call denied by policy."
+
+
+def test_cayu_app_fails_session_when_tool_policy_raises_before_execution():
+    class FailingToolPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            raise RuntimeError("policy unavailable")
+
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=FailingToolPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_raises",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert tool.calls == []
+    assert events[-1].payload == {
+        "error": "policy unavailable",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_cayu_app_fails_session_when_tool_policy_returns_invalid_result():
+    class InvalidToolPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return {"decision": "deny"}  # type: ignore[return-value]
+
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=InvalidToolPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_invalid_result",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert tool.calls == []
+    assert events[-1].payload == {
+        "error": "Tool policies must return ToolPolicyResult instances. Received dict.",
+        "error_type": "TypeError",
+    }
 
 
 def test_cayu_app_context_policy_can_trim_model_facing_messages():
@@ -3872,9 +4406,7 @@ def test_in_memory_session_store_create_rejects_invalid_request_type():
     store = InMemorySessionStore()
 
     with pytest.raises(TypeError, match="RunRequest"):
-        asyncio.run(
-            store.create({"agent_name": "assistant"}, identity=_test_session_identity())
-        )  # type: ignore[arg-type]
+        asyncio.run(store.create({"agent_name": "assistant"}, identity=_test_session_identity()))  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="RunRequest"):
         asyncio.run(store.create(None, identity=_test_session_identity()))  # type: ignore[arg-type]
@@ -4225,6 +4757,12 @@ def test_cayu_app_rejects_invalid_agent_registration_inputs():
             context_policy=object(),  # type: ignore[arg-type]
         )
 
+    with pytest.raises(TypeError, match="tool_policy"):
+        app.register_agent(
+            AgentSpec(name="bad_tool_policy", model="fake-model"),
+            tool_policy=object(),  # type: ignore[arg-type]
+        )
+
 
 def test_cayu_app_rejects_blank_agent_lookup_name():
     app = CayuApp()
@@ -4535,29 +5073,6 @@ def test_cayu_app_rejects_invalid_environment_lookup_name():
 
 
 def test_cayu_app_isolates_registered_environment_shell():
-    class MemoryWorkspace(Workspace):
-        def __init__(self, workspace_id: str) -> None:
-            self.id = workspace_id
-
-        async def read_bytes(
-            self,
-            path: str,
-            *,
-            max_bytes: int | None = None,
-        ) -> WorkspaceReadResult:
-            return WorkspaceReadResult(content=b"", total_bytes=0)
-
-        async def write_bytes(self, path: str, content: bytes) -> None:
-            return None
-
-        async def list(
-            self,
-            pattern: str = "**/*",
-            *,
-            limit: int | None = None,
-        ) -> WorkspaceListResult:
-            return WorkspaceListResult(paths=(), total_count=0)
-
     app = CayuApp()
     original_workspace = MemoryWorkspace("workspace_original")
     environment = Environment(
