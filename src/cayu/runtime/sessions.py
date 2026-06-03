@@ -67,6 +67,7 @@ class ResumeRequest(BaseModel):
 
     session_id: str
     messages: list[Message]
+    model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
 
@@ -83,9 +84,40 @@ class ResumeRequest(BaseModel):
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
 
-    @field_validator("session_id")
+    @field_validator("session_id", "model")
     @classmethod
-    def validate_nonblank_session_id(cls, value: str, info) -> str:
+    def validate_optional_nonblank_strings(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+
+class SessionIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_name: str
+    model: str
+    runtime_name: str = "cayu"
+    runtime_version: str | None = None
+
+    @field_validator("provider_name", "model", "runtime_name")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("runtime_version")
+    @classmethod
+    def validate_optional_runtime_version(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
         return require_nonblank(value, info.field_name)
 
 
@@ -95,6 +127,10 @@ class Session(BaseModel):
     # SessionStore implementations may set this from RunRequest.session_id.
     id: str = Field(default_factory=lambda: str(uuid4()))
     agent_name: str
+    provider_name: str
+    model: str
+    runtime_name: str = "cayu"
+    runtime_version: str | None = None
     environment_name: str | None = None
     status: SessionStatus = SessionStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -106,14 +142,14 @@ class Session(BaseModel):
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
 
-    @field_validator("id", "agent_name")
+    @field_validator("id", "agent_name", "provider_name", "model", "runtime_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("environment_name")
+    @field_validator("environment_name", "runtime_version")
     @classmethod
-    def validate_nonblank_environment_name(
+    def validate_optional_nonblank_fields(
         cls,
         value: str | None,
         info,
@@ -207,7 +243,12 @@ class SessionStore(ABC):
     """Persistent store for sessions and append-only events."""
 
     @abstractmethod
-    async def create(self, request: RunRequest) -> Session:
+    async def create(
+        self,
+        request: RunRequest,
+        *,
+        identity: SessionIdentity,
+    ) -> Session:
         """Create a session for a run request."""
 
     @abstractmethod
@@ -217,6 +258,10 @@ class SessionStore(ABC):
     @abstractmethod
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         """Update session status and return the updated session."""
+
+    @abstractmethod
+    async def update_model(self, session_id: str, model: str) -> Session:
+        """Update the active model for a session and return the updated session."""
 
     @abstractmethod
     async def transition_status(
@@ -282,10 +327,16 @@ class InMemorySessionStore(SessionStore):
         self._transcripts: dict[str, list[Message]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
 
-    async def create(self, request: RunRequest) -> Session:
+    async def create(
+        self,
+        request: RunRequest,
+        *,
+        identity: SessionIdentity,
+    ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
         request = copy_run_request(request)
+        identity = copy_session_identity(identity)
         async with self._lock:
             session_id = request.session_id or str(uuid4())
             if session_id in self._sessions:
@@ -295,6 +346,10 @@ class InMemorySessionStore(SessionStore):
             session = Session(
                 id=session_id,
                 agent_name=request.agent_name,
+                provider_name=identity.provider_name,
+                model=identity.model,
+                runtime_name=identity.runtime_name,
+                runtime_version=identity.runtime_version,
                 environment_name=request.environment_name,
                 status=SessionStatus.PENDING,
                 created_at=now,
@@ -327,6 +382,23 @@ class InMemorySessionStore(SessionStore):
             updated = session.model_copy(
                 update={
                     "status": status,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def update_model(self, session_id: str, model: str) -> Session:
+        session_id = require_nonblank(session_id, "session_id")
+        model = require_nonblank(model, "model")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+            updated = session.model_copy(
+                update={
+                    "model": model,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -513,8 +585,20 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     return ResumeRequest(
         session_id=request.session_id,
         messages=[copy_message(message) for message in messages],
+        model=request.model,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
+    )
+
+
+def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
+    if type(identity) is not SessionIdentity:
+        raise TypeError("Session creation requires a SessionIdentity.")
+    return SessionIdentity(
+        provider_name=identity.provider_name,
+        model=identity.model,
+        runtime_name=identity.runtime_name,
+        runtime_version=identity.runtime_version,
     )
 
 

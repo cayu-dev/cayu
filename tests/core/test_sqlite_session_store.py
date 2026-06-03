@@ -12,7 +12,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime import CayuApp, ResumeRequest, RunRequest, SessionStatus
+from cayu.runtime import CayuApp, ResumeRequest, RunRequest, SessionIdentity, SessionStatus
 
 
 class FakeProvider(ModelProvider):
@@ -45,6 +45,10 @@ async def _collect_app_events(events) -> list[Event]:
     return [event async for event in events]
 
 
+def _identity() -> SessionIdentity:
+    return SessionIdentity(provider_name="fake", model="fake-model")
+
+
 def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -57,9 +61,19 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
                 environment_name="local-dev",
                 messages=[Message.text("user", "hi")],
                 metadata={"project_id": 123},
-            )
+            ),
+            identity=SessionIdentity(
+                provider_name="anthropic",
+                model="claude-test",
+                runtime_name="cayu",
+                runtime_version="test-version",
+            ),
         )
         assert session.status == SessionStatus.PENDING
+        assert session.provider_name == "anthropic"
+        assert session.model == "claude-test"
+        assert session.runtime_name == "cayu"
+        assert session.runtime_version == "test-version"
 
         await store.update_status("sess_sqlite", SessionStatus.RUNNING)
         await store.append_event(
@@ -139,7 +153,8 @@ def test_sqlite_session_store_exposes_queryable_event_identity_columns(tmp_path)
                 agent_name="assistant",
                 session_id="sess_query_columns",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_identity(),
         )
         await store.append_event(
             "sess_query_columns",
@@ -190,10 +205,10 @@ def test_sqlite_session_store_rejects_duplicate_sessions_and_mismatched_events(t
             session_id="sess_duplicate",
             messages=[Message.text("user", "hi")],
         )
-        await store.create(request)
+        await store.create(request, identity=_identity())
 
         with pytest.raises(ValueError, match="Session already exists"):
-            await store.create(request)
+            await store.create(request, identity=_identity())
 
         with pytest.raises(ValueError, match="Event session_id"):
             await store.append_event(
@@ -219,6 +234,79 @@ def test_sqlite_session_store_rejects_duplicate_sessions_and_mismatched_events(t
         await _close(store)
 
     asyncio.run(run_store_operations())
+
+
+def test_sqlite_session_store_persists_updated_session_model_across_reopen(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def create_and_update() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_reopen_model",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="initial-model"),
+        )
+        await store.update_model("sess_reopen_model", "upgraded-model")
+        await _close(store)
+
+    asyncio.run(create_and_update())
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def assert_reopened() -> None:
+        loaded = await reopened.load("sess_reopen_model")
+        assert loaded is not None
+        assert loaded.model == "upgraded-model"
+        await _close(reopened)
+
+    asyncio.run(assert_reopened())
+
+
+def test_sqlite_session_store_rejects_older_pre_public_schema_version(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("PRAGMA user_version = 3")
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="unsupported pre-public Cayu schema version: 3"):
+        SQLiteSessionStore(db_path)
+
+
+def test_sqlite_session_store_rejects_unversioned_existing_tables(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="existing tables but no Cayu schema version"):
+        SQLiteSessionStore(db_path)
+
+
+def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def assert_initialized() -> None:
+        sessions = await store.list_sessions()
+        assert sessions == []
+        await _close(store)
+
+    asyncio.run(assert_initialized())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert version == 4
 
 
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):
@@ -259,6 +347,9 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
         assert persisted_events == events
         assert session is not None
         assert session.status == SessionStatus.COMPLETED
+        assert session.provider_name == "fake"
+        assert session.model == "fake-model"
+        assert session.runtime_name == "cayu"
         await _close(store)
 
     asyncio.run(run_app())

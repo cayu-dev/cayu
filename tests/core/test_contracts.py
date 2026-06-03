@@ -1260,11 +1260,13 @@ def test_resume_request_requires_existing_session_id_and_new_messages():
     request = ResumeRequest(
         session_id="sess_existing",
         messages=[Message.text("user", "continue")],
+        model="upgraded-model",
         metadata={"source": "test"},
     )
 
     assert request.session_id == "sess_existing"
     assert request.messages[0].content[0].text == "continue"
+    assert request.model == "upgraded-model"
     assert request.metadata == {"source": "test"}
     assert request.max_steps == 16
 
@@ -1276,6 +1278,13 @@ def test_resume_request_requires_existing_session_id_and_new_messages():
 
     with pytest.raises(ValidationError, match="cannot be empty"):
         ResumeRequest(session_id="sess_existing", messages=[])
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        ResumeRequest(
+            session_id="sess_existing",
+            messages=[Message.text("user", "continue")],
+            model=" ",
+        )
 
 
 def test_run_request_rejects_coerced_max_steps():

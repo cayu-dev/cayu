@@ -15,6 +15,7 @@ from cayu.runtime.sessions import (
     EventRecord,
     RunRequest,
     Session,
+    SessionIdentity,
     SessionOrder,
     SessionQuery,
     SessionStatus,
@@ -22,6 +23,7 @@ from cayu.runtime.sessions import (
     _validate_status_set,
     copy_event_query,
     copy_run_request,
+    copy_session_identity,
     copy_session_query,
     copy_transcript_messages,
 )
@@ -38,7 +40,7 @@ from cayu.runtime.tasks import (
     copy_task_query,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 class SQLiteSessionStore(SessionStore):
@@ -57,10 +59,16 @@ class SQLiteSessionStore(SessionStore):
         self._connection = self._connect(db_path)
         self._initialize_schema()
 
-    async def create(self, request: RunRequest) -> Session:
+    async def create(
+        self,
+        request: RunRequest,
+        *,
+        identity: SessionIdentity,
+    ) -> Session:
         request = copy_run_request(request)
+        identity = copy_session_identity(identity)
         async with self._lock:
-            session = _session_from_request(request)
+            session = _session_from_request(request, identity=identity)
             try:
                 with self._connection:
                     self._connection.execute(
@@ -68,17 +76,25 @@ class SQLiteSessionStore(SessionStore):
                         INSERT INTO sessions (
                             id,
                             agent_name,
+                            provider_name,
+                            model,
+                            runtime_name,
+                            runtime_version,
                             environment_name,
                             status,
                             created_at,
                             updated_at,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
                             session.agent_name,
+                            session.provider_name,
+                            session.model,
+                            session.runtime_name,
+                            session.runtime_version,
                             session.environment_name,
                             str(session.status),
                             _format_datetime(session.created_at),
@@ -97,7 +113,8 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             row = self._connection.execute(
                 """
-                SELECT id, agent_name, environment_name, status, created_at,
+                SELECT id, agent_name, provider_name, model, runtime_name,
+                       runtime_version, environment_name, status, created_at,
                        updated_at, metadata_json
                 FROM sessions
                 WHERE id = ?
@@ -123,6 +140,28 @@ class SQLiteSessionStore(SessionStore):
                     WHERE id = ?
                     """,
                     (str(status), _format_datetime(updated_at), session_id),
+                )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Session not found: {session_id}")
+
+            loaded = self._load_unlocked(session_id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
+    async def update_model(self, session_id: str, model: str) -> Session:
+        session_id = require_nonblank(session_id, "session_id")
+        model = require_nonblank(model, "model")
+        updated_at = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE sessions
+                    SET model = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (model, _format_datetime(updated_at), session_id),
                 )
             if cursor.rowcount != 1:
                 raise KeyError(f"Session not found: {session_id}")
@@ -336,7 +375,8 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT id, agent_name, environment_name, status, created_at,
+                SELECT id, agent_name, provider_name, model, runtime_name,
+                       runtime_version, environment_name, status, created_at,
                        updated_at, metadata_json
                 FROM sessions
                 {where_sql}
@@ -448,7 +488,8 @@ class SQLiteSessionStore(SessionStore):
     def _load_unlocked(self, session_id: str) -> Session | None:
         row = self._connection.execute(
             """
-            SELECT id, agent_name, environment_name, status, created_at,
+            SELECT id, agent_name, provider_name, model, runtime_name,
+                   runtime_version, environment_name, status, created_at,
                    updated_at, metadata_json
             FROM sessions
             WHERE id = ?
@@ -743,6 +784,16 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError(
             f"SQLite store database was created by a newer Cayu schema version: {version}"
         )
+    if version == 0 and _has_user_tables(connection):
+        raise RuntimeError(
+            "SQLite store database has existing tables but no Cayu schema version. "
+            "Recreate the database with the current Cayu version."
+        )
+    if version not in (0, _SCHEMA_VERSION):
+        raise RuntimeError(
+            "SQLite store database uses an unsupported pre-public Cayu schema "
+            f"version: {version}. Recreate the database with the current Cayu version."
+        )
 
     with connection:
         connection.executescript(
@@ -750,6 +801,10 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 agent_name TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                model TEXT NOT NULL,
+                runtime_name TEXT NOT NULL,
+                runtime_version TEXT,
                 environment_name TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -838,10 +893,27 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
-def _session_from_request(request: RunRequest) -> Session:
+def _has_user_tables(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+        LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _session_from_request(request: RunRequest, *, identity: SessionIdentity) -> Session:
     now = datetime.now(UTC)
     values = {
         "agent_name": request.agent_name,
+        "provider_name": identity.provider_name,
+        "model": identity.model,
+        "runtime_name": identity.runtime_name,
+        "runtime_version": identity.runtime_version,
         "environment_name": request.environment_name,
         "status": SessionStatus.PENDING,
         "created_at": now,
@@ -901,6 +973,10 @@ def _session_from_row(row: sqlite3.Row) -> Session:
     return Session(
         id=row["id"],
         agent_name=row["agent_name"],
+        provider_name=row["provider_name"],
+        model=row["model"],
+        runtime_name=row["runtime_name"],
+        runtime_version=row["runtime_version"],
         environment_name=row["environment_name"],
         status=SessionStatus(row["status"]),
         created_at=_parse_datetime(row["created_at"]),

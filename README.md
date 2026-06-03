@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
@@ -140,6 +140,16 @@ resume_request = ResumeRequest(
 
 async for event in app.resume(resume_request):
     print(event.type)
+```
+
+New sessions use the registered agent's default model. Resume uses the session's active model by default, and can durably update that active model for future resumes while keeping the stored provider fixed:
+
+```python
+resume_request = ResumeRequest(
+    session_id="sess_123",
+    messages=[Message.text("user", "Continue with the larger model.")],
+    model="gpt-5.5",
+)
 ```
 
 Customize model-facing context without rewriting durable transcript history:

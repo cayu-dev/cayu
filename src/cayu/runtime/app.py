@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -41,6 +42,7 @@ from cayu.runtime.sessions import (
     ResumeRequest,
     RunRequest,
     Session,
+    SessionIdentity,
     SessionStatus,
     SessionStore,
     copy_resume_request,
@@ -300,7 +302,13 @@ class CayuApp:
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
-        session = await self.session_store.create(request)
+        session = await self.session_store.create(
+            request,
+            identity=_session_identity(
+                provider_name=registered_provider.name,
+                model=registered_agent.spec.model,
+            ),
+        )
         await self.session_store.update_status(session.id, SessionStatus.RUNNING)
         messages = _initial_messages(
             system_prompt=registered_agent.spec.system_prompt,
@@ -331,7 +339,7 @@ class CayuApp:
             raise KeyError(f"Session not found: {request.session_id}")
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
-        registered_provider = self._get_registered_provider()
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -341,6 +349,8 @@ class CayuApp:
             to_status=SessionStatus.RUNNING,
         )
         try:
+            if request.model is not None:
+                session = await self.session_store.update_model(session.id, request.model)
             transcript = await self.session_store.load_transcript(session.id)
         except Exception as exc:
             await self.session_store.update_status(session.id, SessionStatus.FAILED)
@@ -433,7 +443,10 @@ class CayuApp:
                         context_policy=registered_agent.context_policy,
                         session_store=self.session_store,
                         session=session,
-                        registered_agent=registered_agent,
+                        agent_spec=_session_agent_spec(
+                            registered_agent=registered_agent,
+                            session=session,
+                        ),
                         messages=messages,
                         step=step,
                         environment_name=environment_name,
@@ -476,7 +489,7 @@ class CayuApp:
                     )
 
                 model_request = ModelRequest(
-                    model=registered_agent.spec.model,
+                    model=session.model,
                     messages=context_messages,
                     tools=[
                         {
@@ -503,7 +516,7 @@ class CayuApp:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         payload={
-                            "model": registered_agent.spec.model,
+                            "model": session.model,
                             "provider": registered_provider.name,
                             "step": step,
                         },
@@ -875,12 +888,41 @@ def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
     return copy_resume_request(request)
 
 
+def _session_identity(*, provider_name: str, model: str) -> SessionIdentity:
+    return SessionIdentity(
+        provider_name=provider_name,
+        model=model,
+        runtime_name="cayu",
+        runtime_version=_runtime_version(),
+    )
+
+
+def _runtime_version() -> str | None:
+    try:
+        return version("cayu")
+    except PackageNotFoundError:
+        return None
+
+
+def _session_agent_spec(
+    *,
+    registered_agent: _RegisteredAgentState,
+    session: Session,
+) -> AgentSpec:
+    return AgentSpec(
+        name=registered_agent.spec.name,
+        model=session.model,
+        system_prompt=registered_agent.spec.system_prompt,
+        metadata=copy_json_value(registered_agent.spec.metadata, "metadata"),
+    )
+
+
 async def _build_context(
     *,
     context_policy: ContextPolicy,
     session_store: SessionStore,
     session: Session,
-    registered_agent: _RegisteredAgentState,
+    agent_spec: AgentSpec,
     messages: list[Message],
     step: int,
     environment_name: str | None,
@@ -893,7 +935,7 @@ async def _build_context(
 ]:
     request = ContextRequest(
         session=session.model_copy(deep=True),
-        agent=registered_agent.spec.model_copy(deep=True),
+        agent=agent_spec.model_copy(deep=True),
         messages=[message.model_copy(deep=True) for message in messages],
         step=step,
         environment_name=environment_name,

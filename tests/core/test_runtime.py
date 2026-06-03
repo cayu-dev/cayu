@@ -33,6 +33,7 @@ from cayu.runtime import (
     ResumeRequest,
     RunRequest,
     Session,
+    SessionIdentity,
     SessionStatus,
     TaskCreate,
     TaskStatus,
@@ -63,6 +64,10 @@ class FakeProvider(ModelProvider):
             raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
             yield event
+
+
+class OtherProvider(FakeProvider):
+    name = "other"
 
 
 class MutatingProvider(FakeProvider):
@@ -311,7 +316,16 @@ async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Ev
 
 
 def _test_session() -> Session:
-    return Session(id="sess_context", agent_name="assistant")
+    return Session(
+        id="sess_context",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
+
+
+def _test_session_identity() -> SessionIdentity:
+    return SessionIdentity(provider_name="fake", model="fake-model")
 
 
 def test_cayu_app_rejects_invalid_runtime_dependencies():
@@ -465,6 +479,9 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert persisted == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+    assert session.provider_name == "fake"
+    assert session.model == "fake-model"
+    assert session.runtime_name == "cayu"
 
 
 def test_cayu_app_resumes_completed_session_from_stored_transcript():
@@ -535,6 +552,158 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
     assert session.status == SessionStatus.COMPLETED
 
 
+def test_cayu_app_resume_uses_stored_provider_and_model_identity():
+    class RecordingPolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ContextRequest] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.requests.append(request)
+            return request.messages
+
+    store = InMemorySessionStore()
+    initial_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("first answer"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    initial_app = CayuApp(session_store=store)
+    initial_app.register_provider(initial_provider, default=True)
+    initial_app.register_agent(AgentSpec(name="assistant", model="stored-model"))
+
+    asyncio.run(
+        collect_events(
+            initial_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_stored_identity",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    resume_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("second answer"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    default_provider = OtherProvider(
+        [
+            ModelStreamEvent.text_delta("wrong provider"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    resumed_app = CayuApp(session_store=store)
+    resumed_app.register_provider(resume_provider)
+    resumed_app.register_provider(default_provider, default=True)
+    context_policy = RecordingPolicy()
+    resumed_app.register_agent(
+        AgentSpec(name="assistant", model="new-default-model"),
+        context_policy=context_policy,
+    )
+
+    asyncio.run(
+        collect_resume_events(
+            resumed_app,
+            ResumeRequest(
+                session_id="sess_stored_identity",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+
+    assert len(resume_provider.requests) == 1
+    assert resume_provider.requests[0].model == "stored-model"
+    assert [request.agent.model for request in context_policy.requests] == ["stored-model"]
+    assert default_provider.requests == []
+
+
+def test_cayu_app_resume_model_updates_session_active_model():
+    class RecordingPolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ContextRequest] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.requests.append(request)
+            return request.messages
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("third answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    context_policy = RecordingPolicy()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="stored-model"),
+        context_policy=context_policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_model_update",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    second_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_model_update",
+                messages=[Message.text("user", "second request")],
+                model="upgraded-model",
+            ),
+        )
+    )
+
+    session_after_update = asyncio.run(store.load("sess_model_update"))
+    assert session_after_update is not None
+    assert session_after_update.model == "upgraded-model"
+    assert second_events[1].type == EventType.MODEL_STARTED
+    assert second_events[1].payload["model"] == "upgraded-model"
+
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_model_update",
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert [request.model for request in provider.requests] == [
+        "stored-model",
+        "upgraded-model",
+        "upgraded-model",
+    ]
+    assert [request.agent.model for request in context_policy.requests] == [
+        "stored-model",
+        "upgraded-model",
+        "upgraded-model",
+    ]
+
+
 def test_cayu_app_resume_rejects_active_sessions():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -553,7 +722,8 @@ def test_cayu_app_resume_rejects_active_sessions():
                 agent_name="assistant",
                 session_id="sess_running",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
         await store.update_status("sess_running", SessionStatus.RUNNING)
         await store.append_transcript_messages(
@@ -602,7 +772,8 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
                 agent_name="assistant",
                 session_id="sess_broken_transcript",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
         await store.update_status("sess_broken_transcript", SessionStatus.COMPLETED)
 
@@ -1999,7 +2170,8 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
                 agent_name="assistant",
                 session_id="sess_bad_checkpoint_pair",
                 messages=[],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
     asyncio.run(store.update_status(session.id, SessionStatus.COMPLETED))
@@ -2088,7 +2260,8 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
                 agent_name="assistant",
                 session_id="sess_bad_checkpoint_cursor",
                 messages=[],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
     asyncio.run(store.update_status(session.id, SessionStatus.COMPLETED))
@@ -3689,20 +3862,22 @@ def test_in_memory_session_store_rejects_duplicate_session_ids():
         messages=[Message.text("user", "hi")],
     )
 
-    asyncio.run(store.create(request))
+    asyncio.run(store.create(request, identity=_test_session_identity()))
 
     with pytest.raises(ValueError, match="Session already exists"):
-        asyncio.run(store.create(request))
+        asyncio.run(store.create(request, identity=_test_session_identity()))
 
 
 def test_in_memory_session_store_create_rejects_invalid_request_type():
     store = InMemorySessionStore()
 
     with pytest.raises(TypeError, match="RunRequest"):
-        asyncio.run(store.create({"agent_name": "assistant"}))  # type: ignore[arg-type]
+        asyncio.run(
+            store.create({"agent_name": "assistant"}, identity=_test_session_identity())
+        )  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="RunRequest"):
-        asyncio.run(store.create(None))  # type: ignore[arg-type]
+        asyncio.run(store.create(None, identity=_test_session_identity()))  # type: ignore[arg-type]
 
 
 def test_in_memory_session_store_revalidates_constructed_run_requests():
@@ -3727,7 +3902,8 @@ def test_in_memory_session_store_revalidates_constructed_run_requests():
                 messages=[Message.text("user", "hi")],
                 metadata={},
                 max_steps=1,
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
     assert session.id == "sess_bad"
@@ -3742,7 +3918,8 @@ def test_in_memory_session_store_revalidates_constructed_run_requests():
                     messages=BadMessages([]),
                     metadata={},
                     max_steps=1,
-                )
+                ),
+                identity=_test_session_identity(),
             )
         )
 
@@ -3766,7 +3943,8 @@ def test_in_memory_session_store_rejects_invalid_session_ids(session_id):
                 agent_name="assistant",
                 session_id="sess_invalid_id_target",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
     event = Event(
@@ -3794,7 +3972,8 @@ def test_in_memory_session_store_rejects_invalid_event_type_on_append():
                 agent_name="assistant",
                 session_id="sess_event_type",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
 
@@ -3814,7 +3993,8 @@ def test_in_memory_session_store_revalidates_constructed_events_on_append():
                 agent_name="assistant",
                 session_id="sess_constructed_event",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
 
@@ -3854,7 +4034,7 @@ def test_in_memory_session_store_isolates_request_metadata():
         metadata=metadata,
     )
 
-    asyncio.run(store.create(request))
+    asyncio.run(store.create(request, identity=_test_session_identity()))
     metadata["nested"]["value"] = "mutated"
     session = asyncio.run(store.load("sess_metadata_isolation"))
 
@@ -3871,7 +4051,8 @@ def test_in_memory_session_store_rejects_invalid_status_values(status):
                 agent_name="assistant",
                 session_id="sess_status_validation",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
 
@@ -3887,7 +4068,8 @@ def test_in_memory_session_store_checkpoints_json_state_and_isolates_it():
                 agent_name="assistant",
                 session_id="sess_checkpoint",
                 messages=[Message.text("user", "hi")],
-            )
+            ),
+            identity=_test_session_identity(),
         )
     )
     state = {"nested": {"value": "original"}}
@@ -4063,6 +4245,15 @@ def test_cayu_app_rejects_blank_provider_name():
 
     with pytest.raises(ValueError, match="provider.name"):
         app.register_provider(BlankProvider([]))
+
+
+def test_resume_request_rejects_blank_model():
+    with pytest.raises(ValueError, match="model"):
+        ResumeRequest(
+            session_id="sess_blank_model",
+            messages=[Message.text("user", "hi")],
+            model=" ",
+        )
 
 
 def test_cayu_app_rejects_invalid_provider_registration_inputs():
