@@ -23,6 +23,10 @@ from cayu.runtime import (
     ContextCompactor,
     ContextPolicy,
     ContextRequest,
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
     EventSink,
     ForkSessionRequest,
     InMemoryEventSink,
@@ -408,6 +412,14 @@ async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list
     return [event async for event in app.fork_session(request)]
 
 
+async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
+    return [event async for event in app.dispatch_inline(request)]
+
+
+async def submit_dispatch(app: CayuApp, request: DispatchRequest) -> DispatchHandle:
+    return await app.dispatch(request)
+
+
 async def collect_tool_approval_events(
     app: CayuApp,
     request: ToolApprovalRequest,
@@ -442,6 +454,9 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
     class TaskStoreLike:
         pass
 
+    class DispatcherLike:
+        pass
+
     class SinkLike:
         async def emit(self, event):
             pass
@@ -451,6 +466,9 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
 
     with pytest.raises(TypeError, match="TaskStore"):
         CayuApp(task_store=TaskStoreLike())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="Dispatcher"):
+        CayuApp(dispatcher=DispatcherLike())  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="EventSink"):
         CayuApp(event_sinks=[SinkLike()])  # type: ignore[list-item]
@@ -734,6 +752,344 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
         "first request",
         "first answer",
     ]
+
+
+def test_cayu_app_dispatches_existing_session_inline():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("dispatch answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_source",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    dispatch_events = asyncio.run(
+        collect_dispatch_events(
+            app,
+            DispatchRequest(
+                session_id="sess_dispatch_source",
+                dispatch_id="dispatch_1",
+                messages=[Message.text("user", "run dispatched work")],
+            ),
+        )
+    )
+
+    assert [event.type for event in dispatch_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert dispatch_events[0].payload["dispatch_id"] == "dispatch_1"
+    assert dispatch_events[0].payload["appended_messages"] == 1
+    assert [message.content[0].text for message in provider.requests[1].messages] == [
+        "first request",
+        "first answer",
+        "run dispatched work",
+    ]
+    session = asyncio.run(store.load("sess_dispatch_source"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_dispatch_returns_inline_handle():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("dispatch answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_handle",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    handle = asyncio.run(
+        submit_dispatch(
+            app,
+            DispatchRequest(
+                session_id="sess_dispatch_handle",
+                dispatch_id="dispatch_handle_1",
+                messages=[Message.text("user", "run dispatched work")],
+            ),
+        )
+    )
+
+    assert handle == DispatchHandle(
+        dispatch_id="dispatch_handle_1",
+        session_id="sess_dispatch_handle",
+        backend="inline",
+        status=DispatchStatus.COMPLETED,
+        metadata={"events": 5},
+    )
+    assert [message.content[0].text for message in provider.requests[1].messages] == [
+        "first request",
+        "first answer",
+        "run dispatched work",
+    ]
+    session = asyncio.run(store.load("sess_dispatch_handle"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_dispatches_forked_session_with_task_linkage():
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("fork dispatch answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, task_store=tasks)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_fork_source",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_dispatch_fork_source",
+                session_id="sess_dispatch_fork_child",
+            ),
+        )
+    )
+    task = asyncio.run(
+        tasks.create_task(
+            TaskCreate(
+                type="follow_up",
+                session_id="sess_dispatch_fork_child",
+                assigned_agent_name="assistant",
+                input={"objective": "summarize follow-up"},
+            )
+        )
+    )
+
+    dispatch_events = asyncio.run(
+        collect_dispatch_events(
+            app,
+            DispatchRequest(
+                session_id="sess_dispatch_fork_child",
+                dispatch_id="dispatch_fork_1",
+                task_id=task.id,
+                messages=[Message.text("user", "run the forked follow-up")],
+            ),
+        )
+    )
+
+    assert [event.type for event in dispatch_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TASK_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.TASK_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert dispatch_events[0].payload == {
+        "agent_name": "assistant",
+        "appended_messages": 1,
+        "dispatch_id": "dispatch_fork_1",
+        "task_id": task.id,
+    }
+    completed_task = asyncio.run(tasks.load_task(task.id))
+    assert completed_task is not None
+    assert completed_task.status == TaskStatus.COMPLETED
+    assert completed_task.session_id == "sess_dispatch_fork_child"
+    fork = asyncio.run(store.load("sess_dispatch_fork_child"))
+    assert fork is not None
+    assert fork.parent_session_id == "sess_dispatch_fork_source"
+    assert fork.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_dispatch_rejects_running_session():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_running_session() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_running",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_dispatch_running", SessionStatus.RUNNING)
+
+    asyncio.run(create_running_session())
+
+    with pytest.raises(ValueError, match="status transition not allowed"):
+        asyncio.run(
+            collect_dispatch_events(
+                app,
+                DispatchRequest(
+                    session_id="sess_dispatch_running",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+
+
+def test_cayu_app_dispatch_requires_task_store_for_task_linkage():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_no_task_store",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="task_store is required"):
+        asyncio.run(
+            collect_dispatch_events(
+                app,
+                DispatchRequest(
+                    session_id="sess_dispatch_no_task_store",
+                    task_id="task_missing_store",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+    session = asyncio.run(store.load("sess_dispatch_no_task_store"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_dispatch_uses_configured_dispatcher():
+    class RecordingDispatcher(Dispatcher):
+        def __init__(self) -> None:
+            self.requests: list[DispatchRequest] = []
+
+        async def submit(self, runtime, request: DispatchRequest) -> DispatchHandle:
+            self.requests.append(request)
+            return DispatchHandle(
+                dispatch_id=request.dispatch_id,
+                session_id=request.session_id,
+                backend="recording",
+                status=DispatchStatus.SUBMITTED,
+                metadata={"queued": True},
+            )
+
+    dispatcher = RecordingDispatcher()
+    app = CayuApp(dispatcher=dispatcher)
+
+    handle = asyncio.run(
+        submit_dispatch(
+            app,
+            DispatchRequest(
+                session_id="sess_custom_dispatcher",
+                dispatch_id="dispatch_custom_1",
+                messages=[Message.text("user", "queued")],
+            ),
+        )
+    )
+
+    assert handle == DispatchHandle(
+        dispatch_id="dispatch_custom_1",
+        session_id="sess_custom_dispatcher",
+        backend="recording",
+        status=DispatchStatus.SUBMITTED,
+        metadata={"queued": True},
+    )
+    assert [request.dispatch_id for request in dispatcher.requests] == ["dispatch_custom_1"]
+
+
+def test_cayu_app_dispatch_rejects_mismatched_dispatch_handle():
+    class MismatchedDispatcher(Dispatcher):
+        async def submit(self, runtime, request: DispatchRequest) -> DispatchHandle:
+            return DispatchHandle(
+                dispatch_id="other_dispatch",
+                session_id=request.session_id,
+                backend="mismatched",
+                status=DispatchStatus.SUBMITTED,
+            )
+
+    app = CayuApp(dispatcher=MismatchedDispatcher())
+
+    with pytest.raises(ValueError, match="wrong request fields: dispatch_id"):
+        asyncio.run(
+            submit_dispatch(
+                app,
+                DispatchRequest(
+                    session_id="sess_custom_dispatcher",
+                    dispatch_id="dispatch_custom_1",
+                    messages=[Message.text("user", "queued")],
+                ),
+            )
+        )
 
 
 def test_cayu_app_forks_partial_transcript_without_checkpoint():

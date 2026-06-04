@@ -180,6 +180,33 @@ ForkSessionRequest(
 )
 ```
 
+Dispatch work for an existing session. Fork creates a branch; dispatch submits session work through a pluggable execution backend. The default `InlineDispatcher` runs immediately in the current process and returns a handle:
+
+```python
+from cayu import DispatchRequest, Message
+
+handle = await app.dispatch(
+    DispatchRequest(
+        session_id="sess_branch_a",
+        messages=[Message.text("user", "Run this follow-up objective.")],
+        task_id=task.id,
+    )
+)
+print(handle.status)
+```
+
+For local streaming execution, use `dispatch_inline(...)`:
+
+```python
+async for event in app.dispatch_inline(
+    DispatchRequest(
+        session_id="sess_branch_a",
+        messages=[Message.text("user", "Run this follow-up objective.")],
+    )
+):
+    print(event.type)
+```
+
 Customize model-facing context without rewriting durable transcript history:
 
 ```python

@@ -26,6 +26,16 @@ from cayu.runtime.context import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime.dispatch import (
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchRuntime,
+    DispatchStatus,
+    InlineDispatcher,
+    copy_dispatch_handle,
+    copy_dispatch_request,
+)
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
     CheckpointTransform,
@@ -72,6 +82,11 @@ __all__ = [
     "ContextPolicy",
     "ContextRequest",
     "DefaultContextPolicy",
+    "DispatchHandle",
+    "DispatchRequest",
+    "DispatchRuntime",
+    "DispatchStatus",
+    "Dispatcher",
     "EventQuery",
     "EventRecord",
     "EventSink",
@@ -79,6 +94,7 @@ __all__ = [
     "InMemoryEventSink",
     "InMemorySessionStore",
     "InMemoryTaskStore",
+    "InlineDispatcher",
     "MessageWindowContextPolicy",
     "ModelCompactor",
     "PendingToolApproval",
@@ -110,6 +126,8 @@ __all__ = [
     "ToolPolicyRequest",
     "ToolPolicyResult",
     "TranscriptDigestCompactor",
+    "copy_dispatch_handle",
+    "copy_dispatch_request",
     "default_compaction_prompt",
     "trim_context_messages",
     "trim_context_turns",

@@ -49,6 +49,14 @@ from cayu.runtime.context import (
     RuntimeManagedContextPolicy,
     copy_context_messages,
 )
+from cayu.runtime.dispatch import (
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    InlineDispatcher,
+    copy_dispatch_handle,
+    copy_dispatch_request,
+)
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
     ForkSessionRequest,
@@ -171,12 +179,15 @@ class CayuApp:
         *,
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
+        dispatcher: Dispatcher | None = None,
         event_sinks: Iterable[EventSink] | None = None,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
         if task_store is not None and not isinstance(task_store, TaskStore):
             raise TypeError("task_store must be a TaskStore.")
+        if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
+            raise TypeError("dispatcher must be a Dispatcher.")
         if event_sinks is None:
             sinks = []
         else:
@@ -191,6 +202,7 @@ class CayuApp:
                 raise TypeError("event_sinks must contain EventSink instances.")
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
+        self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
         self._event_sinks = sinks
         self._agents: dict[str, _RegisteredAgentState] = {}
         self._providers: dict[str, RegisteredProvider] = {}
@@ -401,6 +413,51 @@ class CayuApp:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
         request = _validate_resume_request(request)
+        async for event in self._resume_session(
+            request=request,
+            task_id=None,
+            start_event_payload_extra={},
+        ):
+            yield event
+
+    async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Runtime dispatch requires a DispatchRequest.")
+        request = copy_dispatch_request(request)
+        handle = await self.dispatcher.submit(self, request)
+        _validate_dispatch_handle_for_request(handle=handle, request=request)
+        return copy_dispatch_handle(handle)
+
+    async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Inline dispatch requires a DispatchRequest.")
+        request = copy_dispatch_request(request)
+        if request.task_id is not None and self.task_store is None:
+            raise RuntimeError("task_store is required when DispatchRequest.task_id is set.")
+        resume_request = ResumeRequest(
+            session_id=request.session_id,
+            messages=request.messages,
+            model=request.model,
+            metadata=request.metadata,
+            max_steps=request.max_steps,
+        )
+        start_event_payload_extra = {"dispatch_id": request.dispatch_id}
+        if request.task_id is not None:
+            start_event_payload_extra["task_id"] = request.task_id
+        async for event in self._resume_session(
+            request=resume_request,
+            task_id=request.task_id,
+            start_event_payload_extra=start_event_payload_extra,
+        ):
+            yield event
+
+    async def _resume_session(
+        self,
+        *,
+        request: ResumeRequest,
+        task_id: str | None,
+        start_event_payload_extra: dict[str, Any],
+    ) -> AsyncIterator[Event]:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
@@ -451,11 +508,12 @@ class CayuApp:
             messages_to_append=request.messages,
             max_steps=request.max_steps,
             request_metadata=request.metadata,
-            task_id=None,
+            task_id=task_id,
             start_event_type=EventType.SESSION_RESUMED,
             start_event_payload={
                 "agent_name": registered_agent.spec.name,
                 "appended_messages": len(request.messages),
+                **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
             },
         ):
             yield event
@@ -2405,6 +2463,25 @@ def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
     if key not in payload or payload[key] is None:
         return None
     return _require_payload_string(payload, key)
+
+
+def _validate_dispatch_handle_for_request(
+    *,
+    handle: DispatchHandle,
+    request: DispatchRequest,
+) -> None:
+    if type(handle) is not DispatchHandle:
+        raise TypeError("Dispatcher must return a DispatchHandle.")
+    mismatches = []
+    if handle.dispatch_id != request.dispatch_id:
+        mismatches.append("dispatch_id")
+    if handle.session_id != request.session_id:
+        mismatches.append("session_id")
+    if handle.task_id != request.task_id:
+        mismatches.append("task_id")
+    if mismatches:
+        fields = ", ".join(mismatches)
+        raise ValueError(f"Dispatcher returned a handle for the wrong request fields: {fields}.")
 
 
 def _initial_messages(

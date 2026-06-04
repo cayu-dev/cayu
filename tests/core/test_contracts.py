@@ -29,6 +29,9 @@ from cayu.mcp import McpServerSpec
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
 from cayu.runtime import (
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
     InMemoryEventSink,
     ResumeRequest,
     RunRequest,
@@ -124,6 +127,67 @@ def test_event_requires_namespace_for_custom_types():
     for event_type in malformed_custom_types:
         with pytest.raises(ValidationError, match="dot-separated"):
             Event(type=event_type, session_id="sess_1")
+
+
+def test_dispatch_request_validates_boundary_data():
+    request = DispatchRequest(
+        session_id="sess_dispatch",
+        messages=[Message.text("user", "continue")],
+        dispatch_id="dispatch_1",
+        metadata={"source": "test"},
+    )
+
+    assert request.session_id == "sess_dispatch"
+    assert request.dispatch_id == "dispatch_1"
+    assert request.metadata == {"source": "test"}
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        DispatchRequest(
+            session_id=" ",
+            messages=[Message.text("user", "continue")],
+        )
+
+    with pytest.raises(ValidationError, match="cannot be empty"):
+        DispatchRequest(
+            session_id="sess_dispatch",
+            messages=[],
+        )
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        DispatchRequest(
+            session_id="sess_dispatch",
+            messages=[Message.text("user", "continue")],
+            metadata={"bad": object()},
+        )
+
+
+def test_dispatch_handle_validates_boundary_data():
+    handle = DispatchHandle(
+        dispatch_id="dispatch_1",
+        session_id="sess_dispatch",
+        backend="inline",
+        status=DispatchStatus.COMPLETED,
+        metadata={"events": 3},
+    )
+
+    assert handle.dispatch_id == "dispatch_1"
+    assert handle.status == DispatchStatus.COMPLETED
+    assert handle.metadata == {"events": 3}
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        DispatchHandle(
+            dispatch_id=" ",
+            session_id="sess_dispatch",
+            backend="inline",
+        )
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        DispatchHandle(
+            dispatch_id="dispatch_1",
+            session_id="sess_dispatch",
+            backend="inline",
+            metadata={"bad": object()},
+        )
 
 
 def test_static_tool_policy_allows_by_default_and_denies_explicit_names():
