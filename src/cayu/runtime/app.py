@@ -62,6 +62,7 @@ from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookContext,
     RuntimeHookPhase,
+    ToolCallHookContext,
 )
 from cayu.runtime.sessions import (
     ForkSessionRequest,
@@ -744,8 +745,8 @@ class CayuApp:
                 if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
                     reason = _tool_policy_denial_reason(policy_result)
                     result = _blocked_tool_result(policy_result, reason=reason)
-                    yield await self._emit(
-                        Event(
+                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                        event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
@@ -759,9 +760,17 @@ class CayuApp:
                                 "metadata": policy_result.metadata,
                                 "result": result.model_dump(),
                             },
-                        )
-                    )
-                    tool_outcomes.append(ToolCallOutcome(call=tool_call, result=result))
+                        ),
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        result=result,
+                        task_id=pending_approval.task_id,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
                     continue
 
                 if (
@@ -796,8 +805,8 @@ class CayuApp:
                         tool_call=tool_call,
                         approval_required=approval_required,
                     )
-                    yield await self._emit(
-                        Event(
+                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                        event=Event(
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
@@ -811,13 +820,20 @@ class CayuApp:
                                 "metadata": request.metadata,
                                 "result": result.model_dump(),
                             },
-                        )
-                    )
-                    tool_outcomes.append(ToolCallOutcome(call=tool_call, result=result))
+                        ),
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        result=result,
+                        task_id=pending_approval.task_id,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
                     continue
 
-                outcome = None
-                async for event, outcome in self._execute_tool_call(  # noqa: B007
+                async for event, outcome in self._execute_tool_call(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -829,8 +845,8 @@ class CayuApp:
                     approval_id=pending_approval.approval_id,
                 ):
                     yield event
-                if outcome is not None:
-                    tool_outcomes.append(outcome)
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
 
             tool_result_messages = _tool_result_messages(tool_outcomes)
             transcript.extend(tool_result_messages)
@@ -1042,7 +1058,24 @@ class CayuApp:
                     },
                 ),
             ]
-            for event in await self._emit_many(session.id, recovery_events):
+            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            for event in emitted_recovery_events:
+                yield event
+            tool_call = ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            tool_event = emitted_recovery_events[-1]
+            async for event in self._run_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=recovered_result,
+                task_id=pending_approval.task_id,
+            ):
                 yield event
         except Exception:
             await self.session_store.update_status(session.id, loaded_session.status)
@@ -1290,8 +1323,7 @@ class CayuApp:
                 }
                 tool_outcomes: list[ToolCallOutcome] = []
                 for tool_call in tool_calls:
-                    outcome = None
-                    async for event, outcome in self._execute_tool_call(  # noqa: B007
+                    async for event, outcome in self._execute_tool_call(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
@@ -1301,8 +1333,8 @@ class CayuApp:
                         policy_result=policy_results_by_id.get(tool_call.id),
                     ):
                         yield event
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
 
                 tool_result_messages = _tool_result_messages(tool_outcomes)
                 messages.extend(tool_result_messages)
@@ -1564,19 +1596,23 @@ class CayuApp:
             }
             if approval_id is not None:
                 payload["approval_id"] = approval_id
-            yield (
-                await self._emit(
-                    Event(
-                        type=EventType.TOOL_CALL_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=tool_call.name,
-                        payload=payload,
-                    )
+            async for event in self._emit_tool_call_result_with_hooks(
+                event=Event(
+                    type=EventType.TOOL_CALL_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload=payload,
                 ),
-                ToolCallOutcome(call=tool_call, result=result),
-            )
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=task_id,
+            ):
+                yield event
             return
 
         if check_policy:
@@ -1602,19 +1638,23 @@ class CayuApp:
                 }
                 if approval_id is not None:
                     payload["approval_id"] = approval_id
-                yield (
-                    await self._emit(
-                        Event(
-                            type=EventType.TOOL_CALL_BLOCKED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload=payload,
-                        )
+                async for event in self._emit_tool_call_result_with_hooks(
+                    event=Event(
+                        type=EventType.TOOL_CALL_BLOCKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=tool_call.name,
+                        payload=payload,
                     ),
-                    ToolCallOutcome(call=tool_call, result=result),
-                )
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    result=result,
+                    task_id=task_id,
+                ):
+                    yield event
                 return
             if resolved_policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL:
                 approval, checkpoint_event = await self._checkpoint_pending_tool_approval(
@@ -1676,19 +1716,23 @@ class CayuApp:
         }
         if approval_id is not None:
             payload["approval_id"] = approval_id
-        yield (
-            await self._emit(
-                Event(
-                    type=event_type,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload=payload,
-                )
+        async for event in self._emit_tool_call_result_with_hooks(
+            event=Event(
+                type=event_type,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload=payload,
             ),
-            ToolCallOutcome(call=tool_call, result=result),
-        )
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+        ):
+            yield event
 
     async def _checkpoint_pending_tool_approval(
         self,
@@ -1805,6 +1849,156 @@ class CayuApp:
         ):
             yield hook_event
 
+    async def _emit_tool_call_result_with_hooks(
+        self,
+        *,
+        event: Event,
+        session: Session,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_call: ToolCallRequest,
+        result: ToolResult,
+        task_id: str | None,
+    ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
+        tool_event = await self._emit(event)
+        outcome = ToolCallOutcome(call=tool_call, result=result)
+        yield tool_event, outcome
+        async for hook_event in self._run_tool_call_hooks(
+            session=session,
+            tool_event=tool_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+        ):
+            yield hook_event, None
+
+    async def _run_tool_call_hooks(
+        self,
+        *,
+        session: Session,
+        tool_event: Event,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_call: ToolCallRequest,
+        result: ToolResult,
+        task_id: str | None,
+    ) -> AsyncIterator[Event]:
+        async for hook_event in self._run_scoped_tool_call_hooks(
+            session=session,
+            tool_event=tool_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+            hooks=self._runtime_hooks,
+            scope="app",
+        ):
+            yield hook_event
+        async for hook_event in self._run_scoped_tool_call_hooks(
+            session=session,
+            tool_event=tool_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+            hooks=registered_agent.runtime_hooks,
+            scope="agent",
+        ):
+            yield hook_event
+
+    async def _run_scoped_tool_call_hooks(
+        self,
+        *,
+        session: Session,
+        tool_event: Event,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_call: ToolCallRequest,
+        result: ToolResult,
+        task_id: str | None,
+        hooks: tuple[RuntimeHook, ...],
+        scope: str,
+    ) -> AsyncIterator[Event]:
+        for hook in hooks:
+            if not _runtime_hook_supports_phase(
+                hook=hook,
+                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+            ):
+                continue
+            hook_name = require_nonblank(hook.name, "runtime_hook.name")
+            yield await self._emit(
+                _runtime_hook_event(
+                    event_type=EventType.HOOK_STARTED,
+                    hook_name=hook_name,
+                    scope=scope,
+                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    terminal_event=tool_event,
+                    payload={
+                        "tool_name": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                    },
+                )
+            )
+            context = ToolCallHookContext(
+                runtime=self,
+                hook_name=hook_name,
+                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                session=session,
+                tool_event=tool_event,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                arguments=tool_call.arguments,
+                result=result,
+                task_id=task_id,
+            )
+            try:
+                await hook.after_tool_call(context)
+            except Exception as exc:
+                yield await self._emit(
+                    _runtime_hook_event(
+                        event_type=EventType.HOOK_FAILED,
+                        hook_name=hook_name,
+                        scope=scope,
+                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        terminal_event=tool_event,
+                        payload={
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "actions": context.actions,
+                        },
+                    )
+                )
+                continue
+            yield await self._emit(
+                _runtime_hook_event(
+                    event_type=EventType.HOOK_COMPLETED,
+                    hook_name=hook_name,
+                    scope=scope,
+                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    terminal_event=tool_event,
+                    payload={
+                        "tool_name": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "actions": context.actions,
+                    },
+                )
+            )
+
     async def _run_runtime_hooks(
         self,
         *,
@@ -1817,6 +2011,11 @@ class CayuApp:
         scope: str,
     ) -> AsyncIterator[Event]:
         for hook in hooks:
+            if not _runtime_hook_supports_phase(
+                hook=hook,
+                phase=phase,
+            ):
+                continue
             hook_name = require_nonblank(hook.name, "runtime_hook.name")
             yield await self._emit(
                 _runtime_hook_event(
@@ -2506,6 +2705,29 @@ async def _call_runtime_hook(
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         await hook.after_session_interrupted(context)
         return
+    raise ValueError(f"Unsupported runtime hook phase: {phase}")
+
+
+def _runtime_hook_supports_phase(
+    *,
+    hook: RuntimeHook,
+    phase: RuntimeHookPhase,
+) -> bool:
+    method_name = _runtime_hook_method_name(phase)
+    hook_method = getattr(type(hook), method_name)
+    default_method = getattr(RuntimeHook, method_name)
+    return hook_method is not default_method
+
+
+def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
+    if phase == RuntimeHookPhase.AFTER_SESSION_COMPLETED:
+        return "after_session_completed"
+    if phase == RuntimeHookPhase.AFTER_SESSION_FAILED:
+        return "after_session_failed"
+    if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
+        return "after_session_interrupted"
+    if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
+        return "after_tool_call"
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 

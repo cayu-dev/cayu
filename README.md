@@ -244,6 +244,26 @@ app.register_agent(
 )
 ```
 
+Hooks can also observe completed, failed, and blocked tool calls:
+
+```python
+from cayu import RuntimeHook
+
+
+class ToolAuditHook(RuntimeHook):
+    async def after_tool_call(self, context):
+        await context.emit_custom_event(
+            "custom.tool.audit",
+            payload={
+                "tool_name": context.tool_name,
+                "tool_call_id": context.tool_call_id,
+                "is_error": context.result.is_error,
+            },
+        )
+```
+
+`after_tool_call` runs after Cayu has persisted the tool result event. It is for auditing, memory extraction, follow-up tasks, and observability; it does not rewrite the tool result that is appended to the model transcript.
+
 Customize model-facing context without rewriting durable transcript history:
 
 ```python

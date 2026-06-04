@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.events import Event, copy_event
+from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.runtime.sessions import ForkSessionRequest, Session, copy_fork_session_request
 from cayu.runtime.tasks import Task, TaskCreate, copy_task
@@ -15,6 +16,7 @@ class RuntimeHookPhase(StrEnum):
     AFTER_SESSION_COMPLETED = "after_session_completed"
     AFTER_SESSION_FAILED = "after_session_failed"
     AFTER_SESSION_INTERRUPTED = "after_session_interrupted"
+    AFTER_TOOL_CALL = "after_tool_call"
 
 
 class RuntimeHookRuntime(Protocol):
@@ -40,7 +42,7 @@ class RuntimeHookRuntime(Protocol):
         """Emit a custom event from a hook."""
 
 
-class RuntimeHookContext:
+class _HookActionContext:
     def __init__(
         self,
         *,
@@ -48,13 +50,11 @@ class RuntimeHookContext:
         hook_name: str,
         phase: RuntimeHookPhase,
         session: Session,
-        terminal_event: Event,
     ) -> None:
         self._runtime = runtime
         self._hook_name = require_nonblank(hook_name, "hook_name")
         self._phase = phase
         self._session = session.model_copy(deep=True)
-        self._terminal_event = copy_event(terminal_event)
         self._actions: list[dict[str, Any]] = []
 
     @property
@@ -68,10 +68,6 @@ class RuntimeHookContext:
     @property
     def session(self) -> Session:
         return self._session.model_copy(deep=True)
-
-    @property
-    def terminal_event(self) -> Event:
-        return copy_event(self._terminal_event)
 
     @property
     def actions(self) -> list[dict[str, Any]]:
@@ -162,6 +158,82 @@ class RuntimeHookContext:
         )
 
 
+class RuntimeHookContext(_HookActionContext):
+    def __init__(
+        self,
+        *,
+        runtime: RuntimeHookRuntime,
+        hook_name: str,
+        phase: RuntimeHookPhase,
+        session: Session,
+        terminal_event: Event,
+    ) -> None:
+        super().__init__(
+            runtime=runtime,
+            hook_name=hook_name,
+            phase=phase,
+            session=session,
+        )
+        self._terminal_event = copy_event(terminal_event)
+
+    @property
+    def terminal_event(self) -> Event:
+        return copy_event(self._terminal_event)
+
+
+class ToolCallHookContext(_HookActionContext):
+    def __init__(
+        self,
+        *,
+        runtime: RuntimeHookRuntime,
+        hook_name: str,
+        phase: RuntimeHookPhase,
+        session: Session,
+        tool_event: Event,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+        task_id: str | None,
+    ) -> None:
+        super().__init__(
+            runtime=runtime,
+            hook_name=hook_name,
+            phase=phase,
+            session=session,
+        )
+        self._tool_event = copy_event(tool_event)
+        self._tool_name = require_nonblank(tool_name, "tool_name")
+        self._tool_call_id = require_nonblank(tool_call_id, "tool_call_id")
+        self._arguments = copy_json_value(arguments, "arguments")
+        self._result = _copy_tool_result(result)
+        self._task_id = require_nonblank(task_id, "task_id") if task_id is not None else None
+
+    @property
+    def tool_event(self) -> Event:
+        return copy_event(self._tool_event)
+
+    @property
+    def tool_name(self) -> str:
+        return self._tool_name
+
+    @property
+    def tool_call_id(self) -> str:
+        return self._tool_call_id
+
+    @property
+    def arguments(self) -> dict[str, Any]:
+        return copy_json_value(self._arguments, "arguments")
+
+    @property
+    def result(self) -> ToolResult:
+        return _copy_tool_result(self._result)
+
+    @property
+    def task_id(self) -> str | None:
+        return self._task_id
+
+
 class RuntimeHook:
     @property
     def name(self) -> str:
@@ -175,3 +247,17 @@ class RuntimeHook:
 
     async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
         """Run after a session reaches interrupted state."""
+
+    async def after_tool_call(self, context: ToolCallHookContext) -> None:
+        """Run after a tool call result event has been persisted."""
+
+
+def _copy_tool_result(result: ToolResult) -> ToolResult:
+    if type(result) is not ToolResult:
+        raise TypeError("Tool hook result requires a ToolResult.")
+    return ToolResult(
+        content=result.content,
+        structured=copy_json_value(result.structured, "structured"),
+        artifacts=copy_json_value(result.artifacts, "artifacts"),
+        is_error=result.is_error,
+    )

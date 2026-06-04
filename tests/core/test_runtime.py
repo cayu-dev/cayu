@@ -49,6 +49,7 @@ from cayu.runtime import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    ToolCallHookContext,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -1382,6 +1383,180 @@ def test_cayu_app_runtime_hooks_run_app_scope_before_agent_scope():
         ("app_hook", "app"),
         ("agent_hook", "agent"),
     ]
+
+
+def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():
+    class ToolObservationHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.tool_name: str | None = None
+            self.tool_call_id: str | None = None
+            self.arguments: dict | None = None
+            self.result: ToolResult | None = None
+            self.task_id: str | None = None
+            self.tool_event_type: EventType | str | None = None
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            self.tool_name = context.tool_name
+            self.tool_call_id = context.tool_call_id
+            self.arguments = context.arguments
+            self.result = context.result
+            self.task_id = context.task_id
+            self.tool_event_type = context.tool_event.type
+            self.arguments["text"] = "mutated"
+            if self.result.structured is not None:
+                self.result.structured["echoed"] = "mutated"
+            await context.emit_custom_event(
+                "custom.tool.observed",
+                payload={
+                    "tool_name": context.tool_name,
+                    "tool_call_id": context.tool_call_id,
+                    "content": context.result.content,
+                },
+            )
+
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    hook = ToolObservationHook()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_echo",
+                    name="echo",
+                    arguments={"text": "from tool"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, task_store=tasks)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        runtime_hooks=[hook],
+    )
+    task = asyncio.run(tasks.create_task(TaskCreate(task_id="task_tool_hook", type="respond")))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_hook",
+                task_id=task.id,
+                messages=[Message.text("user", "Use the tool.")],
+            ),
+        )
+    )
+
+    assert hook.tool_name == "echo"
+    assert hook.tool_call_id == "call_echo"
+    assert hook.arguments == {"text": "mutated"}
+    assert hook.result is not None
+    assert hook.result.structured == {"agent": "assistant", "echoed": "mutated"}
+    assert hook.task_id == "task_tool_hook"
+    assert hook.tool_event_type == EventType.TOOL_CALL_COMPLETED
+    assert [
+        (event.payload["phase"], event.payload["hook_name"], event.payload["scope"])
+        for event in events
+        if event.type == EventType.HOOK_STARTED
+    ] == [("after_tool_call", "ToolObservationHook", "agent")]
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+    stored_events = asyncio.run(store.load_events("sess_tool_hook"))
+    assert [
+        event.type
+        for event in stored_events
+        if event.type
+        in {
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.HOOK_STARTED,
+            "custom.tool.observed",
+            EventType.HOOK_COMPLETED,
+        }
+    ] == [
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.HOOK_STARTED,
+        "custom.tool.observed",
+        EventType.HOOK_COMPLETED,
+    ]
+    hook_completed = next(
+        event for event in stored_events if event.type == EventType.HOOK_COMPLETED
+    )
+    assert hook_completed.payload["tool_name"] == "echo"
+    assert hook_completed.payload["tool_call_id"] == "call_echo"
+    assert hook_completed.payload["phase"] == "after_tool_call"
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_hook"))
+    tool_result = transcript[2].content[0]
+    assert tool_result.structured == {"agent": "assistant", "echoed": "from tool"}
+    assert provider.requests[1].messages[-1].content[0].structured == {
+        "agent": "assistant",
+        "echoed": "from tool",
+    }
+
+
+def test_cayu_app_after_tool_call_hook_failure_does_not_stop_tool_round():
+    class FailingToolHook(RuntimeHook):
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            raise RuntimeError("tool hook broke")
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_echo",
+                    name="echo",
+                    arguments={"text": "from tool"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done after hook failure"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        runtime_hooks=[FailingToolHook()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_hook_failure",
+                messages=[Message.text("user", "Use the tool.")],
+            ),
+        )
+    )
+
+    assert [
+        event.type
+        for event in events
+        if event.type in {EventType.HOOK_STARTED, EventType.HOOK_FAILED}
+    ] == [EventType.HOOK_STARTED, EventType.HOOK_FAILED]
+    hook_failed = next(event for event in events if event.type == EventType.HOOK_FAILED)
+    assert hook_failed.payload["phase"] == "after_tool_call"
+    assert hook_failed.payload["tool_name"] == "echo"
+    assert hook_failed.payload["tool_call_id"] == "call_echo"
+    assert hook_failed.payload["error"] == "tool hook broke"
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 2
+    session = asyncio.run(store.load("sess_tool_hook_failure"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
 
 
 def test_cayu_app_runtime_hook_failure_is_recorded_without_rewriting_session_status():
@@ -2727,6 +2902,87 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
     assert tool_result.structured["tool_call_id"] == "call_1"
     assert tool_result.structured["tool_name"] == "side_effect"
     assert tool_result.is_error is True
+
+
+def test_cayu_app_after_tool_call_hook_observes_approval_denial_result():
+    class ApprovalDenialHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.tool_event_type: EventType | str | None = None
+            self.result: ToolResult | None = None
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            self.tool_event_type = context.tool_event.type
+            self.result = context.result
+
+    store = InMemorySessionStore()
+    hook = ApprovalDenialHook()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("denial handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+        runtime_hooks=[hook],
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_deny_hook",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_tool_approval_deny_hook",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+            ),
+        )
+    )
+
+    assert hook.tool_event_type == EventType.TOOL_CALL_APPROVAL_DENIED
+    assert hook.result is not None
+    assert hook.result.content == "Tool call denied by approval: not safe"
+    assert hook.result.is_error is True
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.TOOL_CALL_APPROVAL_DENIED,
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        }
+    ] == [
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
 
 
 def test_cayu_app_denied_multi_tool_round_marks_skipped_calls_explicitly():
