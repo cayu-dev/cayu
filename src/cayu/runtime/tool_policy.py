@@ -15,6 +15,7 @@ from cayu.runtime.sessions import Session
 class ToolPolicyDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
+    REQUIRE_APPROVAL = "require_approval"
 
 
 class ToolPolicyRequest(BaseModel):

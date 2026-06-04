@@ -1,6 +1,14 @@
 """Runtime contracts."""
 
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
+from cayu.runtime.approvals import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+)
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     CompactionPromptBuilder,
@@ -69,6 +77,8 @@ __all__ = [
     "InMemoryTaskStore",
     "MessageWindowContextPolicy",
     "ModelCompactor",
+    "PendingToolApproval",
+    "PendingToolCallApproval",
     "RecentTurnsContextPolicy",
     "RegisteredAgent",
     "RegisteredEnvironment",
@@ -87,6 +97,10 @@ __all__ = [
     "TaskQuery",
     "TaskStatus",
     "TaskStore",
+    "ToolApprovalDecision",
+    "ToolApprovalRecoveryOutcome",
+    "ToolApprovalRecoveryRequest",
+    "ToolApprovalRequest",
     "ToolPolicy",
     "ToolPolicyDecision",
     "ToolPolicyRequest",

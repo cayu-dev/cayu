@@ -18,6 +18,7 @@ class EventType(StrEnum):
     SESSION_RESUMED = "session.resumed"
     SESSION_COMPLETED = "session.completed"
     SESSION_FAILED = "session.failed"
+    SESSION_INTERRUPTED = "session.interrupted"
     SESSION_CHECKPOINTED = "session.checkpointed"
 
     TASK_CREATED = "task.created"
@@ -39,6 +40,9 @@ class EventType(StrEnum):
     TOOL_CALL_COMPLETED = "tool.call.completed"
     TOOL_CALL_FAILED = "tool.call.failed"
     TOOL_CALL_BLOCKED = "tool.call.blocked"
+    TOOL_CALL_APPROVAL_REQUESTED = "tool.call.approval_requested"
+    TOOL_CALL_APPROVED = "tool.call.approved"
+    TOOL_CALL_APPROVAL_DENIED = "tool.call.approval_denied"
 
     WORKFLOW_STARTED = "workflow.started"
     WORKFLOW_STEP_STARTED = "workflow.step.started"

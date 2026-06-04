@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 from sse_starlette.sse import EventSourceResponse
 
 from cayu.core.messages import Message
+from cayu.runtime.approvals import (
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+)
 from cayu.runtime.sessions import ResumeRequest, RunRequest, SessionQuery
 from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
@@ -25,6 +31,26 @@ class RunBody(BaseModel):
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
+
+
+class ToolApprovalBody(BaseModel):
+    session_id: NonBlankString
+    approval_id: NonBlankString
+    decision: ToolApprovalDecision
+    reason: NonBlankString | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolApprovalRecoveryBody(BaseModel):
+    session_id: NonBlankString
+    approval_id: NonBlankString
+    tool_call_id: NonBlankString
+    outcome: ToolApprovalRecoveryOutcome
+    message: NonBlankString
+    structured: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    reason: NonBlankString | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def create_router(
@@ -85,6 +111,58 @@ def create_router(
 
         async def generate():
             async for event in cayu_app.resume(request):
+                yield event_to_sse_data(event)
+
+        return EventSourceResponse(generate())
+
+    @router.post("/tool-approvals/resolve")
+    async def resolve_tool_approval(body: ToolApprovalBody):
+        session = await session_store.load(body.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+
+        request = ToolApprovalRequest(
+            session_id=body.session_id,
+            approval_id=body.approval_id,
+            decision=body.decision,
+            reason=body.reason,
+            metadata=body.metadata,
+            max_steps=20,
+        )
+
+        async def generate():
+            async for event in cayu_app.resolve_tool_approval(request):
+                yield event_to_sse_data(event)
+
+        return EventSourceResponse(generate())
+
+    @router.post("/tool-approvals/recover")
+    async def recover_tool_approval(body: ToolApprovalRecoveryBody):
+        session = await session_store.load(body.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+
+        request = ToolApprovalRecoveryRequest(
+            session_id=body.session_id,
+            approval_id=body.approval_id,
+            tool_call_id=body.tool_call_id,
+            outcome=body.outcome,
+            message=body.message,
+            structured=body.structured,
+            artifacts=body.artifacts,
+            reason=body.reason,
+            metadata=body.metadata,
+            max_steps=20,
+        )
+
+        async def generate():
+            async for event in cayu_app.recover_tool_approval(request):
                 yield event_to_sse_data(event)
 
         return EventSourceResponse(generate())

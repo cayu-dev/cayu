@@ -302,6 +302,15 @@ class SessionStore(ABC):
         """Append provider-neutral transcript messages to a session."""
 
     @abstractmethod
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict[str, Any],
+    ) -> None:
+        """Append transcript messages and persist a checkpoint atomically."""
+
+    @abstractmethod
     async def load_transcript(self, session_id: str) -> list[Message]:
         """Load provider-neutral transcript messages for a session."""
 
@@ -523,6 +532,24 @@ class InMemorySessionStore(SessionStore):
             if not copied_messages:
                 return
             self._transcripts[session_id].extend(copied_messages)
+
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict[str, Any],
+    ) -> None:
+        session_id = require_nonblank(session_id, "session_id")
+        copied_messages = copy_transcript_messages(messages)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint state must be a dictionary.")
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            if copied_messages:
+                self._transcripts[session_id].extend(copied_messages)
+            self._checkpoints[session_id] = copied_checkpoint
 
     async def load_transcript(self, session_id: str) -> list[Message]:
         session_id = require_nonblank(session_id, "session_id")

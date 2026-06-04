@@ -418,6 +418,55 @@ class SQLiteSessionStore(SessionStore):
                     ],
                 )
 
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict[str, Any],
+    ) -> None:
+        session_id = require_nonblank(session_id, "session_id")
+        copied_messages = copy_transcript_messages(messages)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint state must be a dictionary.")
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        updated_at = datetime.now(UTC)
+
+        async with self._lock:
+            if not self._session_exists_unlocked(session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            with self._connection:
+                if copied_messages:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO transcript_messages (
+                            session_id,
+                            message_json
+                        )
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (
+                                session_id,
+                                _json_dumps(message.model_dump(mode="json")),
+                            )
+                            for message in copied_messages
+                        ],
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO checkpoints (session_id, state_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        session_id,
+                        _json_dumps(copied_checkpoint),
+                        _format_datetime(updated_at),
+                    ),
+                )
+
     async def load_transcript(self, session_id: str) -> list[Message]:
         session_id = require_nonblank(session_id, "session_id")
         async with self._lock:

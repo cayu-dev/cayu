@@ -13,10 +13,12 @@ from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
+    MessageRole,
     ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
+    copy_message_part,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
@@ -26,6 +28,17 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
     copy_model_stream_event,
+)
+from cayu.runtime.approvals import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
+    copy_pending_tool_approval,
+    copy_tool_approval_recovery_request,
+    copy_tool_approval_request,
 )
 from cayu.runtime.context import (
     ContextBuildError,
@@ -72,6 +85,11 @@ class _RegisteredAgentState:
     tool_policy: ToolPolicy
 
 
+@dataclass
+class _AssistantTextPart:
+    text: str
+
+
 @dataclass(frozen=True)
 class RegisteredTool:
     name: str
@@ -105,11 +123,41 @@ class ToolCallOutcome:
     result: ToolResult
 
 
+@dataclass(frozen=True)
+class ToolCallPolicyOutcome:
+    call: ToolCallRequest
+    result: ToolPolicyResult | None
+
+
+@dataclass(frozen=True)
+class ToolRoundPolicyPlan:
+    outcomes: list[ToolCallPolicyOutcome]
+    pending_approval: tuple[PendingToolApproval, Event] | None
+
+
+class _SessionInterrupted(Exception):
+    def __init__(self, approval: PendingToolApproval) -> None:
+        super().__init__(f"Tool call requires approval: {approval.tool_name}")
+        self.approval = copy_pending_tool_approval(approval)
+
+
+class _ToolApprovalManualRecoveryRequired(RuntimeError):
+    def __init__(self, *, tool_call_id: str, tool_name: str) -> None:
+        super().__init__(
+            "Tool approval cannot be retried automatically because a tool call "
+            f"started without a terminal result: {tool_call_id} ({tool_name})."
+        )
+        self.tool_call_id = tool_call_id
+        self.tool_name = tool_name
+
+
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
+
+_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 
 
 class CayuApp:
@@ -359,6 +407,12 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        if _pending_tool_approval_from_checkpoint(checkpoint) is not None:
+            raise RuntimeError(
+                "Session has a pending tool approval. Resolve it with "
+                "resolve_tool_approval(...) before resuming with new messages."
+            )
         session = await self.session_store.transition_status(
             loaded_session.id,
             from_statuses=_RESUMABLE_SESSION_STATUSES,
@@ -403,6 +457,416 @@ class CayuApp:
         ):
             yield event
 
+    async def resolve_tool_approval(
+        self,
+        request: ToolApprovalRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not ToolApprovalRequest:
+            raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
+        request = _validate_tool_approval_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        pending_approval = _pending_tool_approval_from_checkpoint(checkpoint)
+        if pending_approval is None:
+            raise RuntimeError("Session has no pending tool approval.")
+        if pending_approval.approval_id != request.approval_id:
+            raise ValueError(
+                "Tool approval id does not match pending approval: "
+                f"{request.approval_id}"
+            )
+
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+        )
+
+        async for event in self._continue_tool_approval_resolution(
+            request=request,
+            session=session,
+            pending_approval=pending_approval,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        ):
+            yield event
+
+    async def _continue_tool_approval_resolution(
+        self,
+        *,
+        request: ToolApprovalRequest,
+        session: Session,
+        pending_approval: PendingToolApproval,
+        registered_agent: _RegisteredAgentState,
+        registered_provider: RegisteredProvider,
+        registered_environment: RegisteredEnvironment | None,
+        emit_resume_event: bool = True,
+    ) -> AsyncIterator[Event]:
+        environment_name = _environment_name(registered_environment)
+        pending_approval_cleared = False
+        tool_outcomes: list[ToolCallOutcome] = []
+        try:
+            transcript = await self.session_store.load_transcript(session.id)
+            approval_events = await self.session_store.load_events(session.id)
+            _validate_approval_retry_decision(
+                events=approval_events,
+                approval=pending_approval,
+                decision=request.decision,
+            )
+            recorded_outcomes = _recorded_approval_tool_outcomes(
+                events=approval_events,
+                approval=pending_approval,
+            )
+            if emit_resume_event:
+                yield await self._emit(
+                    _tool_approval_resumed_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        approval=pending_approval,
+                        decision=request.decision,
+                    )
+                )
+
+            if request.decision not in {
+                ToolApprovalDecision.APPROVE,
+                ToolApprovalDecision.DENY,
+            }:
+                raise ValueError(f"Unsupported tool approval decision: {request.decision}")
+
+            for pending_tool_call in _pending_round_tool_calls(pending_approval):
+                tool_call = ToolCallRequest(
+                    id=pending_tool_call.tool_call_id,
+                    name=pending_tool_call.tool_name,
+                    arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+                )
+                policy_result = _policy_result_from_pending_tool_call(pending_tool_call)
+                recorded_outcome = recorded_outcomes.get(tool_call.id)
+                if recorded_outcome is not None:
+                    tool_outcomes.append(recorded_outcome)
+                    continue
+
+                if (
+                    policy_result is not None
+                    and policy_result.decision == ToolPolicyDecision.DENY
+                ):
+                    reason = _tool_policy_denial_reason(policy_result)
+                    result = _blocked_tool_result(policy_result, reason=reason)
+                    yield await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_BLOCKED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "approval_id": pending_approval.approval_id,
+                                "tool_call_id": tool_call.id,
+                                "decision": policy_result.decision.value,
+                                "reason": reason,
+                                "metadata": policy_result.metadata,
+                                "result": result.model_dump(),
+                            },
+                        )
+                    )
+                    tool_outcomes.append(ToolCallOutcome(call=tool_call, result=result))
+                    continue
+
+                if (
+                    policy_result is not None
+                    and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+                    and request.decision == ToolApprovalDecision.APPROVE
+                ):
+                    yield await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_APPROVED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "approval_id": pending_approval.approval_id,
+                                "tool_call_id": tool_call.id,
+                                "reason": request.reason,
+                                "metadata": request.metadata,
+                            },
+                        )
+                    )
+
+                if request.decision == ToolApprovalDecision.DENY:
+                    approval_required = (
+                        policy_result is not None
+                        and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+                    )
+                    result = _approval_denied_tool_result(
+                        request,
+                        approval=pending_approval,
+                        tool_call=tool_call,
+                        approval_required=approval_required,
+                    )
+                    yield await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_APPROVAL_DENIED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "approval_id": pending_approval.approval_id,
+                                "tool_call_id": tool_call.id,
+                                "approval_required": approval_required,
+                                "reason": request.reason,
+                                "metadata": request.metadata,
+                                "result": result.model_dump(),
+                            },
+                        )
+                    )
+                    tool_outcomes.append(ToolCallOutcome(call=tool_call, result=result))
+                    continue
+
+                outcome = None
+                async for event, outcome in self._execute_tool_call(  # noqa: B007
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    request_metadata=request.metadata,
+                    task_id=pending_approval.task_id,
+                    check_policy=False,
+                    emit_started=True,
+                    approval_id=pending_approval.approval_id,
+                ):
+                    yield event
+                if outcome is not None:
+                    tool_outcomes.append(outcome)
+
+            tool_result_messages = _tool_result_messages(tool_outcomes)
+            transcript.extend(tool_result_messages)
+            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(
+                session.id
+            )
+            await self.session_store.append_transcript_messages_and_checkpoint(
+                session.id,
+                tool_result_messages,
+                cleared_checkpoint,
+            )
+            pending_approval_cleared = True
+            yield await self._emit(
+                _pending_tool_approval_cleared_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    approval_id=pending_approval.approval_id,
+                )
+            )
+
+            async for event in self._run_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                messages=transcript,
+                messages_to_append=[],
+                max_steps=request.max_steps,
+                request_metadata=request.metadata,
+                task_id=pending_approval.task_id,
+                start_event_type=None,
+                start_event_payload={},
+                start_task_on_enter=False,
+            ):
+                yield event
+        except Exception as exc:
+            if isinstance(exc, _ToolApprovalManualRecoveryRequired):
+                await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+                yield await self._emit(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "approval": pending_approval.model_dump(),
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "approval_id": pending_approval.approval_id,
+                            "tool_call_id": exc.tool_call_id,
+                            "tool_name": exc.tool_name,
+                            "manual_recovery_required": True,
+                        },
+                    )
+                )
+                return
+
+            if not pending_approval_cleared:
+                await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+                yield await self._emit(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "approval": pending_approval.model_dump(),
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                )
+                return
+
+            task_failure_error: Exception | None = None
+            if pending_approval.task_id is not None and self.task_store is not None:
+                try:
+                    task = await self.task_store.fail_task(
+                        pending_approval.task_id,
+                        {
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "session_id": session.id,
+                            "approval_id": pending_approval.approval_id,
+                        },
+                    )
+                    yield await self._emit(
+                        _task_event(
+                            event_type=EventType.TASK_FAILED,
+                            task=task,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    )
+                except Exception as task_exc:
+                    task_failure_error = task_exc
+            await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            payload: dict[str, Any] = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "approval_id": pending_approval.approval_id,
+                "tool_call_id": pending_approval.tool_call_id,
+            }
+            if task_failure_error is not None:
+                payload["task_update_error"] = str(task_failure_error)
+                payload["task_update_error_type"] = type(task_failure_error).__name__
+            yield await self._emit(
+                Event(
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                )
+            )
+
+    async def recover_tool_approval(
+        self,
+        request: ToolApprovalRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not ToolApprovalRecoveryRequest:
+            raise TypeError(
+                "Runtime approval recovery requires a ToolApprovalRecoveryRequest."
+            )
+        request = _validate_tool_approval_recovery_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        pending_approval = _pending_tool_approval_from_checkpoint(checkpoint)
+        if pending_approval is None:
+            raise RuntimeError("Session has no pending tool approval.")
+        if pending_approval.approval_id != request.approval_id:
+            raise ValueError(
+                "Tool approval id does not match pending approval: "
+                f"{request.approval_id}"
+            )
+
+        pending_tool_call = _pending_tool_call_for_recovery(
+            approval=pending_approval,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+        )
+        recovered_result = _recovered_tool_result(
+            request=request,
+        )
+        event_type = (
+            EventType.TOOL_CALL_FAILED
+            if recovered_result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        )
+
+        try:
+            events = await self.session_store.load_events(session.id)
+            _validate_tool_approval_recovery_target(
+                events=events,
+                approval=pending_approval,
+                tool_call_id=request.tool_call_id,
+            )
+            recovery_events = [
+                _tool_approval_resumed_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    approval=pending_approval,
+                    decision=ToolApprovalDecision.APPROVE,
+                ),
+                Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    tool_name=pending_tool_call.tool_name,
+                    payload={
+                        "approval_id": pending_approval.approval_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "manual_recovery": True,
+                        "reason": request.reason,
+                        "metadata": request.metadata,
+                        "result": recovered_result.model_dump(),
+                    },
+                ),
+            ]
+            for event in await self._emit_many(session.id, recovery_events):
+                yield event
+        except Exception:
+            await self.session_store.update_status(session.id, loaded_session.status)
+            raise
+
+        approval_request = ToolApprovalRequest(
+            session_id=request.session_id,
+            approval_id=request.approval_id,
+            decision=ToolApprovalDecision.APPROVE,
+            reason=request.reason,
+            metadata=request.metadata,
+            max_steps=request.max_steps,
+        )
+        async for event in self._continue_tool_approval_resolution(
+            request=approval_request,
+            session=session,
+            pending_approval=pending_approval,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            emit_resume_event=False,
+        ):
+            yield event
+
     async def _run_session(
         self,
         *,
@@ -415,24 +879,26 @@ class CayuApp:
         max_steps: int,
         request_metadata: dict[str, Any],
         task_id: str | None,
-        start_event_type: EventType,
+        start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
+        start_task_on_enter: bool = True,
     ) -> AsyncIterator[Event]:
         provider = registered_provider.provider
         environment_name = _environment_name(registered_environment)
-        task_started = False
+        task_started = task_id is not None and not start_task_on_enter
         task_finished = False
         try:
-            yield await self._emit(
-                Event(
-                    type=start_event_type,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=start_event_payload,
+            if start_event_type is not None:
+                yield await self._emit(
+                    Event(
+                        type=start_event_type,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=start_event_payload,
+                    )
                 )
-            )
-            if task_id is not None:
+            if task_id is not None and start_task_on_enter:
                 task = await self._start_task(task_id=task_id, session=session)
                 task_started = True
                 yield await self._emit(
@@ -540,7 +1006,7 @@ class CayuApp:
                     )
                 )
 
-                assistant_text: list[str] = []
+                assistant_parts: list[_AssistantTextPart | ToolCallPart] = []
                 tool_calls: list[ToolCallRequest] = []
                 provider_state_parts: list[ProviderStatePart] = []
                 model_completed = False
@@ -552,11 +1018,13 @@ class CayuApp:
                         )
 
                     if stream_event.type == ModelStreamEventType.TOOL_CALL:
-                        tool_calls.append(_parse_tool_call(stream_event.payload))
+                        tool_call = _parse_tool_call(stream_event.payload)
+                        tool_calls.append(tool_call)
+                        assistant_parts.append(_tool_call_part(tool_call))
                         continue
 
                     if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-                        assistant_text.append(stream_event.delta)
+                        _append_assistant_text_delta(assistant_parts, stream_event.delta)
                     elif stream_event.type == ModelStreamEventType.COMPLETED:
                         model_completed = True
                         provider_state_parts = _provider_state_parts(
@@ -579,8 +1047,7 @@ class CayuApp:
                     raise RuntimeError("Model provider stream ended without a completed event.")
 
                 assistant_message = _assistant_message(
-                    text="".join(assistant_text),
-                    tool_calls=tool_calls,
+                    content_parts=assistant_parts,
                     provider_state_parts=provider_state_parts,
                 )
                 if assistant_message is not None:
@@ -593,6 +1060,34 @@ class CayuApp:
                 if not tool_calls:
                     break
 
+                policy_plan = await self._policy_plan_for_tool_round(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_calls=tool_calls,
+                    request_metadata=request_metadata,
+                    task_id=task_id,
+                )
+                if policy_plan.pending_approval is not None:
+                    approval, checkpoint_event = policy_plan.pending_approval
+                    yield await self._emit(checkpoint_event)
+                    yield await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=approval.tool_name,
+                            payload={
+                                "approval": approval.model_dump(),
+                            },
+                        )
+                    )
+                    raise _SessionInterrupted(approval)
+
+                policy_results_by_id = {
+                    outcome.call.id: outcome.result for outcome in policy_plan.outcomes
+                }
                 tool_outcomes: list[ToolCallOutcome] = []
                 for tool_call in tool_calls:
                     outcome = None
@@ -602,6 +1097,8 @@ class CayuApp:
                         registered_environment=registered_environment,
                         tool_call=tool_call,
                         request_metadata=request_metadata,
+                        task_id=task_id,
+                        policy_result=policy_results_by_id.get(tool_call.id),
                     ):
                         yield event
                     if outcome is not None:
@@ -640,6 +1137,19 @@ class CayuApp:
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
+                )
+            )
+        except _SessionInterrupted as exc:
+            await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            yield await self._emit(
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "approval": exc.approval.model_dump(),
+                    },
                 )
             )
         except Exception as exc:
@@ -717,6 +1227,82 @@ class CayuApp:
             },
         )
 
+    async def _policy_plan_for_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_calls: list[ToolCallRequest],
+        request_metadata: dict[str, Any],
+        task_id: str | None,
+    ) -> ToolRoundPolicyPlan:
+        policy_outcomes: list[ToolCallPolicyOutcome] = []
+        approval_policy_result: ToolPolicyResult | None = None
+        approval_tool_call: ToolCallRequest | None = None
+        for tool_call in tool_calls:
+            if tool_call.name not in registered_agent.tools:
+                policy_outcomes.append(ToolCallPolicyOutcome(call=tool_call, result=None))
+                continue
+
+            policy_result = await self._authorize_tool_call(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                request_metadata=request_metadata,
+            )
+            policy_outcomes.append(
+                ToolCallPolicyOutcome(call=tool_call, result=policy_result)
+            )
+            if (
+                approval_policy_result is None
+                and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+            ):
+                approval_policy_result = policy_result
+                approval_tool_call = tool_call
+
+        if approval_policy_result is None or approval_tool_call is None:
+            return ToolRoundPolicyPlan(outcomes=policy_outcomes, pending_approval=None)
+
+        pending_approval = await self._checkpoint_pending_tool_approval(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=approval_tool_call,
+            tool_calls=[outcome.call for outcome in policy_outcomes],
+            policy_outcomes=policy_outcomes,
+            task_id=task_id,
+            policy_result=approval_policy_result,
+        )
+        return ToolRoundPolicyPlan(
+            outcomes=policy_outcomes,
+            pending_approval=pending_approval,
+        )
+
+    async def _authorize_tool_call(
+        self,
+        *,
+        session: Session,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_call: ToolCallRequest,
+        request_metadata: dict[str, Any],
+    ) -> ToolPolicyResult:
+        policy_result = await registered_agent.tool_policy.authorize(
+            ToolPolicyRequest(
+                session=session.model_copy(deep=True),
+                agent=_validate_agent_spec(registered_agent.spec),
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                arguments=tool_call.arguments,
+                environment_name=_environment_name(registered_environment),
+                workspace_id=_workspace_id(registered_environment),
+                metadata=request_metadata,
+            )
+        )
+        return _validate_tool_policy_result(policy_result)
+
     async def _execute_tool_call(
         self,
         *,
@@ -725,24 +1311,33 @@ class CayuApp:
         registered_environment: RegisteredEnvironment | None,
         tool_call: ToolCallRequest,
         request_metadata: dict[str, Any],
+        task_id: str | None,
+        check_policy: bool = True,
+        emit_started: bool = True,
+        policy_result: ToolPolicyResult | None = None,
+        approval_id: str | None = None,
     ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
-        yield (
-            await self._emit(
-                Event(
-                    type=EventType.TOOL_CALL_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload={
-                        "tool_call_id": tool_call.id,
-                        "arguments": deepcopy(tool_call.arguments),
-                    },
-                )
-            ),
-            None,
-        )
+        if emit_started:
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call.id,
+                "arguments": deepcopy(tool_call.arguments),
+            }
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.TOOL_CALL_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=tool_call.name,
+                        payload=payload,
+                    )
+                ),
+                None,
+            )
 
         registered_tool = registered_agent.tools.get(tool_call.name)
         if registered_tool is None:
@@ -750,6 +1345,12 @@ class CayuApp:
                 content=f"Tool not registered: {tool_call.name}",
                 is_error=True,
             )
+            payload = {
+                "tool_call_id": tool_call.id,
+                "result": result.model_dump(),
+            }
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
             yield (
                 await self._emit(
                     Event(
@@ -758,54 +1359,82 @@ class CayuApp:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         tool_name=tool_call.name,
-                        payload={
-                            "tool_call_id": tool_call.id,
-                            "result": result.model_dump(),
-                        },
+                        payload=payload,
                     )
                 ),
                 ToolCallOutcome(call=tool_call, result=result),
             )
             return
 
-        policy_result = await registered_agent.tool_policy.authorize(
-            ToolPolicyRequest(
-                session=session.model_copy(deep=True),
-                agent=_validate_agent_spec(registered_agent.spec),
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                arguments=tool_call.arguments,
-                environment_name=environment_name,
-                workspace_id=_workspace_id(registered_environment),
-                metadata=request_metadata,
-            )
-        )
-        policy_result = _validate_tool_policy_result(policy_result)
-        if policy_result.decision == ToolPolicyDecision.DENY:
-            reason = _tool_policy_denial_reason(policy_result)
-            result = _blocked_tool_result(policy_result, reason=reason)
-            yield (
-                await self._emit(
-                    Event(
-                        type=EventType.TOOL_CALL_BLOCKED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=tool_call.name,
-                        payload={
-                            "tool_call_id": tool_call.id,
-                            "decision": policy_result.decision.value,
-                            "reason": reason,
-                            "metadata": policy_result.metadata,
-                            "result": result.model_dump(),
-                        },
-                    )
-                ),
-                ToolCallOutcome(call=tool_call, result=result),
-            )
-            return
-        if policy_result.decision != ToolPolicyDecision.ALLOW:
-            raise ValueError(f"Unsupported tool policy decision: {policy_result.decision}")
+        if check_policy:
+            if policy_result is None:
+                resolved_policy_result = await self._authorize_tool_call(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    request_metadata=request_metadata,
+                )
+            else:
+                resolved_policy_result = _validate_tool_policy_result(policy_result)
+            if resolved_policy_result.decision == ToolPolicyDecision.DENY:
+                reason = _tool_policy_denial_reason(resolved_policy_result)
+                result = _blocked_tool_result(resolved_policy_result, reason=reason)
+                payload = {
+                    "tool_call_id": tool_call.id,
+                    "decision": resolved_policy_result.decision.value,
+                    "reason": reason,
+                    "metadata": resolved_policy_result.metadata,
+                    "result": result.model_dump(),
+                }
+                if approval_id is not None:
+                    payload["approval_id"] = approval_id
+                yield (
+                    await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_BLOCKED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload=payload,
+                        )
+                    ),
+                    ToolCallOutcome(call=tool_call, result=result),
+                )
+                return
+            if resolved_policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL:
+                approval, checkpoint_event = await self._checkpoint_pending_tool_approval(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    tool_calls=[tool_call],
+                    policy_outcomes=None,
+                    task_id=task_id,
+                    policy_result=resolved_policy_result,
+                )
+                yield (await self._emit(checkpoint_event), None)
+                yield (
+                    await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "approval": approval.model_dump(),
+                            },
+                        )
+                    ),
+                    None,
+                )
+                raise _SessionInterrupted(approval)
+            if resolved_policy_result.decision != ToolPolicyDecision.ALLOW:
+                raise ValueError(
+                    f"Unsupported tool policy decision: {resolved_policy_result.decision}"
+                )
 
         result = await _run_tool(
             tool=registered_tool.tool,
@@ -818,13 +1447,22 @@ class CayuApp:
                 runner=_runner(registered_environment),
                 vault=_vault(registered_environment),
                 mcp_servers=_mcp_servers(registered_environment),
-                metadata={"tool_call_id": tool_call.id},
+                metadata=_tool_context_metadata(
+                    tool_call_id=tool_call.id,
+                    approval_id=approval_id,
+                ),
             ),
             arguments=deepcopy(tool_call.arguments),
         )
         event_type = (
             EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
         )
+        payload = {
+            "tool_call_id": tool_call.id,
+            "result": result.model_dump(),
+        }
+        if approval_id is not None:
+            payload["approval_id"] = approval_id
         yield (
             await self._emit(
                 Event(
@@ -833,14 +1471,70 @@ class CayuApp:
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     tool_name=tool_call.name,
-                    payload={
-                        "tool_call_id": tool_call.id,
-                        "result": result.model_dump(),
-                    },
+                    payload=payload,
                 )
             ),
             ToolCallOutcome(call=tool_call, result=result),
         )
+
+    async def _checkpoint_pending_tool_approval(
+        self,
+        *,
+        session: Session,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+        tool_call: ToolCallRequest,
+        tool_calls: list[ToolCallRequest],
+        policy_outcomes: list[ToolCallPolicyOutcome] | None,
+        task_id: str | None,
+        policy_result: ToolPolicyResult,
+    ) -> tuple[PendingToolApproval, Event]:
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        if _pending_tool_approval_from_checkpoint(checkpoint) is not None:
+            raise RuntimeError("Session already has a pending tool approval.")
+
+        approval = PendingToolApproval(
+            approval_id=str(uuid4()),
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            arguments=copy_json_value(tool_call.arguments, "arguments"),
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            workspace_id=_workspace_id(registered_environment),
+            task_id=task_id,
+            reason=policy_result.reason,
+            metadata=copy_json_value(policy_result.metadata, "metadata"),
+            tool_calls=_pending_tool_call_approvals(
+                tool_calls=tool_calls,
+                policy_outcomes=policy_outcomes,
+            ),
+        )
+        checkpoint[_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump()
+        await self.session_store.checkpoint(session.id, checkpoint)
+        return (
+            approval,
+            Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload={
+                    "checkpoint": _PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                    "approval_id": approval.approval_id,
+                    "tool_call_id": approval.tool_call_id,
+                },
+            ),
+        )
+
+    async def _checkpoint_without_pending_tool_approval(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint.pop(_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
+        return checkpoint
 
     async def _emit(self, event: Event) -> Event:
         await self.session_store.append_event(event.session_id, event)
@@ -865,6 +1559,83 @@ class CayuApp:
                     ),
                 )
         return event
+
+    async def _emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
+        if type(events) is not list:
+            raise TypeError("Runtime events must be a list.")
+        copied_events: list[Event] = []
+        for event in events:
+            if type(event) is not Event:
+                raise TypeError("Runtime events must be Event instances.")
+            if event.session_id != session_id:
+                raise ValueError("Event session_id does not match target session.")
+            copied_events.append(event.model_copy(deep=True))
+
+        await self.session_store.append_events(session_id, copied_events)
+        for event in copied_events:
+            for sink in self._event_sinks:
+                try:
+                    await sink.emit(event.model_copy(deep=True))
+                except Exception as exc:
+                    await self.session_store.append_event(
+                        event.session_id,
+                        Event(
+                            type=EventType.RUNTIME_SINK_FAILED,
+                            session_id=event.session_id,
+                            agent_name=event.agent_name,
+                            environment_name=event.environment_name,
+                            payload={
+                                "sink": type(sink).__name__,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "event_id": event.id,
+                                "event_type": str(event.type),
+                            },
+                        ),
+                    )
+        return copied_events
+
+
+def _tool_approval_resumed_event(
+    *,
+    session: Session,
+    registered_agent: _RegisteredAgentState,
+    registered_environment: RegisteredEnvironment | None,
+    approval: PendingToolApproval,
+    decision: ToolApprovalDecision,
+) -> Event:
+    return Event(
+        type=EventType.SESSION_RESUMED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload={
+            "agent_name": registered_agent.spec.name,
+            "approval_id": approval.approval_id,
+            "tool_call_id": approval.tool_call_id,
+            "decision": decision.value,
+        },
+    )
+
+
+def _pending_tool_approval_cleared_event(
+    *,
+    session: Session,
+    registered_agent: _RegisteredAgentState,
+    registered_environment: RegisteredEnvironment | None,
+    approval_id: str,
+) -> Event:
+    return Event(
+        type=EventType.SESSION_CHECKPOINTED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload={
+            "checkpoint": _PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            "approval_id": approval_id,
+            "cleared": True,
+        },
+    )
 
 
 async def _run_tool(
@@ -904,6 +1675,226 @@ def _blocked_tool_result(policy_result: ToolPolicyResult, *, reason: str) -> Too
     )
 
 
+def _approval_denied_tool_result(
+    request: ToolApprovalRequest,
+    *,
+    approval: PendingToolApproval,
+    tool_call: ToolCallRequest,
+    approval_required: bool,
+) -> ToolResult:
+    if request.reason:
+        reason = request.reason
+        if approval_required:
+            content = f"Tool call denied by approval: {request.reason}"
+        else:
+            content = (
+                "Tool call skipped because approval was denied for the same tool round: "
+                f"{request.reason}"
+            )
+    elif approval_required:
+        reason = "Tool call denied by approval."
+        content = reason
+    else:
+        reason = "Tool call skipped because approval was denied for the same tool round."
+        content = reason
+
+    return ToolResult(
+        content=content,
+        structured={
+            "decision": request.decision.value,
+            "approval_id": approval.approval_id,
+            "tool_call_id": tool_call.id,
+            "tool_name": tool_call.name,
+            "approval_required": approval_required,
+            "denied_by_approval": approval_required,
+            "skipped_due_to_approval_denial": not approval_required,
+            "denied_tool_call_id": approval.tool_call_id,
+            "denied_tool_name": approval.tool_name,
+            "reason": reason,
+            "metadata": request.metadata,
+        },
+        is_error=True,
+    )
+
+
+def _recorded_approval_tool_outcomes(
+    *,
+    events: list[Event],
+    approval: PendingToolApproval,
+) -> dict[str, ToolCallOutcome]:
+    pending_calls = {
+        call.tool_call_id: call for call in _pending_round_tool_calls(approval)
+    }
+    started_ids: set[str] = set()
+    outcomes: dict[str, ToolCallOutcome] = {}
+    terminal_event_types = {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+
+    for event in events:
+        if event.payload.get("approval_id") != approval.approval_id:
+            continue
+
+        tool_call_id = event.payload.get("tool_call_id")
+        if type(tool_call_id) is not str or tool_call_id not in pending_calls:
+            continue
+
+        if event.type == EventType.TOOL_CALL_STARTED:
+            started_ids.add(tool_call_id)
+            continue
+
+        if event.type in terminal_event_types:
+            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
+                event=event,
+                pending_tool_call=pending_calls[tool_call_id],
+            )
+
+    for tool_call_id in started_ids:
+        if tool_call_id not in outcomes:
+            pending_tool_call = pending_calls[tool_call_id]
+            raise _ToolApprovalManualRecoveryRequired(
+                tool_call_id=tool_call_id,
+                tool_name=pending_tool_call.tool_name,
+            )
+
+    return outcomes
+
+
+def _validate_approval_retry_decision(
+    *,
+    events: list[Event],
+    approval: PendingToolApproval,
+    decision: ToolApprovalDecision,
+) -> None:
+    has_denied_result = False
+    has_approved_call = False
+    has_executed_or_recovered_result = False
+
+    for event in events:
+        if event.payload.get("approval_id") != approval.approval_id:
+            continue
+        if event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
+            has_denied_result = True
+        elif event.type == EventType.TOOL_CALL_APPROVED:
+            has_approved_call = True
+        elif event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
+            has_executed_or_recovered_result = True
+
+    if decision == ToolApprovalDecision.APPROVE and has_denied_result:
+        raise RuntimeError(
+            "Tool approval was already denied and cannot be retried as approved: "
+            f"{approval.approval_id}"
+        )
+    if decision == ToolApprovalDecision.DENY and (
+        has_approved_call or has_executed_or_recovered_result
+    ):
+        raise RuntimeError(
+            "Tool approval already has approved or executed tool results and "
+            f"cannot be retried as denied: {approval.approval_id}"
+        )
+
+
+def _pending_tool_call_for_recovery(
+    *,
+    approval: PendingToolApproval,
+    tool_call_id: str,
+) -> PendingToolCallApproval:
+    for pending_tool_call in _pending_round_tool_calls(approval):
+        if pending_tool_call.tool_call_id == tool_call_id:
+            return pending_tool_call
+    raise ValueError(
+        "Tool call is not part of the pending approval: " f"{tool_call_id}"
+    )
+
+
+def _validate_tool_approval_recovery_target(
+    *,
+    events: list[Event],
+    approval: PendingToolApproval,
+    tool_call_id: str,
+) -> None:
+    started = False
+    terminal = False
+    terminal_event_types = {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+    for event in events:
+        if event.payload.get("approval_id") != approval.approval_id:
+            continue
+        if event.payload.get("tool_call_id") != tool_call_id:
+            continue
+        if event.type == EventType.TOOL_CALL_STARTED:
+            started = True
+        elif event.type in terminal_event_types:
+            terminal = True
+
+    if terminal:
+        raise RuntimeError(
+            "Tool call already has a terminal event and does not need recovery: "
+            f"{tool_call_id}"
+        )
+    if not started:
+        raise RuntimeError(
+            "Tool approval recovery requires a recorded tool.call.started event: "
+            f"{tool_call_id}"
+        )
+
+
+def _recovered_tool_result(
+    *,
+    request: ToolApprovalRecoveryRequest,
+) -> ToolResult:
+    if request.outcome not in {
+        ToolApprovalRecoveryOutcome.COMPLETED,
+        ToolApprovalRecoveryOutcome.FAILED,
+    }:
+        raise ValueError(f"Unsupported tool approval recovery outcome: {request.outcome}")
+    return ToolResult(
+        content=request.message,
+        structured=request.structured,
+        artifacts=request.artifacts,
+        is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
+    )
+
+
+def _tool_context_metadata(
+    *,
+    tool_call_id: str,
+    approval_id: str | None,
+) -> dict[str, str]:
+    metadata = {"tool_call_id": tool_call_id}
+    if approval_id is not None:
+        metadata["approval_id"] = approval_id
+    return metadata
+
+
+def _tool_call_outcome_from_terminal_event(
+    *,
+    event: Event,
+    pending_tool_call: PendingToolCallApproval,
+) -> ToolCallOutcome:
+    result_payload = event.payload.get("result")
+    if type(result_payload) is not dict:
+        raise ValueError(
+            f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
+        )
+    result = _normalize_tool_result(_validate_tool_result(ToolResult(**result_payload)))
+    return ToolCallOutcome(
+        call=ToolCallRequest(
+            id=pending_tool_call.tool_call_id,
+            name=pending_tool_call.tool_name,
+            arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+        ),
+        result=result,
+    )
+
+
 def _validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
     if type(result) is not ToolPolicyResult:
         raise TypeError(
@@ -914,6 +1905,76 @@ def _validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
         decision=result.decision,
         reason=result.reason,
         metadata=copy_json_value(result.metadata, "metadata"),
+    )
+
+
+def _pending_tool_approval_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> PendingToolApproval | None:
+    if checkpoint is None:
+        return None
+    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    value = copied_checkpoint.get(_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
+    if value is None:
+        return None
+    if type(value) is not dict:
+        raise ValueError("Pending tool approval checkpoint must be an object.")
+    return PendingToolApproval(**value)
+
+
+def _pending_tool_call_approvals(
+    *,
+    tool_calls: list[ToolCallRequest],
+    policy_outcomes: list[ToolCallPolicyOutcome] | None,
+) -> list[PendingToolCallApproval]:
+    policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
+    if policy_outcomes is not None:
+        policy_results_by_id = {
+            outcome.call.id: outcome.result for outcome in policy_outcomes
+        }
+    return [
+        PendingToolCallApproval(
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            arguments=copy_json_value(tool_call.arguments, "arguments"),
+            policy_decision=(
+                policy_results_by_id[tool_call.id].decision.value
+                if tool_call.id in policy_results_by_id
+                and policy_results_by_id[tool_call.id] is not None
+                else None
+            ),
+            reason=(
+                policy_results_by_id[tool_call.id].reason
+                if tool_call.id in policy_results_by_id
+                and policy_results_by_id[tool_call.id] is not None
+                else None
+            ),
+            metadata=(
+                copy_json_value(policy_results_by_id[tool_call.id].metadata, "metadata")
+                if tool_call.id in policy_results_by_id
+                and policy_results_by_id[tool_call.id] is not None
+                else {}
+            ),
+        )
+        for tool_call in tool_calls
+    ]
+
+
+def _pending_round_tool_calls(
+    approval: PendingToolApproval,
+) -> list[PendingToolCallApproval]:
+    return [PendingToolCallApproval(**call.model_dump()) for call in approval.tool_calls]
+
+
+def _policy_result_from_pending_tool_call(
+    pending_tool_call: PendingToolCallApproval,
+) -> ToolPolicyResult | None:
+    if pending_tool_call.policy_decision is None:
+        return None
+    return ToolPolicyResult(
+        decision=ToolPolicyDecision(pending_tool_call.policy_decision),
+        reason=pending_tool_call.reason,
+        metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
     )
 
 
@@ -972,6 +2033,16 @@ def _validate_run_request(request: RunRequest) -> RunRequest:
 
 def _validate_resume_request(request: ResumeRequest) -> ResumeRequest:
     return copy_resume_request(request)
+
+
+def _validate_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
+    return copy_tool_approval_request(request)
+
+
+def _validate_tool_approval_recovery_request(
+    request: ToolApprovalRecoveryRequest,
+) -> ToolApprovalRecoveryRequest:
+    return copy_tool_approval_recovery_request(request)
 
 
 def _session_identity(*, provider_name: str, model: str) -> SessionIdentity:
@@ -1250,25 +2321,44 @@ def _initial_messages(
 
 def _assistant_message(
     *,
-    text: str,
-    tool_calls: list[ToolCallRequest],
+    content_parts: list[_AssistantTextPart | ToolCallPart],
     provider_state_parts: list[ProviderStatePart],
 ) -> Message | None:
-    content: list[TextPart | ToolCallPart | ProviderStatePart] = []
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = []
+    for part in content_parts:
+        if type(part) is _AssistantTextPart:
+            if part.text.strip():
+                content.append(TextPart(text=part.text))
+            continue
+        if type(part) is ToolCallPart:
+            content.append(copy_message_part(part))
+            continue
+        raise TypeError("Assistant content must contain text buffers or tool calls.")
     content.extend(provider_state_parts)
-    if text.strip():
-        content.append(TextPart(text=text))
-    content.extend(
-        ToolCallPart(
-            tool_call_id=tool_call.id,
-            tool_name=tool_call.name,
-            arguments=deepcopy(tool_call.arguments),
-        )
-        for tool_call in tool_calls
-    )
     if not content:
         return None
-    return Message(role="assistant", content=content)
+    return Message(role=MessageRole.ASSISTANT, content=content)
+
+
+def _append_assistant_text_delta(
+    content_parts: list[_AssistantTextPart | ToolCallPart],
+    delta: str,
+) -> None:
+    if not delta:
+        return
+    if content_parts and type(content_parts[-1]) is _AssistantTextPart:
+        previous = content_parts[-1]
+        previous.text = f"{previous.text}{delta}"
+        return
+    content_parts.append(_AssistantTextPart(text=delta))
+
+
+def _tool_call_part(tool_call: ToolCallRequest) -> ToolCallPart:
+    return ToolCallPart(
+        tool_call_id=tool_call.id,
+        tool_name=tool_call.name,
+        arguments=deepcopy(tool_call.arguments),
+    )
 
 
 def _provider_state_parts(payload: dict[str, Any]) -> list[ProviderStatePart]:

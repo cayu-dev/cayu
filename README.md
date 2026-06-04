@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, first-class tool policies for scoped authority, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
@@ -178,6 +178,40 @@ app.register_agent(
     tools=[ReadFileTool(), ListFilesTool(), ExecCommandTool()],
     tool_policy=StaticToolPolicy(allow=["read_file", "list_files"]),
 )
+```
+
+Custom policies can also require caller approval before a tool round runs. The runtime checkpoints the pending approval, emits `tool.call.approval_requested`, marks the session `interrupted`, and waits for `resolve_tool_approval(...)`:
+
+```python
+from cayu import ToolApprovalDecision, ToolApprovalRequest
+
+async for event in app.resolve_tool_approval(
+    ToolApprovalRequest(
+        session_id="sess_123",
+        approval_id="approval_123",
+        decision=ToolApprovalDecision.APPROVE,
+    )
+):
+    print(event.type)
+```
+
+While a tool approval is pending, `app.resume(...)` rejects normal message resume. Approving or denying the pending approval writes the required tool results and clears the pending checkpoint atomically, then the model loop continues with valid provider-neutral history. If approval close is retried, Cayu reuses durable terminal tool events instead of running completed tools again. If a side-effecting tool started but Cayu cannot prove whether it completed, record the known external outcome and continue without re-running the tool:
+
+```python
+from cayu import ToolApprovalRecoveryOutcome, ToolApprovalRecoveryRequest
+
+async for event in app.recover_tool_approval(
+    ToolApprovalRecoveryRequest(
+        session_id="sess_123",
+        approval_id="approval_123",
+        tool_call_id="call_123",
+        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+        message="Confirmed in email provider logs: the email was sent.",
+        structured={"sent": True},
+        reason="Confirmed in email provider logs.",
+    )
+):
+    print(event.type)
 ```
 
 Use checkpoint-backed compaction for long-running sessions. Without an explicit

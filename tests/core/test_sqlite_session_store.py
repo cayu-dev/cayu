@@ -143,6 +143,46 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
     asyncio.run(assert_reopened_state())
 
 
+def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_atomic_transcript_checkpoint",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.checkpoint(
+            "sess_atomic_transcript_checkpoint",
+            {"pending_tool_approval": {"approval_id": "approval_1"}},
+        )
+        await store.append_transcript_messages_and_checkpoint(
+            "sess_atomic_transcript_checkpoint",
+            [Message.text("assistant", "done")],
+            {"closed": True},
+        )
+        await _close(store)
+
+    asyncio.run(run_store_operations())
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def assert_reopened_state() -> None:
+        transcript = await reopened.load_transcript("sess_atomic_transcript_checkpoint")
+        checkpoint = await reopened.load_checkpoint("sess_atomic_transcript_checkpoint")
+
+        assert [message.role for message in transcript] == ["assistant"]
+        assert transcript[0].content[0].text == "done"
+        assert checkpoint == {"closed": True}
+        await _close(reopened)
+
+    asyncio.run(assert_reopened_state())
+
+
 def test_sqlite_session_store_exposes_queryable_event_identity_columns(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)

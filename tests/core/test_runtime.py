@@ -38,6 +38,10 @@ from cayu.runtime import (
     StaticToolPolicy,
     TaskCreate,
     TaskStatus,
+    ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -139,6 +143,42 @@ class RecordingCompactor(ContextCompactor):
 class FailingCompactor(ContextCompactor):
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         raise RuntimeError("compaction unavailable")
+
+
+class FailingApprovalCloseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_close_once = False
+
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict,
+    ) -> None:
+        if not self.failed_close_once:
+            self.failed_close_once = True
+            raise RuntimeError("approval close unavailable")
+        await super().append_transcript_messages_and_checkpoint(
+            session_id,
+            messages,
+            checkpoint,
+        )
+
+
+class FailingTerminalToolEventStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_terminal_once = False
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
+        if (
+            not self.failed_terminal_once
+            and any(event.type == EventType.TOOL_CALL_COMPLETED for event in events)
+        ):
+            self.failed_terminal_once = True
+            raise RuntimeError("terminal tool event unavailable")
+        await super().append_events(session_id, events)
 
 
 class MemoryWorkspace(Workspace):
@@ -289,6 +329,26 @@ class SideEffectTool(Tool):
         return ToolResult(content="recorded")
 
 
+class RequireApprovalPolicy(ToolPolicy):
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        return ToolPolicyResult(
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+            reason=f"Approval required for {request.tool_name}.",
+            metadata={"scope": "human"},
+        )
+
+
+class SideEffectApprovalPolicy(ToolPolicy):
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        if request.tool_name == "side_effect":
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Approval required for {request.tool_name}.",
+                metadata={"scope": "human"},
+            )
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
 class ArgumentMutatingTool(Tool):
     spec = ToolSpec(
         name="mutate_args",
@@ -342,6 +402,20 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+async def collect_tool_approval_events(
+    app: CayuApp,
+    request: ToolApprovalRequest,
+) -> list[Event]:
+    return [event async for event in app.resolve_tool_approval(request)]
+
+
+async def collect_tool_approval_recovery_events(
+    app: CayuApp,
+    request: ToolApprovalRecoveryRequest,
+) -> list[Event]:
+    return [event async for event in app.recover_tool_approval(request)]
 
 
 def _test_session() -> Session:
@@ -1443,6 +1517,993 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert tool_result_part.is_error is True
 
 
+def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == []
+
+    approval = events[4].payload["approval"]
+    assert approval["tool_call_id"] == "call_1"
+    assert approval["tool_name"] == "side_effect"
+    assert approval["arguments"] == {"value": "secret"}
+    assert approval["agent_name"] == "assistant"
+    assert approval["reason"] == "Approval required for side_effect."
+    assert approval["metadata"] == {"scope": "human"}
+    assert [call["tool_call_id"] for call in approval["tool_calls"]] == ["call_1"]
+
+    session = asyncio.run(store.load("sess_tool_approval"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval"))
+    assert checkpoint is not None
+    assert checkpoint["pending_tool_approval"]["approval_id"] == approval["approval_id"]
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_approval"))
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[-1].content[0].type == "tool_call"
+
+
+def test_cayu_app_resolves_approved_tool_call_and_continues_session():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("approved handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_allow",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_tool_approval_allow",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                reason="approved by test",
+                metadata={"reviewer": "test"},
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert tool.calls == [{"value": "secret"}]
+    assert provider.requests[1].messages[-2].role == "assistant"
+    assert provider.requests[1].messages[-1].role == "tool"
+    assert provider.requests[1].messages[-1].content[0].content == "recorded"
+
+    session = asyncio.run(store.load("sess_tool_approval_allow"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert asyncio.run(store.load_checkpoint("sess_tool_approval_allow")) == {}
+
+
+def test_cayu_app_resolves_approved_multi_tool_round_in_order():
+    store = InMemorySessionStore()
+    side_effect = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "first"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="side_effect",
+                    arguments={"value": "second"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("round handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool(), side_effect],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_multi_tool_approval",
+                messages=[Message.text("user", "use both tools")],
+            ),
+        )
+    )
+    approval = interrupt_events[4].payload["approval"]
+    assert [call["tool_call_id"] for call in approval["tool_calls"]] == [
+        "call_1",
+        "call_2",
+    ]
+    assert side_effect.calls == []
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_multi_tool_approval",
+                approval_id=approval["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert side_effect.calls == [{"value": "second"}]
+
+    tool_result_message = provider.requests[1].messages[-1]
+    assert tool_result_message.role == "tool"
+    assert [part.tool_call_id for part in tool_result_message.content] == [
+        "call_1",
+        "call_2",
+    ]
+    assert [part.content for part in tool_result_message.content] == [
+        "first",
+        "recorded",
+    ]
+
+
+def test_cayu_app_resolves_denied_tool_call_and_continues_session():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("denial handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_deny",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_tool_approval_deny",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert tool.calls == []
+    assert provider.requests[1].messages[-1].role == "tool"
+    tool_result = provider.requests[1].messages[-1].content[0]
+    assert tool_result.type == "tool_result"
+    assert tool_result.content == "Tool call denied by approval: not safe"
+    assert tool_result.structured["denied_by_approval"] is True
+    assert tool_result.structured["skipped_due_to_approval_denial"] is False
+    assert tool_result.structured["tool_call_id"] == "call_1"
+    assert tool_result.structured["tool_name"] == "side_effect"
+    assert tool_result.is_error is True
+
+
+def test_cayu_app_denied_multi_tool_round_marks_skipped_calls_explicitly():
+    store = InMemorySessionStore()
+    side_effect = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "first"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="side_effect",
+                    arguments={"value": "second"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("denied round handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool(), side_effect],
+        tool_policy=SideEffectApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_multi_tool_approval_deny",
+                messages=[Message.text("user", "use both tools")],
+            ),
+        )
+    )
+    approval = interrupt_events[4].payload["approval"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_multi_tool_approval_deny",
+                approval_id=approval["approval_id"],
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert side_effect.calls == []
+
+    tool_result_message = provider.requests[1].messages[-1]
+    assert tool_result_message.role == "tool"
+    assert [part.tool_call_id for part in tool_result_message.content] == [
+        "call_1",
+        "call_2",
+    ]
+
+    skipped_result = tool_result_message.content[0]
+    assert skipped_result.content == (
+        "Tool call skipped because approval was denied for the same tool round: not safe"
+    )
+    assert skipped_result.structured["denied_by_approval"] is False
+    assert skipped_result.structured["skipped_due_to_approval_denial"] is True
+    assert skipped_result.structured["denied_tool_call_id"] == "call_2"
+    assert skipped_result.structured["denied_tool_name"] == "side_effect"
+
+    denied_result = tool_result_message.content[1]
+    assert denied_result.content == "Tool call denied by approval: not safe"
+    assert denied_result.structured["denied_by_approval"] is True
+    assert denied_result.structured["skipped_due_to_approval_denial"] is False
+    assert denied_result.structured["tool_call_id"] == "call_2"
+    assert denied_result.structured["tool_name"] == "side_effect"
+
+
+def test_cayu_app_keeps_pending_approval_if_atomic_resolution_close_fails():
+    store = FailingApprovalCloseStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed after retry"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_atomic_close_failure",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_atomic_close_failure",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[-1].payload["approval"]["approval_id"] == approval_id
+    assert events[-1].payload["error"] == "approval close unavailable"
+
+    session = asyncio.run(store.load("sess_approval_atomic_close_failure"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    checkpoint = asyncio.run(store.load_checkpoint("sess_approval_atomic_close_failure"))
+    assert checkpoint is not None
+    assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+
+    transcript = asyncio.run(store.load_transcript("sess_approval_atomic_close_failure"))
+    assert [message.role for message in transcript] == ["user", "assistant"]
+
+    retry_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_atomic_close_failure",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+            ),
+        )
+    )
+
+    assert retry_events[-1].type == EventType.SESSION_COMPLETED
+    assert asyncio.run(store.load_checkpoint("sess_approval_atomic_close_failure")) == {}
+    assert provider.requests[1].messages[-2].role == "assistant"
+    assert provider.requests[1].messages[-1].role == "tool"
+
+
+def test_cayu_app_retries_approval_close_without_rerunning_completed_tool():
+    store = FailingApprovalCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed after retry"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_approved_close_failure",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_approved_close_failure",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == [{"value": "secret"}]
+
+    retry_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_approved_close_failure",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in retry_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert tool.calls == [{"value": "secret"}]
+    assert provider.requests[1].messages[-1].role == "tool"
+    assert provider.requests[1].messages[-1].content[0].content == "recorded"
+
+
+def test_cayu_app_rejects_denial_retry_after_approved_tool_executed():
+    store = FailingApprovalCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_reject_conflicting_deny",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_reject_conflicting_deny",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert tool.calls == [{"value": "secret"}]
+
+    retry_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_reject_conflicting_deny",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="changed mind",
+            ),
+        )
+    )
+
+    assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
+    assert "cannot be retried as denied" in retry_events[0].payload["error"]
+    assert tool.calls == [{"value": "secret"}]
+    assert asyncio.run(store.load_checkpoint("sess_approval_reject_conflicting_deny"))[
+        "pending_tool_approval"
+    ]["approval_id"] == approval_id
+
+
+def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_scoped_recovery",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+    asyncio.run(
+        store.append_event(
+            "sess_approval_scoped_recovery",
+            Event(
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="sess_approval_scoped_recovery",
+                agent_name="assistant",
+                tool_name="side_effect",
+                payload={
+                    "tool_call_id": "call_1",
+                    "result": ToolResult(content="unrelated").model_dump(),
+                },
+            ),
+        )
+    )
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_scoped_recovery",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[2].payload["approval_id"] == approval_id
+    assert events[3].payload["approval_id"] == approval_id
+    assert tool.calls == [{"value": "secret"}]
+    assert provider.requests[1].messages[-1].content[0].content == "recorded"
+
+
+def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_event():
+    store = FailingTerminalToolEventStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("recovered and continued"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_started_without_terminal",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_started_without_terminal",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == [{"value": "secret"}]
+
+    retry_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_started_without_terminal",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
+    assert retry_events[-1].payload["manual_recovery_required"] is True
+    assert retry_events[-1].payload["tool_call_id"] == "call_1"
+    assert tool.calls == [{"value": "secret"}]
+    session = asyncio.run(store.load("sess_approval_started_without_terminal"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+    recovery_events = asyncio.run(
+        collect_tool_approval_recovery_events(
+            app,
+            ToolApprovalRecoveryRequest(
+                session_id="sess_approval_started_without_terminal",
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="side effect completed externally",
+                structured={"source": "operator"},
+                reason="operator confirmed the side effect completed",
+            ),
+        )
+    )
+
+    assert [event.type for event in recovery_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert recovery_events[1].payload["approval_id"] == approval_id
+    assert recovery_events[1].payload["manual_recovery"] is True
+    assert recovery_events[1].payload["result"]["content"] == (
+        "side effect completed externally"
+    )
+    assert tool.calls == [{"value": "secret"}]
+    assert provider.requests[1].messages[-1].role == "tool"
+    assert provider.requests[1].messages[-1].content[0].content == (
+        "side effect completed externally"
+    )
+    session = asyncio.run(store.load("sess_approval_started_without_terminal"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_recovery_does_not_append_terminal_event_without_session_claim():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recovery_claim_required",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+    asyncio.run(store.update_status("sess_recovery_claim_required", SessionStatus.RUNNING))
+
+    with pytest.raises(ValueError, match="status transition not allowed"):
+        asyncio.run(
+            collect_tool_approval_recovery_events(
+                app,
+                ToolApprovalRecoveryRequest(
+                    session_id="sess_recovery_claim_required",
+                    approval_id=approval_id,
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="confirmed externally",
+                ),
+            )
+        )
+
+    events = asyncio.run(store.load_events("sess_recovery_claim_required"))
+    assert not any(event.payload.get("manual_recovery") is True for event in events)
+
+
+def test_cayu_app_rejects_message_resume_with_pending_tool_approval():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_resume_blocked",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="pending tool approval"):
+        asyncio.run(
+            collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="sess_tool_approval_resume_blocked",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+
+
+def test_cayu_app_rejects_tool_approval_resolution_from_failed_status():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_failed_tool_approval",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = events[4].payload["approval"]["approval_id"]
+    asyncio.run(store.update_status("sess_failed_tool_approval", SessionStatus.FAILED))
+
+    with pytest.raises(ValueError, match="status transition not allowed"):
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_failed_tool_approval",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                ),
+            )
+        )
+
+    with pytest.raises(ValueError, match="status transition not allowed"):
+        asyncio.run(
+            collect_tool_approval_recovery_events(
+                app,
+                ToolApprovalRecoveryRequest(
+                    session_id="sess_failed_tool_approval",
+                    approval_id=approval_id,
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="confirmed externally",
+                ),
+            )
+        )
+
+
 def test_cayu_app_tool_policy_allowlist_blocks_unlisted_registered_tools():
     store = InMemorySessionStore()
     blocked_tool = SideEffectTool()
@@ -1815,7 +2876,6 @@ def test_cayu_app_fails_session_when_tool_policy_raises_before_execution():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
-        EventType.TOOL_CALL_STARTED,
         EventType.SESSION_FAILED,
     ]
     assert tool.calls == []
@@ -3455,6 +4515,7 @@ def test_cayu_app_keeps_text_and_tool_calls_in_one_assistant_turn():
                     name="echo",
                     arguments={"text": "from tool"},
                 ),
+                ModelStreamEvent.text_delta(" After that."),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
             [
@@ -3485,6 +4546,7 @@ def test_cayu_app_keeps_text_and_tool_calls_in_one_assistant_turn():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
@@ -3499,10 +4561,12 @@ def test_cayu_app_keeps_text_and_tool_calls_in_one_assistant_turn():
     assert [part.type for part in assistant_message.content] == [
         "text",
         "tool_call",
+        "text",
     ]
     assert assistant_message.content[0].text == "I will check. "
     assert assistant_message.content[1].tool_call_id == "call_1"
     assert assistant_message.content[1].tool_name == "echo"
+    assert assistant_message.content[2].text == " After that."
 
     tool_result_message = provider.requests[1].messages[-1]
     assert tool_result_message.role == "tool"
