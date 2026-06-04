@@ -37,6 +37,8 @@ from cayu.runtime import (
     RecentTurnsContextPolicy,
     ResumeRequest,
     RunRequest,
+    RuntimeHook,
+    RuntimeHookContext,
     Session,
     SessionIdentity,
     SessionStatus,
@@ -457,6 +459,14 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
     class DispatcherLike:
         pass
 
+    class HookLike:
+        pass
+
+    class BlankNameHook(RuntimeHook):
+        @property
+        def name(self) -> str:
+            return " "
+
     class SinkLike:
         async def emit(self, event):
             pass
@@ -469,6 +479,12 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
 
     with pytest.raises(TypeError, match="Dispatcher"):
         CayuApp(dispatcher=DispatcherLike())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="RuntimeHook"):
+        CayuApp(runtime_hooks=[HookLike()])  # type: ignore[list-item]
+
+    with pytest.raises(ValueError, match="runtime_hook.name"):
+        CayuApp(runtime_hooks=[BlankNameHook()])
 
     with pytest.raises(TypeError, match="EventSink"):
         CayuApp(event_sinks=[SinkLike()])  # type: ignore[list-item]
@@ -1090,6 +1106,262 @@ def test_cayu_app_dispatch_rejects_mismatched_dispatch_handle():
                 ),
             )
         )
+
+
+def test_cayu_app_runtime_hook_can_fork_and_dispatch_followup_work():
+    class RecordingDispatcher(Dispatcher):
+        def __init__(self) -> None:
+            self.requests: list[DispatchRequest] = []
+
+        async def submit(self, runtime, request: DispatchRequest) -> DispatchHandle:
+            self.requests.append(request)
+            return DispatchHandle(
+                dispatch_id=request.dispatch_id,
+                session_id=request.session_id,
+                task_id=request.task_id,
+                backend="recording",
+                status=DispatchStatus.SUBMITTED,
+                metadata={"queued": True},
+            )
+
+    class FollowupHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.session_status: SessionStatus | None = None
+            self.task_id: str | None = None
+            self.handle: DispatchHandle | None = None
+            self.actions: list[dict] = []
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            source_session = context.session
+            if source_session.metadata.get("purpose") == "knowledge_extraction":
+                return
+            self.session_status = source_session.status
+            child_session_id = f"{source_session.id}_knowledge"
+            await context.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session.id,
+                    session_id=child_session_id,
+                    metadata={"purpose": "knowledge_extraction"},
+                )
+            )
+            task = await context.create_task(
+                TaskCreate(
+                    type="knowledge_extraction",
+                    session_id=child_session_id,
+                    assigned_agent_name=source_session.agent_name,
+                    input={"source_session_id": source_session.id},
+                )
+            )
+            self.task_id = task.id
+            self.handle = await context.dispatch(
+                DispatchRequest(
+                    session_id=child_session_id,
+                    dispatch_id="dispatch_knowledge_1",
+                    task_id=task.id,
+                    messages=[Message.text("user", "Extract implementation knowledge.")],
+                )
+            )
+            self.actions = context.actions
+
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    dispatcher = RecordingDispatcher()
+    hook = FollowupHook()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("main task done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        task_store=tasks,
+        dispatcher=dispatcher,
+        runtime_hooks=[hook],
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="builder", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_hook_source",
+                messages=[Message.text("user", "Build the feature.")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert hook.session_status == SessionStatus.COMPLETED
+    assert hook.handle == DispatchHandle(
+        dispatch_id="dispatch_knowledge_1",
+        session_id="sess_hook_source_knowledge",
+        task_id=hook.task_id,
+        backend="recording",
+        status=DispatchStatus.SUBMITTED,
+        metadata={"queued": True},
+    )
+    assert [request.session_id for request in dispatcher.requests] == ["sess_hook_source_knowledge"]
+    assert [action["type"] for action in hook.actions] == [
+        "fork_session",
+        "create_task",
+        "dispatch",
+    ]
+
+    child = asyncio.run(store.load("sess_hook_source_knowledge"))
+    assert child is not None
+    assert child.parent_session_id == "sess_hook_source"
+    assert child.status == SessionStatus.COMPLETED
+    assert child.metadata == {"purpose": "knowledge_extraction"}
+    task = asyncio.run(tasks.load_task(hook.task_id))
+    assert task is not None
+    assert task.status == TaskStatus.PENDING
+    assert task.session_id == "sess_hook_source_knowledge"
+    assert events[-1].payload["hook_name"] == "FollowupHook"
+    assert events[-1].payload["phase"] == "after_session_completed"
+    assert [action["type"] for action in events[-1].payload["actions"]] == [
+        "fork_session",
+        "create_task",
+        "dispatch",
+    ]
+
+
+def test_cayu_app_runtime_hook_failure_is_recorded_without_rewriting_session_status():
+    class FailingHook(RuntimeHook):
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            raise RuntimeError("hook broke")
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("main task done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, runtime_hooks=[FailingHook()])
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_hook_failure",
+                messages=[Message.text("user", "Do the work.")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[-3:]] == [
+        EventType.SESSION_COMPLETED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_FAILED,
+    ]
+    assert events[-1].payload["error"] == "hook broke"
+    session = asyncio.run(store.load("sess_hook_failure"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_runtime_hook_can_emit_custom_events():
+    class CustomEventHook(RuntimeHook):
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            await context.emit_custom_event(
+                "custom.knowledge.extracted",
+                payload={"session_id": context.session.id},
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("main task done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, runtime_hooks=[CustomEventHook()])
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_hook_custom_event",
+                messages=[Message.text("user", "Do the work.")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[-2:]] == [
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    stored_events = asyncio.run(store.load_events("sess_hook_custom_event"))
+    assert [event.type for event in stored_events[-3:]] == [
+        EventType.HOOK_STARTED,
+        "custom.knowledge.extracted",
+        EventType.HOOK_COMPLETED,
+    ]
+    assert stored_events[-2].payload == {"session_id": "sess_hook_custom_event"}
+    assert events[-1].payload["actions"] == [
+        {
+            "type": "emit_custom_event",
+            "payload": {
+                "event_id": stored_events[-2].id,
+                "event_type": "custom.knowledge.extracted",
+                "session_id": "sess_hook_custom_event",
+            },
+        }
+    ]
+
+
+def test_cayu_app_runtime_hook_rejects_non_custom_emitted_events():
+    class BadEventHook(RuntimeHook):
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            await context.emit_custom_event("session.started")
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("main task done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, runtime_hooks=[BadEventHook()])
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_hook_bad_event",
+                messages=[Message.text("user", "Do the work.")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[-3:]] == [
+        EventType.SESSION_COMPLETED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_FAILED,
+    ]
+    assert events[-1].payload["error"] == (
+        "Hook-emitted custom events must use the custom. namespace."
+    )
 
 
 def test_cayu_app_forks_partial_transcript_without_checkpoint():

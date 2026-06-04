@@ -207,6 +207,40 @@ async for event in app.dispatch_inline(
     print(event.type)
 ```
 
+Add runtime hooks for lifecycle automation. Hooks run after terminal session state is already durable, so they are useful for follow-up work such as extracting knowledge from a completed builder session:
+
+```python
+from cayu import DispatchRequest, ForkSessionRequest, Message, RuntimeHook, TaskCreate
+
+
+class KnowledgeHook(RuntimeHook):
+    async def after_session_completed(self, context):
+        if context.session.metadata.get("purpose") == "knowledge_extraction":
+            return
+
+        child_id = f"{context.session.id}_knowledge"
+        await context.fork_session(
+            ForkSessionRequest(
+                source_session_id=context.session.id,
+                session_id=child_id,
+                metadata={"purpose": "knowledge_extraction"},
+            )
+        )
+        task = await context.create_task(
+            TaskCreate(type="knowledge_extraction", session_id=child_id)
+        )
+        await context.dispatch(
+            DispatchRequest(
+                session_id=child_id,
+                task_id=task.id,
+                messages=[Message.text("user", "Extract implementation notes.")],
+            )
+        )
+
+
+app = CayuApp(task_store=task_store, runtime_hooks=[KnowledgeHook()])
+```
+
 Customize model-facing context without rewriting durable transcript history:
 
 ```python

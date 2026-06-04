@@ -58,6 +58,11 @@ from cayu.runtime.dispatch import (
     copy_dispatch_request,
 )
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.hooks import (
+    RuntimeHook,
+    RuntimeHookContext,
+    RuntimeHookPhase,
+)
 from cayu.runtime.sessions import (
     ForkSessionRequest,
     InMemorySessionStore,
@@ -71,7 +76,7 @@ from cayu.runtime.sessions import (
     copy_resume_request,
     copy_run_request,
 )
-from cayu.runtime.tasks import Task, TaskStore
+from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     ToolPolicy,
@@ -180,6 +185,7 @@ class CayuApp:
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
         dispatcher: Dispatcher | None = None,
+        runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
@@ -188,6 +194,17 @@ class CayuApp:
             raise TypeError("task_store must be a TaskStore.")
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
+        if runtime_hooks is None:
+            hooks = []
+        else:
+            if isinstance(runtime_hooks, str | bytes):
+                raise TypeError("runtime_hooks must be an iterable of RuntimeHook instances.")
+            try:
+                hooks = list(runtime_hooks)
+            except TypeError as exc:
+                raise TypeError(
+                    "runtime_hooks must be an iterable of RuntimeHook instances."
+                ) from exc
         if event_sinks is None:
             sinks = []
         else:
@@ -200,9 +217,14 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
+        for hook in hooks:
+            if not isinstance(hook, RuntimeHook):
+                raise TypeError("runtime_hooks must contain RuntimeHook instances.")
+            require_nonblank(hook.name, "runtime_hook.name")
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
+        self._runtime_hooks = tuple(hooks)
         self._event_sinks = sinks
         self._agents: dict[str, _RegisteredAgentState] = {}
         self._providers: dict[str, RegisteredProvider] = {}
@@ -450,6 +472,30 @@ class CayuApp:
             start_event_payload_extra=start_event_payload_extra,
         ):
             yield event
+
+    async def create_task(self, request: TaskCreate) -> Task:
+        if type(request) is not TaskCreate:
+            raise TypeError("Task creation requires a TaskCreate request.")
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to create tasks.")
+        return await self.task_store.create_task(copy_task_create(request))
+
+    async def emit_hook_event(
+        self,
+        *,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Event:
+        event_type = require_nonblank(event_type, "event_type")
+        if not event_type.startswith("custom."):
+            raise ValueError("Hook-emitted custom events must use the custom. namespace.")
+        event = Event(
+            type=event_type,
+            session_id=session_id,
+            payload=copy_json_value(payload or {}, "payload"),
+        )
+        return await self._emit(event)
 
     async def _resume_session(
         self,
@@ -828,9 +874,12 @@ class CayuApp:
                 yield event
         except Exception as exc:
             if isinstance(exc, _ToolApprovalManualRecoveryRequired):
-                await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-                yield await self._emit(
-                    Event(
+                session = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
                         type=EventType.SESSION_INTERRUPTED,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
@@ -844,14 +893,22 @@ class CayuApp:
                             "tool_name": exc.tool_name,
                             "manual_recovery_required": True,
                         },
-                    )
-                )
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
                 return
 
             if not pending_approval_cleared:
-                await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-                yield await self._emit(
-                    Event(
+                session = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
                         type=EventType.SESSION_INTERRUPTED,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
@@ -861,8 +918,13 @@ class CayuApp:
                             "error": str(exc),
                             "error_type": type(exc).__name__,
                         },
-                    )
-                )
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
                 return
 
             task_failure_error: Exception | None = None
@@ -888,7 +950,7 @@ class CayuApp:
                     )
                 except Exception as task_exc:
                     task_failure_error = task_exc
-            await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
             payload: dict[str, Any] = {
                 "error": str(exc),
                 "error_type": type(exc).__name__,
@@ -898,15 +960,20 @@ class CayuApp:
             if task_failure_error is not None:
                 payload["task_update_error"] = str(task_failure_error)
                 payload["task_update_error_type"] = type(task_failure_error).__name__
-            yield await self._emit(
-                Event(
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     payload=payload,
-                )
-            )
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
 
     async def recover_tool_approval(
         self,
@@ -1270,19 +1337,24 @@ class CayuApp:
                         registered_environment=registered_environment,
                     )
                 )
-            await self.session_store.update_status(session.id, SessionStatus.COMPLETED)
-            yield await self._emit(
-                Event(
+            session = await self.session_store.update_status(session.id, SessionStatus.COMPLETED)
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
                     type=EventType.SESSION_COMPLETED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                )
-            )
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
         except _SessionInterrupted as exc:
-            await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-            yield await self._emit(
-                Event(
+            session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
                     type=EventType.SESSION_INTERRUPTED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
@@ -1290,8 +1362,13 @@ class CayuApp:
                     payload={
                         "approval": exc.approval.model_dump(),
                     },
-                )
-            )
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
         except Exception as exc:
             task_failure_error: Exception | None = None
             if (
@@ -1320,7 +1397,7 @@ class CayuApp:
                     )
                 except Exception as task_exc:
                     task_failure_error = task_exc
-            await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
             payload: dict[str, Any] = {
                 "error": str(exc),
                 "error_type": type(exc).__name__,
@@ -1328,15 +1405,20 @@ class CayuApp:
             if task_failure_error is not None:
                 payload["task_update_error"] = str(task_failure_error)
                 payload["task_update_error_type"] = type(task_failure_error).__name__
-            yield await self._emit(
-                Event(
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     payload=payload,
-                )
-            )
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
 
     async def _start_task(
         self,
@@ -1697,6 +1779,91 @@ class CayuApp:
                     ),
                 )
         return event
+
+    async def _emit_terminal_event_with_hooks(
+        self,
+        *,
+        event: Event,
+        phase: RuntimeHookPhase,
+        session: Session,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+    ) -> AsyncIterator[Event]:
+        terminal_event = await self._emit(event)
+        yield terminal_event
+        async for hook_event in self._run_runtime_hooks(
+            phase=phase,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        ):
+            yield hook_event
+
+    async def _run_runtime_hooks(
+        self,
+        *,
+        phase: RuntimeHookPhase,
+        session: Session,
+        terminal_event: Event,
+        registered_agent: _RegisteredAgentState,
+        registered_environment: RegisteredEnvironment | None,
+    ) -> AsyncIterator[Event]:
+        for hook in self._runtime_hooks:
+            hook_name = require_nonblank(hook.name, "runtime_hook.name")
+            yield await self._emit(
+                _runtime_hook_event(
+                    event_type=EventType.HOOK_STARTED,
+                    hook_name=hook_name,
+                    phase=phase,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    terminal_event=terminal_event,
+                    payload={},
+                )
+            )
+            context = RuntimeHookContext(
+                runtime=self,
+                hook_name=hook_name,
+                phase=phase,
+                session=session,
+                terminal_event=terminal_event,
+            )
+            try:
+                await _call_runtime_hook(hook=hook, phase=phase, context=context)
+            except Exception as exc:
+                yield await self._emit(
+                    _runtime_hook_event(
+                        event_type=EventType.HOOK_FAILED,
+                        hook_name=hook_name,
+                        phase=phase,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        terminal_event=terminal_event,
+                        payload={
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "actions": context.actions,
+                        },
+                    )
+                )
+                continue
+            yield await self._emit(
+                _runtime_hook_event(
+                    event_type=EventType.HOOK_COMPLETED,
+                    hook_name=hook_name,
+                    phase=phase,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    terminal_event=terminal_event,
+                    payload={
+                        "actions": context.actions,
+                    },
+                )
+            )
 
     async def _emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
         if type(events) is not list:
@@ -2311,6 +2478,51 @@ def _context_compaction_telemetry_event(
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
         payload=copy_json_value(telemetry.payload, "payload"),
+    )
+
+
+async def _call_runtime_hook(
+    *,
+    hook: RuntimeHook,
+    phase: RuntimeHookPhase,
+    context: RuntimeHookContext,
+) -> None:
+    if phase == RuntimeHookPhase.AFTER_SESSION_COMPLETED:
+        await hook.after_session_completed(context)
+        return
+    if phase == RuntimeHookPhase.AFTER_SESSION_FAILED:
+        await hook.after_session_failed(context)
+        return
+    if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
+        await hook.after_session_interrupted(context)
+        return
+    raise ValueError(f"Unsupported runtime hook phase: {phase}")
+
+
+def _runtime_hook_event(
+    *,
+    event_type: EventType,
+    hook_name: str,
+    phase: RuntimeHookPhase,
+    session: Session,
+    registered_agent: _RegisteredAgentState,
+    registered_environment: RegisteredEnvironment | None,
+    terminal_event: Event,
+    payload: dict[str, Any],
+) -> Event:
+    event_payload = {
+        "hook_name": hook_name,
+        "phase": phase.value,
+        "terminal_event_id": terminal_event.id,
+        "terminal_event_type": str(terminal_event.type),
+        **copy_json_value(payload, "payload"),
+    }
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload=event_payload,
     )
 
 

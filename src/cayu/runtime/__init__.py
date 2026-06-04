@@ -37,6 +37,7 @@ from cayu.runtime.dispatch import (
     copy_dispatch_request,
 )
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
+from cayu.runtime.hooks import RuntimeHook, RuntimeHookContext, RuntimeHookPhase
 from cayu.runtime.sessions import (
     CheckpointTransform,
     EventQuery,
@@ -104,6 +105,9 @@ __all__ = [
     "RegisteredEnvironment",
     "ResumeRequest",
     "RunRequest",
+    "RuntimeHook",
+    "RuntimeHookContext",
+    "RuntimeHookPhase",
     "Session",
     "SessionIdentity",
     "SessionOrder",
