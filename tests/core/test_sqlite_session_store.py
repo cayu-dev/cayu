@@ -12,7 +12,16 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runtime import CayuApp, ResumeRequest, RunRequest, SessionIdentity, SessionStatus
+from cayu.runtime import (
+    CayuApp,
+    ForkSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    Session,
+    SessionIdentity,
+    SessionQuery,
+    SessionStatus,
+)
 
 
 class FakeProvider(ModelProvider):
@@ -183,6 +192,240 @@ def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_p
     asyncio.run(assert_reopened_state())
 
 
+def test_sqlite_session_store_persists_forked_session_state(tmp_path):
+    db_path = tmp_path / "forks.sqlite"
+    store = SQLiteSessionStore(db_path)
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run_operations() -> None:
+        await _collect_app_events(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_sqlite_fork_source",
+                    messages=[Message.text("user", "first request")],
+                )
+            )
+        )
+        await store.checkpoint("sess_sqlite_fork_source", {"context_compaction": {}})
+        events = await _collect_app_events(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="sess_sqlite_fork_source",
+                    session_id="sess_sqlite_fork_child",
+                )
+            )
+        )
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def assert_persisted() -> None:
+        fork = await reopened.load("sess_sqlite_fork_child")
+        assert fork is not None
+        assert fork.parent_session_id == "sess_sqlite_fork_source"
+        assert fork.status == SessionStatus.COMPLETED
+        transcript = await reopened.load_transcript("sess_sqlite_fork_child")
+        assert [message.content[0].text for message in transcript] == [
+            "first request",
+            "first answer",
+        ]
+        checkpoint = await reopened.load_checkpoint("sess_sqlite_fork_child")
+        assert checkpoint == {"context_compaction": {}}
+        children = await reopened.list_sessions(
+            SessionQuery(parent_session_id="sess_sqlite_fork_source")
+        )
+        assert [session.id for session in children] == ["sess_sqlite_fork_child"]
+        events = await reopened.load_events("sess_sqlite_fork_child")
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        await _close(reopened)
+
+    asyncio.run(assert_persisted())
+
+
+def test_sqlite_session_store_rejects_fork_status_mismatch(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "fork-status.sqlite")
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_fork_status_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ValueError, match="Fork status must match"):
+            await store.create_fork(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_sqlite_fork_status_child",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    status=SessionStatus.RUNNING,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                transcript_cursor=None,
+                checkpoint_transform=None,
+            )
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+
+def test_sqlite_session_store_rejects_fork_provider_mismatch(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "fork-provider.sqlite")
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_fork_provider_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ValueError, match="Fork provider_name must match"):
+            await store.create_fork(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_sqlite_fork_provider_child",
+                    agent_name="assistant",
+                    provider_name="other",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    status=SessionStatus.COMPLETED,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                transcript_cursor=None,
+                checkpoint_transform=None,
+            )
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+
+def test_sqlite_session_store_transforms_current_checkpoint_during_fork(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "fork-checkpoint.sqlite")
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_fork_checkpoint_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        await store.checkpoint(source.id, {"version": 2})
+
+        await store.create_fork(
+            source_session_id=source.id,
+            fork=Session(
+                id="sess_sqlite_fork_checkpoint_child",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                parent_session_id=source.id,
+                status=SessionStatus.COMPLETED,
+            ),
+            source_statuses={SessionStatus.COMPLETED},
+            transcript_cursor=None,
+            checkpoint_transform=lambda _session, checkpoint: {
+                "copied_version": checkpoint["version"] if checkpoint else None
+            },
+        )
+
+        assert await store.load_checkpoint("sess_sqlite_fork_checkpoint_child") == {
+            "copied_version": 2
+        }
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+
+def test_sqlite_session_store_fork_reads_checkpoint_inside_write_transaction(tmp_path):
+    db_path = tmp_path / "fork-transaction.sqlite"
+    store = SQLiteSessionStore(db_path)
+    concurrent_write_errors: list[str] = []
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_fork_tx_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        await store.checkpoint(source.id, {"version": 2})
+
+        def transform(_session: Session, checkpoint: dict | None) -> dict:
+            assert checkpoint == {"version": 2}
+            connection = sqlite3.connect(db_path, timeout=0)
+            try:
+                with (
+                    pytest.raises(sqlite3.OperationalError, match="database is locked"),
+                    connection,
+                ):
+                    connection.execute(
+                        """
+                        UPDATE checkpoints
+                        SET state_json = ?
+                        WHERE session_id = ?
+                        """,
+                        ('{"version":99}', source.id),
+                    )
+            except AssertionError:
+                concurrent_write_errors.append("checkpoint write was not locked")
+            finally:
+                connection.close()
+            return {"copied_version": checkpoint["version"] if checkpoint else None}
+
+        await store.create_fork(
+            source_session_id=source.id,
+            fork=Session(
+                id="sess_sqlite_fork_tx_child",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                parent_session_id=source.id,
+                status=SessionStatus.COMPLETED,
+            ),
+            source_statuses={SessionStatus.COMPLETED},
+            transcript_cursor=None,
+            checkpoint_transform=transform,
+        )
+
+        assert concurrent_write_errors == []
+        assert await store.load_checkpoint(source.id) == {"version": 2}
+        assert await store.load_checkpoint("sess_sqlite_fork_tx_child") == {"copied_version": 2}
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+
 def test_sqlite_session_store_exposes_queryable_event_identity_columns(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -346,7 +589,7 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
     finally:
         connection.close()
 
-    assert version == 4
+    assert version == 5
 
 
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):

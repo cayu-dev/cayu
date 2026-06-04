@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner implementations, framework-native file and command tools, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
 
@@ -151,6 +151,32 @@ resume_request = ResumeRequest(
     session_id="sess_123",
     messages=[Message.text("user", "Continue with the larger model.")],
     model="gpt-5.5",
+)
+```
+
+Fork a completed, failed, or interrupted session to create a new branch without mutating the source session:
+
+```python
+from cayu import ForkSessionRequest
+
+async for event in app.fork_session(
+    ForkSessionRequest(
+        source_session_id="sess_123",
+        session_id="sess_branch_a",
+        metadata={"purpose": "try alternate plan"},
+    )
+):
+    print(event.type)
+```
+
+Fork copies the provider-neutral transcript and, by default, the checkpoint state. A partial transcript fork can copy messages up to a 1-based transcript cursor, but must set `copy_checkpoint=False` because checkpoint state may refer to transcript content that was not copied:
+
+```python
+ForkSessionRequest(
+    source_session_id="sess_123",
+    session_id="sess_branch_from_first_message",
+    transcript_cursor=1,
+    copy_checkpoint=False,
 )
 ```
 

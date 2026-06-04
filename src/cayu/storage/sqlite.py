@@ -11,6 +11,7 @@ from cayu._validation import copy_json_object, copy_json_value, require_nonblank
 from cayu.core.events import Event, copy_event
 from cayu.core.messages import Message
 from cayu.runtime.sessions import (
+    CheckpointTransform,
     EventQuery,
     EventRecord,
     RunRequest,
@@ -23,6 +24,7 @@ from cayu.runtime.sessions import (
     _validate_status_set,
     copy_event_query,
     copy_run_request,
+    copy_session,
     copy_session_identity,
     copy_session_query,
     copy_transcript_messages,
@@ -40,7 +42,7 @@ from cayu.runtime.tasks import (
     copy_task_query,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 class SQLiteSessionStore(SessionStore):
@@ -78,6 +80,7 @@ class SQLiteSessionStore(SessionStore):
                             agent_name,
                             provider_name,
                             model,
+                            parent_session_id,
                             runtime_name,
                             runtime_version,
                             environment_name,
@@ -86,13 +89,14 @@ class SQLiteSessionStore(SessionStore):
                             updated_at,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
                             session.agent_name,
                             session.provider_name,
                             session.model,
+                            session.parent_session_id,
                             session.runtime_name,
                             session.runtime_version,
                             session.environment_name,
@@ -108,12 +112,147 @@ class SQLiteSessionStore(SessionStore):
                 raise
             return session.model_copy(deep=True)
 
+    async def create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+    ) -> Session:
+        source_session_id = require_nonblank(source_session_id, "source_session_id")
+        fork = copy_session(fork)
+        allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
+        if fork.parent_session_id != source_session_id:
+            raise ValueError("Fork parent_session_id must match source_session_id.")
+        if transcript_cursor is not None and transcript_cursor < 0:
+            raise ValueError("transcript_cursor must be greater than or equal to 0.")
+
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                source_session = self._load_unlocked(source_session_id)
+                if source_session is None:
+                    raise KeyError(f"Session not found: {source_session_id}")
+                if source_session.status not in allowed_statuses:
+                    raise ValueError(
+                        f"Source session status is not forkable: {source_session.status}"
+                    )
+                if fork.status != source_session.status:
+                    raise ValueError(
+                        "Fork status must match source session status: "
+                        f"{fork.status} != {source_session.status}"
+                    )
+                if fork.provider_name != source_session.provider_name:
+                    raise ValueError(
+                        "Fork provider_name must match source session provider_name: "
+                        f"{fork.provider_name} != {source_session.provider_name}"
+                    )
+                transcript_rows = self._connection.execute(
+                    """
+                    SELECT message_json
+                    FROM transcript_messages
+                    WHERE session_id = ?
+                    ORDER BY sequence ASC
+                    """,
+                    (source_session_id,),
+                ).fetchall()
+                if transcript_cursor is None:
+                    copied_messages = [
+                        Message(**json.loads(row["message_json"])) for row in transcript_rows
+                    ]
+                else:
+                    if transcript_cursor > len(transcript_rows):
+                        raise ValueError(
+                            "transcript_cursor is greater than source transcript length."
+                        )
+                    copied_messages = [
+                        Message(**json.loads(row["message_json"]))
+                        for row in transcript_rows[:transcript_cursor]
+                    ]
+                copied_checkpoint = None
+                if checkpoint_transform is not None:
+                    copied_checkpoint = checkpoint_transform(
+                        source_session,
+                        self._load_checkpoint_unlocked(source_session_id),
+                    )
+                    if copied_checkpoint is not None:
+                        copied_checkpoint = copy_json_value(
+                            copied_checkpoint,
+                            "checkpoint",
+                        )
+
+                self._connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id,
+                        agent_name,
+                        provider_name,
+                        model,
+                        parent_session_id,
+                        runtime_name,
+                        runtime_version,
+                        environment_name,
+                        status,
+                        created_at,
+                        updated_at,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _session_to_row_values(fork),
+                )
+                if copied_messages:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO transcript_messages (
+                            session_id,
+                            message_json
+                        )
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (
+                                fork.id,
+                                _json_dumps(message.model_dump(mode="json")),
+                            )
+                            for message in copied_messages
+                        ],
+                    )
+                if copied_checkpoint is not None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            fork.id,
+                            _json_dumps(copied_checkpoint),
+                            _format_datetime(fork.updated_at),
+                        ),
+                    )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                if self._session_exists_unlocked(fork.id):
+                    raise ValueError(f"Session already exists: {fork.id}") from exc
+                raise
+            except Exception:
+                self._connection.rollback()
+                raise
+
+            loaded = self._load_unlocked(fork.id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {fork.id}")
+            return loaded
+
     async def load(self, session_id: str) -> Session | None:
         session_id = require_nonblank(session_id, "session_id")
         async with self._lock:
             row = self._connection.execute(
                 """
-                SELECT id, agent_name, provider_name, model, runtime_name,
+                SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
                        runtime_version, environment_name, status, created_at,
                        updated_at, metadata_json
                 FROM sessions
@@ -367,6 +506,9 @@ class SQLiteSessionStore(SessionStore):
         if query.environment_name is not None:
             clauses.append("environment_name = ?")
             params.append(query.environment_name)
+        if query.parent_session_id is not None:
+            clauses.append("parent_session_id = ?")
+            params.append(query.parent_session_id)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = _session_order_sql(query.order_by)
@@ -375,7 +517,7 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT id, agent_name, provider_name, model, runtime_name,
+                SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
                        runtime_version, environment_name, status, created_at,
                        updated_at, metadata_json
                 FROM sessions
@@ -512,17 +654,20 @@ class SQLiteSessionStore(SessionStore):
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_nonblank(session_id, "session_id")
         async with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT state_json
-                FROM checkpoints
-                WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            return copy_json_value(json.loads(row["state_json"]), "checkpoint")
+            return self._load_checkpoint_unlocked(session_id)
+
+    def _load_checkpoint_unlocked(self, session_id: str) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT state_json
+            FROM checkpoints
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return copy_json_value(json.loads(row["state_json"]), "checkpoint")
 
     async def close(self) -> None:
         async with self._lock:
@@ -537,7 +682,7 @@ class SQLiteSessionStore(SessionStore):
     def _load_unlocked(self, session_id: str) -> Session | None:
         row = self._connection.execute(
             """
-            SELECT id, agent_name, provider_name, model, runtime_name,
+            SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
                    runtime_version, environment_name, status, created_at,
                    updated_at, metadata_json
             FROM sessions
@@ -852,6 +997,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
                 agent_name TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
                 model TEXT NOT NULL,
+                parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
                 runtime_name TEXT NOT NULL,
                 runtime_version TEXT,
                 environment_name TEXT,
@@ -974,6 +1120,23 @@ def _session_from_request(request: RunRequest, *, identity: SessionIdentity) -> 
     return Session(**values)
 
 
+def _session_to_row_values(session: Session) -> tuple[object, ...]:
+    return (
+        session.id,
+        session.agent_name,
+        session.provider_name,
+        session.model,
+        session.parent_session_id,
+        session.runtime_name,
+        session.runtime_version,
+        session.environment_name,
+        str(session.status),
+        _format_datetime(session.created_at),
+        _format_datetime(session.updated_at),
+        _json_dumps(session.metadata),
+    )
+
+
 def _task_to_row_values(task: Task) -> tuple[object, ...]:
     return (
         task.id,
@@ -1024,6 +1187,7 @@ def _session_from_row(row: sqlite3.Row) -> Session:
         agent_name=row["agent_name"],
         provider_name=row["provider_name"],
         model=row["model"],
+        parent_session_id=row["parent_session_id"],
         runtime_name=row["runtime_name"],
         runtime_version=row["runtime_version"],
         environment_name=row["environment_name"],

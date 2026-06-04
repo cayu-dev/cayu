@@ -51,6 +51,7 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
+    ForkSessionRequest,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
@@ -58,6 +59,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionStatus,
     SessionStore,
+    copy_fork_session_request,
     copy_resume_request,
     copy_run_request,
 )
@@ -156,6 +158,7 @@ _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
+_FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
 
 _PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 
@@ -457,6 +460,94 @@ class CayuApp:
         ):
             yield event
 
+    async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        request = copy_fork_session_request(request)
+        source_session = await self.session_store.load(request.source_session_id)
+        if source_session is None:
+            raise KeyError(f"Session not found: {request.source_session_id}")
+        if source_session.status not in _FORKABLE_SESSION_STATUSES:
+            raise ValueError(
+                "Only completed, failed, or interrupted sessions can be forked: "
+                f"{source_session.status}"
+            )
+        if request.transcript_cursor is not None and request.copy_checkpoint:
+            raise ValueError(
+                "ForkSessionRequest.copy_checkpoint must be false when transcript_cursor is set."
+            )
+        if source_session.status == SessionStatus.INTERRUPTED and not request.copy_checkpoint:
+            raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
+
+        registered_provider = self._get_registered_provider(source_session.provider_name)
+        agent_name = request.agent_name or source_session.agent_name
+        registered_agent = self._get_registered_agent(agent_name)
+        model = request.model or (
+            registered_agent.spec.model if request.agent_name is not None else source_session.model
+        )
+        environment_name = (
+            request.environment_name
+            if request.environment_name is not None
+            else source_session.environment_name
+        )
+        registered_environment = self._get_registered_environment_for_session(environment_name)
+
+        checkpoint_transform = None
+        if request.copy_checkpoint:
+
+            def checkpoint_transform(
+                current_source: Session,
+                source_checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any] | None:
+                if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
+                    raise RuntimeError(
+                        "Interrupted session cannot be forked because checkpoint state is missing."
+                    )
+                return _checkpoint_for_fork(
+                    checkpoint=source_checkpoint,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                )
+
+        fork_session = Session(
+            id=request.session_id or str(uuid4()),
+            agent_name=agent_name,
+            provider_name=registered_provider.name,
+            model=model,
+            parent_session_id=source_session.id,
+            runtime_name=source_session.runtime_name,
+            runtime_version=source_session.runtime_version,
+            environment_name=environment_name,
+            status=source_session.status,
+            metadata=copy_json_value(request.metadata, "metadata"),
+        )
+        created = await self.session_store.create_fork(
+            source_session_id=source_session.id,
+            fork=fork_session,
+            source_statuses=_FORKABLE_SESSION_STATUSES,
+            transcript_cursor=request.transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+        )
+        yield await self._emit(
+            Event(
+                type=EventType.SESSION_FORKED,
+                session_id=created.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload={
+                    "source_session_id": source_session.id,
+                    "source_status": source_session.status.value,
+                    "parent_session_id": created.parent_session_id,
+                    "transcript_cursor": request.transcript_cursor,
+                    "copy_checkpoint": request.copy_checkpoint,
+                    "agent_name": created.agent_name,
+                    "provider_name": created.provider_name,
+                    "model": created.model,
+                    "environment_name": created.environment_name,
+                },
+            )
+        )
+
     async def resolve_tool_approval(
         self,
         request: ToolApprovalRequest,
@@ -474,8 +565,7 @@ class CayuApp:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
             raise ValueError(
-                "Tool approval id does not match pending approval: "
-                f"{request.approval_id}"
+                f"Tool approval id does not match pending approval: {request.approval_id}"
             )
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
@@ -554,10 +644,7 @@ class CayuApp:
                     tool_outcomes.append(recorded_outcome)
                     continue
 
-                if (
-                    policy_result is not None
-                    and policy_result.decision == ToolPolicyDecision.DENY
-                ):
+                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
                     reason = _tool_policy_denial_reason(policy_result)
                     result = _blocked_tool_result(policy_result, reason=reason)
                     yield await self._emit(
@@ -650,9 +737,7 @@ class CayuApp:
 
             tool_result_messages = _tool_result_messages(tool_outcomes)
             transcript.extend(tool_result_messages)
-            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(
-                session.id
-            )
+            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(session.id)
             await self.session_store.append_transcript_messages_and_checkpoint(
                 session.id,
                 tool_result_messages,
@@ -770,9 +855,7 @@ class CayuApp:
         request: ToolApprovalRecoveryRequest,
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolApprovalRecoveryRequest:
-            raise TypeError(
-                "Runtime approval recovery requires a ToolApprovalRecoveryRequest."
-            )
+            raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
@@ -784,8 +867,7 @@ class CayuApp:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
             raise ValueError(
-                "Tool approval id does not match pending approval: "
-                f"{request.approval_id}"
+                f"Tool approval id does not match pending approval: {request.approval_id}"
             )
 
         pending_tool_call = _pending_tool_call_for_recovery(
@@ -1252,9 +1334,7 @@ class CayuApp:
                 tool_call=tool_call,
                 request_metadata=request_metadata,
             )
-            policy_outcomes.append(
-                ToolCallPolicyOutcome(call=tool_call, result=policy_result)
-            )
+            policy_outcomes.append(ToolCallPolicyOutcome(call=tool_call, result=policy_result))
             if (
                 approval_policy_result is None
                 and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
@@ -1638,6 +1718,34 @@ def _pending_tool_approval_cleared_event(
     )
 
 
+def _checkpoint_for_fork(
+    *,
+    checkpoint: dict[str, Any] | None,
+    agent_name: str,
+    environment_name: str | None,
+) -> dict[str, Any] | None:
+    if checkpoint is None:
+        return None
+    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    pending_approval = _pending_tool_approval_from_checkpoint(copied_checkpoint)
+    if pending_approval is None:
+        return copied_checkpoint
+    if pending_approval.agent_name != agent_name:
+        raise ValueError(
+            "Cannot fork a pending tool approval to a different agent: "
+            f"{pending_approval.agent_name} -> {agent_name}"
+        )
+    if pending_approval.environment_name != environment_name:
+        raise ValueError(
+            "Cannot fork a pending tool approval to a different environment: "
+            f"{pending_approval.environment_name} -> {environment_name}"
+        )
+    copied_checkpoint[_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = pending_approval.model_copy(
+        update={"task_id": None}
+    ).model_dump()
+    return copied_checkpoint
+
+
 async def _run_tool(
     *,
     tool: Tool,
@@ -1722,9 +1830,7 @@ def _recorded_approval_tool_outcomes(
     events: list[Event],
     approval: PendingToolApproval,
 ) -> dict[str, ToolCallOutcome]:
-    pending_calls = {
-        call.tool_call_id: call for call in _pending_round_tool_calls(approval)
-    }
+    pending_calls = {call.tool_call_id: call for call in _pending_round_tool_calls(approval)}
     started_ids: set[str] = set()
     outcomes: dict[str, ToolCallOutcome] = {}
     terminal_event_types = {
@@ -1805,9 +1911,7 @@ def _pending_tool_call_for_recovery(
     for pending_tool_call in _pending_round_tool_calls(approval):
         if pending_tool_call.tool_call_id == tool_call_id:
             return pending_tool_call
-    raise ValueError(
-        "Tool call is not part of the pending approval: " f"{tool_call_id}"
-    )
+    raise ValueError(f"Tool call is not part of the pending approval: {tool_call_id}")
 
 
 def _validate_tool_approval_recovery_target(
@@ -1836,13 +1940,11 @@ def _validate_tool_approval_recovery_target(
 
     if terminal:
         raise RuntimeError(
-            "Tool call already has a terminal event and does not need recovery: "
-            f"{tool_call_id}"
+            f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
         )
     if not started:
         raise RuntimeError(
-            "Tool approval recovery requires a recorded tool.call.started event: "
-            f"{tool_call_id}"
+            f"Tool approval recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
 
 
@@ -1929,9 +2031,7 @@ def _pending_tool_call_approvals(
 ) -> list[PendingToolCallApproval]:
     policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
     if policy_outcomes is not None:
-        policy_results_by_id = {
-            outcome.call.id: outcome.result for outcome in policy_outcomes
-        }
+        policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_outcomes}
     return [
         PendingToolCallApproval(
             tool_call_id=tool_call.id,

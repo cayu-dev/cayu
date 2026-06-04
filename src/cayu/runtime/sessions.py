@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.core.events import Event, EventType, copy_event
@@ -96,6 +97,41 @@ class ResumeRequest(BaseModel):
         return require_nonblank(value, info.field_name)
 
 
+class ForkSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_session_id: str
+    session_id: str | None = None
+    agent_name: str | None = None
+    model: str | None = None
+    environment_name: str | None = None
+    transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    copy_checkpoint: StrictBool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator(
+        "source_session_id",
+        "session_id",
+        "agent_name",
+        "model",
+        "environment_name",
+    )
+    @classmethod
+    def validate_optional_nonblank_strings(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+
 class SessionIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -129,6 +165,7 @@ class Session(BaseModel):
     agent_name: str
     provider_name: str
     model: str
+    parent_session_id: str | None = None
     runtime_name: str = "cayu"
     runtime_version: str | None = None
     environment_name: str | None = None
@@ -147,7 +184,7 @@ class Session(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("environment_name", "runtime_version")
+    @field_validator("parent_session_id", "environment_name", "runtime_version")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -157,6 +194,12 @@ class Session(BaseModel):
         if value is None:
             return None
         return require_nonblank(value, info.field_name)
+
+
+CheckpointTransform = Callable[
+    [Session, dict[str, Any] | None],
+    dict[str, Any] | None,
+]
 
 
 class SessionOrder(StrEnum):
@@ -172,11 +215,12 @@ class SessionQuery(BaseModel):
     status: SessionStatus | None = None
     agent_name: str | None = None
     environment_name: str | None = None
+    parent_session_id: str | None = None
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0)
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
 
-    @field_validator("agent_name", "environment_name")
+    @field_validator("agent_name", "environment_name", "parent_session_id")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -250,6 +294,18 @@ class SessionStore(ABC):
         identity: SessionIdentity,
     ) -> Session:
         """Create a session for a run request."""
+
+    @abstractmethod
+    async def create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+    ) -> Session:
+        """Create a forked session with copied transcript/checkpoint state."""
 
     @abstractmethod
     async def load(self, session_id: str) -> Session | None:
@@ -370,6 +426,68 @@ class InMemorySessionStore(SessionStore):
             self._event_ids[session.id] = set()
             self._transcripts[session.id] = []
             return session.model_copy(deep=True)
+
+    async def create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+    ) -> Session:
+        source_session_id = require_nonblank(source_session_id, "source_session_id")
+        fork = copy_session(fork)
+        allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
+        if fork.parent_session_id != source_session_id:
+            raise ValueError("Fork parent_session_id must match source_session_id.")
+        if transcript_cursor is not None and transcript_cursor < 0:
+            raise ValueError("transcript_cursor must be greater than or equal to 0.")
+        async with self._lock:
+            source_session = self._sessions.get(source_session_id)
+            if source_session is None:
+                raise KeyError(f"Session not found: {source_session_id}")
+            if source_session.status not in allowed_statuses:
+                raise ValueError(f"Source session status is not forkable: {source_session.status}")
+            if fork.status != source_session.status:
+                raise ValueError(
+                    "Fork status must match source session status: "
+                    f"{fork.status} != {source_session.status}"
+                )
+            if fork.provider_name != source_session.provider_name:
+                raise ValueError(
+                    "Fork provider_name must match source session provider_name: "
+                    f"{fork.provider_name} != {source_session.provider_name}"
+                )
+            if fork.id in self._sessions:
+                raise ValueError(f"Session already exists: {fork.id}")
+
+            source_transcript = self._transcripts.get(source_session_id, [])
+            if transcript_cursor is None:
+                copied_transcript = [copy_message(message) for message in source_transcript]
+            else:
+                if transcript_cursor > len(source_transcript):
+                    raise ValueError("transcript_cursor is greater than source transcript length.")
+                copied_transcript = [
+                    copy_message(message) for message in source_transcript[:transcript_cursor]
+                ]
+            copied_checkpoint = None
+            if checkpoint_transform is not None:
+                source_checkpoint = self._checkpoints.get(source_session_id)
+                copied_checkpoint = checkpoint_transform(
+                    source_session.model_copy(deep=True),
+                    None if source_checkpoint is None else deepcopy(source_checkpoint),
+                )
+                if copied_checkpoint is not None:
+                    copied_checkpoint = copy_json_value(copied_checkpoint, "checkpoint")
+
+            self._sessions[fork.id] = fork.model_copy(deep=True)
+            self._events[fork.id] = []
+            self._event_ids[fork.id] = set()
+            self._transcripts[fork.id] = copied_transcript
+            if copied_checkpoint is not None:
+                self._checkpoints[fork.id] = copied_checkpoint
+            return fork.model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
         session_id = require_nonblank(session_id, "session_id")
@@ -618,6 +736,40 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     )
 
 
+def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest:
+    if type(request) is not ForkSessionRequest:
+        raise TypeError("Session fork requires a ForkSessionRequest.")
+    return ForkSessionRequest(
+        source_session_id=request.source_session_id,
+        session_id=request.session_id,
+        agent_name=request.agent_name,
+        model=request.model,
+        environment_name=request.environment_name,
+        transcript_cursor=request.transcript_cursor,
+        copy_checkpoint=request.copy_checkpoint,
+        metadata=copy_json_value(request.metadata, "metadata"),
+    )
+
+
+def copy_session(session: Session) -> Session:
+    if type(session) is not Session:
+        raise TypeError("Session copy requires a Session.")
+    return Session(
+        id=session.id,
+        agent_name=session.agent_name,
+        provider_name=session.provider_name,
+        model=session.model,
+        parent_session_id=session.parent_session_id,
+        runtime_name=session.runtime_name,
+        runtime_version=session.runtime_version,
+        environment_name=session.environment_name,
+        status=session.status,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        metadata=copy_json_value(session.metadata, "metadata"),
+    )
+
+
 def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
     if type(identity) is not SessionIdentity:
         raise TypeError("Session creation requires a SessionIdentity.")
@@ -652,6 +804,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         status=query.status,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
+        parent_session_id=query.parent_session_id,
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -679,6 +832,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.status is not None and session.status != query.status:
         return False
     if query.agent_name is not None and session.agent_name != query.agent_name:
+        return False
+    if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
         return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name

@@ -28,8 +28,10 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
+    CheckpointTransform,
     EventQuery,
     EventRecord,
+    ForkSessionRequest,
     InMemorySessionStore,
     ResumeRequest,
     RunRequest,
@@ -62,6 +64,7 @@ __all__ = [
     "AllowAllToolPolicy",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
+    "CheckpointTransform",
     "CompactionPromptBuilder",
     "CompactionRequest",
     "CompactionResult",
@@ -72,6 +75,7 @@ __all__ = [
     "EventQuery",
     "EventRecord",
     "EventSink",
+    "ForkSessionRequest",
     "InMemoryEventSink",
     "InMemorySessionStore",
     "InMemoryTaskStore",

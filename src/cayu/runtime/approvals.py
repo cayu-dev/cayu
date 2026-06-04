@@ -192,9 +192,7 @@ def copy_tool_approval_recovery_request(
     request: ToolApprovalRecoveryRequest,
 ) -> ToolApprovalRecoveryRequest:
     if type(request) is not ToolApprovalRecoveryRequest:
-        raise TypeError(
-            "Tool approval recovery requires a ToolApprovalRecoveryRequest."
-        )
+        raise TypeError("Tool approval recovery requires a ToolApprovalRecoveryRequest.")
     return ToolApprovalRecoveryRequest(
         session_id=request.session_id,
         approval_id=request.approval_id,
@@ -223,9 +221,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         task_id=approval.task_id,
         reason=approval.reason,
         metadata=copy_json_value(approval.metadata, "metadata"),
-        tool_calls=[
-            copy_pending_tool_call_approval(call) for call in approval.tool_calls
-        ],
+        tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
     )
 
 

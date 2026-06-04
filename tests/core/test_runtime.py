@@ -24,6 +24,7 @@ from cayu.runtime import (
     ContextPolicy,
     ContextRequest,
     EventSink,
+    ForkSessionRequest,
     InMemoryEventSink,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -172,9 +173,8 @@ class FailingTerminalToolEventStore(InMemorySessionStore):
         self.failed_terminal_once = False
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        if (
-            not self.failed_terminal_once
-            and any(event.type == EventType.TOOL_CALL_COMPLETED for event in events)
+        if not self.failed_terminal_once and any(
+            event.type == EventType.TOOL_CALL_COMPLETED for event in events
         ):
             self.failed_terminal_once = True
             raise RuntimeError("terminal tool event unavailable")
@@ -402,6 +402,10 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list[Event]:
+    return [event async for event in app.fork_session(request)]
 
 
 async def collect_tool_approval_events(
@@ -653,6 +657,138 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
     session = asyncio.run(store.load("sess_resume"))
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_forks_completed_session_and_preserves_source():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("fork answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_fork_source",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    fork_events = asyncio.run(
+        collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_fork_source",
+                session_id="sess_fork_child",
+                metadata={"purpose": "alternate path"},
+            ),
+        )
+    )
+
+    assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+    assert fork_events[0].session_id == "sess_fork_child"
+    assert fork_events[0].payload["source_session_id"] == "sess_fork_source"
+    fork = asyncio.run(store.load("sess_fork_child"))
+    source = asyncio.run(store.load("sess_fork_source"))
+    assert fork is not None
+    assert source is not None
+    assert fork.parent_session_id == "sess_fork_source"
+    assert fork.status == SessionStatus.COMPLETED
+    assert fork.provider_name == source.provider_name == "fake"
+    assert fork.model == source.model == "fake-model"
+    assert fork.metadata == {"purpose": "alternate path"}
+
+    fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))
+    source_transcript = asyncio.run(store.load_transcript("sess_fork_source"))
+    assert fork_transcript == source_transcript
+
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_fork_child",
+                messages=[Message.text("user", "continue fork")],
+            ),
+        )
+    )
+    assert [message.content[0].text for message in provider.requests[1].messages] == [
+        "first request",
+        "first answer",
+        "continue fork",
+    ]
+    assert [message.content[0].text for message in source_transcript] == [
+        "first request",
+        "first answer",
+    ]
+
+
+def test_cayu_app_forks_partial_transcript_without_checkpoint():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_partial_fork_source",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(store.checkpoint("sess_partial_fork_source", {"context_compaction": {}}))
+
+    asyncio.run(
+        collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_partial_fork_source",
+                session_id="sess_partial_fork_child",
+                transcript_cursor=1,
+                copy_checkpoint=False,
+            ),
+        )
+    )
+
+    fork_transcript = asyncio.run(store.load_transcript("sess_partial_fork_child"))
+    assert [message.content[0].text for message in fork_transcript] == ["first request"]
+    assert asyncio.run(store.load_checkpoint("sess_partial_fork_child")) is None
+
+    with pytest.raises(ValueError, match="copy_checkpoint must be false"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_partial_fork_source",
+                    session_id="sess_invalid_partial_fork",
+                    transcript_cursor=1,
+                ),
+            )
+        )
 
 
 def test_cayu_app_resume_uses_stored_provider_and_model_identity():
@@ -2141,9 +2277,12 @@ def test_cayu_app_rejects_denial_retry_after_approved_tool_executed():
     assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
     assert "cannot be retried as denied" in retry_events[0].payload["error"]
     assert tool.calls == [{"value": "secret"}]
-    assert asyncio.run(store.load_checkpoint("sess_approval_reject_conflicting_deny"))[
-        "pending_tool_approval"
-    ]["approval_id"] == approval_id
+    assert (
+        asyncio.run(store.load_checkpoint("sess_approval_reject_conflicting_deny"))[
+            "pending_tool_approval"
+        ]["approval_id"]
+        == approval_id
+    )
 
 
 def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
@@ -2331,9 +2470,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     ]
     assert recovery_events[1].payload["approval_id"] == approval_id
     assert recovery_events[1].payload["manual_recovery"] is True
-    assert recovery_events[1].payload["result"]["content"] == (
-        "side effect completed externally"
-    )
+    assert recovery_events[1].payload["result"]["content"] == ("side effect completed externally")
     assert tool.calls == [{"value": "secret"}]
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content[0].content == (
@@ -2440,6 +2577,197 @@ def test_cayu_app_rejects_message_resume_with_pending_tool_approval():
                 ),
             )
         )
+
+
+def test_cayu_app_forks_interrupted_session_with_pending_approval_checkpoint():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupted_fork_source",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = events[4].payload["approval"]["approval_id"]
+    source_checkpoint = asyncio.run(store.load_checkpoint("sess_interrupted_fork_source"))
+    assert source_checkpoint is not None
+    source_checkpoint["pending_tool_approval"]["task_id"] = "source_task"
+    asyncio.run(store.checkpoint("sess_interrupted_fork_source", source_checkpoint))
+
+    fork_events = asyncio.run(
+        collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_interrupted_fork_source",
+                session_id="sess_interrupted_fork_child",
+            ),
+        )
+    )
+
+    assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+    fork = asyncio.run(store.load("sess_interrupted_fork_child"))
+    assert fork is not None
+    assert fork.status == SessionStatus.INTERRUPTED
+    assert fork.parent_session_id == "sess_interrupted_fork_source"
+    fork_checkpoint = asyncio.run(store.load_checkpoint("sess_interrupted_fork_child"))
+    assert fork_checkpoint is not None
+    assert fork_checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+    assert fork_checkpoint["pending_tool_approval"]["task_id"] is None
+
+    source_checkpoint_after = asyncio.run(store.load_checkpoint("sess_interrupted_fork_source"))
+    assert source_checkpoint_after is not None
+    assert source_checkpoint_after["pending_tool_approval"]["task_id"] == "source_task"
+
+    with pytest.raises(ValueError, match="without checkpoint state"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_interrupted_fork_source",
+                    session_id="sess_interrupted_fork_no_checkpoint",
+                    copy_checkpoint=False,
+                ),
+            )
+        )
+
+    app.register_agent(AgentSpec(name="other", model="fake-model"))
+    with pytest.raises(ValueError, match="different agent"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_interrupted_fork_source",
+                    session_id="sess_interrupted_fork_other_agent",
+                    agent_name="other",
+                ),
+            )
+        )
+
+
+def test_in_memory_session_store_rejects_fork_status_mismatch():
+    store = InMemorySessionStore()
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_store_fork_status_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="Fork status must match"):
+            await store.create_fork(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_store_fork_status_child",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    status=SessionStatus.RUNNING,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                transcript_cursor=None,
+                checkpoint_transform=None,
+            )
+
+    asyncio.run(run_operations())
+
+
+def test_in_memory_session_store_rejects_fork_provider_mismatch():
+    store = InMemorySessionStore()
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_store_fork_provider_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="Fork provider_name must match"):
+            await store.create_fork(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_store_fork_provider_child",
+                    agent_name="assistant",
+                    provider_name="other",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    status=SessionStatus.COMPLETED,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                transcript_cursor=None,
+                checkpoint_transform=None,
+            )
+
+    asyncio.run(run_operations())
+
+
+def test_in_memory_session_store_transforms_current_checkpoint_during_fork():
+    store = InMemorySessionStore()
+
+    async def run_operations() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_store_fork_checkpoint_source",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        await store.checkpoint(source.id, {"version": 2})
+
+        await store.create_fork(
+            source_session_id=source.id,
+            fork=Session(
+                id="sess_store_fork_checkpoint_child",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                parent_session_id=source.id,
+                status=SessionStatus.COMPLETED,
+            ),
+            source_statuses={SessionStatus.COMPLETED},
+            transcript_cursor=None,
+            checkpoint_transform=lambda _session, checkpoint: {
+                "copied_version": checkpoint["version"] if checkpoint else None
+            },
+        )
+
+        assert await store.load_checkpoint("sess_store_fork_checkpoint_child") == {
+            "copied_version": 2
+        }
+
+    asyncio.run(run_operations())
 
 
 def test_cayu_app_rejects_tool_approval_resolution_from_failed_status():
