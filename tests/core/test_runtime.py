@@ -486,6 +486,19 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
     with pytest.raises(ValueError, match="runtime_hook.name"):
         CayuApp(runtime_hooks=[BlankNameHook()])
 
+    app = CayuApp()
+    with pytest.raises(TypeError, match="RuntimeHook"):
+        app.register_agent(
+            AgentSpec(name="invalid_hook_agent", model="fake-model"),
+            runtime_hooks=[HookLike()],  # type: ignore[list-item]
+        )
+
+    with pytest.raises(ValueError, match="runtime_hook.name"):
+        app.register_agent(
+            AgentSpec(name="blank_hook_agent", model="fake-model"),
+            runtime_hooks=[BlankNameHook()],
+        )
+
     with pytest.raises(TypeError, match="EventSink"):
         CayuApp(event_sinks=[SinkLike()])  # type: ignore[list-item]
 
@@ -1233,6 +1246,141 @@ def test_cayu_app_runtime_hook_can_fork_and_dispatch_followup_work():
         "fork_session",
         "create_task",
         "dispatch",
+    ]
+
+
+def test_cayu_app_agent_runtime_hooks_run_only_for_registered_agent():
+    class RecordingHook(RuntimeHook):
+        def __init__(self, name: str) -> None:
+            self._name = name
+            self.sessions: list[str] = []
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.sessions.append(context.session.id)
+
+    builder_hook = RecordingHook("builder_hook")
+    reviewer_hook = RecordingHook("reviewer_hook")
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("builder done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("reviewer done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="builder", model="fake-model"),
+        runtime_hooks=[builder_hook],
+    )
+    app.register_agent(
+        AgentSpec(name="reviewer", model="fake-model"),
+        runtime_hooks=[reviewer_hook],
+    )
+
+    builder_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_builder_hook",
+                messages=[Message.text("user", "Build it.")],
+            ),
+        )
+    )
+    reviewer_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_reviewer_hook",
+                messages=[Message.text("user", "Review it.")],
+            ),
+        )
+    )
+
+    assert builder_hook.sessions == ["sess_builder_hook"]
+    assert reviewer_hook.sessions == ["sess_reviewer_hook"]
+    assert [
+        event.payload["hook_name"]
+        for event in builder_events
+        if event.type == EventType.HOOK_STARTED
+    ] == ["builder_hook"]
+    assert [
+        event.payload["scope"] for event in builder_events if event.type == EventType.HOOK_STARTED
+    ] == ["agent"]
+    assert [
+        event.payload["hook_name"]
+        for event in reviewer_events
+        if event.type == EventType.HOOK_STARTED
+    ] == ["reviewer_hook"]
+
+
+def test_cayu_app_runtime_hooks_run_app_scope_before_agent_scope():
+    class RecordingHook(RuntimeHook):
+        def __init__(self, name: str, calls: list[str]) -> None:
+            self._name = name
+            self._calls = calls
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self._calls.append(self.name)
+
+    calls: list[str] = []
+    app_hook = RecordingHook("app_hook", calls)
+    agent_hook = RecordingHook("agent_hook", calls)
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(runtime_hooks=[app_hook])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        runtime_hooks=[agent_hook],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_hook_order",
+                messages=[Message.text("user", "Do it.")],
+            ),
+        )
+    )
+
+    assert calls == ["app_hook", "agent_hook"]
+    assert [
+        (event.payload["hook_name"], event.payload["scope"])
+        for event in events
+        if event.type == EventType.HOOK_STARTED
+    ] == [
+        ("app_hook", "app"),
+        ("agent_hook", "agent"),
+    ]
+    assert [
+        (event.payload["hook_name"], event.payload["scope"])
+        for event in events
+        if event.type == EventType.HOOK_COMPLETED
+    ] == [
+        ("app_hook", "app"),
+        ("agent_hook", "agent"),
     ]
 
 

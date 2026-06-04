@@ -210,7 +210,7 @@ async for event in app.dispatch_inline(
 Add runtime hooks for lifecycle automation. Hooks run after terminal session state is already durable, so they are useful for follow-up work such as extracting knowledge from a completed builder session:
 
 ```python
-from cayu import DispatchRequest, ForkSessionRequest, Message, RuntimeHook, TaskCreate
+from cayu import AgentSpec, DispatchRequest, ForkSessionRequest, Message, RuntimeHook, TaskCreate
 
 
 class KnowledgeHook(RuntimeHook):
@@ -238,7 +238,10 @@ class KnowledgeHook(RuntimeHook):
         )
 
 
-app = CayuApp(task_store=task_store, runtime_hooks=[KnowledgeHook()])
+app.register_agent(
+    AgentSpec(name="builder", model="claude-sonnet-4-6"),
+    runtime_hooks=[KnowledgeHook()],
+)
 ```
 
 Customize model-facing context without rewriting durable transcript history:

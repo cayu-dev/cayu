@@ -98,6 +98,7 @@ class _RegisteredAgentState:
     tools: Mapping[str, RegisteredTool]
     context_policy: ContextPolicy
     tool_policy: ToolPolicy
+    runtime_hooks: tuple[RuntimeHook, ...]
 
 
 @dataclass
@@ -194,17 +195,7 @@ class CayuApp:
             raise TypeError("task_store must be a TaskStore.")
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
-        if runtime_hooks is None:
-            hooks = []
-        else:
-            if isinstance(runtime_hooks, str | bytes):
-                raise TypeError("runtime_hooks must be an iterable of RuntimeHook instances.")
-            try:
-                hooks = list(runtime_hooks)
-            except TypeError as exc:
-                raise TypeError(
-                    "runtime_hooks must be an iterable of RuntimeHook instances."
-                ) from exc
+        hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         if event_sinks is None:
             sinks = []
         else:
@@ -217,10 +208,6 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
-        for hook in hooks:
-            if not isinstance(hook, RuntimeHook):
-                raise TypeError("runtime_hooks must contain RuntimeHook instances.")
-            require_nonblank(hook.name, "runtime_hook.name")
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
@@ -239,6 +226,7 @@ class CayuApp:
         tools: Iterable[Tool] | None = None,
         context_policy: ContextPolicy | None = None,
         tool_policy: ToolPolicy | None = None,
+        runtime_hooks: Iterable[RuntimeHook] | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -257,6 +245,10 @@ class CayuApp:
             stored_tool_policy = tool_policy
         else:
             raise TypeError("tool_policy must be a ToolPolicy.")
+        stored_runtime_hooks = _validate_runtime_hooks(
+            runtime_hooks,
+            field_name="runtime_hooks",
+        )
 
         if tools is None:
             agent_tools = []
@@ -282,6 +274,7 @@ class CayuApp:
             tools=MappingProxyType(tools_by_name),
             context_policy=stored_context_policy,
             tool_policy=stored_tool_policy,
+            runtime_hooks=stored_runtime_hooks,
         )
         return spec
 
@@ -1797,6 +1790,18 @@ class CayuApp:
             terminal_event=terminal_event,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+            hooks=self._runtime_hooks,
+            scope="app",
+        ):
+            yield hook_event
+        async for hook_event in self._run_runtime_hooks(
+            phase=phase,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            hooks=registered_agent.runtime_hooks,
+            scope="agent",
         ):
             yield hook_event
 
@@ -1808,13 +1813,16 @@ class CayuApp:
         terminal_event: Event,
         registered_agent: _RegisteredAgentState,
         registered_environment: RegisteredEnvironment | None,
+        hooks: tuple[RuntimeHook, ...],
+        scope: str,
     ) -> AsyncIterator[Event]:
-        for hook in self._runtime_hooks:
+        for hook in hooks:
             hook_name = require_nonblank(hook.name, "runtime_hook.name")
             yield await self._emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_STARTED,
                     hook_name=hook_name,
+                    scope=scope,
                     phase=phase,
                     session=session,
                     registered_agent=registered_agent,
@@ -1837,6 +1845,7 @@ class CayuApp:
                     _runtime_hook_event(
                         event_type=EventType.HOOK_FAILED,
                         hook_name=hook_name,
+                        scope=scope,
                         phase=phase,
                         session=session,
                         registered_agent=registered_agent,
@@ -1854,6 +1863,7 @@ class CayuApp:
                 _runtime_hook_event(
                     event_type=EventType.HOOK_COMPLETED,
                     hook_name=hook_name,
+                    scope=scope,
                     phase=phase,
                     session=session,
                     registered_agent=registered_agent,
@@ -2503,6 +2513,7 @@ def _runtime_hook_event(
     *,
     event_type: EventType,
     hook_name: str,
+    scope: str,
     phase: RuntimeHookPhase,
     session: Session,
     registered_agent: _RegisteredAgentState,
@@ -2512,6 +2523,7 @@ def _runtime_hook_event(
 ) -> Event:
     event_payload = {
         "hook_name": hook_name,
+        "scope": require_nonblank(scope, "runtime_hook.scope"),
         "phase": phase.value,
         "terminal_event_id": terminal_event.id,
         "terminal_event_type": str(terminal_event.type),
@@ -2694,6 +2706,26 @@ def _validate_dispatch_handle_for_request(
     if mismatches:
         fields = ", ".join(mismatches)
         raise ValueError(f"Dispatcher returned a handle for the wrong request fields: {fields}.")
+
+
+def _validate_runtime_hooks(
+    hooks: Iterable[RuntimeHook] | None,
+    *,
+    field_name: str,
+) -> tuple[RuntimeHook, ...]:
+    if hooks is None:
+        return ()
+    if isinstance(hooks, str | bytes):
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.")
+    try:
+        hook_list = list(hooks)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.") from exc
+    for hook in hook_list:
+        if not isinstance(hook, RuntimeHook):
+            raise TypeError(f"{field_name} must contain RuntimeHook instances.")
+        require_nonblank(hook.name, "runtime_hook.name")
+    return tuple(hook_list)
 
 
 def _initial_messages(
