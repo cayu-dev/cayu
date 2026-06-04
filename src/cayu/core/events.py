@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 
 _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
 
@@ -88,7 +88,7 @@ class Event(BaseModel):
     @field_validator("session_id", "id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("agent_name", "environment_name", "workflow_name", "tool_name")
     @classmethod
@@ -99,7 +99,7 @@ class Event(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("type")
     @classmethod

@@ -5,7 +5,7 @@ import os
 from os import PathLike
 from pathlib import Path
 
-from cayu._validation import require_nonblank
+from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -24,7 +24,7 @@ class LocalWorkspace(Workspace):
         if workspace_id is None:
             self.id = str(root_path)
         else:
-            self.id = require_nonblank(workspace_id, "workspace_id")
+            self.id = require_clean_nonblank(workspace_id, "workspace_id")
         self.root = root_path
 
     async def read_bytes(

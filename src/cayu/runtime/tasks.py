@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_object, require_nonblank
+from cayu._validation import copy_json_object, require_clean_nonblank, require_nonblank
 
 
 class TaskStatus(StrEnum):
@@ -74,7 +74,7 @@ class Task(BaseModel):
     @field_validator("id", "type")
     @classmethod
     def validate_nonblank_required_strings(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator(
         "title",
@@ -91,7 +91,9 @@ class Task(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        if info.field_name in {"title", "description"}:
+            return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class TaskCreate(BaseModel):
@@ -115,7 +117,7 @@ class TaskCreate(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_nonblank_type(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator(
         "task_id",
@@ -133,7 +135,9 @@ class TaskCreate(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        if info.field_name in {"title", "description"}:
+            return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class TaskQuery(BaseModel):
@@ -157,7 +161,7 @@ class TaskQuery(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class TaskStore(ABC):
@@ -218,7 +222,7 @@ class InMemoryTaskStore(TaskStore):
             return task.model_copy(deep=True)
 
     async def load_task(self, task_id: str) -> Task | None:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
@@ -239,9 +243,9 @@ class InMemoryTaskStore(TaskStore):
         *,
         session_id: str | None = None,
     ) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
-            session_id = require_nonblank(session_id, "session_id")
+            session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             task = self._require_task(task_id)
             _ensure_can_transition(task, TaskStatus.RUNNING)
@@ -258,7 +262,7 @@ class InMemoryTaskStore(TaskStore):
             return updated.model_copy(deep=True)
 
     async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_json_object(result, "result")
         async with self._lock:
             return self._finish_task(
@@ -269,7 +273,7 @@ class InMemoryTaskStore(TaskStore):
             )
 
     async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_json_object(error, "error")
         async with self._lock:
             return self._finish_task(
@@ -284,7 +288,7 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         error: dict[str, Any] | None = None,
     ) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         copied_error = None if error is None else copy_json_object(error, "error")
         async with self._lock:
             return self._finish_task(

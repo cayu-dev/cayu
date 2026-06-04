@@ -12,7 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 
 
 class MessageRole(StrEnum):
@@ -50,7 +50,7 @@ class ToolCallPart(BaseModel):
     @field_validator("tool_call_id", "tool_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return _require_nonblank(info.field_name, value)
+        return _require_clean_nonblank(info.field_name, value)
 
 
 class ToolResultPart(BaseModel):
@@ -72,7 +72,7 @@ class ToolResultPart(BaseModel):
     @field_validator("tool_call_id", "tool_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return _require_nonblank(info.field_name, value)
+        return _require_clean_nonblank(info.field_name, value)
 
 
 class ProviderStatePart(BaseModel):
@@ -85,7 +85,7 @@ class ProviderStatePart(BaseModel):
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, value: str) -> str:
-        return _require_nonblank("provider", value)
+        return _require_clean_nonblank("provider", value)
 
     @field_validator("state", mode="before")
     @classmethod
@@ -221,7 +221,7 @@ def _require_parts(
 def _require_value(name: str, value: str | None) -> str:
     if value is None:
         raise ValueError(f"`{name}` is required.")
-    return _require_nonblank(name, value)
+    return _require_clean_nonblank(name, value)
 
 
 def copy_message(message: Message) -> Message:
@@ -266,3 +266,7 @@ def copy_message_part(
 
 def _require_nonblank(name: str, value: str) -> str:
     return require_nonblank(value, name)
+
+
+def _require_clean_nonblank(name: str, value: str) -> str:
+    return require_clean_nonblank(value, name)

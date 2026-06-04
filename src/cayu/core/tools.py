@@ -16,7 +16,7 @@ from pydantic import (
     field_validator,
 )
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ class _ToolSpecInput(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class ToolSpec(BaseModel):
@@ -179,7 +179,7 @@ class ToolContext(BaseModel):
     @field_validator("session_id")
     @classmethod
     def validate_nonblank_session_id(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("agent_name", "environment_name", "workspace_id")
     @classmethod
@@ -190,7 +190,7 @@ class ToolContext(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("mcp_servers", mode="before")
     @classmethod

@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
 import cayu.runners.local as local_runner_module
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core import (
     AgentSpec,
     Event,
@@ -559,6 +559,16 @@ def test_nonblank_helper_rejects_string_subclasses_before_strip():
     assert type(tool.name) is str
 
 
+def test_clean_nonblank_helper_rejects_edge_whitespace_without_stripping():
+    with pytest.raises(ValueError, match="must not start or end with whitespace"):
+        require_clean_nonblank(" assistant", "name")
+
+    with pytest.raises(ValueError, match="must not start or end with whitespace"):
+        require_clean_nonblank("assistant ", "name")
+
+    assert require_clean_nonblank("assistant builder", "name") == "assistant builder"
+
+
 def test_json_boundary_fields_reject_scalar_subclasses_before_copying():
     class BadString(str):
         def __deepcopy__(self, memo):
@@ -823,6 +833,27 @@ def test_agent_spec_rejects_blank_identity_fields(kwargs):
         AgentSpec(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"name": " assistant", "model": "fake-model"},
+        {"name": "assistant ", "model": "fake-model"},
+        {"name": "assistant", "model": " fake-model"},
+        {"name": "assistant", "model": "fake-model "},
+    ],
+)
+def test_agent_spec_rejects_edge_whitespace_identity_fields(kwargs):
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        AgentSpec(**kwargs)
+
+
+def test_agent_spec_allows_internal_spaces_in_identity_fields():
+    spec = AgentSpec(name="builder agent", model="fake model")
+
+    assert spec.name == "builder agent"
+    assert spec.model == "fake model"
+
+
 def test_environment_spec_accepts_name_and_metadata():
     metadata = {"nested": {"value": "original"}}
     environment = Environment(EnvironmentSpec(name="local", metadata=metadata))
@@ -883,6 +914,32 @@ def test_runtime_identity_models_reject_blank_fields():
         ToolContext(session_id=" ")
 
 
+def test_runtime_identity_models_reject_edge_whitespace_fields():
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        RunRequest(agent_name=" assistant", messages=[Message.text("user", "start")])
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_1 ",
+            messages=[Message.text("user", "start")],
+        )
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        Session(
+            id=" sess_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        Event(type=EventType.TOOL_CALL_STARTED, session_id="sess_1", tool_name=" echo")
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        ToolContext(session_id="sess_1", workspace_id=" workspace")
+
+
 def test_framework_spec_models_reject_blank_names():
     with pytest.raises(ValidationError, match="cannot be blank"):
         ToolSpec(name=" ")
@@ -912,6 +969,33 @@ def test_framework_spec_models_reject_blank_names():
         KnowledgeItem(id="memory_1", text=" ")
 
 
+def test_framework_spec_models_reject_edge_whitespace_identity_fields():
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        ToolSpec(name=" echo")
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        WorkflowSpec(name="workflow ")
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        EnvironmentSpec(name=" local")
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        ModelRequest(model=" fake-model", messages=[Message.text("user", "start")])
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        McpServerSpec(name=" local", command=["node", "server.js"])
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        SecretRef(name=" OPENAI_API_KEY")
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        KnowledgeItem(id=" memory_1", text="memory")
+
+    item = KnowledgeItem(id="memory_1", text=" memory text ", source="project docs")
+    assert item.text == " memory text "
+    assert item.source == "project docs"
+
+
 def test_mcp_server_rejects_blank_transport_values():
     with pytest.raises(ValidationError, match="cannot be blank"):
         McpServerSpec(name="local", command=["node", " "])
@@ -923,6 +1007,9 @@ def test_mcp_server_rejects_blank_transport_values():
 def test_mcp_server_rejects_blank_config_keys():
     with pytest.raises(ValidationError, match="cannot be blank"):
         McpServerSpec(name="local", command=["node"], env={" ": "production"})
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        McpServerSpec(name="local", command=["node"], headers={" Authorization": "token"})
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         McpServerSpec(

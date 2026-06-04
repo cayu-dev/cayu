@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
 from cayu.core.messages import (
@@ -60,7 +60,7 @@ class ContextRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, "environment_name")
+        return require_clean_nonblank(value, "environment_name")
 
 
 class ContextPolicy(ABC):
@@ -346,7 +346,7 @@ class ModelCompactor(ContextCompactor):
             if max_input_chars < 1000:
                 raise ValueError("max_input_chars must be at least 1000.")
         self.provider = provider
-        self.model = require_nonblank(model, "model")
+        self.model = require_clean_nonblank(model, "model")
         self.system_prompt = require_nonblank(system_prompt, "system_prompt")
         self.options = copy_json_value({} if options is None else options, "options")
         self.max_input_chars = max_input_chars
@@ -405,7 +405,7 @@ class ModelCompactor(ContextCompactor):
             summary=summary,
             metadata={
                 "compactor": type(self).__name__,
-                "provider": require_nonblank(self.provider.name, "provider.name"),
+                "provider": require_clean_nonblank(self.provider.name, "provider.name"),
                 "model": self.model,
                 "input_truncated": input_truncated,
                 "max_input_chars": self.max_input_chars,

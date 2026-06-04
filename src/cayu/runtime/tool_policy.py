@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.runtime.sessions import Session
 
@@ -35,7 +35,7 @@ class ToolPolicyRequest(BaseModel):
     @field_validator("tool_name", "tool_call_id")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("environment_name", "workspace_id")
     @classmethod
@@ -46,7 +46,7 @@ class ToolPolicyRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
@@ -136,5 +136,5 @@ def _copy_tool_name_set(value: Iterable[str], field_name: str) -> frozenset[str]
 
     copied: set[str] = set()
     for index, name in enumerate(names):
-        copied.add(require_nonblank(name, f"{field_name}[{index}]"))
+        copied.add(require_clean_nonblank(name, f"{field_name}[{index}]"))
     return frozenset(copied)

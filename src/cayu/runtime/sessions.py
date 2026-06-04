@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, copy_message
 
@@ -49,7 +49,7 @@ class RunRequest(BaseModel):
     @field_validator("agent_name")
     @classmethod
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("session_id", "task_id", "environment_name")
     @classmethod
@@ -60,7 +60,7 @@ class RunRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class ResumeRequest(BaseModel):
@@ -94,7 +94,7 @@ class ResumeRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class ForkSessionRequest(BaseModel):
@@ -124,7 +124,7 @@ class ForkSessionRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -143,7 +143,7 @@ class SessionIdentity(BaseModel):
     @field_validator("provider_name", "model", "runtime_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("runtime_version")
     @classmethod
@@ -154,7 +154,7 @@ class SessionIdentity(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class Session(BaseModel):
@@ -182,7 +182,7 @@ class Session(BaseModel):
     @field_validator("id", "agent_name", "provider_name", "model", "runtime_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("parent_session_id", "environment_name", "runtime_version")
     @classmethod
@@ -193,7 +193,7 @@ class Session(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 CheckpointTransform = Callable[
@@ -229,7 +229,7 @@ class SessionQuery(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class EventRecord(BaseModel):
@@ -271,7 +271,7 @@ class EventQuery(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("event_type")
     @classmethod
@@ -436,7 +436,7 @@ class InMemorySessionStore(SessionStore):
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
     ) -> Session:
-        source_session_id = require_nonblank(source_session_id, "source_session_id")
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
         fork = copy_session(fork)
         allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
         if fork.parent_session_id != source_session_id:
@@ -490,7 +490,7 @@ class InMemorySessionStore(SessionStore):
             return fork.model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -498,7 +498,7 @@ class InMemorySessionStore(SessionStore):
             return session.model_copy(deep=True)
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
         async with self._lock:
@@ -516,8 +516,8 @@ class InMemorySessionStore(SessionStore):
             return updated.model_copy(deep=True)
 
     async def update_model(self, session_id: str, model: str) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
-        model = require_nonblank(model, "model")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        model = require_clean_nonblank(model, "model")
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -539,7 +539,7 @@ class InMemorySessionStore(SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
     ) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
@@ -565,7 +565,7 @@ class InMemorySessionStore(SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if type(events) is not list:
             raise TypeError("Session events must be a list.")
         copied_events: list[Event] = []
@@ -604,7 +604,7 @@ class InMemorySessionStore(SessionStore):
                 self._next_event_sequence += 1
 
     async def load_events(self, session_id: str) -> list[Event]:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
@@ -642,7 +642,7 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         messages: list[Message],
     ) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
         async with self._lock:
             if session_id not in self._sessions:
@@ -657,7 +657,7 @@ class InMemorySessionStore(SessionStore):
         messages: list[Message],
         checkpoint: dict[str, Any],
     ) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
         if not isinstance(checkpoint, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
@@ -670,14 +670,14 @@ class InMemorySessionStore(SessionStore):
             self._checkpoints[session_id] = copied_checkpoint
 
     async def load_transcript(self, session_id: str) -> list[Message]:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [copy_message(message) for message in self._transcripts.get(session_id, [])]
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         async with self._lock:
@@ -686,7 +686,7 @@ class InMemorySessionStore(SessionStore):
             self._checkpoints[session_id] = copy_json_value(state, "checkpoint")
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             checkpoint = self._checkpoints.get(session_id)
             if checkpoint is None:

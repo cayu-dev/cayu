@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cayu._validation import copy_json_object, copy_json_value, require_nonblank
+from cayu._validation import (
+    copy_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.core.events import Event, copy_event
 from cayu.core.messages import Message
 from cayu.runtime.sessions import (
@@ -121,7 +126,7 @@ class SQLiteSessionStore(SessionStore):
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
     ) -> Session:
-        source_session_id = require_nonblank(source_session_id, "source_session_id")
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
         fork = copy_session(fork)
         allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
         if fork.parent_session_id != source_session_id:
@@ -248,7 +253,7 @@ class SQLiteSessionStore(SessionStore):
             return loaded
 
     async def load(self, session_id: str) -> Session | None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             row = self._connection.execute(
                 """
@@ -265,7 +270,7 @@ class SQLiteSessionStore(SessionStore):
             return _session_from_row(row)
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
 
@@ -289,8 +294,8 @@ class SQLiteSessionStore(SessionStore):
             return loaded
 
     async def update_model(self, session_id: str, model: str) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
-        model = require_nonblank(model, "model")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        model = require_clean_nonblank(model, "model")
         updated_at = datetime.now(UTC)
         async with self._lock:
             with self._connection:
@@ -317,7 +322,7 @@ class SQLiteSessionStore(SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
     ) -> Session:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
@@ -357,7 +362,7 @@ class SQLiteSessionStore(SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if type(events) is not list:
             raise TypeError("Session events must be a list.")
 
@@ -428,7 +433,7 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
     async def load_events(self, session_id: str) -> list[Event]:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if not self._session_exists_unlocked(session_id):
                 raise KeyError(f"Session not found: {session_id}")
@@ -534,7 +539,7 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         messages: list[Message],
     ) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
 
         async with self._lock:
@@ -566,7 +571,7 @@ class SQLiteSessionStore(SessionStore):
         messages: list[Message],
         checkpoint: dict[str, Any],
     ) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
         if not isinstance(checkpoint, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
@@ -610,7 +615,7 @@ class SQLiteSessionStore(SessionStore):
                 )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if not self._session_exists_unlocked(session_id):
                 raise KeyError(f"Session not found: {session_id}")
@@ -626,7 +631,7 @@ class SQLiteSessionStore(SessionStore):
             return [Message(**json.loads(row["message_json"])) for row in rows]
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         checkpoint = copy_json_value(state, "checkpoint")
@@ -652,7 +657,7 @@ class SQLiteSessionStore(SessionStore):
                 )
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
-        session_id = require_nonblank(session_id, "session_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             return self._load_checkpoint_unlocked(session_id)
 
@@ -769,7 +774,7 @@ class SQLiteTaskStore(TaskStore):
             return task.model_copy(deep=True)
 
     async def load_task(self, task_id: str) -> Task | None:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             return self._load_task_unlocked(task_id)
 
@@ -817,9 +822,9 @@ class SQLiteTaskStore(TaskStore):
         *,
         session_id: str | None = None,
     ) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
-            session_id = require_nonblank(session_id, "session_id")
+            session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             now = datetime.now(UTC)
             with self._connection:
@@ -849,7 +854,7 @@ class SQLiteTaskStore(TaskStore):
             return updated.model_copy(deep=True)
 
     async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_json_object(result, "result")
         async with self._lock:
             return self._finish_task_unlocked(
@@ -860,7 +865,7 @@ class SQLiteTaskStore(TaskStore):
             )
 
     async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_json_object(error, "error")
         async with self._lock:
             return self._finish_task_unlocked(
@@ -875,7 +880,7 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         error: dict[str, Any] | None = None,
     ) -> Task:
-        task_id = require_nonblank(task_id, "task_id")
+        task_id = require_clean_nonblank(task_id, "task_id")
         copied_error = None if error is None else copy_json_object(error, "error")
         async with self._lock:
             return self._finish_task_unlocked(

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import (
     copy_json_value,
+    require_clean_nonblank,
     require_finite,
     require_nonblank,
 )
@@ -25,9 +26,14 @@ class KnowledgeItem(BaseModel):
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
 
-    @field_validator("id", "text")
+    @field_validator("id")
     @classmethod
-    def validate_nonblank_fields(cls, value: str, info) -> str:
+    def validate_clean_nonblank_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("text")
+    @classmethod
+    def validate_nonblank_text(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
     @field_validator("source")
@@ -35,7 +41,7 @@ class KnowledgeItem(BaseModel):
     def validate_nonblank_source(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class KnowledgeHit(BaseModel):

@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 
 
 class SecretRef(BaseModel):
@@ -29,14 +29,14 @@ class SecretRef(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("handle")
     @classmethod
     def validate_nonblank_handle(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 def copy_secret_ref(ref: SecretRef) -> SecretRef:
@@ -71,7 +71,7 @@ class ResolvedSecret(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class Vault(ABC):

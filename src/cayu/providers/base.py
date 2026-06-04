@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.messages import Message, copy_message
 
 
@@ -39,7 +39,7 @@ class ModelRequest(BaseModel):
     @field_validator("model")
     @classmethod
     def validate_nonblank_model(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class ModelStreamEvent(BaseModel):
@@ -66,7 +66,7 @@ class ModelStreamEvent(BaseModel):
     def validate_type(cls, value: object) -> ModelStreamEventType:
         if isinstance(value, ModelStreamEventType):
             return value
-        return ModelStreamEventType(require_nonblank(value, "type"))
+        return ModelStreamEventType(require_clean_nonblank(value, "type"))
 
     @classmethod
     def text_delta(cls, delta: str) -> ModelStreamEvent:
@@ -83,11 +83,11 @@ class ModelStreamEvent(BaseModel):
         if not isinstance(arguments, dict):
             raise ValueError("`arguments` must be a dictionary.")
         payload: dict[str, Any] = {
-            "name": require_nonblank(name, "name"),
+            "name": require_clean_nonblank(name, "name"),
             "arguments": copy_json_value(arguments, "arguments"),
         }
         if id is not None:
-            payload["id"] = require_nonblank(id, "id")
+            payload["id"] = require_clean_nonblank(id, "id")
         return cls(type=ModelStreamEventType.TOOL_CALL, payload=payload)
 
     @classmethod

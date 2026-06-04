@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from enum import StrEnum
 from typing import Any, Protocol
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, copy_event
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
@@ -52,7 +52,7 @@ class _HookActionContext:
         session: Session,
     ) -> None:
         self._runtime = runtime
-        self._hook_name = require_nonblank(hook_name, "hook_name")
+        self._hook_name = require_clean_nonblank(hook_name, "hook_name")
         self._phase = phase
         self._session = session.model_copy(deep=True)
         self._actions: list[dict[str, Any]] = []
@@ -203,11 +203,11 @@ class ToolCallHookContext(_HookActionContext):
             session=session,
         )
         self._tool_event = copy_event(tool_event)
-        self._tool_name = require_nonblank(tool_name, "tool_name")
-        self._tool_call_id = require_nonblank(tool_call_id, "tool_call_id")
+        self._tool_name = require_clean_nonblank(tool_name, "tool_name")
+        self._tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
         self._arguments = copy_json_value(arguments, "arguments")
         self._result = _copy_tool_result(result)
-        self._task_id = require_nonblank(task_id, "task_id") if task_id is not None else None
+        self._task_id = require_clean_nonblank(task_id, "task_id") if task_id is not None else None
 
     @property
     def tool_event(self) -> Event:

@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 
 
 class ToolApprovalDecision(StrEnum):
@@ -33,7 +33,7 @@ class ToolApprovalRequest(BaseModel):
     @field_validator("session_id", "approval_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("reason")
     @classmethod
@@ -67,7 +67,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @field_validator("session_id", "approval_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("message")
     @classmethod
@@ -106,7 +106,7 @@ class PendingToolCallApproval(BaseModel):
     @field_validator("tool_call_id", "tool_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("policy_decision", "reason")
     @classmethod
@@ -117,7 +117,9 @@ class PendingToolCallApproval(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        if info.field_name == "reason":
+            return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
@@ -145,7 +147,7 @@ class PendingToolApproval(BaseModel):
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("environment_name", "workspace_id", "task_id", "reason")
     @classmethod
@@ -156,7 +158,9 @@ class PendingToolApproval(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        if info.field_name == "reason":
+            return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod

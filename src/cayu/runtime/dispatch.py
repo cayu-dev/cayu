@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, copy_message
 
@@ -54,7 +54,7 @@ class DispatchRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class DispatchHandle(BaseModel):
@@ -81,7 +81,7 @@ class DispatchHandle(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_clean_nonblank(value, info.field_name)
 
 
 class DispatchRuntime(Protocol):

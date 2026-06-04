@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, Runner
 
@@ -178,7 +178,7 @@ def _optional_env(args: dict) -> dict[str, str] | None:
     for key, item in value.items():
         if type(key) is not str:
             raise ValueError("Tool argument `env` keys must be strings.")
-        key = require_nonblank(key, "env key")
+        key = require_clean_nonblank(key, "env key")
         if type(item) is not str:
             raise ValueError("Tool argument `env` values must be strings.")
         copied[key] = item

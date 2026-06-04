@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
@@ -289,7 +289,7 @@ class CayuApp:
             raise TypeError("Provider registration requires a ModelProvider.")
         if not isinstance(default, bool):
             raise TypeError("Provider default flag must be a bool.")
-        require_nonblank(provider.name, "provider.name")
+        require_clean_nonblank(provider.name, "provider.name")
         if provider.name in self._providers:
             raise ValueError(f"Provider already registered: {provider.name}")
 
@@ -325,7 +325,7 @@ class CayuApp:
         return environment
 
     def get_agent(self, name: str) -> RegisteredAgent:
-        agent_name = require_nonblank(name, "agent.name")
+        agent_name = require_clean_nonblank(name, "agent.name")
         registered_agent = self._get_registered_agent(agent_name)
         return RegisteredAgent(
             spec=registered_agent.spec.model_copy(deep=True),
@@ -335,7 +335,7 @@ class CayuApp:
         )
 
     def _get_registered_agent(self, name: str) -> _RegisteredAgentState:
-        agent_name = require_nonblank(name, "agent.name")
+        agent_name = require_clean_nonblank(name, "agent.name")
         try:
             return self._agents[agent_name]
         except KeyError as exc:
@@ -355,7 +355,7 @@ class CayuApp:
 
     def _get_registered_provider(self, name: str | None = None) -> RegisteredProvider:
         if name is not None:
-            provider_name = require_nonblank(name, "provider.name")
+            provider_name = require_clean_nonblank(name, "provider.name")
         else:
             provider_name = self._default_provider_name
         if provider_name is None:
@@ -370,7 +370,7 @@ class CayuApp:
         name: str | None = None,
     ) -> RegisteredEnvironment | None:
         if name is not None:
-            environment_name = require_nonblank(name, "environment.name")
+            environment_name = require_clean_nonblank(name, "environment.name")
         else:
             environment_name = self._default_environment_name
         if environment_name is None:
@@ -1929,7 +1929,7 @@ class CayuApp:
                 phase=RuntimeHookPhase.AFTER_TOOL_CALL,
             ):
                 continue
-            hook_name = require_nonblank(hook.name, "runtime_hook.name")
+            hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
             yield await self._emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_STARTED,
@@ -2016,7 +2016,7 @@ class CayuApp:
                 phase=phase,
             ):
                 continue
-            hook_name = require_nonblank(hook.name, "runtime_hook.name")
+            hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
             yield await self._emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_STARTED,
@@ -2525,7 +2525,7 @@ def _validate_registered_tool(tool: Tool) -> RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
-    name = require_nonblank(spec.name, "name")
+    name = require_clean_nonblank(spec.name, "name")
     validated_spec = ToolSpec(
         name=name,
         description=spec.description,
@@ -2745,7 +2745,7 @@ def _runtime_hook_event(
 ) -> Event:
     event_payload = {
         "hook_name": hook_name,
-        "scope": require_nonblank(scope, "runtime_hook.scope"),
+        "scope": require_clean_nonblank(scope, "runtime_hook.scope"),
         "phase": phase.value,
         "terminal_event_id": terminal_event.id,
         "terminal_event_type": str(terminal_event.type),
@@ -2790,7 +2790,7 @@ def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str |
     workspace_id = getattr(registered_environment.environment.workspace, "id", None)
     if workspace_id is None:
         return None
-    return require_nonblank(workspace_id, "workspace.id")
+    return require_clean_nonblank(workspace_id, "workspace.id")
 
 
 def _workspace(registered_environment: RegisteredEnvironment | None) -> Any:
@@ -2946,7 +2946,7 @@ def _validate_runtime_hooks(
     for hook in hook_list:
         if not isinstance(hook, RuntimeHook):
             raise TypeError(f"{field_name} must contain RuntimeHook instances.")
-        require_nonblank(hook.name, "runtime_hook.name")
+        require_clean_nonblank(hook.name, "runtime_hook.name")
     return tuple(hook_list)
 
 

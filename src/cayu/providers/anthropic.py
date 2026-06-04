@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import certifi
 import httpx
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -128,13 +128,13 @@ class AnthropicProvider(ModelProvider):
         transport: AnthropicTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
-        self.name = require_nonblank(name, "name")
+        self.name = require_clean_nonblank(name, "name")
         self.api_key = require_nonblank(
             api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", ""),
             "api_key",
         )
         self.base_url = _validate_base_url(base_url)
-        self.anthropic_version = require_nonblank(
+        self.anthropic_version = require_clean_nonblank(
             anthropic_version,
             "anthropic_version",
         )
@@ -391,7 +391,7 @@ def _require_mapping_string(value: Mapping[str, Any], key: str) -> str:
     raw_value = value.get(key)
     if not isinstance(raw_value, str):
         raise ValueError(f"Tool {key} must be a string.")
-    return require_nonblank(raw_value, f"tool.{key}")
+    return require_clean_nonblank(raw_value, f"tool.{key}")
 
 
 def _optional_string(response: Mapping[str, Any], key: str) -> str | None:
@@ -408,7 +408,7 @@ def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
         return {}
     copied: dict[str, str] = {}
     for key, value in headers.items():
-        header_name = require_nonblank(key, "header name")
+        header_name = require_clean_nonblank(key, "header name")
         if header_name.lower() in _PROTECTED_HEADER_NAMES:
             raise ValueError(f"extra_headers cannot override {header_name}.")
         copied[header_name] = require_nonblank(
@@ -423,7 +423,7 @@ def _validate_base_url(base_url: str) -> str:
 
 
 def _validate_url(url: str, field_name: str) -> str:
-    value = require_nonblank(url, field_name)
+    value = require_clean_nonblank(url, field_name)
     parsed = urlparse(value)
     if parsed.scheme != "https":
         raise ValueError(f"Anthropic {field_name} must use https.")

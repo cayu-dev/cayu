@@ -12,6 +12,13 @@ def require_nonblank(value: str, field_name: str) -> str:
     return value
 
 
+def require_clean_nonblank(value: str, field_name: str) -> str:
+    value = require_nonblank(value, field_name)
+    if value != value.strip():
+        raise ValueError(f"`{field_name}` must not start or end with whitespace.")
+    return value
+
+
 def require_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError(f"`{field_name}` must be a dictionary.")
@@ -19,6 +26,16 @@ def require_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[str, A
         if type(key) is not str:
             raise ValueError(f"`{field_name}` keys must be strings.")
         require_nonblank(key, f"{field_name} key")
+    return value
+
+
+def require_clean_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError(f"`{field_name}` must be a dictionary.")
+    for key in value:
+        if type(key) is not str:
+            raise ValueError(f"`{field_name}` keys must be strings.")
+        require_clean_nonblank(key, f"{field_name} key")
     return value
 
 
