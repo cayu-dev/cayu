@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
@@ -13,12 +12,8 @@ from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
-    MessageRole,
     ProviderStatePart,
-    TextPart,
     ToolCallPart,
-    ToolResultPart,
-    copy_message_part,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
@@ -29,11 +24,13 @@ from cayu.providers import (
     ModelStreamEventType,
     copy_model_stream_event,
 )
+from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.approvals import (
     PendingToolApproval,
-    PendingToolCallApproval,
     ToolApprovalDecision,
-    ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_pending_tool_approval,
@@ -86,70 +83,8 @@ from cayu.runtime.tool_policy import (
     ToolPolicyResult,
 )
 
-
-@dataclass(frozen=True)
-class RegisteredAgent:
-    spec: AgentSpec
-    tools: Mapping[str, RegisteredTool]
-
-
-@dataclass(frozen=True)
-class _RegisteredAgentState:
-    spec: AgentSpec
-    tools: Mapping[str, RegisteredTool]
-    context_policy: ContextPolicy
-    tool_policy: ToolPolicy
-    runtime_hooks: tuple[RuntimeHook, ...]
-
-
-@dataclass
-class _AssistantTextPart:
-    text: str
-
-
-@dataclass(frozen=True)
-class RegisteredTool:
-    name: str
-    description: str
-    schema: dict[str, Any]
-    tool: Tool
-
-
-@dataclass(frozen=True)
-class RegisteredProvider:
-    name: str
-    provider: ModelProvider
-
-
-@dataclass(frozen=True)
-class RegisteredEnvironment:
-    spec: EnvironmentSpec
-    environment: Environment
-
-
-@dataclass(frozen=True)
-class ToolCallRequest:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class ToolCallOutcome:
-    call: ToolCallRequest
-    result: ToolResult
-
-
-@dataclass(frozen=True)
-class ToolCallPolicyOutcome:
-    call: ToolCallRequest
-    result: ToolPolicyResult | None
-
-
-@dataclass(frozen=True)
-class ToolRoundPolicyPlan:
-    outcomes: list[ToolCallPolicyOutcome]
-    pending_approval: tuple[PendingToolApproval, Event] | None
+RegisteredAgent = runtime_records.RegisteredAgent
+RegisteredEnvironment = runtime_records.RegisteredEnvironment
 
 
 class _SessionInterrupted(Exception):
@@ -158,24 +93,12 @@ class _SessionInterrupted(Exception):
         self.approval = copy_pending_tool_approval(approval)
 
 
-class _ToolApprovalManualRecoveryRequired(RuntimeError):
-    def __init__(self, *, tool_call_id: str, tool_name: str) -> None:
-        super().__init__(
-            "Tool approval cannot be retried automatically because a tool call "
-            f"started without a terminal result: {tool_call_id} ({tool_name})."
-        )
-        self.tool_call_id = tool_call_id
-        self.tool_name = tool_name
-
-
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
-
-_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 
 
 class CayuApp:
@@ -214,9 +137,9 @@ class CayuApp:
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
         self._runtime_hooks = tuple(hooks)
         self._event_sinks = sinks
-        self._agents: dict[str, _RegisteredAgentState] = {}
-        self._providers: dict[str, RegisteredProvider] = {}
-        self._environments: dict[str, RegisteredEnvironment] = {}
+        self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._providers: dict[str, runtime_records.RegisteredProvider] = {}
+        self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
 
@@ -261,7 +184,7 @@ class CayuApp:
             except TypeError as exc:
                 raise TypeError("Agent tools must be an iterable of Tool instances.") from exc
 
-        tools_by_name: dict[str, RegisteredTool] = {}
+        tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
         for tool in agent_tools:
             if not isinstance(tool, Tool):
                 raise TypeError("Agent tools must be Tool instances.")
@@ -270,7 +193,7 @@ class CayuApp:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
 
-        self._agents[stored_spec.name] = _RegisteredAgentState(
+        self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
             context_policy=stored_context_policy,
@@ -293,7 +216,7 @@ class CayuApp:
         if provider.name in self._providers:
             raise ValueError(f"Provider already registered: {provider.name}")
 
-        self._providers[provider.name] = RegisteredProvider(
+        self._providers[provider.name] = runtime_records.RegisteredProvider(
             name=provider.name,
             provider=provider,
         )
@@ -316,7 +239,7 @@ class CayuApp:
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
 
-        self._environments[stored_spec.name] = RegisteredEnvironment(
+        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=stored_environment,
         )
@@ -324,17 +247,17 @@ class CayuApp:
             self._default_environment_name = stored_spec.name
         return environment
 
-    def get_agent(self, name: str) -> RegisteredAgent:
+    def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         agent_name = require_clean_nonblank(name, "agent.name")
         registered_agent = self._get_registered_agent(agent_name)
-        return RegisteredAgent(
+        return runtime_records.RegisteredAgent(
             spec=registered_agent.spec.model_copy(deep=True),
             tools={
                 name: _copy_registered_tool(tool) for name, tool in registered_agent.tools.items()
             },
         )
 
-    def _get_registered_agent(self, name: str) -> _RegisteredAgentState:
+    def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
         agent_name = require_clean_nonblank(name, "agent.name")
         try:
             return self._agents[agent_name]
@@ -344,16 +267,18 @@ class CayuApp:
     def get_provider(self, name: str | None = None) -> ModelProvider:
         return self._get_registered_provider(name).provider
 
-    def get_environment(self, name: str | None = None) -> RegisteredEnvironment:
+    def get_environment(self, name: str | None = None) -> runtime_records.RegisteredEnvironment:
         registered_environment = self._get_registered_environment(name)
         if registered_environment is None:
             raise RuntimeError("No environment registered.")
-        return RegisteredEnvironment(
+        return runtime_records.RegisteredEnvironment(
             spec=registered_environment.spec.model_copy(deep=True),
             environment=copy_environment(registered_environment.environment),
         )
 
-    def _get_registered_provider(self, name: str | None = None) -> RegisteredProvider:
+    def _get_registered_provider(
+        self, name: str | None = None
+    ) -> runtime_records.RegisteredProvider:
         if name is not None:
             provider_name = require_clean_nonblank(name, "provider.name")
         else:
@@ -368,7 +293,7 @@ class CayuApp:
     def _get_registered_environment(
         self,
         name: str | None = None,
-    ) -> RegisteredEnvironment | None:
+    ) -> runtime_records.RegisteredEnvironment | None:
         if name is not None:
             environment_name = require_clean_nonblank(name, "environment.name")
         else:
@@ -383,7 +308,7 @@ class CayuApp:
     def _get_registered_environment_for_session(
         self,
         name: str | None,
-    ) -> RegisteredEnvironment | None:
+    ) -> runtime_records.RegisteredEnvironment | None:
         if name is None:
             return None
         return self._get_registered_environment(name)
@@ -405,7 +330,7 @@ class CayuApp:
             ),
         )
         await self.session_store.update_status(session.id, SessionStatus.RUNNING)
-        messages = _initial_messages(
+        messages = transcript_helpers.initial_messages(
             system_prompt=registered_agent.spec.system_prompt,
             request_messages=request.messages,
         )
@@ -508,7 +433,7 @@ class CayuApp:
             loaded_session.environment_name
         )
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-        if _pending_tool_approval_from_checkpoint(checkpoint) is not None:
+        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
             raise RuntimeError(
                 "Session has a pending tool approval. Resolve it with "
                 "resolve_tool_approval(...) before resuming with new messages."
@@ -601,7 +526,7 @@ class CayuApp:
                     raise RuntimeError(
                         "Interrupted session cannot be forked because checkpoint state is missing."
                     )
-                return _checkpoint_for_fork(
+                return approval_support.checkpoint_for_fork(
                     checkpoint=source_checkpoint,
                     agent_name=agent_name,
                     environment_name=environment_name,
@@ -658,7 +583,7 @@ class CayuApp:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-        pending_approval = _pending_tool_approval_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         if pending_approval is None:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
@@ -693,32 +618,32 @@ class CayuApp:
         request: ToolApprovalRequest,
         session: Session,
         pending_approval: PendingToolApproval,
-        registered_agent: _RegisteredAgentState,
-        registered_provider: RegisteredProvider,
-        registered_environment: RegisteredEnvironment | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         emit_resume_event: bool = True,
     ) -> AsyncIterator[Event]:
         environment_name = _environment_name(registered_environment)
         pending_approval_cleared = False
-        tool_outcomes: list[ToolCallOutcome] = []
+        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         try:
             transcript = await self.session_store.load_transcript(session.id)
             approval_events = await self.session_store.load_events(session.id)
-            _validate_approval_retry_decision(
+            approval_support.validate_retry_decision(
                 events=approval_events,
                 approval=pending_approval,
                 decision=request.decision,
             )
-            recorded_outcomes = _recorded_approval_tool_outcomes(
+            recorded_outcomes = approval_support.recorded_tool_outcomes(
                 events=approval_events,
                 approval=pending_approval,
             )
             if emit_resume_event:
                 yield await self._emit(
-                    _tool_approval_resumed_event(
+                    approval_support.resumed_event(
                         session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
                         approval=pending_approval,
                         decision=request.decision,
                     )
@@ -730,21 +655,23 @@ class CayuApp:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
-            for pending_tool_call in _pending_round_tool_calls(pending_approval):
-                tool_call = ToolCallRequest(
+            for pending_tool_call in approval_support.pending_round_tool_calls(pending_approval):
+                tool_call = runtime_records.ToolCallRequest(
                     id=pending_tool_call.tool_call_id,
                     name=pending_tool_call.tool_name,
                     arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
                 )
-                policy_result = _policy_result_from_pending_tool_call(pending_tool_call)
+                policy_result = approval_support.policy_result_from_pending_tool_call(
+                    pending_tool_call
+                )
                 recorded_outcome = recorded_outcomes.get(tool_call.id)
                 if recorded_outcome is not None:
                     tool_outcomes.append(recorded_outcome)
                     continue
 
                 if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
-                    reason = _tool_policy_denial_reason(policy_result)
-                    result = _blocked_tool_result(policy_result, reason=reason)
+                    reason = tool_execution.policy_denial_reason(policy_result)
+                    result = tool_execution.blocked_tool_result(policy_result, reason=reason)
                     async for event, outcome in self._emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
@@ -799,7 +726,7 @@ class CayuApp:
                         policy_result is not None
                         and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
                     )
-                    result = _approval_denied_tool_result(
+                    result = approval_support.approval_denied_tool_result(
                         request,
                         approval=pending_approval,
                         tool_call=tool_call,
@@ -848,7 +775,7 @@ class CayuApp:
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
-            tool_result_messages = _tool_result_messages(tool_outcomes)
+            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
             transcript.extend(tool_result_messages)
             cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(session.id)
             await self.session_store.append_transcript_messages_and_checkpoint(
@@ -858,10 +785,10 @@ class CayuApp:
             )
             pending_approval_cleared = True
             yield await self._emit(
-                _pending_tool_approval_cleared_event(
+                approval_support.cleared_event(
                     session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
                     approval_id=pending_approval.approval_id,
                 )
             )
@@ -882,7 +809,7 @@ class CayuApp:
             ):
                 yield event
         except Exception as exc:
-            if isinstance(exc, _ToolApprovalManualRecoveryRequired):
+            if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self.session_store.update_status(
                     session.id,
                     SessionStatus.INTERRUPTED,
@@ -996,7 +923,7 @@ class CayuApp:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-        pending_approval = _pending_tool_approval_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         if pending_approval is None:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
@@ -1004,7 +931,7 @@ class CayuApp:
                 f"Tool approval id does not match pending approval: {request.approval_id}"
             )
 
-        pending_tool_call = _pending_tool_call_for_recovery(
+        pending_tool_call = approval_support.pending_tool_call_for_recovery(
             approval=pending_approval,
             tool_call_id=request.tool_call_id,
         )
@@ -1018,7 +945,7 @@ class CayuApp:
             from_statuses={SessionStatus.INTERRUPTED},
             to_status=SessionStatus.RUNNING,
         )
-        recovered_result = _recovered_tool_result(
+        recovered_result = approval_support.recovered_tool_result(
             request=request,
         )
         event_type = (
@@ -1029,16 +956,16 @@ class CayuApp:
 
         try:
             events = await self.session_store.load_events(session.id)
-            _validate_tool_approval_recovery_target(
+            approval_support.validate_recovery_target(
                 events=events,
                 approval=pending_approval,
                 tool_call_id=request.tool_call_id,
             )
             recovery_events = [
-                _tool_approval_resumed_event(
+                approval_support.resumed_event(
                     session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
                     approval=pending_approval,
                     decision=ToolApprovalDecision.APPROVE,
                 ),
@@ -1061,7 +988,7 @@ class CayuApp:
             emitted_recovery_events = await self._emit_many(session.id, recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = ToolCallRequest(
+            tool_call = runtime_records.ToolCallRequest(
                 id=pending_tool_call.tool_call_id,
                 name=pending_tool_call.tool_name,
                 arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
@@ -1104,9 +1031,9 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_provider: RegisteredProvider,
-        registered_environment: RegisteredEnvironment | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
@@ -1239,8 +1166,8 @@ class CayuApp:
                     )
                 )
 
-                assistant_parts: list[_AssistantTextPart | ToolCallPart] = []
-                tool_calls: list[ToolCallRequest] = []
+                assistant_parts: list[transcript_helpers.AssistantTextPart | ToolCallPart] = []
+                tool_calls: list[runtime_records.ToolCallRequest] = []
                 provider_state_parts: list[ProviderStatePart] = []
                 model_completed = False
                 async for raw_stream_event in provider.stream(model_request):
@@ -1251,16 +1178,18 @@ class CayuApp:
                         )
 
                     if stream_event.type == ModelStreamEventType.TOOL_CALL:
-                        tool_call = _parse_tool_call(stream_event.payload)
+                        tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
                         tool_calls.append(tool_call)
-                        assistant_parts.append(_tool_call_part(tool_call))
+                        assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
                         continue
 
                     if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-                        _append_assistant_text_delta(assistant_parts, stream_event.delta)
+                        transcript_helpers.append_assistant_text_delta(
+                            assistant_parts, stream_event.delta
+                        )
                     elif stream_event.type == ModelStreamEventType.COMPLETED:
                         model_completed = True
-                        provider_state_parts = _provider_state_parts(
+                        provider_state_parts = transcript_helpers.provider_state_parts(
                             stream_event.payload,
                         )
 
@@ -1279,7 +1208,7 @@ class CayuApp:
                 if not model_completed:
                     raise RuntimeError("Model provider stream ended without a completed event.")
 
-                assistant_message = _assistant_message(
+                assistant_message = transcript_helpers.assistant_message(
                     content_parts=assistant_parts,
                     provider_state_parts=provider_state_parts,
                 )
@@ -1321,7 +1250,7 @@ class CayuApp:
                 policy_results_by_id = {
                     outcome.call.id: outcome.result for outcome in policy_plan.outcomes
                 }
-                tool_outcomes: list[ToolCallOutcome] = []
+                tool_outcomes: list[runtime_records.ToolCallOutcome] = []
                 for tool_call in tool_calls:
                     async for event, outcome in self._execute_tool_call(
                         session=session,
@@ -1336,7 +1265,7 @@ class CayuApp:
                         if outcome is not None:
                             tool_outcomes.append(outcome)
 
-                tool_result_messages = _tool_result_messages(tool_outcomes)
+                tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
                 messages.extend(tool_result_messages)
                 await self.session_store.append_transcript_messages(
                     session.id,
@@ -1460,8 +1389,8 @@ class CayuApp:
         *,
         task_id: str,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
@@ -1478,18 +1407,20 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_calls: list[ToolCallRequest],
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_calls: list[runtime_records.ToolCallRequest],
         request_metadata: dict[str, Any],
         task_id: str | None,
-    ) -> ToolRoundPolicyPlan:
-        policy_outcomes: list[ToolCallPolicyOutcome] = []
+    ) -> runtime_records.ToolRoundPolicyPlan:
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
-        approval_tool_call: ToolCallRequest | None = None
+        approval_tool_call: runtime_records.ToolCallRequest | None = None
         for tool_call in tool_calls:
             if tool_call.name not in registered_agent.tools:
-                policy_outcomes.append(ToolCallPolicyOutcome(call=tool_call, result=None))
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(call=tool_call, result=None)
+                )
                 continue
 
             policy_result = await self._authorize_tool_call(
@@ -1499,7 +1430,9 @@ class CayuApp:
                 tool_call=tool_call,
                 request_metadata=request_metadata,
             )
-            policy_outcomes.append(ToolCallPolicyOutcome(call=tool_call, result=policy_result))
+            policy_outcomes.append(
+                runtime_records.ToolCallPolicyOutcome(call=tool_call, result=policy_result)
+            )
             if (
                 approval_policy_result is None
                 and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
@@ -1508,7 +1441,9 @@ class CayuApp:
                 approval_tool_call = tool_call
 
         if approval_policy_result is None or approval_tool_call is None:
-            return ToolRoundPolicyPlan(outcomes=policy_outcomes, pending_approval=None)
+            return runtime_records.ToolRoundPolicyPlan(
+                outcomes=policy_outcomes, pending_approval=None
+            )
 
         pending_approval = await self._checkpoint_pending_tool_approval(
             session=session,
@@ -1520,7 +1455,7 @@ class CayuApp:
             task_id=task_id,
             policy_result=approval_policy_result,
         )
-        return ToolRoundPolicyPlan(
+        return runtime_records.ToolRoundPolicyPlan(
             outcomes=policy_outcomes,
             pending_approval=pending_approval,
         )
@@ -1529,9 +1464,9 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
     ) -> ToolPolicyResult:
         policy_result = await registered_agent.tool_policy.authorize(
@@ -1546,22 +1481,22 @@ class CayuApp:
                 metadata=request_metadata,
             )
         )
-        return _validate_tool_policy_result(policy_result)
+        return tool_execution.validate_tool_policy_result(policy_result)
 
     async def _execute_tool_call(
         self,
         *,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
         task_id: str | None,
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
         approval_id: str | None = None,
-    ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         if emit_started:
             payload: dict[str, Any] = {
@@ -1625,10 +1560,10 @@ class CayuApp:
                     request_metadata=request_metadata,
                 )
             else:
-                resolved_policy_result = _validate_tool_policy_result(policy_result)
+                resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
             if resolved_policy_result.decision == ToolPolicyDecision.DENY:
-                reason = _tool_policy_denial_reason(resolved_policy_result)
-                result = _blocked_tool_result(resolved_policy_result, reason=reason)
+                reason = tool_execution.policy_denial_reason(resolved_policy_result)
+                result = tool_execution.blocked_tool_result(resolved_policy_result, reason=reason)
                 payload = {
                     "tool_call_id": tool_call.id,
                     "decision": resolved_policy_result.decision.value,
@@ -1689,7 +1624,7 @@ class CayuApp:
                     f"Unsupported tool policy decision: {resolved_policy_result.decision}"
                 )
 
-        result = await _run_tool(
+        result = await tool_execution.run_tool(
             tool=registered_tool.tool,
             ctx=ToolContext(
                 session_id=session.id,
@@ -1700,7 +1635,7 @@ class CayuApp:
                 runner=_runner(registered_environment),
                 vault=_vault(registered_environment),
                 mcp_servers=_mcp_servers(registered_environment),
-                metadata=_tool_context_metadata(
+                metadata=tool_execution.context_metadata(
                     tool_call_id=tool_call.id,
                     approval_id=approval_id,
                 ),
@@ -1738,17 +1673,17 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
-        tool_calls: list[ToolCallRequest],
-        policy_outcomes: list[ToolCallPolicyOutcome] | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
         task_id: str | None,
         policy_result: ToolPolicyResult,
     ) -> tuple[PendingToolApproval, Event]:
         checkpoint = await self.session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        if _pending_tool_approval_from_checkpoint(checkpoint) is not None:
+        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
             raise RuntimeError("Session already has a pending tool approval.")
 
         approval = PendingToolApproval(
@@ -1762,12 +1697,12 @@ class CayuApp:
             task_id=task_id,
             reason=policy_result.reason,
             metadata=copy_json_value(policy_result.metadata, "metadata"),
-            tool_calls=_pending_tool_call_approvals(
+            tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
             ),
         )
-        checkpoint[_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump()
+        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump()
         await self.session_store.checkpoint(session.id, checkpoint)
         return (
             approval,
@@ -1777,7 +1712,7 @@ class CayuApp:
                 agent_name=registered_agent.spec.name,
                 environment_name=_environment_name(registered_environment),
                 payload={
-                    "checkpoint": _PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                    "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
                     "approval_id": approval.approval_id,
                     "tool_call_id": approval.tool_call_id,
                 },
@@ -1790,7 +1725,7 @@ class CayuApp:
     ) -> dict[str, Any]:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        checkpoint.pop(_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
+        checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
         return checkpoint
 
     async def _emit(self, event: Event) -> Event:
@@ -1823,8 +1758,8 @@ class CayuApp:
         event: Event,
         phase: RuntimeHookPhase,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncIterator[Event]:
         terminal_event = await self._emit(event)
         yield terminal_event
@@ -1854,14 +1789,14 @@ class CayuApp:
         *,
         event: Event,
         session: Session,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
-    ) -> AsyncIterator[tuple[Event, ToolCallOutcome | None]]:
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         tool_event = await self._emit(event)
-        outcome = ToolCallOutcome(call=tool_call, result=result)
+        outcome = runtime_records.ToolCallOutcome(call=tool_call, result=result)
         yield tool_event, outcome
         async for hook_event in self._run_tool_call_hooks(
             session=session,
@@ -1879,9 +1814,9 @@ class CayuApp:
         *,
         session: Session,
         tool_event: Event,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
     ) -> AsyncIterator[Event]:
@@ -1915,9 +1850,9 @@ class CayuApp:
         *,
         session: Session,
         tool_event: Event,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
-        tool_call: ToolCallRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
         hooks: tuple[RuntimeHook, ...],
@@ -2005,8 +1940,8 @@ class CayuApp:
         phase: RuntimeHookPhase,
         session: Session,
         terminal_event: Event,
-        registered_agent: _RegisteredAgentState,
-        registered_environment: RegisteredEnvironment | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
         hooks: tuple[RuntimeHook, ...],
         scope: str,
     ) -> AsyncIterator[Event]:
@@ -2110,402 +2045,8 @@ class CayuApp:
         return copied_events
 
 
-def _tool_approval_resumed_event(
-    *,
-    session: Session,
-    registered_agent: _RegisteredAgentState,
-    registered_environment: RegisteredEnvironment | None,
-    approval: PendingToolApproval,
-    decision: ToolApprovalDecision,
-) -> Event:
-    return Event(
-        type=EventType.SESSION_RESUMED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload={
-            "agent_name": registered_agent.spec.name,
-            "approval_id": approval.approval_id,
-            "tool_call_id": approval.tool_call_id,
-            "decision": decision.value,
-        },
-    )
-
-
-def _pending_tool_approval_cleared_event(
-    *,
-    session: Session,
-    registered_agent: _RegisteredAgentState,
-    registered_environment: RegisteredEnvironment | None,
-    approval_id: str,
-) -> Event:
-    return Event(
-        type=EventType.SESSION_CHECKPOINTED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload={
-            "checkpoint": _PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
-            "approval_id": approval_id,
-            "cleared": True,
-        },
-    )
-
-
-def _checkpoint_for_fork(
-    *,
-    checkpoint: dict[str, Any] | None,
-    agent_name: str,
-    environment_name: str | None,
-) -> dict[str, Any] | None:
-    if checkpoint is None:
-        return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-    pending_approval = _pending_tool_approval_from_checkpoint(copied_checkpoint)
-    if pending_approval is None:
-        return copied_checkpoint
-    if pending_approval.agent_name != agent_name:
-        raise ValueError(
-            "Cannot fork a pending tool approval to a different agent: "
-            f"{pending_approval.agent_name} -> {agent_name}"
-        )
-    if pending_approval.environment_name != environment_name:
-        raise ValueError(
-            "Cannot fork a pending tool approval to a different environment: "
-            f"{pending_approval.environment_name} -> {environment_name}"
-        )
-    copied_checkpoint[_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = pending_approval.model_copy(
-        update={"task_id": None}
-    ).model_dump()
-    return copied_checkpoint
-
-
-async def _run_tool(
-    *,
-    tool: Tool,
-    ctx: ToolContext,
-    arguments: dict[str, Any],
-) -> ToolResult:
-    try:
-        result = await tool.run(ctx, arguments)
-        if type(result) is not ToolResult:
-            return ToolResult(
-                content=(
-                    "Tool returned invalid result type: "
-                    f"{type(result).__name__}. Expected ToolResult."
-                ),
-                is_error=True,
-            )
-        return _normalize_tool_result(_validate_tool_result(result))
-    except Exception as exc:
-        return ToolResult(content=_exception_message(exc), is_error=True)
-
-
-def _tool_policy_denial_reason(policy_result: ToolPolicyResult) -> str:
-    return policy_result.reason or "Tool call denied by policy."
-
-
-def _blocked_tool_result(policy_result: ToolPolicyResult, *, reason: str) -> ToolResult:
-    return ToolResult(
-        content=reason,
-        structured={
-            "decision": policy_result.decision.value,
-            "reason": reason,
-            "metadata": policy_result.metadata,
-        },
-        is_error=True,
-    )
-
-
-def _approval_denied_tool_result(
-    request: ToolApprovalRequest,
-    *,
-    approval: PendingToolApproval,
-    tool_call: ToolCallRequest,
-    approval_required: bool,
-) -> ToolResult:
-    if request.reason:
-        reason = request.reason
-        if approval_required:
-            content = f"Tool call denied by approval: {request.reason}"
-        else:
-            content = (
-                "Tool call skipped because approval was denied for the same tool round: "
-                f"{request.reason}"
-            )
-    elif approval_required:
-        reason = "Tool call denied by approval."
-        content = reason
-    else:
-        reason = "Tool call skipped because approval was denied for the same tool round."
-        content = reason
-
-    return ToolResult(
-        content=content,
-        structured={
-            "decision": request.decision.value,
-            "approval_id": approval.approval_id,
-            "tool_call_id": tool_call.id,
-            "tool_name": tool_call.name,
-            "approval_required": approval_required,
-            "denied_by_approval": approval_required,
-            "skipped_due_to_approval_denial": not approval_required,
-            "denied_tool_call_id": approval.tool_call_id,
-            "denied_tool_name": approval.tool_name,
-            "reason": reason,
-            "metadata": request.metadata,
-        },
-        is_error=True,
-    )
-
-
-def _recorded_approval_tool_outcomes(
-    *,
-    events: list[Event],
-    approval: PendingToolApproval,
-) -> dict[str, ToolCallOutcome]:
-    pending_calls = {call.tool_call_id: call for call in _pending_round_tool_calls(approval)}
-    started_ids: set[str] = set()
-    outcomes: dict[str, ToolCallOutcome] = {}
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-
-    for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
-            continue
-
-        tool_call_id = event.payload.get("tool_call_id")
-        if type(tool_call_id) is not str or tool_call_id not in pending_calls:
-            continue
-
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started_ids.add(tool_call_id)
-            continue
-
-        if event.type in terminal_event_types:
-            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
-                event=event,
-                pending_tool_call=pending_calls[tool_call_id],
-            )
-
-    for tool_call_id in started_ids:
-        if tool_call_id not in outcomes:
-            pending_tool_call = pending_calls[tool_call_id]
-            raise _ToolApprovalManualRecoveryRequired(
-                tool_call_id=tool_call_id,
-                tool_name=pending_tool_call.tool_name,
-            )
-
-    return outcomes
-
-
-def _validate_approval_retry_decision(
-    *,
-    events: list[Event],
-    approval: PendingToolApproval,
-    decision: ToolApprovalDecision,
-) -> None:
-    has_denied_result = False
-    has_approved_call = False
-    has_executed_or_recovered_result = False
-
-    for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
-            continue
-        if event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
-            has_denied_result = True
-        elif event.type == EventType.TOOL_CALL_APPROVED:
-            has_approved_call = True
-        elif event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
-            has_executed_or_recovered_result = True
-
-    if decision == ToolApprovalDecision.APPROVE and has_denied_result:
-        raise RuntimeError(
-            "Tool approval was already denied and cannot be retried as approved: "
-            f"{approval.approval_id}"
-        )
-    if decision == ToolApprovalDecision.DENY and (
-        has_approved_call or has_executed_or_recovered_result
-    ):
-        raise RuntimeError(
-            "Tool approval already has approved or executed tool results and "
-            f"cannot be retried as denied: {approval.approval_id}"
-        )
-
-
-def _pending_tool_call_for_recovery(
-    *,
-    approval: PendingToolApproval,
-    tool_call_id: str,
-) -> PendingToolCallApproval:
-    for pending_tool_call in _pending_round_tool_calls(approval):
-        if pending_tool_call.tool_call_id == tool_call_id:
-            return pending_tool_call
-    raise ValueError(f"Tool call is not part of the pending approval: {tool_call_id}")
-
-
-def _validate_tool_approval_recovery_target(
-    *,
-    events: list[Event],
-    approval: PendingToolApproval,
-    tool_call_id: str,
-) -> None:
-    started = False
-    terminal = False
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-    for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
-            continue
-        if event.payload.get("tool_call_id") != tool_call_id:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started = True
-        elif event.type in terminal_event_types:
-            terminal = True
-
-    if terminal:
-        raise RuntimeError(
-            f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
-        )
-    if not started:
-        raise RuntimeError(
-            f"Tool approval recovery requires a recorded tool.call.started event: {tool_call_id}"
-        )
-
-
-def _recovered_tool_result(
-    *,
-    request: ToolApprovalRecoveryRequest,
-) -> ToolResult:
-    if request.outcome not in {
-        ToolApprovalRecoveryOutcome.COMPLETED,
-        ToolApprovalRecoveryOutcome.FAILED,
-    }:
-        raise ValueError(f"Unsupported tool approval recovery outcome: {request.outcome}")
-    return ToolResult(
-        content=request.message,
-        structured=request.structured,
-        artifacts=request.artifacts,
-        is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
-    )
-
-
-def _tool_context_metadata(
-    *,
-    tool_call_id: str,
-    approval_id: str | None,
-) -> dict[str, str]:
-    metadata = {"tool_call_id": tool_call_id}
-    if approval_id is not None:
-        metadata["approval_id"] = approval_id
-    return metadata
-
-
-def _tool_call_outcome_from_terminal_event(
-    *,
-    event: Event,
-    pending_tool_call: PendingToolCallApproval,
-) -> ToolCallOutcome:
-    result_payload = event.payload.get("result")
-    if type(result_payload) is not dict:
-        raise ValueError(
-            f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
-        )
-    result = _normalize_tool_result(_validate_tool_result(ToolResult(**result_payload)))
-    return ToolCallOutcome(
-        call=ToolCallRequest(
-            id=pending_tool_call.tool_call_id,
-            name=pending_tool_call.tool_name,
-            arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-        ),
-        result=result,
-    )
-
-
-def _validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
-    if type(result) is not ToolPolicyResult:
-        raise TypeError(
-            "Tool policies must return ToolPolicyResult instances. "
-            f"Received {type(result).__name__}."
-        )
-    return ToolPolicyResult(
-        decision=result.decision,
-        reason=result.reason,
-        metadata=copy_json_value(result.metadata, "metadata"),
-    )
-
-
-def _pending_tool_approval_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-) -> PendingToolApproval | None:
-    if checkpoint is None:
-        return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-    value = copied_checkpoint.get(_PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
-    if value is None:
-        return None
-    if type(value) is not dict:
-        raise ValueError("Pending tool approval checkpoint must be an object.")
-    return PendingToolApproval(**value)
-
-
-def _pending_tool_call_approvals(
-    *,
-    tool_calls: list[ToolCallRequest],
-    policy_outcomes: list[ToolCallPolicyOutcome] | None,
-) -> list[PendingToolCallApproval]:
-    policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
-    if policy_outcomes is not None:
-        policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_outcomes}
-    pending_approvals: list[PendingToolCallApproval] = []
-    for tool_call in tool_calls:
-        policy_result = policy_results_by_id.get(tool_call.id)
-        pending_approvals.append(
-            PendingToolCallApproval(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-                arguments=copy_json_value(tool_call.arguments, "arguments"),
-                policy_decision=policy_result.decision.value if policy_result is not None else None,
-                reason=policy_result.reason if policy_result is not None else None,
-                metadata=(
-                    copy_json_value(policy_result.metadata, "metadata")
-                    if policy_result is not None
-                    else {}
-                ),
-            )
-        )
-    return pending_approvals
-
-
-def _pending_round_tool_calls(
-    approval: PendingToolApproval,
-) -> list[PendingToolCallApproval]:
-    return [PendingToolCallApproval(**call.model_dump()) for call in approval.tool_calls]
-
-
-def _policy_result_from_pending_tool_call(
-    pending_tool_call: PendingToolCallApproval,
-) -> ToolPolicyResult | None:
-    if pending_tool_call.policy_decision is None:
-        return None
-    return ToolPolicyResult(
-        decision=ToolPolicyDecision(pending_tool_call.policy_decision),
-        reason=pending_tool_call.reason,
-        metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
-    )
-
-
-def _copy_registered_tool(tool: RegisteredTool) -> RegisteredTool:
-    return RegisteredTool(
+def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_records.RegisteredTool:
+    return runtime_records.RegisteredTool(
         name=tool.name,
         description=tool.description,
         schema=deepcopy(tool.schema),
@@ -2513,7 +2054,7 @@ def _copy_registered_tool(tool: RegisteredTool) -> RegisteredTool:
     )
 
 
-def _validate_registered_tool(tool: Tool) -> RegisteredTool:
+def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
@@ -2523,7 +2064,7 @@ def _validate_registered_tool(tool: Tool) -> RegisteredTool:
         description=spec.description,
         input_schema=copy_json_value(spec.input_schema, "input_schema"),
     )
-    return RegisteredTool(
+    return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,
         schema=validated_spec.input_schema,
@@ -2589,7 +2130,7 @@ def _runtime_version() -> str | None:
 
 def _session_agent_spec(
     *,
-    registered_agent: _RegisteredAgentState,
+    registered_agent: runtime_records.RegisteredAgentState,
     session: Session,
 ) -> AgentSpec:
     return AgentSpec(
@@ -2655,7 +2196,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
 
 
 def _environment_name(
-    registered_environment: RegisteredEnvironment | None,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> str | None:
     if registered_environment is None:
         return None
@@ -2666,7 +2207,7 @@ def _context_compaction_telemetry_event(
     *,
     telemetry: ContextCompactionTelemetry,
     session: Session,
-    registered_agent: _RegisteredAgentState,
+    registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
 ) -> Event:
     if type(telemetry) is not ContextCompactionTelemetry:
@@ -2730,8 +2271,8 @@ def _runtime_hook_event(
     scope: str,
     phase: RuntimeHookPhase,
     session: Session,
-    registered_agent: _RegisteredAgentState,
-    registered_environment: RegisteredEnvironment | None,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
     terminal_event: Event,
     payload: dict[str, Any],
 ) -> Event:
@@ -2757,8 +2298,8 @@ def _task_event(
     event_type: EventType,
     task: Task,
     session: Session,
-    registered_agent: _RegisteredAgentState,
-    registered_environment: RegisteredEnvironment | None,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Event:
     return Event(
         type=event_type,
@@ -2776,7 +2317,9 @@ def _task_event(
     )
 
 
-def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str | None:
+def _workspace_id(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> str | None:
     if registered_environment is None or registered_environment.environment.workspace is None:
         return None
     workspace_id = getattr(registered_environment.environment.workspace, "id", None)
@@ -2785,54 +2328,30 @@ def _workspace_id(registered_environment: RegisteredEnvironment | None) -> str |
     return require_clean_nonblank(workspace_id, "workspace.id")
 
 
-def _workspace(registered_environment: RegisteredEnvironment | None) -> Any:
+def _workspace(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
     if registered_environment is None:
         return None
     return registered_environment.environment.workspace
 
 
-def _runner(registered_environment: RegisteredEnvironment | None) -> Any:
+def _runner(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
     if registered_environment is None:
         return None
     return registered_environment.environment.runner
 
 
-def _vault(registered_environment: RegisteredEnvironment | None) -> Any:
+def _vault(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
     if registered_environment is None:
         return None
     return registered_environment.environment.vault
 
 
 def _mcp_servers(
-    registered_environment: RegisteredEnvironment | None,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> tuple[Any, ...]:
     if registered_environment is None:
         return ()
     return registered_environment.environment.mcp_servers
-
-
-def _normalize_tool_result(result: ToolResult) -> ToolResult:
-    if result.is_error and not result.content.strip():
-        return result.model_copy(update={"content": "Tool returned an error without details."})
-    return result
-
-
-def _validate_tool_result(result: ToolResult) -> ToolResult:
-    if type(result) is not ToolResult:
-        raise TypeError("Tool results must be ToolResult instances.")
-    return ToolResult(
-        content=result.content,
-        structured=copy_json_value(result.structured, "structured"),
-        artifacts=copy_json_value(result.artifacts, "artifacts"),
-        is_error=result.is_error,
-    )
-
-
-def _exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: tool execution failed"
 
 
 def _validate_stream_event(value: object) -> ModelStreamEvent:
@@ -2845,7 +2364,7 @@ def _model_stream_event_to_runtime_event(
     stream_event: ModelStreamEvent,
     *,
     session: Session,
-    registered_agent: _RegisteredAgentState,
+    registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
@@ -2864,7 +2383,7 @@ def _model_stream_event_to_runtime_event(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
-            payload=_model_completed_event_payload(stream_event.payload),
+            payload=transcript_helpers.model_completed_event_payload(stream_event.payload),
         )
     if stream_event.type == ModelStreamEventType.ERROR:
         return Event(
@@ -2875,34 +2394,6 @@ def _model_stream_event_to_runtime_event(
             payload=copy_json_value(stream_event.payload, "payload"),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
-
-
-def _require_payload_string(payload: dict[str, Any], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Model tool call payload requires non-empty string `{key}`.")
-    return value
-
-
-def _require_payload_dict(payload: dict[str, Any], key: str) -> dict[str, Any]:
-    value = payload.get(key)
-    if type(value) is not dict:
-        raise ValueError(f"Model tool call payload requires object `{key}`.")
-    return value
-
-
-def _parse_tool_call(payload: dict[str, Any]) -> ToolCallRequest:
-    return ToolCallRequest(
-        id=_optional_payload_string(payload, "id") or str(uuid4()),
-        name=_require_payload_string(payload, "name"),
-        arguments=copy_json_value(_require_payload_dict(payload, "arguments"), "arguments"),
-    )
-
-
-def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
-    if key not in payload or payload[key] is None:
-        return None
-    return _require_payload_string(payload, key)
 
 
 def _validate_dispatch_handle_for_request(
@@ -2942,108 +2433,3 @@ def _validate_runtime_hooks(
             raise TypeError(f"{field_name} must contain RuntimeHook instances.")
         require_clean_nonblank(hook.name, "runtime_hook.name")
     return tuple(hook_list)
-
-
-def _initial_messages(
-    *,
-    system_prompt: str | None,
-    request_messages: list[Message],
-) -> list[Message]:
-    messages: list[Message] = []
-    if system_prompt and system_prompt.strip():
-        messages.append(Message.text("system", system_prompt))
-    messages.extend(message.model_copy(deep=True) for message in request_messages)
-    return messages
-
-
-def _assistant_message(
-    *,
-    content_parts: list[_AssistantTextPart | ToolCallPart],
-    provider_state_parts: list[ProviderStatePart],
-) -> Message | None:
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = []
-    for part in content_parts:
-        if type(part) is _AssistantTextPart:
-            if part.text.strip():
-                content.append(TextPart(text=part.text))
-            continue
-        if type(part) is ToolCallPart:
-            content.append(copy_message_part(part))
-            continue
-        raise TypeError("Assistant content must contain text buffers or tool calls.")
-    content.extend(provider_state_parts)
-    if not content:
-        return None
-    return Message(role=MessageRole.ASSISTANT, content=content)
-
-
-def _append_assistant_text_delta(
-    content_parts: list[_AssistantTextPart | ToolCallPart],
-    delta: str,
-) -> None:
-    if not delta:
-        return
-    if content_parts and type(content_parts[-1]) is _AssistantTextPart:
-        previous = content_parts[-1]
-        previous.text = f"{previous.text}{delta}"
-        return
-    content_parts.append(_AssistantTextPart(text=delta))
-
-
-def _tool_call_part(tool_call: ToolCallRequest) -> ToolCallPart:
-    return ToolCallPart(
-        tool_call_id=tool_call.id,
-        tool_name=tool_call.name,
-        arguments=deepcopy(tool_call.arguments),
-    )
-
-
-def _provider_state_parts(payload: dict[str, Any]) -> list[ProviderStatePart]:
-    raw_parts = payload.get("provider_state", [])
-    if raw_parts is None:
-        return []
-    if type(raw_parts) is not list:
-        raise ValueError("Model completed payload provider_state must be a list.")
-    parts: list[ProviderStatePart] = []
-    for index, raw_part in enumerate(raw_parts):
-        if type(raw_part) is not dict:
-            raise ValueError(f"Model completed payload provider_state[{index}] must be an object.")
-        raw_part = cast("dict[str, Any]", raw_part)
-        provider = raw_part.get("provider")
-        state = raw_part.get("state")
-        if type(provider) is not str:
-            raise ValueError(
-                f"Model completed payload provider_state[{index}].provider must be a string."
-            )
-        if type(state) is not dict:
-            raise ValueError(
-                f"Model completed payload provider_state[{index}].state must be an object."
-            )
-        parts.append(ProviderStatePart(provider=provider, state=state))
-    return parts
-
-
-def _model_completed_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    copied = copy_json_value(payload, "payload")
-    if type(copied) is not dict:
-        raise ValueError("Model completed payload must be an object.")
-    copied.pop("provider_state", None)
-    return copied
-
-
-def _tool_result_messages(outcomes: list[ToolCallOutcome]) -> list[Message]:
-    return [
-        Message.tool_result(
-            results=[
-                ToolResultPart(
-                    tool_call_id=outcome.call.id,
-                    tool_name=outcome.call.name,
-                    content=outcome.result.content,
-                    structured=deepcopy(outcome.result.structured),
-                    artifacts=deepcopy(outcome.result.artifacts),
-                    is_error=outcome.result.is_error,
-                )
-                for outcome in outcomes
-            ],
-        )
-    ]

@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
-      - run: uv sync --frozen --extra dev --python 3.11
+      - run: uv sync --frozen --extra dev --extra server --python 3.11
       - run: uv run ty check src/cayu examples
 
   test:
