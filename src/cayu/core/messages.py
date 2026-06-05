@@ -137,6 +137,7 @@ class Message(BaseModel):
         arguments: dict[str, Any] | None = None,
         calls: list[ToolCallPart] | None = None,
     ) -> Message:
+        content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart]
         if calls is not None:
             if tool_call_id is not None or tool_name is not None or arguments is not None:
                 raise ValueError(
@@ -144,7 +145,7 @@ class Message(BaseModel):
                 )
             if not calls:
                 raise ValueError("`calls` cannot be empty.")
-            content = calls
+            content = list(calls)
         else:
             content = [
                 ToolCallPart(
@@ -170,6 +171,7 @@ class Message(BaseModel):
         is_error: bool = False,
         results: list[ToolResultPart] | None = None,
     ) -> Message:
+        result_parts: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart]
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
         if not isinstance(is_error, bool):
@@ -186,7 +188,7 @@ class Message(BaseModel):
                 raise ValueError("`results` cannot be combined with scalar result fields.")
             if not results:
                 raise ValueError("`results` cannot be empty.")
-            result_parts = results
+            result_parts = list(results)
         else:
             result_parts = [
                 ToolResultPart(

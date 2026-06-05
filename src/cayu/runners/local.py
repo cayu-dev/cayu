@@ -54,33 +54,52 @@ class LocalRunner(Runner):
         timeout = _validate_timeout(timeout_s)
         standard_input = _validate_stdin(stdin)
         output_limit = _validate_output_limit(output_limit_bytes)
-        process_options = _subprocess_options()
 
         try:
             if command.kind == "process":
                 if command.argv is None:
                     raise ValueError("Process commands require argv.")
-                process = await asyncio.create_subprocess_exec(
-                    *command.argv,
-                    cwd=str(working_dir),
-                    env=environment,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **process_options,
-                )
+                if os.name == "posix":
+                    process = await asyncio.create_subprocess_exec(
+                        *command.argv,
+                        cwd=str(working_dir),
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                else:
+                    process = await asyncio.create_subprocess_exec(
+                        *command.argv,
+                        cwd=str(working_dir),
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
             else:
                 if command.shell is None:
                     raise ValueError("Shell commands require a script.")
-                process = await asyncio.create_subprocess_shell(
-                    command.shell,
-                    cwd=str(working_dir),
-                    env=environment,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **process_options,
-                )
+                if os.name == "posix":
+                    process = await asyncio.create_subprocess_shell(
+                        command.shell,
+                        cwd=str(working_dir),
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                else:
+                    process = await asyncio.create_subprocess_shell(
+                        command.shell,
+                        cwd=str(working_dir),
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
         except FileNotFoundError:
             command_name = command.argv[0] if command.argv else command.kind
             return ExecResult(
@@ -171,12 +190,6 @@ def _copy_env(env: dict[str, str] | None, *, inherit_env: bool) -> dict[str, str
             raise ValueError("Runner env values must be strings.")
         copied[key] = value
     return copied
-
-
-def _subprocess_options() -> dict[str, bool]:
-    if os.name == "posix":
-        return {"start_new_session": True}
-    return {}
 
 
 def _kill_process(process: asyncio.subprocess.Process) -> None:

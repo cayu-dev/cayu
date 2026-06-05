@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 import certifi
@@ -227,6 +227,7 @@ def anthropic_response_events(
     for index, block in enumerate(content):
         if not isinstance(block, Mapping):
             raise AnthropicProtocolError(f"Anthropic content block {index} must be an object.")
+        block = cast("Mapping[str, Any]", block)
         block_type = block.get("type")
         if block_type == "text":
             text = block.get("text")

@@ -387,22 +387,20 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
 
 def _task_from_create(request: TaskCreate) -> Task:
     now = datetime.now(UTC)
-    values = {
-        "type": request.type,
-        "title": request.title,
-        "description": request.description,
-        "status": TaskStatus.PENDING,
-        "session_id": request.session_id,
-        "parent_task_id": request.parent_task_id,
-        "assigned_agent_name": request.assigned_agent_name,
-        "input": copy_json_object(request.input, "input"),
-        "metadata": copy_json_object(request.metadata, "metadata"),
-        "created_at": now,
-        "updated_at": now,
-    }
-    if request.task_id is not None:
-        values["id"] = request.task_id
-    return Task(**values)
+    return Task(
+        id=request.task_id if request.task_id is not None else str(uuid4()),
+        type=request.type,
+        title=request.title,
+        description=request.description,
+        status=TaskStatus.PENDING,
+        session_id=request.session_id,
+        parent_task_id=request.parent_task_id,
+        assigned_agent_name=request.assigned_agent_name,
+        input=copy_json_object(request.input, "input"),
+        metadata=copy_json_object(request.metadata, "metadata"),
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:

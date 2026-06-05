@@ -670,7 +670,8 @@ def validate_context_messages(messages: list[Message]) -> None:
                     "Context messages contain assistant tool calls that are not "
                     "followed by matching tool results."
                 )
-            result_ids = [part.tool_call_id for part in message.content]
+            result_parts = [part for part in message.content if type(part) is ToolResultPart]
+            result_ids = [part.tool_call_id for part in result_parts]
             if len(result_ids) != len(set(result_ids)):
                 raise ValueError("Context messages contain duplicate tool result ids.")
             if set(result_ids) != pending_tool_call_ids:

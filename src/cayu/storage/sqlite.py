@@ -6,6 +6,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from cayu._validation import (
     copy_json_object,
@@ -1108,21 +1109,19 @@ def _has_user_tables(connection: sqlite3.Connection) -> bool:
 
 def _session_from_request(request: RunRequest, *, identity: SessionIdentity) -> Session:
     now = datetime.now(UTC)
-    values = {
-        "agent_name": request.agent_name,
-        "provider_name": identity.provider_name,
-        "model": identity.model,
-        "runtime_name": identity.runtime_name,
-        "runtime_version": identity.runtime_version,
-        "environment_name": request.environment_name,
-        "status": SessionStatus.PENDING,
-        "created_at": now,
-        "updated_at": now,
-        "metadata": copy_json_value(request.metadata, "metadata"),
-    }
-    if request.session_id is not None:
-        values["id"] = request.session_id
-    return Session(**values)
+    return Session(
+        id=request.session_id if request.session_id is not None else str(uuid4()),
+        agent_name=request.agent_name,
+        provider_name=identity.provider_name,
+        model=identity.model,
+        runtime_name=identity.runtime_name,
+        runtime_version=identity.runtime_version,
+        environment_name=request.environment_name,
+        status=SessionStatus.PENDING,
+        created_at=now,
+        updated_at=now,
+        metadata=copy_json_value(request.metadata, "metadata"),
+    )
 
 
 def _session_to_row_values(session: Session) -> tuple[object, ...]:

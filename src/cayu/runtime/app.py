@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
@@ -2466,32 +2466,24 @@ def _pending_tool_call_approvals(
     policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
     if policy_outcomes is not None:
         policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_outcomes}
-    return [
-        PendingToolCallApproval(
-            tool_call_id=tool_call.id,
-            tool_name=tool_call.name,
-            arguments=copy_json_value(tool_call.arguments, "arguments"),
-            policy_decision=(
-                policy_results_by_id[tool_call.id].decision.value
-                if tool_call.id in policy_results_by_id
-                and policy_results_by_id[tool_call.id] is not None
-                else None
-            ),
-            reason=(
-                policy_results_by_id[tool_call.id].reason
-                if tool_call.id in policy_results_by_id
-                and policy_results_by_id[tool_call.id] is not None
-                else None
-            ),
-            metadata=(
-                copy_json_value(policy_results_by_id[tool_call.id].metadata, "metadata")
-                if tool_call.id in policy_results_by_id
-                and policy_results_by_id[tool_call.id] is not None
-                else {}
-            ),
+    pending_approvals: list[PendingToolCallApproval] = []
+    for tool_call in tool_calls:
+        policy_result = policy_results_by_id.get(tool_call.id)
+        pending_approvals.append(
+            PendingToolCallApproval(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments=copy_json_value(tool_call.arguments, "arguments"),
+                policy_decision=policy_result.decision.value if policy_result is not None else None,
+                reason=policy_result.reason if policy_result is not None else None,
+                metadata=(
+                    copy_json_value(policy_result.metadata, "metadata")
+                    if policy_result is not None
+                    else {}
+                ),
+            )
         )
-        for tool_call in tool_calls
-    ]
+    return pending_approvals
 
 
 def _pending_round_tool_calls(
@@ -2844,6 +2836,8 @@ def _exception_message(exc: Exception) -> str:
 
 
 def _validate_stream_event(value: object) -> ModelStreamEvent:
+    if type(value) is not ModelStreamEvent:
+        raise TypeError("Model providers must yield ModelStreamEvent instances.")
     return copy_model_stream_event(value)
 
 
@@ -3014,8 +3008,17 @@ def _provider_state_parts(payload: dict[str, Any]) -> list[ProviderStatePart]:
     for index, raw_part in enumerate(raw_parts):
         if type(raw_part) is not dict:
             raise ValueError(f"Model completed payload provider_state[{index}] must be an object.")
+        raw_part = cast("dict[str, Any]", raw_part)
         provider = raw_part.get("provider")
         state = raw_part.get("state")
+        if type(provider) is not str:
+            raise ValueError(
+                f"Model completed payload provider_state[{index}].provider must be a string."
+            )
+        if type(state) is not dict:
+            raise ValueError(
+                f"Model completed payload provider_state[{index}].state must be an object."
+            )
         parts.append(ProviderStatePart(provider=provider, state=state))
     return parts
 

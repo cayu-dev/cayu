@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 import certifi
@@ -202,15 +202,26 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
         raise OpenAIProtocolError("OpenAI response output must be a list.")
 
     events: list[ModelStreamEvent] = []
+    provider_state_items: list[dict[str, Any]] = []
     for index, item in enumerate(output):
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(f"OpenAI output item {index} must be an object.")
+        item = cast("Mapping[str, Any]", item)
         item_type = item.get("type")
         if item_type == "message":
             events.extend(_message_output_events(item, index))
+            provider_state_items.append(
+                {"provider": "openai", "state": copy_json_value(item, "output_item")}
+            )
         elif item_type == "function_call":
             events.append(_function_call_event(item, index))
+            provider_state_items.append(
+                {"provider": "openai", "state": copy_json_value(item, "output_item")}
+            )
         elif item_type == "reasoning":
+            provider_state_items.append(
+                {"provider": "openai", "state": copy_json_value(item, "output_item")}
+            )
             continue
         else:
             raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
@@ -221,12 +232,7 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
                 "id": _optional_string(response, "id"),
                 "model": _optional_string(response, "model"),
                 "status": _optional_string(response, "status"),
-                "provider_state": [
-                    {"provider": "openai", "state": copy_json_value(item, "output_item")}
-                    for item in output
-                    if isinstance(item, Mapping)
-                    and item.get("type") in {"reasoning", "message", "function_call"}
-                ],
+                "provider_state": provider_state_items,
                 "usage": copy_json_value(response.get("usage"), "usage"),
                 "incomplete_details": copy_json_value(
                     response.get("incomplete_details"),
@@ -258,6 +264,7 @@ def _message_output_events(
             raise OpenAIProtocolError(
                 f"OpenAI message output content {item_index}.{content_index} must be an object."
             )
+        part = cast("Mapping[str, Any]", part)
         part_type = part.get("type")
         if part_type != "output_text":
             raise OpenAIProtocolError(

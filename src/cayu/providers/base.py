@@ -66,6 +66,8 @@ class ModelStreamEvent(BaseModel):
     def validate_type(cls, value: object) -> ModelStreamEventType:
         if isinstance(value, ModelStreamEventType):
             return value
+        if not isinstance(value, str):
+            raise ValueError("`type` must be a string.")
         return ModelStreamEventType(require_clean_nonblank(value, "type"))
 
     @classmethod
@@ -128,5 +130,5 @@ class ModelProvider(ABC):
     name: str
 
     @abstractmethod
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Stream model events for one request."""

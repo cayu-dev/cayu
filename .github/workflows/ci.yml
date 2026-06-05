@@ -35,7 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --python 3.11
-      - run: uv run ty check --exit-zero
+      - run: uv run ty check src/cayu examples
 
   test:
     name: Test (Python ${{ matrix.python-version }})
