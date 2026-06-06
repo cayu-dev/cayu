@@ -8,12 +8,22 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts import (
+    DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
+    DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
+    DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
+    RESOLVED_FILE_ATTACHMENTS_OPTION,
+    FileAttachment,
+    file_attachment_from_payload,
+    resolved_file_attachment,
+)
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
     ProviderStatePart,
     ToolCallPart,
+    ToolResultPart,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
@@ -112,6 +122,9 @@ class CayuApp:
         dispatcher: Dispatcher | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
+        max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
+        max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
+        max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
@@ -132,6 +145,18 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
+        self._max_file_attachment_bytes = _validate_positive_int(
+            max_file_attachment_bytes,
+            "max_file_attachment_bytes",
+        )
+        self._max_total_file_attachment_bytes = _validate_positive_int(
+            max_total_file_attachment_bytes,
+            "max_total_file_attachment_bytes",
+        )
+        self._max_file_attachments_per_request = _validate_positive_int(
+            max_file_attachments_per_request,
+            "max_file_attachments_per_request",
+        )
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
@@ -1149,6 +1174,16 @@ class CayuApp:
                             else {}
                         ),
                         "step": step,
+                        RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
+                            messages=context_messages,
+                            session=session,
+                            registered_environment=registered_environment,
+                            max_file_attachment_bytes=self._max_file_attachment_bytes,
+                            max_total_file_attachment_bytes=(self._max_total_file_attachment_bytes),
+                            max_file_attachments_per_request=(
+                                self._max_file_attachments_per_request
+                            ),
+                        ),
                     },
                 )
 
@@ -1631,7 +1666,9 @@ class CayuApp:
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 workspace_id=_workspace_id(registered_environment),
+                artifact_store_id=_artifact_store_id(registered_environment),
                 workspace=_workspace(registered_environment),
+                artifact_store=_artifact_store(registered_environment),
                 runner=_runner(registered_environment),
                 vault=_vault(registered_environment),
                 mcp_servers=_mcp_servers(registered_environment),
@@ -2054,6 +2091,14 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
     )
 
 
+def _validate_positive_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+    return value
+
+
 def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
@@ -2332,6 +2377,101 @@ def _workspace(registered_environment: runtime_records.RegisteredEnvironment | N
     if registered_environment is None:
         return None
     return registered_environment.environment.workspace
+
+
+def _artifact_store_id(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> str | None:
+    if registered_environment is None or registered_environment.environment.artifact_store is None:
+        return None
+    artifact_store_id = getattr(registered_environment.environment.artifact_store, "id", None)
+    if artifact_store_id is None:
+        return None
+    return require_clean_nonblank(artifact_store_id, "artifact_store.id")
+
+
+def _artifact_store(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.artifact_store
+
+
+async def _resolved_file_attachments(
+    *,
+    messages: list[Message],
+    session: Session,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    max_file_attachment_bytes: int,
+    max_total_file_attachment_bytes: int,
+    max_file_attachments_per_request: int,
+) -> dict[str, dict[str, Any]]:
+    attachment_refs = _file_attachment_refs(messages)
+    if not attachment_refs:
+        return {}
+    if len(attachment_refs) > max_file_attachments_per_request:
+        raise RuntimeError(
+            "File attachment count exceeds the runtime attachment limit: "
+            f"{len(attachment_refs)} > {max_file_attachments_per_request}"
+        )
+    artifact_store = _artifact_store(registered_environment)
+    if artifact_store is None:
+        raise RuntimeError("File attachments require an artifact store.")
+
+    environment_name = _environment_name(registered_environment)
+    resolved: dict[str, dict[str, Any]] = {}
+    total_attachment_bytes = 0
+    for attachment in attachment_refs:
+        if attachment.size_bytes > max_file_attachment_bytes:
+            raise RuntimeError(
+                "File attachment exceeds the runtime attachment byte limit: "
+                f"{attachment.artifact_id}"
+            )
+        total_attachment_bytes += attachment.size_bytes
+        if total_attachment_bytes > max_total_file_attachment_bytes:
+            raise RuntimeError("File attachments exceed the runtime total attachment byte limit.")
+        if attachment.artifact_id in resolved:
+            continue
+        result = await artifact_store.read_bytes(
+            attachment.artifact_id,
+            max_bytes=attachment.size_bytes,
+        )
+        artifact = result.metadata
+        if artifact.scope.value == "session" and artifact.session_id != session.id:
+            raise RuntimeError("File attachment is not available in this session.")
+        if artifact.scope.value == "environment" and artifact.environment_name != environment_name:
+            raise RuntimeError("File attachment is not available in this environment.")
+        if artifact.content_type != attachment.content_type:
+            raise RuntimeError("File attachment content type changed before provider request.")
+        if artifact.size_bytes != attachment.size_bytes:
+            raise RuntimeError("File attachment size changed before provider request.")
+        resolved[attachment.artifact_id] = resolved_file_attachment(attachment, result)
+    return resolved
+
+
+def _file_attachment_refs(messages: list[Message]) -> tuple[FileAttachment, ...]:
+    refs: dict[str, FileAttachment] = {}
+    ordered_refs: list[FileAttachment] = []
+    for message in messages:
+        for part in message.content:
+            if type(part) is not ToolResultPart:
+                continue
+            for payload in part.artifacts:
+                attachment = file_attachment_from_payload(payload)
+                if attachment is None:
+                    continue
+                existing = refs.get(attachment.artifact_id)
+                if existing is not None and not _same_file_attachment_ref(existing, attachment):
+                    raise RuntimeError(
+                        "Conflicting file attachment references for artifact: "
+                        f"{attachment.artifact_id}"
+                    )
+                refs[attachment.artifact_id] = attachment
+                ordered_refs.append(attachment)
+    return tuple(ordered_refs)
+
+
+def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bool:
+    return left.model_dump(mode="json") == right.model_dump(mode="json")
 
 
 def _runner(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:

@@ -165,7 +165,9 @@ class ToolContext(BaseModel):
     agent_name: str | None = None
     environment_name: str | None = None
     workspace_id: str | None = None
+    artifact_store_id: str | None = None
     workspace: Any = Field(default=None, exclude=True)
+    artifact_store: Any = Field(default=None, exclude=True)
     runner: Any = Field(default=None, exclude=True)
     vault: Any = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
@@ -181,7 +183,7 @@ class ToolContext(BaseModel):
     def validate_nonblank_session_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("agent_name", "environment_name", "workspace_id")
+    @field_validator("agent_name", "environment_name", "workspace_id", "artifact_store_id")
     @classmethod
     def validate_optional_nonblank_ids(
         cls,

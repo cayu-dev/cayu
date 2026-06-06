@@ -23,6 +23,7 @@ from cayu.runtime.context import (
     RecentTurnsContextPolicy,
     TranscriptDigestCompactor,
     default_compaction_prompt,
+    strip_old_file_attachments,
     trim_context_messages,
     trim_context_turns,
 )
@@ -139,6 +140,7 @@ __all__ = [
     "copy_dispatch_handle",
     "copy_dispatch_request",
     "default_compaction_prompt",
+    "strip_old_file_attachments",
     "trim_context_messages",
     "trim_context_turns",
 ]

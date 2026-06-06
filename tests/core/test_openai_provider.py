@@ -6,7 +6,15 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu import (
+    RESOLVED_FILE_ATTACHMENTS_OPTION,
+    AgentSpec,
+    CayuApp,
+    FileAttachmentKind,
+    Message,
+    RunRequest,
+    file_attachment,
+)
 from cayu.core.messages import ProviderStatePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
@@ -159,6 +167,67 @@ def test_build_openai_payload_translates_cayu_messages() -> None:
         ],
         "store": False,
         "temperature": 0.2,
+    }
+
+
+def test_build_openai_payload_translates_file_attachments() -> None:
+    attachment = file_attachment(
+        artifact_id="art_pdf",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="invoice.pdf",
+        content_type="application/pdf",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "Read the invoice."),
+            Message.tool_call(
+                tool_call_id="call_1",
+                tool_name="read_file",
+                arguments={"artifact_id": "art_pdf"},
+            ),
+            Message.tool_result(
+                tool_call_id="call_1",
+                tool_name="read_file",
+                content="Attached PDF artifact art_pdf: invoice.pdf.",
+                artifacts=[attachment],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_pdf": {
+                    "artifact_id": "art_pdf",
+                    "kind": "document",
+                    "filename": "invoice.pdf",
+                    "content_type": "application/pdf",
+                    "data_base64": "aGVsbG8=",
+                    "metadata": {},
+                }
+            }
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["input"][2] == {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "Attached PDF artifact art_pdf: invoice.pdf.",
+    }
+    assert payload["input"][3] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "The previous tool result returned file content for inspection.",
+            },
+            {
+                "type": "input_file",
+                "filename": "invoice.pdf",
+                "file_data": "data:application/pdf;base64,aGVsbG8=",
+            },
+        ],
     }
 
 

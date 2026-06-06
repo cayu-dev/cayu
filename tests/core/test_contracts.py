@@ -9,6 +9,18 @@ from pydantic import SecretStr, TypeAdapter, ValidationError
 
 import cayu.runners.local as local_runner_module
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts import (
+    ArtifactListResult,
+    ArtifactMetadata,
+    ArtifactReadResult,
+    ArtifactScope,
+    FileAttachment,
+    FileAttachmentKind,
+    LocalArtifactStore,
+    ResolvedFileAttachment,
+    file_attachment,
+    file_attachment_from_payload,
+)
 from cayu.core import (
     AgentSpec,
     Event,
@@ -863,6 +875,7 @@ def test_environment_spec_accepts_name_and_metadata():
     assert environment.spec.name == "local"
     assert environment.spec.metadata == {"nested": {"value": "original"}}
     assert environment.workspace is None
+    assert environment.artifact_store is None
     assert environment.runner is None
     assert environment.vault is None
     assert environment.mcp_servers == ()
@@ -1901,6 +1914,261 @@ def test_local_workspace_reads_writes_and_lists_files(tmp_path):
     assert list_result.paths == ("notes/todo.txt",)
     assert list_result.total_count == 1
     assert list_result.truncated is False
+
+
+def test_local_artifact_store_puts_reads_lists_and_deletes_artifacts(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+
+    session_artifact = asyncio.run(
+        store.put_bytes(
+            b"invoice text",
+            filename="invoice.txt",
+            content_type="text/plain",
+            session_id="sess_1",
+            agent_name="assistant",
+            environment_name="local-dev",
+            metadata={"source": "upload"},
+        )
+    )
+    environment_artifact = asyncio.run(
+        store.put_bytes(
+            b"shared text",
+            filename="shared.txt",
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="local-dev",
+        )
+    )
+
+    read_result = asyncio.run(store.read_bytes(session_artifact.id))
+    session_list = asyncio.run(store.list(scope=ArtifactScope.SESSION, session_id="sess_1"))
+    environment_list = asyncio.run(
+        store.list(
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="local-dev",
+        )
+    )
+
+    assert store.id == "artifacts"
+    assert read_result.metadata == session_artifact
+    assert read_result.content == b"invoice text"
+    assert read_result.total_bytes == 12
+    assert read_result.truncated is False
+    assert session_list.artifacts == (session_artifact,)
+    assert session_list.total_count == 1
+    assert session_list.truncated is False
+    assert environment_list.artifacts == (environment_artifact,)
+
+    asyncio.run(store.delete(session_artifact.id))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(store.read_bytes(session_artifact.id))
+
+
+def test_local_artifact_store_enforces_scope_owners_and_limits(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="session_id"):
+        asyncio.run(store.put_bytes(b"content", filename="a.txt"))
+
+    with pytest.raises(ValueError, match="environment_name"):
+        asyncio.run(
+            store.put_bytes(
+                b"content",
+                filename="a.txt",
+                scope=ArtifactScope.ENVIRONMENT,
+            )
+        )
+
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"abcdef",
+            filename="a.txt",
+            session_id="sess_1",
+        )
+    )
+    read_result = asyncio.run(store.read_bytes(artifact.id, max_bytes=3))
+
+    assert read_result.content == b"abc"
+    assert read_result.total_bytes == 6
+    assert read_result.truncated is True
+
+    with pytest.raises(TypeError, match="bytes"):
+        asyncio.run(
+            store.put_bytes(
+                "content",  # type: ignore[arg-type]
+                filename="a.txt",
+                session_id="sess_1",
+            )
+        )
+
+    with pytest.raises(ValueError, match="limit"):
+        asyncio.run(store.list(limit=0))
+
+    non_artifact_dir = tmp_path / "artifacts" / "not_artifact"
+    non_artifact_dir.mkdir()
+    with pytest.raises(ValueError, match="local artifact id"):
+        asyncio.run(store.delete("not_artifact"))
+    assert non_artifact_dir.exists()
+
+
+def test_artifact_result_types_validate_boundary_values():
+    artifact = ArtifactMetadata(
+        id="art_1",
+        filename="a.txt",
+        content_type="text/plain",
+        size_bytes=3,
+        session_id="sess_1",
+    )
+    read_result = ArtifactReadResult(
+        metadata=artifact,
+        content=b"abc",
+        total_bytes=3,
+    )
+    list_result = ArtifactListResult(artifacts=[artifact], total_count=1)
+
+    assert read_result.metadata == artifact
+    assert list_result.artifacts == (artifact,)
+
+    with pytest.raises(ValueError, match="session_id"):
+        ArtifactMetadata(
+            id="art_1",
+            filename="a.txt",
+            size_bytes=0,
+        )
+
+    with pytest.raises(ValueError, match="environment_name"):
+        ArtifactMetadata(
+            id="art_1",
+            filename="a.txt",
+            size_bytes=0,
+            scope=ArtifactScope.ENVIRONMENT,
+        )
+
+    with pytest.raises(TypeError, match="content"):
+        ArtifactReadResult(metadata=artifact, content="text", total_bytes=4)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="total_bytes"):
+        ArtifactReadResult(metadata=artifact, content=b"", total_bytes=-1)
+
+    with pytest.raises(TypeError, match="truncated"):
+        ArtifactReadResult(metadata=artifact, content=b"", total_bytes=0, truncated=1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="smaller than content"):
+        ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=1)
+
+    with pytest.raises(ValueError, match="truncated must match"):
+        ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=3, truncated=True)
+
+    with pytest.raises(ValueError, match="truncated must match"):
+        ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=4, truncated=False)
+
+    with pytest.raises(TypeError, match="artifacts"):
+        ArtifactListResult(artifacts="a.txt", total_count=1)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="artifact entries"):
+        ArtifactListResult(artifacts=[artifact, "bad"], total_count=2)  # type: ignore[list-item]
+
+    with pytest.raises(ValueError, match="total_count"):
+        ArtifactListResult(artifacts=[], total_count=-1)
+
+    with pytest.raises(TypeError, match="truncated"):
+        ArtifactListResult(artifacts=[], total_count=0, truncated=1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="required"):
+        ArtifactListResult(artifacts=[artifact], total_count=None, truncated=False)
+
+    with pytest.raises(ValueError, match="must equal artifacts"):
+        ArtifactListResult(artifacts=[artifact], total_count=2, truncated=False)
+
+    with pytest.raises(ValueError, match="smaller than artifacts"):
+        ArtifactListResult(artifacts=[artifact, artifact], total_count=1, truncated=True)
+
+
+def test_file_attachment_contracts_are_json_safe_references():
+    payload = file_attachment(
+        artifact_id="art_1",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=123,
+        metadata={"source": "upload"},
+    )
+    attachment = file_attachment_from_payload(payload)
+    resolved = ResolvedFileAttachment(
+        artifact_id="art_1",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        data_base64="aGVsbG8=",
+    )
+
+    assert payload == {
+        "type": "cayu.file_attachment.v1",
+        "artifact_id": "art_1",
+        "kind": "image",
+        "filename": "invoice.png",
+        "content_type": "image/png",
+        "size_bytes": 123,
+        "metadata": {"source": "upload"},
+    }
+    assert attachment is not None
+    assert attachment.artifact_id == "art_1"
+    assert resolved.kind == FileAttachmentKind.IMAGE
+    assert file_attachment_from_payload({"type": "other"}) is None
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        FileAttachment(
+            artifact_id=" ",
+            kind=FileAttachmentKind.IMAGE,
+            filename="invoice.png",
+            content_type="image/png",
+            size_bytes=123,
+        )
+
+    with pytest.raises(ValidationError, match="greater than zero"):
+        FileAttachment(
+            artifact_id="art_1",
+            kind=FileAttachmentKind.IMAGE,
+            filename="invoice.png",
+            content_type="image/png",
+            size_bytes=0,
+        )
+
+    with pytest.raises(ValidationError, match="Image file attachments require"):
+        FileAttachment(
+            artifact_id="art_1",
+            kind=FileAttachmentKind.IMAGE,
+            filename="invoice.pdf",
+            content_type="application/pdf",
+            size_bytes=123,
+        )
+
+    with pytest.raises(ValidationError, match="Document file attachments require"):
+        FileAttachment(
+            artifact_id="art_1",
+            kind=FileAttachmentKind.DOCUMENT,
+            filename="invoice.png",
+            content_type="image/png",
+            size_bytes=123,
+        )
+
+    with pytest.raises(ValidationError, match="Image file attachments require"):
+        ResolvedFileAttachment(
+            artifact_id="art_1",
+            kind=FileAttachmentKind.IMAGE,
+            filename="invoice.pdf",
+            content_type="application/pdf",
+            data_base64="aGVsbG8=",
+        )
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        file_attachment(
+            artifact_id="art_1",
+            kind=FileAttachmentKind.IMAGE,
+            filename="invoice.png",
+            content_type="image/png",
+            size_bytes=123,
+            metadata={"bad": object()},
+        )
 
 
 def test_workspace_result_types_validate_boundary_values():

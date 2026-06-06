@@ -11,6 +11,11 @@ import certifi
 import httpx
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts import (
+    FileAttachmentKind,
+    file_attachment_from_payload,
+    resolved_file_attachments_from_options,
+)
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -175,9 +180,10 @@ def build_openai_payload(request: ModelRequest) -> dict[str, Any]:
     if instructions:
         payload["instructions"] = instructions
 
+    resolved_attachments = resolved_file_attachments_from_options(request.options)
     input_items: list[dict[str, Any]] = []
     for message in request.messages:
-        input_items.extend(_openai_input_items(message))
+        input_items.extend(_openai_input_items(message, resolved_attachments=resolved_attachments))
     if not input_items:
         raise ValueError("OpenAI requests require at least one non-system input item.")
     payload["input"] = input_items
@@ -336,7 +342,11 @@ def _system_text(messages: list[Message]) -> str:
     return "\n\n".join(system_parts)
 
 
-def _openai_input_items(message: Message) -> list[dict[str, Any]]:
+def _openai_input_items(
+    message: Message,
+    *,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
     if message.role == MessageRole.SYSTEM:
         return []
     if message.role == MessageRole.USER:
@@ -371,7 +381,26 @@ def _openai_input_items(message: Message) -> list[dict[str, Any]]:
                 )
         return items
     if message.role == MessageRole.TOOL:
-        return [_function_call_output_item(part) for part in message.content]
+        items: list[dict[str, Any]] = []
+        attachment_parts: list[dict[str, Any]] = []
+        for part in message.content:
+            items.append(_function_call_output_item(part))
+            if type(part) is ToolResultPart:
+                attachment_parts.extend(_openai_file_attachment_parts(part, resolved_attachments))
+        if attachment_parts:
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "The previous tool result returned file content for inspection.",
+                        },
+                        *attachment_parts,
+                    ],
+                }
+            )
+        return items
     raise OpenAIProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
@@ -430,6 +459,39 @@ def _function_call_output_item(
         "call_id": part.tool_call_id,
         "output": part.content,
     }
+
+
+def _openai_file_attachment_parts(
+    part: ToolResultPart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for payload in part.artifacts:
+        attachment = file_attachment_from_payload(payload)
+        if attachment is None:
+            continue
+        resolved = resolved_attachments.get(attachment.artifact_id)
+        if resolved is None:
+            raise OpenAIProtocolError(f"Missing resolved file attachment: {attachment.artifact_id}")
+        parts.append(_openai_file_attachment_part(resolved))
+    return parts
+
+
+def _openai_file_attachment_part(resolved: dict[str, Any]) -> dict[str, Any]:
+    kind = FileAttachmentKind(resolved["kind"])
+    data_url = f"data:{resolved['content_type']};base64,{resolved['data_base64']}"
+    if kind == FileAttachmentKind.IMAGE:
+        return {
+            "type": "input_image",
+            "image_url": data_url,
+        }
+    if kind == FileAttachmentKind.DOCUMENT:
+        return {
+            "type": "input_file",
+            "filename": resolved["filename"],
+            "file_data": data_url,
+        }
+    raise OpenAIProtocolError(f"Unsupported file attachment kind: {kind!r}")
 
 
 def _json_arguments(arguments: Mapping[str, Any]) -> str:

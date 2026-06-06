@@ -6,7 +6,15 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu import (
+    RESOLVED_FILE_ATTACHMENTS_OPTION,
+    AgentSpec,
+    CayuApp,
+    FileAttachmentKind,
+    Message,
+    RunRequest,
+    file_attachment,
+)
 from cayu.core.messages import TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
@@ -160,6 +168,116 @@ def test_build_anthropic_payload_translates_cayu_messages() -> None:
         ],
         "temperature": 0.2,
     }
+
+
+def test_build_anthropic_payload_translates_file_attachments() -> None:
+    attachment = file_attachment(
+        artifact_id="art_image",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("user", "Read the invoice."),
+            Message.tool_call(
+                tool_call_id="toolu_1",
+                tool_name="read_file",
+                arguments={"artifact_id": "art_image"},
+            ),
+            Message.tool_result(
+                tool_call_id="toolu_1",
+                tool_name="read_file",
+                content="Attached image artifact art_image: invoice.png.",
+                artifacts=[attachment],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_image": {
+                    "artifact_id": "art_image",
+                    "kind": "image",
+                    "filename": "invoice.png",
+                    "content_type": "image/png",
+                    "data_base64": "aGVsbG8=",
+                    "metadata": {},
+                }
+            }
+        },
+    )
+
+    payload = build_anthropic_payload(request)
+
+    tool_result = payload["messages"][2]["content"][0]
+    assert tool_result == {
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": [
+            {"type": "text", "text": "Attached image artifact art_image: invoice.png."},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8=",
+                },
+            },
+        ],
+    }
+
+
+def test_build_anthropic_payload_translates_pdf_attachments_without_filename() -> None:
+    attachment = file_attachment(
+        artifact_id="art_pdf",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="blank-page.pdf",
+        content_type="application/pdf",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("user", "Read the PDF."),
+            Message.tool_call(
+                tool_call_id="toolu_1",
+                tool_name="read_file",
+                arguments={"artifact_id": "art_pdf"},
+            ),
+            Message.tool_result(
+                tool_call_id="toolu_1",
+                tool_name="read_file",
+                content="Attached PDF artifact art_pdf: blank-page.pdf.",
+                artifacts=[attachment],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_pdf": {
+                    "artifact_id": "art_pdf",
+                    "kind": "document",
+                    "filename": "blank-page.pdf",
+                    "content_type": "application/pdf",
+                    "data_base64": "JVBERi0xLjQ=",
+                    "metadata": {},
+                }
+            }
+        },
+    )
+
+    payload = build_anthropic_payload(request)
+
+    document_block = payload["messages"][2]["content"][0]["content"][1]
+    assert document_block == {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQ=",
+        },
+    }
+    assert "filename" not in document_block
 
 
 @pytest.mark.anyio

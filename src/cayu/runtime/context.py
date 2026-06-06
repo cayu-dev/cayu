@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts import FileAttachment, file_attachment_from_payload
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
 from cayu.core.messages import (
@@ -17,6 +18,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
     copy_message,
+    copy_message_part,
 )
 from cayu.providers.base import (
     ModelProvider,
@@ -176,10 +178,16 @@ class RuntimeManagedContextPolicy(ContextPolicy):
 
 
 class DefaultContextPolicy(ContextPolicy):
-    """Default policy that sends the current runtime transcript unchanged."""
+    """Default policy that sends transcript context with bounded file attachments."""
+
+    def __init__(self, *, max_attachment_results: int = 1) -> None:
+        self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
     async def build(self, request: ContextRequest) -> list[Message]:
-        return [copy_message(message) for message in request.messages]
+        return strip_old_file_attachments(
+            request.messages,
+            max_attachment_results=self.max_attachment_results,
+        )
 
 
 class MessageWindowContextPolicy(ContextPolicy):
@@ -190,6 +198,7 @@ class MessageWindowContextPolicy(ContextPolicy):
         *,
         max_messages: int,
         preserve_system: bool = True,
+        max_attachment_results: int = 1,
     ) -> None:
         if type(max_messages) is not int:
             raise TypeError("max_messages must be an integer.")
@@ -199,12 +208,17 @@ class MessageWindowContextPolicy(ContextPolicy):
             raise ValueError("max_messages must be greater than zero.")
         self.max_messages = max_messages
         self.preserve_system = preserve_system
+        self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
     async def build(self, request: ContextRequest) -> list[Message]:
-        return trim_context_messages(
+        trimmed = trim_context_messages(
             request.messages,
             max_messages=self.max_messages,
             preserve_system=self.preserve_system,
+        )
+        return strip_old_file_attachments(
+            trimmed,
+            max_attachment_results=self.max_attachment_results,
         )
 
 
@@ -216,6 +230,7 @@ class RecentTurnsContextPolicy(ContextPolicy):
         *,
         max_user_turns: int,
         preserve_system: bool = True,
+        max_attachment_results: int = 1,
     ) -> None:
         if type(max_user_turns) is not int:
             raise TypeError("max_user_turns must be an integer.")
@@ -225,12 +240,17 @@ class RecentTurnsContextPolicy(ContextPolicy):
             raise ValueError("max_user_turns must be greater than zero.")
         self.max_user_turns = max_user_turns
         self.preserve_system = preserve_system
+        self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
     async def build(self, request: ContextRequest) -> list[Message]:
-        return trim_context_turns(
+        trimmed = trim_context_turns(
             request.messages,
             max_user_turns=self.max_user_turns,
             preserve_system=self.preserve_system,
+        )
+        return strip_old_file_attachments(
+            trimmed,
+            max_attachment_results=self.max_attachment_results,
         )
 
 
@@ -429,6 +449,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         max_user_turns: int = 10,
         compact_after_messages: int = 40,
         summary_prefix: str = "Previous session context summary:",
+        max_attachment_results: int = 1,
     ) -> None:
         if compactor is None:
             self.compactor = TranscriptDigestCompactor()
@@ -447,6 +468,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         self.max_user_turns = max_user_turns
         self.compact_after_messages = compact_after_messages
         self.summary_prefix = require_nonblank(summary_prefix, "summary_prefix")
+        self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
     async def build_with_checkpoint(
         self,
@@ -566,7 +588,10 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         if summary is not None:
             messages.append(Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"))
         messages.extend(copy_message(message) for message in recent_messages)
-        validate_context_messages(messages)
+        messages = strip_old_file_attachments(
+            messages,
+            max_attachment_results=self.max_attachment_results,
+        )
         return ContextBuildResult(
             messages=messages,
             checkpoint=checkpoint_update,
@@ -653,6 +678,62 @@ def trim_context_turns(
     return [copy_message(message) for message in candidate]
 
 
+def strip_old_file_attachments(
+    messages: list[Message],
+    *,
+    max_attachment_results: int = 1,
+) -> list[Message]:
+    """Remove old native file attachment refs from provider-facing context.
+
+    Durable transcript messages keep their original artifacts. This helper only
+    projects model-facing context so providers do not receive the same native
+    file bytes on every subsequent model request.
+    """
+
+    if type(max_attachment_results) is not int:
+        raise TypeError("max_attachment_results must be an integer.")
+    if max_attachment_results < 0:
+        raise ValueError("max_attachment_results must be non-negative.")
+
+    copied_messages = [copy_message(message) for message in messages]
+    validate_context_messages(copied_messages)
+
+    attachment_positions: list[tuple[int, int]] = []
+    for message_index, message in enumerate(copied_messages):
+        if message.role != MessageRole.TOOL:
+            continue
+        for part_index, part in enumerate(message.content):
+            if type(part) is not ToolResultPart:
+                continue
+            if _file_attachments_in_part(part):
+                attachment_positions.append((message_index, part_index))
+
+    if len(attachment_positions) <= max_attachment_results:
+        return [copy_message(message) for message in copied_messages]
+
+    keep_positions = (
+        set()
+        if max_attachment_results == 0
+        else set(attachment_positions[-max_attachment_results:])
+    )
+    projected_messages: list[Message] = []
+    for message_index, message in enumerate(copied_messages):
+        if message.role != MessageRole.TOOL:
+            projected_messages.append(copy_message(message))
+            continue
+
+        projected_parts: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = []
+        for part_index, part in enumerate(message.content):
+            if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
+                projected_parts.append(copy_message_part(part))
+                continue
+            projected_parts.append(_strip_file_attachments_from_tool_result(part))
+        projected_messages.append(Message(role=message.role, content=projected_parts))
+
+    validate_context_messages(projected_messages)
+    return [copy_message(message) for message in projected_messages]
+
+
 def validate_context_messages(messages: list[Message]) -> None:
     if type(messages) is not list:
         raise TypeError("Context messages must be a list of Message instances.")
@@ -700,6 +781,85 @@ def validate_context_messages(messages: list[Message]) -> None:
         raise ValueError(
             "Context messages end with assistant tool calls that have no matching tool results."
         )
+
+
+def _strip_file_attachments_from_tool_result(part: ToolResultPart) -> ToolResultPart:
+    kept_artifacts: list[dict[str, Any]] = []
+    stripped_attachments: list[FileAttachment] = []
+    for payload in part.artifacts:
+        attachment = file_attachment_from_payload(payload)
+        if attachment is None:
+            kept_artifacts.append(copy_json_value(payload, "artifact"))
+        else:
+            stripped_attachments.append(attachment)
+
+    if not stripped_attachments:
+        return ToolResultPart(
+            tool_call_id=part.tool_call_id,
+            tool_name=part.tool_name,
+            content=part.content,
+            structured=copy_json_value(part.structured, "structured"),
+            artifacts=kept_artifacts,
+            is_error=part.is_error,
+        )
+
+    content = _content_with_stripped_file_attachment_note(part.content, stripped_attachments)
+    structured = copy_json_value(part.structured, "structured")
+    if structured is None:
+        structured = {}
+    structured["cayu_file_attachments_stripped"] = [
+        {
+            "artifact_id": attachment.artifact_id,
+            "filename": attachment.filename,
+            "content_type": attachment.content_type,
+            "size_bytes": attachment.size_bytes,
+            "kind": attachment.kind.value,
+        }
+        for attachment in stripped_attachments
+    ]
+    return ToolResultPart(
+        tool_call_id=part.tool_call_id,
+        tool_name=part.tool_name,
+        content=content,
+        structured=structured,
+        artifacts=kept_artifacts,
+        is_error=part.is_error,
+    )
+
+
+def _content_with_stripped_file_attachment_note(
+    content: str,
+    attachments: list[FileAttachment],
+) -> str:
+    lines = [
+        (
+            f"- {attachment.filename} ({attachment.content_type}, "
+            f"{attachment.size_bytes} bytes, artifact_id={attachment.artifact_id})"
+        )
+        for attachment in attachments
+    ]
+    note = "File attachments from this older tool result were omitted from this provider request:\n"
+    note += "\n".join(lines)
+    if content:
+        return f"{content}\n\n{note}"
+    return note
+
+
+def _file_attachments_in_part(part: ToolResultPart) -> tuple[FileAttachment, ...]:
+    attachments: list[FileAttachment] = []
+    for payload in part.artifacts:
+        attachment = file_attachment_from_payload(payload)
+        if attachment is not None:
+            attachments.append(attachment)
+    return tuple(attachments)
+
+
+def _validate_max_attachment_results(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("max_attachment_results must be an integer.")
+    if value < 0:
+        raise ValueError("max_attachment_results must be non-negative.")
+    return value
 
 
 def _split_system_prefix(

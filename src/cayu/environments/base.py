@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu.artifacts import ArtifactStore
 from cayu.mcp import McpServerSpec
 from cayu.runners import Runner
 from cayu.vaults import Vault
@@ -42,6 +43,7 @@ class Environment:
         spec: EnvironmentSpec,
         *,
         workspace: Workspace | None = None,
+        artifact_store: ArtifactStore | None = None,
         runner: Runner | None = None,
         vault: Vault | None = None,
         mcp_servers: Iterable[McpServerSpec] | None = None,
@@ -52,6 +54,8 @@ class Environment:
 
         if workspace is not None and not isinstance(workspace, Workspace):
             raise TypeError("workspace must be a Workspace.")
+        if artifact_store is not None and not isinstance(artifact_store, ArtifactStore):
+            raise TypeError("artifact_store must be an ArtifactStore.")
         if runner is not None and not isinstance(runner, Runner):
             raise TypeError("runner must be a Runner.")
         if vault is not None and not isinstance(vault, Vault):
@@ -68,6 +72,7 @@ class Environment:
                 raise TypeError("mcp_servers must be an iterable of McpServerSpec.") from exc
 
         self.workspace = workspace
+        self.artifact_store = artifact_store
         self.runner = runner
         self.vault = vault
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
@@ -79,6 +84,7 @@ def copy_environment(environment: Environment) -> Environment:
     return Environment(
         copy_environment_spec(environment.spec),
         workspace=environment.workspace,
+        artifact_store=environment.artifact_store,
         runner=environment.runner,
         vault=environment.vault,
         mcp_servers=environment.mcp_servers,

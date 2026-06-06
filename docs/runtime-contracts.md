@@ -16,11 +16,11 @@ Builds the model-facing message list immediately before each provider request.
 
 The durable transcript is the source record of what happened in the session. A context policy is a projection of that transcript for one model call. It may trim old messages, replace large tool results, inject retrieved context, or implement app-specific conversation routing. It must not destructively rewrite the stored transcript.
 
-`DefaultContextPolicy` returns the current runtime transcript unchanged. Custom policies implement `build(ContextRequest) -> list[Message]`. The runtime passes copied session, agent, message, environment, step, and metadata values into the policy, validates the returned messages, and then sends those messages to the provider. Invalid policy output fails the session before a provider request is made.
+`DefaultContextPolicy` returns the current runtime transcript as model-facing context while stripping old native file attachment references by default. Custom policies implement `build(ContextRequest) -> list[Message]`. The runtime passes copied session, agent, message, environment, step, and metadata values into the policy, validates the returned messages, and then sends those messages to the provider. Invalid policy output fails the session before a provider request is made.
 
 Context output must preserve complete tool rounds: assistant tool calls must be followed by matching tool results, and tool results cannot appear without their preceding assistant tool calls. Policies that trim recent history should use `trim_context_turns(...)` for user-turn based history or `trim_context_messages(...)` for message-count based history instead of slicing blindly. Both helpers preserve leading system messages by default.
 
-Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, and `CheckpointCompactionContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
+Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, and `CheckpointCompactionContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
@@ -31,7 +31,7 @@ Compaction checkpoints store the summary and `compacted_transcript_cursor`, the 
 Cayu separates agent definition, execution environment, and session state:
 
 - `AgentSpec`: model, system prompt, tool declarations, and metadata.
-- `Environment`: workspace, runner, vault, MCP servers, and execution metadata.
+- `Environment`: workspace, artifact store, runner, vault, MCP servers, and execution metadata.
 - `RunRequest` / `ResumeRequest` / `Session`: one run of an agent, optionally in a named environment, with messages, status, events, and checkpoints.
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
@@ -197,13 +197,14 @@ String-only tool results are not enough for the final framework.
 
 Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. Tool policy denials are recorded separately as `tool.call.blocked`, do not execute the tool, and are also returned to the model as structured error `tool_result` message parts. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, runner, vault, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
 
 The first built-in tools are:
 
-- `read_file`: read UTF-8 text from the active workspace, capped by `max_bytes`
+- `read_file`: read UTF-8 text from the active workspace by `path`, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers
 - `write_file`: write UTF-8 text to the active workspace, capped by `max_bytes`
 - `list_files`: list files in the active workspace, capped by `limit`
+- `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
@@ -211,8 +212,11 @@ These tools are ordinary `Tool` implementations. They prove the environment-serv
 Default built-in tool caps are intentionally large enough for normal coding work but small enough to protect model context and runtime memory:
 
 - `read_file`: 256 KB by default, 4 MB maximum per call
+- `read_file` native file attachments: 8 MB by default, 8 MB maximum per call for the built-in tool instance. Applications may raise or lower that tool-facing cap with `ReadFileTool(default_attachment_limit_bytes=..., max_attachment_limit_bytes=...)`.
+- Runtime file attachment resolution: 8 MB maximum per attachment, 32 MB maximum total per provider request, and 20 attachments maximum per provider request by default. Applications may override those runtime caps with `CayuApp(max_file_attachment_bytes=..., max_total_file_attachment_bytes=..., max_file_attachments_per_request=...)`.
 - `write_file`: 256 KB by default, 4 MB maximum per call
 - `list_files`: 500 paths by default, 10,000 maximum per call
+- `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
 - `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
 
 ## Workflow
@@ -238,7 +242,7 @@ Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 
 ## Workspace
 
-Filesystem/artifact boundary. For coding agents this is often a target repo. For document/data agents this may be uploaded files and generated outputs.
+Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
 `LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
 Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
 
@@ -247,6 +251,51 @@ Workspace result objects enforce consistent metadata:
 - `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
+
+## ArtifactStore
+
+Uploaded/generated file reference boundary. Artifacts are not the active project filesystem. They are durable file blobs with metadata, content type, size, creation time, and explicit scope.
+
+`LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
+
+Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
+
+Immediately before a provider request, the runtime scans model-facing tool results for `cayu.file_attachment.v1` references, resolves the referenced bytes from the active `ArtifactStore`, verifies session/environment scope again, and passes a temporary `cayu_file_attachments` map in `ModelRequest.options`. Provider adapters translate that temporary map into native provider content:
+
+- Anthropic: `image` and `document` content blocks inside `tool_result` content.
+- OpenAI Responses: the text `function_call_output` plus a following user input item containing `input_image` or `input_file`.
+
+This keeps Cayu's durable transcript provider-neutral and avoids dumping base64 into event/session storage. The built-in `read_file` supports text artifacts, provider-native image attachments, and provider-native PDF attachments. Image/PDF inspection requires the optional file dependencies installed with `cayu[files]`; with them, oversized images can be resized and PDF page ranges can be extracted. Without them, the tool returns a clear error instead of emitting an unvalidated native attachment.
+
+`ReadFileTool` is extensible through artifact readers. Workspace path reads remain built in. The common extension path is additive: pass `extra_artifact_readers` to run app-owned readers before Cayu's defaults, while keeping the built-in text, image, and PDF readers available as fallbacks.
+
+```python
+from cayu import ArtifactReadRequest, ReadFileTool, ToolResult
+
+
+class InvoiceOcrReader:
+    def can_read(self, artifact):
+        return artifact.content_type in {"application/pdf", "image/png", "image/jpeg"}
+
+    async def read(self, request: ArtifactReadRequest):
+        # App-owned OCR/parser logic here.
+        return ToolResult(content="Extracted invoice fields ...")
+
+
+read_file = ReadFileTool(extra_artifact_readers=[InvoiceOcrReader()])
+```
+
+Applications that only need to add one format do not need to reimplement workspace reading, artifact lookup, scope checks, or provider-neutral attachment creation.
+
+Applications that need strict control can pass `artifact_readers=[...]` instead. That replaces the full artifact-reader chain and intentionally disables Cayu's default artifact readers.
+
+Provider-native file upload APIs can be added later as provider-specific optimizations behind the same artifact reference boundary. Remote stores such as S3 can be added as `ArtifactStore` implementations without changing the model-facing tool contract.
+
+Artifact result objects enforce consistent metadata:
+
+- `ArtifactReadResult`: `truncated` must equal `len(content) < total_bytes`
+- `ArtifactListResult` complete list: `truncated=false` and `total_count == len(artifacts)`
+- `ArtifactListResult` truncated list: `truncated=true` and `total_count >= len(artifacts)`
 
 ## Vault
 

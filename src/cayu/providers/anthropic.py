@@ -11,6 +11,11 @@ import certifi
 import httpx
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts import (
+    FileAttachmentKind,
+    file_attachment_from_payload,
+    resolved_file_attachments_from_options,
+)
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -203,7 +208,11 @@ def build_anthropic_payload(
     if system:
         payload["system"] = system
 
-    messages = [_anthropic_message(message) for message in request.messages]
+    resolved_attachments = resolved_file_attachments_from_options(request.options)
+    messages = [
+        _anthropic_message(message, resolved_attachments=resolved_attachments)
+        for message in request.messages
+    ]
     payload["messages"] = [message for message in messages if message is not None]
     if not payload["messages"]:
         raise ValueError("Anthropic requests require at least one non-system message.")
@@ -301,7 +310,11 @@ def _system_text(messages: list[Message]) -> str:
     return "\n\n".join(system_parts)
 
 
-def _anthropic_message(message: Message) -> dict[str, Any] | None:
+def _anthropic_message(
+    message: Message,
+    *,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
     if message.role == MessageRole.SYSTEM:
         return None
     if message.role == MessageRole.USER:
@@ -324,7 +337,10 @@ def _anthropic_message(message: Message) -> dict[str, Any] | None:
     if message.role == MessageRole.TOOL:
         return {
             "role": "user",
-            "content": [_tool_result_block(part) for part in message.content],
+            "content": [
+                _tool_result_block(part, resolved_attachments=resolved_attachments)
+                for part in message.content
+            ],
         }
     raise AnthropicProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
@@ -354,17 +370,68 @@ def _assistant_block(
 
 def _tool_result_block(
     part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    *,
+    resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise AnthropicProtocolError("Tool messages can only contain tool_result blocks.")
+    content_blocks = _tool_result_content_blocks(part, resolved_attachments)
+    has_file_attachments = any(
+        file_attachment_from_payload(payload) is not None for payload in part.artifacts
+    )
     block: dict[str, Any] = {
         "type": "tool_result",
         "tool_use_id": part.tool_call_id,
-        "content": part.content,
+        "content": content_blocks if has_file_attachments else part.content,
     }
     if part.is_error:
         block["is_error"] = True
     return block
+
+
+def _tool_result_content_blocks(
+    part: ToolResultPart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    content_blocks: list[dict[str, Any]] = []
+    if part.content:
+        content_blocks.append({"type": "text", "text": part.content})
+    for payload in part.artifacts:
+        attachment = file_attachment_from_payload(payload)
+        if attachment is None:
+            continue
+        resolved = resolved_attachments.get(attachment.artifact_id)
+        if resolved is None:
+            raise AnthropicProtocolError(
+                f"Missing resolved file attachment: {attachment.artifact_id}"
+            )
+        content_blocks.append(_anthropic_file_attachment_block(resolved))
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+    return content_blocks
+
+
+def _anthropic_file_attachment_block(resolved: dict[str, Any]) -> dict[str, Any]:
+    kind = FileAttachmentKind(resolved["kind"])
+    if kind == FileAttachmentKind.IMAGE:
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": resolved["content_type"],
+                "data": resolved["data_base64"],
+            },
+        }
+    if kind == FileAttachmentKind.DOCUMENT:
+        return {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": resolved["content_type"],
+                "data": resolved["data_base64"],
+            },
+        }
+    raise AnthropicProtocolError(f"Unsupported file attachment kind: {kind!r}")
 
 
 def _anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:

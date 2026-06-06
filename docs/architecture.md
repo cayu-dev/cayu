@@ -22,13 +22,14 @@ The framework should run locally, on a VPS, in Docker, in ECS, or behind any oth
 ```text
 core
   providers -> core
+  artifacts -> core
   runners -> core
   workspaces -> core
   storage -> core
   vaults -> core
   mcp -> core
-  environments -> workspaces + runners + vaults + mcp
-  runtime -> core + providers + runners + workspaces + storage + vaults + mcp
+  environments -> artifacts + workspaces + runners + vaults + mcp
+  runtime -> core + providers + artifacts + runners + workspaces + storage + vaults + mcp
   cli -> runtime + project scaffolding
   dashboard -> runtime API / event store
 ```
@@ -72,12 +73,15 @@ This requires both deterministic orchestration and LLM orchestrator agents.
 Cayu follows an agent/environment/session separation:
 
 - `Agent`: model, system prompt, tool declarations, and metadata.
-- `Environment`: workspace, runner, vault, MCP servers, and execution metadata.
+- `Environment`: workspace, artifact store, runner, vault, MCP servers, and execution metadata.
 - `Session`: one run of an agent in an environment, with messages, status, events, and checkpoints.
 
-- `Workspace`: files/artifacts an agent can work with.
+- `Workspace`: active filesystem an agent can work with, such as a target repo or working directory.
+- `ArtifactStore`: uploaded/generated durable file references scoped to a session or environment.
 - `Runner`: executes explicit `ExecCommand` values in a workspace or sandbox.
 - `Sandbox`: isolated workspace plus runner plus lifecycle and limits.
+
+Model-facing file reads should persist artifact references, not provider-specific file payloads. The runtime resolves those references from the active artifact store immediately before provider calls, and provider adapters translate them into Anthropic/OpenAI/etc. native file/image/document content. Built-in context policies strip older native attachment references from provider-facing history while keeping transcript summaries, so file-heavy sessions do not resend the same bytes indefinitely. This keeps transcripts portable while still allowing multimodal providers to inspect images and PDFs.
 
 `LocalRunner` is not a sandbox. It is only a development or already-disposable-environment execution backend.
 

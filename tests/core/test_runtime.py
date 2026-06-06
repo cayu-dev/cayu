@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
+from cayu.artifacts import file_attachment
 from cayu.core import AgentSpec, Event, EventType, Message, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -55,6 +56,7 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
     default_compaction_prompt,
+    strip_old_file_attachments,
     trim_context_messages,
     trim_context_turns,
 )
@@ -511,6 +513,18 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
 
     with pytest.raises(TypeError, match="event_sinks"):
         CayuApp(event_sinks="")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="max_file_attachment_bytes"):
+        CayuApp(max_file_attachment_bytes=1.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="max_file_attachment_bytes"):
+        CayuApp(max_file_attachment_bytes=0)
+
+    with pytest.raises(ValueError, match="max_total_file_attachment_bytes"):
+        CayuApp(max_total_file_attachment_bytes=0)
+
+    with pytest.raises(ValueError, match="max_file_attachments_per_request"):
+        CayuApp(max_file_attachments_per_request=0)
 
 
 def test_cayu_app_preserves_falsey_session_store_instance():
@@ -5529,6 +5543,74 @@ def test_trim_context_messages_uses_limit_after_dropping_system_messages():
     ]
 
 
+def test_strip_old_file_attachments_preserves_latest_attachment_result_only():
+    old_attachment = file_attachment(
+        artifact_id="art_old",
+        kind="image",
+        filename="old.png",
+        content_type="image/png",
+        size_bytes=3,
+    )
+    current_attachment = file_attachment(
+        artifact_id="art_current",
+        kind="image",
+        filename="current.png",
+        content_type="image/png",
+        size_bytes=7,
+    )
+    messages = [
+        Message.text("user", "old"),
+        Message.tool_call(
+            tool_call_id="call_old",
+            tool_name="read_file",
+            arguments={"artifact_id": "art_old"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_old",
+            tool_name="read_file",
+            content="Attached image artifact art_old: old.png.",
+            artifacts=[old_attachment],
+        ),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current"),
+        Message.tool_call(
+            tool_call_id="call_current",
+            tool_name="read_file",
+            arguments={"artifact_id": "art_current"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_current",
+            tool_name="read_file",
+            content="Attached image artifact art_current: current.png.",
+            artifacts=[current_attachment],
+        ),
+    ]
+
+    projected = strip_old_file_attachments(messages, max_attachment_results=1)
+
+    old_result = projected[2].content[0]
+    current_result = projected[6].content[0]
+    assert old_result.artifacts == []
+    assert "omitted from this provider request" in old_result.content
+    assert old_result.structured == {
+        "cayu_file_attachments_stripped": [
+            {
+                "artifact_id": "art_old",
+                "filename": "old.png",
+                "content_type": "image/png",
+                "size_bytes": 3,
+                "kind": "image",
+            }
+        ]
+    }
+    assert current_result.artifacts == [current_attachment]
+    assert messages[2].content[0].artifacts == [old_attachment]
+
+    strip_all = strip_old_file_attachments(messages, max_attachment_results=0)
+    assert strip_all[2].content[0].artifacts == []
+    assert strip_all[6].content[0].artifacts == []
+
+
 def test_cayu_app_sends_agent_system_prompt_as_first_message():
     provider = FakeProvider(
         [
@@ -7577,6 +7659,9 @@ def test_environment_rejects_invalid_bound_services():
     class RunnerLike:
         isolation = "fake"
 
+    class ArtifactStoreLike:
+        id = "artifacts"
+
     class VaultLike:
         pass
 
@@ -7590,6 +7675,12 @@ def test_environment_rejects_invalid_bound_services():
         Environment(
             EnvironmentSpec(name="runner_like"),
             runner=RunnerLike(),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="artifact_store"):
+        Environment(
+            EnvironmentSpec(name="artifact_store_like"),
+            artifact_store=ArtifactStoreLike(),  # type: ignore[arg-type]
         )
 
     with pytest.raises(TypeError, match="vault"):

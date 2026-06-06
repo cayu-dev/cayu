@@ -20,10 +20,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "fastapi>=0.115",
   "httpx2>=2.3,<3",
+  "pillow>=10",
+  "pypdf>=4",
   "pytest>=8.0",
   "ruff>=0.11",
+  "sse-starlette>=2.0",
   "ty>=0.0.1a8",
+  "uvicorn>=0.30",
+]
+files = [
+  "pillow>=10",
+  "pypdf>=4",
 ]
 server = [
   "fastapi>=0.115",
@@ -32,6 +41,8 @@ server = [
 ]
 all = [
   "fastapi>=0.115",
+  "pillow>=10",
+  "pypdf>=4",
   "uvicorn>=0.30",
   "sse-starlette>=2.0",
 ]
