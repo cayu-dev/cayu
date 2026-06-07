@@ -212,12 +212,25 @@ def test_stdio_mcp_client_cleans_pending_request_on_cancellation() -> None:
         client = StdioMcpClient()
         session = await client.connect(_fake_server_spec())
         assert isinstance(session, StdioMcpSession)
+        request_written = asyncio.Event()
+        original_write_with_timeout = session._write_with_timeout
+
+        async def capture_tool_call_write(
+            payload: dict[str, Any],
+            *,
+            timeout_message: str,
+        ) -> None:
+            await original_write_with_timeout(payload, timeout_message=timeout_message)
+            if payload.get("method") == "tools/call":
+                request_written.set()
+
         try:
+            session._write_with_timeout = capture_tool_call_write
             task = asyncio.create_task(
                 session.call_tool("echo", {"text": "cancelled", "defer_response": True})
             )
-            while not session._pending:
-                await asyncio.sleep(0)
+            await request_written.wait()
+            await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -236,17 +249,29 @@ def test_stdio_mcp_client_sends_cancelled_notification_when_request_is_cancelled
         session = await client.connect(_fake_server_spec())
         assert isinstance(session, StdioMcpSession)
         notifications: list[tuple[str, dict[str, Any]]] = []
+        request_written = asyncio.Event()
+        original_write_with_timeout = session._write_with_timeout
 
         async def capture_notify(method: str, params: dict[str, Any]) -> None:
             notifications.append((method, params))
 
+        async def capture_tool_call_write(
+            payload: dict[str, Any],
+            *,
+            timeout_message: str,
+        ) -> None:
+            await original_write_with_timeout(payload, timeout_message=timeout_message)
+            if payload.get("method") == "tools/call":
+                request_written.set()
+
         try:
+            session._write_with_timeout = capture_tool_call_write
             session._notify = capture_notify
             task = asyncio.create_task(
                 session.call_tool("echo", {"text": "cancelled", "defer_response": True})
             )
-            while not session._pending:
-                await asyncio.sleep(0)
+            await request_written.wait()
+            await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
