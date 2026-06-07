@@ -308,6 +308,47 @@ MCP config separates plain and secret values:
 
 The framework should not guess whether a key name is sensitive.
 
+MCP is an interoperability layer, not the required custom tool model. Application-owned
+Python tools should use Cayu's native `Tool` contract. External or separately packaged
+tool servers can be connected through MCP.
+
+The first MCP implementation supports stdio servers:
+
+- `StdioMcpClient` launches an explicit argv command and speaks newline-delimited
+  JSON-RPC over stdin/stdout.
+- stderr is treated as server logging, not protocol output.
+- The client rejects servers that negotiate an unsupported MCP protocol version.
+- Stdio writes are timeout-bounded separately from server response waits, so a
+  broken or backpressured MCP subprocess cannot hang Cayu before the request
+  timeout starts. A write timeout closes the stdio session because the server may
+  already have received part or all of the JSON-RPC message.
+- Timed-out or caller-cancelled in-flight requests send MCP
+  `notifications/cancelled` when the request has already been written, except for
+  `initialize`, which MCP clients must not cancel. The notification write is
+  best-effort and timeout-bounded; if it is interrupted, the stdio session is
+  closed instead of being reused.
+- Session shutdown closes the child process stdin first, waits for graceful exit,
+  then escalates to terminate/kill if the server does not exit.
+- `connect_mcp_toolset(...)` initializes the server, lists tools, and returns
+  one `McpToolset` that owns the live MCP session and its `McpToolAdapter`
+  instances.
+- Callers must close the toolset when the application or environment shuts down.
+  Tool adapters intentionally reuse that initialized session instead of launching
+  a fresh MCP process for every tool call.
+- The initialize result is available as `McpToolset.initialize_result`, including
+  protocol version, server info, capabilities, and server instructions.
+- `McpToolAdapter` exposes one MCP tool as a normal Cayu `Tool`, so tool policies,
+  approvals, events, transcript persistence, and provider adapters work through the
+  same path as framework-native tools.
+- Cayu tool names are prefixed with the MCP server namespace, such as
+  `mcp__local-mcp__echo`, to make provenance visible and avoid collisions.
+
+This first stdio client does not resolve `secret_env` itself. Secret resolution belongs
+at the environment/vault boundary before the subprocess is started. Streamable HTTP MCP,
+OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are future
+layers. MCP resources should remain explicit and policy-controlled instead of being
+dumped into model context automatically.
+
 ## KnowledgeStore
 
 Searchable memory/knowledge interface. Default local implementation should eventually support file indexing plus SQLite FTS.

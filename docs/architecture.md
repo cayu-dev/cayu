@@ -17,6 +17,10 @@ The framework should run locally, on a VPS, in Docker, in ECS, or behind any oth
 - MCP: interoperability layer, not the required custom tool model
 - Runtime model: separate agent, environment, and session concerns
 
+MCP tools should enter the runtime as normal Cayu tools through adapters. That keeps
+external servers under the same policy, approval, event, and transcript model as native
+Python tools while preserving MCP as an interoperability boundary.
+
 ## Dependency Direction
 
 ```text
