@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 import pytest
 
+import cayu.providers.openai as openai_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
     CayuApp,
     FileAttachmentKind,
     Message,
+    ResumeRequest,
     RunRequest,
     file_attachment,
 )
@@ -30,41 +33,49 @@ from cayu.providers import (
 
 
 class RecordingTransport:
-    def __init__(self, responses: list[Mapping[str, Any]]) -> None:
-        self.responses = list(responses)
+    def __init__(
+        self,
+        stream_events: list[list[Mapping[str, Any]]] | None = None,
+    ) -> None:
+        self.stream_event_batches = list(stream_events or [])
         self.calls: list[dict[str, Any]] = []
 
-    async def create_response(
+    async def stream_response_events(
         self,
         *,
         url: str,
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-    ) -> Mapping[str, Any]:
+        stream_idle_timeout_s: float,
+    ):
         self.calls.append(
             {
                 "url": url,
                 "headers": dict(headers),
                 "payload": dict(payload),
                 "timeout_s": timeout_s,
+                "stream_idle_timeout_s": stream_idle_timeout_s,
             }
         )
-        if not self.responses:
-            raise AssertionError("No fake OpenAI response queued.")
-        return self.responses.pop(0)
+        if not self.stream_event_batches:
+            raise AssertionError("No fake OpenAI stream queued.")
+        for event in self.stream_event_batches.pop(0):
+            yield event
 
 
 class BlankFailingTransport:
-    async def create_response(
+    async def stream_response_events(
         self,
         *,
         url: str,
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-    ) -> Mapping[str, Any]:
+        stream_idle_timeout_s: float,
+    ):
         raise RuntimeError()
+        yield {}
 
 
 class EchoTool(Tool):
@@ -234,28 +245,35 @@ def test_build_openai_payload_translates_file_attachments() -> None:
 @pytest.mark.anyio
 async def test_openai_provider_emits_text_and_completed_events() -> None:
     transport = RecordingTransport(
-        [
-            {
-                "id": "resp_1",
-                "model": "gpt-test",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": "msg_1",
+        stream_events=[
+            [
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {"type": "response.output_text.delta", "delta": "hello"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
                         "status": "completed",
-                        "role": "assistant",
-                        "content": [
+                        "output": [
                             {
-                                "type": "output_text",
-                                "text": "hello",
-                                "annotations": [],
+                                "type": "message",
+                                "id": "msg_1",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "hello",
+                                        "annotations": [],
+                                    }
+                                ],
                             }
                         ],
-                    }
-                ],
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            }
+                        "usage": {"input_tokens": 10, "output_tokens": 2},
+                    },
+                },
+            ]
         ]
     )
     provider = OpenAIProvider(api_key="test-key", transport=transport)
@@ -275,33 +293,69 @@ async def test_openai_provider_emits_text_and_completed_events() -> None:
     assert transport.calls[0]["url"] == "https://api.openai.com/v1/responses"
     assert transport.calls[0]["headers"]["authorization"] == "Bearer test-key"
     assert transport.calls[0]["payload"]["store"] is False
+    assert transport.calls[0]["payload"]["stream"] is True
 
 
 @pytest.mark.anyio
 async def test_openai_provider_emits_tool_call_events() -> None:
     transport = RecordingTransport(
-        [
-            {
-                "id": "resp_1",
-                "model": "gpt-test",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "reasoning",
-                        "id": "rs_1",
-                        "summary": [],
-                        "phase": "tool_use",
-                    },
-                    {
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
                         "type": "function_call",
                         "id": "fc_1",
                         "call_id": "call_1",
                         "name": "echo",
-                        "arguments": '{"text":"hello"}',
-                        "status": "completed",
+                        "arguments": "",
                     },
-                ],
-            }
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": '{"text":',
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": '"hello"}',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "name": "echo",
+                    "arguments": '{"text":"hello"}',
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "id": "rs_1",
+                                "summary": [],
+                                "phase": "tool_use",
+                            },
+                            {
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "echo",
+                                "arguments": '{"text":"hello"}',
+                                "status": "completed",
+                            },
+                        ],
+                    },
+                },
+            ]
         ]
     )
     provider = OpenAIProvider(api_key="test-key", transport=transport)
@@ -327,48 +381,83 @@ async def test_openai_provider_emits_tool_call_events() -> None:
 @pytest.mark.anyio
 async def test_openai_provider_round_trips_runtime_tool_results() -> None:
     transport = RecordingTransport(
-        [
-            {
-                "id": "resp_1",
-                "model": "gpt-test",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "reasoning",
-                        "id": "rs_1",
-                        "summary": [],
-                        "phase": "tool_use",
-                    },
-                    {
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
                         "type": "function_call",
                         "id": "fc_1",
                         "call_id": "call_1",
                         "name": "echo",
-                        "arguments": '{"text":"hello from openai"}',
-                        "status": "completed",
+                        "arguments": "",
                     },
-                ],
-            },
-            {
-                "id": "resp_2",
-                "model": "gpt-test",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "id": "msg_2",
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "delta": '{"text":"hello from openai"}',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "output_index": 1,
+                    "name": "echo",
+                    "arguments": '{"text":"hello from openai"}',
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
                         "status": "completed",
-                        "role": "assistant",
-                        "content": [
+                        "output": [
                             {
-                                "type": "output_text",
-                                "text": "final answer",
-                                "annotations": [],
+                                "type": "reasoning",
+                                "id": "rs_1",
+                                "summary": [],
+                                "phase": "tool_use",
+                            },
+                            {
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "echo",
+                                "arguments": '{"text":"hello from openai"}',
+                                "status": "completed",
+                            },
+                        ],
+                    },
+                },
+            ],
+            [
+                {"type": "response.output_text.delta", "delta": "final answer"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_2",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "final answer",
+                                        "annotations": [],
+                                    }
+                                ],
                             }
                         ],
-                    }
-                ],
-            },
+                    },
+                },
+            ],
         ]
     )
     provider = OpenAIProvider(api_key="test-key", transport=transport)
@@ -430,6 +519,207 @@ async def test_openai_provider_round_trips_runtime_tool_results() -> None:
     ]
 
 
+@pytest.mark.anyio
+async def test_openai_provider_replays_streamed_function_call_when_completed_lacks_output() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "echo",
+                        "arguments": "",
+                    },
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": '{"text":"hello from openai"}',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "name": "echo",
+                    "arguments": '{"text":"hello from openai"}',
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
+                        "status": "completed",
+                    },
+                },
+            ],
+            [
+                {"type": "response.output_text.delta", "delta": "final answer"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "final answer"}],
+                            }
+                        ],
+                    },
+                },
+            ],
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test", system_prompt="Use tools."),
+        tools=[EchoTool()],
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Echo this.")],
+            )
+        )
+    ]
+
+    assert events[-1].type == "session.completed"
+    assert transport.calls[1]["payload"]["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Echo this."}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "echo",
+            "arguments": '{"text":"hello from openai"}',
+            "status": "completed",
+            "id": "fc_1",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "hello from openai",
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_openai_provider_replays_streamed_text_when_completed_lacks_output() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                },
+                {"type": "response.output_text.delta", "delta": "hello"},
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "gpt-test",
+                        "status": "completed",
+                    },
+                },
+            ],
+            [
+                {"type": "response.output_text.delta", "delta": "second answer"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "second answer"}],
+                            }
+                        ],
+                    },
+                },
+            ],
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test", system_prompt="Be direct."))
+
+    run_events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_openai_text_replay",
+                messages=[Message.text("user", "Say hello.")],
+            )
+        )
+    ]
+    resume_events = [
+        event
+        async for event in app.resume(
+            ResumeRequest(
+                session_id="sess_openai_text_replay",
+                messages=[Message.text("user", "Again.")],
+            )
+        )
+    ]
+
+    assert run_events[-1].type == "session.completed"
+    assert resume_events[-1].type == "session.completed"
+    assert transport.calls[1]["payload"]["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Say hello."}],
+        },
+        {
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Again."}],
+        },
+    ]
+
+
 def test_openai_response_events_rejects_malformed_function_call() -> None:
     with pytest.raises(OpenAIProtocolError, match="arguments were not valid JSON"):
         openai_response_events(
@@ -467,6 +757,227 @@ def test_openai_response_events_sanitizes_response_error() -> None:
     )
     assert "debug" not in message
     assert "not persisted" not in message
+
+
+def test_openai_response_events_emits_refusal_text() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_1",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "refusal",
+                            "refusal": "I cannot help with that.",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "I cannot help with that."
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_emits_incomplete_terminal_response() -> None:
+    async def raw_events():
+        yield {"type": "response.output_text.delta", "delta": "partial"}
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "incomplete",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "partial"}],
+                    }
+                ],
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        }
+
+    events = [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "partial"
+    assert events[1].payload["status"] == "incomplete"
+    assert events[1].payload["incomplete_details"] == {"reason": "max_output_tokens"}
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_uses_done_function_call_arguments() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": "",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "name": "echo",
+            "arguments": '{"text":"from done event"}',
+            "sequence_number": 2,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+            },
+        }
+
+    events = [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload == {
+        "id": "call_1",
+        "name": "echo",
+        "arguments": {"text": "from done event"},
+    }
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_emits_refusal_text() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.refusal.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "I cannot help with that.",
+            "sequence_number": 1,
+        }
+        yield {
+            "type": "response.refusal.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "refusal": "I cannot help with that.",
+            "sequence_number": 2,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "refusal",
+                                "refusal": "I cannot help with that.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+    events = [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "I cannot help with that."
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_function_call_done_without_call_id() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "name": "echo",
+            "arguments": '{"text":"hello"}',
+            "sequence_number": 1,
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="arrived before output_item.added"):
+        [event async for event in openai_module.openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_extracts_response_failed_error() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {
+                    "code": "server_error",
+                    "message": "The model failed.",
+                    "debug": "not persisted",
+                },
+            },
+            "sequence_number": 1,
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    message = str(exc_info.value)
+    assert message == (
+        'OpenAI streaming error: {"code":"server_error","message":"The model failed."}'
+    )
+    assert "debug" not in message
+    assert "not persisted" not in message
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_extracts_top_level_error_event() -> None:
+    async def raw_events():
+        yield {
+            "type": "error",
+            "code": "rate_limit_exceeded",
+            "message": "Too many requests.",
+            "param": None,
+            "sequence_number": 1,
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert str(exc_info.value) == (
+        'OpenAI streaming error: {"code":"rate_limit_exceeded",'
+        '"message":"Too many requests.","type":"error"}'
+    )
 
 
 def test_openai_response_events_rejects_unsupported_output_item() -> None:
@@ -777,3 +1288,20 @@ async def test_openai_provider_emits_nonblank_error_for_blank_exception() -> Non
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
     assert events[0].payload == {"error": "RuntimeError: OpenAI provider failed"}
+
+
+@pytest.mark.anyio
+async def test_openai_sse_parser_does_not_let_keepalives_reset_event_idle_timeout() -> None:
+    async def lines():
+        yield ": keepalive"
+        await asyncio.sleep(0.01)
+        yield ""
+
+    with pytest.raises(TimeoutError, match="no SSE events"):
+        [
+            event
+            async for event in openai_module._aiter_sse_json_events(
+                lines(),
+                idle_timeout_s=0.001,
+            )
+        ]

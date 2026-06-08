@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -28,6 +29,7 @@ from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
+DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 
 _RESERVED_OPENAI_OPTIONS = {
@@ -59,15 +61,16 @@ class OpenAIProtocolError(OpenAIError):
 
 
 class OpenAITransport(Protocol):
-    async def create_response(
+    def stream_response_events(
         self,
         *,
         url: str,
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
         timeout_s: float,
-    ) -> Mapping[str, Any]:
-        """POST a Responses API payload and return decoded JSON."""
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        """POST a streaming Responses API payload and yield decoded SSE data objects."""
 
 
 class HttpxOpenAITransport:
@@ -110,6 +113,45 @@ class HttpxOpenAITransport:
             raise OpenAIProtocolError("OpenAI response must be a JSON object.")
         return decoded
 
+    async def stream_response_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        url = _validate_url(url, "url")
+        timeout = httpx.Timeout(timeout_s, read=None)
+        try:
+            async with (
+                httpx.AsyncClient(
+                    timeout=timeout,
+                    verify=certifi.where(),
+                ) as client,
+                client.stream(
+                    "POST",
+                    url,
+                    headers=dict(headers),
+                    json=dict(payload),
+                ) as response,
+            ):
+                response.raise_for_status()
+                async for event in _aiter_sse_json_events(
+                    response.aiter_lines(),
+                    idle_timeout_s=stream_idle_timeout_s,
+                ):
+                    yield event
+        except httpx.HTTPStatusError as exc:
+            raise OpenAIAPIError(
+                "OpenAI API request failed with HTTP "
+                f"{exc.response.status_code}: "
+                f"{_safe_error_response_text(exc.response)}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
+
 
 class OpenAIProvider(ModelProvider):
     """OpenAI Responses API adapter for Cayu's provider-neutral runtime."""
@@ -123,6 +165,7 @@ class OpenAIProvider(ModelProvider):
         name: str = "openai",
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         timeout_s: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
+        stream_idle_timeout_s: float = DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
@@ -137,6 +180,11 @@ class OpenAIProvider(ModelProvider):
         if timeout_s <= 0:
             raise ValueError("timeout_s must be greater than zero.")
         self.timeout_s = float(timeout_s)
+        if type(stream_idle_timeout_s) not in {int, float}:
+            raise TypeError("stream_idle_timeout_s must be a number.")
+        if stream_idle_timeout_s <= 0:
+            raise ValueError("stream_idle_timeout_s must be greater than zero.")
+        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = _copy_headers(extra_headers)
 
@@ -145,14 +193,15 @@ class OpenAIProvider(ModelProvider):
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
-            payload = build_openai_payload(request)
-            response = await self.transport.create_response(
+            payload = build_openai_payload(request, stream=True)
+            raw_events = self.transport.stream_response_events(
                 url=f"{self.base_url}/v1/responses",
                 headers=self._headers(),
                 payload=payload,
                 timeout_s=self.timeout_s,
+                stream_idle_timeout_s=self.stream_idle_timeout_s,
             )
-            for event in openai_response_events(response):
+            async for event in openai_stream_events(raw_events):
                 yield event
         except Exception as exc:
             yield ModelStreamEvent.error(_exception_message(exc))
@@ -166,7 +215,7 @@ class OpenAIProvider(ModelProvider):
         return headers
 
 
-def build_openai_payload(request: ModelRequest) -> dict[str, Any]:
+def build_openai_payload(request: ModelRequest, *, stream: bool = False) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
 
@@ -191,6 +240,8 @@ def build_openai_payload(request: ModelRequest) -> dict[str, Any]:
     tools = [_openai_tool(tool) for tool in request.tools]
     if tools:
         payload["tools"] = tools
+    if stream:
+        payload["stream"] = True
     payload.update(options)
     return copy_json_value(payload, "openai_payload")
 
@@ -232,22 +283,82 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
         else:
             raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
 
-    events.append(
-        ModelStreamEvent.completed(
-            {
-                "id": _optional_string(response, "id"),
-                "model": _optional_string(response, "model"),
-                "status": _optional_string(response, "status"),
-                "provider_state": provider_state_items,
-                "usage": copy_json_value(response.get("usage"), "usage"),
-                "incomplete_details": copy_json_value(
-                    response.get("incomplete_details"),
-                    "incomplete_details",
-                ),
-            }
-        )
-    )
+    events.append(_completed_event_from_response(response, provider_state_items))
     return events
+
+
+async def openai_stream_events(
+    events: AsyncIterator[Mapping[str, Any]],
+) -> AsyncIterator[ModelStreamEvent]:
+    pending_function_calls: dict[int, _PendingFunctionCall] = {}
+    fallback_output_items: dict[int, dict[str, Any]] = {}
+    completed = False
+    async for event in events:
+        if not isinstance(event, Mapping):
+            raise OpenAIProtocolError("OpenAI stream event must be a JSON object.")
+        event_type = event.get("type")
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                raise OpenAIProtocolError("OpenAI output_text delta must be a string.")
+            if delta:
+                yield ModelStreamEvent.text_delta(delta)
+            continue
+        if event_type == "response.refusal.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                raise OpenAIProtocolError("OpenAI refusal delta must be a string.")
+            if delta:
+                yield ModelStreamEvent.text_delta(delta)
+            continue
+        if event_type == "response.output_item.added":
+            _record_stream_output_item_added(event, pending_function_calls)
+            continue
+        if event_type == "response.output_item.done":
+            _record_stream_output_item_done(event, fallback_output_items)
+            continue
+        if event_type == "response.function_call_arguments.delta":
+            _record_stream_function_call_delta(event, pending_function_calls)
+            continue
+        if event_type == "response.function_call_arguments.done":
+            tool_call_event, output_item = _stream_function_call_event(
+                event,
+                pending_function_calls,
+            )
+            fallback_output_items[_stream_output_index(event)] = output_item
+            yield tool_call_event
+            continue
+        if event_type in {"response.completed", "response.incomplete"}:
+            yield _stream_completed_event(event, fallback_output_items)
+            completed = True
+            continue
+        if event_type in {"response.failed", "error"}:
+            raise OpenAIAPIError(f"OpenAI streaming error: {_stream_error_message(event)}")
+
+    if not completed:
+        raise OpenAIProtocolError("OpenAI streaming response ended before response.completed.")
+
+
+class _PendingFunctionCall:
+    def __init__(
+        self,
+        *,
+        item_id: str | None,
+        call_id: str | None,
+        name: str | None,
+        arguments: str,
+    ) -> None:
+        self.item_id = item_id
+        self.call_id = call_id
+        self.name = name
+        self.arguments_parts = [arguments] if arguments else []
+
+    def append_arguments(self, delta: str) -> None:
+        self.arguments_parts.append(delta)
+
+    @property
+    def arguments(self) -> str:
+        return "".join(self.arguments_parts)
 
 
 def _message_output_events(
@@ -272,13 +383,17 @@ def _message_output_events(
             )
         part = cast("Mapping[str, Any]", part)
         part_type = part.get("type")
-        if part_type != "output_text":
+        if part_type == "output_text":
+            text_key = "text"
+        elif part_type == "refusal":
+            text_key = "refusal"
+        else:
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI message output content type: {part_type!r}."
             )
-        text = part.get("text")
+        text = part.get(text_key)
         if not isinstance(text, str):
-            raise OpenAIProtocolError("OpenAI output_text content requires string text.")
+            raise OpenAIProtocolError(f"OpenAI {part_type} content requires string {text_key}.")
         if text:
             events.append(ModelStreamEvent.text_delta(text))
     return events
@@ -316,6 +431,236 @@ def _function_call_event(
         name=name,
         arguments=copy_json_value(decoded_arguments, "arguments"),
     )
+
+
+def _completed_event_from_response(
+    response: Mapping[str, Any],
+    provider_state_items: list[dict[str, Any]] | None = None,
+) -> ModelStreamEvent:
+    if provider_state_items is None:
+        provider_state_items = _provider_state_items_from_response(response)
+    return ModelStreamEvent.completed(
+        {
+            "id": _optional_string(response, "id"),
+            "model": _optional_string(response, "model"),
+            "status": _optional_string(response, "status"),
+            "provider_state": provider_state_items,
+            "usage": copy_json_value(response.get("usage"), "usage"),
+            "incomplete_details": copy_json_value(
+                response.get("incomplete_details"),
+                "incomplete_details",
+            ),
+        }
+    )
+
+
+def _stream_completed_event(
+    event: Mapping[str, Any],
+    fallback_output_items: Mapping[int, Mapping[str, Any]],
+) -> ModelStreamEvent:
+    response = _stream_response_object(event)
+    if response.get("output") is None:
+        provider_state_items = _provider_state_items_from_output_items(
+            fallback_output_items,
+        )
+        return _completed_event_from_response(response, provider_state_items)
+    return _completed_event_from_response(response)
+
+
+def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+    output = response.get("output")
+    if output is None:
+        return []
+    if not isinstance(output, list):
+        raise OpenAIProtocolError("OpenAI response output must be a list.")
+    provider_state_items: list[dict[str, Any]] = []
+    for index, item in enumerate(output):
+        if not isinstance(item, Mapping):
+            raise OpenAIProtocolError(f"OpenAI output item {index} must be an object.")
+        item = cast("Mapping[str, Any]", item)
+        item_type = item.get("type")
+        if item_type in {"reasoning", "message", "function_call"}:
+            provider_state_items.append(
+                {"provider": "openai", "state": copy_json_value(item, "output_item")}
+            )
+            continue
+        raise OpenAIProtocolError(f"Unsupported OpenAI output item type: {item_type!r}.")
+    return provider_state_items
+
+
+def _provider_state_items_from_output_items(
+    output_items: Mapping[int, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    provider_state_items: list[dict[str, Any]] = []
+    for output_index in sorted(output_items):
+        item = output_items[output_index]
+        provider_state_items.append(
+            {"provider": "openai", "state": copy_json_value(item, "output_item")}
+        )
+    return provider_state_items
+
+
+def _record_stream_output_item_added(
+    event: Mapping[str, Any],
+    pending_function_calls: dict[int, _PendingFunctionCall],
+) -> None:
+    output_index = _stream_output_index(event)
+    item = event.get("item")
+    if not isinstance(item, Mapping):
+        raise OpenAIProtocolError("OpenAI output_item.added requires item object.")
+    item_type = item.get("type")
+    if item_type != "function_call":
+        return
+    pending_function_calls[output_index] = _PendingFunctionCall(
+        item_id=_mapping_optional_string(item, "id"),
+        call_id=_mapping_optional_string(item, "call_id"),
+        name=_mapping_optional_string(item, "name"),
+        arguments=_mapping_string_or_default(item, "arguments", ""),
+    )
+
+
+def _record_stream_output_item_done(
+    event: Mapping[str, Any],
+    output_items: dict[int, dict[str, Any]],
+) -> None:
+    output_index = _stream_output_index(event)
+    item = event.get("item")
+    if not isinstance(item, Mapping):
+        raise OpenAIProtocolError("OpenAI output_item.done requires item object.")
+    item_type = item.get("type")
+    if item_type in {"reasoning", "message", "function_call"}:
+        output_items[output_index] = copy_json_value(item, "output_item")
+
+
+def _record_stream_function_call_delta(
+    event: Mapping[str, Any],
+    pending_function_calls: dict[int, _PendingFunctionCall],
+) -> None:
+    output_index = _stream_output_index(event)
+    pending = pending_function_calls.get(output_index)
+    if pending is None:
+        raise OpenAIProtocolError(
+            "OpenAI function_call_arguments.delta arrived before output_item.added."
+        )
+    item_id = _mapping_optional_string(event, "item_id")
+    if pending.item_id is not None and item_id is not None and pending.item_id != item_id:
+        raise OpenAIProtocolError("OpenAI function_call_arguments.delta item_id mismatch.")
+    delta = event.get("delta")
+    if not isinstance(delta, str):
+        raise OpenAIProtocolError("OpenAI function_call_arguments.delta requires string delta.")
+    pending.append_arguments(delta)
+
+
+def _stream_function_call_event(
+    event: Mapping[str, Any],
+    pending_function_calls: dict[int, _PendingFunctionCall],
+) -> tuple[ModelStreamEvent, dict[str, Any]]:
+    output_index = _stream_output_index(event)
+    pending = pending_function_calls.pop(output_index, None)
+    if pending is None:
+        raise OpenAIProtocolError(
+            "OpenAI function_call_arguments.done arrived before output_item.added."
+        )
+    item_id = _mapping_optional_string(event, "item_id")
+    if pending.item_id is not None and item_id is not None and pending.item_id != item_id:
+        raise OpenAIProtocolError("OpenAI function_call_arguments.done item_id mismatch.")
+    call_id = _first_nonblank_string(pending.call_id)
+    name = _first_nonblank_string(
+        _mapping_optional_string(event, "name"),
+        pending.name,
+    )
+    arguments = _first_string(
+        _mapping_optional_string(event, "arguments"),
+        pending.arguments if pending.arguments else None,
+    )
+    output_item = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+    output_item_id = _first_string_or_none(
+        item_id,
+        pending.item_id,
+    )
+    if output_item_id is not None:
+        output_item["id"] = output_item_id
+    return (
+        _function_call_event(output_item, output_index),
+        output_item,
+    )
+
+
+def _stream_response_object(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    response = event.get("response")
+    if response is None:
+        response = event
+    if not isinstance(response, Mapping):
+        raise OpenAIProtocolError("OpenAI stream terminal event requires response object.")
+    return response
+
+
+def _stream_error_message(event: Mapping[str, Any]) -> str:
+    event_type = event.get("type")
+    if event_type == "response.failed":
+        response = _stream_response_object(event)
+        error = response.get("error")
+        if error is not None:
+            return _safe_error_value(error)
+        return _safe_error_value(response)
+    if event_type == "error":
+        return _safe_error_json(event)
+    return _safe_error_value(event)
+
+
+def _stream_output_index(event: Mapping[str, Any]) -> int:
+    output_index = event.get("output_index")
+    if type(output_index) is not int:
+        raise OpenAIProtocolError("OpenAI stream event requires integer output_index.")
+    if output_index < 0:
+        raise OpenAIProtocolError("OpenAI stream event output_index must be non-negative.")
+    return output_index
+
+
+def _mapping_optional_string(value: Mapping[str, Any] | None, key: str) -> str | None:
+    if value is None:
+        return None
+    raw_value = value.get(key)
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise OpenAIProtocolError(f"OpenAI stream field {key} must be a string.")
+    stripped = raw_value.strip()
+    return stripped or None
+
+
+def _mapping_string_or_default(value: Mapping[str, Any], key: str, default: str) -> str:
+    raw_value = value.get(key, default)
+    if not isinstance(raw_value, str):
+        raise OpenAIProtocolError(f"OpenAI stream field {key} must be a string.")
+    return raw_value
+
+
+def _first_nonblank_string(*values: str | None) -> str:
+    for value in values:
+        if value is not None and value.strip():
+            return value
+    raise OpenAIProtocolError("OpenAI streaming function call is missing required identity.")
+
+
+def _first_string(*values: str | None) -> str:
+    for value in values:
+        if value is not None:
+            return value
+    raise OpenAIProtocolError("OpenAI streaming function call is missing arguments.")
+
+
+def _first_string_or_none(*values: str | None) -> str | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -567,6 +912,71 @@ def _validate_url(url: str, field_name: str) -> str:
     if not parsed.netloc:
         raise ValueError(f"OpenAI {field_name} must include a host.")
     return value
+
+
+async def _aiter_sse_json_events(
+    lines: AsyncIterator[str],
+    *,
+    idle_timeout_s: float,
+) -> AsyncIterator[Mapping[str, Any]]:
+    if idle_timeout_s <= 0:
+        raise ValueError("idle_timeout_s must be greater than zero.")
+    iterator = lines.__aiter__()
+    loop = asyncio.get_running_loop()
+    last_event_at = loop.time()
+    data_lines: list[str] = []
+
+    while True:
+        elapsed = loop.time() - last_event_at
+        remaining = idle_timeout_s - elapsed
+        if remaining <= 0:
+            raise TimeoutError(
+                f"OpenAI streaming response produced no SSE events for {idle_timeout_s:g} seconds."
+            )
+        try:
+            line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            break
+        except TimeoutError:
+            raise TimeoutError(
+                f"OpenAI streaming response produced no SSE events for {idle_timeout_s:g} seconds."
+            ) from None
+
+        if line.startswith(":"):
+            continue
+        if line == "":
+            if not data_lines:
+                continue
+            data = "\n".join(data_lines)
+            data_lines = []
+            if data == "[DONE]":
+                break
+            try:
+                decoded = json.loads(data)
+            except ValueError as exc:
+                raise OpenAIProtocolError("OpenAI SSE data was not valid JSON.") from exc
+            if not isinstance(decoded, Mapping):
+                raise OpenAIProtocolError("OpenAI SSE data must decode to a JSON object.")
+            last_event_at = loop.time()
+            yield decoded
+            continue
+        if line.startswith("data:"):
+            data = line[5:]
+            if data.startswith(" "):
+                data = data[1:]
+            data_lines.append(data)
+            continue
+
+    if data_lines:
+        data = "\n".join(data_lines)
+        if data != "[DONE]":
+            try:
+                decoded = json.loads(data)
+            except ValueError as exc:
+                raise OpenAIProtocolError("OpenAI SSE data was not valid JSON.") from exc
+            if not isinstance(decoded, Mapping):
+                raise OpenAIProtocolError("OpenAI SSE data must decode to a JSON object.")
+            yield decoded
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:

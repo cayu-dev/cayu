@@ -173,9 +173,15 @@ Providers that require opaque response items for stateless continuation may retu
 
 `AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks.
 
-`OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
+`OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 
-The first provider implementations use complete API responses and yield normalized Cayu stream events from the returned model response. Server-sent-event streaming can be added behind the same provider contract later.
+Configure OpenAI transport timeouts on the provider. `timeout_s` controls ordinary HTTP transport timeouts; `stream_idle_timeout_s` controls how long a streaming response may go without a parsed provider event before Cayu treats the model step as stalled:
+
+```python
+OpenAIProvider(timeout_s=600, stream_idle_timeout_s=300)
+```
+
+`AnthropicProvider` currently uses complete API responses and yields normalized Cayu stream events from the returned model response. Anthropic server-sent-event streaming can be added behind the same provider contract later.
 
 ## Tool
 
@@ -258,6 +264,16 @@ Workspace result objects enforce consistent metadata:
 Uploaded/generated file reference boundary. Artifacts are not the active project filesystem. They are durable file blobs with metadata, content type, size, creation time, and explicit scope.
 
 `LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
+
+Configure an artifact store on the environment when the agent should inspect uploaded/generated artifacts or workspace PDFs/images:
+
+```python
+Environment(
+    EnvironmentSpec(name="local"),
+    workspace=LocalWorkspace("./workspace", workspace_id="local"),
+    artifact_store=LocalArtifactStore("./.cayu/artifacts", store_id="local-artifacts"),
+)
+```
 
 Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 

@@ -15,7 +15,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
-It does not yet include hosted deployment adapters, vector search, isolated runners, higher-level task orchestration, or streaming provider adapters.
+It does not yet include hosted deployment adapters, vector search, isolated runners, or higher-level task orchestration.
 
 ## Contract Rules
 
@@ -72,6 +72,31 @@ provider request, and 20 attachments per provider request. Override the model-fa
 `CayuApp`. Built-in context policies keep only the latest file-attachment tool result
 provider-resolvable by default, so older attachments stay in the durable transcript as
 references/summaries without being resent on every model call.
+
+Configure an artifact store when an agent should inspect uploaded/generated files or
+workspace PDFs/images:
+
+```python
+from cayu import Environment, EnvironmentSpec, LocalArtifactStore, LocalWorkspace
+
+environment = Environment(
+    EnvironmentSpec(name="local"),
+    workspace=LocalWorkspace("./workspace", workspace_id="local"),
+    artifact_store=LocalArtifactStore("./.cayu/artifacts", store_id="local-artifacts"),
+)
+```
+
+The OpenAI provider uses Responses API streaming by default. Tune the ordinary HTTP
+timeout and the no-provider-event stall timeout separately:
+
+```python
+from cayu import OpenAIProvider
+
+provider = OpenAIProvider(
+    timeout_s=600,
+    stream_idle_timeout_s=300,
+)
+```
 
 ## Example
 
