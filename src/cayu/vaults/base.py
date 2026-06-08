@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 
 
 class SecretRef(BaseModel):
@@ -39,6 +39,31 @@ class SecretRef(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class SecretEnv(BaseModel):
+    """Environment variable whose value must be resolved from a secret ref."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    ref: SecretRef
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+    @field_validator("name")
+    @classmethod
+    def validate_nonblank_name(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("ref")
+    @classmethod
+    def copy_ref(cls, value: SecretRef) -> SecretRef:
+        return copy_secret_ref(value)
+
+
 def copy_secret_ref(ref: SecretRef) -> SecretRef:
     if type(ref) is not SecretRef:
         raise TypeError("Secret references must be SecretRef instances.")
@@ -46,6 +71,16 @@ def copy_secret_ref(ref: SecretRef) -> SecretRef:
         name=ref.name,
         handle=ref.handle,
         metadata=copy_json_value(ref.metadata, "metadata"),
+    )
+
+
+def copy_secret_env(secret_env: SecretEnv) -> SecretEnv:
+    if type(secret_env) is not SecretEnv:
+        raise TypeError("Secret environment entries must be SecretEnv instances.")
+    return SecretEnv(
+        name=secret_env.name,
+        ref=copy_secret_ref(secret_env.ref),
+        metadata=copy_json_value(secret_env.metadata, "metadata"),
     )
 
 
@@ -72,6 +107,20 @@ class ResolvedSecret(BaseModel):
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("value")
+    @classmethod
+    def validate_nonblank_value(cls, value: SecretStr, info) -> SecretStr:
+        require_nonblank(value.get_secret_value(), info.field_name)
+        return value
+
+
+class VaultError(RuntimeError):
+    """Base error for vault resolution failures."""
+
+
+class SecretNotFound(VaultError):
+    """Raised when a vault cannot resolve a requested secret."""
 
 
 class Vault(ABC):

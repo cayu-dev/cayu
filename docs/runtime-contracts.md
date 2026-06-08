@@ -316,14 +316,48 @@ Artifact result objects enforce consistent metadata:
 
 ## Vault
 
-Secrets abstraction. Raw secret values should be injected into tools/runners by runtime and should not be placed in model prompts.
+Secrets abstraction. `SecretRef` is the serializable boundary value; raw secret
+values are resolved only by trusted application/runtime code and should not be
+placed in model prompts, tool schemas, transcripts, durable events, or ordinary
+logs.
+
+An `Environment` can attach a vault resolver:
+
+```python
+Environment(
+    EnvironmentSpec(name="local"),
+    vault=LocalEnvVault({"github_token": "GITHUB_TOKEN"}),
+)
+```
+
+The built-in local implementations are:
+
+- `LocalEnvVault`: maps secret names to environment variables in the trusted app process.
+- `StaticVault`: stores in-memory secrets for tests and trusted local development.
+
+`SecretEnv` represents a deliberate environment variable injection:
+
+```python
+SecretEnv(name="GITHUB_TOKEN", ref=SecretRef(name="github_token"))
+```
+
+Runner/MCP integrations should accept secret refs and resolve them through the
+active environment vault at the execution boundary. The model should not receive
+a general-purpose secret-reading tool. Application-owned tools can use secrets
+internally by resolving refs in trusted code and returning safe results.
 
 MCP config separates plain and secret values:
 
 - `env` / `headers`: non-secret strings
 - `secret_env` / `secret_headers`: `SecretRef` values resolved by runtime
 
-The framework should not guess whether a key name is sensitive.
+The framework should not guess whether a key name is sensitive. Secrets already
+present inside a workspace, such as `.env`, `.npmrc`, or cloud credential files,
+are a workspace/sandbox policy problem rather than a vault-resolution problem.
+Production runners should execute untrusted shell/code in an isolated sandbox
+with minimal environment and narrow mounts. `SecretRedactor` is available for
+defense-in-depth redaction of known resolved secret values before persistence or
+display, but redaction is not the security boundary.
 
 MCP is an interoperability layer, not the required custom tool model. Application-owned
 Python tools should use Cayu's native `Tool` contract. External or separately packaged

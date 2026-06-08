@@ -9,7 +9,7 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import ArtifactStore
 from cayu.mcp import McpServerSpec
 from cayu.runners import Runner
-from cayu.vaults import Vault
+from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
 
 
@@ -76,6 +76,20 @@ class Environment:
         self.runner = runner
         self.vault = vault
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
+
+    async def resolve_secret(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> ResolvedSecret:
+        """Resolve a secret ref through the environment vault."""
+
+        if type(ref) is not SecretRef:
+            raise TypeError("Environment secret refs must be SecretRef instances.")
+        if self.vault is None:
+            raise VaultError(f"Environment has no vault configured: {self.spec.name}")
+        return await self.vault.resolve(ref, scope=scope)
 
 
 def copy_environment(environment: Environment) -> Environment:
