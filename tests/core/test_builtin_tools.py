@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 from collections.abc import AsyncIterator
+from importlib import import_module
 
 import pytest
 
@@ -52,7 +54,7 @@ from cayu.tools.files import (
     ReadFileTool,
     WriteFileTool,
 )
-from cayu.workspaces import LocalWorkspace
+from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
 
 TINY_PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
@@ -435,6 +437,272 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
     }
 
 
+def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        agent_name="assistant",
+        environment_name="local-dev",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    pdf_bytes = _tiny_pdf_bytes()
+
+    asyncio.run(workspace.write_bytes("docs/invoice.pdf", pdf_bytes))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "docs/invoice.pdf"}))
+
+    assert result.is_error is False
+    assert "Attached PDF artifact" in result.content
+    assert "docs/invoice.pdf" in result.content
+    assert "%PDF" not in result.content
+    assert result.structured["source"] == "workspace"
+    assert result.structured["path"] == "docs/invoice.pdf"
+    assert result.structured["content_type"] == "application/pdf"
+    assert result.structured["snapshot_artifact_id"].startswith("art_")
+    assert result.structured["attachment_artifact_id"] == result.structured["snapshot_artifact_id"]
+    assert result.artifacts[0]["artifact_id"] == result.structured["snapshot_artifact_id"]
+    assert result.artifacts[0]["kind"] == "document"
+
+
+def test_read_file_forwards_pages_for_workspace_pdf_snapshot(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+
+    asyncio.run(workspace.write_bytes("docs/report.pdf", _tiny_pdf_bytes()))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "docs/report.pdf", "pages": "1"}))
+
+    assert result.is_error is False
+    assert "showing pages 1-1 of 1" in result.content
+    assert result.structured["source"] == "workspace"
+    assert result.structured["path"] == "docs/report.pdf"
+    assert result.structured["pages"] == "1"
+    assert result.structured["snapshot_artifact_id"].startswith("art_")
+    assert result.structured["attachment_artifact_id"] != result.structured["snapshot_artifact_id"]
+    assert result.artifacts[0]["kind"] == "document"
+    assert result.artifacts[0]["metadata"]["pages"] == "1"
+
+
+def test_read_file_snapshots_workspace_image_as_artifact_attachment(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        agent_name="assistant",
+        environment_name="local-dev",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+
+    asyncio.run(workspace.write_bytes("images/red-dot.png", TINY_PNG_BYTES))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "images/red-dot.png"}))
+
+    assert result.is_error is False
+    assert "Attached image artifact" in result.content
+    assert "images/red-dot.png" in result.content
+    assert "\ufffdPNG" not in result.content
+    assert result.structured["content_type"] == "image/png"
+    assert result.structured["snapshot_artifact_id"].startswith("art_")
+    assert result.structured["attachment_artifact_id"] == result.structured["snapshot_artifact_id"]
+    assert result.artifacts[0]["artifact_id"] == result.structured["snapshot_artifact_id"]
+    assert result.artifacts[0]["kind"] == "image"
+    assert result.structured["total_bytes"] == len(TINY_PNG_BYTES)
+
+
+def test_read_file_rejects_inspectable_workspace_binary_without_artifact_store(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    asyncio.run(workspace.write_bytes("images/red-dot.png", TINY_PNG_BYTES))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "images/red-dot.png"}))
+
+    assert result.is_error is True
+    assert "requires an artifact store" in result.content
+    assert result.structured["content_type"] == "image/png"
+    assert result.structured["binary"] is True
+    assert result.structured["inspectable"] is True
+
+
+def test_read_file_routes_empty_workspace_pdf_and_image_to_artifact_readers(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+
+    asyncio.run(workspace.write_bytes("empty.pdf", b""))
+    asyncio.run(workspace.write_bytes("empty.png", b""))
+
+    pdf_result = asyncio.run(ReadFileTool().run(ctx, {"path": "empty.pdf"}))
+    image_result = asyncio.run(ReadFileTool().run(ctx, {"path": "empty.png"}))
+
+    assert pdf_result.is_error is True
+    assert "PDF artifact 'empty.pdf' is empty and cannot be inspected." in pdf_result.content
+    assert pdf_result.structured["source"] == "workspace"
+    assert pdf_result.structured["content_type"] == "application/pdf"
+    assert pdf_result.structured["binary"] is True
+    assert pdf_result.structured["inspectable"] is True
+    assert image_result.is_error is True
+    assert "Image artifact 'empty.png' is empty and cannot be inspected." in image_result.content
+    assert image_result.structured["source"] == "workspace"
+    assert image_result.structured["content_type"] == "image/png"
+    assert image_result.structured["binary"] is True
+    assert image_result.structured["inspectable"] is True
+
+
+def test_read_file_rejects_unsupported_workspace_binary_without_returning_raw_bytes(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+    binary = b"\x00\x01\x02\x03\x04binary data"
+
+    asyncio.run(workspace.write_bytes("build/app.bin", binary))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "build/app.bin"}))
+
+    assert result.is_error is True
+    assert "Workspace file 'build/app.bin' appears to be binary" in result.content
+    assert "binary data" not in result.content
+    assert result.structured["content_type"] == "application/octet-stream"
+    assert result.structured["binary"] is True
+    assert result.structured["inspectable"] is False
+
+
+def test_read_file_rejects_binary_bytes_even_with_text_extension(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+    binary = b"looks textual first\x00\x01binary data"
+
+    asyncio.run(workspace.write_bytes("notes/payload.txt", binary))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes/payload.txt"}))
+
+    assert result.is_error is True
+    assert "appears to be binary" in result.content
+    assert "binary data" not in result.content
+    assert result.structured["content_type"] == "text/plain"
+    assert result.structured["binary"] is True
+    assert result.structured["inspectable"] is False
+
+
+def test_read_file_rejects_binary_bytes_after_text_prefix(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+    binary = b"a" * (9 * 1024) + b"\x00\x01binary tail"
+
+    asyncio.run(workspace.write_bytes("notes/payload.txt", binary))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes/payload.txt"}))
+
+    assert result.is_error is True
+    assert "appears to be binary" in result.content
+    assert "binary tail" not in result.content
+    assert result.structured["content_type"] == "text/plain"
+    assert result.structured["binary"] is True
+    assert result.structured["inspectable"] is False
+
+
+def test_read_file_returns_tool_error_when_workspace_attachment_changes_during_snapshot(tmp_path):
+    class MutatingWorkspace(LocalWorkspace):
+        def __init__(self, root):
+            super().__init__(root, workspace_id="local")
+            self.read_count = 0
+
+        async def read_bytes(self, path: str, *, max_bytes: int | None = None):
+            self.read_count += 1
+            if self.read_count == 1:
+                return await super().read_bytes(path, max_bytes=max_bytes)
+            return WorkspaceReadResult(
+                content=b"now text",
+                total_bytes=8,
+                truncated=False,
+            )
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = MutatingWorkspace(workspace_root)
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+
+    asyncio.run(workspace.write_bytes("images/red-dot.png", TINY_PNG_BYTES))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "images/red-dot.png"}))
+
+    assert result.is_error is True
+    assert "changed while it was being captured" in result.content
+    assert "Retry read_file" in result.content
+    assert result.structured["content_type"] == "image/png"
+    assert result.structured["binary"] is True
+    assert result.structured["inspectable"] is True
+
+
+def test_read_file_still_reads_text_like_workspace_formats(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    asyncio.run(workspace.write_bytes("data/results.csv", b"name,score\ncayu,10\n"))
+    asyncio.run(workspace.write_bytes("pages/index.html", b"<h1>Cayu</h1>\n"))
+    asyncio.run(workspace.write_bytes("README", b"Cayu workspace notes\n"))
+    asyncio.run(workspace.write_bytes("src/app.ts", b"export const name = 'cayu';\n"))
+    asyncio.run(workspace.write_bytes("src/Main.java", b"class Main {}\n"))
+
+    csv_result = asyncio.run(ReadFileTool().run(ctx, {"path": "data/results.csv"}))
+    html_result = asyncio.run(ReadFileTool().run(ctx, {"path": "pages/index.html"}))
+    readme_result = asyncio.run(ReadFileTool().run(ctx, {"path": "README"}))
+    typescript_result = asyncio.run(ReadFileTool().run(ctx, {"path": "src/app.ts"}))
+    java_result = asyncio.run(ReadFileTool().run(ctx, {"path": "src/Main.java"}))
+
+    assert csv_result.is_error is False
+    assert csv_result.content == "name,score\ncayu,10\n"
+    assert csv_result.structured["encoding"] == "utf-8"
+    assert "binary" not in csv_result.structured
+    assert html_result.is_error is False
+    assert html_result.content == "<h1>Cayu</h1>\n"
+    assert readme_result.is_error is False
+    assert readme_result.content == "Cayu workspace notes\n"
+    assert readme_result.structured["encoding"] == "utf-8"
+    assert "binary" not in readme_result.structured
+    assert typescript_result.is_error is False
+    assert typescript_result.content == "export const name = 'cayu';\n"
+    assert typescript_result.structured["encoding"] == "utf-8"
+    assert "binary" not in typescript_result.structured
+    assert java_result.is_error is False
+    assert java_result.content == "class Main {}\n"
+    assert java_result.structured["encoding"] == "utf-8"
+    assert "binary" not in java_result.structured
+
+
+def _tiny_pdf_bytes() -> bytes:
+    pypdf = import_module("pypdf")
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
 def test_workspace_tools_return_error_without_workspace():
     ctx = ToolContext(session_id="sess_1")
 
@@ -755,6 +1023,33 @@ def test_read_file_extends_default_artifact_readers(tmp_path):
     assert pdf_result.structured["reader"] == "custom"
     assert text_result.content == "text artifact ok"
     assert text_result.structured["encoding"] == "utf-8"
+
+
+def test_read_file_uses_extra_artifact_readers_for_workspace_snapshots(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    tool = ReadFileTool(extra_artifact_readers=[CustomPdfReader()])
+
+    asyncio.run(workspace.write_bytes("docs/invoice.pdf", b"%PDF custom"))
+
+    result = asyncio.run(tool.run(ctx, {"path": "docs/invoice.pdf"}))
+
+    assert result.is_error is False
+    assert result.content.startswith(
+        "Captured workspace file 'docs/invoice.pdf' as artifact snapshot"
+    )
+    assert "custom pdf reader: invoice.pdf" in result.content
+    assert result.structured["source"] == "workspace"
+    assert result.structured["path"] == "docs/invoice.pdf"
+    assert result.structured["reader"] == "custom"
+    assert result.structured["snapshot_artifact_id"].startswith("art_")
 
 
 def test_read_file_can_replace_artifact_readers_explicitly(tmp_path):

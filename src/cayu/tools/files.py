@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import mimetypes
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
+from pathlib import PurePosixPath
 from typing import Protocol
 
 from cayu._validation import require_nonblank
@@ -18,7 +20,7 @@ from cayu.artifacts import (
     file_attachment,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.workspaces import Workspace
+from cayu.workspaces import Workspace, WorkspaceReadResult
 
 DEFAULT_READ_LIMIT_BYTES = 256 * 1024
 MAX_READ_LIMIT_BYTES = 4 * 1024 * 1024
@@ -39,6 +41,37 @@ _PIL_IMAGE_FORMAT_CONTENT_TYPES = {
     "PNG": "image/png",
     "GIF": "image/gif",
     "WEBP": "image/webp",
+}
+_CONTROL_TEXT_BYTES = {9, 10, 12, 13, 27}
+_TEXT_CONTENT_TYPES = {
+    "application/javascript",
+    "application/json",
+    "application/ld+json",
+    "application/toml",
+    "application/x-httpd-php",
+    "application/x-ndjson",
+    "application/x-sh",
+    "application/x-yaml",
+    "application/xml",
+    "image/svg+xml",
+}
+_TEXT_CONTENT_TYPE_SUFFIXES = ("+json", "+xml", "+yaml")
+_BINARY_CONTENT_TYPE_PREFIXES = ("image/",)
+_BINARY_CONTENT_TYPES = {
+    "application/gzip",
+    "application/java-archive",
+    "application/pdf",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/x-7z-compressed",
+    "application/x-bzip2",
+    "application/x-dosexec",
+    "application/x-executable",
+    "application/x-rar-compressed",
+    "application/x-tar",
+    "application/zip",
 }
 
 
@@ -77,10 +110,11 @@ def _read_file_tool_spec(
     return ToolSpec(
         name="read_file",
         description=(
-            "Read a UTF-8 text file from the active workspace or read an artifact by id. "
+            "Read a file from the active workspace or read an artifact by id. "
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
-            "Text artifacts return text. Image and PDF artifacts return provider-neutral file "
-            "attachments that capable providers can inspect natively."
+            "Text files return text. Workspace image/PDF files are captured as artifact "
+            "snapshots when an artifact store is configured. Image and PDF artifacts return "
+            "provider-neutral file attachments that capable providers can inspect natively."
         ),
         input_schema={
             "type": "object",
@@ -189,7 +223,14 @@ class ReadFileTool(Tool):
         )
         pages = _optional_arg_string(args, "pages")
         if path is not None:
-            return await _read_workspace_file(ctx, path=path, max_bytes=max_bytes)
+            return await _read_workspace_file(
+                ctx,
+                path=path,
+                artifact_readers=self.artifact_readers,
+                max_bytes=max_bytes,
+                max_attachment_bytes=max_attachment_bytes,
+                pages=pages,
+            )
         if artifact_id is not None:
             return await _read_artifact(
                 ctx,
@@ -206,12 +247,38 @@ async def _read_workspace_file(
     ctx: ToolContext,
     *,
     path: str,
+    artifact_readers: list[ArtifactReader],
     max_bytes: int,
+    max_attachment_bytes: int,
+    pages: str | None,
 ) -> ToolResult:
     workspace = _require_workspace(ctx)
     if workspace is None:
         return _missing_workspace_result()
     result = await workspace.read_bytes(path, max_bytes=max_bytes)
+    content_type = _guess_workspace_content_type(path)
+    if _is_workspace_file_attachment_content_type(content_type):
+        return await _read_workspace_file_attachment(
+            ctx,
+            path=path,
+            content_type=content_type,
+            artifact_readers=artifact_readers,
+            max_bytes=max_bytes,
+            max_attachment_bytes=max_attachment_bytes,
+            pages=pages,
+            initial_result=result,
+        )
+    if _is_binary_workspace_file(content_type=content_type, content=result.content):
+        return _binary_workspace_file_result(
+            path=path,
+            content_type=content_type,
+            bytes_read=len(result.content),
+            total_bytes=result.total_bytes,
+            truncated=result.truncated,
+            inspectable=False,
+        )
+    if pages is not None:
+        raise ValueError("Tool argument `pages` is only valid for PDF files.")
     text = result.content.decode("utf-8", errors="replace")
     return ToolResult(
         content=f"{text}\n\n[file truncated]" if result.truncated else text,
@@ -223,6 +290,246 @@ async def _read_workspace_file(
             "encoding": "utf-8",
             "truncated": result.truncated,
         },
+    )
+
+
+def _guess_workspace_content_type(path: str) -> str:
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+
+async def _read_workspace_file_attachment(
+    ctx: ToolContext,
+    *,
+    path: str,
+    content_type: str,
+    artifact_readers: list[ArtifactReader],
+    max_bytes: int,
+    max_attachment_bytes: int,
+    pages: str | None,
+    initial_result: WorkspaceReadResult,
+) -> ToolResult:
+    artifact_store = _require_artifact_store(ctx)
+    if artifact_store is None:
+        return _binary_workspace_file_result(
+            path=path,
+            content_type=content_type,
+            bytes_read=len(initial_result.content),
+            total_bytes=initial_result.total_bytes,
+            truncated=initial_result.truncated,
+            inspectable=True,
+            reason="Native inspection of this workspace file requires an artifact store.",
+        )
+
+    source_cap = _workspace_attachment_source_cap(content_type)
+    try:
+        result = await _read_full_workspace_attachment(
+            ctx,
+            path=path,
+            content_type=content_type,
+            initial_result=initial_result,
+            max_source_bytes=source_cap,
+        )
+    except WorkspaceFileChangedError as exc:
+        return _binary_workspace_file_result(
+            path=path,
+            content_type=content_type,
+            bytes_read=len(initial_result.content),
+            total_bytes=initial_result.total_bytes,
+            truncated=initial_result.truncated,
+            inspectable=True,
+            reason=f"{exc} Retry read_file after the workspace file is stable.",
+        )
+    if result.truncated:
+        return _binary_workspace_file_result(
+            path=path,
+            content_type=content_type,
+            bytes_read=len(result.content),
+            total_bytes=result.total_bytes,
+            truncated=True,
+            inspectable=True,
+            reason=(f"Workspace file is too large to inspect natively (max {source_cap} bytes)."),
+        )
+
+    snapshot = await artifact_store.put_bytes(
+        result.content,
+        filename=_workspace_snapshot_filename(path),
+        content_type=content_type,
+        scope=ArtifactScope.SESSION,
+        session_id=ctx.session_id,
+        agent_name=ctx.agent_name,
+        environment_name=ctx.environment_name,
+        metadata={
+            "source": "workspace",
+            "source_workspace_id": ctx.workspace_id,
+            "source_workspace_path": path,
+            "operation": "read_file_workspace_snapshot",
+        },
+    )
+    artifact_result = await _read_artifact(
+        ctx,
+        artifact_id=snapshot.id,
+        artifact_readers=artifact_readers,
+        max_bytes=max_bytes,
+        max_attachment_bytes=max_attachment_bytes,
+        pages=pages,
+    )
+    return _workspace_snapshot_result(
+        path=path,
+        content_type=content_type,
+        workspace_result=result,
+        snapshot=snapshot,
+        artifact_result=artifact_result,
+    )
+
+
+async def _read_full_workspace_attachment(
+    ctx: ToolContext,
+    *,
+    path: str,
+    content_type: str,
+    initial_result: WorkspaceReadResult,
+    max_source_bytes: int,
+) -> WorkspaceReadResult:
+    workspace = _require_workspace(ctx)
+    if workspace is None:
+        raise RuntimeError("Workspace disappeared while reading workspace file attachment.")
+    result = await workspace.read_bytes(path, max_bytes=max_source_bytes)
+    if (
+        not initial_result.truncated
+        and not result.truncated
+        and (
+            result.total_bytes != initial_result.total_bytes
+            or result.content != initial_result.content
+        )
+    ):
+        raise WorkspaceFileChangedError(
+            "Workspace file content changed while it was being captured as an artifact snapshot."
+        )
+    if result.content and not _is_binary_workspace_file(
+        content_type=content_type,
+        content=result.content,
+    ):
+        raise WorkspaceFileChangedError(
+            "Workspace file content changed while it was being captured as an artifact snapshot."
+        )
+    return result
+
+
+class WorkspaceFileChangedError(RuntimeError):
+    pass
+
+
+def _workspace_snapshot_filename(path: str) -> str:
+    return PurePosixPath(path).name or "workspace-file"
+
+
+def _is_binary_workspace_file(*, content_type: str, content: bytes) -> bool:
+    if not content:
+        return False
+    if b"\x00" in content:
+        return True
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    if not decoded:
+        return False
+    control_count = sum(
+        1 for char in decoded if ord(char) < 32 and ord(char) not in _CONTROL_TEXT_BYTES
+    )
+    if control_count / len(decoded) > 0.05:
+        return True
+    if _is_text_content_type(content_type):
+        return False
+    return _is_binary_content_type(content_type)
+
+
+def _is_binary_content_type(content_type: str) -> bool:
+    normalized = content_type.lower()
+    if _is_text_content_type(normalized):
+        return False
+    return normalized in _BINARY_CONTENT_TYPES or normalized.startswith(
+        _BINARY_CONTENT_TYPE_PREFIXES
+    )
+
+
+def _is_workspace_file_attachment_content_type(content_type: str) -> bool:
+    return content_type == PDF_CONTENT_TYPE or content_type in IMAGE_CONTENT_TYPES
+
+
+def _workspace_attachment_source_cap(content_type: str) -> int:
+    if content_type == PDF_CONTENT_TYPE:
+        return MAX_PDF_SOURCE_BYTES
+    if content_type in IMAGE_CONTENT_TYPES:
+        return MAX_IMAGE_SOURCE_BYTES
+    return DEFAULT_ATTACHMENT_LIMIT_BYTES
+
+
+def _binary_workspace_file_result(
+    *,
+    path: str,
+    content_type: str,
+    bytes_read: int,
+    total_bytes: int,
+    truncated: bool,
+    inspectable: bool,
+    reason: str | None = None,
+) -> ToolResult:
+    if reason is None:
+        reason = "Use an artifact or custom parser/tool to inspect this file."
+    return ToolResult(
+        content=(
+            f"Workspace file '{path}' appears to be binary "
+            f"({content_type}, {total_bytes} bytes). "
+            "read_file does not decode unsupported binary workspace files as text. "
+            f"{reason}"
+        ),
+        structured={
+            "source": "workspace",
+            "path": path,
+            "bytes": bytes_read,
+            "total_bytes": total_bytes,
+            "content_type": content_type,
+            "encoding": None,
+            "binary": True,
+            "inspectable": inspectable,
+            "truncated": truncated,
+        },
+        is_error=True,
+    )
+
+
+def _workspace_snapshot_result(
+    *,
+    path: str,
+    content_type: str,
+    workspace_result: WorkspaceReadResult,
+    snapshot: ArtifactMetadata,
+    artifact_result: ToolResult,
+) -> ToolResult:
+    structured = {
+        **(artifact_result.structured or {}),
+        "source": "workspace",
+        "path": path,
+        "workspace_id": snapshot.metadata.get("source_workspace_id"),
+        "content_type": content_type,
+        "bytes": len(workspace_result.content),
+        "total_bytes": workspace_result.total_bytes,
+        "binary": True,
+        "inspectable": True,
+        "truncated": workspace_result.truncated,
+        "snapshot_artifact_id": snapshot.id,
+        "snapshot_artifact_bytes": snapshot.size_bytes,
+        "snapshot_artifact_scope": snapshot.scope.value,
+    }
+    return ToolResult(
+        content=(
+            f"Captured workspace file '{path}' as artifact snapshot {snapshot.id}. "
+            f"{artifact_result.content}"
+        ),
+        structured=structured,
+        artifacts=artifact_result.artifacts,
+        is_error=artifact_result.is_error,
     )
 
 
@@ -906,12 +1213,12 @@ def _optional_scope(
 
 
 def _is_text_content_type(content_type: str) -> bool:
-    return content_type.startswith("text/") or content_type in {
-        "application/json",
-        "application/xml",
-        "application/x-yaml",
-        "application/yaml",
-    }
+    normalized = content_type.lower()
+    return (
+        normalized.startswith("text/")
+        or normalized in _TEXT_CONTENT_TYPES
+        or normalized.endswith(_TEXT_CONTENT_TYPE_SUFFIXES)
+    )
 
 
 def _resize_image_bytes(

@@ -201,7 +201,7 @@ Framework-native tools receive runtime services through `ToolContext`: workspace
 
 The first built-in tools are:
 
-- `read_file`: read UTF-8 text from the active workspace by `path`, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers
+- `read_file`: read text from the active workspace by `path`, capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers
 - `write_file`: write UTF-8 text to the active workspace, capped by `max_bytes`
 - `list_files`: list files in the active workspace, capped by `limit`
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
@@ -245,6 +245,7 @@ Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
 `LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
 Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
+The built-in `read_file(path=...)` treats byte-level binary evidence as stronger than filename/MIME hints, so binary bytes are not decoded into model context just because a path has a text-like extension. Text-looking source files remain readable even when platform MIME tables classify an extension incorrectly.
 
 Workspace result objects enforce consistent metadata:
 
@@ -258,7 +259,7 @@ Uploaded/generated file reference boundary. Artifacts are not the active project
 
 `LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
 
-Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
+Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 
 Immediately before a provider request, the runtime scans model-facing tool results for `cayu.file_attachment.v1` references, resolves the referenced bytes from the active `ArtifactStore`, verifies session/environment scope again, and passes a temporary `cayu_file_attachments` map in `ModelRequest.options`. Provider adapters translate that temporary map into native provider content:
 
@@ -267,7 +268,7 @@ Immediately before a provider request, the runtime scans model-facing tool resul
 
 This keeps Cayu's durable transcript provider-neutral and avoids dumping base64 into event/session storage. The built-in `read_file` supports text artifacts, provider-native image attachments, and provider-native PDF attachments. Image/PDF inspection requires the optional file dependencies installed with `cayu[files]`; with them, oversized images can be resized and PDF page ranges can be extracted. Without them, the tool returns a clear error instead of emitting an unvalidated native attachment.
 
-`ReadFileTool` is extensible through artifact readers. Workspace path reads remain built in. The common extension path is additive: pass `extra_artifact_readers` to run app-owned readers before Cayu's defaults, while keeping the built-in text, image, and PDF readers available as fallbacks.
+`ReadFileTool` is extensible through artifact readers. Workspace text reads remain built in. Workspace image/PDF path reads are captured as artifacts and then use the same artifact-reader chain. The common extension path is additive: pass `extra_artifact_readers` to run app-owned readers before Cayu's defaults, while keeping the built-in text, image, and PDF readers available as fallbacks.
 
 ```python
 from cayu import ArtifactReadRequest, ReadFileTool, ToolResult
