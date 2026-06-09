@@ -34,6 +34,9 @@ files = [
   "pillow>=10",
   "pypdf>=4",
 ]
+microsandbox = [
+  "microsandbox>=0.5.5,<0.6",
+]
 server = [
   "fastapi>=0.115",
   "uvicorn>=0.30",

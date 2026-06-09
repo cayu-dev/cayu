@@ -246,6 +246,53 @@ Runner output capture is bounded by `output_limit_bytes` and returns `stdout_tru
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 `LocalRunner` is available for development and trusted local execution. It is not a sandbox. By default it inherits the parent process environment and overlays any explicit `env` values; set `inherit_env=False` when commands should only receive the explicit environment passed to the runner.
 
+`MicrosandboxRunner` is available as an optional microVM-backed runner:
+
+```bash
+pip install "cayu[microsandbox]"
+```
+
+```python
+from cayu import Environment, EnvironmentSpec, MicrosandboxRunner
+from microsandbox import Network
+
+async with await MicrosandboxRunner.create(
+    "agent-session-123",
+    image="python:3.13",
+    replace=True,
+    network=Network.none(),  # microsandbox SDK object; app-owned policy
+) as runner:
+    environment = Environment(
+        EnvironmentSpec(name="sandboxed"),
+        runner=runner,
+    )
+```
+
+`MicrosandboxRunner.create(...)` passes extra keyword arguments through to
+`microsandbox.Sandbox.create(...)`, so applications can configure images,
+volumes, network policies, resource limits, labels, patches, and Microsandbox
+secret placeholders without Cayu inventing a lossy abstraction over those
+backend-specific controls.
+
+Lifecycle is explicit:
+
+- `close_action="remove"`: stop and remove a sandbox created for a session or test.
+- `close_action="stop"`: stop the sandbox but leave the persisted record.
+- `close_action="detach"`: detach and let the sandbox outlive the Python process.
+- `close_action="none"`: attach/use only; no lifecycle action on close.
+
+Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
+creation and lifecycle.
+
+The runner executes all commands under an absolute guest root, `/workspace` by
+default. Per-command `cwd` values must be relative to that root. `env` values
+are explicit overlays only; host process environment variables are not inherited.
+Vault integrations should resolve only the specific secrets needed at the
+execution boundary and pass them through the runner or Microsandbox's own secret
+placeholder mechanism. A microVM boundary prevents ordinary workspace escape,
+but it does not make broad host mounts, host env inheritance, or unscoped secret
+injection safe.
+
 ## Workspace
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.

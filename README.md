@@ -6,7 +6,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 - Build real agent applications, not just hosted prompt/config definitions.
 - Support multiple agents collaborating through shared state, channels, tasks, triggers, and workflows.
-- Treat tool execution as a first-class runtime concern with explicit workspace, runner, and sandbox contracts.
+- Treat tool execution as a first-class runtime concern with explicit workspace, runner, vault, and sandbox contracts.
 - Store every important run action as structured events for CLI output, dashboard inspection, webhooks, and replay.
 - Run locally, in containers, on hosted infrastructure, or behind an application server.
 - Make MCP an interoperability layer, not the only custom tool model.
@@ -15,7 +15,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
-It does not yet include hosted deployment adapters, vector search, isolated runners, or higher-level task orchestration.
+It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
 ## Contract Rules
 
@@ -43,6 +43,10 @@ src/cayu/
   vaults/      secrets access contracts
   cli/         developer/admin CLI
 ```
+
+`LocalRunner` is for trusted local development. `MicrosandboxRunner` is available
+behind the optional `cayu[microsandbox]` extra for microVM-backed command
+execution when agents need an isolated sandbox boundary.
 
 ## Development
 

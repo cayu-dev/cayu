@@ -58,9 +58,14 @@ from cayu.mcp import (
 from cayu.providers import AnthropicProvider, OpenAIProvider
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    DEFAULT_MICROSANDBOX_CWD,
+    DEFAULT_MICROSANDBOX_IMAGE,
+    MICROSANDBOX_NAME_MAX_BYTES,
     ExecCommand,
     ExecResult,
     LocalRunner,
+    MicrosandboxCloseAction,
+    MicrosandboxRunner,
 )
 from cayu.runtime import (
     AllowAllToolPolicy,
@@ -159,8 +164,11 @@ __all__ = [
     "DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S",
     "DEFAULT_MCP_REQUEST_TIMEOUT_S",
     "DEFAULT_MCP_WRITE_TIMEOUT_S",
+    "DEFAULT_MICROSANDBOX_CWD",
+    "DEFAULT_MICROSANDBOX_IMAGE",
     "FILE_ATTACHMENT_TYPE",
     "MCP_PROTOCOL_VERSION",
+    "MICROSANDBOX_NAME_MAX_BYTES",
     "REDACTED_SECRET",
     "RESOLVED_FILE_ATTACHMENTS_OPTION",
     "Agent",
@@ -223,6 +231,8 @@ __all__ = [
     "Message",
     "MessageRole",
     "MessageWindowContextPolicy",
+    "MicrosandboxCloseAction",
+    "MicrosandboxRunner",
     "ModelCompactor",
     "OpenAIProvider",
     "PdfArtifactReader",
