@@ -7,7 +7,7 @@ import time
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
-import cayu.runners.local as local_runner_module
+import cayu.runners._subprocess as runner_subprocess_module
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
     ArtifactListResult,
@@ -2496,7 +2496,7 @@ def test_local_runner_kills_process_on_cancellation(tmp_path):
 def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypatch):
     marker = tmp_path / "marker.txt"
     runner = LocalRunner(tmp_path)
-    original_waiter = local_runner_module._await_process_exit
+    original_waiter = runner_subprocess_module._await_process_exit
 
     async def run_and_cancel() -> None:
         cleanup_started = asyncio.Event()
@@ -2509,7 +2509,7 @@ def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypa
                 await original_waiter(wait_task)
                 raise
 
-        monkeypatch.setattr(local_runner_module, "_await_process_exit", delayed_waiter)
+        monkeypatch.setattr(runner_subprocess_module, "_await_process_exit", delayed_waiter)
         task = asyncio.create_task(
             runner.exec(
                 ExecCommand.process(
