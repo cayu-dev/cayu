@@ -90,6 +90,20 @@ environment = Environment(
 )
 ```
 
+For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
+read/write/list inside the same sandbox boundary as `exec_command`:
+
+```python
+from cayu import Environment, EnvironmentSpec, MicrosandboxRunner, MicrosandboxWorkspace
+
+runner = await MicrosandboxRunner.create("session-123")
+environment = Environment(
+    EnvironmentSpec(name="sandbox"),
+    runner=runner,
+    workspace=MicrosandboxWorkspace(runner, workspace_id="sandbox-workspace"),
+)
+```
+
 The OpenAI provider uses Responses API streaming by default. Tune the ordinary HTTP
 timeout and the no-provider-event stall timeout separately:
 

@@ -173,6 +173,32 @@ class MicrosandboxRunner(Runner):
             return
         raise AssertionError(f"Unsupported Microsandbox close action: {self.close_action}")
 
+    def filesystem(self) -> Any:
+        """Return the native Microsandbox filesystem API for workspace adapters."""
+
+        if self._closed:
+            raise RuntimeError("MicrosandboxRunner is closed.")
+        return self._sandbox.fs
+
+    async def real_path(self, path: str) -> str:
+        """Resolve a guest path through Microsandbox's SFTP realpath API."""
+
+        if self._closed:
+            raise RuntimeError("MicrosandboxRunner is closed.")
+        ssh = self._sandbox.ssh()
+        client = await ssh.connect(sftp=True)
+        sftp = None
+        try:
+            sftp = await client.sftp()
+            resolved = await sftp.real_path(path)
+            if type(resolved) is not str or not resolved:
+                raise RuntimeError("Microsandbox real_path returned an invalid path.")
+            return posixpath.normpath(resolved)
+        finally:
+            if sftp is not None:
+                await sftp.close()
+            await client.close()
+
     async def exec(
         self,
         command: ExecCommand,
@@ -192,6 +218,7 @@ class MicrosandboxRunner(Runner):
         environment = copy_runner_env(env, inherit_env=False)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
+        sdk_stdin = standard_input.encode("utf-8") if standard_input is not None else None
         output_limit = validate_output_limit(output_limit_bytes)
 
         stdout = _LimitedBytes(output_limit)
@@ -211,7 +238,7 @@ class MicrosandboxRunner(Runner):
                     cwd=working_dir,
                     env=environment,
                     timeout=float(timeout) if timeout is not None else None,
-                    stdin=standard_input,
+                    stdin=sdk_stdin,
                 )
             else:
                 if command.shell is None:
@@ -221,7 +248,7 @@ class MicrosandboxRunner(Runner):
                     cwd=working_dir,
                     env=environment,
                     timeout=float(timeout) if timeout is not None else None,
-                    stdin=standard_input,
+                    stdin=sdk_stdin,
                 )
 
             async for event in handle:

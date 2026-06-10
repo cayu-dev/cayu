@@ -151,7 +151,17 @@ from cayu.vaults import (
     VaultError,
     copy_secret_env,
 )
-from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces import (
+    DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT,
+    DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES,
+    DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT,
+    DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
+    LocalWorkspace,
+    MicrosandboxWorkspace,
+    RunnerWorkspace,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+)
 
 __all__ = [
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
@@ -166,6 +176,10 @@ __all__ = [
     "DEFAULT_MCP_WRITE_TIMEOUT_S",
     "DEFAULT_MICROSANDBOX_CWD",
     "DEFAULT_MICROSANDBOX_IMAGE",
+    "DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT",
+    "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES",
+    "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
+    "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
     "FILE_ATTACHMENT_TYPE",
     "MCP_PROTOCOL_VERSION",
     "MICROSANDBOX_NAME_MAX_BYTES",
@@ -233,6 +247,7 @@ __all__ = [
     "MessageWindowContextPolicy",
     "MicrosandboxCloseAction",
     "MicrosandboxRunner",
+    "MicrosandboxWorkspace",
     "ModelCompactor",
     "OpenAIProvider",
     "PdfArtifactReader",
@@ -246,6 +261,7 @@ __all__ = [
     "ResolvedSecret",
     "ResumeRequest",
     "RunRequest",
+    "RunnerWorkspace",
     "RuntimeHook",
     "RuntimeHookContext",
     "RuntimeHookPhase",

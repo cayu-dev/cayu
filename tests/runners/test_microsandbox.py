@@ -261,7 +261,7 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
             "cwd": "/workspace/src",
             "env": {"VISIBLE": "1"},
             "timeout": 5.0,
-            "stdin": "input",
+            "stdin": b"input",
         }
     ]
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]

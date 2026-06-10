@@ -300,6 +300,32 @@ Filesystem boundary. For coding agents this is often a target repo. For document
 Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
 The built-in `read_file(path=...)` treats byte-level binary evidence as stronger than filename/MIME hints, so binary bytes are not decoded into model context just because a path has a text-like extension. Text-looking source files remain readable even when platform MIME tables classify an extension incorrectly.
 
+`MicrosandboxWorkspace` exposes a Microsandbox filesystem root through the same
+workspace contract:
+
+```python
+from cayu import Environment, EnvironmentSpec, MicrosandboxRunner, MicrosandboxWorkspace
+
+runner = await MicrosandboxRunner.create("session-123")
+environment = Environment(
+    EnvironmentSpec(name="sandbox"),
+    runner=runner,
+    workspace=MicrosandboxWorkspace(runner, workspace_id="sandbox-workspace"),
+)
+```
+
+Use `MicrosandboxWorkspace` when file tools must operate inside the same
+Microsandbox boundary as `exec_command`. It uses Microsandbox's native
+filesystem API, so it does not require Python inside the sandbox image for file
+operations. Its `root` defaults to `/workspace`, matching `MicrosandboxRunner`.
+
+`RunnerWorkspace` is the generic fallback for runners that do not have a native
+filesystem adapter. It uses small Python helper programs executed through the
+runner for read/write/list operations. This keeps the workspace contract
+portable across custom runners, but the runner image must provide Python 3, or
+`RunnerWorkspace(..., python_executable=...)` must point to an equivalent Python
+executable available inside the runner.
+
 Workspace result objects enforce consistent metadata:
 
 - `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
