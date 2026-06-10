@@ -18,7 +18,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import ProviderStatePart, TextPart, ToolCallPart
+from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     HttpxOpenAITransport,
@@ -30,6 +30,7 @@ from cayu.providers import (
     build_openai_payload,
     openai_response_events,
 )
+from cayu.providers.openai import openai_stream_events
 
 
 class RecordingTransport:
@@ -103,7 +104,7 @@ def test_build_openai_payload_translates_cayu_messages() -> None:
             Message.text("system", "You are a careful assistant."),
             Message.text("user", "Read a file."),
             Message(
-                role="assistant",
+                role=MessageRole.ASSISTANT,
                 content=[
                     TextPart(text="I will inspect it."),
                     ToolCallPart(
@@ -1032,7 +1033,7 @@ def test_openai_payload_replays_provider_state_items() -> None:
         messages=[
             Message.text("user", "hello"),
             Message(
-                role="assistant",
+                role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
                         provider="openai",
@@ -1104,7 +1105,7 @@ def test_openai_payload_ignores_other_provider_state_items() -> None:
         messages=[
             Message.text("user", "hello"),
             Message(
-                role="assistant",
+                role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
                         provider="other-provider",
@@ -1308,3 +1309,298 @@ async def test_openai_sse_parser_does_not_let_keepalives_reset_event_idle_timeou
                 idle_timeout_s=0.001,
             )
         ]
+
+
+def _simple_request():
+    return ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "hi")],
+    )
+
+
+def test_inline_payload_sets_store_false_and_include():
+    payload = build_openai_payload(_simple_request(), reasoning_state="inline")
+    assert payload["store"] is False
+    assert payload["include"] == ["reasoning.encrypted_content"]
+    assert "previous_response_id" not in payload
+
+
+def test_reasoning_state_defaults_to_inline():
+    p = OpenAIProvider(api_key="k")
+    assert p.reasoning_state == "inline"
+
+
+def test_reasoning_state_accepts_server():
+    p = OpenAIProvider(api_key="k", reasoning_state="server")
+    assert p.reasoning_state == "server"
+
+
+def test_reasoning_state_rejects_unknown():
+    with pytest.raises(ValueError):
+        OpenAIProvider(api_key="k", reasoning_state="bogus")
+
+
+def test_build_openai_payload_rejects_unknown_reasoning_state():
+    with pytest.raises(ValueError, match="reasoning_state"):
+        build_openai_payload(_simple_request(), reasoning_state="bogus")
+
+
+def test_build_openai_payload_rejects_non_boolean_chain():
+    bad_chain: Any = "yes"
+    with pytest.raises(TypeError, match="chain"):
+        build_openai_payload(_simple_request(), chain=bad_chain)
+
+
+def _assistant_with_reasoning():
+    return Message(
+        role=MessageRole.ASSISTANT,
+        content=[
+            ProviderStatePart(
+                provider="openai",
+                state={"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+            ),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "f",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+            ),
+        ],
+    )
+
+
+def test_server_first_call_payload():
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "go"), _assistant_with_reasoning()],
+    )
+    payload = build_openai_payload(request, reasoning_state="server")
+    assert payload["store"] is True
+    assert "include" not in payload
+    assert "previous_response_id" not in payload
+    types = [item.get("type") for item in payload["input"]]
+    assert "reasoning" not in types
+    assert "function_call" in types
+
+
+async def _drain(events, **kwargs):
+    async def gen():
+        for e in events:
+            yield e
+
+    out = []
+    async for ev in openai_stream_events(gen(), **kwargs):
+        out.append(ev)
+    return out
+
+
+def _completed_sse(resp_id):
+    return {
+        "type": "response.completed",
+        "response": {
+            "id": resp_id,
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_server_mode_emits_response_ref() -> None:
+    events = await _drain([_completed_sse("resp_123")], reasoning_state="server")
+    completed = events[-1]
+    states = [s["state"] for s in completed.payload["provider_state"]]
+    assert {"type": "response_ref", "id": "resp_123"} in states
+
+
+@pytest.mark.anyio
+async def test_inline_mode_emits_no_response_ref() -> None:
+    events = await _drain([_completed_sse("resp_123")], reasoning_state="inline")
+    completed = events[-1]
+    types = [s["state"].get("type") for s in completed.payload["provider_state"]]
+    assert "response_ref" not in types
+
+
+def test_server_later_call_sends_delta_and_previous_response_id():
+    prior_assistant = Message(
+        role=MessageRole.ASSISTANT,
+        content=[
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+            ),
+            ProviderStatePart(provider="openai", state={"type": "response_ref", "id": "resp_prev"}),
+        ],
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "first"),
+            prior_assistant,
+            Message.text("user", "second"),  # the new turn
+        ],
+    )
+    payload = build_openai_payload(request, reasoning_state="server")
+    assert payload["previous_response_id"] == "resp_prev"
+    assert len(payload["input"]) == 1
+    assert payload["input"][0]["content"][0]["text"] == "second"
+
+
+class StaleChainRecoveryTransport:
+    """404s on the first call (stale chain), succeeds on the second."""
+
+    def __init__(self):
+        self.payloads = []
+        self._calls = 0
+
+    async def stream_response_events(
+        self, *, url, headers, payload, timeout_s, stream_idle_timeout_s
+    ):
+        self.payloads.append(payload)
+        self._calls += 1
+        if self._calls == 1:
+            raise OpenAIAPIError(
+                "OpenAI API request failed with HTTP 404: "
+                '{"message":"Previous response with id resp_prev not found.","type":"invalid_request_error"}'
+            )
+            yield {}  # unreachable; makes this an async generator
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_new",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }
+
+
+class NonStalePreviousResponseErrorTransport:
+    def __init__(self):
+        self.payloads = []
+
+    async def stream_response_events(
+        self, *, url, headers, payload, timeout_s, stream_idle_timeout_s
+    ):
+        self.payloads.append(payload)
+        raise OpenAIAPIError(
+            "OpenAI API request failed with HTTP 400: "
+            '{"message":"previous_response_id cannot be used with conversation.",'
+            '"type":"invalid_request_error"}'
+        )
+        yield {}  # unreachable; makes this an async generator
+
+
+@pytest.mark.anyio
+async def test_server_mode_recovers_from_stale_previous_response_id() -> None:
+    transport = StaleChainRecoveryTransport()
+    provider = OpenAIProvider(api_key="k", reasoning_state="server", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ProviderStatePart(
+                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                    )
+                ],
+            ),
+            Message.text("user", "second"),
+        ],
+    )
+    events = [e async for e in provider.stream(request)]
+    assert any(e.type.name == "COMPLETED" for e in events)
+    assert transport.payloads[0].get("previous_response_id") == "resp_prev"
+    assert "previous_response_id" not in transport.payloads[1]
+    assert transport.payloads[1]["store"] is True
+    assert len(transport.payloads) == 2
+
+
+@pytest.mark.anyio
+async def test_server_mode_does_not_recover_non_stale_previous_response_error() -> None:
+    transport = NonStalePreviousResponseErrorTransport()
+    provider = OpenAIProvider(api_key="k", reasoning_state="server", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ProviderStatePart(
+                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                    )
+                ],
+            ),
+            Message.text("user", "second"),
+        ],
+    )
+
+    events = [e async for e in provider.stream(request)]
+
+    assert len(transport.payloads) == 1
+    assert any(e.type.name == "ERROR" for e in events)
+
+
+@pytest.mark.anyio
+async def test_inline_mode_does_not_recover_on_stale_chain_error() -> None:
+    transport = StaleChainRecoveryTransport()
+    provider = OpenAIProvider(api_key="k", reasoning_state="inline", transport=transport)
+    request = ModelRequest(model="gpt-test", messages=[Message.text("user", "hi")])
+    events = [e async for e in provider.stream(request)]
+    # Inline mode never recovers: exactly one transport call, error surfaces as MODEL_ERROR.
+    assert len(transport.payloads) == 1
+    assert any(e.type.name == "ERROR" for e in events)
+
+
+def test_server_recovery_payload_drops_chain_and_provider_state():
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ProviderStatePart(
+                        provider="openai",
+                        state={"type": "reasoning", "id": "rs_1", "encrypted_content": "b"},
+                    ),
+                    ProviderStatePart(
+                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                    ),
+                ],
+            ),
+            Message.text("user", "second"),
+        ],
+    )
+    payload = build_openai_payload(request, reasoning_state="server", chain=False)
+    assert "previous_response_id" not in payload
+    assert payload["store"] is True
+    texts = [c.get("text") for item in payload["input"] for c in item.get("content", [])]
+    assert "first" in texts and "second" in texts
+    types = [item.get("type") for item in payload["input"]]
+    assert "reasoning" not in types and "response_ref" not in types

@@ -46,6 +46,7 @@ _PROTECTED_HEADER_NAMES = {
     "content-type",
 }
 _OPENAI_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_VALID_REASONING_STATES = {"inline", "server"}
 
 
 class OpenAIError(RuntimeError):
@@ -172,6 +173,7 @@ class OpenAIProvider(ModelProvider):
         stream_idle_timeout_s: float = DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: OpenAITransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        reasoning_state: str = "inline",
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key = require_nonblank(
@@ -191,24 +193,49 @@ class OpenAIProvider(ModelProvider):
         self.stream_idle_timeout_s = float(stream_idle_timeout_s)
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = _copy_headers(extra_headers)
+        self.reasoning_state = _validate_reasoning_state(reasoning_state)
 
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
-            payload = build_openai_payload(request, stream=True)
-            raw_events = self.transport.stream_response_events(
-                url=f"{self.base_url}/v1/responses",
-                headers=self._headers(),
-                payload=payload,
-                timeout_s=self.timeout_s,
-                stream_idle_timeout_s=self.stream_idle_timeout_s,
+            payload = build_openai_payload(
+                request, stream=True, reasoning_state=self.reasoning_state
             )
-            async for event in openai_stream_events(raw_events):
+            yielded_any = False
+            try:
+                async for event in self._consume(payload):
+                    yielded_any = True
+                    yield event
+                return
+            except OpenAIAPIError as exc:
+                recoverable = (
+                    self.reasoning_state == "server"
+                    and not yielded_any
+                    and _is_stale_chain_error(exc)
+                )
+                if not recoverable:
+                    raise
+            # Recovery: one clean full resend rebuilt from neutral parts.
+            recovery_payload = build_openai_payload(
+                request, stream=True, reasoning_state=self.reasoning_state, chain=False
+            )
+            async for event in self._consume(recovery_payload):
                 yield event
         except Exception as exc:
             yield ModelStreamEvent.error(_exception_message(exc))
+
+    async def _consume(self, payload: dict[str, Any]) -> AsyncIterator[ModelStreamEvent]:
+        raw_events = self.transport.stream_response_events(
+            url=f"{self.base_url}/v1/responses",
+            headers=self._headers(),
+            payload=payload,
+            timeout_s=self.timeout_s,
+            stream_idle_timeout_s=self.stream_idle_timeout_s,
+        )
+        async for event in openai_stream_events(raw_events, reasoning_state=self.reasoning_state):
+            yield event
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -219,27 +246,54 @@ class OpenAIProvider(ModelProvider):
         return headers
 
 
-def build_openai_payload(request: ModelRequest, *, stream: bool = False) -> dict[str, Any]:
+def build_openai_payload(
+    request: ModelRequest,
+    *,
+    stream: bool = False,
+    reasoning_state: str = "inline",
+    chain: bool = True,
+) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
+    reasoning_state = _validate_reasoning_state(reasoning_state)
+    if type(chain) is not bool:
+        raise TypeError("OpenAI payload chain must be a bool.")
 
     options = _openai_options(request.options)
     payload: dict[str, Any] = {
         "model": request.model,
         "input": [],
-        "store": False,
+        "store": reasoning_state == "server",
     }
     instructions = _system_text(request.messages)
     if instructions:
         payload["instructions"] = instructions
 
     resolved_attachments = resolved_file_attachments_from_options(request.options)
+
+    previous_response_id: str | None = None
+    messages_to_send = request.messages
+    use_provider_state = True
+    if reasoning_state == "server" and chain:
+        previous_response_id, messages_to_send = _server_chain(request.messages)
+    elif reasoning_state == "server" and not chain:
+        use_provider_state = False  # recovery: rebuild from neutral parts
+
     input_items: list[dict[str, Any]] = []
-    for message in request.messages:
-        input_items.extend(_openai_input_items(message, resolved_attachments=resolved_attachments))
+    for message in messages_to_send:
+        input_items.extend(
+            _openai_input_items(
+                message,
+                resolved_attachments=resolved_attachments,
+                reasoning_state=reasoning_state,
+                use_provider_state=use_provider_state,
+            )
+        )
     if not input_items:
         raise ValueError("OpenAI requests require at least one non-system input item.")
     payload["input"] = input_items
+    if previous_response_id is not None:
+        payload["previous_response_id"] = previous_response_id
 
     tools = [_openai_tool(tool) for tool in request.tools]
     if tools:
@@ -249,7 +303,8 @@ def build_openai_payload(request: ModelRequest, *, stream: bool = False) -> dict
     # (HTTP 404). Requesting reasoning.encrypted_content attaches an opaque blob
     # that round-trips reasoning across stateless calls. Harmless for non-reasoning
     # models. Apps can still override via options.openai.
-    payload["include"] = ["reasoning.encrypted_content"]
+    if reasoning_state == "inline":
+        payload["include"] = ["reasoning.encrypted_content"]
     if stream:
         payload["stream"] = True
     payload.update(options)
@@ -298,7 +353,7 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
 
 
 async def openai_stream_events(
-    events: AsyncIterator[Mapping[str, Any]],
+    events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
 ) -> AsyncIterator[ModelStreamEvent]:
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     fallback_output_items: dict[int, dict[str, Any]] = {}
@@ -339,7 +394,9 @@ async def openai_stream_events(
             yield tool_call_event
             continue
         if event_type in {"response.completed", "response.incomplete"}:
-            yield _stream_completed_event(event, fallback_output_items)
+            yield _stream_completed_event(
+                event, fallback_output_items, reasoning_state=reasoning_state
+            )
             completed = True
             continue
         if event_type in {"response.failed", "error"}:
@@ -446,9 +503,18 @@ def _function_call_event(
 def _completed_event_from_response(
     response: Mapping[str, Any],
     provider_state_items: list[dict[str, Any]] | None = None,
+    *,
+    reasoning_state: str = "inline",
 ) -> ModelStreamEvent:
     if provider_state_items is None:
         provider_state_items = _provider_state_items_from_response(response)
+    if reasoning_state == "server":
+        response_id = _optional_string(response, "id")
+        if response_id:
+            provider_state_items = [
+                *provider_state_items,
+                {"provider": "openai", "state": {"type": "response_ref", "id": response_id}},
+            ]
     return ModelStreamEvent.completed(
         {
             "id": _optional_string(response, "id"),
@@ -467,14 +533,16 @@ def _completed_event_from_response(
 def _stream_completed_event(
     event: Mapping[str, Any],
     fallback_output_items: Mapping[int, Mapping[str, Any]],
+    *,
+    reasoning_state: str = "inline",
 ) -> ModelStreamEvent:
     response = _stream_response_object(event)
     if response.get("output") is None:
-        provider_state_items = _provider_state_items_from_output_items(
-            fallback_output_items,
+        provider_state_items = _provider_state_items_from_output_items(fallback_output_items)
+        return _completed_event_from_response(
+            response, provider_state_items, reasoning_state=reasoning_state
         )
-        return _completed_event_from_response(response, provider_state_items)
-    return _completed_event_from_response(response)
+    return _completed_event_from_response(response, reasoning_state=reasoning_state)
 
 
 def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -701,6 +769,8 @@ def _openai_input_items(
     message: Message,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
+    reasoning_state: str = "inline",
+    use_provider_state: bool = True,
 ) -> list[dict[str, Any]]:
     if message.role == MessageRole.SYSTEM:
         return []
@@ -712,7 +782,9 @@ def _openai_input_items(
             }
         ]
     if message.role == MessageRole.ASSISTANT:
-        provider_state_items = _openai_provider_state_items(message)
+        provider_state_items = _openai_provider_state_items(
+            message, reasoning_state=reasoning_state, use_provider_state=use_provider_state
+        )
         if provider_state_items:
             return provider_state_items
 
@@ -759,7 +831,37 @@ def _openai_input_items(
     raise OpenAIProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
-def _openai_provider_state_items(message: Message) -> list[dict[str, Any]]:
+def _server_chain(messages: list[Message]) -> tuple[str | None, list[Message]]:
+    """Return (previous_response_id, messages_to_send) for server mode.
+
+    Finds the latest assistant message carrying a response_ref marker. Everything
+    at or before it already lives on OpenAI's servers, so only later messages are
+    sent. No marker found -> (None, all messages) for a full first send.
+    """
+    last_index: int | None = None
+    last_id: str | None = None
+    for index, message in enumerate(messages):
+        if message.role != MessageRole.ASSISTANT:
+            continue
+        for part in message.content:
+            if type(part) is not ProviderStatePart or part.provider != "openai":
+                continue
+            state = part.state
+            if isinstance(state, dict) and state.get("type") == "response_ref":
+                response_id = state.get("id")
+                if isinstance(response_id, str) and response_id:
+                    last_index = index
+                    last_id = response_id
+    if last_index is None:
+        return None, messages
+    return last_id, messages[last_index + 1 :]
+
+
+def _openai_provider_state_items(
+    message: Message, *, reasoning_state: str = "inline", use_provider_state: bool = True
+) -> list[dict[str, Any]]:
+    if not use_provider_state:
+        return []
     items: list[dict[str, Any]] = []
     for part in message.content:
         if type(part) is not ProviderStatePart:
@@ -770,7 +872,16 @@ def _openai_provider_state_items(message: Message) -> list[dict[str, Any]]:
         if type(state) is not dict:
             raise OpenAIProtocolError("OpenAI provider state must be an object.")
         item_type = state.get("type")
-        if item_type not in {"reasoning", "message", "function_call"}:
+        if item_type == "response_ref":
+            continue  # synthetic chain marker, never sent as input
+        if item_type == "reasoning":
+            # Inline mode replays reasoning with its encrypted_content; server mode
+            # leaves reasoning on OpenAI's servers, so never replays it.
+            if reasoning_state == "server":
+                continue
+            items.append(state)
+            continue
+        if item_type not in {"message", "function_call"}:
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI provider state item type: {item_type!r}."
             )
@@ -1056,3 +1167,16 @@ def _exception_message(exc: Exception) -> str:
     if message:
         return message
     return f"{type(exc).__name__}: OpenAI provider failed"
+
+
+def _is_stale_chain_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "previous_response_id" in message and "not found" in message:
+        return True
+    return "previous response with id" in message and "not found" in message
+
+
+def _validate_reasoning_state(value: str) -> str:
+    if value not in _VALID_REASONING_STATES:
+        raise ValueError(f"reasoning_state must be one of {sorted(_VALID_REASONING_STATES)}.")
+    return value
