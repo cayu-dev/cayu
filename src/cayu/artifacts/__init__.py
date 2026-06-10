@@ -24,8 +24,16 @@ from cayu.artifacts.base import (
     ArtifactStore,
 )
 from cayu.artifacts.local import LocalArtifactStore
+from cayu.artifacts.workspace import (
+    DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES,
+    ArtifactToWorkspaceResult,
+    WorkspaceToArtifactResult,
+    copy_artifact_to_workspace,
+    copy_workspace_file_to_artifact,
+)
 
 __all__ = [
+    "DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES",
     "DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST",
     "DEFAULT_MAX_FILE_ATTACHMENT_BYTES",
     "DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES",
@@ -38,10 +46,14 @@ __all__ = [
     "ArtifactReadResult",
     "ArtifactScope",
     "ArtifactStore",
+    "ArtifactToWorkspaceResult",
     "FileAttachment",
     "FileAttachmentKind",
     "LocalArtifactStore",
     "ResolvedFileAttachment",
+    "WorkspaceToArtifactResult",
+    "copy_artifact_to_workspace",
+    "copy_workspace_file_to_artifact",
     "file_attachment",
     "file_attachment_from_payload",
     "resolved_file_attachment",

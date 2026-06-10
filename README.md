@@ -90,6 +90,36 @@ environment = Environment(
 )
 ```
 
+Use the workspace for mutable work and the artifact store for durable file objects.
+For a coding agent, clone the target repo into the sandbox workspace and let file
+tools and command tools operate there. For a document or invoice agent, store the
+original upload as an artifact, copy it into the workspace only when a path-based
+tool or script needs to edit/process it, then store the generated output as a new
+artifact:
+
+```python
+from cayu import copy_artifact_to_workspace, copy_workspace_file_to_artifact
+
+await copy_artifact_to_workspace(
+    artifact_store,
+    workspace,
+    artifact_id,
+    "inputs/invoice.pdf",
+)
+
+output = await copy_workspace_file_to_artifact(
+    workspace,
+    artifact_store,
+    "results/invoice-summary.json",
+    session_id=session_id,
+    agent_name="invoice-agent",
+    environment_name="local",
+)
+```
+
+These copy helpers are explicit one-way operations. There is no hidden sync between
+artifact storage and the active workspace.
+
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:
 
@@ -162,6 +192,12 @@ CAYU_PROVIDER=openai CAYU_ARTIFACT_KIND=pdf PYTHONPATH=src python examples/artif
 export ANTHROPIC_API_KEY=...
 CAYU_PROVIDER=anthropic CAYU_ARTIFACT_KIND=image PYTHONPATH=src python examples/artifact_file_live.py
 CAYU_PROVIDER=anthropic CAYU_ARTIFACT_KIND=pdf PYTHONPATH=src python examples/artifact_file_live.py
+```
+
+Run the deterministic artifact/workspace bridge example:
+
+```bash
+PYTHONPATH=src python examples/artifact_workspace_bridge.py
 ```
 
 Use durable local session/event/transcript storage:

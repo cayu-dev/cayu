@@ -350,6 +350,41 @@ Environment(
 
 Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 
+### Workspace/artifact bridge
+
+The artifact store is not the agent's mutable filesystem. The workspace is not the durable upload/output store. Move files between them explicitly:
+
+```python
+from cayu import copy_artifact_to_workspace, copy_workspace_file_to_artifact
+
+await copy_artifact_to_workspace(
+    artifact_store,
+    workspace,
+    artifact_id,
+    "inputs/invoice.pdf",
+)
+
+# Agent tools or app-owned scripts can now work on /workspace/inputs/invoice.pdf.
+
+output = await copy_workspace_file_to_artifact(
+    workspace,
+    artifact_store,
+    "results/invoice-summary.json",
+    session_id=session_id,
+    agent_name="invoice-agent",
+    environment_name="local",
+    metadata={"source_artifact_id": artifact_id},
+)
+```
+
+By default these helpers refuse to write partial copies when a file exceeds `max_bytes`. Increase `max_bytes` for large files, or pass `allow_truncated=True` only when a partial copy is intentional and safe for the application.
+
+Common patterns:
+
+- Coding agent: clone the repo into the workspace, work there, and commit/push through explicit policy. No artifact copy is needed for normal source files.
+- Document/invoice agent: keep the original upload as an artifact, copy it into the workspace only when a path-based tool/script must edit or process it, and store the final output as a new artifact.
+- Workspace PDF/image inspection: `read_file(path=...)` captures a stable artifact snapshot before provider-native inspection, because the workspace file can change after the tool result is written.
+
 Immediately before a provider request, the runtime scans model-facing tool results for `cayu.file_attachment.v1` references, resolves the referenced bytes from the active `ArtifactStore`, verifies session/environment scope again, and passes a temporary `cayu_file_attachments` map in `ModelRequest.options`. Provider adapters translate that temporary map into native provider content:
 
 - Anthropic: `image` and `document` content blocks inside `tool_result` content.

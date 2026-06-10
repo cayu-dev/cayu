@@ -85,6 +85,15 @@ Cayu follows an agent/environment/session separation:
 - `Runner`: executes explicit `ExecCommand` values in a workspace or sandbox.
 - `Sandbox`: isolated workspace plus runner plus lifecycle and limits.
 
+Workspaces and artifacts are separate on purpose:
+
+- Use the workspace for mutable work: cloned repositories, temporary files, generated outputs, editable documents, test results, and command-line processing.
+- Use the artifact store for durable file objects: original uploads, stable snapshots, final outputs, evidence, attachments, and files that must survive replay/fork/resume independently of the current workspace state.
+- Use Git inside the workspace for code repositories when the Git remote is the source of truth. A coding agent should usually clone into the sandbox workspace, edit there, and only commit/push through explicit user policy.
+- Copy artifacts into the workspace only when a tool or script needs a path-backed mutable file. Store workspace files back as artifacts only when a generated/edited result should become durable output.
+
+There is no implicit bidirectional sync between artifacts and the workspace. Copies are explicit one-way operations.
+
 Model-facing file reads should persist artifact references, not provider-specific file payloads. The runtime resolves those references from the active artifact store immediately before provider calls, and provider adapters translate them into Anthropic/OpenAI/etc. native file/image/document content. Built-in context policies strip older native attachment references from provider-facing history while keeping transcript summaries, so file-heavy sessions do not resend the same bytes indefinitely. This keeps transcripts portable while still allowing multimodal providers to inspect images and PDFs.
 
 `LocalRunner` is not a sandbox. It is only a development or already-disposable-environment execution backend.

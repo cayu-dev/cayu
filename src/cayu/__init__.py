@@ -1,6 +1,7 @@
 """Cayu public API."""
 
 from cayu.artifacts import (
+    DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
@@ -11,10 +12,14 @@ from cayu.artifacts import (
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
+    ArtifactToWorkspaceResult,
     FileAttachment,
     FileAttachmentKind,
     LocalArtifactStore,
     ResolvedFileAttachment,
+    WorkspaceToArtifactResult,
+    copy_artifact_to_workspace,
+    copy_workspace_file_to_artifact,
     file_attachment,
     file_attachment_from_payload,
 )
@@ -164,6 +169,7 @@ from cayu.workspaces import (
 )
 
 __all__ = [
+    "DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
     "DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST",
     "DEFAULT_MAX_FILE_ATTACHMENT_BYTES",
@@ -196,6 +202,7 @@ __all__ = [
     "ArtifactReader",
     "ArtifactScope",
     "ArtifactStore",
+    "ArtifactToWorkspaceResult",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CompactionPromptBuilder",
@@ -308,9 +315,12 @@ __all__ = [
     "WorkflowSpec",
     "WorkspaceListResult",
     "WorkspaceReadResult",
+    "WorkspaceToArtifactResult",
     "WriteFileTool",
     "connect_mcp_toolset",
+    "copy_artifact_to_workspace",
     "copy_secret_env",
+    "copy_workspace_file_to_artifact",
     "default_artifact_readers",
     "default_compaction_prompt",
     "file_attachment",
