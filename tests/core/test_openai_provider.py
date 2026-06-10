@@ -177,6 +177,9 @@ def test_build_openai_payload_translates_cayu_messages() -> None:
             }
         ],
         "store": False,
+        # Requested so reasoning items carry encrypted_content and survive replay
+        # across stateless (store=false) calls instead of 404-ing on their rs_ id.
+        "include": ["reasoning.encrypted_content"],
         "temperature": 0.2,
     }
 

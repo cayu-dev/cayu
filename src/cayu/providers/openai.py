@@ -137,18 +137,22 @@ class HttpxOpenAITransport:
                     json=dict(payload),
                 ) as response,
             ):
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    # Read the streamed error body while the response is still open.
+                    # Otherwise _safe_error_response_text touches an unread streaming
+                    # body and raises httpx.ResponseNotRead, masking the real API
+                    # error (e.g. HTTP 404 "item not found").
+                    await response.aread()
+                    raise OpenAIAPIError(
+                        "OpenAI API request failed with HTTP "
+                        f"{response.status_code}: "
+                        f"{_safe_error_response_text(response)}"
+                    )
                 async for event in _aiter_sse_json_events(
                     response.aiter_lines(),
                     idle_timeout_s=stream_idle_timeout_s,
                 ):
                     yield event
-        except httpx.HTTPStatusError as exc:
-            raise OpenAIAPIError(
-                "OpenAI API request failed with HTTP "
-                f"{exc.response.status_code}: "
-                f"{_safe_error_response_text(exc.response)}"
-            ) from exc
         except httpx.RequestError as exc:
             raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
 
@@ -240,6 +244,12 @@ def build_openai_payload(request: ModelRequest, *, stream: bool = False) -> dict
     tools = [_openai_tool(tool) for tool in request.tools]
     if tools:
         payload["tools"] = tools
+    # Ask for encrypted reasoning content. Under store=false, reasoning output
+    # items carry only an rs_ id that the server cannot resolve on the next call
+    # (HTTP 404). Requesting reasoning.encrypted_content attaches an opaque blob
+    # that round-trips reasoning across stateless calls. Harmless for non-reasoning
+    # models. Apps can still override via options.openai.
+    payload["include"] = ["reasoning.encrypted_content"]
     if stream:
         payload["stream"] = True
     payload.update(options)
