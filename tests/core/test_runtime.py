@@ -17,6 +17,7 @@ from cayu.providers import (
     ModelStreamEventType,
 )
 from cayu.runtime import (
+    CancelSessionRequest,
     CayuApp,
     CheckpointCompactionContextPolicy,
     CompactionRequest,
@@ -7783,3 +7784,487 @@ def test_cayu_app_freezes_tool_declarations_at_registration():
     assert events[3].type == EventType.TOOL_CALL_STARTED
     assert events[3].tool_name == "echo"
     assert events[4].type == EventType.TOOL_CALL_COMPLETED
+
+
+def test_cancel_session_marks_running_session_cancelled_and_emits_event():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cancel_direct",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_cancel_direct", SessionStatus.RUNNING)
+        events = [
+            event
+            async for event in app.cancel_session(
+                CancelSessionRequest(
+                    session_id="sess_cancel_direct",
+                    reason="operator requested stop",
+                    metadata={"actor": "operator"},
+                )
+            )
+        ]
+        return events, await store.load("sess_cancel_direct")
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.CANCELLED
+    assert [event.type for event in events] == [EventType.SESSION_CANCELLED]
+    assert events[0].payload == {
+        "reason": "operator requested stop",
+        "metadata": {"actor": "operator"},
+    }
+
+
+def test_cancel_session_race_returns_existing_cancel_event_without_duplicate():
+    class PausingCancelStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transition_started: asyncio.Event | None = None
+            self.allow_transition_return: asyncio.Event | None = None
+
+        async def transition_status(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+        ) -> Session:
+            session = await super().transition_status(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+            )
+            if (
+                session_id == "sess_cancel_race_idempotent"
+                and to_status == SessionStatus.CANCELLED
+                and self.transition_started is not None
+                and self.allow_transition_return is not None
+            ):
+                self.transition_started.set()
+                await self.allow_transition_return.wait()
+            return session
+
+    store = PausingCancelStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        store.transition_started = asyncio.Event()
+        store.allow_transition_return = asyncio.Event()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cancel_race_idempotent",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_cancel_race_idempotent", SessionStatus.RUNNING)
+
+        async def cancel(reason: str) -> list[Event]:
+            return [
+                event
+                async for event in app.cancel_session(
+                    CancelSessionRequest(
+                        session_id="sess_cancel_race_idempotent",
+                        reason=reason,
+                    )
+                )
+            ]
+
+        first_cancel = asyncio.create_task(cancel("first request"))
+        await store.transition_started.wait()
+        second_cancel = asyncio.create_task(cancel("second request"))
+        await asyncio.sleep(0)
+        store.allow_transition_return.set()
+        first_events, second_events = await asyncio.gather(first_cancel, second_cancel)
+        stored_events = await store.load_events("sess_cancel_race_idempotent")
+        return first_events, second_events, stored_events
+
+    first_events, second_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in first_events] == [EventType.SESSION_CANCELLED]
+    assert [event.type for event in second_events] == [EventType.SESSION_CANCELLED]
+    assert first_events[0].id == second_events[0].id
+    assert first_events[0].payload["reason"] == "first request"
+    assert [event for event in stored_events if event.type == EventType.SESSION_CANCELLED] == [
+        first_events[0]
+    ]
+
+
+def test_run_stops_after_session_is_cancelled_before_tool_execution():
+    store = InMemorySessionStore()
+    side_effect = SideEffectTool()
+
+    class CancellingSink(EventSink):
+        async def emit(self, event: Event) -> None:
+            if event.type == EventType.MODEL_COMPLETED:
+                await store.update_status(event.session_id, SessionStatus.CANCELLED)
+                await store.append_event(
+                    event.session_id,
+                    Event(
+                        type=EventType.SESSION_CANCELLED,
+                        session_id=event.session_id,
+                        agent_name=event.agent_name,
+                        environment_name=event.environment_name,
+                        payload={"reason": "test cancellation", "metadata": {}},
+                    ),
+                )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store, event_sinks=[CancellingSink()])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[side_effect],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cancel_before_tool",
+                messages=[Message.text("user", "call tool")],
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_cancel_before_tool"))
+
+    assert session is not None
+    assert session.status == SessionStatus.CANCELLED
+    assert side_effect.calls == []
+    assert len(provider.requests) == 1
+    assert events[-1].type == EventType.SESSION_CANCELLED
+    assert EventType.TOOL_CALL_STARTED not in [event.type for event in events]
+
+
+def test_run_cancels_running_task_when_session_is_cancelled():
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+
+    class CancellingSink(EventSink):
+        async def emit(self, event: Event) -> None:
+            if event.type == EventType.MODEL_COMPLETED:
+                await store.update_status(event.session_id, SessionStatus.CANCELLED)
+                await store.append_event(
+                    event.session_id,
+                    Event(
+                        type=EventType.SESSION_CANCELLED,
+                        session_id=event.session_id,
+                        agent_name=event.agent_name,
+                        environment_name=event.environment_name,
+                        payload={"reason": "task cancellation", "metadata": {}},
+                    ),
+                )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store, task_store=tasks, event_sinks=[CancellingSink()])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    async def run():
+        task = await tasks.create_task(TaskCreate(type="run", title="cancel me"))
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancel_task",
+                    task_id=task.id,
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+        return events, await tasks.load_task(task.id)
+
+    events, task = asyncio.run(run())
+
+    assert task is not None
+    assert task.status == TaskStatus.CANCELLED
+    assert EventType.TASK_CANCELLED in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_CANCELLED
+
+
+def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
+    class PausingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.provider_waiting: asyncio.Event | None = None
+            self.allow_provider_complete: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"})
+            if self.provider_waiting is None or self.allow_provider_complete is None:
+                raise AssertionError("PausingProvider test events were not initialized.")
+            self.provider_waiting.set()
+            await self.allow_provider_complete.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+    class PausingCancelStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transition_started: asyncio.Event | None = None
+            self.allow_transition_return: asyncio.Event | None = None
+
+        async def transition_status(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+        ) -> Session:
+            session = await super().transition_status(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+            )
+            if (
+                session_id == "sess_run_cancel_race"
+                and to_status == SessionStatus.CANCELLED
+                and self.transition_started is not None
+                and self.allow_transition_return is not None
+            ):
+                self.transition_started.set()
+                await self.allow_transition_return.wait()
+            return session
+
+    store = PausingCancelStore()
+    provider = PausingProvider()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    async def run():
+        store.transition_started = asyncio.Event()
+        store.allow_transition_return = asyncio.Event()
+        provider.provider_waiting = asyncio.Event()
+        provider.allow_provider_complete = asyncio.Event()
+
+        async def run_session() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_run_cancel_race",
+                        messages=[Message.text("user", "hello")],
+                    )
+                )
+            ]
+
+        async def cancel_session() -> list[Event]:
+            return [
+                event
+                async for event in app.cancel_session(
+                    CancelSessionRequest(
+                        session_id="sess_run_cancel_race",
+                        reason="external cancel",
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(run_session())
+        await provider.provider_waiting.wait()
+
+        cancel_task = asyncio.create_task(cancel_session())
+        await store.transition_started.wait()
+        provider.allow_provider_complete.set()
+        await asyncio.sleep(0)
+        store.allow_transition_return.set()
+
+        run_events, cancel_events = await asyncio.gather(run_task, cancel_task)
+        stored_events = await store.load_events("sess_run_cancel_race")
+        return run_events, cancel_events, stored_events
+
+    run_events, cancel_events, stored_events = asyncio.run(run())
+
+    stored_cancel_events = [
+        event for event in stored_events if event.type == EventType.SESSION_CANCELLED
+    ]
+    assert len(stored_cancel_events) == 1
+    assert [event.type for event in cancel_events] == [EventType.SESSION_CANCELLED]
+    assert run_events[-1].type == EventType.SESSION_CANCELLED
+    assert run_events[-1].id == cancel_events[0].id == stored_cancel_events[0].id
+    assert stored_cancel_events[0].payload["reason"] == "external cancel"
+
+
+def test_cancel_interrupted_session_cancels_pending_approval_task():
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+
+    class ApprovalPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"approval required for {request.tool_name}",
+            )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store, task_store=tasks)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        tool_policy=ApprovalPolicy(),
+    )
+
+    async def run():
+        task = await tasks.create_task(TaskCreate(task_id="task_cancel_approval", type="run"))
+        interrupted_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancel_approval",
+                    task_id=task.id,
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+        assert interrupted_events[-1].type == EventType.SESSION_INTERRUPTED
+
+        cancel_events = [
+            event
+            async for event in app.cancel_session(
+                CancelSessionRequest(
+                    session_id="sess_cancel_approval",
+                    reason="operator requested stop",
+                )
+            )
+        ]
+        return (
+            cancel_events,
+            await store.load("sess_cancel_approval"),
+            await tasks.load_task(task.id),
+        )
+
+    cancel_events, session, task = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.CANCELLED
+    assert task is not None
+    assert task.status == TaskStatus.CANCELLED
+    assert [event.type for event in cancel_events] == [
+        EventType.SESSION_CANCELLED,
+        EventType.TASK_CANCELLED,
+    ]
+
+
+def test_cancel_interrupted_session_orders_terminal_task_and_hook_events():
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    hook_calls: list[tuple[str, EventType | str]] = []
+
+    class ApprovalPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"approval required for {request.tool_name}",
+            )
+
+    class CancellationHook(RuntimeHook):
+        @property
+        def name(self) -> str:
+            return "cancellation_hook"
+
+        async def after_session_cancelled(self, context: RuntimeHookContext) -> None:
+            hook_calls.append((context.session.id, context.terminal_event.type))
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        task_store=tasks,
+        runtime_hooks=[CancellationHook()],
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        tool_policy=ApprovalPolicy(),
+    )
+
+    async def run():
+        task = await tasks.create_task(TaskCreate(task_id="task_cancel_hook", type="run"))
+        interrupted_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancel_hook_order",
+                    task_id=task.id,
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+        assert interrupted_events[-1].type == EventType.SESSION_INTERRUPTED
+
+        cancel_events = [
+            event
+            async for event in app.cancel_session(
+                CancelSessionRequest(
+                    session_id="sess_cancel_hook_order",
+                    reason="operator requested stop",
+                )
+            )
+        ]
+        stored_events = await store.load_events("sess_cancel_hook_order")
+        return cancel_events, stored_events, await tasks.load_task(task.id)
+
+    cancel_events, stored_events, task = asyncio.run(run())
+
+    assert task is not None
+    assert task.status == TaskStatus.CANCELLED
+    assert [event.type for event in cancel_events[-4:]] == [
+        EventType.SESSION_CANCELLED,
+        EventType.TASK_CANCELLED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert [event.type for event in stored_events[-4:]] == [
+        EventType.SESSION_CANCELLED,
+        EventType.TASK_CANCELLED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert hook_calls == [("sess_cancel_hook_order", EventType.SESSION_CANCELLED)]

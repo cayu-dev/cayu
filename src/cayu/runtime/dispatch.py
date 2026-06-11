@@ -19,6 +19,7 @@ class DispatchStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    CANCELLED = "cancelled"
 
 
 class DispatchRequest(BaseModel):
@@ -167,4 +168,6 @@ def _dispatch_status_after_event(
         return DispatchStatus.FAILED
     if event.type == EventType.SESSION_INTERRUPTED:
         return DispatchStatus.INTERRUPTED
+    if event.type == EventType.SESSION_CANCELLED:
+        return DispatchStatus.CANCELLED
     return fallback

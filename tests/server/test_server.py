@@ -12,8 +12,9 @@ pytest.importorskip("sse_starlette")
 from fastapi.testclient import TestClient
 
 from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message
+from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import RunRequest, SessionIdentity, SessionStatus
+from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
 from cayu.server import create_server
 
 
@@ -206,3 +207,142 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
         "actor": "operator",
         "source": "dashboard",
     }
+
+
+def test_cancel_session_endpoint_streams_cancelled_event() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_running_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_cancel_endpoint",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status("session_cancel_endpoint", SessionStatus.RUNNING)
+
+    asyncio.run(create_running_session())
+    client = TestClient(create_server(app))
+
+    with client.stream(
+        "POST",
+        "/api/sessions/session_cancel_endpoint/cancel",
+        json={"reason": "operator requested stop", "metadata": {"actor": "operator"}},
+    ) as response:
+        assert response.status_code == 200
+        lines = list(response.iter_lines())
+
+    body = "\n".join(lines)
+    assert "session.cancelled" in body
+    assert "operator requested stop" in body
+
+    session = asyncio.run(app.session_store.load("session_cancel_endpoint"))
+    assert session is not None
+    assert session.status == SessionStatus.CANCELLED
+
+
+def test_cancel_session_endpoint_rejects_completed_session_before_streaming() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_completed_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_cancel_completed",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status("session_cancel_completed", SessionStatus.COMPLETED)
+
+    asyncio.run(create_completed_session())
+    client = TestClient(create_server(app))
+
+    response = client.post("/api/sessions/session_cancel_completed/cancel")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Session cannot be cancelled from status: completed",
+    }
+
+
+def test_cancel_session_endpoint_rejects_completion_race_before_streaming() -> None:
+    class CompletingRaceStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loads = 0
+
+        async def load(self, session_id: str):
+            self.loads += 1
+            if session_id == "session_cancel_race" and self.loads == 2:
+                await self.update_status(session_id, SessionStatus.COMPLETED)
+            return await super().load(session_id)
+
+    store = CompletingRaceStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_running_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_cancel_race",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status("session_cancel_race", SessionStatus.RUNNING)
+
+    asyncio.run(create_running_session())
+    client = TestClient(create_server(app))
+
+    response = client.post("/api/sessions/session_cancel_race/cancel")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Session status transition not allowed: completed -> cancelled"
+    )
+
+
+def test_cancel_session_endpoint_is_idempotent_for_cancelled_session() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_cancelled_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_cancel_idempotent",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status("session_cancel_idempotent", SessionStatus.CANCELLED)
+        await app.session_store.append_event(
+            "session_cancel_idempotent",
+            Event(
+                type=EventType.SESSION_CANCELLED,
+                session_id="session_cancel_idempotent",
+                agent_name="assistant",
+                payload={"reason": "already cancelled", "metadata": {}},
+            ),
+        )
+
+    asyncio.run(create_cancelled_session())
+    client = TestClient(create_server(app))
+
+    with client.stream("POST", "/api/sessions/session_cancel_idempotent/cancel") as response:
+        assert response.status_code == 200
+        lines = list(response.iter_lines())
+
+    body = "\n".join(lines)
+    assert "session.cancelled" in body
+    assert "already cancelled" in body

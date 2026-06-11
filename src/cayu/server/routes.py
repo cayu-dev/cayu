@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -16,11 +17,23 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
-from cayu.runtime.sessions import ResumeRequest, RunRequest, SessionQuery
+from cayu.runtime.sessions import (
+    CancelSessionRequest,
+    ResumeRequest,
+    RunRequest,
+    SessionQuery,
+    SessionStatus,
+)
 from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+_SERVER_CANCELLABLE_SESSION_STATUSES = {
+    SessionStatus.PENDING,
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTED,
+    SessionStatus.CANCELLED,
+}
 
 
 class RunBody(BaseModel):
@@ -31,6 +44,11 @@ class RunBody(BaseModel):
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
+
+
+class CancelSessionBody(BaseModel):
+    reason: NonBlankString | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolApprovalBody(BaseModel):
@@ -111,6 +129,52 @@ def create_router(
 
         async def generate():
             async for event in cayu_app.resume(request):
+                yield event_to_sse_data(event)
+
+        return EventSourceResponse(generate())
+
+    @router.post("/sessions/{session_id}/cancel")
+    async def cancel_session(session_id: NonBlankString, body: CancelSessionBody | None = None):
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            )
+        if session.status not in _SERVER_CANCELLABLE_SESSION_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session cannot be cancelled from status: {session.status.value}",
+            )
+
+        request = CancelSessionRequest(
+            session_id=session_id,
+            reason=body.reason if body is not None else None,
+            metadata=body.metadata if body is not None else {},
+        )
+        event_stream = cayu_app.cancel_session(request)
+        try:
+            first_event = await anext(event_stream)
+        except StopAsyncIteration as exc:
+            await event_stream.aclose()
+            raise HTTPException(
+                status_code=500,
+                detail="Session cancellation produced no events.",
+            ) from exc
+        except ValueError as exc:
+            await event_stream.aclose()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            await event_stream.aclose()
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception:
+            with contextlib.suppress(Exception):
+                await event_stream.aclose()
+            raise
+
+        async def generate():
+            yield event_to_sse_data(first_event)
+            async for event in event_stream:
                 yield event_to_sse_data(event)
 
         return EventSourceResponse(generate())

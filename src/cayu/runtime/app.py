@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
 from importlib.metadata import PackageNotFoundError, version
@@ -72,6 +74,7 @@ from cayu.runtime.hooks import (
     ToolCallHookContext,
 )
 from cayu.runtime.sessions import (
+    CancelSessionRequest,
     ForkSessionRequest,
     InMemorySessionStore,
     ResumeRequest,
@@ -80,6 +83,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionStatus,
     SessionStore,
+    copy_cancel_session_request,
     copy_fork_session_request,
     copy_resume_request,
     copy_run_request,
@@ -103,12 +107,25 @@ class _SessionInterrupted(Exception):
         self.approval = copy_pending_tool_approval(approval)
 
 
+class _SessionCancelled(Exception):
+    def __init__(self, session_id: str) -> None:
+        self.session_id = require_clean_nonblank(session_id, "session_id")
+        super().__init__(f"Session cancelled: {self.session_id}")
+
+
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
+_CANCELLABLE_SESSION_STATUSES = {
+    SessionStatus.PENDING,
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTED,
+}
+_CANCELLED_EVENT_WAIT_ATTEMPTS = 10
+_CANCELLED_EVENT_WAIT_INTERVAL_S = 0.01
 
 
 class CayuApp:
@@ -392,6 +409,88 @@ class CayuApp:
             start_event_payload_extra={},
         ):
             yield event
+
+    async def cancel_session(self, request: CancelSessionRequest) -> AsyncIterator[Event]:
+        if type(request) is not CancelSessionRequest:
+            raise TypeError("Runtime cancellation requires a CancelSessionRequest.")
+        request = copy_cancel_session_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        if loaded_session.status == SessionStatus.CANCELLED:
+            existing_cancel_event = await self._wait_for_session_cancelled_event(loaded_session.id)
+            if existing_cancel_event is not None:
+                yield existing_cancel_event
+                return
+            raise RuntimeError(
+                f"Session is cancelled but has no session.cancelled event: {loaded_session.id}"
+            )
+        else:
+            try:
+                session = await self.session_store.transition_status(
+                    loaded_session.id,
+                    from_statuses=_CANCELLABLE_SESSION_STATUSES,
+                    to_status=SessionStatus.CANCELLED,
+                )
+            except ValueError:
+                existing_cancel_event = await self._wait_for_session_cancelled_event(
+                    loaded_session.id
+                )
+                if existing_cancel_event is not None:
+                    yield existing_cancel_event
+                    return
+                raise
+        task_event: Event | None = None
+        task_cancel_error: Exception | None = None
+        if loaded_session.status == SessionStatus.INTERRUPTED and self.task_store is not None:
+            try:
+                task_event = await self._pending_approval_task_cancelled_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            except Exception as task_exc:
+                task_cancel_error = task_exc
+        payload = {
+            "reason": request.reason,
+            "metadata": request.metadata,
+        }
+        if task_cancel_error is not None:
+            payload["task_update_error"] = str(task_cancel_error)
+            payload["task_update_error_type"] = type(task_cancel_error).__name__
+        terminal_event_stream = self._emit_terminal_event_with_hooks(
+            event=Event(
+                type=EventType.SESSION_CANCELLED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload=payload,
+            ),
+            phase=RuntimeHookPhase.AFTER_SESSION_CANCELLED,
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+        try:
+            first_terminal_event = await anext(terminal_event_stream)
+        except StopAsyncIteration as exc:
+            raise RuntimeError("Session cancellation produced no terminal event.") from exc
+
+        try:
+            emitted_task_event = await self._emit(task_event) if task_event is not None else None
+            yield first_terminal_event
+            if emitted_task_event is not None:
+                yield emitted_task_event
+            async for event in terminal_event_stream:
+                yield event
+        except Exception:
+            with contextlib.suppress(Exception):
+                await _close_async_iterator(terminal_event_stream)
+            raise
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
@@ -1107,6 +1206,7 @@ class CayuApp:
                 messages_to_append,
             )
             for step in range(1, max_steps + 1):
+                await self._raise_if_session_cancelled(session.id)
                 try:
                     (
                         context_messages,
@@ -1161,6 +1261,7 @@ class CayuApp:
                             payload=checkpoint_event_payload,
                         )
                     )
+                await self._raise_if_session_cancelled(session.id)
 
                 model_request = ModelRequest(
                     model=session.model,
@@ -1249,6 +1350,7 @@ class CayuApp:
 
                 if not model_completed:
                     raise RuntimeError("Model provider stream ended without a completed event.")
+                await self._raise_if_session_cancelled(session.id)
 
                 assistant_message = transcript_helpers.assistant_message(
                     content_parts=assistant_parts,
@@ -1264,6 +1366,7 @@ class CayuApp:
                 if not tool_calls:
                     break
 
+                await self._raise_if_session_cancelled(session.id)
                 policy_plan = await self._policy_plan_for_tool_round(
                     session=session,
                     registered_agent=registered_agent,
@@ -1294,6 +1397,7 @@ class CayuApp:
                 }
                 tool_outcomes: list[runtime_records.ToolCallOutcome] = []
                 for tool_call in tool_calls:
+                    await self._raise_if_session_cancelled(session.id)
                     async for event, outcome in self._execute_tool_call(
                         session=session,
                         registered_agent=registered_agent,
@@ -1306,6 +1410,7 @@ class CayuApp:
                         yield event
                         if outcome is not None:
                             tool_outcomes.append(outcome)
+                    await self._raise_if_session_cancelled(session.id)
 
                 tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
                 messages.extend(tool_result_messages)
@@ -1317,6 +1422,7 @@ class CayuApp:
                 raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
 
             if task_id is not None:
+                await self._raise_if_session_cancelled(session.id)
                 task = await self._complete_task(
                     task_id=task_id,
                     session=session,
@@ -1361,6 +1467,63 @@ class CayuApp:
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
+        except _SessionCancelled:
+            task_cancel_error: Exception | None = None
+            if (
+                task_started
+                and not task_finished
+                and task_id is not None
+                and self.task_store is not None
+            ):
+                try:
+                    task = await self.task_store.cancel_task(
+                        task_id,
+                        {
+                            "message": "Session cancelled.",
+                            "session_id": session.id,
+                        },
+                    )
+                    yield await self._emit(
+                        _task_event(
+                            event_type=EventType.TASK_CANCELLED,
+                            task=task,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    )
+                except Exception as task_exc:
+                    task_cancel_error = task_exc
+            loaded_cancelled = await self.session_store.load(session.id)
+            if loaded_cancelled is None:
+                raise KeyError(f"Session not found: {session.id}") from None
+            if loaded_cancelled.status != SessionStatus.CANCELLED:
+                loaded_cancelled = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.CANCELLED,
+                )
+            existing_cancel_event = await self._wait_for_session_cancelled_event(session.id)
+            if existing_cancel_event is not None:
+                yield existing_cancel_event
+                return
+            payload: dict[str, Any] = {}
+            if task_cancel_error is not None:
+                payload["task_update_error"] = str(task_cancel_error)
+                payload["task_update_error_type"] = type(task_cancel_error).__name__
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_CANCELLED,
+                    session_id=loaded_cancelled.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_CANCELLED,
+                session=loaded_cancelled,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
             ):
@@ -1771,6 +1934,65 @@ class CayuApp:
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
         return checkpoint
+
+    async def _pending_approval_task_cancelled_event(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        if self.task_store is None:
+            return None
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        if pending_approval is None or pending_approval.task_id is None:
+            return None
+        task = await self.task_store.cancel_task(
+            pending_approval.task_id,
+            {
+                "message": "Session cancelled.",
+                "session_id": session.id,
+                "approval_id": pending_approval.approval_id,
+            },
+        )
+        return _task_event(
+            event_type=EventType.TASK_CANCELLED,
+            task=task,
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+
+    async def _raise_if_session_cancelled(self, session_id: str) -> None:
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        if session.status == SessionStatus.CANCELLED:
+            raise _SessionCancelled(session_id)
+
+    async def _latest_session_cancelled_event(self, session_id: str) -> Event | None:
+        events = await self.session_store.load_events(session_id)
+        for event in reversed(events):
+            if event.type == EventType.SESSION_CANCELLED:
+                return event.model_copy(deep=True)
+        return None
+
+    async def _wait_for_session_cancelled_event(self, session_id: str) -> Event | None:
+        for attempt in range(_CANCELLED_EVENT_WAIT_ATTEMPTS):
+            existing_event = await self._latest_session_cancelled_event(session_id)
+            if existing_event is not None:
+                return existing_event
+
+            session = await self.session_store.load(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.status != SessionStatus.CANCELLED:
+                return None
+            if attempt < _CANCELLED_EVENT_WAIT_ATTEMPTS - 1:
+                await asyncio.sleep(_CANCELLED_EVENT_WAIT_INTERVAL_S)
+
+        return None
 
     async def _emit(self, event: Event) -> Event:
         await self.session_store.append_event(event.session_id, event)
@@ -2290,6 +2512,9 @@ async def _call_runtime_hook(
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         await hook.after_session_interrupted(context)
         return
+    if phase == RuntimeHookPhase.AFTER_SESSION_CANCELLED:
+        await hook.after_session_cancelled(context)
+        return
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 
@@ -2311,9 +2536,17 @@ def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
         return "after_session_failed"
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         return "after_session_interrupted"
+    if phase == RuntimeHookPhase.AFTER_SESSION_CANCELLED:
+        return "after_session_cancelled"
     if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
         return "after_tool_call"
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
+
+
+async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is not None:
+        await close()
 
 
 def _runtime_hook_event(

@@ -79,6 +79,7 @@ from cayu.runners import (
 )
 from cayu.runtime import (
     AllowAllToolPolicy,
+    CancelSessionRequest,
     CayuApp,
     CheckpointCompactionContextPolicy,
     CompactionPromptBuilder,
@@ -217,6 +218,7 @@ __all__ = [
     "ArtifactScope",
     "ArtifactStore",
     "ArtifactToWorkspaceResult",
+    "CancelSessionRequest",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CompactionPromptBuilder",

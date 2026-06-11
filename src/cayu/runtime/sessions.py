@@ -22,6 +22,7 @@ class SessionStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    CANCELLED = "cancelled"
 
 
 class RunRequest(BaseModel):
@@ -92,6 +93,31 @@ class ResumeRequest(BaseModel):
         value: str | None,
         info,
     ) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+
+class CancelSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_optional_reason(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
@@ -733,6 +759,16 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         model=request.model,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
+    )
+
+
+def copy_cancel_session_request(request: CancelSessionRequest) -> CancelSessionRequest:
+    if type(request) is not CancelSessionRequest:
+        raise TypeError("Session cancellation requires a CancelSessionRequest.")
+    return CancelSessionRequest(
+        session_id=request.session_id,
+        reason=request.reason,
+        metadata=copy_json_value(request.metadata, "metadata"),
     )
 
 

@@ -45,6 +45,7 @@ from cayu.runtime.hooks import (
     ToolCallHookContext,
 )
 from cayu.runtime.sessions import (
+    CancelSessionRequest,
     CheckpointTransform,
     EventQuery,
     EventRecord,
@@ -79,6 +80,7 @@ from cayu.runtime.tool_policy import (
 
 __all__ = [
     "AllowAllToolPolicy",
+    "CancelSessionRequest",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CheckpointTransform",

@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, session cancellation, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
@@ -346,6 +346,25 @@ resume_request = ResumeRequest(
     messages=[Message.text("user", "Continue with the larger model.")],
     model="gpt-5.5",
 )
+```
+
+Cancel a pending, running, or interrupted session through the runtime.
+Cancellation is durable: Cayu marks the session `cancelled`, emits
+`session.cancelled`, and cooperatively stops active runtime loops before further
+model requests or tool calls. If the run is linked to a running task, Cayu marks
+that task `cancelled`.
+
+```python
+from cayu import CancelSessionRequest
+
+async for event in app.cancel_session(
+    CancelSessionRequest(
+        session_id="sess_123",
+        reason="operator requested stop",
+        metadata={"actor": "operator"},
+    )
+):
+    print(event.type)
 ```
 
 Fork a completed, failed, or interrupted session to create a new branch without mutating the source session:
