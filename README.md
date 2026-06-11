@@ -45,8 +45,10 @@ src/cayu/
 ```
 
 `LocalRunner` is for trusted local development. `MicrosandboxRunner` is available
-behind the optional `cayu[microsandbox]` extra for microVM-backed command
-execution when agents need an isolated sandbox boundary.
+behind the optional `cayu[microsandbox]` extra for local microVM-backed command
+execution. `E2BRunner` and `E2BWorkspace` are available behind the optional
+`cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
+access.
 
 ## Development
 
@@ -134,6 +136,39 @@ environment = Environment(
 )
 ```
 
+For E2B execution, use `E2BWorkspace` so file tools read/write/list through
+E2B's native filesystem API while command tools run in the same cloud sandbox:
+
+```python
+from cayu import E2BRunner, E2BWorkspace, Environment, EnvironmentSpec
+
+runner = await E2BRunner.create(
+    template="base",
+    sandbox_timeout_s=300,
+    close_action="kill",
+)
+environment = Environment(
+    EnvironmentSpec(name="e2b"),
+    runner=runner,
+    workspace=E2BWorkspace(runner, workspace_id="e2b-workspace"),
+)
+```
+
+Install the optional dependency with:
+
+```bash
+pip install "cayu[e2b]"
+```
+
+E2B's command API runs command strings through Bash. Cayu preserves process-form
+`ExecCommand.process(...)` by shell-quoting argv before sending it to E2B. Use
+`ExecCommand.bash(...)` only when shell parsing and expansion are intentional.
+The E2B runner does not inherit the trusted host process environment; pass only
+explicit command env values that are safe for model-controlled commands.
+Likewise, `E2BRunner.create(envs=...)` configures sandbox-level environment
+variables. Treat those values as visible to code running in the sandbox, and use
+them only for non-secret boot/config values.
+
 The OpenAI provider uses Responses API streaming by default. Tune the ordinary HTTP
 timeout and the no-provider-event stall timeout separately:
 
@@ -198,6 +233,13 @@ Run the deterministic artifact/workspace bridge example:
 
 ```bash
 PYTHONPATH=src python examples/artifact_workspace_bridge.py
+```
+
+Run gated E2B examples with a real E2B account:
+
+```bash
+E2B_API_KEY=... PYTHONPATH=src python examples/e2b_runner_live.py
+E2B_API_KEY=... PYTHONPATH=src python examples/e2b_workspace_live.py
 ```
 
 Use durable local session/event/transcript storage:

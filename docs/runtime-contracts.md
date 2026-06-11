@@ -36,6 +36,15 @@ Cayu separates agent definition, execution environment, and session state:
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
 
+Runner and workspace implementations should share the same execution boundary.
+For a sandbox-backed environment, `exec_command` and file tools must both talk to
+the sandbox, not split command execution into the sandbox and file access into
+the trusted host. `MicrosandboxRunner` pairs with `MicrosandboxWorkspace`.
+`E2BRunner` pairs with `E2BWorkspace`. E2B's Python SDK command API executes
+strings through Bash, so Cayu maps process-form commands with shell quoting
+before sending them to E2B; this keeps Cayu's public command contract stable
+while making the E2B-specific execution semantics explicit.
+
 ## ToolPolicy
 
 Authorizes registered tool calls immediately before execution.

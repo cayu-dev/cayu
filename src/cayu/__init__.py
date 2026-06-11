@@ -62,10 +62,14 @@ from cayu.mcp import (
 )
 from cayu.providers import AnthropicProvider, OpenAIProvider
 from cayu.runners import (
+    DEFAULT_E2B_CWD,
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     DEFAULT_MICROSANDBOX_CWD,
     DEFAULT_MICROSANDBOX_IMAGE,
+    E2B_SANDBOX_ID_MAX_BYTES,
     MICROSANDBOX_NAME_MAX_BYTES,
+    E2BCloseAction,
+    E2BRunner,
     ExecCommand,
     ExecResult,
     LocalRunner,
@@ -157,10 +161,14 @@ from cayu.vaults import (
     copy_secret_env,
 )
 from cayu.workspaces import (
+    DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
+    DEFAULT_E2B_WORKSPACE_LIST_LIMIT,
+    DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES,
     DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT,
     DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES,
     DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT,
     DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
+    E2BWorkspace,
     LocalWorkspace,
     MicrosandboxWorkspace,
     RunnerWorkspace,
@@ -170,6 +178,10 @@ from cayu.workspaces import (
 
 __all__ = [
     "DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES",
+    "DEFAULT_E2B_CWD",
+    "DEFAULT_E2B_WORKSPACE_LIST_DEPTH",
+    "DEFAULT_E2B_WORKSPACE_LIST_LIMIT",
+    "DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
     "DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST",
     "DEFAULT_MAX_FILE_ATTACHMENT_BYTES",
@@ -186,6 +198,7 @@ __all__ = [
     "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES",
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
+    "E2B_SANDBOX_ID_MAX_BYTES",
     "FILE_ATTACHMENT_TYPE",
     "MCP_PROTOCOL_VERSION",
     "MICROSANDBOX_NAME_MAX_BYTES",
@@ -217,6 +230,9 @@ __all__ = [
     "DispatchRuntime",
     "DispatchStatus",
     "Dispatcher",
+    "E2BCloseAction",
+    "E2BRunner",
+    "E2BWorkspace",
     "Environment",
     "EnvironmentSpec",
     "Event",
