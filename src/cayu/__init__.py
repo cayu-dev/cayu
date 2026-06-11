@@ -60,6 +60,7 @@ from cayu.mcp import (
     connect_mcp_toolset,
     mcp_cayu_tool_name,
 )
+from cayu.observability import LoggingEventSink
 from cayu.providers import AnthropicProvider, OpenAIProvider
 from cayu.runners import (
     DEFAULT_E2B_CWD,
@@ -254,6 +255,7 @@ __all__ = [
     "LocalEnvVault",
     "LocalRunner",
     "LocalWorkspace",
+    "LoggingEventSink",
     "McpClient",
     "McpInitializeResult",
     "McpProtocolError",

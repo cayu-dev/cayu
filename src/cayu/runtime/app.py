@@ -122,6 +122,7 @@ class CayuApp:
         dispatcher: Dispatcher | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
+        enable_logging: bool = True,
         max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
         max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
@@ -132,6 +133,8 @@ class CayuApp:
             raise TypeError("task_store must be a TaskStore.")
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
+        if type(enable_logging) is not bool:
+            raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         if event_sinks is None:
             sinks = []
@@ -145,6 +148,10 @@ class CayuApp:
         for sink in sinks:
             if not isinstance(sink, EventSink):
                 raise TypeError("event_sinks must contain EventSink instances.")
+        if enable_logging:
+            from cayu.observability.logging import LoggingEventSink
+
+            sinks.insert(0, LoggingEventSink())
         self._max_file_attachment_bytes = _validate_positive_int(
             max_file_attachment_bytes,
             "max_file_attachment_bytes",

@@ -143,12 +143,22 @@ terminal statuses do not transition
 
 Receives events and forwards them somewhere:
 
-- stdout
+- Python logging
 - dashboard websocket
 - webhook
 - log file
 - database
 - hosted platform adapter
+
+`CayuApp` registers `LoggingEventSink` by default. It emits concise summaries to
+`logging.getLogger("cayu")` and does not configure process-wide handlers, levels,
+or formatters. It must not log full prompts, raw file contents, or raw tool
+arguments by default. Logged values are escaped onto a single line to avoid log
+injection. Error summaries can include lower-level exception text, so
+applications that resolve secrets should configure `LoggingEventSink(redactor=...)`
+to redact known secret values. Applications can disable the default sink with
+`CayuApp(enable_logging=False)`, pass additional sinks through
+`CayuApp(event_sinks=[...])`.
 
 ## Agent
 

@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
@@ -178,6 +178,39 @@ from cayu import OpenAIProvider
 provider = OpenAIProvider(
     timeout_s=600,
     stream_idle_timeout_s=300,
+)
+```
+
+`CayuApp` registers `LoggingEventSink` by default. It writes concise event
+summaries to `logging.getLogger("cayu")` without configuring global logging
+handlers, process-wide levels, or formatters. Applications control where those
+logs go through ordinary Python logging configuration:
+
+```python
+import logging
+
+from cayu import CayuApp, LoggingEventSink, SecretRedactor
+
+logging.basicConfig(level=logging.INFO)
+app = CayuApp()
+```
+
+Disable the default logging sink when an app wants to manage all event sinks
+itself:
+
+```python
+app = CayuApp(enable_logging=False)
+```
+
+When your app has known resolved secrets that may appear in lower-level error
+strings, configure the sink with a redactor:
+
+```python
+app = CayuApp(
+    enable_logging=False,
+    event_sinks=[
+        LoggingEventSink(redactor=SecretRedactor(["sk-secret-value"])),
+    ],
 )
 ```
 
