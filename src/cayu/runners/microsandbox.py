@@ -165,7 +165,7 @@ class MicrosandboxRunner(Runner):
             self._closed = True
             return
         if self.close_action in {"stop", "remove"}:
-            await self._sandbox.stop_and_wait()
+            await self._sandbox.stop()
             if self.close_action == "remove":
                 module = _microsandbox_module(self._sandbox_module)
                 await module.Sandbox.remove(self.name)
@@ -186,7 +186,7 @@ class MicrosandboxRunner(Runner):
         if self._closed:
             raise RuntimeError("MicrosandboxRunner is closed.")
         ssh = self._sandbox.ssh()
-        client = await ssh.connect(sftp=True)
+        client = await ssh.open_client(sftp=True)
         sftp = None
         try:
             sftp = await client.sftp()
@@ -454,7 +454,7 @@ async def _kill_handle_best_effort(handle: Any) -> None:
 
 async def _cleanup_created_sandbox(module: ModuleType | Any, sandbox: Any, name: str) -> None:
     try:
-        await sandbox.stop_and_wait()
+        await sandbox.stop()
     finally:
         await module.Sandbox.remove(name)
 

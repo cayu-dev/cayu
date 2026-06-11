@@ -7,6 +7,7 @@ import pytest
 
 from cayu.runners import MicrosandboxRunner
 from cayu.workspaces import MicrosandboxWorkspace
+from cayu.workspaces.microsandbox import _is_path_not_found_error
 
 
 @dataclass
@@ -149,7 +150,9 @@ class FakeSsh:
     def __init__(self, fs: FakeMicrosandboxFs) -> None:
         self.fs = fs
 
-    async def connect(self, *, sftp: bool = True) -> FakeSshClient:
+    async def open_client(
+        self, *, user: str = "root", term: str | None = None, sftp: bool = True
+    ) -> FakeSshClient:
         return FakeSshClient(self.fs)
 
 
@@ -304,3 +307,12 @@ def test_microsandbox_workspace_rejects_closed_runner() -> None:
 
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(workspace.list("**/*"))
+
+
+def test_is_path_not_found_error_recognizes_sftp_enoent_message() -> None:
+    # microsandbox 0.5.x SFTP real_path raises a generic error carrying the
+    # ENOENT text rather than a typed not-found error; it must still be treated
+    # as "file not found" so read_bytes surfaces FileNotFoundError.
+    assert _is_path_not_found_error(RuntimeError("SFTP error: No such file: /workspace/x"))
+    assert _is_path_not_found_error(FileNotFoundError("/x"))
+    assert not _is_path_not_found_error(RuntimeError("permission denied"))

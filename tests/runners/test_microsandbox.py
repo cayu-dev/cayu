@@ -126,9 +126,8 @@ class FakeSandbox:
         self.shell_calls.append({"script": script, **kwargs})
         return self.next_handle
 
-    async def stop_and_wait(self) -> tuple[int, bool]:
+    async def stop(self) -> None:
         self.stop_calls += 1
-        return 0, False
 
     async def detach(self) -> None:
         self.detach_calls += 1

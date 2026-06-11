@@ -299,7 +299,11 @@ def _is_path_not_found_error(exc: Exception) -> bool:
     code = getattr(exc, "code", None)
     if code == "path-not-found":
         return True
-    return type(exc).__name__ == "PathNotFoundError"
+    if type(exc).__name__ == "PathNotFoundError":
+        return True
+    # microsandbox 0.5.x SFTP real_path raises a generic error whose message
+    # carries the ENOENT text rather than a typed not-found error.
+    return "no such file" in str(exc).lower()
 
 
 def _matches_pattern(path: str, pattern: str) -> bool:
