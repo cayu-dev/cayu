@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -16,6 +17,19 @@ from pydantic import (
 from cayu._validation import copy_json_value
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
+
+
+class RunnerCancelledError(asyncio.CancelledError):
+    """Cancelled runner execution with optional cleanup diagnostics."""
+
+    def __init__(
+        self,
+        message: str = "Runner command was cancelled.",
+        *,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.artifacts = copy_json_value([] if artifacts is None else artifacts, "artifacts")
 
 
 class ExecCommand(BaseModel):

@@ -5,11 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event
 from cayu.core.tools import Tool, ToolResult
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider
-from cayu.runtime.approvals import PendingToolApproval
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
@@ -70,6 +68,14 @@ class ToolCallPolicyOutcome:
 
 
 @dataclass(frozen=True)
+class PendingToolApprovalPlan:
+    call: ToolCallRequest
+    calls: list[ToolCallRequest]
+    policy_outcomes: list[ToolCallPolicyOutcome]
+    policy_result: ToolPolicyResult
+
+
+@dataclass(frozen=True)
 class ToolRoundPolicyPlan:
     outcomes: list[ToolCallPolicyOutcome]
-    pending_approval: tuple[PendingToolApproval, Event] | None
+    pending_approval: PendingToolApprovalPlan | None

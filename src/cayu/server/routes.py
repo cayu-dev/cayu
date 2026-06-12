@@ -18,7 +18,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.sessions import (
-    CancelSessionRequest,
+    InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
     SessionQuery,
@@ -28,11 +28,11 @@ from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-_SERVER_CANCELLABLE_SESSION_STATUSES = {
+_SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTING,
     SessionStatus.INTERRUPTED,
-    SessionStatus.CANCELLED,
 }
 
 
@@ -46,7 +46,7 @@ class ResumeBody(BaseModel):
     prompt: NonBlankString
 
 
-class CancelSessionBody(BaseModel):
+class InterruptSessionBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -133,35 +133,41 @@ def create_router(
 
         return EventSourceResponse(generate())
 
-    @router.post("/sessions/{session_id}/cancel")
-    async def cancel_session(session_id: NonBlankString, body: CancelSessionBody | None = None):
+    @router.post("/sessions/{session_id}/interrupt")
+    async def interrupt_session(
+        session_id: NonBlankString,
+        body: InterruptSessionBody | None = None,
+    ):
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Session not found: {session_id}",
             )
-        if session.status not in _SERVER_CANCELLABLE_SESSION_STATUSES:
+        if session.status not in _SERVER_INTERRUPTIBLE_SESSION_STATUSES:
             raise HTTPException(
                 status_code=409,
-                detail=f"Session cannot be cancelled from status: {session.status.value}",
+                detail=f"Session cannot be interrupted from status: {session.status.value}",
             )
 
-        request = CancelSessionRequest(
+        request = InterruptSessionRequest(
             session_id=session_id,
             reason=body.reason if body is not None else None,
             metadata=body.metadata if body is not None else {},
         )
-        event_stream = cayu_app.cancel_session(request)
+        event_stream = cayu_app.interrupt_session(request)
         try:
             first_event = await anext(event_stream)
         except StopAsyncIteration as exc:
             await event_stream.aclose()
             raise HTTPException(
                 status_code=500,
-                detail="Session cancellation produced no events.",
+                detail="Session interruption produced no events.",
             ) from exc
         except ValueError as exc:
+            await event_stream.aclose()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TimeoutError as exc:
             await event_stream.aclose()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:

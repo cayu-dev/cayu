@@ -6,8 +6,9 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import file_attachment
-from cayu.core import AgentSpec, Event, EventType, Message, TextPart
+from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import (
@@ -16,8 +17,8 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
+from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
-    CancelSessionRequest,
     CayuApp,
     CheckpointCompactionContextPolicy,
     CompactionRequest,
@@ -34,6 +35,7 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InMemoryTaskStore,
+    InterruptSessionRequest,
     MessageWindowContextPolicy,
     ModelCompactor,
     RecentTurnsContextPolicy,
@@ -61,6 +63,7 @@ from cayu.runtime import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime.context import validate_context_messages
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -412,6 +415,10 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+async def collect_interrupt_events(app: CayuApp, request: InterruptSessionRequest) -> list[Event]:
+    return [event async for event in app.interrupt_session(request)]
 
 
 async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list[Event]:
@@ -2664,6 +2671,8 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     assert tool.calls == []
 
     approval = events[4].payload["approval"]
+    assert events[-1].payload["interruption_type"] == "tool_approval_required"
+    assert events[-1].payload["approval"]["approval_id"] == approval["approval_id"]
     assert approval["tool_call_id"] == "call_1"
     assert approval["tool_name"] == "side_effect"
     assert approval["arguments"] == {"value": "secret"}
@@ -3147,6 +3156,7 @@ def test_cayu_app_keeps_pending_approval_if_atomic_resolution_close_fails():
         EventType.TOOL_CALL_APPROVAL_DENIED,
         EventType.SESSION_INTERRUPTED,
     ]
+    assert events[-1].payload["interruption_type"] == "tool_approval_required"
     assert events[-1].payload["approval"]["approval_id"] == approval_id
     assert events[-1].payload["error"] == "approval close unavailable"
 
@@ -3484,6 +3494,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     )
 
     assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
+    assert retry_events[-1].payload["interruption_type"] == "tool_approval_required"
     assert retry_events[-1].payload["manual_recovery_required"] is True
     assert retry_events[-1].payload["tool_call_id"] == "call_1"
     assert tool.calls == [{"value": "secret"}]
@@ -7786,7 +7797,7 @@ def test_cayu_app_freezes_tool_declarations_at_registration():
     assert events[4].type == EventType.TOOL_CALL_COMPLETED
 
 
-def test_cancel_session_marks_running_session_cancelled_and_emits_event():
+def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
     app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
@@ -7796,57 +7807,59 @@ def test_cancel_session_marks_running_session_cancelled_and_emits_event():
         await store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_cancel_direct",
+                session_id="sess_interrupt_direct",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await store.update_status("sess_cancel_direct", SessionStatus.RUNNING)
         events = [
             event
-            async for event in app.cancel_session(
-                CancelSessionRequest(
-                    session_id="sess_cancel_direct",
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_direct",
                     reason="operator requested stop",
                     metadata={"actor": "operator"},
                 )
             )
         ]
-        return events, await store.load("sess_cancel_direct")
+        return events, await store.load("sess_interrupt_direct")
 
     events, session = asyncio.run(run())
 
     assert session is not None
-    assert session.status == SessionStatus.CANCELLED
-    assert [event.type for event in events] == [EventType.SESSION_CANCELLED]
+    assert session.status == SessionStatus.INTERRUPTED
+    assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
     assert events[0].payload == {
         "reason": "operator requested stop",
         "metadata": {"actor": "operator"},
+        "interruption_type": "operator_requested",
     }
 
 
-def test_cancel_session_race_returns_existing_cancel_event_without_duplicate():
-    class PausingCancelStore(InMemorySessionStore):
+def test_interrupt_session_race_returns_existing_interrupt_event_without_duplicate():
+    class PausingInterruptStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
             self.transition_started: asyncio.Event | None = None
             self.allow_transition_return: asyncio.Event | None = None
 
-        async def transition_status(
+        async def transition_status_and_checkpoint(
             self,
             session_id: str,
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
+            checkpoint_transform,
         ) -> Session:
-            session = await super().transition_status(
+            session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
             )
             if (
-                session_id == "sess_cancel_race_idempotent"
-                and to_status == SessionStatus.CANCELLED
+                session_id == "sess_interrupt_race_idempotent"
+                and to_status == SessionStatus.INTERRUPTING
                 and self.transition_started is not None
                 and self.allow_transition_return is not None
             ):
@@ -7854,7 +7867,7 @@ def test_cancel_session_race_returns_existing_cancel_event_without_duplicate():
                 await self.allow_transition_return.wait()
             return session
 
-    store = PausingCancelStore()
+    store = PausingInterruptStore()
     app = CayuApp(session_store=store)
     app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -7865,60 +7878,59 @@ def test_cancel_session_race_returns_existing_cancel_event_without_duplicate():
         await store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_cancel_race_idempotent",
+                session_id="sess_interrupt_race_idempotent",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await store.update_status("sess_cancel_race_idempotent", SessionStatus.RUNNING)
 
-        async def cancel(reason: str) -> list[Event]:
+        async def interrupt(reason: str) -> list[Event]:
             return [
                 event
-                async for event in app.cancel_session(
-                    CancelSessionRequest(
-                        session_id="sess_cancel_race_idempotent",
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_interrupt_race_idempotent",
                         reason=reason,
                     )
                 )
             ]
 
-        first_cancel = asyncio.create_task(cancel("first request"))
+        first_interrupt = asyncio.create_task(interrupt("first request"))
         await store.transition_started.wait()
-        second_cancel = asyncio.create_task(cancel("second request"))
+        second_interrupt = asyncio.create_task(interrupt("second request"))
         await asyncio.sleep(0)
         store.allow_transition_return.set()
-        first_events, second_events = await asyncio.gather(first_cancel, second_cancel)
-        stored_events = await store.load_events("sess_cancel_race_idempotent")
+        first_events, second_events = await asyncio.gather(first_interrupt, second_interrupt)
+        stored_events = await store.load_events("sess_interrupt_race_idempotent")
         return first_events, second_events, stored_events
 
     first_events, second_events, stored_events = asyncio.run(run())
 
-    assert [event.type for event in first_events] == [EventType.SESSION_CANCELLED]
-    assert [event.type for event in second_events] == [EventType.SESSION_CANCELLED]
+    assert [event.type for event in first_events] == [EventType.SESSION_INTERRUPTED]
+    assert [event.type for event in second_events] == [EventType.SESSION_INTERRUPTED]
     assert first_events[0].id == second_events[0].id
     assert first_events[0].payload["reason"] == "first request"
-    assert [event for event in stored_events if event.type == EventType.SESSION_CANCELLED] == [
+    assert [event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED] == [
         first_events[0]
     ]
 
 
-def test_run_stops_after_session_is_cancelled_before_tool_execution():
+def test_run_stops_after_session_is_interrupted_before_tool_execution():
     store = InMemorySessionStore()
     side_effect = SideEffectTool()
 
-    class CancellingSink(EventSink):
+    class InterruptingSink(EventSink):
         async def emit(self, event: Event) -> None:
             if event.type == EventType.MODEL_COMPLETED:
-                await store.update_status(event.session_id, SessionStatus.CANCELLED)
+                await store.update_status(event.session_id, SessionStatus.INTERRUPTED)
                 await store.append_event(
                     event.session_id,
                     Event(
-                        type=EventType.SESSION_CANCELLED,
+                        type=EventType.SESSION_INTERRUPTED,
                         session_id=event.session_id,
                         agent_name=event.agent_name,
                         environment_name=event.environment_name,
-                        payload={"reason": "test cancellation", "metadata": {}},
+                        payload={"reason": "test interruption", "metadata": {}},
                     ),
                 )
 
@@ -7928,7 +7940,7 @@ def test_run_stops_after_session_is_cancelled_before_tool_execution():
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    app = CayuApp(session_store=store, event_sinks=[CancellingSink()])
+    app = CayuApp(session_store=store, event_sinks=[InterruptingSink()])
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -7940,37 +7952,37 @@ def test_run_stops_after_session_is_cancelled_before_tool_execution():
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_cancel_before_tool",
+                session_id="sess_interrupt_before_tool",
                 messages=[Message.text("user", "call tool")],
             ),
         )
     )
-    session = asyncio.run(store.load("sess_cancel_before_tool"))
+    session = asyncio.run(store.load("sess_interrupt_before_tool"))
 
     assert session is not None
-    assert session.status == SessionStatus.CANCELLED
+    assert session.status == SessionStatus.INTERRUPTED
     assert side_effect.calls == []
     assert len(provider.requests) == 1
-    assert events[-1].type == EventType.SESSION_CANCELLED
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert EventType.TOOL_CALL_STARTED not in [event.type for event in events]
 
 
-def test_run_cancels_running_task_when_session_is_cancelled():
+def test_run_interrupt_leaves_linked_task_running():
     store = InMemorySessionStore()
     tasks = InMemoryTaskStore()
 
-    class CancellingSink(EventSink):
+    class InterruptingSink(EventSink):
         async def emit(self, event: Event) -> None:
             if event.type == EventType.MODEL_COMPLETED:
-                await store.update_status(event.session_id, SessionStatus.CANCELLED)
+                await store.update_status(event.session_id, SessionStatus.INTERRUPTED)
                 await store.append_event(
                     event.session_id,
                     Event(
-                        type=EventType.SESSION_CANCELLED,
+                        type=EventType.SESSION_INTERRUPTED,
                         session_id=event.session_id,
                         agent_name=event.agent_name,
                         environment_name=event.environment_name,
-                        payload={"reason": "task cancellation", "metadata": {}},
+                        payload={"reason": "task interruption", "metadata": {}},
                     ),
                 )
 
@@ -7980,7 +7992,7 @@ def test_run_cancels_running_task_when_session_is_cancelled():
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    app = CayuApp(session_store=store, task_store=tasks, event_sinks=[CancellingSink()])
+    app = CayuApp(session_store=store, task_store=tasks, event_sinks=[InterruptingSink()])
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -7988,13 +8000,13 @@ def test_run_cancels_running_task_when_session_is_cancelled():
     )
 
     async def run():
-        task = await tasks.create_task(TaskCreate(type="run", title="cancel me"))
+        task = await tasks.create_task(TaskCreate(type="run", title="interrupt me"))
         events = [
             event
             async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
-                    session_id="sess_cancel_task",
+                    session_id="sess_interrupt_task",
                     task_id=task.id,
                     messages=[Message.text("user", "hello")],
                 )
@@ -8005,12 +8017,12 @@ def test_run_cancels_running_task_when_session_is_cancelled():
     events, task = asyncio.run(run())
 
     assert task is not None
-    assert task.status == TaskStatus.CANCELLED
-    assert EventType.TASK_CANCELLED in [event.type for event in events]
-    assert events[-1].type == EventType.SESSION_CANCELLED
+    assert task.status == TaskStatus.RUNNING
+    assert EventType.TASK_CANCELLED not in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
 
 
-def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
+def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
     class PausingProvider(ModelProvider):
         name = "fake"
 
@@ -8028,27 +8040,29 @@ def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
             await self.allow_provider_complete.wait()
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
-    class PausingCancelStore(InMemorySessionStore):
+    class PausingInterruptStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
             self.transition_started: asyncio.Event | None = None
             self.allow_transition_return: asyncio.Event | None = None
 
-        async def transition_status(
+        async def transition_status_and_checkpoint(
             self,
             session_id: str,
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
+            checkpoint_transform,
         ) -> Session:
-            session = await super().transition_status(
+            session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
             )
             if (
-                session_id == "sess_run_cancel_race"
-                and to_status == SessionStatus.CANCELLED
+                session_id == "sess_run_interrupt_race"
+                and to_status == SessionStatus.INTERRUPTING
                 and self.transition_started is not None
                 and self.allow_transition_return is not None
             ):
@@ -8056,7 +8070,7 @@ def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
                 await self.allow_transition_return.wait()
             return session
 
-    store = PausingCancelStore()
+    store = PausingInterruptStore()
     provider = PausingProvider()
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
@@ -8077,19 +8091,19 @@ def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
                 async for event in app.run(
                     RunRequest(
                         agent_name="assistant",
-                        session_id="sess_run_cancel_race",
+                        session_id="sess_run_interrupt_race",
                         messages=[Message.text("user", "hello")],
                     )
                 )
             ]
 
-        async def cancel_session() -> list[Event]:
+        async def interrupt_session() -> list[Event]:
             return [
                 event
-                async for event in app.cancel_session(
-                    CancelSessionRequest(
-                        session_id="sess_run_cancel_race",
-                        reason="external cancel",
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_run_interrupt_race",
+                        reason="external interrupt",
                     )
                 )
             ]
@@ -8097,174 +8111,1559 @@ def test_run_cancel_race_reuses_external_cancel_event_without_duplicate():
         run_task = asyncio.create_task(run_session())
         await provider.provider_waiting.wait()
 
-        cancel_task = asyncio.create_task(cancel_session())
+        interrupt_task = asyncio.create_task(interrupt_session())
         await store.transition_started.wait()
         provider.allow_provider_complete.set()
         await asyncio.sleep(0)
         store.allow_transition_return.set()
 
-        run_events, cancel_events = await asyncio.gather(run_task, cancel_task)
-        stored_events = await store.load_events("sess_run_cancel_race")
-        return run_events, cancel_events, stored_events
+        run_events, interrupt_events = await asyncio.gather(run_task, interrupt_task)
+        stored_events = await store.load_events("sess_run_interrupt_race")
+        return run_events, interrupt_events, stored_events
 
-    run_events, cancel_events, stored_events = asyncio.run(run())
+    run_events, interrupt_events, stored_events = asyncio.run(run())
 
-    stored_cancel_events = [
-        event for event in stored_events if event.type == EventType.SESSION_CANCELLED
+    stored_interrupt_events = [
+        event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED
     ]
-    assert len(stored_cancel_events) == 1
-    assert [event.type for event in cancel_events] == [EventType.SESSION_CANCELLED]
-    assert run_events[-1].type == EventType.SESSION_CANCELLED
-    assert run_events[-1].id == cancel_events[0].id == stored_cancel_events[0].id
-    assert stored_cancel_events[0].payload["reason"] == "external cancel"
+    assert len(stored_interrupt_events) == 1
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id == stored_interrupt_events[0].id
+    assert stored_interrupt_events[0].payload["reason"] == "external interrupt"
 
 
-def test_cancel_interrupted_session_cancels_pending_approval_task():
-    store = InMemorySessionStore()
-    tasks = InMemoryTaskStore()
+def test_interrupt_session_stops_in_flight_provider_stream():
+    class BlockingProvider(ModelProvider):
+        name = "fake"
 
-    class ApprovalPolicy(ToolPolicy):
-        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-            return ToolPolicyResult(
-                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-                reason=f"approval required for {request.tool_name}",
-            )
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.stream_started: asyncio.Event | None = None
+            self.stream_cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
 
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"}),
-            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-        ]
-    )
-    app = CayuApp(session_store=store, task_store=tasks)
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if (
+                self.stream_started is None
+                or self.stream_cancelled is None
+                or self.never_complete is None
+            ):
+                raise AssertionError("BlockingProvider test events were not initialized.")
+            self.stream_started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.stream_cancelled.set()
+                raise
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = BlockingProvider()
+    app = CayuApp()
     app.register_provider(provider, default=True)
-    app.register_agent(
-        AgentSpec(name="assistant", model="fake-model"),
-        tools=[EchoTool()],
-        tool_policy=ApprovalPolicy(),
-    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     async def run():
-        task = await tasks.create_task(TaskCreate(task_id="task_cancel_approval", type="run"))
-        interrupted_events = [
-            event
-            async for event in app.run(
+        provider.stream_started = asyncio.Event()
+        provider.stream_cancelled = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
                 RunRequest(
                     agent_name="assistant",
-                    session_id="sess_cancel_approval",
-                    task_id=task.id,
+                    session_id="sess_interrupt_provider_stream",
                     messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await provider.stream_started.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_provider_stream",
+                    reason="operator stop",
                 )
             )
         ]
-        assert interrupted_events[-1].type == EventType.SESSION_INTERRUPTED
+        await asyncio.wait_for(provider.stream_cancelled.wait(), timeout=1)
+        run_events = await run_task
+        stored_events = await app.session_store.load_events("sess_interrupt_provider_stream")
+        return run_events, interrupt_events, stored_events
 
-        cancel_events = [
+    run_events, interrupt_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id
+    assert (
+        len([event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED]) == 1
+    )
+    assert EventType.MODEL_COMPLETED not in [event.type for event in stored_events]
+
+
+def test_interrupt_session_payload_is_durable_across_app_instances():
+    class ReleasingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.release: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            if self.started is None or self.release is None:
+                raise AssertionError("ReleasingProvider test events were not initialized.")
+            self.started.set()
+            await self.release.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    store = InMemorySessionStore()
+    provider = ReleasingProvider()
+    worker_app = CayuApp(session_store=store)
+    api_app = CayuApp(session_store=store)
+    for app in (worker_app, api_app):
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        provider.started = asyncio.Event()
+        provider.release = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                worker_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cross_app_interrupt",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await provider.started.wait()
+
+        interrupt_task = asyncio.create_task(
+            collect_interrupt_events(
+                api_app,
+                InterruptSessionRequest(
+                    session_id="sess_cross_app_interrupt",
+                    reason="operator stop from api",
+                    metadata={"actor": "operator"},
+                ),
+            )
+        )
+        for _ in range(100):
+            session = await store.load("sess_cross_app_interrupt")
+            if session is not None and session.status == SessionStatus.INTERRUPTING:
+                break
+            await asyncio.sleep(0.01)
+        provider.release.set()
+
+        run_events, interrupt_events = await asyncio.gather(run_task, interrupt_task)
+        checkpoint = await store.load_checkpoint("sess_cross_app_interrupt")
+        return run_events, interrupt_events, checkpoint
+
+    run_events, interrupt_events, checkpoint = asyncio.run(run())
+
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert interrupt_events == [run_events[-1]]
+    assert run_events[-1].payload == {
+        "reason": "operator stop from api",
+        "metadata": {"actor": "operator"},
+        "interruption_type": "operator_requested",
+    }
+    assert checkpoint == {}
+
+
+def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_direct_stream_closed",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        stream = app.interrupt_session(
+            InterruptSessionRequest(
+                session_id="sess_interrupt_direct_stream_closed",
+                reason="operator stop",
+            )
+        )
+        first_event = await anext(stream)
+        await stream.aclose()
+        checkpoint = await store.load_checkpoint("sess_interrupt_direct_stream_closed")
+        return first_event, checkpoint
+
+    first_event, checkpoint = asyncio.run(run())
+
+    assert first_event.type == EventType.SESSION_INTERRUPTED
+    assert first_event.payload["reason"] == "operator stop"
+    assert checkpoint == {}
+
+
+def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
+    class BlockingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            if self.started is None or self.never_complete is None:
+                raise AssertionError("BlockingProvider test events were not initialized.")
+            self.started.set()
+            await self.never_complete.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    store = InMemorySessionStore()
+    provider = BlockingProvider()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        provider.started = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+
+        async def run_until_interrupted() -> Event:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_active_stream_closed",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                if event.type == EventType.SESSION_INTERRUPTED:
+                    return event
+            raise AssertionError("Run stream ended without session.interrupted.")
+
+        run_task = asyncio.create_task(run_until_interrupted())
+        await provider.started.wait()
+        interrupt_events = [
             event
-            async for event in app.cancel_session(
-                CancelSessionRequest(
-                    session_id="sess_cancel_approval",
-                    reason="operator requested stop",
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_active_stream_closed",
+                    reason="operator stop",
+                )
+            )
+        ]
+        run_event = await run_task
+        checkpoint = await store.load_checkpoint("sess_interrupt_active_stream_closed")
+        return run_event, interrupt_events, checkpoint
+
+    run_event, interrupt_events, checkpoint = asyncio.run(run())
+
+    assert run_event.type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_event.id == interrupt_events[0].id
+    assert run_event.payload["reason"] == "operator stop"
+    assert checkpoint == {}
+
+
+def test_interrupt_session_persists_payload_atomically_with_interrupting_status():
+    class AtomicInterruptStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checked_inside_transition = False
+
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform,
+        ):
+            session = await super().transition_status_and_checkpoint(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
+            )
+            checkpoint = await self.load_checkpoint(session_id)
+            assert session.status == SessionStatus.INTERRUPTING
+            assert checkpoint is not None
+            assert checkpoint["pending_session_interrupt"]["reason"] == "operator stop"
+            self.checked_inside_transition = True
+            return session
+
+    store = AtomicInterruptStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_atomic_interrupt_payload",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        _ = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_atomic_interrupt_payload",
+                    reason="operator stop",
+                )
+            )
+        ]
+        return store.checked_inside_transition
+
+    assert asyncio.run(run()) is True
+
+
+def test_interrupt_session_checkpoint_failure_does_not_transition_status():
+    class FailingAtomicInterruptStore(InMemorySessionStore):
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform,
+        ):
+            raise RuntimeError("checkpoint unavailable")
+
+    store = FailingAtomicInterruptStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_checkpoint_failure",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+            _ = [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_interrupt_checkpoint_failure",
+                        reason="operator stop",
+                    )
+                )
+            ]
+        return await store.load("sess_interrupt_checkpoint_failure")
+
+    session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.PENDING
+
+
+def test_interrupt_session_cleans_request_marker_when_caller_is_cancelled(monkeypatch):
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 100)
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0.01)
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cancel_interrupt_request",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_cancel_interrupt_request", SessionStatus.RUNNING)
+
+        task = asyncio.create_task(
+            collect_interrupt_events(
+                app,
+                InterruptSessionRequest(
+                    session_id="sess_cancel_interrupt_request",
+                    reason="operator stop",
+                ),
+            )
+        )
+        for _ in range(100):
+            if app._is_session_interruption_request_active("sess_cancel_interrupt_request"):
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return app._is_session_interruption_request_active("sess_cancel_interrupt_request")
+
+    assert asyncio.run(run()) is False
+
+
+def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellation(monkeypatch):
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+
+    class DelayedInterruptionProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.stream_started: asyncio.Event | None = None
+            self.release_after_cancel: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            if self.stream_started is None or self.release_after_cancel is None:
+                raise AssertionError(
+                    "DelayedInterruptionProvider test events were not initialized."
+                )
+            self.stream_started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await self.release_after_cancel.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = DelayedInterruptionProvider()
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        provider.stream_started = asyncio.Event()
+        provider.release_after_cancel = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_delayed_provider_interrupt",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await provider.stream_started.wait()
+
+        with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+            _ = [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_delayed_provider_interrupt",
+                        reason="operator stop",
+                    )
+                )
+            ]
+        events_before_release = await store.load_events("sess_delayed_provider_interrupt")
+        provider.release_after_cancel.set()
+        run_events = await run_task
+        events_after_release = await store.load_events("sess_delayed_provider_interrupt")
+        repeated_interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_delayed_provider_interrupt",
+                    reason="operator stop",
                 )
             )
         ]
         return (
-            cancel_events,
-            await store.load("sess_cancel_approval"),
-            await tasks.load_task(task.id),
+            repeated_interrupt_events,
+            events_before_release,
+            run_events,
+            events_after_release,
         )
 
-    cancel_events, session, task = asyncio.run(run())
+    interrupt_events, events_before_release, run_events, events_after_release = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert interrupt_events[0].payload["reason"] == "operator stop"
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in events_before_release]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id
+    assert [event.type for event in events_after_release].count(EventType.SESSION_INTERRUPTED) == 1
+    assert EventType.MODEL_COMPLETED not in [event.type for event in events_after_release]
+
+
+def test_interrupt_session_does_not_finalize_unowned_running_session(monkeypatch):
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unowned_running_interrupt",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_unowned_running_interrupt", SessionStatus.RUNNING)
+
+        with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+            _ = [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_unowned_running_interrupt",
+                        reason="operator stop",
+                    )
+                )
+            ]
+        return (
+            await store.load("sess_unowned_running_interrupt"),
+            await store.load_events("sess_unowned_running_interrupt"),
+        )
+
+    session, events = asyncio.run(run())
 
     assert session is not None
-    assert session.status == SessionStatus.CANCELLED
-    assert task is not None
-    assert task.status == TaskStatus.CANCELLED
-    assert [event.type for event in cancel_events] == [
-        EventType.SESSION_CANCELLED,
-        EventType.TASK_CANCELLED,
-    ]
+    assert session.status == SessionStatus.INTERRUPTING
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in events]
 
 
-def test_cancel_interrupted_session_orders_terminal_task_and_hook_events():
-    store = InMemorySessionStore()
-    tasks = InMemoryTaskStore()
-    hook_calls: list[tuple[str, EventType | str]] = []
+def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
-    class ApprovalPolicy(ToolPolicy):
-        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-            return ToolPolicyResult(
-                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-                reason=f"approval required for {request.tool_name}",
+    class LosingTransitionStore(InMemorySessionStore):
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform,
+        ) -> Session:
+            if session_id == "sess_interrupt_transition_loser_finalizing":
+                await super().transition_status_and_checkpoint(
+                    session_id,
+                    from_statuses=from_statuses,
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=checkpoint_transform,
+                )
+                raise ValueError("lost transition")
+            return await super().transition_status_and_checkpoint(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
             )
 
-    class CancellationHook(RuntimeHook):
-        @property
-        def name(self) -> str:
-            return "cancellation_hook"
+    store = LosingTransitionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        async def after_session_cancelled(self, context: RuntimeHookContext) -> None:
-            hook_calls.append((context.session.id, context.terminal_event.type))
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_transition_loser_finalizing",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(
+            "sess_interrupt_transition_loser_finalizing",
+            SessionStatus.RUNNING,
+        )
+        with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+            _ = [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_interrupt_transition_loser_finalizing",
+                        reason="operator stop",
+                    )
+                )
+            ]
+        return await store.load("sess_interrupt_transition_loser_finalizing")
 
+    session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTING
+
+
+def test_interrupt_session_stops_in_flight_tool_call():
+    class BlockingTool(Tool):
+        spec = ToolSpec(
+            name="blocking_tool",
+            description="Block until cancelled.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.cancelled is None or self.never_complete is None:
+                raise AssertionError("BlockingTool test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return ToolResult(content="unexpected")
+
+    tool = BlockingTool()
     provider = FakeProvider(
         [
-            ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "hi"}),
+            ModelStreamEvent.tool_call(id="call_1", name="blocking_tool", arguments={}),
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    app = CayuApp(
-        session_store=store,
-        task_store=tasks,
-        runtime_hooks=[CancellationHook()],
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
     )
+
+    async def run():
+        tool.started = asyncio.Event()
+        tool.cancelled = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_tool_call",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_tool_call",
+                    reason="operator stop",
+                )
+            )
+        ]
+        await asyncio.wait_for(tool.cancelled.wait(), timeout=1)
+        run_events = await run_task
+        stored_events = await app.session_store.load_events("sess_interrupt_tool_call")
+        transcript = await app.session_store.load_transcript("sess_interrupt_tool_call")
+        return run_events, interrupt_events, stored_events, transcript
+
+    run_events, interrupt_events, stored_events, transcript = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert interrupt_events[0].payload == {
+        "reason": "operator stop",
+        "metadata": {},
+        "interruption_type": "operator_requested",
+    }
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id
+    assert (
+        len([event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED]) == 1
+    )
+    assert EventType.TOOL_CALL_COMPLETED not in [event.type for event in stored_events]
+    failed_tool_events = [
+        event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED
+    ]
+    assert len(failed_tool_events) == 1
+    assert failed_tool_events[0].payload["tool_call_id"] == "call_1"
+    assert failed_tool_events[0].payload["result"]["is_error"] is True
+    assert failed_tool_events[0].payload["result"]["structured"] == {
+        "interrupted": True,
+        "tool_call_id": "call_1",
+        "tool_name": "blocking_tool",
+    }
+    stored_event_types = [event.type for event in stored_events]
+    assert stored_event_types.index(EventType.TOOL_CALL_FAILED) < stored_event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert transcript[-1].content[0].tool_call_id == "call_1"
+    assert transcript[-1].content[0].is_error is True
+
+
+def test_cancelled_runner_cleanup_diagnostics_are_preserved_in_tool_result():
+    cleanup_artifact = {
+        "type": "cayu.runner_cleanup.v1",
+        "adapter": "e2b",
+        "action": "kill_sandbox",
+        "status": "timeout",
+        "timeout_s": 0.01,
+    }
+
+    class CleanupDiagnosticTool(Tool):
+        spec = ToolSpec(
+            name="cleanup_diagnostic_tool",
+            description="Raise runner cancellation diagnostics.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.never_complete is None:
+                raise AssertionError("CleanupDiagnosticTool test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError as exc:
+                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+            return ToolResult(content="unexpected")
+
+    tool = CleanupDiagnosticTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="cleanup_diagnostic_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        tool.started = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_tool_cleanup_diagnostics",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_tool_cleanup_diagnostics",
+                    reason="operator stop",
+                )
+            )
+        ]
+        run_events = await run_task
+        stored_events = await app.session_store.load_events(
+            "sess_interrupt_tool_cleanup_diagnostics"
+        )
+        transcript = await app.session_store.load_transcript(
+            "sess_interrupt_tool_cleanup_diagnostics"
+        )
+        return run_events, interrupt_events, stored_events, transcript
+
+    run_events, interrupt_events, stored_events, transcript = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].id == interrupt_events[0].id
+    failed_tool_events = [
+        event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED
+    ]
+    assert len(failed_tool_events) == 1
+    assert failed_tool_events[0].payload["result"]["artifacts"] == [cleanup_artifact]
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert transcript[-1].content[0].artifacts == [cleanup_artifact]
+
+
+def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool():
+    cleanup_artifact = {
+        "type": "cayu.runner_cleanup.v1",
+        "adapter": "e2b",
+        "action": "kill_sandbox",
+        "status": "timeout",
+        "timeout_s": 0.01,
+    }
+
+    class CleanupDiagnosticTool(Tool):
+        spec = ToolSpec(
+            name="cleanup_diagnostic_tool",
+            description="Raise runner cancellation diagnostics.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.never_complete is None:
+                raise AssertionError("CleanupDiagnosticTool test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError as exc:
+                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+            return ToolResult(content="unexpected")
+
+    tool = CleanupDiagnosticTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_active",
+                name="cleanup_diagnostic_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.tool_call(
+                id="call_not_started",
+                name="echo",
+                arguments={"text": "never runs"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool, EchoTool()],
+    )
+
+    async def run():
+        tool.started = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_tool_cleanup_diagnostics_round",
+                    messages=[Message.text("user", "use tools")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        _ = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_tool_cleanup_diagnostics_round",
+                    reason="operator stop",
+                )
+            )
+        ]
+        run_events = await run_task
+        transcript = await app.session_store.load_transcript(
+            "sess_interrupt_tool_cleanup_diagnostics_round"
+        )
+        stored_events = await app.session_store.load_events(
+            "sess_interrupt_tool_cleanup_diagnostics_round"
+        )
+        return run_events, transcript, stored_events
+
+    run_events, transcript, stored_events = asyncio.run(run())
+
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    failed_tool_events = [
+        event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED
+    ]
+    assert [event.payload["tool_call_id"] for event in failed_tool_events] == [
+        "call_active",
+        "call_not_started",
+    ]
+    assert failed_tool_events[0].payload["result"]["artifacts"] == [cleanup_artifact]
+    assert failed_tool_events[1].payload["result"]["artifacts"] == []
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    result_parts = transcript[-1].content
+    assert [part.tool_call_id for part in result_parts] == [
+        "call_active",
+        "call_not_started",
+    ]
+    assert result_parts[0].artifacts == [cleanup_artifact]
+    assert result_parts[1].artifacts == []
+
+
+def test_interrupt_session_suppresses_late_tool_events_while_finalizing(monkeypatch):
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+
+    class DelayedInterruptionTool(Tool):
+        spec = ToolSpec(
+            name="delayed_tool",
+            description="Delay after cancellation.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.release_after_cancel: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.release_after_cancel is None:
+                raise AssertionError("DelayedInterruptionTool test events were not initialized.")
+            self.started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await self.release_after_cancel.wait()
+            return ToolResult(content="late result")
+
+    tool = DelayedInterruptionTool()
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="delayed_tool", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        tool.started = asyncio.Event()
+        tool.release_after_cancel = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_delayed_tool_interrupt",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+            _ = [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_delayed_tool_interrupt",
+                        reason="operator stop",
+                    )
+                )
+            ]
+        events_before_release = await store.load_events("sess_delayed_tool_interrupt")
+        tool.release_after_cancel.set()
+        run_events = await run_task
+        events_after_release = await store.load_events("sess_delayed_tool_interrupt")
+        transcript = await store.load_transcript("sess_delayed_tool_interrupt")
+        repeated_interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_delayed_tool_interrupt",
+                    reason="operator stop",
+                )
+            )
+        ]
+        return (
+            repeated_interrupt_events,
+            events_before_release,
+            run_events,
+            events_after_release,
+            transcript,
+        )
+
+    (
+        interrupt_events,
+        events_before_release,
+        run_events,
+        events_after_release,
+        transcript,
+    ) = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in events_before_release]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id
+    event_types_after_release = [event.type for event in events_after_release]
+    assert event_types_after_release.count(EventType.SESSION_INTERRUPTED) == 1
+    assert EventType.TOOL_CALL_COMPLETED not in event_types_after_release
+    assert event_types_after_release.count(EventType.TOOL_CALL_FAILED) == 1
+    assert event_types_after_release[-1] == EventType.SESSION_INTERRUPTED
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert transcript[-1].content[0].tool_call_id == "call_1"
+    assert transcript[-1].content[0].content == "Tool call interrupted before completion."
+    assert transcript[-1].content[0].is_error is True
+
+
+def test_repeated_interrupt_waits_for_active_interruption_terminal_event():
+    class BlockingSink(EventSink):
+        def __init__(self) -> None:
+            self.failed_seen: asyncio.Event | None = None
+            self.release_failed_event: asyncio.Event | None = None
+
+        async def emit(self, event: Event) -> None:
+            if event.type == EventType.TOOL_CALL_FAILED:
+                if self.failed_seen is None or self.release_failed_event is None:
+                    raise AssertionError("BlockingSink test events were not initialized.")
+                self.failed_seen.set()
+                await self.release_failed_event.wait()
+
+    class BlockingTool(Tool):
+        spec = ToolSpec(
+            name="blocking_tool",
+            description="Block until cancelled.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.never_complete is None:
+                raise AssertionError("BlockingTool test events were not initialized.")
+            self.started.set()
+            await self.never_complete.wait()
+            return ToolResult(content="unexpected")
+
+    sink = BlockingSink()
+    tool = BlockingTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="blocking_tool", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(event_sinks=[sink])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        sink.failed_seen = asyncio.Event()
+        sink.release_failed_event = asyncio.Event()
+        tool.started = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+
+        async def interrupt(reason: str) -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_repeated_interrupt_waits",
+                        reason=reason,
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_repeated_interrupt_waits",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.started.wait()
+
+        first_interrupt = asyncio.create_task(interrupt("first interrupt"))
+        await sink.failed_seen.wait()
+        second_interrupt = asyncio.create_task(interrupt("second interrupt"))
+        await asyncio.sleep(0)
+        sink.release_failed_event.set()
+        first_events, second_events, run_events = await asyncio.gather(
+            first_interrupt,
+            second_interrupt,
+            run_task,
+        )
+        stored_events = await app.session_store.load_events("sess_repeated_interrupt_waits")
+        return first_events, second_events, run_events, stored_events
+
+    first_events, second_events, run_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in first_events] == [EventType.SESSION_INTERRUPTED]
+    assert [event.type for event in second_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert first_events[0].id == second_events[0].id == run_events[-1].id
+    assert first_events[0].payload == {
+        "reason": "first interrupt",
+        "metadata": {},
+        "interruption_type": "operator_requested",
+    }
+    stored_event_types = [event.type for event in stored_events]
+    assert stored_event_types.index(EventType.TOOL_CALL_FAILED) < stored_event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
+    assert stored_event_types.count(EventType.SESSION_INTERRUPTED) == 1
+
+
+def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
+    class BlockingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.stream_started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            if self.stream_started is None or self.never_complete is None:
+                raise AssertionError("BlockingProvider test events were not initialized.")
+            self.stream_started.set()
+            await self.never_complete.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    class RacingInterruptStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transition_waiters = 0
+            self.transition_barrier: asyncio.Event | None = None
+
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform,
+        ) -> Session:
+            if (
+                session_id == "sess_concurrent_interrupt_transition_loser"
+                and to_status == SessionStatus.INTERRUPTING
+                and self.transition_barrier is not None
+            ):
+                self.transition_waiters += 1
+                if self.transition_waiters >= 2:
+                    self.transition_barrier.set()
+                await self.transition_barrier.wait()
+            return await super().transition_status_and_checkpoint(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
+            )
+
+    store = RacingInterruptStore()
+    provider = BlockingProvider()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        store.transition_barrier = asyncio.Event()
+        provider.stream_started = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+
+        async def interrupt(reason: str) -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="sess_concurrent_interrupt_transition_loser",
+                        reason=reason,
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_concurrent_interrupt_transition_loser",
+                    messages=[Message.text("user", "start")],
+                ),
+            )
+        )
+        await provider.stream_started.wait()
+        first_interrupt = asyncio.create_task(interrupt("first interrupt"))
+        second_interrupt = asyncio.create_task(interrupt("second interrupt"))
+        first_events, second_events, run_events = await asyncio.gather(
+            first_interrupt,
+            second_interrupt,
+            run_task,
+        )
+        stored_events = await store.load_events("sess_concurrent_interrupt_transition_loser")
+        return first_events, second_events, run_events, stored_events
+
+    first_events, second_events, run_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in first_events] == [EventType.SESSION_INTERRUPTED]
+    assert [event.type for event in second_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert first_events[0].id == second_events[0].id == run_events[-1].id
+    stored_interrupt_events = [
+        event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED
+    ]
+    assert stored_interrupt_events == [run_events[-1]]
+
+
+def test_interrupt_session_preserves_completed_tool_results_in_interrupted_round():
+    class BlockingTool(Tool):
+        spec = ToolSpec(
+            name="blocking_tool",
+            description="Block until cancelled.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.cancelled is None or self.never_complete is None:
+                raise AssertionError("BlockingTool test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return ToolResult(content="unexpected")
+
+    blocking_tool = BlockingTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_echo",
+                name="echo",
+                arguments={"text": "first"},
+            ),
+            ModelStreamEvent.tool_call(
+                id="call_block",
+                name="blocking_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool(), blocking_tool],
+    )
+
+    async def run():
+        blocking_tool.started = asyncio.Event()
+        blocking_tool.cancelled = asyncio.Event()
+        blocking_tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_partial_tool_round",
+                    messages=[Message.text("user", "use tools")],
+                ),
+            )
+        )
+        await blocking_tool.started.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_partial_tool_round",
+                    reason="operator stop",
+                )
+            )
+        ]
+        await asyncio.wait_for(blocking_tool.cancelled.wait(), timeout=1)
+        run_events = await run_task
+        stored_events = await app.session_store.load_events("sess_interrupt_partial_tool_round")
+        transcript = await app.session_store.load_transcript("sess_interrupt_partial_tool_round")
+        return run_events, interrupt_events, stored_events, transcript
+
+    run_events, interrupt_events, stored_events, transcript = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert run_events[-1].id == interrupt_events[0].id
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_COMPLETED) == 1
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 1
+    validate_context_messages(transcript)
+    result_parts = transcript[-1].content
+    assert [part.tool_call_id for part in result_parts] == ["call_echo", "call_block"]
+    assert result_parts[0].content == "first"
+    assert result_parts[0].is_error is False
+    assert result_parts[1].content == "Tool call interrupted before completion."
+    assert result_parts[1].is_error is True
+
+
+def test_interrupt_session_preserves_tool_result_when_interrupted_after_tool_returns():
+    store = InMemorySessionStore()
+
+    class InterruptingAfterReturnTool(Tool):
+        spec = ToolSpec(
+            name="interrupting_after_return_tool",
+            description="Interrupt session immediately before returning a real result.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            await store.update_status(ctx.session_id, SessionStatus.INTERRUPTED)
+            return ToolResult(
+                content="real completed result",
+                structured={"completed": True},
+            )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_finished",
+                name="interrupting_after_return_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[InterruptingAfterReturnTool()],
+    )
+
+    async def run():
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_after_tool_return",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+        transcript = await store.load_transcript("sess_interrupt_after_tool_return")
+        stored_events = await store.load_events("sess_interrupt_after_tool_return")
+        return events, transcript, stored_events
+
+    events, transcript, stored_events = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_COMPLETED) == 1
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 0
+    tool_event = next(
+        event for event in stored_events if event.type == EventType.TOOL_CALL_COMPLETED
+    )
+    assert tool_event.payload["result"]["content"] == "real completed result"
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert len(transcript[-1].content) == 1
+    assert transcript[-1].content[0].tool_call_id == "call_finished"
+    assert transcript[-1].content[0].content == "real completed result"
+    assert transcript[-1].content[0].structured == {"completed": True}
+    assert transcript[-1].content[0].is_error is False
+
+
+def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_tool_call_append():
+    class InterruptingAfterAssistantToolCallStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupt_after_next_assistant_tool_call_append = False
+
+        async def append_transcript_messages(
+            self,
+            session_id: str,
+            messages: list[Message],
+        ) -> None:
+            await super().append_transcript_messages(session_id, messages)
+            if self.interrupt_after_next_assistant_tool_call_append and any(
+                any(type(part) is ToolCallPart for part in message.content) for message in messages
+            ):
+                self.interrupt_after_next_assistant_tool_call_append = False
+                await self.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    store = InterruptingAfterAssistantToolCallStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_echo",
+                name="echo",
+                arguments={"text": "should not execute"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[EchoTool()],
-        tool_policy=ApprovalPolicy(),
     )
 
     async def run():
-        task = await tasks.create_task(TaskCreate(task_id="task_cancel_hook", type="run"))
-        interrupted_events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="sess_cancel_hook_order",
-                    task_id=task.id,
-                    messages=[Message.text("user", "hello")],
-                )
+        store.interrupt_after_next_assistant_tool_call_append = True
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_after_assistant_tool_call_append",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+        transcript = await store.load_transcript("sess_interrupt_after_assistant_tool_call_append")
+        stored_events = await store.load_events("sess_interrupt_after_assistant_tool_call_append")
+        return events, transcript, stored_events
+
+    events, transcript, stored_events = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_COMPLETED) == 0
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 1
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert len(transcript[-1].content) == 1
+    assert transcript[-1].content[0].tool_call_id == "call_echo"
+    assert transcript[-1].content[0].content == "Tool call interrupted before completion."
+    assert transcript[-1].content[0].structured == {
+        "interrupted": True,
+        "tool_call_id": "call_echo",
+        "tool_name": "echo",
+    }
+    assert transcript[-1].content[0].is_error is True
+
+
+def test_interrupt_session_does_not_leave_pending_approval_when_interrupted_after_policy_plan():
+    store = InMemorySessionStore()
+
+    class InterruptingApprovalPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            await store.update_status(request.session.id, SessionStatus.INTERRUPTED)
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Approval required for {request.tool_name}.",
             )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_echo",
+                name="echo",
+                arguments={"text": "should not execute"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
-        assert interrupted_events[-1].type == EventType.SESSION_INTERRUPTED
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        tool_policy=InterruptingApprovalPolicy(),
+    )
 
-        cancel_events = [
-            event
-            async for event in app.cancel_session(
-                CancelSessionRequest(
-                    session_id="sess_cancel_hook_order",
-                    reason="operator requested stop",
-                )
-            )
+    async def run():
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_after_policy_plan",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+        transcript = await store.load_transcript("sess_interrupt_after_policy_plan")
+        stored_events = await store.load_events("sess_interrupt_after_policy_plan")
+        checkpoint = await store.load_checkpoint("sess_interrupt_after_policy_plan")
+        return events, transcript, stored_events, checkpoint
+
+    events, transcript, stored_events, checkpoint = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert EventType.TOOL_CALL_APPROVAL_REQUESTED not in [event.type for event in stored_events]
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 1
+    assert checkpoint is None
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert transcript[-1].content[0].tool_call_id == "call_echo"
+    assert transcript[-1].content[0].content == "Tool call interrupted before completion."
+    assert transcript[-1].content[0].is_error is True
+
+
+def test_interrupt_session_preserves_tool_results_when_interrupted_before_append():
+    class InterruptingTranscriptStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupt_on_next_tool_result_append = False
+
+        async def append_transcript_messages(
+            self,
+            session_id: str,
+            messages: list[Message],
+        ) -> None:
+            if self.interrupt_on_next_tool_result_append and any(
+                message.role == "tool" for message in messages
+            ):
+                self.interrupt_on_next_tool_result_append = False
+                await self.update_status(session_id, SessionStatus.INTERRUPTED)
+                raise asyncio.CancelledError
+            await super().append_transcript_messages(session_id, messages)
+
+    store = InterruptingTranscriptStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_echo",
+                name="echo",
+                arguments={"text": "finished"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
-        stored_events = await store.load_events("sess_cancel_hook_order")
-        return cancel_events, stored_events, await tasks.load_task(task.id)
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
 
-    cancel_events, stored_events, task = asyncio.run(run())
+    async def run():
+        store.interrupt_on_next_tool_result_append = True
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_after_tool_before_append",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+        transcript = await store.load_transcript("sess_interrupt_after_tool_before_append")
+        stored_events = await store.load_events("sess_interrupt_after_tool_before_append")
+        return events, transcript, stored_events
 
-    assert task is not None
-    assert task.status == TaskStatus.CANCELLED
-    assert [event.type for event in cancel_events[-4:]] == [
-        EventType.SESSION_CANCELLED,
-        EventType.TASK_CANCELLED,
-        EventType.HOOK_STARTED,
-        EventType.HOOK_COMPLETED,
-    ]
-    assert [event.type for event in stored_events[-4:]] == [
-        EventType.SESSION_CANCELLED,
-        EventType.TASK_CANCELLED,
-        EventType.HOOK_STARTED,
-        EventType.HOOK_COMPLETED,
-    ]
-    assert hook_calls == [("sess_cancel_hook_order", EventType.SESSION_CANCELLED)]
+    events, transcript, stored_events = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in stored_events].count(EventType.SESSION_INTERRUPTED) == 1
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_COMPLETED) == 1
+    assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 0
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    assert len(transcript[-1].content) == 1
+    assert transcript[-1].content[0].tool_call_id == "call_echo"
+    assert transcript[-1].content[0].content == "finished"
+    assert transcript[-1].content[0].is_error is False

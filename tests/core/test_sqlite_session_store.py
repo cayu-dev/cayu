@@ -192,6 +192,178 @@ def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_p
     asyncio.run(assert_reopened_state())
 
 
+def test_sqlite_session_store_atomically_transitions_status_and_checkpoint(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_atomic_status_checkpoint",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        session = await store.transition_status_and_checkpoint(
+            "sess_atomic_status_checkpoint",
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=lambda _session, checkpoint: {
+                **({} if checkpoint is None else checkpoint),
+                "pending_session_interrupt": {"reason": "operator stop"},
+            },
+        )
+        checkpoint = await store.load_checkpoint("sess_atomic_status_checkpoint")
+        await _close(store)
+        return session, checkpoint
+
+    session, checkpoint = asyncio.run(run_store_operations())
+
+    assert session.status == SessionStatus.INTERRUPTING
+    assert checkpoint == {"pending_session_interrupt": {"reason": "operator stop"}}
+
+
+def test_sqlite_session_store_rejects_stale_atomic_status_checkpoint_transition(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    first = SQLiteSessionStore(db_path)
+    second = SQLiteSessionStore(db_path)
+
+    async def run_store_operations() -> None:
+        await first.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_stale_atomic_status_checkpoint",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await second.update_status(
+            "sess_stale_atomic_status_checkpoint",
+            SessionStatus.RUNNING,
+        )
+
+        with pytest.raises(ValueError, match="Session status transition not allowed"):
+            await first.transition_status_and_checkpoint(
+                "sess_stale_atomic_status_checkpoint",
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.INTERRUPTING,
+                checkpoint_transform=lambda _session, checkpoint: {
+                    **({} if checkpoint is None else checkpoint),
+                    "pending_session_interrupt": {"reason": "operator stop"},
+                },
+            )
+
+        session = await first.load("sess_stale_atomic_status_checkpoint")
+        checkpoint = await first.load_checkpoint("sess_stale_atomic_status_checkpoint")
+        await first.close()
+        await second.close()
+        return session, checkpoint
+
+    session, checkpoint = asyncio.run(run_store_operations())
+
+    assert session is not None
+    assert session.status == SessionStatus.RUNNING
+    assert checkpoint is None
+
+
+def test_sqlite_session_store_locks_checkpoint_during_atomic_status_checkpoint_transition(
+    tmp_path,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    first = SQLiteSessionStore(db_path)
+
+    async def run_store_operations() -> None:
+        await first.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_atomic_checkpoint_lock",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await first.checkpoint("sess_atomic_checkpoint_lock", {"existing": True})
+
+        def transform(_session: Session, checkpoint: dict | None) -> dict:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                connection = sqlite3.connect(db_path, timeout=0)
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            "sess_atomic_checkpoint_lock",
+                            '{"external": true}',
+                            "2026-01-01T00:00:00+00:00",
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+            return {
+                **({} if checkpoint is None else checkpoint),
+                "pending_session_interrupt": {"reason": "operator stop"},
+            }
+
+        session = await first.transition_status_and_checkpoint(
+            "sess_atomic_checkpoint_lock",
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=transform,
+        )
+        checkpoint = await first.load_checkpoint("sess_atomic_checkpoint_lock")
+        await first.close()
+        return session, checkpoint
+
+    session, checkpoint = asyncio.run(run_store_operations())
+
+    assert session.status == SessionStatus.INTERRUPTING
+    assert checkpoint == {
+        "existing": True,
+        "pending_session_interrupt": {"reason": "operator stop"},
+    }
+
+
+def test_sqlite_session_store_atomic_status_checkpoint_returns_written_snapshot(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    first = SQLiteSessionStore(db_path)
+    second = SQLiteSessionStore(db_path)
+
+    async def run_store_operations() -> tuple[Session, Session | None]:
+        await first.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_atomic_return_snapshot",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        returned = await first.transition_status_and_checkpoint(
+            "sess_atomic_return_snapshot",
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=lambda _session, checkpoint: {
+                **({} if checkpoint is None else checkpoint),
+                "pending_session_interrupt": {"reason": "operator stop"},
+            },
+        )
+        await second.update_status("sess_atomic_return_snapshot", SessionStatus.INTERRUPTED)
+        loaded = await first.load("sess_atomic_return_snapshot")
+        await first.close()
+        await second.close()
+        return returned, loaded
+
+    returned, loaded = asyncio.run(run_store_operations())
+
+    assert returned.status == SessionStatus.INTERRUPTING
+    assert loaded is not None
+    assert loaded.status == SessionStatus.INTERRUPTED
+
+
 def test_sqlite_session_store_persists_forked_session_state(tmp_path):
     db_path = tmp_path / "forks.sqlite"
     store = SQLiteSessionStore(db_path)

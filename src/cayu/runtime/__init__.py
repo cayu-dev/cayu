@@ -45,12 +45,12 @@ from cayu.runtime.hooks import (
     ToolCallHookContext,
 )
 from cayu.runtime.sessions import (
-    CancelSessionRequest,
     CheckpointTransform,
     EventQuery,
     EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
+    InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
     Session,
@@ -80,7 +80,6 @@ from cayu.runtime.tool_policy import (
 
 __all__ = [
     "AllowAllToolPolicy",
-    "CancelSessionRequest",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CheckpointTransform",
@@ -104,6 +103,7 @@ __all__ = [
     "InMemorySessionStore",
     "InMemoryTaskStore",
     "InlineDispatcher",
+    "InterruptSessionRequest",
     "MessageWindowContextPolicy",
     "ModelCompactor",
     "PendingToolApproval",

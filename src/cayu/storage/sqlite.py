@@ -355,6 +355,92 @@ class SQLiteSessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             return loaded
 
+    async def transition_status_and_checkpoint(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+
+        updated_at = datetime.now(UTC)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                if loaded.status not in allowed_statuses:
+                    raise ValueError(
+                        f"Session status transition not allowed: {loaded.status} -> {to_status}"
+                    )
+
+                transformed_checkpoint = checkpoint_transform(
+                    loaded,
+                    self._load_checkpoint_unlocked(session_id),
+                )
+                if transformed_checkpoint is not None:
+                    transformed_checkpoint = copy_json_value(
+                        transformed_checkpoint,
+                        "checkpoint",
+                    )
+
+                placeholders = ", ".join("?" for _ in allowed_statuses)
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE sessions
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status IN ({placeholders})
+                    """,
+                    (
+                        str(to_status),
+                        sqlite_support.format_datetime(updated_at),
+                        session_id,
+                        *(str(status) for status in allowed_statuses),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    current = self._load_unlocked(session_id)
+                    if current is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    raise ValueError(
+                        f"Session status transition not allowed: {current.status} -> {to_status}"
+                    )
+                if transformed_checkpoint is not None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            session_id,
+                            sqlite_support.json_dumps(transformed_checkpoint),
+                            sqlite_support.format_datetime(updated_at),
+                        ),
+                    )
+                self._connection.commit()
+                transitioned = loaded.model_copy(
+                    update={
+                        "status": to_status,
+                        "updated_at": updated_at,
+                    }
+                )
+            except Exception:
+                self._connection.rollback()
+                raise
+
+            return transitioned
+
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 

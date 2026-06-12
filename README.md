@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, session cancellation, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
@@ -348,17 +348,55 @@ resume_request = ResumeRequest(
 )
 ```
 
-Cancel a pending, running, or interrupted session through the runtime.
-Cancellation is durable: Cayu marks the session `cancelled`, emits
-`session.cancelled`, and cooperatively stops active runtime loops before further
-model requests or tool calls. If the run is linked to a running task, Cayu marks
-that task `cancelled`.
+Interrupt a pending or running session through the runtime. Interruption is
+durable and resumable after finalization: Cayu first marks the session
+`interrupting`, signals active runtime work for that session in the current
+`CayuApp` process, repairs any in-progress tool round if needed, then marks the
+session `interrupted` and emits `session.interrupted`. You can later continue
+the same session with `ResumeRequest` after the `session.interrupted` event.
+If the current process does not own the active run, or the active run is still
+stopping and repairing its transcript, `interrupt_session(...)` reports that
+interruption is still finalizing and leaves the session `interrupting`. The
+caller should retry, poll the session/event store, or subscribe to events until
+`session.interrupted` is durable.
+Every `session.interrupted` event includes a normalized `interruption_type`:
+`operator_requested` for explicit `InterruptSessionRequest` calls,
+`tool_approval_required` for approval pauses, and `runtime_interrupted` for
+runtime/status-driven interruption repairs.
+
+Provider streams and runner/tool calls that are currently awaited are stopped
+through normal asyncio cancellation. `E2BRunner` and `MicrosandboxRunner`
+separate user/runtime interruption from command timeout:
+
+- `cancellation_cleanup` defaults to `"command"`. It asks the
+  provider command handle to kill only the current command and keeps the sandbox
+  reusable when that succeeds. This preserves interactive coding workspaces
+  after an operator interrupt.
+- `timeout_cleanup` defaults to `"command"`. It also asks the provider
+  command handle to kill only the current command, so timeout handling preserves
+  workspace state by default. Apps that prefer a stronger cleanup boundary can
+  set it to `"sandbox"`.
+
+Cleanup waits are bounded by `cancel_timeout_s`; cleanup failures are surfaced
+as `cayu.runner_cleanup.v1` diagnostics on interrupted tool results or timed-out
+`ExecResult.artifacts`. If E2B has not yet returned a command handle when
+interruption or timeout arrives, Cayu first tries to stop the start attempt and
+resolve the handle within the cleanup window. With `"command"` cleanup, Cayu
+reports deferred cleanup and continues waiting in the background for a bounded
+adapter-owned window. If that delayed command start never resolves, Cayu
+preserves the sandbox but closes that runner's exec path so later commands do
+not overlap with an unknown command state. With `"sandbox"` cleanup, Cayu kills
+the sandbox immediately because the sandbox is the configured cleanup boundary.
+Apps that need a stronger cleanup boundary can set either cleanup field to
+`"sandbox"`, or use `"none"` when they own cleanup outside Cayu. Interrupting a
+session does not automatically cancel a linked task; task state remains
+application/workflow owned.
 
 ```python
-from cayu import CancelSessionRequest
+from cayu import InterruptSessionRequest
 
-async for event in app.cancel_session(
-    CancelSessionRequest(
+async for event in app.interrupt_session(
+    InterruptSessionRequest(
         session_id="sess_123",
         reason="operator requested stop",
         metadata={"actor": "operator"},

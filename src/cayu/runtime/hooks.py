@@ -16,7 +16,6 @@ class RuntimeHookPhase(StrEnum):
     AFTER_SESSION_COMPLETED = "after_session_completed"
     AFTER_SESSION_FAILED = "after_session_failed"
     AFTER_SESSION_INTERRUPTED = "after_session_interrupted"
-    AFTER_SESSION_CANCELLED = "after_session_cancelled"
     AFTER_TOOL_CALL = "after_tool_call"
 
 
@@ -248,9 +247,6 @@ class RuntimeHook:
 
     async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
         """Run after a session reaches interrupted state."""
-
-    async def after_session_cancelled(self, context: RuntimeHookContext) -> None:
-        """Run after a session reaches cancelled state."""
 
     async def after_tool_call(self, context: ToolCallHookContext) -> None:
         """Run after a tool call result event has been persisted."""

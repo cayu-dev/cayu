@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
 from typing import Any
@@ -36,6 +37,7 @@ from cayu.providers import (
     ModelStreamEventType,
     copy_model_stream_event,
 )
+from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -74,17 +76,17 @@ from cayu.runtime.hooks import (
     ToolCallHookContext,
 )
 from cayu.runtime.sessions import (
-    CancelSessionRequest,
     ForkSessionRequest,
     InMemorySessionStore,
+    InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
     Session,
     SessionIdentity,
     SessionStatus,
     SessionStore,
-    copy_cancel_session_request,
     copy_fork_session_request,
+    copy_interrupt_session_request,
     copy_resume_request,
     copy_run_request,
 )
@@ -107,10 +109,18 @@ class _SessionInterrupted(Exception):
         self.approval = copy_pending_tool_approval(approval)
 
 
-class _SessionCancelled(Exception):
+class _SessionInterruptedByRequest(Exception):
     def __init__(self, session_id: str) -> None:
         self.session_id = require_clean_nonblank(session_id, "session_id")
-        super().__init__(f"Session cancelled: {self.session_id}")
+        super().__init__(f"Session interrupted: {self.session_id}")
+
+
+@dataclass
+class _ActiveSessionRun:
+    runtime_task: asyncio.Task[Any]
+    task_id: str | None
+    task_started: bool
+    task_finished: bool
 
 
 _RESUMABLE_SESSION_STATUSES = {
@@ -119,13 +129,22 @@ _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.INTERRUPTED,
 }
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
-_CANCELLABLE_SESSION_STATUSES = {
+_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
+}
+_INTERRUPT_REQUESTED_SESSION_STATUSES = {
+    SessionStatus.INTERRUPTING,
     SessionStatus.INTERRUPTED,
 }
-_CANCELLED_EVENT_WAIT_ATTEMPTS = 10
-_CANCELLED_EVENT_WAIT_INTERVAL_S = 0.01
+_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 10
+_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
+_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 600
+_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
+_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
+_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
+_INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
+_INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 
 
 class CayuApp:
@@ -191,6 +210,9 @@ class CayuApp:
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
+        self._active_session_runs: dict[str, dict[asyncio.Task[Any], _ActiveSessionRun]] = {}
+        self._sessions_emitting_interrupted: set[str] = set()
+        self._sessions_requesting_interruption: set[str] = set()
 
     def register_agent(
         self,
@@ -410,10 +432,10 @@ class CayuApp:
         ):
             yield event
 
-    async def cancel_session(self, request: CancelSessionRequest) -> AsyncIterator[Event]:
-        if type(request) is not CancelSessionRequest:
-            raise TypeError("Runtime cancellation requires a CancelSessionRequest.")
-        request = copy_cancel_session_request(request)
+    async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
+        if type(request) is not InterruptSessionRequest:
+            raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
+        request = copy_interrupt_session_request(request)
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
@@ -421,76 +443,143 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        if loaded_session.status == SessionStatus.CANCELLED:
-            existing_cancel_event = await self._wait_for_session_cancelled_event(loaded_session.id)
-            if existing_cancel_event is not None:
-                yield existing_cancel_event
+        if loaded_session.status == SessionStatus.INTERRUPTED:
+            existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
+                loaded_session.id
+            )
+            if existing_interrupt_event is not None:
+                yield existing_interrupt_event
                 return
             raise RuntimeError(
-                f"Session is cancelled but has no session.cancelled event: {loaded_session.id}"
+                f"Session is interrupted but has no session.interrupted event: {loaded_session.id}"
             )
-        else:
-            try:
-                session = await self.session_store.transition_status(
-                    loaded_session.id,
-                    from_statuses=_CANCELLABLE_SESSION_STATUSES,
-                    to_status=SessionStatus.CANCELLED,
-                )
-            except ValueError:
-                existing_cancel_event = await self._wait_for_session_cancelled_event(
-                    loaded_session.id
-                )
-                if existing_cancel_event is not None:
-                    yield existing_cancel_event
-                    return
-                raise
-        task_event: Event | None = None
-        task_cancel_error: Exception | None = None
-        if loaded_session.status == SessionStatus.INTERRUPTED and self.task_store is not None:
-            try:
-                task_event = await self._pending_approval_task_cancelled_event(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
-            except Exception as task_exc:
-                task_cancel_error = task_exc
-        payload = {
+
+        if loaded_session.status == SessionStatus.INTERRUPTING:
+            existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
+                loaded_session.id
+            )
+            if existing_interrupt_event is not None:
+                yield existing_interrupt_event
+                return
+            raise TimeoutError(f"Session interruption is still finalizing: {loaded_session.id}")
+
+        if loaded_session.status not in _INTERRUPTIBLE_SESSION_STATUSES:
+            raise ValueError(f"Session cannot be interrupted from status: {loaded_session.status}")
+
+        interrupt_payload = {
             "reason": request.reason,
             "metadata": request.metadata,
+            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
         }
-        if task_cancel_error is not None:
-            payload["task_update_error"] = str(task_cancel_error)
-            payload["task_update_error_type"] = type(task_cancel_error).__name__
-        terminal_event_stream = self._emit_terminal_event_with_hooks(
-            event=Event(
-                type=EventType.SESSION_CANCELLED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload=payload,
-            ),
-            phase=RuntimeHookPhase.AFTER_SESSION_CANCELLED,
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-        )
+        self._sessions_requesting_interruption.add(loaded_session.id)
+        request_marker_active = True
         try:
-            first_terminal_event = await anext(terminal_event_stream)
-        except StopAsyncIteration as exc:
-            raise RuntimeError("Session cancellation produced no terminal event.") from exc
+            session = await self.session_store.transition_status_and_checkpoint(
+                loaded_session.id,
+                from_statuses=_INTERRUPTIBLE_SESSION_STATUSES,
+                to_status=SessionStatus.INTERRUPTING,
+                checkpoint_transform=_checkpoint_with_pending_session_interrupt(interrupt_payload),
+            )
+            active_work_signalled = self._interrupt_active_session_runs(session.id)
+            if active_work_signalled:
+                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
+                    session.id
+                )
+                if existing_interrupt_event is not None:
+                    request_marker_active = False
+                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    yield existing_interrupt_event
+                    return
+                raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
+            if loaded_session.status == SessionStatus.RUNNING:
+                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
+                    session.id
+                )
+                if existing_interrupt_event is not None:
+                    request_marker_active = False
+                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    yield existing_interrupt_event
+                    return
+                raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
+        except ValueError:
+            reloaded_session = await self.session_store.load(loaded_session.id)
+            if reloaded_session is None:
+                raise KeyError(f"Session not found: {loaded_session.id}") from None
+            if reloaded_session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES:
+                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
+                    reloaded_session.id
+                )
+                if existing_interrupt_event is not None:
+                    request_marker_active = False
+                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    yield existing_interrupt_event
+                    return
+                if self._has_active_session_tasks(reloaded_session.id):
+                    raise TimeoutError(
+                        f"Session interruption is still finalizing: {reloaded_session.id}"
+                    ) from None
+                if reloaded_session.status == SessionStatus.INTERRUPTING:
+                    raise TimeoutError(
+                        f"Session interruption is still finalizing: {reloaded_session.id}"
+                    ) from None
+                raise RuntimeError(
+                    f"Session is interrupted but has no session.interrupted event: "
+                    f"{reloaded_session.id}"
+                ) from None
+            else:
+                raise
+        except BaseException:
+            if request_marker_active:
+                self._sessions_requesting_interruption.discard(loaded_session.id)
+            raise
 
+        session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+        payload = await self._load_pending_session_interrupt_payload(
+            session.id,
+            default={
+                "reason": request.reason,
+                "metadata": request.metadata,
+                "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+            },
+        )
+        terminal_event_stream: AsyncIterator[Event] | None = None
         try:
-            emitted_task_event = await self._emit(task_event) if task_event is not None else None
+            existing_interrupt_event = await self._latest_session_interrupted_event(session.id)
+            if existing_interrupt_event is not None:
+                await self._clear_pending_session_interrupt(session.id)
+                yield existing_interrupt_event
+                return
+            terminal_event_stream = self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload=payload,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            try:
+                first_terminal_event = await anext(terminal_event_stream)
+            except StopAsyncIteration as exc:
+                raise RuntimeError("Session interruption produced no terminal event.") from exc
+
+            await self._clear_pending_session_interrupt(session.id)
             yield first_terminal_event
-            if emitted_task_event is not None:
-                yield emitted_task_event
             async for event in terminal_event_stream:
                 yield event
         except Exception:
-            with contextlib.suppress(Exception):
-                await _close_async_iterator(terminal_event_stream)
+            if terminal_event_stream is not None:
+                with contextlib.suppress(Exception):
+                    await _close_async_iterator(terminal_event_stream)
             raise
+        finally:
+            if request_marker_active:
+                self._sessions_requesting_interruption.discard(loaded_session.id)
+        return
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
@@ -952,6 +1041,7 @@ class CayuApp:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                             "approval": pending_approval.model_dump(),
                             "error": str(exc),
                             "error_type": type(exc).__name__,
@@ -981,6 +1071,7 @@ class CayuApp:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                             "approval": pending_approval.model_dump(),
                             "error": str(exc),
                             "error_type": type(exc).__name__,
@@ -1178,6 +1269,16 @@ class CayuApp:
         environment_name = _environment_name(registered_environment)
         task_started = task_id is not None and not start_task_on_enter
         task_finished = False
+        current_task = asyncio.current_task()
+        active_run: _ActiveSessionRun | None = None
+        if current_task is not None:
+            active_run = self._register_active_session_task(
+                session.id,
+                current_task,
+                task_id=task_id,
+                task_started=task_started,
+                task_finished=task_finished,
+            )
         try:
             if start_event_type is not None:
                 yield await self._emit(
@@ -1192,6 +1293,8 @@ class CayuApp:
             if task_id is not None and start_task_on_enter:
                 task = await self._start_task(task_id=task_id, session=session)
                 task_started = True
+                if active_run is not None:
+                    active_run.task_started = True
                 yield await self._emit(
                     _task_event(
                         event_type=EventType.TASK_STARTED,
@@ -1206,7 +1309,7 @@ class CayuApp:
                 messages_to_append,
             )
             for step in range(1, max_steps + 1):
-                await self._raise_if_session_cancelled(session.id)
+                await self._raise_if_session_interrupted(session.id)
                 try:
                     (
                         context_messages,
@@ -1261,7 +1364,7 @@ class CayuApp:
                             payload=checkpoint_event_payload,
                         )
                     )
-                await self._raise_if_session_cancelled(session.id)
+                await self._raise_if_session_interrupted(session.id)
 
                 model_request = ModelRequest(
                     model=session.model,
@@ -1315,6 +1418,7 @@ class CayuApp:
                 model_completed = False
                 async for raw_stream_event in provider.stream(model_request):
                     stream_event = _validate_stream_event(raw_stream_event)
+                    await self._raise_if_session_interrupted(session.id)
                     if model_completed:
                         raise RuntimeError(
                             f"Model provider emitted event after completed: {stream_event.type}"
@@ -1350,7 +1454,7 @@ class CayuApp:
 
                 if not model_completed:
                     raise RuntimeError("Model provider stream ended without a completed event.")
-                await self._raise_if_session_cancelled(session.id)
+                await self._raise_if_session_interrupted(session.id)
 
                 assistant_message = transcript_helpers.assistant_message(
                     content_parts=assistant_parts,
@@ -1366,63 +1470,169 @@ class CayuApp:
                 if not tool_calls:
                     break
 
-                await self._raise_if_session_cancelled(session.id)
-                policy_plan = await self._policy_plan_for_tool_round(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_calls=tool_calls,
-                    request_metadata=request_metadata,
-                    task_id=task_id,
-                )
-                if policy_plan.pending_approval is not None:
-                    approval, checkpoint_event = policy_plan.pending_approval
-                    yield await self._emit(checkpoint_event)
-                    yield await self._emit(
-                        Event(
-                            type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=approval.tool_name,
-                            payload={
-                                "approval": approval.model_dump(),
-                            },
-                        )
+                tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+                try:
+                    await self._raise_if_session_interrupted(session.id)
+                    policy_plan = await self._policy_plan_for_tool_round(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_calls=tool_calls,
+                        request_metadata=request_metadata,
                     )
+                    await self._raise_if_session_interrupted(session.id)
+                except _SessionInterruptedByRequest:
+                    async for event in self._close_interrupted_tool_round(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        tool_outcomes=tool_outcomes,
+                    ):
+                        yield event
+                    raise
+                except asyncio.CancelledError as exc:
+                    if await self._session_interrupt_requested(session.id):
+                        _clear_current_task_cancellation()
+                        async for event in self._close_interrupted_tool_round(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            messages=messages,
+                            tool_calls=tool_calls,
+                            tool_outcomes=tool_outcomes,
+                            cancellation_artifacts=_cancellation_artifacts(exc),
+                        ):
+                            yield event
+                    raise
+
+                if policy_plan.pending_approval is not None:
+                    approval_plan = policy_plan.pending_approval
+                    try:
+                        approval, checkpoint_event = await self._checkpoint_pending_tool_approval(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            tool_call=approval_plan.call,
+                            tool_calls=approval_plan.calls,
+                            policy_outcomes=approval_plan.policy_outcomes,
+                            task_id=task_id,
+                            policy_result=approval_plan.policy_result,
+                        )
+                        yield await self._emit(checkpoint_event)
+                        yield await self._emit(
+                            Event(
+                                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                tool_name=approval.tool_name,
+                                payload={
+                                    "approval": approval.model_dump(),
+                                },
+                            )
+                        )
+                    except _SessionInterruptedByRequest:
+                        await self._clear_pending_tool_approval_for_tool_round(
+                            session.id,
+                            tool_calls,
+                        )
+                        async for event in self._close_interrupted_tool_round(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            messages=messages,
+                            tool_calls=tool_calls,
+                            tool_outcomes=tool_outcomes,
+                        ):
+                            yield event
+                        raise
+                    except asyncio.CancelledError as exc:
+                        if await self._session_interrupt_requested(session.id):
+                            _clear_current_task_cancellation()
+                            await self._clear_pending_tool_approval_for_tool_round(
+                                session.id,
+                                tool_calls,
+                            )
+                            async for event in self._close_interrupted_tool_round(
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                messages=messages,
+                                tool_calls=tool_calls,
+                                tool_outcomes=tool_outcomes,
+                                cancellation_artifacts=_cancellation_artifacts(exc),
+                            ):
+                                yield event
+                        raise
                     raise _SessionInterrupted(approval)
 
                 policy_results_by_id = {
                     outcome.call.id: outcome.result for outcome in policy_plan.outcomes
                 }
-                tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-                for tool_call in tool_calls:
-                    await self._raise_if_session_cancelled(session.id)
-                    async for event, outcome in self._execute_tool_call(
+                try:
+                    for tool_call in tool_calls:
+                        await self._raise_if_session_interrupted(session.id)
+                        async for event, outcome in self._execute_tool_call(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            tool_call=tool_call,
+                            request_metadata=request_metadata,
+                            task_id=task_id,
+                            policy_result=policy_results_by_id.get(tool_call.id),
+                        ):
+                            yield event
+                            if outcome is not None:
+                                tool_outcomes.append(outcome)
+                        await self._raise_if_session_interrupted(session.id)
+                except _SessionInterruptedByRequest:
+                    async for event in self._close_interrupted_tool_round(
                         session=session,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        request_metadata=request_metadata,
-                        task_id=task_id,
-                        policy_result=policy_results_by_id.get(tool_call.id),
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        tool_outcomes=tool_outcomes,
                     ):
                         yield event
-                        if outcome is not None:
-                            tool_outcomes.append(outcome)
-                    await self._raise_if_session_cancelled(session.id)
+                    raise
+                except asyncio.CancelledError as exc:
+                    if await self._session_interrupt_requested(session.id):
+                        _clear_current_task_cancellation()
+                        async for event in self._close_interrupted_tool_round(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            messages=messages,
+                            tool_calls=tool_calls,
+                            tool_outcomes=tool_outcomes,
+                            cancellation_artifacts=_cancellation_artifacts(exc),
+                        ):
+                            yield event
+                    raise
 
                 tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
                 messages.extend(tool_result_messages)
-                await self.session_store.append_transcript_messages(
-                    session.id,
-                    tool_result_messages,
-                )
+                try:
+                    await self.session_store.append_transcript_messages(
+                        session.id,
+                        tool_result_messages,
+                    )
+                except asyncio.CancelledError:
+                    if await self._session_interrupt_requested(session.id):
+                        _clear_current_task_cancellation()
+                        await self.session_store.append_transcript_messages(
+                            session.id,
+                            tool_result_messages,
+                        )
+                    raise
             else:
                 raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
 
             if task_id is not None:
-                await self._raise_if_session_cancelled(session.id)
+                await self._raise_if_session_interrupted(session.id)
                 task = await self._complete_task(
                     task_id=task_id,
                     session=session,
@@ -1430,6 +1640,8 @@ class CayuApp:
                     registered_environment=registered_environment,
                 )
                 task_finished = True
+                if active_run is not None:
+                    active_run.task_finished = True
                 yield await self._emit(
                     _task_event(
                         event_type=EventType.TASK_COMPLETED,
@@ -1462,6 +1674,7 @@ class CayuApp:
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     payload={
+                        "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                         "approval": exc.approval.model_dump(),
                     },
                 ),
@@ -1471,63 +1684,26 @@ class CayuApp:
                 registered_environment=registered_environment,
             ):
                 yield event
-        except _SessionCancelled:
-            task_cancel_error: Exception | None = None
-            if (
-                task_started
-                and not task_finished
-                and task_id is not None
-                and self.task_store is not None
-            ):
-                try:
-                    task = await self.task_store.cancel_task(
-                        task_id,
-                        {
-                            "message": "Session cancelled.",
-                            "session_id": session.id,
-                        },
-                    )
-                    yield await self._emit(
-                        _task_event(
-                            event_type=EventType.TASK_CANCELLED,
-                            task=task,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
-                    )
-                except Exception as task_exc:
-                    task_cancel_error = task_exc
-            loaded_cancelled = await self.session_store.load(session.id)
-            if loaded_cancelled is None:
-                raise KeyError(f"Session not found: {session.id}") from None
-            if loaded_cancelled.status != SessionStatus.CANCELLED:
-                loaded_cancelled = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.CANCELLED,
-                )
-            existing_cancel_event = await self._wait_for_session_cancelled_event(session.id)
-            if existing_cancel_event is not None:
-                yield existing_cancel_event
-                return
-            payload: dict[str, Any] = {}
-            if task_cancel_error is not None:
-                payload["task_update_error"] = str(task_cancel_error)
-                payload["task_update_error_type"] = type(task_cancel_error).__name__
-            async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_CANCELLED,
-                    session_id=loaded_cancelled.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                ),
-                phase=RuntimeHookPhase.AFTER_SESSION_CANCELLED,
-                session=loaded_cancelled,
+        except _SessionInterruptedByRequest:
+            async for event in self._handle_session_interrupted(
+                session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                environment_name=environment_name,
             ):
                 yield event
+            return
+        except asyncio.CancelledError:
+            if await self._session_interrupt_requested(session.id):
+                async for event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                ):
+                    yield event
+                return
+            raise
         except Exception as exc:
             task_failure_error: Exception | None = None
             if (
@@ -1545,6 +1721,9 @@ class CayuApp:
                             "session_id": session.id,
                         },
                     )
+                    task_finished = True
+                    if active_run is not None:
+                        active_run.task_finished = True
                     yield await self._emit(
                         _task_event(
                             event_type=EventType.TASK_FAILED,
@@ -1578,6 +1757,9 @@ class CayuApp:
                 registered_environment=registered_environment,
             ):
                 yield event
+        finally:
+            if current_task is not None:
+                self._unregister_active_session_task(session.id, current_task)
 
     async def _start_task(
         self,
@@ -1616,7 +1798,6 @@ class CayuApp:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_calls: list[runtime_records.ToolCallRequest],
         request_metadata: dict[str, Any],
-        task_id: str | None,
     ) -> runtime_records.ToolRoundPolicyPlan:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
@@ -1650,19 +1831,14 @@ class CayuApp:
                 outcomes=policy_outcomes, pending_approval=None
             )
 
-        pending_approval = await self._checkpoint_pending_tool_approval(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=approval_tool_call,
-            tool_calls=[outcome.call for outcome in policy_outcomes],
-            policy_outcomes=policy_outcomes,
-            task_id=task_id,
-            policy_result=approval_policy_result,
-        )
         return runtime_records.ToolRoundPolicyPlan(
             outcomes=policy_outcomes,
-            pending_approval=pending_approval,
+            pending_approval=runtime_records.PendingToolApprovalPlan(
+                call=approval_tool_call,
+                calls=[outcome.call for outcome in policy_outcomes],
+                policy_outcomes=policy_outcomes,
+                policy_result=approval_policy_result,
+            ),
         )
 
     async def _authorize_tool_call(
@@ -1849,6 +2025,8 @@ class CayuApp:
             ),
             arguments=deepcopy(tool_call.arguments),
         )
+        if await self._session_is_interrupting(session.id):
+            raise _SessionInterruptedByRequest(session.id)
         event_type = (
             EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
         )
@@ -1935,64 +2113,275 @@ class CayuApp:
         checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
         return checkpoint
 
-    async def _pending_approval_task_cancelled_event(
+    async def _clear_pending_tool_approval_for_tool_round(
+        self,
+        session_id: str,
+        tool_calls: list[runtime_records.ToolCallRequest],
+    ) -> None:
+        expected_ids = {tool_call.id for tool_call in tool_calls}
+        if not expected_ids:
+            return
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        pending_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
+        if pending_approval is None or pending_approval.tool_call_id not in expected_ids:
+            return
+        copied_checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
+        await self.session_store.checkpoint(session_id, copied_checkpoint)
+
+    async def _load_pending_session_interrupt_payload(
+        self,
+        session_id: str,
+        *,
+        default: dict[str, Any],
+    ) -> dict[str, Any]:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return copy_json_value(default, "interrupt_payload")
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        value = copied_checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        if value is None:
+            return copy_json_value(default, "interrupt_payload")
+        if type(value) is not dict:
+            raise ValueError("Pending session interrupt checkpoint must be an object.")
+        return copy_json_value(value, "interrupt_payload")
+
+    async def _clear_pending_session_interrupt(self, session_id: str) -> None:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, None)
+        await self.session_store.checkpoint(session_id, copied_checkpoint)
+
+    async def _handle_session_interrupted(
         self,
         *,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-    ) -> Event | None:
-        if self.task_store is None:
-            return None
-        checkpoint = await self.session_store.load_checkpoint(session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        if pending_approval is None or pending_approval.task_id is None:
-            return None
-        task = await self.task_store.cancel_task(
-            pending_approval.task_id,
-            {
-                "message": "Session cancelled.",
-                "session_id": session.id,
-                "approval_id": pending_approval.approval_id,
-            },
+        environment_name: str | None,
+    ) -> AsyncIterator[Event]:
+        _clear_current_task_cancellation()
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._unregister_active_session_task(session.id, current_task)
+        self._sessions_emitting_interrupted.add(session.id)
+        try:
+            loaded_interrupted = await self.session_store.load(session.id)
+            if loaded_interrupted is None:
+                raise KeyError(f"Session not found: {session.id}") from None
+            if loaded_interrupted.status != SessionStatus.INTERRUPTED:
+                loaded_interrupted = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+            existing_interrupt_event = await self._wait_for_session_interrupted_event(session.id)
+            if existing_interrupt_event is not None:
+                await self._clear_pending_session_interrupt(session.id)
+                yield existing_interrupt_event
+                return
+            payload = await self._load_pending_session_interrupt_payload(session.id, default={})
+            payload.setdefault("interruption_type", _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED)
+            terminal_event_stream = self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=loaded_interrupted.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=loaded_interrupted,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            try:
+                first_terminal_event = await anext(terminal_event_stream)
+            except StopAsyncIteration as exc:
+                raise RuntimeError("Session interruption produced no terminal event.") from exc
+
+            await self._clear_pending_session_interrupt(session.id)
+            yield first_terminal_event
+            async for event in terminal_event_stream:
+                yield event
+        finally:
+            self._sessions_emitting_interrupted.discard(session.id)
+
+    async def _close_interrupted_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        tool_outcomes: list[runtime_records.ToolCallOutcome],
+        cancellation_artifacts: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[Event]:
+        if await self._tool_round_has_result_messages(session.id, tool_calls):
+            return
+        terminal_event_exists = await self._latest_session_interrupted_event(session.id) is not None
+        interrupted_results = _interrupted_tool_round_results(
+            tool_calls=tool_calls,
+            completed_outcomes=tool_outcomes,
+            cancellation_artifacts=cancellation_artifacts,
         )
-        return _task_event(
-            event_type=EventType.TASK_CANCELLED,
-            task=task,
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
+        if not interrupted_results and not tool_outcomes:
+            return
+        if not terminal_event_exists:
+            for interrupted_result in interrupted_results:
+                yield await self._emit(
+                    _interrupted_tool_call_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call_outcome=interrupted_result,
+                    )
+                )
+        tool_outcomes.extend(interrupted_results)
+        interrupted_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        messages.extend(interrupted_messages)
+        await self.session_store.append_transcript_messages(
+            session.id,
+            interrupted_messages,
         )
 
-    async def _raise_if_session_cancelled(self, session_id: str) -> None:
+    async def _tool_round_has_result_messages(
+        self,
+        session_id: str,
+        tool_calls: list[runtime_records.ToolCallRequest],
+    ) -> bool:
+        expected_ids = {tool_call.id for tool_call in tool_calls}
+        if not expected_ids:
+            return True
+        transcript = await self.session_store.load_transcript(session_id)
+        for message in reversed(transcript):
+            result_ids = {
+                part.tool_call_id for part in message.content if type(part) is ToolResultPart
+            }
+            if expected_ids.issubset(result_ids):
+                return True
+            call_ids = {part.tool_call_id for part in message.content if type(part) is ToolCallPart}
+            if expected_ids & call_ids:
+                return False
+        return False
+
+    async def _raise_if_session_interrupted(self, session_id: str) -> None:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}")
-        if session.status == SessionStatus.CANCELLED:
-            raise _SessionCancelled(session_id)
+        if session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES:
+            raise _SessionInterruptedByRequest(session_id)
 
-    async def _latest_session_cancelled_event(self, session_id: str) -> Event | None:
+    async def _session_interrupt_requested(self, session_id: str) -> bool:
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES
+
+    async def _session_is_interrupting(self, session_id: str) -> bool:
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return session.status == SessionStatus.INTERRUPTING
+
+    async def _latest_session_interrupted_event(self, session_id: str) -> Event | None:
         events = await self.session_store.load_events(session_id)
         for event in reversed(events):
-            if event.type == EventType.SESSION_CANCELLED:
+            if event.type == EventType.SESSION_INTERRUPTED:
                 return event.model_copy(deep=True)
         return None
 
-    async def _wait_for_session_cancelled_event(self, session_id: str) -> Event | None:
-        for attempt in range(_CANCELLED_EVENT_WAIT_ATTEMPTS):
-            existing_event = await self._latest_session_cancelled_event(session_id)
+    async def _wait_for_session_interrupted_event(self, session_id: str) -> Event | None:
+        for attempt in range(_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
+            existing_event = await self._latest_session_interrupted_event(session_id)
             if existing_event is not None:
                 return existing_event
 
             session = await self.session_store.load(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
-            if session.status != SessionStatus.CANCELLED:
+            if session.status != SessionStatus.INTERRUPTED:
                 return None
-            if attempt < _CANCELLED_EVENT_WAIT_ATTEMPTS - 1:
-                await asyncio.sleep(_CANCELLED_EVENT_WAIT_INTERVAL_S)
+            if attempt < _INTERRUPTED_EVENT_WAIT_ATTEMPTS - 1:
+                await asyncio.sleep(_INTERRUPTED_EVENT_WAIT_INTERVAL_S)
 
         return None
+
+    async def _wait_for_active_session_interrupted_event(self, session_id: str) -> Event | None:
+        for attempt in range(_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
+            existing_event = await self._latest_session_interrupted_event(session_id)
+            if existing_event is not None:
+                return existing_event
+            if (
+                not self._has_active_session_tasks(session_id)
+                and not self._is_session_emitting_interrupted(session_id)
+                and not self._is_session_interruption_request_active(session_id)
+            ):
+                return None
+            if attempt < _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS - 1:
+                await asyncio.sleep(_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S)
+        return None
+
+    def _register_active_session_task(
+        self,
+        session_id: str,
+        task: asyncio.Task[Any],
+        *,
+        task_id: str | None,
+        task_started: bool,
+        task_finished: bool,
+    ) -> _ActiveSessionRun:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        active_run = _ActiveSessionRun(
+            runtime_task=task,
+            task_id=task_id,
+            task_started=task_started,
+            task_finished=task_finished,
+        )
+        self._active_session_runs.setdefault(session_id, {})[task] = active_run
+        return active_run
+
+    def _unregister_active_session_task(
+        self,
+        session_id: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        active_runs = self._active_session_runs.get(session_id)
+        if active_runs is None:
+            return
+        active_runs.pop(task, None)
+        if not active_runs:
+            self._active_session_runs.pop(session_id, None)
+
+    def _has_active_session_tasks(self, session_id: str) -> bool:
+        return any(
+            not active_run.runtime_task.done()
+            for active_run in self._active_session_run_records(session_id)
+        )
+
+    def _is_session_emitting_interrupted(self, session_id: str) -> bool:
+        return session_id in self._sessions_emitting_interrupted
+
+    def _is_session_interruption_request_active(self, session_id: str) -> bool:
+        return session_id in self._sessions_requesting_interruption
+
+    def _interrupt_active_session_runs(self, session_id: str) -> bool:
+        current_task = asyncio.current_task()
+        signalled = False
+        for active_run in self._active_session_run_records(session_id):
+            task = active_run.runtime_task
+            if task is current_task or task.done():
+                continue
+            task.cancel()
+            signalled = True
+        return signalled
+
+    def _active_session_run_records(self, session_id: str) -> tuple[_ActiveSessionRun, ...]:
+        return tuple(self._active_session_runs.get(session_id, {}).values())
 
     async def _emit(self, event: Event) -> Event:
         await self.session_store.append_event(event.session_id, event)
@@ -2512,9 +2901,6 @@ async def _call_runtime_hook(
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         await hook.after_session_interrupted(context)
         return
-    if phase == RuntimeHookPhase.AFTER_SESSION_CANCELLED:
-        await hook.after_session_cancelled(context)
-        return
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 
@@ -2536,11 +2922,93 @@ def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
         return "after_session_failed"
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         return "after_session_interrupted"
-    if phase == RuntimeHookPhase.AFTER_SESSION_CANCELLED:
-        return "after_session_cancelled"
     if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
         return "after_tool_call"
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
+
+
+def _clear_current_task_cancellation() -> None:
+    current_task = asyncio.current_task()
+    if current_task is None:
+        return
+    while current_task.cancelling():
+        current_task.uncancel()
+
+
+def _checkpoint_with_pending_session_interrupt(
+    payload: dict[str, Any],
+):
+    copied_payload = copy_json_value(payload, "interrupt_payload")
+
+    def transform(_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+        copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        copied_checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = copy_json_value(
+            copied_payload,
+            "interrupt_payload",
+        )
+        return copied_checkpoint
+
+    return transform
+
+
+def _interrupted_tool_round_results(
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    completed_outcomes: list[runtime_records.ToolCallOutcome],
+    cancellation_artifacts: list[dict[str, Any]] | None = None,
+) -> list[runtime_records.ToolCallOutcome]:
+    completed_ids = {outcome.call.id for outcome in completed_outcomes}
+    artifacts_for_interrupted_tool = (
+        [] if cancellation_artifacts is None else cancellation_artifacts
+    )
+    interrupted_outcomes: list[runtime_records.ToolCallOutcome] = []
+    for tool_call in tool_calls:
+        if tool_call.id in completed_ids:
+            continue
+        result_artifacts = artifacts_for_interrupted_tool
+        artifacts_for_interrupted_tool = []
+        interrupted_outcomes.append(
+            runtime_records.ToolCallOutcome(
+                call=tool_call,
+                result=ToolResult(
+                    content="Tool call interrupted before completion.",
+                    structured={
+                        "interrupted": True,
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                    },
+                    artifacts=result_artifacts,
+                    is_error=True,
+                ),
+            )
+        )
+    return interrupted_outcomes
+
+
+def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]:
+    if isinstance(exc, RunnerCancelledError):
+        return copy_json_value(exc.artifacts, "artifacts")
+    return []
+
+
+def _interrupted_tool_call_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    tool_call_outcome: runtime_records.ToolCallOutcome,
+) -> Event:
+    return Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        tool_name=tool_call_outcome.call.name,
+        payload={
+            "tool_call_id": tool_call_outcome.call.id,
+            "result": tool_call_outcome.result.model_dump(),
+        },
+    )
 
 
 async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:

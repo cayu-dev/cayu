@@ -7,6 +7,15 @@ from types import ModuleType
 from typing import Any, Literal
 
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.runners._cleanup import (
+    DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+    DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+    DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+    RunnerCleanupPolicy,
+    cleanup_runner_command_with_diagnostic,
+    validate_cancel_timeout,
+    validate_runner_cleanup_policy,
+)
 from cayu.runners._subprocess import (
     copy_runner_env,
     validate_output_limit,
@@ -18,6 +27,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerCancelledError,
 )
 
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
@@ -43,6 +53,9 @@ class MicrosandboxRunner(Runner):
         name: str,
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "none",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         sandbox_module: ModuleType | Any | None = None,
     ) -> None:
         if sandbox is None:
@@ -50,9 +63,15 @@ class MicrosandboxRunner(Runner):
         self.name = _validate_sandbox_name(name)
         self.default_cwd = _validate_guest_root(default_cwd)
         self.close_action = _validate_close_action(close_action)
+        self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
+        self.cancellation_cleanup = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         self._sandbox = sandbox
         self._sandbox_module = sandbox_module
         self._closed = False
+        self._exec_closed = False
 
     @classmethod
     async def create(
@@ -62,6 +81,9 @@ class MicrosandboxRunner(Runner):
         image: Any = DEFAULT_MICROSANDBOX_IMAGE,
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "remove",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         ensure_default_cwd: bool = True,
         sandbox_module: ModuleType | Any | None = None,
         **sandbox_options: Any,
@@ -77,6 +99,10 @@ class MicrosandboxRunner(Runner):
         sandbox_name = _validate_sandbox_name(name)
         guest_root = _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancellation_policy = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         if type(ensure_default_cwd) is not bool:
             raise TypeError("MicrosandboxRunner ensure_default_cwd must be a bool.")
         sandbox = await module.Sandbox.create(
@@ -110,6 +136,9 @@ class MicrosandboxRunner(Runner):
             name=sandbox_name,
             default_cwd=guest_root,
             close_action=close_action,
+            cancel_timeout_s=cancel_timeout_s,
+            cancellation_cleanup=cancellation_policy,
+            timeout_cleanup=timeout_policy,
             sandbox_module=module,
         )
 
@@ -120,6 +149,9 @@ class MicrosandboxRunner(Runner):
         *,
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "none",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         sandbox_module: ModuleType | Any | None = None,
     ) -> MicrosandboxRunner:
         """Attach to an existing Microsandbox sandbox by name."""
@@ -128,6 +160,10 @@ class MicrosandboxRunner(Runner):
         sandbox_name = _validate_sandbox_name(name)
         _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancellation_policy = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         handle = await module.Sandbox.get(sandbox_name)
         sandbox = await handle.connect()
         return cls(
@@ -135,6 +171,9 @@ class MicrosandboxRunner(Runner):
             name=sandbox_name,
             default_cwd=default_cwd,
             close_action=close_action,
+            cancel_timeout_s=cancel_timeout_s,
+            cancellation_cleanup=cancellation_policy,
+            timeout_cleanup=timeout_policy,
             sandbox_module=module,
         )
 
@@ -165,7 +204,7 @@ class MicrosandboxRunner(Runner):
             self._closed = True
             return
         if self.close_action in {"stop", "remove"}:
-            await self._sandbox.stop()
+            await _stop_sandbox(self._sandbox)
             if self.close_action == "remove":
                 module = _microsandbox_module(self._sandbox_module)
                 await module.Sandbox.remove(self.name)
@@ -211,7 +250,7 @@ class MicrosandboxRunner(Runner):
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
-        if self._closed:
+        if self._closed or self._exec_closed:
             raise RuntimeError("MicrosandboxRunner is closed.")
 
         working_dir = self.resolve_cwd(cwd)
@@ -270,15 +309,27 @@ class MicrosandboxRunner(Runner):
 
         try:
             await asyncio.wait_for(run_command(), timeout=timeout)
-        except asyncio.CancelledError:
-            if handle is not None:
-                await _kill_handle_best_effort(handle)
-            raise
+        except asyncio.CancelledError as exc:
+            cleanup = await cleanup_runner_command_with_diagnostic(
+                self._sandbox,
+                handle=handle,
+                adapter="microsandbox",
+                timeout_s=self.cancel_timeout_s,
+                policy=self.cancellation_cleanup,
+            )
+            self._apply_cleanup_result(cleanup)
+            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
         except Exception as exc:
             if not _is_timeout_error(exc):
                 raise
-            if handle is not None:
-                await _kill_handle_best_effort(handle)
+            cleanup = await cleanup_runner_command_with_diagnostic(
+                self._sandbox,
+                handle=handle,
+                adapter="microsandbox",
+                timeout_s=self.cancel_timeout_s,
+                policy=self.timeout_cleanup,
+            )
+            self._apply_cleanup_result(cleanup)
             return ExecResult(
                 stdout=stdout.text(),
                 stderr=stderr.text(),
@@ -286,6 +337,7 @@ class MicrosandboxRunner(Runner):
                 timed_out=True,
                 stdout_truncated=stdout.truncated,
                 stderr_truncated=stderr.truncated,
+                artifacts=[cleanup.artifact],
             )
 
         return ExecResult(
@@ -296,6 +348,15 @@ class MicrosandboxRunner(Runner):
             stdout_truncated=stdout.truncated,
             stderr_truncated=stderr.truncated,
         )
+
+    def _apply_cleanup_result(self, cleanup: Any) -> None:
+        if cleanup.close_runner:
+            self._exec_closed = True
+        if (
+            cleanup.artifact.get("action") == "kill_sandbox"
+            and cleanup.artifact.get("status") == "completed"
+        ):
+            self._closed = True
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         if cwd is None:
@@ -443,20 +504,19 @@ def _is_timeout_error(exc: Exception) -> bool:
     return isinstance(exc, TimeoutError) or exc.__class__.__name__ == "ExecTimeoutError"
 
 
-async def _kill_handle_best_effort(handle: Any) -> None:
-    kill = getattr(handle, "kill", None)
-    if kill is not None:
-        try:
-            await kill()
-        except Exception:
-            return
-
-
 async def _cleanup_created_sandbox(module: ModuleType | Any, sandbox: Any, name: str) -> None:
     try:
-        await sandbox.stop()
+        await _stop_sandbox(sandbox)
     finally:
         await module.Sandbox.remove(name)
+
+
+async def _stop_sandbox(sandbox: Any) -> None:
+    stop_and_wait = getattr(sandbox, "stop_and_wait", None)
+    if stop_and_wait is not None:
+        await stop_and_wait()
+        return
+    await sandbox.stop()
 
 
 async def _cleanup_created_sandbox_after_failure(

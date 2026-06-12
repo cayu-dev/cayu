@@ -2,18 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import os
+from typing import cast
 
-from cayu import ExecCommand, MicrosandboxRunner
+from cayu import ExecCommand, MicrosandboxRunner, RunnerCancelledError, RunnerCleanupPolicy
 
 
 async def main() -> None:
     sandbox_name = os.environ.get("CAYU_MICROSANDBOX_NAME", "cayu-live-runner")
     image = os.environ.get("CAYU_MICROSANDBOX_IMAGE", "alpine")
+    cancel_delay_s = float(os.environ.get("CAYU_CANCEL_DELAY_S", "0.2"))
+    cancellation_cleanup = cast(
+        "RunnerCleanupPolicy",
+        os.environ.get("CAYU_RUNNER_CANCELLATION_CLEANUP", "command"),
+    )
+    timeout_cleanup = cast(
+        "RunnerCleanupPolicy",
+        os.environ.get("CAYU_RUNNER_TIMEOUT_CLEANUP", "command"),
+    )
 
     os.environ["CAYU_HOST_SECRET_SHOULD_NOT_LEAK"] = "hidden"
 
     print(f"sandbox_name {sandbox_name}")
     print(f"image {image}")
+    print(f"cancellation_cleanup {cancellation_cleanup}")
+    print(f"timeout_cleanup {timeout_cleanup}")
+    print(f"cancel_delay_s {cancel_delay_s}")
     print("creating sandbox")
 
     async with await MicrosandboxRunner.create(
@@ -21,6 +34,8 @@ async def main() -> None:
         image=image,
         replace=True,
         close_action="remove",
+        cancellation_cleanup=cancellation_cleanup,
+        timeout_cleanup=timeout_cleanup,
     ) as runner:
         print("sandbox ready")
 
@@ -77,28 +92,20 @@ async def main() -> None:
         )
         print(f"relative_cwd {cwd.stdout.strip()}")
 
-        timed_out = await runner.exec(
-            ExecCommand.process("sh", "-c", "printf before; sleep 5"),
-            timeout_s=1,
-        )
-        print(
-            "timeout "
-            f"stdout={timed_out.stdout!r} "
-            f"timed_out={timed_out.timed_out} "
-            f"exit_code={timed_out.exit_code}"
-        )
-
         cancelled = asyncio.create_task(runner.exec(ExecCommand.process("sh", "-c", "sleep 30")))
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(cancel_delay_s)
         cancelled.cancel()
         try:
             await cancelled
             print("cancelled missing")
-        except asyncio.CancelledError:
-            print("cancelled true")
+        except RunnerCancelledError as exc:
+            print(f"cancelled true artifacts={exc.artifacts}")
 
-        after_cancel = await runner.exec(ExecCommand.process("printf", "after-cancel"))
-        print(f"after_cancel {after_cancel.stdout.strip()}")
+        try:
+            after_cancel = await runner.exec(ExecCommand.process("printf", "after-cancel"))
+            print(f"after_cancel reusable stdout={after_cancel.stdout!r}")
+        except RuntimeError as exc:
+            print(f"after_cancel closed: {exc}")
 
         print("closing sandbox")
 

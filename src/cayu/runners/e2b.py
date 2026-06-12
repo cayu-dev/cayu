@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import posixpath
 import shlex
@@ -8,6 +9,17 @@ from types import ModuleType
 from typing import Any, Literal
 
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.runners._cleanup import (
+    DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+    DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+    DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+    RUNNER_CLEANUP_ARTIFACT_TYPE,
+    RunnerCleanupPolicy,
+    RunnerCleanupResult,
+    cleanup_runner_command_with_diagnostic,
+    validate_cancel_timeout,
+    validate_runner_cleanup_policy,
+)
 from cayu.runners._subprocess import (
     copy_runner_env,
     validate_output_limit,
@@ -19,10 +31,12 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerCancelledError,
 )
 
 DEFAULT_E2B_CWD = "/home/user/workspace"
 E2B_SANDBOX_ID_MAX_BYTES = 256
+E2B_LATE_START_CLEANUP_TIMEOUT_MULTIPLIER = 4.0
 
 E2BCloseAction = Literal["kill", "detach", "none"]
 
@@ -44,6 +58,9 @@ class E2BRunner(Runner):
         sandbox_id: str | None = None,
         default_cwd: str = DEFAULT_E2B_CWD,
         close_action: E2BCloseAction = "none",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         e2b_module: ModuleType | Any | None = None,
     ) -> None:
         if sandbox is None:
@@ -54,9 +71,20 @@ class E2BRunner(Runner):
         self.sandbox_id = _validate_sandbox_id(resolved_id)
         self.default_cwd = _validate_guest_root(default_cwd)
         self.close_action = _validate_close_action(close_action)
+        self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
+        self.cancellation_cleanup = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         self._sandbox = sandbox
         self._e2b_module = e2b_module
         self._closed = False
+        self._exec_closed = False
+        self._exec_closed_reason: str | None = None
+        self._late_start_cleanup_timeout_s = self.cancel_timeout_s * (
+            E2B_LATE_START_CLEANUP_TIMEOUT_MULTIPLIER
+        )
+        self._late_start_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @classmethod
     async def create(
@@ -66,6 +94,9 @@ class E2BRunner(Runner):
         sandbox_timeout_s: int | None = None,
         default_cwd: str = DEFAULT_E2B_CWD,
         close_action: E2BCloseAction = "kill",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         ensure_default_cwd: bool = True,
         metadata: dict[str, str] | None = None,
         envs: dict[str, str] | None = None,
@@ -87,6 +118,10 @@ class E2BRunner(Runner):
         module = _e2b_module(e2b_module)
         guest_root = _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancellation_policy = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         if type(ensure_default_cwd) is not bool:
             raise TypeError("E2BRunner ensure_default_cwd must be a bool.")
         if type(secure) is not bool:
@@ -134,6 +169,9 @@ class E2BRunner(Runner):
             sandbox,
             default_cwd=guest_root,
             close_action=close_action,
+            cancel_timeout_s=cancel_timeout_s,
+            cancellation_cleanup=cancellation_policy,
+            timeout_cleanup=timeout_policy,
             e2b_module=module,
         )
 
@@ -145,6 +183,9 @@ class E2BRunner(Runner):
         sandbox_timeout_s: int | None = None,
         default_cwd: str = DEFAULT_E2B_CWD,
         close_action: E2BCloseAction = "none",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         ensure_default_cwd: bool = True,
         e2b_module: ModuleType | Any | None = None,
         **api_options: Any,
@@ -155,6 +196,10 @@ class E2BRunner(Runner):
         resolved_id = _validate_sandbox_id(sandbox_id)
         guest_root = _validate_guest_root(default_cwd)
         _validate_close_action(close_action)
+        cancellation_policy = validate_runner_cleanup_policy(
+            cancellation_cleanup, "cancellation_cleanup"
+        )
+        timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         if type(ensure_default_cwd) is not bool:
             raise TypeError("E2BRunner ensure_default_cwd must be a bool.")
         timeout = _validate_sandbox_timeout(sandbox_timeout_s)
@@ -172,6 +217,9 @@ class E2BRunner(Runner):
             sandbox_id=resolved_id,
             default_cwd=guest_root,
             close_action=close_action,
+            cancel_timeout_s=cancel_timeout_s,
+            cancellation_cleanup=cancellation_policy,
+            timeout_cleanup=timeout_policy,
             e2b_module=module,
         )
 
@@ -192,6 +240,7 @@ class E2BRunner(Runner):
 
         if self._closed:
             return
+        await self._wait_for_late_start_cleanup_tasks()
         if self.close_action in {"none", "detach"}:
             self._closed = True
             return
@@ -222,6 +271,9 @@ class E2BRunner(Runner):
             raise TypeError("E2BRunner command must be an ExecCommand.")
         if self._closed:
             raise RuntimeError("E2BRunner is closed.")
+        if self._exec_closed:
+            reason = self._exec_closed_reason or "runner exec path is closed"
+            raise RuntimeError(f"E2BRunner is closed: {reason}")
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
@@ -232,6 +284,7 @@ class E2BRunner(Runner):
         stdout = _LimitedText(output_limit)
         stderr = _LimitedText(output_limit)
         handle = None
+        start_task: asyncio.Task[Any] | None = None
 
         async def on_stdout(chunk: str) -> None:
             stdout.append(chunk)
@@ -240,16 +293,19 @@ class E2BRunner(Runner):
             stderr.append(chunk)
 
         try:
-            handle = await self._sandbox.commands.run(
-                script,
-                background=True,
-                envs=environment,
-                cwd=working_dir,
-                on_stdout=on_stdout,
-                on_stderr=on_stderr,
-                stdin=standard_input is not None,
-                timeout=float(timeout) if timeout is not None else 0,
+            start_task = asyncio.create_task(
+                self._sandbox.commands.run(
+                    script,
+                    background=True,
+                    envs=environment,
+                    cwd=working_dir,
+                    on_stdout=on_stdout,
+                    on_stderr=on_stderr,
+                    stdin=standard_input is not None,
+                    timeout=float(timeout) if timeout is not None else 0,
+                )
             )
+            handle = await self._await_started_handle(start_task, timeout_s=timeout)
             if standard_input is not None:
                 await handle.send_stdin(standard_input)
                 await handle.close_stdin()
@@ -257,14 +313,22 @@ class E2BRunner(Runner):
                 result = await handle.wait()
             else:
                 result = await asyncio.wait_for(handle.wait(), timeout=timeout)
-        except asyncio.CancelledError:
-            if handle is not None:
-                await _kill_handle_best_effort(handle)
-            raise
+        except asyncio.CancelledError as exc:
+            cleanup = await self._cleanup_interrupted_command(
+                start_task,
+                current_handle=handle,
+                cleanup_policy=self.cancellation_cleanup,
+                wait_for_handle_before_cancelling=True,
+            )
+            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
         except Exception as exc:
             if _is_timeout_error(exc):
-                if handle is not None:
-                    await _kill_handle_best_effort(handle)
+                cleanup = await self._cleanup_interrupted_command(
+                    start_task,
+                    current_handle=handle,
+                    cleanup_policy=self.timeout_cleanup,
+                    wait_for_handle_before_cancelling=False,
+                )
                 return ExecResult(
                     stdout=stdout.text(),
                     stderr=stderr.text(),
@@ -272,12 +336,204 @@ class E2BRunner(Runner):
                     timed_out=True,
                     stdout_truncated=stdout.truncated,
                     stderr_truncated=stderr.truncated,
+                    artifacts=[cleanup.artifact],
                 )
             if _is_command_exit(exc):
                 return _exec_result_from_e2b_result(exc, stdout, stderr)
             raise
 
         return _exec_result_from_e2b_result(result, stdout, stderr)
+
+    async def _await_started_handle(
+        self,
+        start_task: asyncio.Task[Any],
+        *,
+        timeout_s: int | None,
+    ) -> Any:
+        if timeout_s is None:
+            return await asyncio.shield(start_task)
+        return await asyncio.wait_for(asyncio.shield(start_task), timeout=timeout_s)
+
+    async def _cleanup_interrupted_command(
+        self,
+        start_task: asyncio.Task[Any] | None,
+        *,
+        current_handle: Any | None,
+        cleanup_policy: RunnerCleanupPolicy,
+        wait_for_handle_before_cancelling: bool,
+    ) -> RunnerCleanupResult:
+        handle, cleanup_deferred = await self._resolve_started_handle_after_interruption(
+            start_task,
+            current_handle=current_handle,
+            cleanup_policy=cleanup_policy,
+            wait_for_handle_before_cancelling=wait_for_handle_before_cancelling,
+        )
+        if cleanup_deferred:
+            return RunnerCleanupResult(
+                artifact=_late_start_cleanup_deferred_artifact(
+                    timeout_s=self.cancel_timeout_s,
+                    late_start_cleanup_timeout_s=self._late_start_cleanup_timeout_s,
+                ),
+                close_runner=False,
+            )
+        cleanup = await cleanup_runner_command_with_diagnostic(
+            self._sandbox,
+            handle=handle,
+            adapter="e2b",
+            timeout_s=self.cancel_timeout_s,
+            policy=cleanup_policy,
+        )
+        self._apply_cleanup_result(cleanup)
+        return cleanup
+
+    def _apply_cleanup_result(self, cleanup: Any) -> None:
+        if cleanup.close_runner:
+            self._close_exec("runner cleanup closed the exec path")
+        if (
+            cleanup.artifact.get("action") == "kill_sandbox"
+            and cleanup.artifact.get("status") == "completed"
+        ):
+            self._closed = True
+
+    def _close_exec(self, reason: str) -> None:
+        self._exec_closed = True
+        self._exec_closed_reason = reason
+
+    def _open_exec(self) -> None:
+        self._exec_closed = False
+        self._exec_closed_reason = None
+
+    async def _resolve_started_handle_after_interruption(
+        self,
+        start_task: asyncio.Task[Any] | None,
+        *,
+        current_handle: Any | None,
+        cleanup_policy: RunnerCleanupPolicy,
+        wait_for_handle_before_cancelling: bool,
+    ) -> tuple[Any | None, bool]:
+        if current_handle is not None:
+            return current_handle, False
+        if start_task is None:
+            return None, False
+        if start_task.done():
+            try:
+                handle = await start_task
+                return handle, False
+            except asyncio.CancelledError:
+                return None, False
+            except Exception:
+                return None, False
+        if not wait_for_handle_before_cancelling:
+            return await self._cancel_or_track_start_task(
+                start_task,
+                cleanup_policy=cleanup_policy,
+            )
+        try:
+            handle = await asyncio.wait_for(
+                asyncio.shield(start_task),
+                timeout=self.cancel_timeout_s,
+            )
+            return handle, False
+        except TimeoutError:
+            return await self._cancel_or_track_start_task(
+                start_task,
+                cleanup_policy=cleanup_policy,
+            )
+        except asyncio.CancelledError:
+            return await self._cancel_or_track_start_task(
+                start_task,
+                cleanup_policy=cleanup_policy,
+            )
+        except Exception:
+            return None, False
+
+    async def _cancel_or_track_start_task(
+        self,
+        start_task: asyncio.Task[Any],
+        *,
+        cleanup_policy: RunnerCleanupPolicy,
+    ) -> tuple[Any | None, bool]:
+        start_task.cancel()
+        try:
+            handle = await asyncio.wait_for(
+                asyncio.shield(start_task),
+                timeout=self.cancel_timeout_s,
+            )
+            return handle, False
+        except TimeoutError:
+            if cleanup_policy == "sandbox":
+                return None, False
+            if cleanup_policy == "none":
+                self._close_exec("E2B command start did not stop; command state is unknown")
+                return None, False
+            self._track_late_start_cleanup(start_task, cleanup_policy=cleanup_policy)
+            return None, True
+        except asyncio.CancelledError:
+            return None, False
+        except Exception:
+            return None, False
+
+    def _track_late_start_cleanup(
+        self,
+        start_task: asyncio.Task[Any],
+        *,
+        cleanup_policy: RunnerCleanupPolicy,
+    ) -> None:
+        self._close_exec("E2B command start cleanup is pending")
+        cleanup_task = asyncio.create_task(
+            self._cleanup_late_started_command(start_task, cleanup_policy=cleanup_policy)
+        )
+        self._late_start_cleanup_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self._late_start_cleanup_tasks.discard)
+
+    async def _cleanup_late_started_command(
+        self,
+        start_task: asyncio.Task[Any],
+        *,
+        cleanup_policy: RunnerCleanupPolicy,
+    ) -> None:
+        try:
+            handle = await asyncio.wait_for(
+                asyncio.shield(start_task),
+                timeout=self._late_start_cleanup_timeout_s,
+            )
+        except asyncio.CancelledError:
+            self._open_exec()
+            return
+        except TimeoutError:
+            self._close_exec(
+                "E2B command start did not resolve after interruption or timeout; "
+                "command state is unknown"
+            )
+            return
+        except Exception:
+            self._open_exec()
+            return
+        cleanup = await cleanup_runner_command_with_diagnostic(
+            self._sandbox,
+            handle=handle,
+            adapter="e2b",
+            timeout_s=self.cancel_timeout_s,
+            policy=cleanup_policy,
+        )
+        self._apply_cleanup_result(cleanup)
+        if (
+            cleanup.artifact.get("action") == "kill_command"
+            and cleanup.artifact.get("status") == "completed"
+        ):
+            self._open_exec()
+            return
+        self._close_exec("late-started E2B command cleanup did not complete")
+
+    async def _wait_for_late_start_cleanup_tasks(self) -> None:
+        if not self._late_start_cleanup_tasks:
+            return
+        tasks = tuple(self._late_start_cleanup_tasks)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)),
+                timeout=self.cancel_timeout_s,
+            )
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         if cwd is None:
@@ -427,19 +683,26 @@ def _is_timeout_error(exc: Exception) -> bool:
     return isinstance(exc, TimeoutError) or exc.__class__.__name__ == "TimeoutException"
 
 
+def _late_start_cleanup_deferred_artifact(
+    *,
+    timeout_s: float,
+    late_start_cleanup_timeout_s: float,
+) -> dict[str, Any]:
+    return {
+        "type": RUNNER_CLEANUP_ARTIFACT_TYPE,
+        "adapter": "e2b",
+        "action": "kill_command",
+        "status": "deferred",
+        "timeout_s": timeout_s,
+        "late_start_cleanup_timeout_s": late_start_cleanup_timeout_s,
+        "reason": "command handle is not available yet; cleanup will continue in background",
+    }
+
+
 def _is_same_or_child(path: str, root: str) -> bool:
     if root == "/":
         return posixpath.isabs(path)
     return path == root or path.startswith(f"{root.rstrip('/')}/")
-
-
-async def _kill_handle_best_effort(handle: Any) -> None:
-    kill = getattr(handle, "kill", None)
-    if kill is not None:
-        try:
-            await kill()
-        except Exception:
-            return
 
 
 async def _cleanup_created_sandbox(sandbox: Any) -> None:

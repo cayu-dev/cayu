@@ -19,10 +19,10 @@ from cayu.core.messages import Message, copy_message
 class SessionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
+    INTERRUPTING = "interrupting"
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
-    CANCELLED = "cancelled"
 
 
 class RunRequest(BaseModel):
@@ -98,7 +98,7 @@ class ResumeRequest(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
-class CancelSessionRequest(BaseModel):
+class InterruptSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
@@ -355,6 +355,17 @@ class SessionStore(ABC):
     ) -> Session:
         """Atomically transition a session status when its current status is allowed."""
 
+    @abstractmethod
+    async def transition_status_and_checkpoint(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        """Atomically transition status and persist transformed checkpoint state."""
+
     async def append_event(self, session_id: str, event: Event) -> None:
         """Append one event to a session."""
         await self.append_events(session_id, [event])
@@ -587,6 +598,51 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
+    async def transition_status_and_checkpoint(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.status not in allowed_statuses:
+                raise ValueError(
+                    f"Session status transition not allowed: {session.status} -> {to_status}"
+                )
+
+            current_checkpoint = self._checkpoints.get(session_id)
+            transformed_checkpoint = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current_checkpoint is None else deepcopy(current_checkpoint),
+            )
+            if transformed_checkpoint is not None:
+                transformed_checkpoint = copy_json_value(
+                    transformed_checkpoint,
+                    "checkpoint",
+                )
+
+            updated = session.model_copy(
+                update={
+                    "status": to_status,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._sessions[session_id] = updated
+            if transformed_checkpoint is not None:
+                self._checkpoints[session_id] = transformed_checkpoint
+            return updated.model_copy(deep=True)
+
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 
@@ -762,10 +818,10 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     )
 
 
-def copy_cancel_session_request(request: CancelSessionRequest) -> CancelSessionRequest:
-    if type(request) is not CancelSessionRequest:
-        raise TypeError("Session cancellation requires a CancelSessionRequest.")
-    return CancelSessionRequest(
+def copy_interrupt_session_request(request: InterruptSessionRequest) -> InterruptSessionRequest:
+    if type(request) is not InterruptSessionRequest:
+        raise TypeError("Session interruption requires an InterruptSessionRequest.")
+    return InterruptSessionRequest(
         session_id=request.session_id,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),

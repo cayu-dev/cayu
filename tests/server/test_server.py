@@ -209,43 +209,42 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
     }
 
 
-def test_cancel_session_endpoint_streams_cancelled_event() -> None:
+def test_interrupt_session_endpoint_streams_interrupted_event() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def create_running_session() -> None:
+    async def create_pending_session() -> None:
         await app.session_store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="session_cancel_endpoint",
+                session_id="session_interrupt_endpoint",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await app.session_store.update_status("session_cancel_endpoint", SessionStatus.RUNNING)
 
-    asyncio.run(create_running_session())
+    asyncio.run(create_pending_session())
     client = TestClient(create_server(app))
 
     with client.stream(
         "POST",
-        "/api/sessions/session_cancel_endpoint/cancel",
+        "/api/sessions/session_interrupt_endpoint/interrupt",
         json={"reason": "operator requested stop", "metadata": {"actor": "operator"}},
     ) as response:
         assert response.status_code == 200
         lines = list(response.iter_lines())
 
     body = "\n".join(lines)
-    assert "session.cancelled" in body
+    assert "session.interrupted" in body
     assert "operator requested stop" in body
 
-    session = asyncio.run(app.session_store.load("session_cancel_endpoint"))
+    session = asyncio.run(app.session_store.load("session_interrupt_endpoint"))
     assert session is not None
-    assert session.status == SessionStatus.CANCELLED
+    assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cancel_session_endpoint_rejects_completed_session_before_streaming() -> None:
+def test_interrupt_session_endpoint_rejects_completed_session_before_streaming() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -254,25 +253,27 @@ def test_cancel_session_endpoint_rejects_completed_session_before_streaming() ->
         await app.session_store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="session_cancel_completed",
+                session_id="session_interrupt_completed",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await app.session_store.update_status("session_cancel_completed", SessionStatus.COMPLETED)
+        await app.session_store.update_status(
+            "session_interrupt_completed", SessionStatus.COMPLETED
+        )
 
     asyncio.run(create_completed_session())
     client = TestClient(create_server(app))
 
-    response = client.post("/api/sessions/session_cancel_completed/cancel")
+    response = client.post("/api/sessions/session_interrupt_completed/interrupt")
 
     assert response.status_code == 409
     assert response.json() == {
-        "detail": "Session cannot be cancelled from status: completed",
+        "detail": "Session cannot be interrupted from status: completed",
     }
 
 
-def test_cancel_session_endpoint_rejects_completion_race_before_streaming() -> None:
+def test_interrupt_session_endpoint_rejects_completion_race_before_streaming() -> None:
     class CompletingRaceStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
@@ -280,7 +281,7 @@ def test_cancel_session_endpoint_rejects_completion_race_before_streaming() -> N
 
         async def load(self, session_id: str):
             self.loads += 1
-            if session_id == "session_cancel_race" and self.loads == 2:
+            if session_id == "session_interrupt_race" and self.loads == 2:
                 await self.update_status(session_id, SessionStatus.COMPLETED)
             return await super().load(session_id)
 
@@ -293,56 +294,89 @@ def test_cancel_session_endpoint_rejects_completion_race_before_streaming() -> N
         await app.session_store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="session_cancel_race",
+                session_id="session_interrupt_race",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await app.session_store.update_status("session_cancel_race", SessionStatus.RUNNING)
+        await app.session_store.update_status("session_interrupt_race", SessionStatus.RUNNING)
 
     asyncio.run(create_running_session())
     client = TestClient(create_server(app))
 
-    response = client.post("/api/sessions/session_cancel_race/cancel")
+    response = client.post("/api/sessions/session_interrupt_race/interrupt")
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "Session status transition not allowed: completed -> cancelled"
-    )
+    assert response.json()["detail"] == "Session cannot be interrupted from status: completed"
 
 
-def test_cancel_session_endpoint_is_idempotent_for_cancelled_session() -> None:
+def test_interrupt_session_endpoint_returns_conflict_while_interruption_finalizes() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def create_cancelled_session() -> None:
+    async def create_interrupting_session() -> None:
         await app.session_store.create(
             RunRequest(
                 agent_name="assistant",
-                session_id="session_cancel_idempotent",
+                session_id="session_interrupt_finalizing",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        await app.session_store.update_status("session_cancel_idempotent", SessionStatus.CANCELLED)
-        await app.session_store.append_event(
-            "session_cancel_idempotent",
-            Event(
-                type=EventType.SESSION_CANCELLED,
-                session_id="session_cancel_idempotent",
+        await app.session_store.update_status(
+            "session_interrupt_finalizing",
+            SessionStatus.INTERRUPTING,
+        )
+
+    asyncio.run(create_interrupting_session())
+    client = TestClient(create_server(app))
+
+    response = client.post("/api/sessions/session_interrupt_finalizing/interrupt")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Session interruption is still finalizing: session_interrupt_finalizing",
+    }
+
+
+def test_interrupt_session_endpoint_is_idempotent_for_interrupted_session() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_interrupted_session() -> None:
+        await app.session_store.create(
+            RunRequest(
                 agent_name="assistant",
-                payload={"reason": "already cancelled", "metadata": {}},
+                session_id="session_interrupt_idempotent",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(
+            "session_interrupt_idempotent", SessionStatus.INTERRUPTED
+        )
+        await app.session_store.append_event(
+            "session_interrupt_idempotent",
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id="session_interrupt_idempotent",
+                agent_name="assistant",
+                payload={"reason": "already interrupted", "metadata": {}},
             ),
         )
 
-    asyncio.run(create_cancelled_session())
+    asyncio.run(create_interrupted_session())
     client = TestClient(create_server(app))
 
-    with client.stream("POST", "/api/sessions/session_cancel_idempotent/cancel") as response:
+    with client.stream(
+        "POST",
+        "/api/sessions/session_interrupt_idempotent/interrupt",
+    ) as response:
         assert response.status_code == 200
         lines = list(response.iter_lines())
 
     body = "\n".join(lines)
-    assert "session.cancelled" in body
-    assert "already cancelled" in body
+    assert "session.interrupted" in body
+    assert "already interrupted" in body

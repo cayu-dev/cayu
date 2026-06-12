@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from math import inf, nan
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from cayu.runners import (
     DEFAULT_MICROSANDBOX_CWD,
     ExecCommand,
     MicrosandboxRunner,
+    RunnerCancelledError,
 )
 
 
@@ -48,6 +50,7 @@ class FakeHandle:
         self.collect_output = collect_output
         self.killed = False
         self.fail_kill = False
+        self.hang_kill = False
 
     def __aiter__(self):
         return self
@@ -65,6 +68,8 @@ class FakeHandle:
         return self.collect_output or FakeExecOutput(exit_code=self.wait_result[0])
 
     async def kill(self) -> None:
+        if self.hang_kill:
+            await asyncio.sleep(30)
         if self.fail_kill:
             raise RuntimeError("kill failed")
         self.killed = True
@@ -95,9 +100,15 @@ class FakeSandbox:
         self.exec_calls: list[dict[str, Any]] = []
         self.shell_calls: list[dict[str, Any]] = []
         self.stop_calls = 0
+        self.stop_and_wait_calls = 0
         self.detach_calls = 0
+        self.kill_calls = 0
         self.fail_next_exec = False
         self.cancel_next_exec = False
+        self.cancel_next_stream = False
+        self.timeout_next_stream = False
+        self.fail_kill = False
+        self.hang_kill = False
         self.next_handle = FakeHandle(
             [
                 FakeEvent("stdout", b"hello "),
@@ -120,14 +131,36 @@ class FakeSandbox:
 
     async def exec_stream(self, cmd: str, args: list[str], **kwargs: Any) -> FakeHandle:
         self.exec_calls.append({"cmd": cmd, "args": args, **kwargs})
+        if self.cancel_next_stream:
+            self.cancel_next_stream = False
+            raise asyncio.CancelledError
+        if self.timeout_next_stream:
+            self.timeout_next_stream = False
+            raise TimeoutError
         return self.next_handle
 
     async def shell_stream(self, script: str, **kwargs: Any) -> FakeHandle:
         self.shell_calls.append({"script": script, **kwargs})
+        if self.cancel_next_stream:
+            self.cancel_next_stream = False
+            raise asyncio.CancelledError
+        if self.timeout_next_stream:
+            self.timeout_next_stream = False
+            raise TimeoutError
         return self.next_handle
 
     async def stop(self) -> None:
         self.stop_calls += 1
+
+    async def stop_and_wait(self) -> None:
+        self.stop_and_wait_calls += 1
+
+    async def kill(self) -> None:
+        if self.hang_kill:
+            await asyncio.sleep(30)
+        if self.fail_kill:
+            raise RuntimeError("sandbox kill failed")
+        self.kill_calls += 1
 
     async def detach(self) -> None:
         self.detach_calls += 1
@@ -415,7 +448,8 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         removable_sandbox = removable._sandbox
         await removable.close()
         await removable.close()
-        assert removable_sandbox.stop_calls == 1
+        assert removable_sandbox.stop_calls == 0
+        assert removable_sandbox.stop_and_wait_calls == 1
         assert FakeSandboxApi.removed == ["remove-me"]
 
         detachable_sandbox = FakeSandbox("detach-me")
@@ -428,6 +462,7 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         await detachable.close()
         assert detachable_sandbox.detach_calls == 1
         assert detachable_sandbox.stop_calls == 0
+        assert detachable_sandbox.stop_and_wait_calls == 0
 
         no_op_sandbox = FakeSandbox("keep-me")
         no_op = MicrosandboxRunner(
@@ -438,6 +473,7 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         )
         await no_op.close()
         assert no_op_sandbox.stop_calls == 0
+        assert no_op_sandbox.stop_and_wait_calls == 0
 
     asyncio.run(run())
 
@@ -485,7 +521,8 @@ def test_microsandbox_runner_cleans_up_created_sandbox_when_setup_fails() -> Non
 
     sandbox = asyncio.run(run())
 
-    assert sandbox.stop_calls == 1
+    assert sandbox.stop_calls == 0
+    assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == ["setup-fails"]
 
 
@@ -508,7 +545,8 @@ def test_microsandbox_runner_reports_setup_and_cleanup_failures_together() -> No
 
     sandbox = asyncio.run(run())
 
-    assert sandbox.stop_calls == 1
+    assert sandbox.stop_calls == 0
+    assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == []
 
 
@@ -526,7 +564,8 @@ def test_microsandbox_runner_cleans_up_created_sandbox_when_setup_is_cancelled()
 
     sandbox = asyncio.run(run())
 
-    assert sandbox.stop_calls == 1
+    assert sandbox.stop_calls == 0
+    assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == ["setup-cancelled"]
 
 
@@ -546,7 +585,8 @@ def test_microsandbox_runner_close_can_retry_after_cleanup_failure() -> None:
 
     sandbox = asyncio.run(run())
 
-    assert sandbox.stop_calls == 2
+    assert sandbox.stop_calls == 0
+    assert sandbox.stop_and_wait_calls == 2
     assert FakeSandboxApi.removed == ["retry-cleanup"]
 
 
@@ -565,33 +605,230 @@ def test_microsandbox_runner_from_existing_does_not_own_lifecycle_by_default() -
     sandbox = asyncio.run(run())
 
     assert sandbox.stop_calls == 0
+    assert sandbox.stop_and_wait_calls == 0
     assert FakeSandboxApi.removed == []
 
 
-def test_microsandbox_runner_cancels_running_command() -> None:
-    async def run() -> BlockingHandle:
+def test_microsandbox_runner_kills_command_on_cancellation_by_default() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, RunnerCancelledError, int]:
         sandbox = FakeSandbox("runner")
         handle = BlockingHandle()
         sandbox.next_handle = handle
         runner = MicrosandboxRunner(
             sandbox,
             name="runner",
+            close_action="remove",
             sandbox_module=FakeMicrosandboxModule,
         )
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.started.wait()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(RunnerCancelledError) as exc_info:
             await task
-        return handle
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
 
-    handle = asyncio.run(run())
+    sandbox, handle, exc, after = asyncio.run(run())
 
     assert handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
 
 
-def test_microsandbox_runner_preserves_cancellation_when_kill_fails() -> None:
-    async def run() -> BlockingHandle:
+def test_microsandbox_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, RunnerCancelledError]:
+        sandbox = FakeSandbox("runner")
+        handle = BlockingHandle()
+        sandbox.next_handle = handle
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            cancellation_cleanup="sandbox",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value
+
+    sandbox, handle, exc = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 1
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_sandbox",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_microsandbox_runner_can_skip_cancellation_cleanup_explicitly() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox("runner")
+        handle = BlockingHandle()
+        sandbox.next_handle = handle
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            cancellation_cleanup="none",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
+
+    sandbox, handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "none",
+            "status": "skipped",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_microsandbox_runner_stays_reusable_when_cancelled_before_handle_is_returned() -> None:
+    async def run() -> tuple[FakeSandbox, RunnerCancelledError, int]:
+        reset_fake_module()
+        sandbox = FakeSandbox("runner")
+        sandbox.cancel_next_stream = True
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            close_action="remove",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await runner.exec(ExecCommand.process("sleep", "30"))
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        await runner.close()
+        return sandbox, exc_info.value, after.exit_code
+
+    sandbox, exc, after = asyncio.run(run())
+
+    assert sandbox.kill_calls == 0
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.removed == ["runner"]
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 5.0,
+            "error": "command handle is not available",
+        }
+    ]
+
+
+def test_microsandbox_runner_reports_explicit_sandbox_cleanup_failure() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, RunnerCancelledError]:
+        sandbox = FakeSandbox("runner")
+        handle = BlockingHandle()
+        sandbox.next_handle = handle
+        sandbox.fail_kill = True
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            cancellation_cleanup="sandbox",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value
+
+    sandbox, handle, exc = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_sandbox",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+            "error": "sandbox kill failed",
+        }
+    ]
+
+
+def test_microsandbox_runner_bounds_hanging_command_kill_on_cancellation() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox("runner")
+        handle = BlockingHandle()
+        sandbox.next_handle = handle
+        handle.hang_kill = True
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            cancel_timeout_s=0.01,
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
+
+    sandbox, handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "timeout",
+            "timeout_s": 0.01,
+        }
+    ]
+
+
+def test_microsandbox_runner_stays_reusable_when_command_kill_fails() -> None:
+    async def run() -> tuple[BlockingHandle, RunnerCancelledError, int]:
         sandbox = FakeSandbox("runner")
         handle = BlockingHandle()
         handle.fail_kill = True
@@ -604,17 +841,65 @@ def test_microsandbox_runner_preserves_cancellation_when_kill_fails() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.started.wait()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(RunnerCancelledError) as exc_info:
             await task
-        return handle
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return handle, exc_info.value, after.exit_code
 
-    handle = asyncio.run(run())
+    handle, exc, after = asyncio.run(run())
 
     assert handle.killed is False
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+            "error": "kill failed",
+        }
+    ]
 
 
-def test_microsandbox_runner_enforces_timeout_and_kills_running_command() -> None:
-    async def run() -> tuple[BlockingHandle, Any]:
+def test_microsandbox_runner_stays_reusable_when_timeout_happens_before_handle_is_returned() -> (
+    None
+):
+    async def run() -> tuple[FakeSandbox, Any]:
+        sandbox = FakeSandbox("runner")
+        sandbox.timeout_next_stream = True
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        result = await runner.exec(ExecCommand.process("sleep", "30"))
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result, after.exit_code
+
+    sandbox, result, after = asyncio.run(run())
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 5.0,
+            "error": "command handle is not available",
+        }
+    ]
+
+
+def test_microsandbox_runner_enforces_timeout_and_kills_command_by_default() -> None:
+    async def run() -> tuple[FakeSandbox, BlockingHandle, Any]:
         sandbox = FakeSandbox("runner")
         handle = BlockingHandle()
         sandbox.next_handle = handle
@@ -627,17 +912,65 @@ def test_microsandbox_runner_enforces_timeout_and_kills_running_command() -> Non
             ExecCommand.process("sleep", "30"),
             timeout_s=1,
         )
-        return handle, result
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, result, after.exit_code
 
-    handle, result = asyncio.run(run())
+    sandbox, handle, result, after = asyncio.run(run())
 
     assert result.timed_out is True
     assert result.exit_code == -9
     assert handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
 
 
-def test_microsandbox_runner_preserves_timeout_when_kill_fails() -> None:
-    async def run() -> Any:
+def test_microsandbox_runner_can_kill_sandbox_on_timeout_explicitly() -> None:
+    async def run() -> tuple[FakeSandbox, Any]:
+        sandbox = FakeSandbox("runner")
+        handle = BlockingHandle()
+        sandbox.next_handle = handle
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="runner",
+            timeout_cleanup="sandbox",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        result = await runner.exec(
+            ExecCommand.process("sleep", "30"),
+            timeout_s=1,
+        )
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result
+
+    sandbox, result = asyncio.run(run())
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert sandbox.kill_calls == 1
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_sandbox",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_microsandbox_runner_preserves_timeout_when_command_kill_fails() -> None:
+    async def run() -> tuple[FakeSandbox, Any, int]:
         sandbox = FakeSandbox("runner")
         handle = BlockingHandle()
         handle.fail_kill = True
@@ -647,20 +980,37 @@ def test_microsandbox_runner_preserves_timeout_when_kill_fails() -> None:
             name="runner",
             sandbox_module=FakeMicrosandboxModule,
         )
-        return await runner.exec(
+        result = await runner.exec(
             ExecCommand.process("sleep", "30"),
             timeout_s=1,
         )
+        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result, after.exit_code
 
-    result = asyncio.run(run())
+    sandbox, result, after = asyncio.run(run())
 
     assert result.timed_out is True
     assert result.exit_code == -9
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+            "error": "kill failed",
+        }
+    ]
 
 
 def test_microsandbox_runner_validates_inputs() -> None:
     bad_close_action: Any = "delete"
     bad_command: Any = "echo bad"
+    bad_cleanup: Any = "delete_process"
     bad_env: Any = []
 
     with pytest.raises(ValueError, match="whitespace"):
@@ -678,6 +1028,36 @@ def test_microsandbox_runner_validates_inputs() -> None:
             FakeSandbox("runner"),
             name="runner",
             close_action=bad_close_action,
+        )
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        MicrosandboxRunner(
+            FakeSandbox("runner"),
+            name="runner",
+            cancel_timeout_s=0,
+        )
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        MicrosandboxRunner(
+            FakeSandbox("runner"),
+            name="runner",
+            cancel_timeout_s=inf,
+        )
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        MicrosandboxRunner(
+            FakeSandbox("runner"),
+            name="runner",
+            cancel_timeout_s=nan,
+        )
+    with pytest.raises(ValueError, match="cancellation_cleanup"):
+        MicrosandboxRunner(
+            FakeSandbox("runner"),
+            name="runner",
+            cancellation_cleanup=bad_cleanup,
+        )
+    with pytest.raises(ValueError, match="timeout_cleanup"):
+        MicrosandboxRunner(
+            FakeSandbox("runner"),
+            name="runner",
+            timeout_cleanup=bad_cleanup,
         )
 
     runner = MicrosandboxRunner(

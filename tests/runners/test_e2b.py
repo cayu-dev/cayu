@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from math import inf, nan
 from typing import Any
 
 import pytest
 
-from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand
+from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand, ExecResult, RunnerCancelledError
 
 
 @dataclass
@@ -37,6 +38,8 @@ class FakeHandle:
         self.stdin: list[str] = []
         self.stdin_closed = False
         self.killed = False
+        self.fail_kill = False
+        self.hang_kill = False
         self.wait_started = asyncio.Event()
 
     async def wait(self) -> FakeCommandResult:
@@ -52,6 +55,10 @@ class FakeHandle:
         self.stdin_closed = True
 
     async def kill(self) -> bool:
+        if self.hang_kill:
+            await asyncio.sleep(30)
+        if self.fail_kill:
+            raise RuntimeError("kill failed")
         self.killed = True
         return True
 
@@ -68,10 +75,33 @@ class FakeCommands:
         self.calls: list[dict[str, Any]] = []
         self.next_handle: FakeHandle = FakeHandle()
         self.fail_next_setup = False
+        self.cancel_next_background = False
+        self.timeout_next_background = False
+        self.background_delay_s = 0.0
+        self.start_cancelled = False
+        self.hang_after_start_cancel = False
+        self.return_after_start_cancel_delay_s: float | None = None
 
     async def run(self, cmd: str, **kwargs: Any) -> Any:
         self.calls.append({"cmd": cmd, **kwargs})
         if kwargs.get("background"):
+            if self.background_delay_s:
+                try:
+                    await asyncio.sleep(self.background_delay_s)
+                except asyncio.CancelledError:
+                    self.start_cancelled = True
+                    if self.hang_after_start_cancel:
+                        await asyncio.sleep(30)
+                    if self.return_after_start_cancel_delay_s is not None:
+                        await asyncio.sleep(self.return_after_start_cancel_delay_s)
+                        return self.next_handle
+                    raise
+            if self.cancel_next_background:
+                self.cancel_next_background = False
+                raise asyncio.CancelledError
+            if self.timeout_next_background:
+                self.timeout_next_background = False
+                raise TimeoutError
             on_stdout = kwargs.get("on_stdout")
             on_stderr = kwargs.get("on_stderr")
             if on_stdout is not None:
@@ -94,8 +124,14 @@ class FakeSandbox:
         self.sandbox_id = sandbox_id
         self.commands = FakeCommands()
         self.kill_calls = 0
+        self.fail_kill = False
+        self.hang_kill = False
 
     async def kill(self) -> bool:
+        if self.hang_kill:
+            await asyncio.sleep(30)
+        if self.fail_kill:
+            raise RuntimeError("sandbox kill failed")
         self.kill_calls += 1
         return True
 
@@ -266,7 +302,7 @@ def test_e2b_runner_returns_nonzero_exit_as_exec_result() -> None:
     assert result.stderr == "uvwxyz"
 
 
-def test_e2b_runner_kills_command_on_timeout() -> None:
+def test_e2b_runner_kills_command_on_timeout_by_default() -> None:
     sandbox = FakeSandbox()
     sandbox.commands.next_handle = BlockingHandle()
     runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
@@ -282,10 +318,87 @@ def test_e2b_runner_kills_command_on_timeout() -> None:
     assert result.timed_out is True
     assert result.exit_code == -9
     assert sandbox.commands.next_handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+    sandbox.commands.next_handle = FakeHandle()
+    after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
+    assert after.exit_code == 0
 
 
-def test_e2b_runner_kills_command_on_cancellation() -> None:
-    async def run() -> FakeHandle:
+def test_e2b_runner_can_kill_sandbox_on_timeout_explicitly() -> None:
+    sandbox = FakeSandbox()
+    handle = BlockingHandle()
+    sandbox.commands.next_handle = handle
+    runner = E2BRunner(sandbox, timeout_cleanup="sandbox", e2b_module=FakeE2BModule)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process("sleep", "30"),
+            timeout_s=1,
+            output_limit_bytes=10,
+        )
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert handle.killed is False
+    assert sandbox.kill_calls == 1
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_sandbox",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+    with pytest.raises(RuntimeError, match="closed"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+
+
+def test_e2b_runner_reports_timeout_cleanup_failure() -> None:
+    sandbox = FakeSandbox()
+    handle = BlockingHandle()
+    handle.fail_kill = True
+    sandbox.commands.next_handle = handle
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process("sleep", "30"),
+            timeout_s=1,
+            output_limit_bytes=10,
+        )
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+            "error": "kill failed",
+        }
+    ]
+    sandbox.commands.next_handle = FakeHandle()
+    after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
+    assert after.exit_code == 0
+
+
+def test_e2b_runner_kills_command_on_cancellation_by_default() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -293,13 +406,542 @@ def test_e2b_runner_kills_command_on_cancellation() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(RunnerCancelledError) as exc_info:
             await task
-        return handle
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
 
-    handle = asyncio.run(run())
+    sandbox, handle, exc, after = asyncio.run(run())
 
     assert handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_e2b_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError]:
+        sandbox = FakeSandbox()
+        handle = BlockingHandle()
+        sandbox.commands.next_handle = handle
+        runner = E2BRunner(
+            sandbox,
+            cancellation_cleanup="sandbox",
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.wait_started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value
+
+    sandbox, handle, exc = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 1
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_sandbox",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_e2b_runner_can_skip_cancellation_cleanup_explicitly() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        handle = BlockingHandle()
+        sandbox.commands.next_handle = handle
+        runner = E2BRunner(
+            sandbox,
+            cancellation_cleanup="none",
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.wait_started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
+
+    sandbox, handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is False
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "none",
+            "status": "skipped",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_e2b_runner_waits_for_start_handle_on_cancellation() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        handle = BlockingHandle()
+        sandbox.commands.next_handle = handle
+        sandbox.commands.background_delay_s = 0.01
+        runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, handle, exc_info.value, after.exit_code
+
+    sandbox, handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_e2b_runner_stays_reusable_when_cancelled_before_handle_is_returned() -> None:
+    async def run() -> tuple[FakeSandbox, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        sandbox.commands.cancel_next_background = True
+        runner = E2BRunner(sandbox, close_action="kill", e2b_module=FakeE2BModule)
+
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await runner.exec(ExecCommand.process("sleep", "30"))
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        await runner.close()
+        return sandbox, exc_info.value, after.exit_code
+
+    sandbox, exc, after = asyncio.run(run())
+
+    assert sandbox.kill_calls == 1
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 5.0,
+            "error": "command handle is not available",
+        }
+    ]
+
+
+def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> None:
+    async def run() -> tuple[FakeSandbox, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        sandbox.commands.background_delay_s = 1
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+        await asyncio.sleep(0)
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, exc_info.value, after.exit_code
+
+    sandbox, exc, after = asyncio.run(run())
+
+    assert sandbox.commands.start_cancelled is True
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 0.01,
+            "error": "command handle is not available",
+        }
+    ]
+
+
+def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellation() -> None:
+    async def run() -> tuple[FakeSandbox, RunnerCancelledError, bool, int]:
+        sandbox = FakeSandbox()
+        sandbox.commands.background_delay_s = 1
+        sandbox.commands.hang_after_start_cancel = True
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+        await asyncio.sleep(0.05)
+        with pytest.raises(RuntimeError, match="command state is unknown"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, exc_info.value, runner._exec_closed, len(runner._late_start_cleanup_tasks)
+
+    sandbox, exc, exec_closed, late_cleanup_tasks = asyncio.run(run())
+
+    assert sandbox.commands.start_cancelled is True
+    assert sandbox.kill_calls == 0
+    assert exec_closed is True
+    assert late_cleanup_tasks == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "deferred",
+            "timeout_s": 0.01,
+            "late_start_cleanup_timeout_s": 0.04,
+            "reason": "command handle is not available yet; cleanup will continue in background",
+        }
+    ]
+
+
+def test_e2b_runner_kills_late_handle_after_start_cancellation_timeout() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool, int]:
+        sandbox = FakeSandbox()
+        late_handle = FakeHandle()
+        sandbox.commands.next_handle = late_handle
+        sandbox.commands.background_delay_s = 1
+        sandbox.commands.return_after_start_cancel_delay_s = 0.02
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            await runner.exec(ExecCommand.process("pwd"))
+
+        for _ in range(20):
+            if late_handle.killed:
+                break
+            await asyncio.sleep(0.01)
+
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, late_handle, exc_info.value, runner._exec_closed, after.exit_code
+
+    sandbox, late_handle, exc, exec_closed, after = asyncio.run(run())
+
+    assert sandbox.commands.start_cancelled is True
+    assert late_handle.killed is True
+    assert sandbox.kill_calls == 0
+    assert exec_closed is False
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "deferred",
+            "timeout_s": 0.01,
+            "late_start_cleanup_timeout_s": 0.04,
+            "reason": "command handle is not available yet; cleanup will continue in background",
+        }
+    ]
+
+
+def test_e2b_runner_late_start_sandbox_cleanup_keeps_runner_closed() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool, bool]:
+        sandbox = FakeSandbox()
+        late_handle = FakeHandle()
+        sandbox.commands.next_handle = late_handle
+        sandbox.commands.background_delay_s = 1
+        sandbox.commands.return_after_start_cancel_delay_s = 0.02
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            cancellation_cleanup="sandbox",
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+
+        for _ in range(20):
+            if sandbox.kill_calls:
+                break
+            await asyncio.sleep(0.01)
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec(ExecCommand.process("pwd"))
+
+        return sandbox, late_handle, exc_info.value, runner._closed, runner._exec_closed
+
+    sandbox, late_handle, exc, closed, exec_closed = asyncio.run(run())
+
+    assert late_handle.killed is False
+    assert sandbox.kill_calls == 1
+    assert closed is True
+    assert exec_closed is True
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_sandbox",
+            "status": "completed",
+            "timeout_s": 0.01,
+        }
+    ]
+
+
+def test_e2b_runner_late_start_skip_cleanup_keeps_exec_closed() -> None:
+    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool]:
+        sandbox = FakeSandbox()
+        late_handle = FakeHandle()
+        sandbox.commands.next_handle = late_handle
+        sandbox.commands.background_delay_s = 1
+        sandbox.commands.return_after_start_cancel_delay_s = 0.02
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            cancellation_cleanup="none",
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+
+        await asyncio.sleep(0.05)
+        with pytest.raises(RuntimeError, match="command state is unknown"):
+            await runner.exec(ExecCommand.process("pwd"))
+
+        return sandbox, late_handle, exc_info.value, runner._exec_closed
+
+    sandbox, late_handle, exc, exec_closed = asyncio.run(run())
+
+    assert late_handle.killed is False
+    assert sandbox.kill_calls == 0
+    assert exec_closed is True
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "none",
+            "status": "skipped",
+            "timeout_s": 0.01,
+        }
+    ]
+
+
+def test_e2b_runner_stays_reusable_when_timeout_happens_before_handle_is_returned() -> None:
+    sandbox = FakeSandbox()
+    sandbox.commands.timeout_next_background = True
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    result = asyncio.run(runner.exec(ExecCommand.process("sleep", "30")))
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert sandbox.kill_calls == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 5.0,
+            "error": "command handle is not available",
+        }
+    ]
+    sandbox.commands.next_handle = FakeHandle()
+    after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
+    assert after.exit_code == 0
+
+
+def test_e2b_runner_times_out_delayed_start_without_hanging() -> None:
+    async def run() -> tuple[FakeSandbox, ExecResult, int]:
+        sandbox = FakeSandbox()
+        sandbox.commands.background_delay_s = 30
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+
+        result = await asyncio.wait_for(
+            runner.exec(ExecCommand.process("sleep", "30"), timeout_s=1),
+            timeout=2,
+        )
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result, after.exit_code
+
+    sandbox, result, after = asyncio.run(run())
+
+    assert sandbox.commands.start_cancelled is True
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert sandbox.kill_calls == 0
+    assert after == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "unsupported",
+            "timeout_s": 0.01,
+            "error": "command handle is not available",
+        }
+    ]
+
+
+def test_e2b_runner_closes_exec_when_delayed_start_timeout_cannot_be_resolved() -> None:
+    async def run() -> tuple[FakeSandbox, ExecResult, bool, int]:
+        sandbox = FakeSandbox()
+        sandbox.commands.background_delay_s = 30
+        sandbox.commands.hang_after_start_cancel = True
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+
+        result = await asyncio.wait_for(
+            runner.exec(ExecCommand.process("sleep", "30"), timeout_s=1),
+            timeout=2,
+        )
+        await asyncio.sleep(0.05)
+        with pytest.raises(RuntimeError, match="command state is unknown"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result, runner._exec_closed, len(runner._late_start_cleanup_tasks)
+
+    sandbox, result, exec_closed, late_cleanup_tasks = asyncio.run(run())
+
+    assert sandbox.commands.start_cancelled is True
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    assert sandbox.kill_calls == 0
+    assert exec_closed is True
+    assert late_cleanup_tasks == 0
+    assert result.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "deferred",
+            "timeout_s": 0.01,
+            "late_start_cleanup_timeout_s": 0.04,
+            "reason": "command handle is not available yet; cleanup will continue in background",
+        }
+    ]
+
+
+def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
+    async def run() -> tuple[FakeHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        handle = BlockingHandle()
+        sandbox.commands.next_handle = handle
+        handle.hang_kill = True
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.wait_started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return handle, exc_info.value, after.exit_code
+
+    handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is False
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "timeout",
+            "timeout_s": 0.01,
+        }
+    ]
+
+
+def test_e2b_runner_stays_reusable_when_command_kill_fails() -> None:
+    async def run() -> tuple[FakeHandle, RunnerCancelledError, int]:
+        sandbox = FakeSandbox()
+        handle = BlockingHandle()
+        handle.fail_kill = True
+        sandbox.commands.next_handle = handle
+        runner = E2BRunner(
+            sandbox,
+            e2b_module=FakeE2BModule,
+        )
+        task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
+        await handle.wait_started.wait()
+        task.cancel()
+        with pytest.raises(RunnerCancelledError) as exc_info:
+            await task
+        sandbox.commands.next_handle = FakeHandle()
+        after = await runner.exec(ExecCommand.process("pwd"))
+        return handle, exc_info.value, after.exit_code
+
+    handle, exc, after = asyncio.run(run())
+
+    assert handle.killed is False
+    assert after == 0
+    assert exc.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+            "error": "kill failed",
+        }
+    ]
 
 
 def test_e2b_runner_cleans_up_created_sandbox_when_setup_fails() -> None:
@@ -320,6 +962,7 @@ def test_e2b_runner_cleans_up_created_sandbox_when_setup_fails() -> None:
 def test_e2b_runner_validates_boundary_inputs() -> None:
     sandbox = FakeSandbox()
     runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+    bad_cleanup: Any = "delete_process"
 
     with pytest.raises(ValueError, match="relative"):
         asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="/home/user/workspace"))
@@ -329,3 +972,26 @@ def test_e2b_runner_validates_boundary_inputs() -> None:
 
     with pytest.raises(ValueError, match="sandbox_timeout_s"):
         asyncio.run(E2BRunner.create(sandbox_timeout_s=0, e2b_module=FakeE2BModule))
+
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        E2BRunner(sandbox, cancel_timeout_s=0, e2b_module=FakeE2BModule)
+
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        E2BRunner(sandbox, cancel_timeout_s=inf, e2b_module=FakeE2BModule)
+
+    with pytest.raises(ValueError, match="cancel_timeout_s"):
+        E2BRunner(sandbox, cancel_timeout_s=nan, e2b_module=FakeE2BModule)
+
+    with pytest.raises(ValueError, match="cancellation_cleanup"):
+        E2BRunner(
+            sandbox,
+            cancellation_cleanup=bad_cleanup,
+            e2b_module=FakeE2BModule,
+        )
+
+    with pytest.raises(ValueError, match="timeout_cleanup"):
+        E2BRunner(
+            sandbox,
+            timeout_cleanup=bad_cleanup,
+            e2b_module=FakeE2BModule,
+        )
