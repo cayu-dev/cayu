@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -90,6 +91,13 @@ from cayu.runtime.sessions import (
     copy_resume_request,
     copy_run_request,
 )
+from cayu.runtime.stop_policy import (
+    RunLimits,
+    StopDecision,
+    copy_run_limits,
+    first_reached_limit,
+    has_run_limits,
+)
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
@@ -151,6 +159,7 @@ _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
+_INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 
 
 class CayuApp:
@@ -420,6 +429,7 @@ class CayuApp:
             messages=messages,
             messages_to_append=messages,
             max_steps=request.max_steps,
+            limits=request.limits,
             request_metadata=request.metadata,
             task_id=request.task_id,
             start_event_type=EventType.SESSION_STARTED,
@@ -607,6 +617,7 @@ class CayuApp:
             model=request.model,
             metadata=request.metadata,
             max_steps=request.max_steps,
+            limits=request.limits,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
@@ -706,6 +717,7 @@ class CayuApp:
             messages=messages,
             messages_to_append=request.messages,
             max_steps=request.max_steps,
+            limits=request.limits,
             request_metadata=request.metadata,
             task_id=task_id,
             start_event_type=EventType.SESSION_RESUMED,
@@ -1035,6 +1047,7 @@ class CayuApp:
                 messages=transcript,
                 messages_to_append=[],
                 max_steps=request.max_steps,
+                limits=request.limits,
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
                 start_event_type=None,
@@ -1251,6 +1264,7 @@ class CayuApp:
             reason=request.reason,
             metadata=request.metadata,
             max_steps=request.max_steps,
+            limits=request.limits,
         )
         async for event in self._continue_tool_approval_resolution(
             request=approval_request,
@@ -1273,6 +1287,7 @@ class CayuApp:
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
+        limits: RunLimits,
         request_metadata: dict[str, Any],
         task_id: str | None,
         start_event_type: EventType | None,
@@ -1285,6 +1300,8 @@ class CayuApp:
         task_finished = False
         current_task = asyncio.current_task()
         active_run: _ActiveSessionRun | None = None
+        run_started_at = time.monotonic()
+        limits = copy_run_limits(limits)
         if current_task is not None:
             active_run = self._register_active_session_task(
                 session.id,
@@ -1324,6 +1341,25 @@ class CayuApp:
             )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
+                decision, usage_summary = await self._first_limit_decision(
+                    session=session,
+                    limits=limits,
+                    run_started_at=run_started_at,
+                )
+                if decision is not None:
+                    async for event in self._stop_session_for_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        decision=decision,
+                        usage_summary=usage_summary,
+                        messages=messages,
+                        tool_calls=[],
+                        completed_tool_outcomes=[],
+                    ):
+                        yield event
+                    return
                 try:
                     (
                         context_messages,
@@ -1461,7 +1497,8 @@ class CayuApp:
                         environment_name=environment_name,
                         provider_name=registered_provider.name,
                     )
-                    yield await self._emit(event)
+                    emitted_event = await self._emit(event)
+                    yield emitted_event
                     if stream_event.type == ModelStreamEventType.ERROR:
                         raise RuntimeError(
                             str(stream_event.payload.get("error") or "Model provider error")
@@ -1481,6 +1518,27 @@ class CayuApp:
                         session.id,
                         [assistant_message],
                     )
+
+                decision, usage_summary = await self._first_limit_decision(
+                    session=session,
+                    limits=limits,
+                    run_started_at=run_started_at,
+                    pending_tool_calls=len(tool_calls),
+                )
+                if decision is not None:
+                    async for event in self._stop_session_for_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        decision=decision,
+                        usage_summary=usage_summary,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        completed_tool_outcomes=[],
+                    ):
+                        yield event
+                    return
 
                 if not tool_calls:
                     break
@@ -1521,6 +1579,27 @@ class CayuApp:
                         ):
                             yield event
                     raise
+
+                decision, usage_summary = await self._first_limit_decision(
+                    session=session,
+                    limits=limits,
+                    run_started_at=run_started_at,
+                    pending_tool_calls=len(tool_calls),
+                )
+                if decision is not None:
+                    async for event in self._stop_session_for_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        decision=decision,
+                        usage_summary=usage_summary,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        completed_tool_outcomes=[],
+                    ):
+                        yield event
+                    return
 
                 if policy_plan.pending_approval is not None:
                     approval_plan = policy_plan.pending_approval
@@ -1589,6 +1668,26 @@ class CayuApp:
                 try:
                     for tool_call in tool_calls:
                         await self._raise_if_session_interrupted(session.id)
+                        decision, usage_summary = await self._first_limit_decision(
+                            session=session,
+                            limits=limits,
+                            run_started_at=run_started_at,
+                            pending_tool_calls=1,
+                        )
+                        if decision is not None:
+                            async for event in self._stop_session_for_limit_reached(
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                environment_name=environment_name,
+                                decision=decision,
+                                usage_summary=usage_summary,
+                                messages=messages,
+                                tool_calls=tool_calls,
+                                completed_tool_outcomes=tool_outcomes,
+                            ):
+                                yield event
+                            return
                         async for event, outcome in self._execute_tool_call(
                             session=session,
                             registered_agent=registered_agent,
@@ -1804,6 +1903,125 @@ class CayuApp:
                 "environment_name": _environment_name(registered_environment),
             },
         )
+
+    async def _first_limit_decision(
+        self,
+        *,
+        session: Session,
+        limits: RunLimits,
+        run_started_at: float,
+        pending_tool_calls: int = 0,
+    ) -> tuple[StopDecision | None, SessionUsageSummary]:
+        if not has_run_limits(limits):
+            return None, SessionUsageSummary(session_id=session.id)
+        events = await self.session_store.load_events(session.id)
+        usage_summary = session_usage_summary(session.id, events)
+        elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
+        decision = first_reached_limit(
+            limits=limits,
+            usage=usage_summary,
+            elapsed_seconds=elapsed_seconds,
+            pending_tool_calls=pending_tool_calls,
+        )
+        return decision, usage_summary
+
+    async def _stop_session_for_limit_reached(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        decision: StopDecision,
+        usage_summary: SessionUsageSummary,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+    ) -> AsyncIterator[Event]:
+        limit_payload = _limit_reached_payload(
+            decision=decision,
+            usage_summary=usage_summary,
+        )
+        yield await self._emit(
+            Event(
+                type=EventType.SESSION_LIMIT_REACHED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=limit_payload,
+            )
+        )
+        if tool_calls:
+            async for event in self._close_limited_tool_round(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=messages,
+                tool_calls=tool_calls,
+                completed_tool_outcomes=completed_tool_outcomes,
+                decision=decision,
+            ):
+                yield event
+
+        interrupted_session = await self.session_store.update_status(
+            session.id,
+            SessionStatus.INTERRUPTED,
+        )
+        terminal_payload = {
+            "interruption_type": _INTERRUPTION_TYPE_LIMIT_REACHED,
+            **limit_payload,
+        }
+        async for event in self._emit_terminal_event_with_hooks(
+            event=Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=interrupted_session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=terminal_payload,
+            ),
+            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+            session=interrupted_session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        ):
+            yield event
+
+    async def _close_limited_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+        decision: StopDecision,
+    ) -> AsyncIterator[Event]:
+        if await self._tool_round_has_result_messages(session.id, tool_calls):
+            return
+        completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
+        remaining_tool_calls = [
+            tool_call for tool_call in tool_calls if tool_call.id not in completed_ids
+        ]
+        skipped_outcomes = _limit_reached_tool_round_results(
+            tool_calls=remaining_tool_calls,
+            decision=decision,
+        )
+        for skipped_outcome in skipped_outcomes:
+            yield await self._emit(
+                _limit_reached_tool_call_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call_outcome=skipped_outcome,
+                    decision=decision,
+                )
+            )
+        tool_result_messages = transcript_helpers.tool_result_messages(
+            [*completed_tool_outcomes, *skipped_outcomes]
+        )
+        messages.extend(tool_result_messages)
+        await self.session_store.append_transcript_messages(session.id, tool_result_messages)
 
     async def _policy_plan_for_tool_round(
         self,
@@ -2870,6 +3088,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         environment_name=environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
+        limits=copy_run_limits(request.limits),
     )
 
 
@@ -3000,6 +3219,49 @@ def _interrupted_tool_round_results(
     return interrupted_outcomes
 
 
+def _limit_reached_payload(
+    *,
+    decision: StopDecision,
+    usage_summary: SessionUsageSummary,
+) -> dict[str, Any]:
+    return {
+        "reason": "limit_reached",
+        "limit": decision.limit.value,
+        "maximum": decision.maximum,
+        "actual": decision.actual,
+        "message": decision.message,
+        "usage_summary": usage_summary.model_dump(),
+    }
+
+
+def _limit_reached_tool_round_results(
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    decision: StopDecision,
+) -> list[runtime_records.ToolCallOutcome]:
+    outcomes: list[runtime_records.ToolCallOutcome] = []
+    for tool_call in tool_calls:
+        outcomes.append(
+            runtime_records.ToolCallOutcome(
+                call=tool_call,
+                result=ToolResult(
+                    content="Tool call skipped because a run limit was reached.",
+                    structured={
+                        "skipped": True,
+                        "reason": "limit_reached",
+                        "limit": decision.limit.value,
+                        "maximum": decision.maximum,
+                        "actual": decision.actual,
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                    },
+                    is_error=True,
+                ),
+            )
+        )
+    return outcomes
+
+
 def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]:
     if isinstance(exc, RunnerCancelledError):
         return copy_json_value(exc.artifacts, "artifacts")
@@ -3021,6 +3283,29 @@ def _interrupted_tool_call_event(
         tool_name=tool_call_outcome.call.name,
         payload={
             "tool_call_id": tool_call_outcome.call.id,
+            "result": tool_call_outcome.result.model_dump(),
+        },
+    )
+
+
+def _limit_reached_tool_call_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    tool_call_outcome: runtime_records.ToolCallOutcome,
+    decision: StopDecision,
+) -> Event:
+    return Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        tool_name=tool_call_outcome.call.name,
+        payload={
+            "tool_call_id": tool_call_outcome.call.id,
+            "reason": "limit_reached",
+            "limit": decision.limit.value,
             "result": tool_call_outcome.result.model_dump(),
         },
     )

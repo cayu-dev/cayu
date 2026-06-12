@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from cayu.core import Event, EventType
+from cayu.runtime.stop_policy import (
+    RunLimits,
+    StopLimit,
+    first_reached_limit,
+    has_run_limits,
+)
 from cayu.runtime.usage import (
     normalize_usage_metrics,
     session_usage_summary,
@@ -156,3 +162,70 @@ def test_session_usage_summary_aggregates_model_steps_and_tools() -> None:
 def test_usage_metrics_from_event_payload_rejects_non_usage_payload() -> None:
     assert usage_metrics_from_event_payload({"usage": "bad"}) is None
     assert usage_metrics_from_event_payload({"usage": {}}) is None
+
+
+def test_run_limits_detect_reached_token_budget() -> None:
+    summary = session_usage_summary(
+        "session_1",
+        [
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="session_1",
+                payload={
+                    "usage_metrics": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "cache": {
+                            "read_tokens": 0,
+                            "write_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "uncached_input_tokens": 7,
+                        },
+                    }
+                },
+            )
+        ],
+    )
+
+    decision = first_reached_limit(
+        limits=RunLimits(max_total_tokens=10),
+        usage=summary,
+        elapsed_seconds=0,
+    )
+
+    assert decision is not None
+    assert decision.limit == StopLimit.TOTAL_TOKENS
+    assert decision.maximum == 10
+    assert decision.actual == 10
+
+
+def test_run_limits_allow_tool_call_until_capacity_is_exceeded() -> None:
+    summary = session_usage_summary(
+        "session_1",
+        [Event(type=EventType.TOOL_CALL_STARTED, session_id="session_1")],
+    )
+
+    allowed = first_reached_limit(
+        limits=RunLimits(max_tool_calls=2),
+        usage=summary,
+        elapsed_seconds=0,
+        pending_tool_calls=1,
+    )
+    blocked = first_reached_limit(
+        limits=RunLimits(max_tool_calls=2),
+        usage=summary,
+        elapsed_seconds=0,
+        pending_tool_calls=2,
+    )
+
+    assert allowed is None
+    assert blocked is not None
+    assert blocked.limit == StopLimit.TOOL_CALLS
+    assert blocked.actual == 3
+
+
+def test_has_run_limits_detects_empty_and_configured_limits() -> None:
+    assert not has_run_limits(RunLimits())
+    assert has_run_limits(RunLimits(max_elapsed_seconds=1))

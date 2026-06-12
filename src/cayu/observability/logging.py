@@ -17,6 +17,7 @@ _DEBUG_EVENTS = {
 }
 _WARNING_EVENTS = {
     EventType.SESSION_INTERRUPTED,
+    EventType.SESSION_LIMIT_REACHED,
     EventType.MODEL_ERROR,
     EventType.TOOL_CALL_BLOCKED,
     EventType.TOOL_CALL_APPROVAL_DENIED,
@@ -110,6 +111,10 @@ def _summarize_event(
             payload.get("usage_metrics") or payload.get("usage"),
             redactor=redactor,
         )
+    elif event_type == EventType.SESSION_LIMIT_REACHED:
+        _append(parts, "limit", payload.get("limit"), redactor=redactor)
+        _append(parts, "actual", payload.get("actual"), redactor=redactor)
+        _append(parts, "maximum", payload.get("maximum"), redactor=redactor)
     elif event_type in {
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,

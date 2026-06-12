@@ -24,6 +24,7 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
 )
+from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
 
@@ -39,11 +40,13 @@ _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
 class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
+    limits: RunLimits = Field(default_factory=RunLimits)
 
 
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
+    limits: RunLimits = Field(default_factory=RunLimits)
 
 
 class InterruptSessionBody(BaseModel):
@@ -57,6 +60,7 @@ class ToolApprovalBody(BaseModel):
     decision: ToolApprovalDecision
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    limits: RunLimits = Field(default_factory=RunLimits)
 
 
 class ToolApprovalRecoveryBody(BaseModel):
@@ -69,6 +73,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    limits: RunLimits = Field(default_factory=RunLimits)
 
 
 def create_router(
@@ -104,6 +109,7 @@ def create_router(
             task_id=task_id,
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
+            limits=body.limits,
         )
 
         async def generate():
@@ -125,6 +131,7 @@ def create_router(
             session_id=body.session_id,
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
+            limits=body.limits,
         )
 
         async def generate():
@@ -201,6 +208,7 @@ def create_router(
             reason=body.reason,
             metadata=body.metadata,
             max_steps=20,
+            limits=body.limits,
         )
 
         async def generate():
@@ -229,6 +237,7 @@ def create_router(
             reason=body.reason,
             metadata=body.metadata,
             max_steps=20,
+            limits=body.limits,
         )
 
         async def generate():

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, copy_message
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 
 
 class DispatchStatus(StrEnum):
@@ -32,6 +33,7 @@ class DispatchRequest(BaseModel):
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    limits: RunLimits = Field(default_factory=RunLimits)
 
     @field_validator("messages")
     @classmethod
@@ -139,6 +141,7 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         model=request.model,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
+        limits=copy_run_limits(request.limits),
     )
 
 

@@ -21,6 +21,7 @@ class EventType(StrEnum):
     SESSION_INTERRUPTED = "session.interrupted"
     SESSION_CHECKPOINTED = "session.checkpointed"
     SESSION_FORKED = "session.forked"
+    SESSION_LIMIT_REACHED = "session.limit_reached"
 
     TASK_CREATED = "task.created"
     TASK_STARTED = "task.started"

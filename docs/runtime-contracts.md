@@ -204,6 +204,26 @@ events. The optional FastAPI server exposes the same value at
 records; retry, budget, and stop policies should consume them instead of parsing
 provider-specific payloads directly.
 
+`RunLimits` provides hard stop controls for runtime calls. It can be attached to
+`RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
+`ToolApprovalRecoveryRequest`. Token and tool-call limits are session-cumulative
+because they are evaluated from durable `model.completed` and
+`tool.call.started` events. `max_elapsed_seconds` is scoped to the current
+runtime invocation and resets for each `run(...)` or `resume(...)` call.
+
+When a limit is reached, the runtime emits `session.limit_reached`, updates the
+session to `interrupted`, and emits `session.interrupted` with
+`interruption_type="limit_reached"`. This is a controlled pause, not a runtime
+failure. The session can be resumed later with a higher cumulative budget, a
+different instruction, no cumulative budget, or only a fresh elapsed-time limit.
+If a resume call repeats the same already-exhausted cumulative token or
+tool-call limit, Cayu interrupts again before doing more work; this prevents a
+budget from being bypassed by repeatedly continuing the same session. If a model
+step has already produced tool calls when a limit is reached, Cayu does not
+execute those tools. It appends skipped `tool_result` messages and emits
+`tool.call.failed` events before the terminal interruption event so the
+provider-neutral transcript remains valid for resume.
+
 ## Provider
 
 Model providers translate model-specific APIs into Cayu runtime contracts.

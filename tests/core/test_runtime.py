@@ -40,6 +40,7 @@ from cayu.runtime import (
     ModelCompactor,
     RecentTurnsContextPolicy,
     ResumeRequest,
+    RunLimits,
     RunRequest,
     RuntimeHook,
     RuntimeHookContext,
@@ -659,6 +660,394 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert session.provider_name == "fake"
     assert session.model == "fake-model"
     assert session.runtime_name == "cayu"
+
+
+def test_cayu_app_stops_on_token_limit_before_tool_side_effects():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 4,
+                        "total_tokens": 11,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_token_limit",
+                messages=[Message.text("user", "do it")],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[3].payload["limit"] == "total_tokens"
+    assert events[3].payload["actual"] == 11
+    assert events[3].payload["maximum"] == 10
+    assert events[4].payload["reason"] == "limit_reached"
+    assert events[5].payload["interruption_type"] == "limit_reached"
+    assert tool.calls == []
+
+    transcript = asyncio.run(store.load_transcript("sess_token_limit"))
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    session = asyncio.run(store.load("sess_token_limit"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_stops_on_token_limit_after_final_model_answer():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 6,
+                        "output_tokens": 4,
+                        "total_tokens": 10,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_final_token_limit",
+                messages=[Message.text("user", "answer")],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[4].payload["limit"] == "total_tokens"
+    assert events[5].payload["interruption_type"] == "limit_reached"
+
+    transcript = asyncio.run(store.load_transcript("sess_final_token_limit"))
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    session = asyncio.run(store.load("sess_final_token_limit"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"step": 1},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="side_effect",
+                    arguments={"step": 2},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_limit",
+                messages=[Message.text("user", "do it")],
+                limits=RunLimits(max_tool_calls=1),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == [{"step": 1}]
+    assert events[7].payload["limit"] == "tool_calls"
+    assert events[7].payload["actual"] == 2
+    assert events[8].payload["tool_call_id"] == "call_2"
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_limit"))
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
+
+
+def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
+    clock = {"value": 0.0}
+    monkeypatch.setattr(runtime_app_module.time, "monotonic", lambda: clock["value"])
+
+    class ElapsedTool(SideEffectTool):
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            result = await super().run(ctx, args)
+            clock["value"] = 1.0
+            return result
+
+    store = InMemorySessionStore()
+    tool = ElapsedTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={"step": 1},
+            ),
+            ModelStreamEvent.tool_call(
+                id="call_2",
+                name="side_effect",
+                arguments={"step": 2},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_elapsed_limit_between_tools",
+                messages=[Message.text("user", "do it")],
+                limits=RunLimits(max_elapsed_seconds=1),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == [{"step": 1}]
+    assert events[5].payload["limit"] == "elapsed_seconds"
+    assert events[6].payload["tool_call_id"] == "call_2"
+
+    transcript = asyncio.run(store.load_transcript("sess_elapsed_limit_between_tools"))
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    tool_results = transcript[-1].content
+    assert len(tool_results) == 2
+    assert tool_results[0].tool_call_id == "call_1"
+    assert tool_results[1].tool_call_id == "call_2"
+
+
+def test_cayu_app_elapsed_limit_stops_after_policy_before_approval(monkeypatch):
+    clock = {"value": 0.0}
+    monkeypatch.setattr(runtime_app_module.time, "monotonic", lambda: clock["value"])
+
+    class AdvancingApprovalPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            clock["value"] = 1.0
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason="Approval required.",
+            )
+
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=AdvancingApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_elapsed_limit_before_approval",
+                messages=[Message.text("user", "do it")],
+                limits=RunLimits(max_elapsed_seconds=1),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
+    assert tool.calls == []
+
+    checkpoint = asyncio.run(store.load_checkpoint("sess_elapsed_limit_before_approval"))
+    assert checkpoint is None
+
+
+def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 4,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_limit",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_limit",
+                messages=[Message.text("user", "second")],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert len(provider.requests) == 1
+    assert events[1].payload["usage_summary"]["usage"]["total_tokens"] == 10
+
+    session = asyncio.run(store.load("sess_resume_limit"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
 
 
 def test_cayu_app_resumes_completed_session_from_stored_transcript():

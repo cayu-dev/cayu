@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
@@ -234,6 +234,37 @@ The optional server exposes the same summary at
 `GET /api/sessions/{session_id}/usage`. These metrics are observability data;
 budget and stop policies should build on them instead of parsing raw provider
 responses.
+
+Set hard run limits with `RunLimits` on `RunRequest`, `ResumeRequest`,
+`DispatchRequest`, or tool-approval continuation requests:
+
+```python
+from cayu import RunLimits, RunRequest
+
+request = RunRequest(
+    agent_name="assistant",
+    messages=[Message.text("user", "Analyze these invoices.")],
+    limits=RunLimits(
+        max_total_tokens=50_000,
+        max_tool_calls=25,
+        max_elapsed_seconds=300,
+    ),
+)
+```
+
+Token and tool-call limits are evaluated from durable session events, so they
+apply across resume and dispatch paths. Elapsed time is evaluated for the active
+runtime invocation and resets on each `run(...)` or `resume(...)` call.
+
+When a limit is reached, Cayu emits `session.limit_reached`, marks the session
+`interrupted`, emits `session.interrupted` with
+`interruption_type="limit_reached"`, and leaves the session resumable. Resuming
+with the same exhausted cumulative token or tool-call budget will interrupt
+again immediately; pass a higher budget, omit that limit, or use only a
+per-invocation elapsed-time limit if "continue" should mean "give this run
+another attempt." If the model requested tools in the same step, Cayu records
+skipped tool results before interrupting so the provider-neutral transcript
+remains valid for resume.
 
 ## Example
 

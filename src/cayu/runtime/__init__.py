@@ -60,6 +60,14 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
 )
+from cayu.runtime.stop_policy import (
+    RunLimits,
+    StopDecision,
+    StopLimit,
+    copy_run_limits,
+    first_reached_limit,
+    has_run_limits,
+)
 from cayu.runtime.tasks import (
     InMemoryTaskStore,
     Task,
@@ -121,6 +129,7 @@ __all__ = [
     "RegisteredAgent",
     "RegisteredEnvironment",
     "ResumeRequest",
+    "RunLimits",
     "RunRequest",
     "RuntimeHook",
     "RuntimeHookContext",
@@ -133,6 +142,8 @@ __all__ = [
     "SessionStore",
     "SessionUsageSummary",
     "StaticToolPolicy",
+    "StopDecision",
+    "StopLimit",
     "Task",
     "TaskCreate",
     "TaskOrder",
@@ -152,7 +163,10 @@ __all__ = [
     "UsageMetrics",
     "copy_dispatch_handle",
     "copy_dispatch_request",
+    "copy_run_limits",
     "default_compaction_prompt",
+    "first_reached_limit",
+    "has_run_limits",
     "normalize_usage_metrics",
     "session_usage_summary",
     "strip_old_file_attachments",
