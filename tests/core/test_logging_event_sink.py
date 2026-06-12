@@ -73,6 +73,45 @@ def test_logging_event_sink_keeps_token_deltas_at_debug(caplog: pytest.LogCaptur
     assert caplog.records == []
 
 
+def test_logging_event_sink_summarizes_normalized_usage_metrics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("cayu.test.usage")
+    sink = LoggingEventSink(logger=logger)
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_usage",
+        payload={
+            "usage_metrics": {
+                "provider_name": "openai",
+                "model": "gpt-5.5",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "reasoning_output_tokens": 5,
+                "cache": {
+                    "read_tokens": 60,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 60,
+                    "uncached_input_tokens": 40,
+                },
+            }
+        },
+    )
+
+    caplog.set_level(logging.INFO, logger=logger.name)
+    asyncio.run(sink.emit(event))
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].message
+    assert "input_tokens=100" in message
+    assert "output_tokens=20" in message
+    assert "reasoning_output_tokens=5" in message
+    assert "cache_read_tokens=60" in message
+    assert "cache_write_tokens=0" in message
+    assert "cached_input_tokens=60" in message
+
+
 def test_logging_event_sink_does_not_dump_raw_tool_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

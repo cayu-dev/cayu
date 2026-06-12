@@ -77,9 +77,18 @@ from cayu.runtime.tool_policy import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.runtime.usage import (
+    CacheUsageMetrics,
+    SessionUsageSummary,
+    UsageMetrics,
+    normalize_usage_metrics,
+    session_usage_summary,
+    usage_metrics_from_event_payload,
+)
 
 __all__ = [
     "AllowAllToolPolicy",
+    "CacheUsageMetrics",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CheckpointTransform",
@@ -122,6 +131,7 @@ __all__ = [
     "SessionQuery",
     "SessionStatus",
     "SessionStore",
+    "SessionUsageSummary",
     "StaticToolPolicy",
     "Task",
     "TaskCreate",
@@ -139,10 +149,14 @@ __all__ = [
     "ToolPolicyRequest",
     "ToolPolicyResult",
     "TranscriptDigestCompactor",
+    "UsageMetrics",
     "copy_dispatch_handle",
     "copy_dispatch_request",
     "default_compaction_prompt",
+    "normalize_usage_metrics",
+    "session_usage_summary",
     "strip_old_file_attachments",
     "trim_context_messages",
     "trim_context_turns",
+    "usage_metrics_from_event_payload",
 ]

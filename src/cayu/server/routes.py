@@ -256,6 +256,14 @@ def create_router(
             for s in sessions
         ]
 
+    @router.get("/sessions/{session_id}/usage")
+    async def get_session_usage(session_id: NonBlankString):
+        try:
+            summary = await cayu_app.get_session_usage(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        return summary.model_dump()
+
     @router.get("/sessions/{session_id}")
     async def get_session(session_id: str):
         session = await session_store.load(session_id)

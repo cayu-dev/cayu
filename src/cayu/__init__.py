@@ -83,6 +83,7 @@ from cayu.runners import (
 )
 from cayu.runtime import (
     AllowAllToolPolicy,
+    CacheUsageMetrics,
     CayuApp,
     CheckpointCompactionContextPolicy,
     CompactionPromptBuilder,
@@ -116,6 +117,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionOrder,
     SessionQuery,
+    SessionUsageSummary,
     StaticToolPolicy,
     Task,
     TaskCreate,
@@ -133,10 +135,14 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
     TranscriptDigestCompactor,
+    UsageMetrics,
     default_compaction_prompt,
+    normalize_usage_metrics,
+    session_usage_summary,
     strip_old_file_attachments,
     trim_context_messages,
     trim_context_turns,
+    usage_metrics_from_event_payload,
 )
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tools import (
@@ -224,6 +230,7 @@ __all__ = [
     "ArtifactScope",
     "ArtifactStore",
     "ArtifactToWorkspaceResult",
+    "CacheUsageMetrics",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CompactionPromptBuilder",
@@ -309,6 +316,7 @@ __all__ = [
     "SessionIdentity",
     "SessionOrder",
     "SessionQuery",
+    "SessionUsageSummary",
     "StaticToolPolicy",
     "StaticVault",
     "StdioMcpClient",
@@ -337,6 +345,7 @@ __all__ = [
     "ToolResultPart",
     "ToolSpec",
     "TranscriptDigestCompactor",
+    "UsageMetrics",
     "Vault",
     "VaultError",
     "Workflow",
@@ -354,7 +363,10 @@ __all__ = [
     "file_attachment",
     "file_attachment_from_payload",
     "mcp_cayu_tool_name",
+    "normalize_usage_metrics",
+    "session_usage_summary",
     "strip_old_file_attachments",
     "trim_context_messages",
     "trim_context_turns",
+    "usage_metrics_from_event_payload",
 ]

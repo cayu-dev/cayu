@@ -98,6 +98,12 @@ from cayu.runtime.tool_policy import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.runtime.usage import (
+    SessionUsageSummary,
+    normalize_usage_metrics,
+    session_usage_summary,
+    usage_metrics_payload,
+)
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
@@ -618,6 +624,14 @@ class CayuApp:
         if self.task_store is None:
             raise RuntimeError("task_store is required to create tasks.")
         return await self.task_store.create_task(copy_task_create(request))
+
+    async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        events = await self.session_store.load_events(session_id)
+        return session_usage_summary(session_id, events)
 
     async def emit_hook_event(
         self,
@@ -1445,6 +1459,7 @@ class CayuApp:
                         session=session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
+                        provider_name=registered_provider.name,
                     )
                     yield await self._emit(event)
                     if stream_event.type == ModelStreamEventType.ERROR:
@@ -3214,6 +3229,7 @@ def _model_stream_event_to_runtime_event(
     session: Session,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
+    provider_name: str | None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -3226,12 +3242,22 @@ def _model_stream_event_to_runtime_event(
             payload={"delta": stream_event.delta},
         )
     if stream_event.type == ModelStreamEventType.COMPLETED:
+        payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
+        usage_metrics = usage_metrics_payload(
+            normalize_usage_metrics(
+                provider_name=provider_name,
+                model=_payload_model(payload, fallback=session.model),
+                raw_usage=payload.get("usage"),
+            )
+        )
+        if usage_metrics is not None:
+            payload["usage_metrics"] = usage_metrics
         return Event(
             type=EventType.MODEL_COMPLETED,
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
-            payload=transcript_helpers.model_completed_event_payload(stream_event.payload),
+            payload=payload,
         )
     if stream_event.type == ModelStreamEventType.ERROR:
         return Event(
@@ -3242,6 +3268,13 @@ def _model_stream_event_to_runtime_event(
             payload=copy_json_value(stream_event.payload, "payload"),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _payload_model(payload: dict[str, Any], *, fallback: str) -> str:
+    model = payload.get("model")
+    if type(model) is str and model.strip():
+        return model
+    return fallback
 
 
 def _validate_dispatch_handle_for_request(

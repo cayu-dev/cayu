@@ -4624,6 +4624,110 @@ def test_model_compactor_summarizes_context_with_provider():
     assert "assistant: old answer" in prompt
 
 
+def test_runtime_adds_usage_metrics_to_model_completed_events():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "fake-model-version",
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {"cached_tokens": 5},
+                        "output_tokens": 3,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_runtime",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["usage_metrics"] == {
+        "provider_name": "fake",
+        "model": "fake-model-version",
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "total_tokens": 15,
+        "reasoning_output_tokens": 0,
+        "cache": {
+            "read_tokens": 0,
+            "write_tokens": 0,
+            "cached_input_tokens": 5,
+            "uncached_input_tokens": 7,
+        },
+    }
+
+
+def test_cayu_app_get_session_usage_summarizes_durable_events():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="upper",
+                    arguments={"text": "hello"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 4,
+                            "input_tokens_details": {"cached_tokens": 8},
+                        }
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UpperTool()],
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_summary",
+                messages=[Message.text("user", "uppercase hello")],
+                max_steps=3,
+            ),
+        )
+    )
+    summary = asyncio.run(app.get_session_usage("usage_summary"))
+
+    assert summary.model_steps == 2
+    assert summary.tool_calls == 1
+    assert summary.provider_names == ["fake"]
+    assert summary.models == ["fake-model"]
+    assert summary.usage.input_tokens == 30
+    assert summary.usage.output_tokens == 6
+    assert summary.usage.total_tokens == 36
+    assert summary.usage.cache.cached_input_tokens == 8
+    assert summary.usage.cache.uncached_input_tokens == 22
+
+
 def test_model_compactor_rejects_tool_calls_from_compaction_model():
     provider = FakeProvider(
         [

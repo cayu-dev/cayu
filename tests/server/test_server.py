@@ -26,6 +26,26 @@ class OneShotProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class UsageProvider(ModelProvider):
+    name = "fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed(
+            {
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 4},
+                    "output_tokens": 2,
+                }
+            }
+        )
+
+
+async def _collect_run(app: CayuApp, request: RunRequest) -> list[Event]:
+    return [event async for event in app.run(request)]
+
+
 def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
@@ -45,6 +65,71 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert len(tasks) == 1
     assert tasks[0]["type"] == "run"
     assert tasks[0]["status"] == "completed"
+
+
+def test_server_exposes_session_usage_summary() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_1",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/usage_1/usage")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": "usage_1",
+        "model_steps": 1,
+        "tool_calls": 0,
+        "provider_names": ["fake"],
+        "models": ["fake-model"],
+        "usage": {
+            "provider_name": None,
+            "model": None,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "reasoning_output_tokens": 0,
+            "cache": {
+                "read_tokens": 0,
+                "write_tokens": 0,
+                "cached_input_tokens": 4,
+                "uncached_input_tokens": 6,
+            },
+        },
+    }
+
+
+def test_server_session_usage_returns_404_for_missing_session() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/missing/usage")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_server_session_usage_rejects_blank_session_id() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/%20/usage")
+
+    assert response.status_code == 422
 
 
 def test_dashboard_routes_fall_back_to_index_without_masking_api_or_assets() -> None:

@@ -105,7 +105,11 @@ def _summarize_event(
         _append(parts, "model", payload.get("model"), redactor=redactor)
         _append(parts, "step", payload.get("step"), redactor=redactor)
     elif event_type == EventType.MODEL_COMPLETED:
-        _append_usage(parts, payload.get("usage"), redactor=redactor)
+        _append_usage(
+            parts,
+            payload.get("usage_metrics") or payload.get("usage"),
+            redactor=redactor,
+        )
     elif event_type in {
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
@@ -171,6 +175,23 @@ def _append_usage(parts: list[str], usage: Any, *, redactor: SecretRedactor) -> 
     _append(parts, "input_tokens", usage.get("input_tokens"), redactor=redactor)
     _append(parts, "output_tokens", usage.get("output_tokens"), redactor=redactor)
     _append(parts, "total_tokens", usage.get("total_tokens"), redactor=redactor)
+    _append(
+        parts,
+        "reasoning_output_tokens",
+        usage.get("reasoning_output_tokens"),
+        redactor=redactor,
+    )
+    cache = usage.get("cache")
+    if type(cache) is dict:
+        _append(parts, "cache_read_tokens", cache.get("read_tokens"), redactor=redactor)
+        _append(parts, "cache_write_tokens", cache.get("write_tokens"), redactor=redactor)
+        _append(
+            parts,
+            "cached_input_tokens",
+            cache.get("cached_input_tokens"),
+            redactor=redactor,
+        )
+        return
     input_details = usage.get("input_tokens_details")
     if type(input_details) is dict:
         _append(parts, "cached_tokens", input_details.get("cached_tokens"), redactor=redactor)

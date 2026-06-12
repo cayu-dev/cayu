@@ -176,6 +176,34 @@ The initial `CayuApp` runtime registers agent specs, model providers, and tools,
 
 `CayuApp.run()` and `CayuApp.resume()` are event-stream APIs. Runtime failures are represented as terminal `session.failed` events rather than re-raised exceptions from the iterator. A stricter programmatic API can be added later on top of the same runtime path.
 
+## Usage Metrics
+
+Provider `completed` stream events may include the provider's raw `usage` payload.
+The runtime keeps that raw payload in the durable `model.completed` event and,
+when token counters are available, adds provider-neutral `usage_metrics` beside
+it.
+
+Normalized usage includes:
+
+- `input_tokens`
+- `output_tokens`
+- `total_tokens`
+- `reasoning_output_tokens`
+- `cache.read_tokens`
+- `cache.write_tokens`
+- `cache.cached_input_tokens`
+- `cache.uncached_input_tokens`
+
+OpenAI cached input token counters and Anthropic cache read/write token counters
+are normalized into this shape. The provider-specific raw `usage` value remains
+available for callers that need exact provider fields.
+
+`CayuApp.get_session_usage(session_id)` derives totals from durable session
+events. The optional FastAPI server exposes the same value at
+`GET /api/sessions/{session_id}/usage`. Usage summaries are observability
+records; retry, budget, and stop policies should consume them instead of parsing
+provider-specific payloads directly.
+
 ## Provider
 
 Model providers translate model-specific APIs into Cayu runtime contracts.
