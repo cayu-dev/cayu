@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
@@ -29,6 +30,7 @@ class RunLimits(BaseModel):
     max_total_tokens: StrictInt | None = Field(default=None, ge=1)
     max_tool_calls: StrictInt | None = Field(default=None, ge=1)
     max_elapsed_seconds: StrictInt | None = Field(default=None, ge=1)
+    scope: Literal["session", "run"] = "session"
 
 
 class StopDecision(BaseModel):
@@ -53,6 +55,7 @@ def copy_run_limits(limits: RunLimits | None) -> RunLimits:
         max_total_tokens=limits.max_total_tokens,
         max_tool_calls=limits.max_tool_calls,
         max_elapsed_seconds=limits.max_elapsed_seconds,
+        scope=limits.scope,
     )
 
 

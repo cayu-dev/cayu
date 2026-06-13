@@ -1050,6 +1050,133 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
     assert session.status == SessionStatus.INTERRUPTED
 
 
+def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 4,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_run_scope",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+
+    # The prior turn already consumed 10 total tokens. With scope="run" the
+    # per-invocation delta starts at 0, so a resume must proceed normally even
+    # though cumulative usage already meets the cap.
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_run_scope",
+                messages=[Message.text("user", "second")],
+                limits=RunLimits(max_total_tokens=10, scope="run"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+
+
+def test_cayu_app_run_scoped_limit_still_trips_within_a_single_run():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"step": 1},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="side_effect",
+                    arguments={"step": 2},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_run_scope_runaway",
+                messages=[Message.text("user", "do it")],
+                limits=RunLimits(max_tool_calls=1, scope="run"),
+            ),
+        )
+    )
+
+    assert EventType.SESSION_LIMIT_REACHED in [event.type for event in events]
+    assert tool.calls == [{"step": 1}]
+
+
 def test_cayu_app_resumes_completed_session_from_stored_transcript():
     store = InMemorySessionStore()
     provider = FakeProvider(

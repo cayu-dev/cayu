@@ -239,7 +239,7 @@ Set hard run limits with `RunLimits` on `RunRequest`, `ResumeRequest`,
 `DispatchRequest`, or tool-approval continuation requests:
 
 ```python
-from cayu import RunLimits, RunRequest
+from cayu import Message, RunLimits, RunRequest
 
 request = RunRequest(
     agent_name="assistant",
@@ -248,23 +248,29 @@ request = RunRequest(
         max_total_tokens=50_000,
         max_tool_calls=25,
         max_elapsed_seconds=300,
+        scope="session",
     ),
 )
 ```
 
 Token and tool-call limits are evaluated from durable session events, so they
-apply across resume and dispatch paths. Elapsed time is evaluated for the active
-runtime invocation and resets on each `run(...)` or `resume(...)` call.
+apply across resume and dispatch paths by default. `scope="session"` is the
+default and treats token/tool-call limits as lifetime session budgets.
+`scope="run"` evaluates token/tool-call limits against only the current
+`run(...)`, `resume(...)`, dispatch, or approval-continuation invocation. Elapsed
+time is always evaluated for the active runtime invocation and resets on each
+call.
 
 When a limit is reached, Cayu emits `session.limit_reached`, marks the session
 `interrupted`, emits `session.interrupted` with
 `interruption_type="limit_reached"`, and leaves the session resumable. Resuming
-with the same exhausted cumulative token or tool-call budget will interrupt
-again immediately; pass a higher budget, omit that limit, or use only a
-per-invocation elapsed-time limit if "continue" should mean "give this run
-another attempt." If the model requested tools in the same step, Cayu records
-skipped tool results before interrupting so the provider-neutral transcript
-remains valid for resume.
+with the same exhausted session-scoped token or tool-call budget will interrupt
+again immediately; pass a higher budget, omit that limit, or use `scope="run"`
+if "continue" should mean "give this invocation a fresh token/tool budget." In a
+limit event, `actual` is the value evaluated for the selected scope, while
+`usage_summary` remains the cumulative session summary. If the model requested
+tools in the same step, Cayu records skipped tool results before interrupting so
+the provider-neutral transcript remains valid for resume.
 
 ## Example
 

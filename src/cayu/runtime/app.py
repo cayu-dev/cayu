@@ -108,6 +108,7 @@ from cayu.runtime.tool_policy import (
 )
 from cayu.runtime.usage import (
     SessionUsageSummary,
+    UsageMetrics,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_payload,
@@ -1302,6 +1303,10 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None
         run_started_at = time.monotonic()
         limits = copy_run_limits(limits)
+        run_baseline: SessionUsageSummary | None = None
+        if limits.scope == "run" and has_run_limits(limits):
+            baseline_events = await self.session_store.load_events(session.id)
+            run_baseline = session_usage_summary(session.id, baseline_events)
         if current_task is not None:
             active_run = self._register_active_session_task(
                 session.id,
@@ -1345,6 +1350,7 @@ class CayuApp:
                     session=session,
                     limits=limits,
                     run_started_at=run_started_at,
+                    run_baseline=run_baseline,
                 )
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
@@ -1523,6 +1529,7 @@ class CayuApp:
                     session=session,
                     limits=limits,
                     run_started_at=run_started_at,
+                    run_baseline=run_baseline,
                     pending_tool_calls=len(tool_calls),
                 )
                 if decision is not None:
@@ -1584,6 +1591,7 @@ class CayuApp:
                     session=session,
                     limits=limits,
                     run_started_at=run_started_at,
+                    run_baseline=run_baseline,
                     pending_tool_calls=len(tool_calls),
                 )
                 if decision is not None:
@@ -1672,6 +1680,7 @@ class CayuApp:
                             session=session,
                             limits=limits,
                             run_started_at=run_started_at,
+                            run_baseline=run_baseline,
                             pending_tool_calls=1,
                         )
                         if decision is not None:
@@ -1910,16 +1919,29 @@ class CayuApp:
         session: Session,
         limits: RunLimits,
         run_started_at: float,
+        run_baseline: SessionUsageSummary | None = None,
         pending_tool_calls: int = 0,
     ) -> tuple[StopDecision | None, SessionUsageSummary]:
         if not has_run_limits(limits):
             return None, SessionUsageSummary(session_id=session.id)
         events = await self.session_store.load_events(session.id)
         usage_summary = session_usage_summary(session.id, events)
+        usage_for_limits = usage_summary
+        if limits.scope == "run" and run_baseline is not None:
+            cur, base = usage_summary.usage, run_baseline.usage
+            usage_for_limits = SessionUsageSummary(
+                session_id=session.id,
+                tool_calls=max(0, usage_summary.tool_calls - run_baseline.tool_calls),
+                usage=UsageMetrics(
+                    input_tokens=max(0, cur.input_tokens - base.input_tokens),
+                    output_tokens=max(0, cur.output_tokens - base.output_tokens),
+                    total_tokens=max(0, cur.total_tokens - base.total_tokens),
+                ),
+            )
         elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
         decision = first_reached_limit(
             limits=limits,
-            usage=usage_summary,
+            usage=usage_for_limits,
             elapsed_seconds=elapsed_seconds,
             pending_tool_calls=pending_tool_calls,
         )

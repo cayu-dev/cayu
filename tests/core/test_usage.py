@@ -4,6 +4,7 @@ from cayu.core import Event, EventType
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopLimit,
+    copy_run_limits,
     first_reached_limit,
     has_run_limits,
 )
@@ -229,3 +230,17 @@ def test_run_limits_allow_tool_call_until_capacity_is_exceeded() -> None:
 def test_has_run_limits_detects_empty_and_configured_limits() -> None:
     assert not has_run_limits(RunLimits())
     assert has_run_limits(RunLimits(max_elapsed_seconds=1))
+
+
+def test_run_limits_scope_defaults_to_session() -> None:
+    assert RunLimits().scope == "session"
+
+
+def test_copy_run_limits_preserves_scope() -> None:
+    copied = copy_run_limits(RunLimits(scope="run", max_tool_calls=3))
+    assert copied.scope == "run"
+    assert copied.max_tool_calls == 3
+
+
+def test_run_limits_scope_alone_is_not_a_limit() -> None:
+    assert not has_run_limits(RunLimits(scope="run"))
