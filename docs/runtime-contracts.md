@@ -204,6 +204,22 @@ events. The optional FastAPI server exposes the same value at
 records; retry, budget, and stop policies should consume them instead of parsing
 provider-specific payloads directly.
 
+`PricingCatalog` and `ModelPricing` estimate session cost from durable
+`model.completed` events. Pricing is caller supplied; Cayu does not hardcode
+provider prices. `CayuApp.get_session_cost(session_id, pricing)` walks each
+model step, matches provider/model to exact or prefix pricing entries, and
+returns a `SessionCostSummary` with per-step `CostLineItem` records. Missing
+usage or missing pricing is reported as unpriced line items so dashboards and
+operators can see estimation gaps instead of silently treating them as free. If
+cache read/write prices are omitted, the estimator falls back to the configured
+input-token price for those counters.
+
+Cost estimation is observability, not billing authority. Provider invoices,
+rounding, regional pricing, provider-side discounts, or account-specific terms
+can differ from a caller's pricing table. Cost stop policies should build on
+this primitive only after the app has supplied pricing appropriate for its
+deployment.
+
 `RunLimits` provides hard stop controls for runtime calls. It can be attached to
 `RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
 `ToolApprovalRecoveryRequest`. `scope="session"` is the default: token and

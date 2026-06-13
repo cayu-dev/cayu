@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from cayu.core import Event, EventType
+import asyncio
+from decimal import Decimal
+
+from cayu.core import Event, EventType, Message
+from cayu.runtime import CayuApp, ModelPricing, PricingCatalog, RunRequest, SessionIdentity
+from cayu.runtime.costs import estimate_session_cost
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopLimit,
@@ -160,6 +165,283 @@ def test_session_usage_summary_aggregates_model_steps_and_tools() -> None:
     assert summary.usage.cache.uncached_input_tokens == 90
 
 
+def test_estimate_session_cost_prices_each_model_step() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5-2026-04-23",
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "total_tokens": 1200,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 400,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 400,
+                        "uncached_input_tokens": 600,
+                    },
+                }
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 300,
+                        "write_tokens": 200,
+                        "cached_input_tokens": 300,
+                        "uncached_input_tokens": 500,
+                    },
+                }
+            },
+        ),
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                match="prefix",
+                input_per_million=Decimal("2"),
+                output_per_million=Decimal("8"),
+                cache_read_input_per_million=Decimal("0.5"),
+            ),
+            ModelPricing(
+                provider_name="anthropic",
+                model="claude-sonnet-4-6",
+                input_per_million=Decimal("3"),
+                output_per_million=Decimal("15"),
+                cache_read_input_per_million=Decimal("0.3"),
+                cache_write_input_per_million=Decimal("3.75"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert summary.model_steps == 2
+    assert summary.priced_model_steps == 2
+    assert summary.unpriced_model_steps == 0
+    assert summary.line_items[0].pricing_model == "gpt-5.5"
+    assert summary.line_items[0].pricing_match == "prefix"
+    assert summary.line_items[0].input_cost == Decimal("0.0012")
+    assert summary.line_items[0].cache_read_input_cost == Decimal("0.0002")
+    assert summary.line_items[0].output_cost == Decimal("0.0016")
+    assert summary.line_items[0].total_cost == Decimal("0.0030")
+    assert summary.line_items[1].input_cost == Decimal("0.0015")
+    assert summary.line_items[1].cache_read_input_cost == Decimal("0.00009")
+    assert summary.line_items[1].cache_write_input_cost == Decimal("0.00075")
+    assert summary.line_items[1].output_cost == Decimal("0.0015")
+    assert summary.line_items[1].total_cost == Decimal("0.00384")
+    assert summary.total_cost == Decimal("0.00684")
+
+
+def test_estimate_session_cost_reports_unpriced_model_steps() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-unknown",
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "uncached_input_tokens": 100,
+                    },
+                }
+            },
+        ),
+        Event(type=EventType.MODEL_COMPLETED, session_id="session_1", payload={}),
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert summary.total_cost == Decimal("0")
+    assert summary.priced_model_steps == 0
+    assert summary.unpriced_model_steps == 2
+    assert summary.line_items[0].missing_pricing_reason == "no matching model pricing"
+    assert (
+        summary.line_items[1].missing_pricing_reason
+        == "model.completed event has no token usage metrics"
+    )
+
+
+def test_estimate_session_cost_rejects_currency_mismatch() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "uncached_input_tokens": 100,
+                    },
+                }
+            },
+        )
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+                currency="EUR",
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(
+        session_id="session_1",
+        events=events,
+        pricing=pricing,
+        currency="USD",
+    )
+
+    assert summary.total_cost == Decimal("0")
+    assert summary.unpriced_model_steps == 1
+    assert summary.line_items[0].missing_pricing_reason == (
+        "pricing currency EUR does not match requested USD"
+    )
+
+
+def test_estimate_session_cost_prefers_exact_pricing_over_prefix_pricing() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5-special",
+                    "input_tokens": 1000,
+                    "output_tokens": 0,
+                    "total_tokens": 1000,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "uncached_input_tokens": 1000,
+                    },
+                }
+            },
+        )
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                match="prefix",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5-special",
+                match="exact",
+                input_per_million=Decimal("10"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(
+        session_id="session_1",
+        events=events,
+        pricing=pricing,
+        currency="usd",
+    )
+
+    assert summary.currency == "USD"
+    assert summary.line_items[0].pricing_match == "exact"
+    assert summary.total_cost == Decimal("0.01")
+
+
+def test_estimate_session_cost_respects_explicit_zero_cache_prices() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 1000,
+                    "output_tokens": 0,
+                    "total_tokens": 1000,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 800,
+                        "write_tokens": 100,
+                        "cached_input_tokens": 800,
+                        "uncached_input_tokens": 100,
+                    },
+                }
+            },
+        )
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("10"),
+                output_per_million=Decimal("10"),
+                cache_read_input_per_million=Decimal("0"),
+                cache_write_input_per_million=Decimal("0"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert summary.line_items[0].input_cost == Decimal("0.001")
+    assert summary.line_items[0].cache_read_input_cost == Decimal("0")
+    assert summary.line_items[0].cache_write_input_cost == Decimal("0")
+    assert summary.total_cost == Decimal("0.001")
+
+
 def test_usage_metrics_from_event_payload_rejects_non_usage_payload() -> None:
     assert usage_metrics_from_event_payload({"usage": "bad"}) is None
     assert usage_metrics_from_event_payload({"usage": {}}) is None
@@ -244,3 +526,61 @@ def test_copy_run_limits_preserves_scope() -> None:
 
 def test_run_limits_scope_alone_is_not_a_limit() -> None:
     assert not has_run_limits(RunLimits(scope="run"))
+
+
+def test_cayu_app_get_session_cost_uses_durable_events() -> None:
+    app = CayuApp()
+    asyncio.run(
+        app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hi")],
+                session_id="cost_session",
+            ),
+            identity=SessionIdentity(
+                provider_name="openai",
+                model="gpt-5.5",
+                runtime_name="cayu",
+                runtime_version=None,
+            ),
+        )
+    )
+    asyncio.run(
+        app.session_store.append_event(
+            "cost_session",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="cost_session",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "openai",
+                        "model": "gpt-5.5",
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "total_tokens": 1100,
+                        "reasoning_output_tokens": 0,
+                        "cache": {
+                            "read_tokens": 0,
+                            "write_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "uncached_input_tokens": 1000,
+                        },
+                    }
+                },
+            ),
+        )
+    )
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+
+    summary = asyncio.run(app.get_session_cost("cost_session", pricing))
+
+    assert summary.total_cost == Decimal("0.002")

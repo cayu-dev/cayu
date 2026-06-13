@@ -235,6 +235,43 @@ The optional server exposes the same summary at
 budget and stop policies should build on them instead of parsing raw provider
 responses.
 
+Estimate session cost from the same durable usage events by passing your own
+pricing table. Cayu does not ship hardcoded provider prices because those change
+outside the framework:
+
+```python
+from decimal import Decimal
+
+from cayu import ModelPricing, PricingCatalog
+
+pricing = PricingCatalog(
+    prices=(
+        ModelPricing(
+            provider_name="openai",
+            model="gpt-5.5",
+            match="prefix",
+            input_per_million=Decimal("2.00"),
+            output_per_million=Decimal("8.00"),
+            cache_read_input_per_million=Decimal("0.50"),
+        ),
+    )
+)
+
+cost = await app.get_session_cost("session_123", pricing)
+
+print(cost.total_cost)
+print(cost.unpriced_model_steps)
+```
+
+Cost estimation walks each durable `model.completed` event, matches its
+provider/model against the pricing catalog, and returns line items. A pricing
+entry can match an exact model name or a provider model-name prefix so callers
+can handle provider snapshot suffixes. Missing pricing is reported as unpriced
+line items instead of being silently treated as free. If cache read/write prices
+are omitted, Cayu falls back to the normal input-token price for those counters;
+provide explicit cache prices when your provider or account charges them
+differently.
+
 Set hard run limits with `RunLimits` on `RunRequest`, `ResumeRequest`,
 `DispatchRequest`, or tool-approval continuation requests:
 

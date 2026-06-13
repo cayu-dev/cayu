@@ -61,6 +61,7 @@ from cayu.runtime.context import (
     RuntimeManagedContextPolicy,
     copy_context_messages,
 )
+from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
 from cayu.runtime.dispatch import (
     Dispatcher,
     DispatchHandle,
@@ -676,6 +677,25 @@ class CayuApp:
             raise KeyError(f"Session not found: {session_id}") from None
         events = await self.session_store.load_events(session_id)
         return session_usage_summary(session_id, events)
+
+    async def get_session_cost(
+        self,
+        session_id: str,
+        pricing: PricingCatalog,
+        *,
+        currency: str = "USD",
+    ) -> SessionCostSummary:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session = await self.session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        events = await self.session_store.load_events(session_id)
+        return estimate_session_cost(
+            session_id=session_id,
+            events=events,
+            pricing=pricing,
+            currency=currency,
+        )
 
     async def emit_hook_event(
         self,
