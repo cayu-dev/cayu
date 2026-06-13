@@ -230,6 +230,39 @@ limit is reached, Cayu does not execute those tools. It appends skipped
 `tool_result` messages and emits `tool.call.failed` events before the terminal
 interruption event so the provider-neutral transcript remains valid for resume.
 
+## Retry Policy
+
+`RetryPolicy` controls retry attempts for one provider model step. It can be
+configured as a `CayuApp(retry_policy=...)` default or attached to
+`RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
+`ToolApprovalRecoveryRequest`. Request-level policy overrides the app default.
+The default policy has `max_attempts=1`, which means retries are disabled.
+
+Retries are deliberately scoped to the model provider request. The runtime emits
+`model.started` for each attempt. If a retryable provider error happens, Cayu
+emits `model.error`, emits durable `model.retry` with attempt, next attempt,
+reason, status code, delay, provider, and model fields, waits for the configured
+backoff delay, and starts a new provider attempt. Retried failed attempts do not
+append assistant messages to the provider-neutral transcript.
+When retries are enabled, provider-derived `model.text.delta`, `model.error`,
+and `model.completed` events include `step`, `attempt`, and `max_attempts` so
+SSE consumers, dashboards, and replay tools can distinguish failed-attempt
+output from the successful attempt.
+
+Cayu does not retry tool execution. If a provider attempt emits tool calls and
+then fails before the model step completes, those tool calls have not executed
+yet and the provider step can still be retried. Once a provider step completes,
+the assistant tool-call message may be appended and tool side effects may start;
+later failures are handled by tool failure, approval recovery, interruption, or
+session failure paths instead of provider-step retry.
+
+Built-in retry classification covers HTTP 429/500/502/503/504/529 status text,
+timeouts, connection/network failures, and rate-limit messages. Permanent
+quota/billing failures are not retried even when a provider reports them with
+HTTP 429. Provider adapters should keep enough error detail in
+`ModelStreamEvent.error(...)` for classification and debugging while still
+sanitizing secrets.
+
 ## Provider
 
 Model providers translate model-specific APIs into Cayu runtime contracts.

@@ -17,6 +17,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
+from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     ResumeRequest,
@@ -41,12 +42,14 @@ class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
 
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
 
 class InterruptSessionBody(BaseModel):
@@ -61,6 +64,7 @@ class ToolApprovalBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
 
 class ToolApprovalRecoveryBody(BaseModel):
@@ -74,6 +78,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
 
 def create_router(
@@ -110,6 +115,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
+            retry_policy=body.retry_policy,
         )
 
         async def generate():
@@ -132,6 +138,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
+            retry_policy=body.retry_policy,
         )
 
         async def generate():
@@ -209,6 +216,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
+            retry_policy=body.retry_policy,
         )
 
         async def generate():
@@ -238,6 +246,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
+            retry_policy=body.retry_policy,
         )
 
         async def generate():

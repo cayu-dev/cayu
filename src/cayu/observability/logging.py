@@ -19,6 +19,7 @@ _WARNING_EVENTS = {
     EventType.SESSION_INTERRUPTED,
     EventType.SESSION_LIMIT_REACHED,
     EventType.MODEL_ERROR,
+    EventType.MODEL_RETRY,
     EventType.TOOL_CALL_BLOCKED,
     EventType.TOOL_CALL_APPROVAL_DENIED,
     EventType.RUNTIME_SINK_FAILED,
@@ -111,6 +112,16 @@ def _summarize_event(
             payload.get("usage_metrics") or payload.get("usage"),
             redactor=redactor,
         )
+    elif event_type == EventType.MODEL_RETRY:
+        _append(parts, "provider", payload.get("provider"), redactor=redactor)
+        _append(parts, "model", payload.get("model"), redactor=redactor)
+        _append(parts, "step", payload.get("step"), redactor=redactor)
+        _append(parts, "attempt", payload.get("attempt"), redactor=redactor)
+        _append(parts, "next_attempt", payload.get("next_attempt"), redactor=redactor)
+        _append(parts, "max_attempts", payload.get("max_attempts"), redactor=redactor)
+        _append(parts, "reason", payload.get("reason"), redactor=redactor)
+        _append(parts, "delay_seconds", payload.get("delay_seconds"), redactor=redactor)
+        _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
     elif event_type == EventType.SESSION_LIMIT_REACHED:
         _append(parts, "limit", payload.get("limit"), redactor=redactor)
         _append(parts, "actual", payload.get("actual"), redactor=redactor)

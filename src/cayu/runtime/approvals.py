@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 
 
@@ -31,6 +32,7 @@ class ToolApprovalRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
     @field_validator("session_id", "approval_id")
     @classmethod
@@ -66,6 +68,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
+    retry_policy: RetryPolicy | None = None
 
     @field_validator("session_id", "approval_id", "tool_call_id")
     @classmethod
@@ -193,6 +196,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
+        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
     )
 
 
@@ -213,6 +217,7 @@ def copy_tool_approval_recovery_request(
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
+        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
     )
 
 

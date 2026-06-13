@@ -76,6 +76,13 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
     ToolCallHookContext,
 )
+from cayu.runtime.retry_policy import (
+    RetryDecision,
+    RetryPolicy,
+    copy_retry_policy,
+    retry_decision,
+    retry_event_payload,
+)
 from cayu.runtime.sessions import (
     ForkSessionRequest,
     InMemorySessionStore,
@@ -130,6 +137,22 @@ class _SessionInterruptedByRequest(Exception):
         super().__init__(f"Session interrupted: {self.session_id}")
 
 
+class _ModelAttemptFailed(Exception):
+    def __init__(
+        self,
+        *,
+        message: str,
+        payload: dict[str, Any],
+        emitted_error_event: bool,
+        cause: Exception | None = None,
+    ) -> None:
+        self.message = require_nonblank(message, "message")
+        self.payload = copy_json_value(payload, "payload")
+        self.emitted_error_event = emitted_error_event
+        self.cause = cause
+        super().__init__(self.message)
+
+
 @dataclass
 class _ActiveSessionRun:
     runtime_task: asyncio.Task[Any]
@@ -172,6 +195,7 @@ class CayuApp:
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
         dispatcher: Dispatcher | None = None,
+        retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
@@ -219,6 +243,7 @@ class CayuApp:
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
+        self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._event_sinks = sinks
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
@@ -400,6 +425,11 @@ class CayuApp:
             return None
         return self._get_registered_environment(name)
 
+    def _effective_retry_policy(self, request_policy: RetryPolicy | None) -> RetryPolicy:
+        if request_policy is not None:
+            return copy_retry_policy(request_policy)
+        return copy_retry_policy(self._default_retry_policy)
+
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
@@ -431,6 +461,7 @@ class CayuApp:
             messages_to_append=messages,
             max_steps=request.max_steps,
             limits=request.limits,
+            retry_policy=self._effective_retry_policy(request.retry_policy),
             request_metadata=request.metadata,
             task_id=request.task_id,
             start_event_type=EventType.SESSION_STARTED,
@@ -619,6 +650,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
+            retry_policy=request.retry_policy,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
@@ -719,6 +751,7 @@ class CayuApp:
             messages_to_append=request.messages,
             max_steps=request.max_steps,
             limits=request.limits,
+            retry_policy=self._effective_retry_policy(request.retry_policy),
             request_metadata=request.metadata,
             task_id=task_id,
             start_event_type=EventType.SESSION_RESUMED,
@@ -1049,6 +1082,7 @@ class CayuApp:
                 messages_to_append=[],
                 max_steps=request.max_steps,
                 limits=request.limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
                 start_event_type=None,
@@ -1266,6 +1300,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
+            retry_policy=request.retry_policy,
         )
         async for event in self._continue_tool_approval_resolution(
             request=approval_request,
@@ -1289,6 +1324,7 @@ class CayuApp:
         messages_to_append: list[Message],
         max_steps: int,
         limits: RunLimits,
+        retry_policy: RetryPolicy,
         request_metadata: dict[str, Any],
         task_id: str | None,
         start_event_type: EventType | None,
@@ -1303,6 +1339,7 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None
         run_started_at = time.monotonic()
         limits = copy_run_limits(limits)
+        retry_policy = copy_retry_policy(retry_policy)
         run_baseline: SessionUsageSummary | None = None
         if limits.scope == "run" and has_run_limits(limits):
             baseline_events = await self.session_store.load_events(session.id)
@@ -1454,70 +1491,23 @@ class CayuApp:
                     },
                 )
 
-                yield await self._emit(
-                    Event(
-                        type=EventType.MODEL_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        payload={
-                            "model": session.model,
-                            "provider": registered_provider.name,
-                            "step": step,
-                        },
-                        environment_name=environment_name,
-                    )
-                )
-
-                assistant_parts: list[transcript_helpers.AssistantTextPart | ToolCallPart] = []
+                assistant_message: Message | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
-                provider_state_parts: list[ProviderStatePart] = []
-                model_completed = False
-                async for raw_stream_event in provider.stream(model_request):
-                    stream_event = _validate_stream_event(raw_stream_event)
-                    await self._raise_if_session_interrupted(session.id)
-                    if model_completed:
-                        raise RuntimeError(
-                            f"Model provider emitted event after completed: {stream_event.type}"
-                        )
+                async for event, result in self._run_model_step_with_retries(
+                    provider=provider,
+                    model_request=model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=step,
+                    retry_policy=retry_policy,
+                ):
+                    if event is not None:
+                        yield event
+                    if result is not None:
+                        assistant_message, tool_calls = result
 
-                    if stream_event.type == ModelStreamEventType.TOOL_CALL:
-                        tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
-                        tool_calls.append(tool_call)
-                        assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
-                        continue
-
-                    if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-                        transcript_helpers.append_assistant_text_delta(
-                            assistant_parts, stream_event.delta
-                        )
-                    elif stream_event.type == ModelStreamEventType.COMPLETED:
-                        model_completed = True
-                        provider_state_parts = transcript_helpers.provider_state_parts(
-                            stream_event.payload,
-                        )
-
-                    event = _model_stream_event_to_runtime_event(
-                        stream_event,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        provider_name=registered_provider.name,
-                    )
-                    emitted_event = await self._emit(event)
-                    yield emitted_event
-                    if stream_event.type == ModelStreamEventType.ERROR:
-                        raise RuntimeError(
-                            str(stream_event.payload.get("error") or "Model provider error")
-                        )
-
-                if not model_completed:
-                    raise RuntimeError("Model provider stream ended without a completed event.")
-                await self._raise_if_session_interrupted(session.id)
-
-                assistant_message = transcript_helpers.assistant_message(
-                    content_parts=assistant_parts,
-                    provider_state_parts=provider_state_parts,
-                )
                 if assistant_message is not None:
                     messages.append(assistant_message)
                     await self.session_store.append_transcript_messages(
@@ -1912,6 +1902,231 @@ class CayuApp:
                 "environment_name": _environment_name(registered_environment),
             },
         )
+
+    async def _run_model_step_with_retries(
+        self,
+        *,
+        provider: ModelProvider,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        retry_policy: RetryPolicy,
+    ) -> AsyncIterator[
+        tuple[Event | None, tuple[Message | None, list[runtime_records.ToolCallRequest]] | None]
+    ]:
+        retry_policy = copy_retry_policy(retry_policy)
+        attempt = 1
+        while True:
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        payload={
+                            "model": session.model,
+                            "provider": registered_provider.name,
+                            "step": step,
+                            "attempt": attempt,
+                            "max_attempts": retry_policy.max_attempts,
+                        },
+                        environment_name=environment_name,
+                    )
+                ),
+                None,
+            )
+            try:
+                result: tuple[Message | None, list[runtime_records.ToolCallRequest]] | None = None
+                async for event, step_result in self._run_model_step_once(
+                    provider=provider,
+                    model_request=model_request,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=retry_policy.max_attempts,
+                ):
+                    if event is not None:
+                        yield event, None
+                    if step_result is not None:
+                        result = step_result
+                if result is None:
+                    raise RuntimeError("Model step finished without a result.")
+                yield None, result
+                return
+            except _ModelAttemptFailed as exc:
+                decision = retry_decision(
+                    policy=retry_policy,
+                    attempt=attempt,
+                    error=exc.message,
+                )
+                if decision.reason is not None and not exc.emitted_error_event:
+                    yield (
+                        await self._emit(
+                            Event(
+                                type=EventType.MODEL_ERROR,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload=_retry_attempt_payload(
+                                    exc.payload,
+                                    step=step,
+                                    attempt=attempt,
+                                    max_attempts=retry_policy.max_attempts,
+                                ),
+                            )
+                        ),
+                        None,
+                    )
+                if not decision.retry:
+                    if exc.cause is not None:
+                        raise exc.cause from exc
+                    raise RuntimeError(exc.message) from exc
+                yield (
+                    await self._emit(
+                        _model_retry_event(
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            registered_provider=registered_provider,
+                            step=step,
+                            decision=decision,
+                            error=exc.message,
+                        )
+                    ),
+                    None,
+                )
+                await self._sleep_before_retry(session.id, decision)
+                attempt += 1
+
+    async def _run_model_step_once(
+        self,
+        *,
+        provider: ModelProvider,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+    ) -> AsyncIterator[
+        tuple[Event | None, tuple[Message | None, list[runtime_records.ToolCallRequest]] | None]
+    ]:
+        assistant_parts: list[transcript_helpers.AssistantTextPart | ToolCallPart] = []
+        tool_calls: list[runtime_records.ToolCallRequest] = []
+        provider_state_parts: list[ProviderStatePart] = []
+        model_completed = False
+        try:
+            async for raw_stream_event in provider.stream(model_request):
+                stream_event = _validate_stream_event(raw_stream_event)
+                await self._raise_if_session_interrupted(session.id)
+                if model_completed:
+                    raise _ModelAttemptFailed(
+                        message=(
+                            f"Model provider emitted event after completed: {stream_event.type}"
+                        ),
+                        payload={
+                            "error": (
+                                f"Model provider emitted event after completed: {stream_event.type}"
+                            ),
+                            "error_type": "RuntimeError",
+                        },
+                        emitted_error_event=False,
+                        cause=RuntimeError(
+                            f"Model provider emitted event after completed: {stream_event.type}"
+                        ),
+                    )
+
+                if stream_event.type == ModelStreamEventType.TOOL_CALL:
+                    tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
+                    tool_calls.append(tool_call)
+                    assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
+                    continue
+
+                if stream_event.type == ModelStreamEventType.TEXT_DELTA:
+                    transcript_helpers.append_assistant_text_delta(
+                        assistant_parts, stream_event.delta
+                    )
+                elif stream_event.type == ModelStreamEventType.COMPLETED:
+                    model_completed = True
+                    provider_state_parts = transcript_helpers.provider_state_parts(
+                        stream_event.payload,
+                    )
+
+                event = _model_stream_event_to_runtime_event(
+                    stream_event,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    provider_name=registered_provider.name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                emitted_event = await self._emit(event)
+                if stream_event.type == ModelStreamEventType.ERROR:
+                    yield emitted_event, None
+                    raise _ModelAttemptFailed(
+                        message=str(stream_event.payload.get("error") or "Model provider error"),
+                        payload=copy_json_value(stream_event.payload, "payload"),
+                        emitted_error_event=True,
+                        cause=RuntimeError(
+                            str(stream_event.payload.get("error") or "Model provider error")
+                        ),
+                    )
+                yield emitted_event, None
+        except _SessionInterruptedByRequest:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except _ModelAttemptFailed:
+            raise
+        except Exception as exc:
+            raise _ModelAttemptFailed(
+                message=str(exc),
+                payload={
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+                emitted_error_event=False,
+                cause=exc,
+            ) from exc
+
+        if not model_completed:
+            message = "Model provider stream ended without a completed event."
+            raise _ModelAttemptFailed(
+                message=message,
+                payload={
+                    "error": message,
+                    "error_type": "RuntimeError",
+                },
+                emitted_error_event=False,
+                cause=RuntimeError(message),
+            )
+        await self._raise_if_session_interrupted(session.id)
+
+        assistant_message = transcript_helpers.assistant_message(
+            content_parts=assistant_parts,
+            provider_state_parts=provider_state_parts,
+        )
+        yield None, (assistant_message, tool_calls)
+
+    async def _sleep_before_retry(
+        self,
+        session_id: str,
+        decision: RetryDecision,
+    ) -> None:
+        await self._raise_if_session_interrupted(session_id)
+        if decision.delay_seconds > 0:
+            await asyncio.sleep(decision.delay_seconds)
+        await self._raise_if_session_interrupted(session_id)
 
     async def _first_limit_decision(
         self,
@@ -3111,6 +3326,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
+        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
     )
 
 
@@ -3139,6 +3355,31 @@ def _context_compaction_telemetry_event(
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
         payload=copy_json_value(telemetry.payload, "payload"),
+    )
+
+
+def _model_retry_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    registered_provider: runtime_records.RegisteredProvider,
+    step: int,
+    decision: RetryDecision,
+    error: str,
+) -> Event:
+    return Event(
+        type=EventType.MODEL_RETRY,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=retry_event_payload(
+            decision=decision,
+            provider_name=registered_provider.name,
+            model=session.model,
+            step=step,
+            error=error,
+        ),
     )
 
 
@@ -3537,6 +3778,9 @@ def _model_stream_event_to_runtime_event(
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     provider_name: str | None,
+    step: int,
+    attempt: int,
+    max_attempts: int,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -3546,7 +3790,12 @@ def _model_stream_event_to_runtime_event(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
-            payload={"delta": stream_event.delta},
+            payload=_retry_attempt_payload(
+                {"delta": stream_event.delta},
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ),
         )
     if stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
@@ -3559,6 +3808,12 @@ def _model_stream_event_to_runtime_event(
         )
         if usage_metrics is not None:
             payload["usage_metrics"] = usage_metrics
+        payload = _retry_attempt_payload(
+            payload,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
         return Event(
             type=EventType.MODEL_COMPLETED,
             session_id=session.id,
@@ -3572,9 +3827,30 @@ def _model_stream_event_to_runtime_event(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
-            payload=copy_json_value(stream_event.payload, "payload"),
+            payload=_retry_attempt_payload(
+                copy_json_value(stream_event.payload, "payload"),
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _retry_attempt_payload(
+    payload: dict[str, Any],
+    *,
+    step: int,
+    attempt: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    if max_attempts <= 1:
+        return payload
+    enriched = dict(payload)
+    enriched["step"] = step
+    enriched["attempt"] = attempt
+    enriched["max_attempts"] = max_attempts
+    return enriched
 
 
 def _payload_model(payload: dict[str, Any], *, fallback: str) -> str:

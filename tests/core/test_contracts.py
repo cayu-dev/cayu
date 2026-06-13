@@ -46,6 +46,8 @@ from cayu.runtime import (
     DispatchStatus,
     InMemoryEventSink,
     ResumeRequest,
+    RetryPolicy,
+    RetryReason,
     RunRequest,
     Session,
     SessionStatus,
@@ -54,6 +56,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    retry_decision,
 )
 from cayu.storage import KnowledgeHit, KnowledgeItem
 from cayu.storage.memory import copy_knowledge_item
@@ -816,6 +819,127 @@ def test_run_request_accepts_messages_and_metadata():
     assert request.agent_name == "orchestrator"
     assert request.messages[0].content[0].text == "start"
     assert request.metadata == {"source": "test"}
+
+
+def test_retry_policy_validates_retry_controls():
+    assert 529 in RetryPolicy().retry_on_status_codes
+
+    policy = RetryPolicy(
+        max_attempts=3,
+        initial_delay_s=0.0,
+        max_delay_s=2.0,
+        backoff_multiplier=1.5,
+        retry_on_status_codes=(429, 503),
+    )
+
+    assert policy.max_attempts == 3
+    assert policy.retry_on_status_codes == (429, 503)
+
+    with pytest.raises(ValidationError):
+        RetryPolicy(max_attempts=0)
+
+    with pytest.raises(ValidationError):
+        RetryPolicy(retry_on_status_codes=(99,))
+
+    with pytest.raises(ValidationError):
+        RetryPolicy(retry_on_status_codes=(600,))
+
+
+def test_retry_policy_classifies_common_status_code_formats():
+    policy = RetryPolicy(max_attempts=2, retry_on_status_codes=(429, 500, 503, 529))
+
+    retryable_errors = [
+        "OpenAI API request failed with HTTP 500: unavailable",
+        "Anthropic API request failed with HTTP 529: overloaded_error",
+        "HTTP/2 503 service unavailable",
+        "HTTP/1.1 500 internal server error",
+        "provider failed with HTTP status 503",
+        "provider failed with HTTP status code 503",
+        "provider failed with status 429",
+        "provider failed with status_code=429",
+        "provider failed with status-code: 500",
+        "response status code: 503",
+    ]
+
+    for error in retryable_errors:
+        decision = retry_decision(policy=policy, attempt=1, error=error)
+        assert decision.retry is True
+        assert decision.reason == RetryReason.HTTP_STATUS
+        assert decision.status_code in {429, 500, 503, 529}
+
+
+def test_retry_policy_does_not_retry_permanent_quota_errors():
+    permanent_errors = [
+        "OpenAI API request failed with HTTP 429: insufficient_quota",
+        "OpenAI API request failed with HTTP 429: You exceeded your current quota",
+        "OpenAI API request failed with HTTP 429: run out of credits",
+        "OpenAI API request failed with HTTP 429: hit your maximum monthly spend",
+        "OpenAI API request failed with HTTP 429: check your plan and billing details",
+        "OpenAI API request failed: insufficient_quota",
+    ]
+
+    for error in permanent_errors:
+        decision = retry_decision(
+            policy=RetryPolicy(max_attempts=2),
+            attempt=1,
+            error=error,
+        )
+        assert decision.retry is False
+        assert decision.reason is None
+        assert decision.status_code in {None, 429}
+
+
+def test_retry_policy_permanent_patterns_do_not_mask_retryable_server_errors():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2),
+        attempt=1,
+        error="Provider failed with HTTP 503: billing service temporarily unavailable",
+    )
+
+    assert decision.retry is True
+    assert decision.reason == RetryReason.HTTP_STATUS
+    assert decision.status_code == 503
+
+
+def test_retry_policy_still_retries_rate_limit_429_errors():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2),
+        attempt=1,
+        error="OpenAI API request failed with HTTP 429: Rate limit reached for requests",
+    )
+
+    assert decision.retry is True
+    assert decision.reason == RetryReason.HTTP_STATUS
+    assert decision.status_code == 429
+
+
+def test_retry_policy_does_not_treat_unlabeled_numbers_as_status_codes():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2),
+        attempt=1,
+        error="model emitted 500 tokens before failing validation",
+    )
+
+    assert decision.retry is False
+    assert decision.status_code is None
+
+
+def test_retry_policy_jitter_does_not_exceed_max_delay():
+    policy = RetryPolicy(
+        max_attempts=2,
+        initial_delay_s=10.0,
+        max_delay_s=10.0,
+        jitter_s=5.0,
+    )
+
+    for _ in range(50):
+        decision = retry_decision(
+            policy=policy,
+            attempt=1,
+            error="HTTP 503",
+        )
+        assert decision.retry is True
+        assert decision.delay_seconds <= policy.max_delay_s
 
 
 def test_agent_spec_uses_explicit_system_prompt_field():

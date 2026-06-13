@@ -272,6 +272,37 @@ limit event, `actual` is the value evaluated for the selected scope, while
 tools in the same step, Cayu records skipped tool results before interrupting so
 the provider-neutral transcript remains valid for resume.
 
+Configure provider-step retries with `RetryPolicy` on `CayuApp` or on one
+request. Retries are disabled by default. A retry only wraps the model provider
+request before any assistant transcript message is appended and before any tool
+executes:
+
+```python
+from cayu import CayuApp, Message, RetryPolicy, RunRequest
+
+app = CayuApp(retry_policy=RetryPolicy(max_attempts=3))
+
+request = RunRequest(
+    agent_name="assistant",
+    messages=[Message.text("user", "Research this domain.")],
+    retry_policy=RetryPolicy(
+        max_attempts=2,
+        initial_delay_s=0.5,
+        max_delay_s=3.0,
+        retry_on_status_codes=(429, 500, 502, 503, 504, 529),
+    ),
+)
+```
+
+Retryable provider failures emit `model.error`, then `model.retry`, then a new
+`model.started` attempt. When retries are enabled, provider-derived model events
+include `step`, `attempt`, and `max_attempts` so live logs and dashboards can
+separate failed-attempt output from successful output. Cayu does not retry tool
+execution or any model step after tool side effects have started. Built-in
+classification treats provider overload, server errors, timeouts, connection
+failures, and rate-limit errors as retryable. Permanent quota/billing failures
+are not retried even when a provider reports them with HTTP 429.
+
 ## Example
 
 Run the deterministic echo-tool runtime example:

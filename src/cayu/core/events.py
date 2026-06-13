@@ -33,6 +33,7 @@ class EventType(StrEnum):
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_COMPLETED = "model.completed"
     MODEL_ERROR = "model.error"
+    MODEL_RETRY = "model.retry"
 
     CONTEXT_COMPACTION_STARTED = "context.compaction.started"
     CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"

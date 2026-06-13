@@ -40,6 +40,7 @@ from cayu.runtime import (
     ModelCompactor,
     RecentTurnsContextPolicy,
     ResumeRequest,
+    RetryPolicy,
     RunLimits,
     RunRequest,
     RuntimeHook,
@@ -2777,6 +2778,350 @@ def test_cayu_app_fails_task_when_run_fails():
         "error": "provider down",
         "error_type": "RuntimeError",
     }
+
+
+def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_failed_attempt",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.error("OpenAI API request failed with HTTP 429: rate limit"),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_successful_attempt",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_before_tool",
+                messages=[Message.text("user", "use the tool")],
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_retry_before_tool"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 3
+    assert len(tool.calls) == 1
+    assert events[3].payload["reason"] == "http_status"
+    assert events[3].payload["status_code"] == 429
+    assert events[3].payload["attempt"] == 1
+    assert events[3].payload["next_attempt"] == 2
+    assert events[6].payload["tool_call_id"] == "call_successful_attempt"
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert transcript[1].content[0].type == "tool_call"
+    assert transcript[1].content[0].tool_call_id == "call_successful_attempt"
+
+
+def test_cayu_app_does_not_retry_without_retry_policy():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.error("OpenAI API request failed with HTTP 429: rate limit"),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_disabled",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.SESSION_FAILED,
+    ]
+    assert len(provider.requests) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+
+
+def test_cayu_app_does_not_retry_non_retryable_model_error():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.error("OpenAI API request failed with HTTP 400: bad request"),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_non_retryable",
+                messages=[Message.text("user", "hi")],
+                retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.SESSION_FAILED,
+    ]
+    assert len(provider.requests) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+
+
+def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
+    class TimeoutThenSuccessProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise TimeoutError("stream idle timeout")
+            yield ModelStreamEvent.text_delta("ok")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    store = InMemorySessionStore()
+    provider = TimeoutThenSuccessProvider()
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_exception",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_retry_exception"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+    assert events[3].payload["reason"] == "timeout"
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[1].content[0].text == "ok"
+
+
+def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("partial answer"),
+                ModelStreamEvent.error("OpenAI API request failed with HTTP 500: unavailable"),
+            ],
+            [
+                ModelStreamEvent.text_delta("final answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_stream_attempt_metadata",
+                messages=[Message.text("user", "hi")],
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_retry_stream_attempt_metadata"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[2].payload == {
+        "delta": "partial answer",
+        "step": 1,
+        "attempt": 1,
+        "max_attempts": 2,
+    }
+    assert events[3].payload["attempt"] == 1
+    assert events[3].payload["max_attempts"] == 2
+    assert events[6].payload == {
+        "delta": "final answer",
+        "step": 1,
+        "attempt": 2,
+        "max_attempts": 2,
+    }
+    assert events[7].payload["attempt"] == 2
+    assert events[7].payload["max_attempts"] == 2
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[1].content[0].text == "final answer"
+
+
+def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
+    class AlwaysTimeoutProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            raise TimeoutError("stream idle timeout")
+            yield
+
+    provider = AlwaysTimeoutProvider()
+    app = CayuApp(
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_final_exception_error",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.SESSION_FAILED,
+    ]
+    assert len(provider.requests) == 2
+    assert events[2].payload == {
+        "error": "stream idle timeout",
+        "error_type": "TimeoutError",
+        "step": 1,
+        "attempt": 1,
+        "max_attempts": 2,
+    }
+    assert events[5].payload == {
+        "error": "stream idle timeout",
+        "error_type": "TimeoutError",
+        "step": 1,
+        "attempt": 2,
+        "max_attempts": 2,
+    }
+
+
+def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent(
+                type=ModelStreamEventType.TOOL_CALL,
+                payload={"name": "echo", "arguments": "not-an-object"},
+            )
+        ]
+    )
+    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_non_retryable_contract_failure",
+                messages=[Message.text("user", "bad call")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.SESSION_FAILED,
+    ]
 
 
 def test_cayu_app_fails_session_clearly_when_task_store_is_missing():

@@ -223,6 +223,46 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
     )
 
 
+def test_run_endpoint_passes_retry_policy_to_runtime() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    captured_requests = []
+
+    async def run(request):
+        captured_requests.append(request)
+        yield Event(
+            type=EventType.SESSION_STARTED,
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+        )
+
+    app.run = run
+    client = TestClient(create_server(app))
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={
+            "prompt": "hello",
+            "retry_policy": {
+                "max_attempts": 2,
+                "initial_delay_s": 0,
+                "retry_on_status_codes": [429],
+            },
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    assert len(captured_requests) == 1
+    retry_policy = captured_requests[0].retry_policy
+    assert retry_policy is not None
+    assert retry_policy.max_attempts == 2
+    assert retry_policy.initial_delay_s == 0.0
+    assert retry_policy.retry_on_status_codes == (429,)
+
+
 def test_tool_approval_endpoints_preserve_metadata() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
