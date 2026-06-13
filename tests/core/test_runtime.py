@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from decimal import Decimal
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
@@ -26,6 +28,7 @@ from cayu.runtime import (
     ContextCompactor,
     ContextPolicy,
     ContextRequest,
+    CostBudget,
     Dispatcher,
     DispatchHandle,
     DispatchRequest,
@@ -38,6 +41,8 @@ from cayu.runtime import (
     InterruptSessionRequest,
     MessageWindowContextPolicy,
     ModelCompactor,
+    ModelPricing,
+    PricingCatalog,
     RecentTurnsContextPolicy,
     ResumeRequest,
     RetryPolicy,
@@ -364,6 +369,21 @@ class SideEffectApprovalPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class DenyEchoRequireSideEffectApprovalPolicy(ToolPolicy):
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        if request.tool_name == "echo":
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                reason="echo is blocked",
+            )
+        if request.tool_name == "side_effect":
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason="side effect needs approval",
+            )
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
 class ArgumentMutatingTool(Tool):
     spec = ToolSpec(
         name="mutate_args",
@@ -417,6 +437,29 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+def fake_cost_budget(
+    max_estimated_cost: str,
+    *,
+    scope: Literal["session", "run"] = "session",
+    allow_unpriced: bool = False,
+) -> CostBudget:
+    return CostBudget(
+        max_estimated_cost=Decimal(max_estimated_cost),
+        pricing=PricingCatalog(
+            prices=(
+                ModelPricing(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("10"),
+                ),
+            )
+        ),
+        scope=scope,
+        allow_unpriced=allow_unpriced,
+    )
 
 
 async def collect_interrupt_events(app: CayuApp, request: InterruptSessionRequest) -> list[Event]:
@@ -777,6 +820,115 @@ def test_cayu_app_stops_on_token_limit_after_final_model_answer():
     assert session.status == SessionStatus.INTERRUPTED
 
 
+def test_cayu_app_stops_on_estimated_cost_budget_after_final_model_answer():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "total_tokens": 1100,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cost_limit",
+                messages=[Message.text("user", "answer")],
+                cost_budget=fake_cost_budget("0.002"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[4].payload["limit"] == "estimated_cost"
+    assert events[4].payload["maximum"] == "0.002"
+    assert events[4].payload["actual"] == "0.002"
+    assert events[4].payload["cost_summary"]["total_cost"] == "0.002"
+    assert events[5].payload["interruption_type"] == "limit_reached"
+
+    session = asyncio.run(store.load("sess_cost_limit"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_cost_budget_stops_before_tool_side_effects():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "total_tokens": 1100,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cost_limit_tool",
+                messages=[Message.text("user", "do it")],
+                cost_budget=fake_cost_budget("0.002"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[3].payload["limit"] == "estimated_cost"
+    assert events[4].payload["reason"] == "limit_reached"
+    assert tool.calls == []
+
+    transcript = asyncio.run(store.load_transcript("sess_cost_limit_tool"))
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+
+
 def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool():
     store = InMemorySessionStore()
     tool = SideEffectTool()
@@ -1108,6 +1260,184 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
                 session_id="sess_run_scope",
                 messages=[Message.text("user", "second")],
                 limits=RunLimits(max_total_tokens=10, scope="run"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+
+
+def test_cayu_app_cost_budget_fails_closed_when_model_step_is_unpriced():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cost_limit_unpriced",
+                messages=[Message.text("user", "answer")],
+                cost_budget=CostBudget(
+                    max_estimated_cost=Decimal("100"),
+                    pricing=PricingCatalog(
+                        prices=(
+                            ModelPricing(
+                                provider_name="fake",
+                                model="other-model",
+                                input_per_million=Decimal("1"),
+                                output_per_million=Decimal("1"),
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert len(provider.requests) == 0
+    assert events[1].payload["limit"] == "estimated_cost"
+    assert "no matching pricing" in events[1].payload["message"]
+    assert events[1].payload["cost_summary"]["unpriced_model_steps"] == 0
+
+
+def test_cayu_app_cost_budget_allows_unpriced_steps_when_explicitly_configured():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_cost_limit_unpriced_allowed",
+                messages=[Message.text("user", "answer")],
+                cost_budget=CostBudget(
+                    max_estimated_cost=Decimal("100"),
+                    pricing=PricingCatalog(
+                        prices=(
+                            ModelPricing(
+                                provider_name="fake",
+                                model="other-model",
+                                input_per_million=Decimal("1"),
+                                output_per_million=Decimal("1"),
+                            ),
+                        )
+                    ),
+                    allow_unpriced=True,
+                ),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+
+
+def test_cayu_app_run_scoped_cost_budget_ignores_prior_session_cost():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 100,
+                            "total_tokens": 1100,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_run_scope_cost",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_run_scope_cost",
+                messages=[Message.text("user", "second")],
+                cost_budget=fake_cost_budget("0.002", scope="run"),
             ),
         )
     )
@@ -3629,6 +3959,169 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
     assert asyncio.run(store.load_checkpoint("sess_tool_approval_allow")) == {}
 
 
+def test_cayu_app_cost_budget_stops_approval_before_tool_side_effects():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 100,
+                            "total_tokens": 1100,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_cost_limit",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_tool_approval_cost_limit",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                cost_budget=fake_cost_budget("0.002"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[1].payload["limit"] == "estimated_cost"
+    assert events[2].payload["reason"] == "limit_reached"
+    assert tool.calls == []
+    assert len(provider.requests) == 1
+
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval_cost_limit"))
+    assert checkpoint == {}
+    transcript = asyncio.run(store.load_transcript("sess_tool_approval_cost_limit"))
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    session = asyncio.run(store.load("sess_tool_approval_cost_limit"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_approval_limit_counts_only_executable_pending_tools():
+    store = InMemorySessionStore()
+    side_effect = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "first"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="side_effect",
+                    arguments={"value": "second"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("round handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool(), side_effect],
+        tool_policy=DenyEchoRequireSideEffectApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_limit_executable_only",
+                messages=[Message.text("user", "use both tools")],
+            ),
+        )
+    )
+    approval = interrupt_events[4].payload["approval"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_limit_executable_only",
+                approval_id=approval["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+                limits=RunLimits(max_tool_calls=1),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert EventType.SESSION_LIMIT_REACHED not in [event.type for event in events]
+    assert side_effect.calls == [{"value": "second"}]
+    assert asyncio.run(store.load_checkpoint("sess_approval_limit_executable_only")) == {}
+
+    tool_result_message = provider.requests[1].messages[-1]
+    assert tool_result_message.role == "tool"
+    assert [part.tool_call_id for part in tool_result_message.content] == [
+        "call_1",
+        "call_2",
+    ]
+    assert tool_result_message.content[0].is_error is True
+    assert tool_result_message.content[1].content == "recorded"
+
+
 def test_cayu_app_resolves_approved_multi_tool_round_in_order():
     store = InMemorySessionStore()
     side_effect = SideEffectTool()
@@ -4130,6 +4623,101 @@ def test_cayu_app_retries_approval_close_without_rerunning_completed_tool():
     assert tool.calls == [{"value": "secret"}]
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content[0].content == "recorded"
+
+
+def test_cayu_app_approval_limit_replays_recorded_tool_outcomes_before_stopping():
+    store = FailingApprovalCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 100,
+                            "total_tokens": 1100,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_recorded_outcome_limit",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_recorded_outcome_limit",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert tool.calls == [{"value": "secret"}]
+
+    retry_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_recorded_outcome_limit",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                cost_budget=fake_cost_budget("0.001"),
+            ),
+        )
+    )
+
+    assert [event.type for event in retry_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert retry_events[1].payload["limit"] == "estimated_cost"
+    assert tool.calls == [{"value": "secret"}]
+    assert len(provider.requests) == 1
+    assert asyncio.run(store.load_checkpoint("sess_approval_recorded_outcome_limit")) == {}
+
+    transcript = asyncio.run(store.load_transcript("sess_approval_recorded_outcome_limit"))
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    assert transcript[-1].content[0].content == "recorded"
 
 
 def test_cayu_app_rejects_denial_retry_after_approved_tool_executed():

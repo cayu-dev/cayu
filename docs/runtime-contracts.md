@@ -220,31 +220,41 @@ can differ from a caller's pricing table. Cost stop policies should build on
 this primitive only after the app has supplied pricing appropriate for its
 deployment.
 
-`RunLimits` provides hard stop controls for runtime calls. It can be attached to
-`RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
-`ToolApprovalRecoveryRequest`. `scope="session"` is the default: token and
-tool-call limits are session-cumulative because they are evaluated from durable
-`model.completed` and `tool.call.started` events. `scope="run"` evaluates
-token and tool-call limits against the delta since the current `run(...)`,
-`resume(...)`, dispatch, or approval-continuation invocation started.
-`max_elapsed_seconds` is always scoped to the current runtime invocation and
-resets for each call.
+`RunLimits` provides hard token/tool/time stop controls for runtime calls.
+`CostBudget` provides an estimated-cost stop control backed by a caller-supplied
+`PricingCatalog`. Both can be attached to `RunRequest`, `ResumeRequest`,
+`DispatchRequest`, `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`.
+`scope="session"` is the default: token, tool-call, and cost limits are
+session-cumulative because they are evaluated from durable `model.completed` and
+`tool.call.started` events. `scope="run"` evaluates token, tool-call, and cost
+limits against the delta since the current `run(...)`, `resume(...)`, dispatch,
+or approval-continuation invocation started. `max_elapsed_seconds` is always
+scoped to the current runtime invocation and resets for each call.
+
+Cost budgets are estimates, not billing records. They use normalized usage
+metrics and the app's pricing table. By default, `CostBudget` fails closed when
+a newly observed model step has no matching pricing entry; Cayu interrupts
+instead of silently treating unknown usage as free. Apps that intentionally allow
+missing prices can set `allow_unpriced=True` for that request.
 
 When a limit is reached, the runtime emits `session.limit_reached`, updates the
 session to `interrupted`, and emits `session.interrupted` with
 `interruption_type="limit_reached"`. This is a controlled pause, not a runtime
 failure. The session can be resumed later with a higher cumulative budget, a
 different instruction, no cumulative budget, or a run-scoped limit. If a resume
-call repeats the same already-exhausted session-scoped token or tool-call limit,
-Cayu interrupts again before doing more work; this prevents a lifetime budget
-from being bypassed by repeatedly continuing the same session. If
-`scope="run"` is used, token/tool-call counters start from the invocation
+call repeats the same already-exhausted session-scoped token, tool-call, or cost
+limit, Cayu interrupts again before doing more work; this prevents a lifetime
+budget from being bypassed by repeatedly continuing the same session. If
+`scope="run"` is used, token/tool-call/cost counters start from the invocation
 baseline but the `usage_summary` in `session.limit_reached` remains the
 cumulative session summary. The event's `actual` field is the value evaluated
-for the selected scope. If a model step has already produced tool calls when a
-limit is reached, Cayu does not execute those tools. It appends skipped
-`tool_result` messages and emits `tool.call.failed` events before the terminal
-interruption event so the provider-neutral transcript remains valid for resume.
+for the selected scope. Cost-limit events also include `cost_summary`; decimal
+cost values are serialized as strings for JSON stability. `cost_summary` is
+cumulative, matching `usage_summary`; use `actual` for the scoped value that
+triggered the stop. If a model step has already produced tool calls when a limit
+is reached, Cayu does not execute those tools. It appends skipped `tool_result`
+messages and emits `tool.call.failed` events before the terminal interruption
+event so the provider-neutral transcript remains valid for resume.
 
 ## Retry Policy
 

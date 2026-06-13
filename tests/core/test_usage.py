@@ -4,8 +4,15 @@ import asyncio
 from decimal import Decimal
 
 from cayu.core import Event, EventType, Message
-from cayu.runtime import CayuApp, ModelPricing, PricingCatalog, RunRequest, SessionIdentity
-from cayu.runtime.costs import estimate_session_cost
+from cayu.runtime import (
+    CayuApp,
+    CostBudget,
+    ModelPricing,
+    PricingCatalog,
+    RunRequest,
+    SessionIdentity,
+)
+from cayu.runtime.costs import copy_cost_budget, estimate_session_cost
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopLimit,
@@ -440,6 +447,34 @@ def test_estimate_session_cost_respects_explicit_zero_cache_prices() -> None:
     assert summary.line_items[0].cache_read_input_cost == Decimal("0")
     assert summary.line_items[0].cache_write_input_cost == Decimal("0")
     assert summary.total_cost == Decimal("0.001")
+
+
+def test_cost_budget_validates_currency_and_copies_pricing() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
+    )
+
+    budget = CostBudget(
+        max_estimated_cost=Decimal("0.01"),
+        pricing=pricing,
+        currency="usd",
+        scope="run",
+    )
+    copied = copy_cost_budget(budget)
+
+    assert copied is not None
+    assert copied is not budget
+    assert copied.currency == "USD"
+    assert copied.scope == "run"
+    assert copied.pricing is not budget.pricing
+    assert copied.pricing.prices[0] is not budget.pricing.prices[0]
 
 
 def test_usage_metrics_from_event_payload_rejects_non_usage_payload() -> None:

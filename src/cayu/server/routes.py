@@ -17,6 +17,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
+from cayu.runtime.costs import CostBudget
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
@@ -42,6 +43,7 @@ class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
     limits: RunLimits = Field(default_factory=RunLimits)
+    cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
 
 
@@ -49,6 +51,7 @@ class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
     limits: RunLimits = Field(default_factory=RunLimits)
+    cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
 
 
@@ -64,6 +67,7 @@ class ToolApprovalBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
+    cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
 
 
@@ -78,6 +82,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
+    cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
 
 
@@ -115,6 +120,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
+            cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
         )
 
@@ -138,6 +144,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
+            cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
         )
 
@@ -216,6 +223,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
+            cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
         )
 
@@ -246,6 +254,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
+            cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
         )
 

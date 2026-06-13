@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
 from typing import Any
@@ -61,7 +62,13 @@ from cayu.runtime.context import (
     RuntimeManagedContextPolicy,
     copy_context_messages,
 )
-from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
+from cayu.runtime.costs import (
+    CostBudget,
+    PricingCatalog,
+    SessionCostSummary,
+    copy_cost_budget,
+    estimate_session_cost,
+)
 from cayu.runtime.dispatch import (
     Dispatcher,
     DispatchHandle,
@@ -102,6 +109,7 @@ from cayu.runtime.sessions import (
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopDecision,
+    StopLimit,
     copy_run_limits,
     first_reached_limit,
     has_run_limits,
@@ -462,6 +470,7 @@ class CayuApp:
             messages_to_append=messages,
             max_steps=request.max_steps,
             limits=request.limits,
+            cost_budget=request.cost_budget,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             request_metadata=request.metadata,
             task_id=request.task_id,
@@ -651,6 +660,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
+            cost_budget=request.cost_budget,
             retry_policy=request.retry_policy,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
@@ -771,6 +781,7 @@ class CayuApp:
             messages_to_append=request.messages,
             max_steps=request.max_steps,
             limits=request.limits,
+            cost_budget=request.cost_budget,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             request_metadata=request.metadata,
             task_id=task_id,
@@ -955,6 +966,75 @@ class CayuApp:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
+            if request.decision == ToolApprovalDecision.APPROVE:
+                run_started_at = time.monotonic()
+                limits = copy_run_limits(request.limits)
+                cost_budget = copy_cost_budget(request.cost_budget)
+                run_baseline = (
+                    session_usage_summary(session.id, approval_events)
+                    if limits.scope == "run" and has_run_limits(limits)
+                    else None
+                )
+                cost_baseline = (
+                    estimate_session_cost(
+                        session_id=session.id,
+                        events=approval_events,
+                        pricing=cost_budget.pricing,
+                        currency=cost_budget.currency,
+                    )
+                    if cost_budget is not None and cost_budget.scope == "run"
+                    else None
+                )
+                recorded_tool_outcomes = list(recorded_outcomes.values())
+                pending_tool_calls: list[runtime_records.ToolCallRequest] = []
+                executable_pending_tool_calls = 0
+                for pending_tool_call in approval_support.pending_round_tool_calls(
+                    pending_approval
+                ):
+                    if pending_tool_call.tool_call_id in recorded_outcomes:
+                        continue
+                    tool_call = runtime_records.ToolCallRequest(
+                        id=pending_tool_call.tool_call_id,
+                        name=pending_tool_call.tool_name,
+                        arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+                    )
+                    pending_tool_calls.append(tool_call)
+                    policy_result = approval_support.policy_result_from_pending_tool_call(
+                        pending_tool_call
+                    )
+                    if (
+                        policy_result is not None
+                        and policy_result.decision == ToolPolicyDecision.DENY
+                    ):
+                        continue
+                    executable_pending_tool_calls += 1
+                decision, usage_summary, cost_summary = await self._first_limit_decision(
+                    session=session,
+                    limits=limits,
+                    cost_budget=cost_budget,
+                    run_started_at=run_started_at,
+                    run_baseline=run_baseline,
+                    cost_baseline=cost_baseline,
+                    pending_tool_calls=executable_pending_tool_calls,
+                )
+                if decision is not None:
+                    async for event in self._stop_session_for_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        decision=decision,
+                        usage_summary=usage_summary,
+                        cost_summary=cost_summary,
+                        messages=transcript,
+                        tool_calls=pending_tool_calls,
+                        completed_tool_outcomes=recorded_tool_outcomes,
+                        pending_approval_to_clear=pending_approval,
+                    ):
+                        yield event
+                    pending_approval_cleared = True
+                    return
+
             for pending_tool_call in approval_support.pending_round_tool_calls(pending_approval):
                 tool_call = runtime_records.ToolCallRequest(
                     id=pending_tool_call.tool_call_id,
@@ -1102,6 +1182,7 @@ class CayuApp:
                 messages_to_append=[],
                 max_steps=request.max_steps,
                 limits=request.limits,
+                cost_budget=request.cost_budget,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
@@ -1320,6 +1401,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
+            cost_budget=request.cost_budget,
             retry_policy=request.retry_policy,
         )
         async for event in self._continue_tool_approval_resolution(
@@ -1344,6 +1426,7 @@ class CayuApp:
         messages_to_append: list[Message],
         max_steps: int,
         limits: RunLimits,
+        cost_budget: CostBudget | None,
         retry_policy: RetryPolicy,
         request_metadata: dict[str, Any],
         task_id: str | None,
@@ -1359,11 +1442,25 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None
         run_started_at = time.monotonic()
         limits = copy_run_limits(limits)
+        cost_budget = copy_cost_budget(cost_budget)
         retry_policy = copy_retry_policy(retry_policy)
         run_baseline: SessionUsageSummary | None = None
-        if limits.scope == "run" and has_run_limits(limits):
+        cost_baseline: SessionCostSummary | None = None
+        if (limits.scope == "run" and has_run_limits(limits)) or (
+            cost_budget is not None and cost_budget.scope == "run"
+        ):
             baseline_events = await self.session_store.load_events(session.id)
+        else:
+            baseline_events = []
+        if limits.scope == "run" and has_run_limits(limits):
             run_baseline = session_usage_summary(session.id, baseline_events)
+        if cost_budget is not None and cost_budget.scope == "run":
+            cost_baseline = estimate_session_cost(
+                session_id=session.id,
+                events=baseline_events,
+                pricing=cost_budget.pricing,
+                currency=cost_budget.currency,
+            )
         if current_task is not None:
             active_run = self._register_active_session_task(
                 session.id,
@@ -1403,11 +1500,13 @@ class CayuApp:
             )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
-                decision, usage_summary = await self._first_limit_decision(
+                decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
                     limits=limits,
+                    cost_budget=cost_budget,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
+                    cost_baseline=cost_baseline,
                 )
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
@@ -1417,6 +1516,7 @@ class CayuApp:
                         environment_name=environment_name,
                         decision=decision,
                         usage_summary=usage_summary,
+                        cost_summary=cost_summary,
                         messages=messages,
                         tool_calls=[],
                         completed_tool_outcomes=[],
@@ -1535,11 +1635,13 @@ class CayuApp:
                         [assistant_message],
                     )
 
-                decision, usage_summary = await self._first_limit_decision(
+                decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
                     limits=limits,
+                    cost_budget=cost_budget,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
+                    cost_baseline=cost_baseline,
                     pending_tool_calls=len(tool_calls),
                 )
                 if decision is not None:
@@ -1550,6 +1652,7 @@ class CayuApp:
                         environment_name=environment_name,
                         decision=decision,
                         usage_summary=usage_summary,
+                        cost_summary=cost_summary,
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
@@ -1597,11 +1700,13 @@ class CayuApp:
                             yield event
                     raise
 
-                decision, usage_summary = await self._first_limit_decision(
+                decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
                     limits=limits,
+                    cost_budget=cost_budget,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
+                    cost_baseline=cost_baseline,
                     pending_tool_calls=len(tool_calls),
                 )
                 if decision is not None:
@@ -1612,6 +1717,7 @@ class CayuApp:
                         environment_name=environment_name,
                         decision=decision,
                         usage_summary=usage_summary,
+                        cost_summary=cost_summary,
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
@@ -1686,11 +1792,13 @@ class CayuApp:
                 try:
                     for tool_call in tool_calls:
                         await self._raise_if_session_interrupted(session.id)
-                        decision, usage_summary = await self._first_limit_decision(
+                        decision, usage_summary, cost_summary = await self._first_limit_decision(
                             session=session,
                             limits=limits,
+                            cost_budget=cost_budget,
                             run_started_at=run_started_at,
                             run_baseline=run_baseline,
+                            cost_baseline=cost_baseline,
                             pending_tool_calls=1,
                         )
                         if decision is not None:
@@ -1701,6 +1809,7 @@ class CayuApp:
                                 environment_name=environment_name,
                                 decision=decision,
                                 usage_summary=usage_summary,
+                                cost_summary=cost_summary,
                                 messages=messages,
                                 tool_calls=tool_calls,
                                 completed_tool_outcomes=tool_outcomes,
@@ -2153,12 +2262,14 @@ class CayuApp:
         *,
         session: Session,
         limits: RunLimits,
+        cost_budget: CostBudget | None,
         run_started_at: float,
         run_baseline: SessionUsageSummary | None = None,
+        cost_baseline: SessionCostSummary | None = None,
         pending_tool_calls: int = 0,
-    ) -> tuple[StopDecision | None, SessionUsageSummary]:
-        if not has_run_limits(limits):
-            return None, SessionUsageSummary(session_id=session.id)
+    ) -> tuple[StopDecision | None, SessionUsageSummary, SessionCostSummary | None]:
+        if not has_run_limits(limits) and cost_budget is None:
+            return None, SessionUsageSummary(session_id=session.id), None
         events = await self.session_store.load_events(session.id)
         usage_summary = session_usage_summary(session.id, events)
         usage_for_limits = usage_summary
@@ -2180,7 +2291,26 @@ class CayuApp:
             elapsed_seconds=elapsed_seconds,
             pending_tool_calls=pending_tool_calls,
         )
-        return decision, usage_summary
+        if decision is not None:
+            return decision, usage_summary, None
+
+        cost_summary: SessionCostSummary | None = None
+        if cost_budget is not None:
+            cost_summary = estimate_session_cost(
+                session_id=session.id,
+                events=events,
+                pricing=cost_budget.pricing,
+                currency=cost_budget.currency,
+            )
+            cost_decision = _first_cost_limit_decision(
+                session=session,
+                cost_budget=cost_budget,
+                cost_summary=cost_summary,
+                cost_baseline=cost_baseline,
+            )
+            if cost_decision is not None:
+                return cost_decision, usage_summary, cost_summary
+        return None, usage_summary, cost_summary
 
     async def _stop_session_for_limit_reached(
         self,
@@ -2191,13 +2321,16 @@ class CayuApp:
         environment_name: str | None,
         decision: StopDecision,
         usage_summary: SessionUsageSummary,
+        cost_summary: SessionCostSummary | None,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+        pending_approval_to_clear: PendingToolApproval | None = None,
     ) -> AsyncIterator[Event]:
         limit_payload = _limit_reached_payload(
             decision=decision,
             usage_summary=usage_summary,
+            cost_summary=cost_summary,
         )
         yield await self._emit(
             Event(
@@ -2208,7 +2341,7 @@ class CayuApp:
                 payload=limit_payload,
             )
         )
-        if tool_calls:
+        if tool_calls or completed_tool_outcomes or pending_approval_to_clear is not None:
             async for event in self._close_limited_tool_round(
                 session=session,
                 registered_agent=registered_agent,
@@ -2217,6 +2350,7 @@ class CayuApp:
                 tool_calls=tool_calls,
                 completed_tool_outcomes=completed_tool_outcomes,
                 decision=decision,
+                pending_approval_to_clear=pending_approval_to_clear,
             ):
                 yield event
 
@@ -2253,8 +2387,23 @@ class CayuApp:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         decision: StopDecision,
+        pending_approval_to_clear: PendingToolApproval | None = None,
     ) -> AsyncIterator[Event]:
-        if await self._tool_round_has_result_messages(session.id, tool_calls):
+        expected_tool_calls = [*tool_calls, *(outcome.call for outcome in completed_tool_outcomes)]
+        if await self._tool_round_has_result_messages(session.id, expected_tool_calls):
+            if pending_approval_to_clear is not None:
+                cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(
+                    session.id
+                )
+                await self.session_store.checkpoint(session.id, cleared_checkpoint)
+                yield await self._emit(
+                    approval_support.cleared_event(
+                        session=session,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        approval_id=pending_approval_to_clear.approval_id,
+                    )
+                )
             return
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
         remaining_tool_calls = [
@@ -2278,7 +2427,23 @@ class CayuApp:
             [*completed_tool_outcomes, *skipped_outcomes]
         )
         messages.extend(tool_result_messages)
-        await self.session_store.append_transcript_messages(session.id, tool_result_messages)
+        if pending_approval_to_clear is not None:
+            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(session.id)
+            await self.session_store.append_transcript_messages_and_checkpoint(
+                session.id,
+                tool_result_messages,
+                cleared_checkpoint,
+            )
+            yield await self._emit(
+                approval_support.cleared_event(
+                    session=session,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    approval_id=pending_approval_to_clear.approval_id,
+                )
+            )
+        else:
+            await self.session_store.append_transcript_messages(session.id, tool_result_messages)
 
     async def _policy_plan_for_tool_round(
         self,
@@ -3346,6 +3511,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
+        cost_budget=copy_cost_budget(request.cost_budget),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
     )
 
@@ -3506,15 +3672,104 @@ def _limit_reached_payload(
     *,
     decision: StopDecision,
     usage_summary: SessionUsageSummary,
+    cost_summary: SessionCostSummary | None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "reason": "limit_reached",
         "limit": decision.limit.value,
-        "maximum": decision.maximum,
-        "actual": decision.actual,
+        "maximum": _limit_value_for_payload(decision.maximum),
+        "actual": _limit_value_for_payload(decision.actual),
         "message": decision.message,
         "usage_summary": usage_summary.model_dump(),
     }
+    if cost_summary is not None:
+        payload["cost_summary"] = cost_summary.model_dump(mode="json")
+    return payload
+
+
+def _first_cost_limit_decision(
+    *,
+    session: Session,
+    cost_budget: CostBudget,
+    cost_summary: SessionCostSummary,
+    cost_baseline: SessionCostSummary | None,
+) -> StopDecision | None:
+    if type(session) is not Session:
+        raise TypeError("session must be a Session instance.")
+    if type(cost_budget) is not CostBudget:
+        raise TypeError("cost_budget must be a CostBudget instance.")
+    if type(cost_summary) is not SessionCostSummary:
+        raise TypeError("cost_summary must be a SessionCostSummary.")
+    if cost_baseline is not None and type(cost_baseline) is not SessionCostSummary:
+        raise TypeError("cost_baseline must be a SessionCostSummary.")
+
+    actual_cost = cost_summary.total_cost
+    unpriced_model_steps = cost_summary.unpriced_model_steps
+    if cost_budget.scope == "run" and cost_baseline is not None:
+        actual_cost = max(cost_summary.total_cost - cost_baseline.total_cost, Decimal("0"))
+        unpriced_model_steps = max(
+            cost_summary.unpriced_model_steps - cost_baseline.unpriced_model_steps,
+            0,
+        )
+
+    if unpriced_model_steps > 0 and not cost_budget.allow_unpriced:
+        return StopDecision(
+            limit=StopLimit.ESTIMATED_COST,
+            maximum=cost_budget.max_estimated_cost,
+            actual=actual_cost,
+            message=(
+                "Estimated cost budget cannot be verified because "
+                f"{unpriced_model_steps} model step(s) have no matching pricing."
+            ),
+        )
+    preflight_error = _cost_budget_preflight_error(session=session, cost_budget=cost_budget)
+    if preflight_error is not None:
+        return StopDecision(
+            limit=StopLimit.ESTIMATED_COST,
+            maximum=cost_budget.max_estimated_cost,
+            actual=actual_cost,
+            message=preflight_error,
+        )
+    if actual_cost >= cost_budget.max_estimated_cost:
+        return StopDecision(
+            limit=StopLimit.ESTIMATED_COST,
+            maximum=cost_budget.max_estimated_cost,
+            actual=actual_cost,
+            message=(
+                "Estimated cost budget reached: "
+                f"{actual_cost} >= {cost_budget.max_estimated_cost} {cost_budget.currency}."
+            ),
+        )
+    return None
+
+
+def _cost_budget_preflight_error(*, session: Session, cost_budget: CostBudget) -> str | None:
+    if cost_budget.allow_unpriced:
+        return None
+    price = cost_budget.pricing.match_price(
+        provider_name=session.provider_name,
+        model=session.model,
+    )
+    if price is None:
+        return (
+            "Estimated cost budget cannot be verified because "
+            f"{session.provider_name}/{session.model} has no matching pricing."
+        )
+    if price.currency.upper() != cost_budget.currency.upper():
+        return (
+            "Estimated cost budget cannot be verified because "
+            f"{session.provider_name}/{session.model} pricing currency {price.currency} "
+            f"does not match requested {cost_budget.currency}."
+        )
+    return None
+
+
+def _limit_value_for_payload(value: int | Decimal) -> int | str:
+    if type(value) is Decimal:
+        return str(value)
+    if type(value) is int:
+        return value
+    raise TypeError("limit payload value must be an int or Decimal.")
 
 
 def _limit_reached_tool_round_results(
@@ -3533,8 +3788,8 @@ def _limit_reached_tool_round_results(
                         "skipped": True,
                         "reason": "limit_reached",
                         "limit": decision.limit.value,
-                        "maximum": decision.maximum,
-                        "actual": decision.actual,
+                        "maximum": _limit_value_for_payload(decision.maximum),
+                        "actual": _limit_value_for_payload(decision.actual),
                         "tool_call_id": tool_call.id,
                         "tool_name": tool_call.name,
                     },

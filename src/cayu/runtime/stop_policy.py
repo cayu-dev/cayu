@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu.runtime.usage import SessionUsageSummary
 
@@ -14,6 +15,7 @@ class StopLimit(StrEnum):
     TOTAL_TOKENS = "total_tokens"
     TOOL_CALLS = "tool_calls"
     ELAPSED_SECONDS = "elapsed_seconds"
+    ESTIMATED_COST = "estimated_cost"
 
 
 class RunLimits(BaseModel):
@@ -39,9 +41,16 @@ class StopDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     limit: StopLimit
-    maximum: StrictInt
-    actual: StrictInt
+    maximum: StrictInt | Decimal
+    actual: StrictInt | Decimal
     message: str
+
+    @field_validator("maximum", "actual")
+    @classmethod
+    def validate_numeric_values(cls, value: int | Decimal, info) -> int | Decimal:
+        if type(value) is Decimal and not value.is_finite():
+            raise ValueError(f"{info.field_name} must be finite.")
+        return value
 
 
 def copy_run_limits(limits: RunLimits | None) -> RunLimits:

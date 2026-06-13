@@ -28,10 +28,12 @@ from cayu.runtime.context import (
     trim_context_turns,
 )
 from cayu.runtime.costs import (
+    CostBudget,
     CostLineItem,
     ModelPricing,
     PricingCatalog,
     SessionCostSummary,
+    copy_cost_budget,
     copy_pricing_catalog,
     estimate_session_cost,
 )
@@ -122,6 +124,7 @@ __all__ = [
     "ContextCompactor",
     "ContextPolicy",
     "ContextRequest",
+    "CostBudget",
     "CostLineItem",
     "DefaultContextPolicy",
     "DispatchHandle",
@@ -185,6 +188,7 @@ __all__ = [
     "TranscriptDigestCompactor",
     "UsageMetrics",
     "classify_retryable_error",
+    "copy_cost_budget",
     "copy_dispatch_handle",
     "copy_dispatch_request",
     "copy_pricing_catalog",
