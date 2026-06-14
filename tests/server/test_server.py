@@ -324,6 +324,320 @@ def test_server_session_cost_validates_pricing_body() -> None:
     assert response.status_code == 422
 
 
+def test_server_exposes_paginated_session_events() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_events() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="events_1",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "events_1",
+            [
+                Event(
+                    id="event_1",
+                    type=EventType.SESSION_STARTED,
+                    session_id="events_1",
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_2",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="events_1",
+                    agent_name="assistant",
+                    tool_name="read_file",
+                    payload={"path": "notes/result.txt"},
+                ),
+                Event(
+                    id="event_3",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="events_1",
+                    agent_name="assistant",
+                    payload={"finish_reason": "stop"},
+                ),
+            ],
+        )
+
+    asyncio.run(seed_events())
+
+    client = TestClient(create_server(app))
+
+    first_page = client.get("/api/sessions/events_1/events?limit=2")
+    assert first_page.status_code == 200
+    first_body = first_page.json()
+    assert first_body["session_id"] == "events_1"
+    assert first_body["has_more"] is True
+    assert first_body["next_sequence"] == 2
+    assert [event["id"] for event in first_body["events"]] == ["event_1", "event_2"]
+    assert first_body["events"][1] == {
+        "sequence": 2,
+        "id": "event_2",
+        "type": "tool.call.completed",
+        "session_id": "events_1",
+        "agent_name": "assistant",
+        "environment_name": None,
+        "workflow_name": None,
+        "tool_name": "read_file",
+        "payload": {"path": "notes/result.txt"},
+        "timestamp": first_body["events"][1]["timestamp"],
+    }
+
+    second_page = client.get("/api/sessions/events_1/events?after_sequence=2&limit=2")
+    assert second_page.status_code == 200
+    second_body = second_page.json()
+    assert second_body["has_more"] is False
+    assert second_body["next_sequence"] == 3
+    assert [event["id"] for event in second_body["events"]] == ["event_3"]
+
+
+def test_server_filters_session_events() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_events() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="events_filters",
+                environment_name="local",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "events_filters",
+            [
+                Event(
+                    id="event_filter_1",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="events_filters",
+                    agent_name="assistant",
+                    environment_name="local",
+                    tool_name="read_file",
+                ),
+                Event(
+                    id="event_filter_2",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="events_filters",
+                    agent_name="assistant",
+                    environment_name="local",
+                    tool_name="write_file",
+                ),
+                Event(
+                    id="event_filter_3",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="events_filters",
+                    agent_name="assistant",
+                    environment_name="local",
+                ),
+            ],
+        )
+
+    asyncio.run(seed_events())
+
+    client = TestClient(create_server(app))
+    response = client.get(
+        "/api/sessions/events_filters/events",
+        params={
+            "event_type": "tool.call.completed",
+            "tool_name": "read_file",
+            "environment_name": "local",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_more"] is False
+    assert body["next_sequence"] == 1
+    assert [event["id"] for event in body["events"]] == ["event_filter_1"]
+
+
+def test_server_session_events_returns_404_for_missing_session() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/missing/events")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_server_session_events_validates_query() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="events_validation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(create_session())
+
+    client = TestClient(create_server(app))
+
+    assert client.get("/api/sessions/events_validation/events?limit=0").status_code == 422
+    assert (
+        client.get("/api/sessions/events_validation/events?event_type=not.valid").status_code == 422
+    )
+    assert client.get("/api/sessions/%20/events").status_code == 422
+
+
+def test_server_exposes_paginated_session_transcript() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_transcript() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="transcript_1",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_transcript_messages(
+            "transcript_1",
+            [
+                Message.text("user", "hello"),
+                Message.tool_call(
+                    tool_call_id="call_1",
+                    tool_name="read_file",
+                    arguments={"path": "notes/result.txt"},
+                ),
+                Message.tool_result(
+                    tool_call_id="call_1",
+                    tool_name="read_file",
+                    content="file contents",
+                ),
+                Message.text("assistant", "done"),
+            ],
+        )
+
+    asyncio.run(seed_transcript())
+
+    client = TestClient(create_server(app))
+    first_page = client.get("/api/sessions/transcript_1/transcript?limit=2")
+
+    assert first_page.status_code == 200
+    first_body = first_page.json()
+    assert first_body["session_id"] == "transcript_1"
+    assert first_body["offset"] == 0
+    assert first_body["next_offset"] == 2
+    assert first_body["has_more"] is True
+    assert first_body["total_messages"] == 4
+    assert [message["index"] for message in first_body["messages"]] == [0, 1]
+    assert [message["role"] for message in first_body["messages"]] == ["user", "assistant"]
+    assert first_body["messages"][1]["content"] == [
+        {
+            "type": "tool_call",
+            "tool_call_id": "call_1",
+            "tool_name": "read_file",
+            "arguments": {"path": "notes/result.txt"},
+        }
+    ]
+
+    second_page = client.get("/api/sessions/transcript_1/transcript?offset=2&limit=2")
+    assert second_page.status_code == 200
+    second_body = second_page.json()
+    assert second_body["next_offset"] == 4
+    assert second_body["has_more"] is False
+    assert [message["role"] for message in second_body["messages"]] == ["tool", "assistant"]
+
+
+def test_server_filters_session_transcript_by_role() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_transcript() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="transcript_roles",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_transcript_messages(
+            "transcript_roles",
+            [
+                Message.text("user", "first"),
+                Message.text("assistant", "reply"),
+                Message.text("user", "second"),
+            ],
+        )
+
+    asyncio.run(seed_transcript())
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/transcript_roles/transcript?role=user")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_messages"] == 2
+    assert body["has_more"] is False
+    assert [message["index"] for message in body["messages"]] == [0, 2]
+    assert [message["content"][0]["text"] for message in body["messages"]] == [
+        "first",
+        "second",
+    ]
+
+
+def test_server_session_transcript_returns_404_for_missing_session() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/missing/transcript")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_server_session_transcript_validates_query() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="transcript_validation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(create_session())
+
+    client = TestClient(create_server(app))
+
+    assert client.get("/api/sessions/transcript_validation/transcript?limit=0").status_code == 422
+    assert (
+        client.get("/api/sessions/transcript_validation/transcript?role=invalid").status_code == 422
+    )
+    assert client.get("/api/sessions/%20/transcript").status_code == 422
+
+
 def test_dashboard_routes_fall_back_to_index_without_masking_api_or_assets() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)

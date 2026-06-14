@@ -242,6 +242,19 @@ exact provider payload. If a provider reports usage fields Cayu does not
 understand yet, the event still keeps raw `usage` even when `usage_metrics` is
 absent.
 
+For dashboards, CLIs, and audit views, the optional server exposes paginated
+durable events at `GET /api/sessions/{session_id}/events`. It supports
+`after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,
+`environment_name`, and `workflow_name` query parameters. Responses include each
+event's durable `sequence` plus `has_more` and `next_sequence`, so clients can
+poll or page without loading the full session transcript.
+
+The provider-neutral transcript is exposed separately at
+`GET /api/sessions/{session_id}/transcript`. It supports `offset`, `limit`, and
+`role` filters and returns each message with its zero-based transcript `index`.
+Use events to inspect what happened; use transcript to inspect the conversation
+state Cayu will use for resume, compaction, and provider requests.
+
 Prompt cache configuration is provider-specific. Some providers apply caching
 automatically when a prompt is long and repeated, while others expose explicit
 cache controls, TTLs, or routing hints. Cayu normalizes cache observability, but

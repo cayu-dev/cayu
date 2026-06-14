@@ -25,6 +25,9 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    TranscriptPage,
+    TranscriptQuery,
+    TranscriptRecord,
     _validate_status_set,
     copy_event_query,
     copy_run_request,
@@ -32,6 +35,7 @@ from cayu.runtime.sessions import (
     copy_session_identity,
     copy_session_query,
     copy_transcript_messages,
+    copy_transcript_query,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -210,13 +214,15 @@ class SQLiteSessionStore(SessionStore):
                         """
                         INSERT INTO transcript_messages (
                             session_id,
+                            role,
                             message_json
                         )
-                        VALUES (?, ?)
+                        VALUES (?, ?, ?)
                         """,
                         [
                             (
                                 fork.id,
+                                str(message.role),
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
                             )
                             for message in copied_messages
@@ -635,13 +641,15 @@ class SQLiteSessionStore(SessionStore):
                     """
                     INSERT INTO transcript_messages (
                         session_id,
+                        role,
                         message_json
                     )
-                    VALUES (?, ?)
+                    VALUES (?, ?, ?)
                     """,
                     [
                         (
                             session_id,
+                            str(message.role),
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
                         )
                         for message in copied_messages
@@ -670,13 +678,15 @@ class SQLiteSessionStore(SessionStore):
                         """
                         INSERT INTO transcript_messages (
                             session_id,
+                            role,
                             message_json
                         )
-                        VALUES (?, ?)
+                        VALUES (?, ?, ?)
                         """,
                         [
                             (
                                 session_id,
+                                str(message.role),
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
                             )
                             for message in copied_messages
@@ -712,6 +722,68 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             return [Message(**json.loads(row["message_json"])) for row in rows]
+
+    async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        query = copy_transcript_query(query)
+        role_clause = "WHERE role = ?" if query.role is not None else ""
+        role_params: list[object] = [str(query.role)] if query.role is not None else []
+
+        async with self._lock:
+            if not self._session_exists_unlocked(query.session_id):
+                raise KeyError(f"Session not found: {query.session_id}")
+
+            count_params: list[object] = [query.session_id, *role_params]
+            total_row = self._connection.execute(
+                f"""
+                WITH ordered AS (
+                    SELECT
+                        role,
+                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
+                    FROM transcript_messages
+                    WHERE session_id = ?
+                )
+                SELECT COUNT(*) AS total_records
+                FROM ordered
+                {role_clause}
+                """,
+                count_params,
+            ).fetchone()
+            total_records = int(total_row["total_records"])
+
+            page_params: list[object] = [
+                query.session_id,
+                *role_params,
+                query.limit,
+                query.offset,
+            ]
+            rows = self._connection.execute(
+                f"""
+                WITH ordered AS (
+                    SELECT
+                        role,
+                        message_json,
+                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
+                    FROM transcript_messages
+                    WHERE session_id = ?
+                )
+                SELECT transcript_index, message_json
+                FROM ordered
+                {role_clause}
+                ORDER BY transcript_index ASC
+                LIMIT ? OFFSET ?
+                """,
+                page_params,
+            ).fetchall()
+            return TranscriptPage(
+                records=[
+                    TranscriptRecord(
+                        index=row["transcript_index"],
+                        message=Message(**json.loads(row["message_json"])),
+                    )
+                    for row in rows
+                ],
+                total_records=total_records,
+            )
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

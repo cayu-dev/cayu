@@ -6,11 +6,11 @@ import contextlib
 from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, StringConstraints
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 from sse_starlette.sse import EventSourceResponse
 
-from cayu.core.messages import Message
+from cayu.core.messages import Message, MessageRole
 from cayu.runtime.approvals import (
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
@@ -20,17 +20,22 @@ from cayu.runtime.approvals import (
 from cayu.runtime.costs import CostBudget, PricingCatalog
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
+    EventQuery,
+    EventRecord,
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
     SessionQuery,
     SessionStatus,
+    TranscriptQuery,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+_EVENT_PAGE_LIMIT_MAX = 1000
+_TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
@@ -89,6 +94,30 @@ class ToolApprovalRecoveryBody(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+
+
+def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
+    event = record.event
+    return {
+        "sequence": record.sequence,
+        "id": event.id,
+        "type": str(event.type),
+        "session_id": event.session_id,
+        "agent_name": event.agent_name,
+        "environment_name": event.environment_name,
+        "workflow_name": event.workflow_name,
+        "tool_name": event.tool_name,
+        "payload": event.payload,
+        "timestamp": event.timestamp.isoformat(),
+    }
+
+
+def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any]:
+    return {
+        "index": index,
+        "role": str(message.role),
+        "content": [part.model_dump(mode="json") for part in message.content],
+    }
 
 
 def create_router(
@@ -308,6 +337,83 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump(mode="json")
 
+    @router.get("/sessions/{session_id}/events")
+    async def list_session_events(
+        session_id: NonBlankString,
+        event_type: str | None = None,
+        tool_name: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        workflow_name: str | None = None,
+        after_sequence: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=_EVENT_PAGE_LIMIT_MAX),
+    ):
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        try:
+            query = EventQuery(
+                session_id=session_id,
+                event_type=event_type,
+                tool_name=tool_name,
+                agent_name=agent_name,
+                environment_name=environment_name,
+                workflow_name=workflow_name,
+                after_sequence=after_sequence,
+                limit=limit + 1,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_context=False, include_url=False),
+            ) from exc
+
+        records = await session_store.query_events(query)
+        page = records[:limit]
+        has_more = len(records) > limit
+        next_sequence = page[-1].sequence if page else after_sequence
+
+        return {
+            "session_id": session_id,
+            "events": [_serialize_event_record(record) for record in page],
+            "next_sequence": next_sequence,
+            "has_more": has_more,
+        }
+
+    @router.get("/sessions/{session_id}/transcript")
+    async def get_session_transcript(
+        session_id: NonBlankString,
+        role: MessageRole | None = None,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
+    ):
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        transcript_page = await session_store.query_transcript(
+            TranscriptQuery(
+                session_id=session_id,
+                role=role,
+                offset=offset,
+                limit=limit,
+            )
+        )
+        next_offset = offset + len(transcript_page.records)
+
+        return {
+            "session_id": session_id,
+            "messages": [
+                _serialize_transcript_message(record.index, record.message)
+                for record in transcript_page.records
+            ],
+            "offset": offset,
+            "next_offset": next_offset,
+            "has_more": next_offset < transcript_page.total_records,
+            "total_messages": transcript_page.total_records,
+        }
+
     @router.get("/sessions/{session_id}")
     async def get_session(session_id: str):
         session = await session_store.load(session_id)
@@ -345,7 +451,7 @@ def create_router(
             "transcript": [
                 {
                     "role": str(m.role),
-                    "content": [p.model_dump() for p in m.content],
+                    "content": [p.model_dump(mode="json") for p in m.content],
                 }
                 for m in transcript
             ],

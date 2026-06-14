@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
-from cayu.core.messages import Message, copy_message
+from cayu.core.messages import Message, MessageRole, copy_message
 from cayu.runtime.costs import CostBudget, copy_cost_budget
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -318,6 +318,46 @@ class EventQuery(BaseModel):
         return Event(type=value, session_id="query").type
 
 
+class TranscriptRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: StrictInt = Field(ge=0)
+    message: Message
+
+    @field_validator("message")
+    @classmethod
+    def copy_message(cls, value: Message) -> Message:
+        return copy_message(value)
+
+
+class TranscriptPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[TranscriptRecord] = Field(default_factory=list)
+    total_records: StrictInt = Field(ge=0)
+
+
+class TranscriptQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    role: MessageRole | str | None = None
+    offset: StrictInt = Field(default=0, ge=0)
+    limit: StrictInt = Field(default=100, ge=1, le=5000)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "session_id")
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: MessageRole | str | None) -> MessageRole | None:
+        if value is None:
+            return None
+        return MessageRole(value)
+
+
 class SessionStore(ABC):
     """Persistent store for sessions and append-only events."""
 
@@ -415,6 +455,10 @@ class SessionStore(ABC):
     @abstractmethod
     async def load_transcript(self, session_id: str) -> list[Message]:
         """Load provider-neutral transcript messages for a session."""
+
+    @abstractmethod
+    async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        """Query provider-neutral transcript messages with stable message indexes."""
 
     @abstractmethod
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
@@ -767,6 +811,26 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             return [copy_message(message) for message in self._transcripts.get(session_id, [])]
 
+    async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
+        query = copy_transcript_query(query)
+        async with self._lock:
+            if query.session_id not in self._sessions:
+                raise KeyError(f"Session not found: {query.session_id}")
+
+            indexed_messages = list(enumerate(self._transcripts.get(query.session_id, [])))
+            if query.role is not None:
+                indexed_messages = [
+                    (index, message)
+                    for index, message in indexed_messages
+                    if message.role == query.role
+                ]
+
+            page = indexed_messages[query.offset : query.offset + query.limit]
+            return TranscriptPage(
+                records=[TranscriptRecord(index=index, message=message) for index, message in page],
+                total_records=len(indexed_messages),
+            )
+
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
@@ -931,6 +995,17 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         workflow_name=query.workflow_name,
         tool_name=query.tool_name,
         after_sequence=query.after_sequence,
+        limit=query.limit,
+    )
+
+
+def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:
+    if type(query) is not TranscriptQuery:
+        raise TypeError("Transcript queries must be TranscriptQuery instances.")
+    return TranscriptQuery(
+        session_id=query.session_id,
+        role=query.role,
+        offset=query.offset,
         limit=query.limit,
     )
 

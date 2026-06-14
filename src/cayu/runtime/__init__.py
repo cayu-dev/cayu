@@ -77,6 +77,9 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    TranscriptPage,
+    TranscriptQuery,
+    TranscriptRecord,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -186,6 +189,9 @@ __all__ = [
     "ToolPolicyRequest",
     "ToolPolicyResult",
     "TranscriptDigestCompactor",
+    "TranscriptPage",
+    "TranscriptQuery",
+    "TranscriptRecord",
     "UsageMetrics",
     "classify_retryable_error",
     "copy_cost_budget",

@@ -22,6 +22,7 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
 )
+from cayu.storage import _sqlite_support
 
 
 class FakeProvider(ModelProvider):
@@ -761,7 +762,7 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
     finally:
         connection.close()
 
-    assert version == 5
+    assert version == _sqlite_support.SCHEMA_VERSION
 
 
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):

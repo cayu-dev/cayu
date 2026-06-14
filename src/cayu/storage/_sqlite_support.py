@@ -17,7 +17,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -91,6 +91,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS transcript_messages (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
                 message_json TEXT NOT NULL
             );
 
@@ -133,6 +134,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
                 ON events(tool_name);
             CREATE INDEX IF NOT EXISTS idx_transcript_messages_session_sequence
                 ON transcript_messages(session_id, sequence);
+            CREATE INDEX IF NOT EXISTS idx_transcript_messages_session_role_sequence
+                ON transcript_messages(session_id, role, sequence);
             CREATE INDEX IF NOT EXISTS idx_tasks_status
                 ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_type

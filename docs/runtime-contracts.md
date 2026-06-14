@@ -110,6 +110,23 @@ Session stores expose two read surfaces:
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
 
+The optional FastAPI server exposes the same event query surface at
+`GET /api/sessions/{session_id}/events`. The endpoint validates the session,
+accepts `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,
+`environment_name`, and `workflow_name` filters, and returns durable event
+records with `sequence`, `has_more`, and `next_sequence`. Clients should use
+this endpoint for timelines, logs, replay panes, and polling instead of fetching
+the full session when they only need events.
+
+The optional server also exposes `GET /api/sessions/{session_id}/transcript`
+for paginated transcript inspection. It accepts `offset`, `limit`, and `role`
+filters and returns provider-neutral messages with their zero-based transcript
+`index`. Transcript pagination is intentionally offset-based because the current
+transcript store is append-only per session and compaction/resume already reason
+about transcript positions as message counts. Events remain the source of truth
+for execution chronology; transcript messages are the provider-neutral
+conversation state used by resume, context policy, and compaction.
+
 Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted. Terminal tool events must be durable before approval retry can safely skip execution. `append_transcript_messages_and_checkpoint(...)` must also be atomic: it is the boundary used when closing an interrupted tool-approval round, where the transcript cannot be updated independently from the checkpoint.
 
 ## TaskStore

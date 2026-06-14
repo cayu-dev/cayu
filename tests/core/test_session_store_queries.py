@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import pytest
 
-from cayu import EventQuery, SessionOrder, SessionQuery, SQLiteSessionStore
+from cayu import EventQuery, SessionOrder, SessionQuery, SQLiteSessionStore, TranscriptQuery
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     InMemorySessionStore,
@@ -259,6 +259,34 @@ def test_session_stores_append_and_load_transcript_messages(
         loaded_again = await store.load_transcript("sess_transcript")
         assert loaded_again[0].content[0].text == "build"
 
+        transcript_page = await store.query_transcript(
+            TranscriptQuery(
+                session_id="sess_transcript",
+                offset=1,
+                limit=1,
+            )
+        )
+        assert transcript_page.total_records == 3
+        assert [record.index for record in transcript_page.records] == [1]
+        assert transcript_page.records[0].message.content[0].tool_name == "read_file"
+
+        user_page = await store.query_transcript(
+            TranscriptQuery(
+                session_id="sess_transcript",
+                role="user",
+                limit=10,
+            )
+        )
+        assert user_page.total_records == 1
+        assert [record.index for record in user_page.records] == [0]
+        assert user_page.records[0].message.content[0].text == "build"
+
+        user_page.records[0].message.content[0].text = "changed after query"
+        user_page_again = await store.query_transcript(
+            TranscriptQuery(session_id="sess_transcript", role="user")
+        )
+        assert user_page_again.records[0].message.content[0].text == "build"
+
         with pytest.raises(KeyError, match="Session not found"):
             await store.append_transcript_messages(
                 "missing_session",
@@ -266,6 +294,8 @@ def test_session_stores_append_and_load_transcript_messages(
             )
         with pytest.raises(KeyError, match="Session not found"):
             await store.load_transcript("missing_session")
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.query_transcript(TranscriptQuery(session_id="missing_session"))
 
         await _close_store(store)
 
