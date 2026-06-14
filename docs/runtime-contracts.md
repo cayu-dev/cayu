@@ -251,6 +251,12 @@ operators can see estimation gaps instead of silently treating them as free. If
 cache read/write prices are omitted, the estimator falls back to the configured
 input-token price for those counters.
 
+The optional FastAPI server exposes the same estimator at
+`POST /api/sessions/{session_id}/cost`. The request body supplies a
+`PricingCatalog` and optional `currency`; the response is the JSON form of
+`SessionCostSummary`, with decimal cost values serialized as strings for stable
+API output.
+
 Cost estimation is observability, not billing authority. Provider invoices,
 rounding, regional pricing, provider-side discounts, or account-specific terms
 can differ from a caller's pricing table. Cost stop policies should build on

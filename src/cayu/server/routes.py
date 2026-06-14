@@ -17,7 +17,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
-from cayu.runtime.costs import CostBudget
+from cayu.runtime.costs import CostBudget, PricingCatalog
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
@@ -58,6 +58,11 @@ class ResumeBody(BaseModel):
 class InterruptSessionBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionCostBody(BaseModel):
+    pricing: PricingCatalog
+    currency: NonBlankString = "USD"
 
 
 class ToolApprovalBody(BaseModel):
@@ -290,6 +295,18 @@ def create_router(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump()
+
+    @router.post("/sessions/{session_id}/cost")
+    async def estimate_session_cost(session_id: NonBlankString, body: SessionCostBody):
+        try:
+            summary = await cayu_app.get_session_cost(
+                session_id,
+                body.pricing,
+                currency=body.currency,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        return summary.model_dump(mode="json")
 
     @router.get("/sessions/{session_id}")
     async def get_session(session_id: str):

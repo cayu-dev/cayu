@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from cayu import (
@@ -15,7 +16,9 @@ from cayu import (
     LocalRunner,
     LocalWorkspace,
     Message,
+    ModelPricing,
     OpenAIProvider,
+    PricingCatalog,
     ReadFileTool,
     RunRequest,
     WriteFileTool,
@@ -92,6 +95,33 @@ async def main() -> None:
         )
 
     print("workspace_files", list((await workspace.list("**/*")).paths))
+    usage = await app.get_session_usage("demo_openai_local_tools")
+    print("usage_input_tokens", usage.usage.input_tokens)
+    print("usage_output_tokens", usage.usage.output_tokens)
+    print("usage_cache_read_tokens", usage.usage.cache.read_tokens)
+    print("usage_cache_write_tokens", usage.usage.cache.write_tokens)
+    print("usage_cached_input_tokens", usage.usage.cache.cached_input_tokens)
+
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model=os.environ.get("CAYU_OPENAI_PRICING_MODEL_PREFIX", model),
+                match="prefix",
+                input_per_million=Decimal(os.environ.get("CAYU_OPENAI_INPUT_PER_MILLION", "0")),
+                output_per_million=Decimal(os.environ.get("CAYU_OPENAI_OUTPUT_PER_MILLION", "0")),
+                cache_read_input_per_million=Decimal(
+                    os.environ.get("CAYU_OPENAI_CACHE_READ_INPUT_PER_MILLION", "0")
+                ),
+                cache_write_input_per_million=Decimal(
+                    os.environ.get("CAYU_OPENAI_CACHE_WRITE_INPUT_PER_MILLION", "0")
+                ),
+            ),
+        )
+    )
+    cost = await app.get_session_cost("demo_openai_local_tools", pricing)
+    print("estimated_cost", cost.total_cost)
+    print("estimated_cost_unpriced_model_steps", cost.unpriced_model_steps)
 
 
 if __name__ == "__main__":

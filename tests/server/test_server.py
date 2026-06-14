@@ -166,6 +166,164 @@ def test_server_session_usage_rejects_blank_session_id() -> None:
     assert response.status_code == 422
 
 
+def test_server_exposes_session_cost_estimate() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="cost_1",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/cost_1/cost",
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_per_million": "1",
+                        "output_per_million": "2",
+                        "cache_read_input_per_million": "0.25",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": "cost_1",
+        "currency": "USD",
+        "model_steps": 1,
+        "priced_model_steps": 1,
+        "unpriced_model_steps": 0,
+        "total_cost": "0.000010",
+        "line_items": [
+            {
+                "model_step": 1,
+                "provider_name": "fake",
+                "model": "fake-model",
+                "pricing_provider_name": "fake",
+                "pricing_model": "fake-model",
+                "pricing_match": "exact",
+                "priced": True,
+                "currency": "USD",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "uncached_input_tokens": 6,
+                "input_cost": "0.000006",
+                "output_cost": "0.000004",
+                "cache_read_input_cost": "0.00",
+                "cache_write_input_cost": "0",
+                "total_cost": "0.000010",
+                "missing_pricing_reason": None,
+            }
+        ],
+    }
+
+
+def test_server_session_cost_reports_unpriced_steps() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="cost_unpriced",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/cost_unpriced/cost",
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "other-provider",
+                        "model": "other-model",
+                        "input_per_million": "1",
+                        "output_per_million": "1",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_cost"] == "0"
+    assert body["priced_model_steps"] == 0
+    assert body["unpriced_model_steps"] == 1
+    assert body["line_items"][0]["missing_pricing_reason"] == "no matching model pricing"
+
+
+def test_server_session_cost_returns_404_for_missing_session() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/missing/cost",
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_per_million": "1",
+                        "output_per_million": "1",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_server_session_cost_validates_pricing_body() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/session_1/cost",
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_per_million": "-1",
+                        "output_per_million": "1",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_dashboard_routes_fall_back_to_index_without_masking_api_or_assets() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)

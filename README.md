@@ -318,6 +318,45 @@ are omitted, Cayu falls back to the normal input-token price for those counters;
 provide explicit cache prices when your provider or account charges them
 differently.
 
+The optional server exposes the same estimate at
+`POST /api/sessions/{session_id}/cost`. The request body supplies the pricing
+catalog because Cayu does not hardcode provider prices:
+
+```json
+{
+  "pricing": {
+    "prices": [
+      {
+        "provider_name": "openai",
+        "model": "gpt-5.5",
+        "match": "prefix",
+        "input_per_million": "2.00",
+        "output_per_million": "8.00",
+        "cache_read_input_per_million": "0.50"
+      }
+    ]
+  }
+}
+```
+
+Run `examples/usage_cost_summary.py` for a deterministic local example that
+prints normalized usage, cache counters, and estimated cost without calling a
+real provider API.
+
+The live OpenAI tools example also prints normalized usage/cache counters and an
+estimated cost after the run:
+
+```bash
+OPENAI_API_KEY=... \
+CAYU_OPENAI_INPUT_PER_MILLION=2.00 \
+CAYU_OPENAI_OUTPUT_PER_MILLION=8.00 \
+CAYU_OPENAI_CACHE_READ_INPUT_PER_MILLION=0.50 \
+PYTHONPATH=src python examples/openai_local_tools.py
+```
+
+Those environment variables are example pricing inputs only. Use prices from
+your own provider account and deployment.
+
 Set hard run limits with `RunLimits` and estimated-cost budgets with
 `CostBudget` on `RunRequest`, `ResumeRequest`, `DispatchRequest`, or
 tool-approval continuation requests:
