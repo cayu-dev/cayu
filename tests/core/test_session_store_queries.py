@@ -220,6 +220,298 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_summarize_outcome_from_terminal_and_retry_events(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_outcome",
+                messages=[Message.text("user", "retry then stop")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_outcome", SessionStatus.INTERRUPTED)
+        await store.append_events(
+            "sess_outcome",
+            [
+                Event(
+                    id="event_retry",
+                    type=EventType.MODEL_RETRY,
+                    session_id="sess_outcome",
+                    payload={
+                        "provider": "fake",
+                        "model": "fake-model",
+                        "step": 1,
+                        "attempt": 1,
+                        "next_attempt": 2,
+                        "max_attempts": 2,
+                        "reason": "http_status",
+                        "status_code": 429,
+                        "delay_seconds": 0.0,
+                        "error": "rate limited",
+                    },
+                ),
+                Event(
+                    id="event_interrupted",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="sess_outcome",
+                    payload={
+                        "interruption_type": "limit_reached",
+                        "limit": "total_tokens",
+                        "actual": 12,
+                        "maximum": 10,
+                        "message": "Run limit reached.",
+                    },
+                ),
+                Event(
+                    id="event_hook_after_terminal",
+                    type=EventType.HOOK_COMPLETED,
+                    session_id="sess_outcome",
+                    payload={"hook": "after_session_interrupted"},
+                ),
+            ],
+        )
+
+        outcome = await store.summarize_outcome("sess_outcome")
+
+        assert outcome.status == SessionStatus.INTERRUPTED
+        assert outcome.reason == "limit_reached"
+        assert outcome.details == {
+            "interruption_type": "limit_reached",
+            "limit": "total_tokens",
+            "maximum": 10,
+            "actual": 12,
+            "message": "Run limit reached.",
+        }
+        assert outcome.retry == {
+            "provider": "fake",
+            "model": "fake-model",
+            "step": 1,
+            "attempt": 1,
+            "next_attempt": 2,
+            "max_attempts": 2,
+            "delay_seconds": 0.0,
+            "reason": "http_status",
+            "status_code": 429,
+        }
+        assert outcome.terminal_event is not None
+        assert outcome.terminal_event.event.id == "event_interrupted"
+        assert outcome.latest_retry_event is not None
+        assert outcome.latest_retry_event.event.id == "event_retry"
+
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.summarize_outcome("missing_session")
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_summarize_outcome_prefers_current_active_status(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resumed_running",
+                messages=[Message.text("user", "first")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_resumed_running", SessionStatus.COMPLETED)
+        await store.append_event(
+            "sess_resumed_running",
+            Event(
+                id="event_completed_before_resume",
+                type=EventType.SESSION_COMPLETED,
+                session_id="sess_resumed_running",
+            ),
+        )
+        await store.update_status("sess_resumed_running", SessionStatus.RUNNING)
+
+        outcome = await store.summarize_outcome("sess_resumed_running")
+
+        assert outcome.status == SessionStatus.RUNNING
+        assert outcome.reason == "running"
+        assert outcome.details == {}
+        assert outcome.terminal_event is None
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_summarize_outcome_ignores_mismatched_terminal_event(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_mismatch",
+                messages=[Message.text("user", "first")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_terminal_mismatch", SessionStatus.COMPLETED)
+        await store.append_event(
+            "sess_terminal_mismatch",
+            Event(
+                id="event_completed_before_failed_status",
+                type=EventType.SESSION_COMPLETED,
+                session_id="sess_terminal_mismatch",
+            ),
+        )
+        await store.update_status("sess_terminal_mismatch", SessionStatus.FAILED)
+
+        outcome = await store.summarize_outcome("sess_terminal_mismatch")
+
+        assert outcome.status == SessionStatus.FAILED
+        assert outcome.reason == "failed"
+        assert outcome.details == {}
+        assert outcome.terminal_event is None
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_summarize_outcome_scopes_retry_to_latest_lifecycle(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_then_clean_resume",
+                messages=[Message.text("user", "first")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_retry_then_clean_resume", SessionStatus.COMPLETED)
+        await store.append_events(
+            "sess_retry_then_clean_resume",
+            [
+                Event(
+                    id="event_started",
+                    type=EventType.SESSION_STARTED,
+                    session_id="sess_retry_then_clean_resume",
+                ),
+                Event(
+                    id="event_retry_old",
+                    type=EventType.MODEL_RETRY,
+                    session_id="sess_retry_then_clean_resume",
+                    payload={
+                        "provider": "fake",
+                        "model": "fake-model",
+                        "step": 1,
+                        "attempt": 1,
+                        "next_attempt": 2,
+                        "max_attempts": 2,
+                        "reason": "timeout",
+                        "delay_seconds": 0.0,
+                    },
+                ),
+                Event(
+                    id="event_completed_first",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="sess_retry_then_clean_resume",
+                ),
+                Event(
+                    id="event_resumed",
+                    type=EventType.SESSION_RESUMED,
+                    session_id="sess_retry_then_clean_resume",
+                ),
+                Event(
+                    id="event_completed_after_clean_resume",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="sess_retry_then_clean_resume",
+                ),
+            ],
+        )
+
+        outcome = await store.summarize_outcome("sess_retry_then_clean_resume")
+
+        assert outcome.status == SessionStatus.COMPLETED
+        assert outcome.reason == "completed"
+        assert outcome.retry is None
+        assert outcome.latest_retry_event is None
+        assert outcome.terminal_event is not None
+        assert outcome.terminal_event.event.id == "event_completed_after_clean_resume"
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_summarize_outcome_scopes_terminal_to_latest_lifecycle(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_then_resume",
+                messages=[Message.text("user", "first")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_terminal_then_resume", SessionStatus.COMPLETED)
+        await store.append_events(
+            "sess_terminal_then_resume",
+            [
+                Event(
+                    id="event_started",
+                    type=EventType.SESSION_STARTED,
+                    session_id="sess_terminal_then_resume",
+                ),
+                Event(
+                    id="event_completed_before_resume",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="sess_terminal_then_resume",
+                ),
+                Event(
+                    id="event_resumed",
+                    type=EventType.SESSION_RESUMED,
+                    session_id="sess_terminal_then_resume",
+                ),
+            ],
+        )
+
+        outcome = await store.summarize_outcome("sess_terminal_then_resume")
+
+        assert outcome.status == SessionStatus.COMPLETED
+        assert outcome.reason == "completed"
+        assert outcome.details == {}
+        assert outcome.terminal_event is None
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_append_and_load_transcript_messages(
     store_factory: StoreFactory,
     tmp_path,

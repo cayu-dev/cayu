@@ -25,6 +25,7 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
+    SessionOutcome,
     SessionQuery,
     SessionStatus,
     TranscriptQuery,
@@ -109,6 +110,26 @@ def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
         "tool_name": event.tool_name,
         "payload": event.payload,
         "timestamp": event.timestamp.isoformat(),
+    }
+
+
+def _serialize_session_outcome(outcome: SessionOutcome) -> dict[str, Any]:
+    return {
+        "session_id": outcome.session_id,
+        "status": outcome.status.value,
+        "reason": outcome.reason,
+        "details": outcome.details,
+        "retry": outcome.retry,
+        "terminal_event": (
+            None
+            if outcome.terminal_event is None
+            else _serialize_event_record(outcome.terminal_event)
+        ),
+        "latest_retry_event": (
+            None
+            if outcome.latest_retry_event is None
+            else _serialize_event_record(outcome.latest_retry_event)
+        ),
     }
 
 
@@ -344,6 +365,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found")
 
         event_summary = await session_store.summarize_events(session_id)
+        outcome = await session_store.summarize_outcome(session_id)
         transcript_page = await session_store.query_transcript(
             TranscriptQuery(session_id=session_id, limit=1)
         )
@@ -376,6 +398,7 @@ def create_router(
             "transcript": {
                 "total_messages": transcript_page.total_records,
             },
+            "outcome": _serialize_session_outcome(outcome),
             "usage": usage_summary.model_dump(),
         }
 

@@ -23,6 +23,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionOutcome,
     SessionQuery,
     SessionStatus,
     SessionStore,
@@ -37,6 +38,7 @@ from cayu.runtime.sessions import (
     copy_session_query,
     copy_transcript_messages,
     copy_transcript_query,
+    session_outcome,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -50,6 +52,15 @@ from cayu.runtime.tasks import (
     copy_task_query,
 )
 from cayu.storage import _sqlite_support as sqlite_support
+
+
+def _event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
+    if row is None:
+        return None
+    return EventRecord(
+        sequence=row["sequence"],
+        event=Event(**json.loads(row["event_json"])),
+    )
 
 
 class SQLiteSessionStore(SessionStore):
@@ -634,6 +645,60 @@ class SQLiteSessionStore(SessionStore):
                         event=Event(**json.loads(latest_row["event_json"])),
                     )
                 ),
+            )
+
+    async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._load_unlocked(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+            terminal_row = self._connection.execute(
+                """
+                SELECT sequence, event_json
+                FROM events
+                WHERE session_id = ?
+                  AND event_type IN ('session.completed', 'session.failed', 'session.interrupted')
+                  AND sequence > COALESCE(
+                      (
+                          SELECT MAX(sequence)
+                          FROM events
+                          WHERE session_id = ?
+                            AND event_type IN ('session.started', 'session.resumed')
+                      ),
+                      0
+                  )
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (session_id, session_id),
+            ).fetchone()
+            retry_row = self._connection.execute(
+                """
+                SELECT sequence, event_json
+                FROM events
+                WHERE session_id = ?
+                  AND event_type = 'model.retry'
+                  AND sequence > COALESCE(
+                      (
+                          SELECT MAX(sequence)
+                          FROM events
+                          WHERE session_id = ?
+                            AND event_type IN ('session.started', 'session.resumed')
+                      ),
+                      0
+                  )
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (session_id, session_id),
+            ).fetchone()
+
+            return session_outcome(
+                session,
+                terminal_event=_event_record_from_row(terminal_row),
+                latest_retry_event=_event_record_from_row(retry_row),
             )
 
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:

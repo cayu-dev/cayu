@@ -293,6 +293,41 @@ class EventSummary(BaseModel):
         return require_clean_nonblank(value, "session_id")
 
 
+class SessionOutcome(BaseModel):
+    """Derived reason for the current session state.
+
+    The outcome is computed from durable events. It is intentionally not stored
+    as separate state so event replay remains the source of truth.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    status: SessionStatus
+    reason: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    retry: dict[str, Any] | None = None
+    terminal_event: EventRecord | None = None
+    latest_retry_event: EventRecord | None = None
+
+    @field_validator("session_id", "reason")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("details", mode="before")
+    @classmethod
+    def copy_details(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "details")
+
+    @field_validator("retry", mode="before")
+    @classmethod
+    def copy_retry(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return copy_json_value(value, "retry")
+
+
 class EventQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -448,6 +483,10 @@ class SessionStore(ABC):
     @abstractmethod
     async def summarize_events(self, session_id: str) -> EventSummary:
         """Summarize stored events for one session without loading every event."""
+
+    @abstractmethod
+    async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        """Derive the current session outcome from durable events."""
 
     @abstractmethod
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
@@ -811,6 +850,47 @@ class InMemorySessionStore(SessionStore):
                 ),
             )
 
+    async def summarize_outcome(self, session_id: str) -> SessionOutcome:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+            latest_lifecycle_sequence = 0
+            for record in reversed(self._event_records):
+                if record.event.session_id != session_id:
+                    continue
+                if _is_outcome_lifecycle_event(record.event):
+                    latest_lifecycle_sequence = record.sequence
+                    break
+
+            terminal_record: EventRecord | None = None
+            for record in reversed(self._event_records):
+                if record.event.session_id != session_id:
+                    continue
+                if record.sequence <= latest_lifecycle_sequence:
+                    break
+                if _is_outcome_terminal_event(record.event):
+                    terminal_record = record
+                    break
+
+            retry_record: EventRecord | None = None
+            for record in reversed(self._event_records):
+                if record.event.session_id != session_id:
+                    continue
+                if record.sequence <= latest_lifecycle_sequence:
+                    break
+                if record.event.type == EventType.MODEL_RETRY:
+                    retry_record = record
+                    break
+
+            return session_outcome(
+                session,
+                terminal_event=terminal_record,
+                latest_retry_event=retry_record,
+            )
+
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
         query = copy_session_query(query)
         async with self._lock:
@@ -900,6 +980,149 @@ class InMemorySessionStore(SessionStore):
 
 def _validate_event(event: Event) -> Event:
     return copy_event(event)
+
+
+def session_outcome(
+    session: Session,
+    *,
+    terminal_event: EventRecord | None,
+    latest_retry_event: EventRecord | None,
+) -> SessionOutcome:
+    session = copy_session(session)
+    terminal_event = _copy_event_record(terminal_event)
+    latest_retry_event = _copy_event_record(latest_retry_event)
+    if not _terminal_event_matches_status(session, terminal_event):
+        terminal_event = None
+    reason, details = _outcome_reason_and_details(session, terminal_event)
+    return SessionOutcome(
+        session_id=session.id,
+        status=session.status,
+        reason=reason,
+        details=details,
+        retry=_retry_details(latest_retry_event),
+        terminal_event=terminal_event,
+        latest_retry_event=latest_retry_event,
+    )
+
+
+def _is_outcome_terminal_event(event: Event) -> bool:
+    return event.type in {
+        EventType.SESSION_COMPLETED,
+        EventType.SESSION_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    }
+
+
+def _is_outcome_lifecycle_event(event: Event) -> bool:
+    return event.type in {
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+    }
+
+
+def _outcome_reason_and_details(
+    session: Session,
+    terminal_event: EventRecord | None,
+) -> tuple[str, dict[str, Any]]:
+    if session.status not in _OUTCOME_TERMINAL_STATUSES:
+        return session.status.value, {}
+    if terminal_event is None:
+        return session.status.value, {}
+
+    event = terminal_event.event
+    if event.type != _OUTCOME_EVENT_TYPE_BY_STATUS[session.status]:
+        return session.status.value, {}
+
+    payload = event.payload
+    if event.type == EventType.SESSION_COMPLETED:
+        return "completed", {}
+    if event.type == EventType.SESSION_FAILED:
+        return "failed", _copy_payload_fields(payload, ("error", "error_type"))
+    if event.type == EventType.SESSION_INTERRUPTED:
+        reason = _optional_payload_string(payload, "interruption_type") or "interrupted"
+        details = _copy_payload_fields(
+            payload,
+            (
+                "interruption_type",
+                "reason",
+                "limit",
+                "maximum",
+                "actual",
+                "message",
+                "error",
+                "error_type",
+                "manual_recovery_required",
+                "tool_call_id",
+                "tool_name",
+            ),
+        )
+        return reason, details
+    return session.status.value, {}
+
+
+def _terminal_event_matches_status(
+    session: Session,
+    terminal_event: EventRecord | None,
+) -> bool:
+    if terminal_event is None:
+        return False
+    expected_event_type = _OUTCOME_EVENT_TYPE_BY_STATUS.get(session.status)
+    if expected_event_type is None:
+        return False
+    return terminal_event.event.type == expected_event_type
+
+
+def _retry_details(latest_retry_event: EventRecord | None) -> dict[str, Any] | None:
+    if latest_retry_event is None:
+        return None
+    return _copy_payload_fields(
+        latest_retry_event.event.payload,
+        (
+            "provider",
+            "model",
+            "step",
+            "attempt",
+            "next_attempt",
+            "max_attempts",
+            "delay_seconds",
+            "reason",
+            "status_code",
+        ),
+    )
+
+
+def _copy_event_record(record: EventRecord | None) -> EventRecord | None:
+    if record is None:
+        return None
+    return EventRecord(sequence=record.sequence, event=record.event)
+
+
+def _copy_payload_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for field in fields:
+        if field in payload and payload[field] is not None:
+            copied[field] = copy_json_value(payload[field], field)
+    return copied
+
+
+def _optional_payload_string(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    if type(value) is str and value.strip():
+        return value
+    return None
+
+
+_OUTCOME_TERMINAL_STATUSES = {
+    SessionStatus.COMPLETED,
+    SessionStatus.FAILED,
+    SessionStatus.INTERRUPTED,
+}
+
+_OUTCOME_EVENT_TYPE_BY_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
 
 
 def copy_transcript_messages(messages: list[Message]) -> list[Message]:

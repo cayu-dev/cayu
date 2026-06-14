@@ -360,6 +360,13 @@ def test_server_exposes_session_summary() -> None:
     }
     assert body["events"]["latest_event"]["type"] == "session.completed"
     assert body["transcript"] == {"total_messages": 2}
+    assert body["outcome"]["session_id"] == "summary_1"
+    assert body["outcome"]["status"] == "completed"
+    assert body["outcome"]["reason"] == "completed"
+    assert body["outcome"]["details"] == {}
+    assert body["outcome"]["retry"] is None
+    assert body["outcome"]["terminal_event"]["type"] == "session.completed"
+    assert body["outcome"]["latest_retry_event"] is None
     assert body["usage"] == {
         "session_id": "summary_1",
         "model_steps": 1,
@@ -381,6 +388,99 @@ def test_server_exposes_session_summary() -> None:
             },
         },
     }
+
+
+def test_server_session_summary_exposes_interrupted_outcome_and_retry() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="summary_interrupted",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(
+                provider_name="fake",
+                model="fake-model",
+                runtime_name="cayu",
+                runtime_version=None,
+            ),
+        )
+        await app.session_store.update_status(
+            "summary_interrupted",
+            SessionStatus.INTERRUPTED,
+        )
+        await app.session_store.append_events(
+            "summary_interrupted",
+            [
+                Event(
+                    id="summary_retry",
+                    type=EventType.MODEL_RETRY,
+                    session_id="summary_interrupted",
+                    payload={
+                        "provider": "fake",
+                        "model": "fake-model",
+                        "step": 1,
+                        "attempt": 1,
+                        "next_attempt": 2,
+                        "max_attempts": 2,
+                        "reason": "timeout",
+                        "delay_seconds": 0.0,
+                        "error": "stream idle timeout",
+                    },
+                ),
+                Event(
+                    id="summary_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="summary_interrupted",
+                    payload={
+                        "interruption_type": "limit_reached",
+                        "limit": "total_tokens",
+                        "actual": 12,
+                        "maximum": 10,
+                        "message": "Run limit reached.",
+                    },
+                ),
+                Event(
+                    id="summary_hook",
+                    type=EventType.HOOK_COMPLETED,
+                    session_id="summary_interrupted",
+                    payload={"hook": "after_session_interrupted"},
+                ),
+            ],
+        )
+
+    asyncio.run(seed())
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/summary_interrupted/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    outcome = body["outcome"]
+    assert outcome["status"] == "interrupted"
+    assert outcome["reason"] == "limit_reached"
+    assert outcome["details"] == {
+        "interruption_type": "limit_reached",
+        "limit": "total_tokens",
+        "maximum": 10,
+        "actual": 12,
+        "message": "Run limit reached.",
+    }
+    assert outcome["retry"] == {
+        "provider": "fake",
+        "model": "fake-model",
+        "step": 1,
+        "attempt": 1,
+        "next_attempt": 2,
+        "max_attempts": 2,
+        "delay_seconds": 0.0,
+        "reason": "timeout",
+    }
+    assert outcome["terminal_event"]["id"] == "summary_terminal"
+    assert outcome["latest_retry_event"]["id"] == "summary_retry"
+    assert body["events"]["latest_event"]["id"] == "summary_hook"
 
 
 def test_server_session_summary_returns_404_for_missing_session() -> None:

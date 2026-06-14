@@ -258,7 +258,11 @@ state Cayu will use for resume, compaction, and provider requests.
 For one-call session health views, the optional server exposes
 `GET /api/sessions/{session_id}/summary`. It returns session identity/status,
 event totals and counts, the latest event, transcript message count, and the
-same normalized usage summary as `/usage`. Estimated cost remains a separate
+same normalized usage summary as `/usage`. It also includes a derived
+`outcome` object with the current status reason, terminal event, latest retry
+event for the latest session invocation, and compact details such as `limit`,
+`actual`, `maximum`, `error_type`, or `interruption_type` when those fields
+exist in durable events. Estimated cost remains a separate
 `POST /api/sessions/{session_id}/cost` call because pricing is supplied by the
 application.
 
