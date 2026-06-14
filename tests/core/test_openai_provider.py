@@ -185,6 +185,24 @@ def test_build_openai_payload_translates_cayu_messages() -> None:
     }
 
 
+def test_build_openai_payload_passes_provider_cache_options() -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "hello")],
+        options={
+            "openai": {
+                "prompt_cache_key": "tenant-a-agent",
+                "prompt_cache_retention": "24h",
+            }
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["prompt_cache_key"] == "tenant-a-agent"
+    assert payload["prompt_cache_retention"] == "24h"
+
+
 def test_build_openai_payload_translates_file_attachments() -> None:
     attachment = file_attachment(
         artifact_id="art_pdf",

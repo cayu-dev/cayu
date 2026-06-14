@@ -1591,6 +1591,10 @@ class CayuApp:
                         for tool in registered_agent.tools.values()
                     ],
                     options={
+                        **copy_json_value(
+                            registered_agent.spec.provider_options,
+                            "provider_options",
+                        ),
                         "agent_metadata": deepcopy(registered_agent.spec.metadata),
                         "environment_metadata": (
                             deepcopy(registered_environment.spec.metadata)
@@ -3398,6 +3402,7 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
         model=spec.model,
         system_prompt=spec.system_prompt,
         metadata=copy_json_value(spec.metadata, "metadata"),
+        provider_options=copy_json_value(spec.provider_options, "provider_options"),
     )
 
 
@@ -3456,6 +3461,10 @@ def _session_agent_spec(
         model=session.model,
         system_prompt=registered_agent.spec.system_prompt,
         metadata=copy_json_value(registered_agent.spec.metadata, "metadata"),
+        provider_options=copy_json_value(
+            registered_agent.spec.provider_options,
+            "provider_options",
+        ),
     )
 
 

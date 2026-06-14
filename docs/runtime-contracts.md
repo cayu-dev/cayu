@@ -196,7 +196,44 @@ Normalized usage includes:
 
 OpenAI cached input token counters and Anthropic cache read/write token counters
 are normalized into this shape. The provider-specific raw `usage` value remains
-available for callers that need exact provider fields.
+available for callers that need exact provider fields. If Cayu cannot normalize
+a provider's usage payload, the durable `model.completed` event still keeps raw
+`usage`; it simply omits `usage_metrics`.
+
+Prompt caching behavior is not a universal runtime contract. Providers differ:
+some apply prompt caching automatically, some require or benefit from explicit
+cache controls, and some expose TTLs or routing hints. Cayu's runtime contract is
+to preserve raw provider usage and normalize cache observability where possible.
+Provider-specific cache controls should remain provider options rather than a
+single Cayu-level abstraction that hides incompatible semantics.
+
+Normal agent runs accept stable provider options on `AgentSpec`:
+
+```python
+AgentSpec(
+    name="assistant",
+    model="gpt-5.5",
+    provider_options={
+        "openai": {
+            "prompt_cache_key": "tenant-a-agent",
+            "prompt_cache_retention": "24h",
+        },
+        "anthropic": {
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    },
+)
+```
+
+The runtime copies these options into every provider request for that agent, then
+adds framework-owned request metadata such as `agent_metadata`, environment
+metadata, step number, and resolved file attachments. Provider-backed compaction
+uses `ModelCompactor(options=...)` because compaction is its own direct model
+request. OpenAI prompt caching is mostly automatic and can use
+`prompt_cache_key` / `prompt_cache_retention` as provider options. Anthropic
+automatic prompt caching uses top-level `cache_control`; explicit block-level
+cache breakpoints are intentionally not modeled in Cayu's provider-neutral
+message contract yet.
 
 `CayuApp.get_session_usage(session_id)` derives totals from durable session
 events. The optional FastAPI server exposes the same value at
@@ -305,7 +342,7 @@ The runtime owns conversion from `ModelStreamEvent` to durable runtime `Event` r
 
 Providers that require opaque response items for stateless continuation may return transcript-only `provider_state` in completed stream-event payloads. The runtime stores that state as assistant `ProviderStatePart` content so future provider requests can replay it, but strips it from `model.completed` event payloads and compaction metadata. Provider state is not user-facing text and should not be treated as dashboard telemetry.
 
-`AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks.
+`AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks. Callers can override Anthropic request options through `ModelRequest.options["anthropic"]` except for fields owned by the provider contract.
 
 `OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 

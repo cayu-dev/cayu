@@ -170,6 +170,18 @@ def test_build_anthropic_payload_translates_cayu_messages() -> None:
     }
 
 
+def test_build_anthropic_payload_passes_provider_cache_options() -> None:
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("user", "hello")],
+        options={"anthropic": {"cache_control": {"type": "ephemeral", "ttl": "1h"}}},
+    )
+
+    payload = build_anthropic_payload(request)
+
+    assert payload["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
 def test_build_anthropic_payload_translates_file_attachments() -> None:
     attachment = file_attachment(
         artifact_id="art_image",

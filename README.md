@@ -235,6 +235,52 @@ The optional server exposes the same summary at
 budget and stop policies should build on them instead of parsing raw provider
 responses.
 
+The raw provider `usage` payload remains available on each durable
+`model.completed` event for dashboards, audits, and provider-specific
+diagnostics. `usage_metrics` is Cayu's stable summary shape; raw `usage` is the
+exact provider payload. If a provider reports usage fields Cayu does not
+understand yet, the event still keeps raw `usage` even when `usage_metrics` is
+absent.
+
+Prompt cache configuration is provider-specific. Some providers apply caching
+automatically when a prompt is long and repeated, while others expose explicit
+cache controls, TTLs, or routing hints. Cayu normalizes cache observability, but
+does not pretend there is one universal cache-control API. Provider-specific
+cache knobs should flow through the provider options for that provider.
+
+```python
+from cayu import AgentSpec
+
+app.register_agent(
+    AgentSpec(
+        name="assistant",
+        model="gpt-5.5",
+        provider_options={
+            "openai": {
+                "prompt_cache_key": "tenant-a-agent",
+                "prompt_cache_retention": "24h",
+            },
+            "anthropic": {
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        },
+    )
+)
+```
+
+Cayu blocks provider options that would replace framework-owned fields such as
+messages, tools, `store`, or `previous_response_id`, but it preserves
+provider-specific cache controls as request options. OpenAI prompt caching is
+mostly automatic and can use `prompt_cache_key` / `prompt_cache_retention`.
+Anthropic automatic prompt caching uses top-level `cache_control`. Explicit
+Anthropic block-level cache breakpoints are not a Cayu-level abstraction yet;
+they require block-level provider metadata and should be added deliberately if
+the transcript contract grows that capability.
+
+Provider options configured on `AgentSpec` are copied into each normal model
+request for that agent. Provider-backed compaction can use the existing
+`ModelCompactor(options=...)` argument for compaction-model cache settings.
+
 Estimate session cost from the same durable usage events by passing your own
 pricing table. Cayu does not ship hardcoded provider prices because those change
 outside the framework:

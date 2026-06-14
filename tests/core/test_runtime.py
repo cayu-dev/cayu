@@ -6105,6 +6105,11 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
     )
 
     completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["usage"] == {
+        "input_tokens": 12,
+        "input_tokens_details": {"cached_tokens": 5},
+        "output_tokens": 3,
+    }
     assert completed.payload["usage_metrics"] == {
         "provider_name": "fake",
         "model": "fake-model-version",
@@ -6119,6 +6124,44 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
             "uncached_input_tokens": 7,
         },
     }
+
+
+def test_runtime_keeps_raw_model_completed_usage_when_it_cannot_normalize_usage_metrics():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "fake-model-version",
+                    "usage": {
+                        "provider_specific_counter": 123,
+                        "provider_specific_cache_mode": "hit",
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_runtime_raw_only",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["usage"] == {
+        "provider_specific_counter": 123,
+        "provider_specific_cache_mode": "hit",
+    }
+    assert "usage_metrics" not in completed.payload
 
 
 def test_cayu_app_get_session_usage_summarizes_durable_events():
@@ -7770,6 +7813,50 @@ def test_cayu_app_protects_agent_metadata_from_provider_mutation():
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert provider.requests[0].options["agent_metadata"] == {"nested": {"value": "mutated"}}
     assert provider.requests[1].options["agent_metadata"] == {"nested": {"value": "original"}}
+
+
+def test_cayu_app_passes_agent_provider_options_to_model_request():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            provider_options={
+                "openai": {
+                    "prompt_cache_key": "tenant-a-agent",
+                    "prompt_cache_retention": "24h",
+                }
+            },
+        )
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_provider_options",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert provider.requests[0].options["openai"] == {
+        "prompt_cache_key": "tenant-a-agent",
+        "prompt_cache_retention": "24h",
+    }
+    assert provider.requests[0].options["agent_metadata"] == {}
+    assert provider.requests[0].options["step"] == 1
 
 
 def test_cayu_app_groups_multiple_tool_calls_and_results_in_history():

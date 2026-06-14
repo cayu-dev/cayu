@@ -19,11 +19,12 @@ class AgentSpec(BaseModel):
     model: str
     system_prompt: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    provider_options: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("metadata", mode="before")
+    @field_validator("metadata", "provider_options", mode="before")
     @classmethod
-    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+    def copy_json_mapping(cls, value: dict[str, Any], info) -> dict[str, Any]:
+        return copy_json_value(value, info.field_name)
 
     @field_validator("name", "model")
     @classmethod

@@ -955,6 +955,19 @@ def test_agent_spec_uses_explicit_system_prompt_field():
         AgentSpec(name="assistant", model="fake-model", prompt="too vague")  # type: ignore[call-arg]
 
 
+def test_agent_spec_copies_provider_options():
+    options = {"openai": {"prompt_cache_key": "tenant-a-agent"}}
+    spec = AgentSpec(
+        name="assistant",
+        model="fake-model",
+        provider_options=options,
+    )
+
+    options["openai"]["prompt_cache_key"] = "mutated"
+
+    assert spec.provider_options == {"openai": {"prompt_cache_key": "tenant-a-agent"}}
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
