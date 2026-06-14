@@ -337,6 +337,48 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump(mode="json")
 
+    @router.get("/sessions/{session_id}/summary")
+    async def get_session_summary(session_id: NonBlankString):
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        event_summary = await session_store.summarize_events(session_id)
+        transcript_page = await session_store.query_transcript(
+            TranscriptQuery(session_id=session_id, limit=1)
+        )
+        usage_summary = await cayu_app.get_session_usage(session_id)
+
+        return {
+            "session": {
+                "id": session.id,
+                "status": session.status.value,
+                "agent_name": session.agent_name,
+                "provider_name": session.provider_name,
+                "model": session.model,
+                "parent_session_id": session.parent_session_id,
+                "runtime_name": session.runtime_name,
+                "runtime_version": session.runtime_version,
+                "environment_name": session.environment_name,
+                "created_at": session.created_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "metadata": session.metadata,
+            },
+            "events": {
+                "total_events": event_summary.total_events,
+                "counts_by_type": event_summary.counts_by_type,
+                "latest_event": (
+                    None
+                    if event_summary.latest_event is None
+                    else _serialize_event_record(event_summary.latest_event)
+                ),
+            },
+            "transcript": {
+                "total_messages": transcript_page.total_records,
+            },
+            "usage": usage_summary.model_dump(),
+        }
+
     @router.get("/sessions/{session_id}/events")
     async def list_session_events(
         session_id: NonBlankString,

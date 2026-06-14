@@ -279,6 +279,20 @@ class EventRecord(BaseModel):
         return copy_event(value)
 
 
+class EventSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    total_events: StrictInt = Field(ge=0)
+    counts_by_type: dict[str, StrictInt] = Field(default_factory=dict)
+    latest_event: EventRecord | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "session_id")
+
+
 class EventQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -430,6 +444,10 @@ class SessionStore(ABC):
     @abstractmethod
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         """Query stored events with durable sequence cursors."""
+
+    @abstractmethod
+    async def summarize_events(self, session_id: str) -> EventSummary:
+        """Summarize stored events for one session without loading every event."""
 
     @abstractmethod
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
@@ -761,6 +779,37 @@ class InMemorySessionStore(SessionStore):
                 )
                 for record in records[: query.limit]
             ]
+
+    async def summarize_events(self, session_id: str) -> EventSummary:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+
+            records = [
+                record for record in self._event_records if record.event.session_id == session_id
+            ]
+            counts_by_type: dict[str, int] = {}
+            latest_record: EventRecord | None = None
+            for record in records:
+                event_type = str(record.event.type)
+                counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
+                if latest_record is None or record.sequence > latest_record.sequence:
+                    latest_record = record
+
+            return EventSummary(
+                session_id=session_id,
+                total_events=len(records),
+                counts_by_type=counts_by_type,
+                latest_event=(
+                    None
+                    if latest_record is None
+                    else EventRecord(
+                        sequence=latest_record.sequence,
+                        event=latest_record.event,
+                    )
+                ),
+            )
 
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
         query = copy_session_query(query)

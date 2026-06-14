@@ -92,6 +92,8 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.sessions import (
+    EventQuery,
+    EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -685,8 +687,49 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        events = await self.session_store.load_events(session_id)
+        usage_event_records = await self._query_all_event_records(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.MODEL_COMPLETED,
+            )
+        )
+        tool_event_records = await self._query_all_event_records(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.TOOL_CALL_STARTED,
+            )
+        )
+        events = [
+            record.event
+            for record in sorted(
+                [*usage_event_records, *tool_event_records],
+                key=lambda record: record.sequence,
+            )
+        ]
         return session_usage_summary(session_id, events)
+
+    async def _query_all_event_records(self, query: EventQuery) -> list[EventRecord]:
+        records: list[EventRecord] = []
+        after_sequence = query.after_sequence
+        while True:
+            page = await self.session_store.query_events(
+                EventQuery(
+                    session_id=query.session_id,
+                    event_type=query.event_type,
+                    agent_name=query.agent_name,
+                    environment_name=query.environment_name,
+                    workflow_name=query.workflow_name,
+                    tool_name=query.tool_name,
+                    after_sequence=after_sequence,
+                    limit=query.limit,
+                )
+            )
+            if not page:
+                return records
+            records.extend(page)
+            if len(page) < query.limit:
+                return records
+            after_sequence = page[-1].sequence
 
     async def get_session_cost(
         self,

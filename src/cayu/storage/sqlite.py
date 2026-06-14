@@ -19,6 +19,7 @@ from cayu.runtime.sessions import (
     CheckpointTransform,
     EventQuery,
     EventRecord,
+    EventSummary,
     RunRequest,
     Session,
     SessionIdentity,
@@ -585,6 +586,55 @@ class SQLiteSessionStore(SessionStore):
                 )
                 for row in rows
             ]
+
+    async def summarize_events(self, session_id: str) -> EventSummary:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if not self._session_exists_unlocked(session_id):
+                raise KeyError(f"Session not found: {session_id}")
+
+            total_row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS total_events
+                FROM events
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            count_rows = self._connection.execute(
+                """
+                SELECT event_type, COUNT(*) AS count
+                FROM events
+                WHERE session_id = ?
+                GROUP BY event_type
+                ORDER BY event_type ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            latest_row = self._connection.execute(
+                """
+                SELECT sequence, event_json
+                FROM events
+                WHERE session_id = ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+
+            return EventSummary(
+                session_id=session_id,
+                total_events=int(total_row["total_events"]),
+                counts_by_type={row["event_type"]: int(row["count"]) for row in count_rows},
+                latest_event=(
+                    None
+                    if latest_row is None
+                    else EventRecord(
+                        sequence=latest_row["sequence"],
+                        event=Event(**json.loads(latest_row["event_json"])),
+                    )
+                ),
+            )
 
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
         query = copy_session_query(query)

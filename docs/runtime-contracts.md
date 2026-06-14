@@ -127,6 +127,13 @@ about transcript positions as message counts. Events remain the source of truth
 for execution chronology; transcript messages are the provider-neutral
 conversation state used by resume, context policy, and compaction.
 
+The optional server exposes `GET /api/sessions/{session_id}/summary` for compact
+session health views. It combines session identity/status, storage-backed event
+totals and counts, the latest event, transcript message count, and normalized
+usage. It does not estimate cost because Cayu does not own provider pricing;
+callers pass their own pricing to `POST /api/sessions/{session_id}/cost` when
+they need cost estimates.
+
 Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted. Terminal tool events must be durable before approval retry can safely skip execution. `append_transcript_messages_and_checkpoint(...)` must also be atomic: it is the boundary used when closing an interrupted tool-approval round, where the transcript cannot be updated independently from the checkpoint.
 
 ## TaskStore

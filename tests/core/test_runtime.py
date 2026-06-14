@@ -33,6 +33,7 @@ from cayu.runtime import (
     DispatchHandle,
     DispatchRequest,
     DispatchStatus,
+    EventQuery,
     EventSink,
     ForkSessionRequest,
     InMemoryEventSink,
@@ -6218,6 +6219,65 @@ def test_cayu_app_get_session_usage_summarizes_durable_events():
     assert summary.usage.total_tokens == 36
     assert summary.usage.cache.cached_input_tokens == 8
     assert summary.usage.cache.uncached_input_tokens == 22
+
+
+def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
+    class TrackingStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.load_events_called = False
+            self.event_queries: list[EventQuery] = []
+
+        async def load_events(self, session_id: str) -> list[Event]:
+            self.load_events_called = True
+            return await super().load_events(session_id)
+
+        async def query_events(self, query: EventQuery | None = None):
+            if query is not None:
+                self.event_queries.append(query)
+            return await super().query_events(query)
+
+    store = TrackingStore()
+    app = CayuApp(session_store=store)
+
+    async def run() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_query",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            "usage_query",
+            [
+                Event(type=EventType.SESSION_STARTED, session_id="usage_query"),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="usage_query",
+                    payload={"usage": {"input_tokens": 10, "output_tokens": 2}},
+                ),
+                Event(type=EventType.MODEL_TEXT_DELTA, session_id="usage_query"),
+                Event(type=EventType.TOOL_CALL_STARTED, session_id="usage_query"),
+                Event(type=EventType.TOOL_CALL_COMPLETED, session_id="usage_query"),
+            ],
+        )
+
+        summary = await app.get_session_usage("usage_query")
+
+        assert summary.model_steps == 1
+        assert summary.tool_calls == 1
+        assert summary.usage.input_tokens == 10
+        assert summary.usage.output_tokens == 2
+
+    asyncio.run(run())
+
+    assert store.load_events_called is False
+    assert [str(query.event_type) for query in store.event_queries] == [
+        "model.completed",
+        "tool.call.started",
+    ]
 
 
 def test_model_compactor_rejects_tool_calls_from_compaction_model():

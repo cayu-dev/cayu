@@ -324,6 +324,88 @@ def test_server_session_cost_validates_pricing_body() -> None:
     assert response.status_code == 422
 
 
+def test_server_exposes_session_summary() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="summary_1",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/summary_1/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session"]["id"] == "summary_1"
+    assert body["session"]["status"] == "completed"
+    assert body["session"]["agent_name"] == "assistant"
+    assert body["session"]["provider_name"] == "fake"
+    assert body["session"]["model"] == "fake-model"
+    assert body["session"]["environment_name"] is None
+    assert body["events"]["total_events"] == 5
+    assert body["events"]["counts_by_type"] == {
+        "model.completed": 1,
+        "model.started": 1,
+        "model.text.delta": 1,
+        "session.completed": 1,
+        "session.started": 1,
+    }
+    assert body["events"]["latest_event"]["type"] == "session.completed"
+    assert body["transcript"] == {"total_messages": 2}
+    assert body["usage"] == {
+        "session_id": "summary_1",
+        "model_steps": 1,
+        "tool_calls": 0,
+        "provider_names": ["fake"],
+        "models": ["fake-model"],
+        "usage": {
+            "provider_name": None,
+            "model": None,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "reasoning_output_tokens": 0,
+            "cache": {
+                "read_tokens": 0,
+                "write_tokens": 0,
+                "cached_input_tokens": 4,
+                "uncached_input_tokens": 6,
+            },
+        },
+    }
+
+
+def test_server_session_summary_returns_404_for_missing_session() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/missing/summary")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+def test_server_session_summary_rejects_blank_session_id() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+    response = client.get("/api/sessions/%20/summary")
+
+    assert response.status_code == 422
+
+
 def test_server_exposes_paginated_session_events() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)

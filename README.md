@@ -255,6 +255,13 @@ The provider-neutral transcript is exposed separately at
 Use events to inspect what happened; use transcript to inspect the conversation
 state Cayu will use for resume, compaction, and provider requests.
 
+For one-call session health views, the optional server exposes
+`GET /api/sessions/{session_id}/summary`. It returns session identity/status,
+event totals and counts, the latest event, transcript message count, and the
+same normalized usage summary as `/usage`. Estimated cost remains a separate
+`POST /api/sessions/{session_id}/cost` call because pricing is supplied by the
+application.
+
 Prompt cache configuration is provider-specific. Some providers apply caching
 automatically when a prompt is long and repeated, while others expose explicit
 cache controls, TTLs, or routing hints. Cayu normalizes cache observability, but

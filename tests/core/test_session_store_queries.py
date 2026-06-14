@@ -162,6 +162,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
+        event_summary = await store.summarize_events("sess_builder")
 
         assert [record.sequence for record in all_records] == [1, 2, 3, 4]
         assert [record.event.id for record in builder_records] == [
@@ -178,6 +179,14 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_3",
             "event_4",
         ]
+        assert event_summary.total_events == 3
+        assert event_summary.counts_by_type == {
+            "model.completed": 1,
+            "session.started": 1,
+            "tool.call.completed": 1,
+        }
+        assert event_summary.latest_event is not None
+        assert event_summary.latest_event.event.id == "event_3"
 
         with pytest.raises(ValueError, match="Event already exists"):
             await store.append_events(
@@ -203,6 +212,8 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_3",
             "event_4",
         ]
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.summarize_events("missing_session")
         await _close_store(store)
 
     asyncio.run(run_store_operations())
