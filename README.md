@@ -266,6 +266,23 @@ exist in durable events. Estimated cost remains a separate
 `POST /api/sessions/{session_id}/cost` call because pricing is supplied by the
 application.
 
+Programmatic apps can combine the server and app APIs without the dashboard:
+
+```python
+usage = await app.get_session_usage("session_123")
+cost = await app.get_session_cost("session_123", pricing)
+
+print(usage.usage.cache.read_tokens)
+print(cost.total_cost)
+```
+
+Use `/summary` to explain why the session is currently completed, failed, or
+interrupted; use `get_session_usage(...)` for normalized token/cache counters;
+use `get_session_cost(...)` for caller-priced estimates; use `/events` when you
+need the full durable trace. Custom storage or observability integrations can
+call `SessionStore.summarize_outcome(...)`, which is the store-level primitive
+behind `/summary`.
+
 Prompt cache configuration is provider-specific. Some providers apply caching
 automatically when a prompt is long and repeated, while others expose explicit
 cache controls, TTLs, or routing hints. Cayu normalizes cache observability, but
@@ -363,9 +380,9 @@ catalog because Cayu does not hardcode provider prices:
 }
 ```
 
-Run `examples/usage_cost_summary.py` for a deterministic local example that
-prints normalized usage, cache counters, and estimated cost without calling a
-real provider API.
+Run `examples/usage_cost_summary.py` for a deterministic local session report
+that emits retry events and prints normalized usage, cache counters, and
+estimated cost without calling a real provider API.
 
 The live OpenAI tools example also prints normalized usage/cache counters and an
 estimated cost after the run:

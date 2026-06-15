@@ -284,6 +284,15 @@ The optional FastAPI server exposes the same estimator at
 `SessionCostSummary`, with decimal cost values serialized as strings for stable
 API output.
 
+For compact health views, use the server's
+`GET /api/sessions/{session_id}/summary`. The summary endpoint includes outcome
+data derived through `SessionStore.summarize_outcome(session_id)`: current
+status reason, compact terminal details, and the latest retry event for the
+latest session invocation. It complements, but does not replace, event replay:
+outcome answers "why is this session in its current state?", usage answers "how
+many tokens/cache counters were observed?", and cost answers "what does my
+pricing table estimate for those events?"
+
 Cost estimation is observability, not billing authority. Provider invoices,
 rounding, regional pricing, provider-side discounts, or account-specific terms
 can differ from a caller's pricing table. Cost stop policies should build on

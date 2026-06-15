@@ -10,17 +10,25 @@ from cayu import (
     Message,
     ModelPricing,
     PricingCatalog,
+    RetryPolicy,
     RunRequest,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 
-class UsageProvider(ModelProvider):
-    """Deterministic provider that emits OpenAI-shaped usage counters."""
+class ReportProvider(ModelProvider):
+    """Deterministic provider that retries once, then emits OpenAI-shaped usage."""
 
     name = "openai"
 
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            raise TimeoutError("stream idle timeout")
+
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed(
             {
@@ -37,8 +45,8 @@ class UsageProvider(ModelProvider):
 
 
 async def main() -> None:
-    app = CayuApp()
-    app.register_provider(UsageProvider(), default=True)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ReportProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="gpt-5.5"))
 
     async for event in app.run(
@@ -46,14 +54,12 @@ async def main() -> None:
             agent_name="assistant",
             session_id="demo_usage_cost",
             messages=[Message.text("user", "Summarize usage.")],
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
         )
     ):
         print(event.type, event.payload)
 
     usage = await app.get_session_usage("demo_usage_cost")
-    print("input_tokens", usage.usage.input_tokens)
-    print("output_tokens", usage.usage.output_tokens)
-    print("cached_input_tokens", usage.usage.cache.cached_input_tokens)
 
     pricing = PricingCatalog(
         prices=(
@@ -68,6 +74,11 @@ async def main() -> None:
         )
     )
     cost = await app.get_session_cost("demo_usage_cost", pricing)
+
+    print("usage_input_tokens", usage.usage.input_tokens)
+    print("usage_output_tokens", usage.usage.output_tokens)
+    print("usage_cache_read_tokens", usage.usage.cache.read_tokens)
+    print("usage_cached_input_tokens", usage.usage.cache.cached_input_tokens)
     print("estimated_cost", cost.total_cost)
     print("unpriced_model_steps", cost.unpriced_model_steps)
 
