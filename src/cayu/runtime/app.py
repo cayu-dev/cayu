@@ -26,6 +26,7 @@ from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     Message,
+    MessageRole,
     ProviderStatePart,
     ToolCallPart,
     ToolResultPart,
@@ -125,12 +126,18 @@ from cayu.runtime.stop_policy import (
     has_run_limits,
 )
 from cayu.runtime.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputError,
     StructuredOutputSpec,
     StructuredOutputValidation,
     copy_structured_output_spec,
+    structured_output_repair_lead,
     structured_output_repair_prompt,
     structured_output_spec_payload,
-    validate_structured_output_text,
+    structured_output_tool_instruction,
+    structured_output_tool_required_validation,
+    structured_output_tool_spec,
+    validate_structured_output_tool_arguments,
 )
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
@@ -1539,6 +1546,10 @@ class CayuApp:
                 pricing=cost_budget.pricing,
                 currency=cost_budget.currency,
             )
+        if structured_output is not None and STRUCTURED_OUTPUT_TOOL_NAME in registered_agent.tools:
+            raise ValueError(
+                f"Tool name is reserved for structured output: {STRUCTURED_OUTPUT_TOOL_NAME}"
+            )
         if current_task is not None:
             active_run = self._register_active_session_task(
                 session.id,
@@ -1657,17 +1668,26 @@ class CayuApp:
                     )
                 await self._raise_if_session_interrupted(session.id)
 
+                model_tools = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": deepcopy(tool.schema),
+                    }
+                    for tool in registered_agent.tools.values()
+                ]
+                model_messages = context_messages
+                if structured_output is not None:
+                    model_tools.append(structured_output_tool_spec(structured_output))
+                    model_messages = _with_structured_output_tool_instruction(
+                        context_messages,
+                        structured_output,
+                    )
+
                 model_request = ModelRequest(
                     model=session.model,
-                    messages=context_messages,
-                    tools=[
-                        {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": deepcopy(tool.schema),
-                        }
-                        for tool in registered_agent.tools.values()
-                    ],
+                    messages=model_messages,
+                    tools=model_tools,
                     options={
                         **copy_json_value(
                             registered_agent.spec.provider_options,
@@ -1699,7 +1719,6 @@ class CayuApp:
                 )
 
                 assistant_message: Message | None = None
-                assistant_step_result: AssistantStepResult | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
                 async for event, result in self._run_model_step_with_retries(
                     provider=provider,
@@ -1714,7 +1733,6 @@ class CayuApp:
                     if event is not None:
                         yield event
                     if result is not None:
-                        assistant_step_result = result
                         assistant_message = result.assistant_message
                         tool_calls = result.tool_calls
 
@@ -1732,7 +1750,7 @@ class CayuApp:
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     cost_baseline=cost_baseline,
-                    pending_tool_calls=len(tool_calls),
+                    pending_tool_calls=_user_tool_call_count(tool_calls),
                 )
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
@@ -1750,30 +1768,79 @@ class CayuApp:
                         yield event
                     return
 
+                if structured_output is not None and _has_structured_output_tool_call(tool_calls):
+                    validation = _validate_structured_output_tool_round(
+                        tool_calls=tool_calls,
+                        spec=structured_output,
+                    )
+                    structured_tool_outcomes = _structured_output_tool_round_outcomes(
+                        tool_calls=tool_calls,
+                        spec=structured_output,
+                        validation=validation,
+                    )
+                    tool_result_messages = transcript_helpers.tool_result_messages(
+                        structured_tool_outcomes
+                    )
+                    messages.extend(tool_result_messages)
+                    await self.session_store.append_transcript_messages(
+                        session.id,
+                        tool_result_messages,
+                    )
+                    if validation.valid:
+                        yield await self._emit(
+                            _structured_output_event(
+                                event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                spec=structured_output,
+                                validation=validation,
+                                step=step,
+                                attempt=structured_output_retries + 1,
+                            )
+                        )
+                        break
+                    yield await self._emit(
+                        _structured_output_event(
+                            event_type=EventType.STRUCTURED_OUTPUT_FAILED,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            spec=structured_output,
+                            validation=validation,
+                            step=step,
+                            attempt=structured_output_retries + 1,
+                        )
+                    )
+                    if structured_output_retries >= structured_output.max_retries:
+                        raise RuntimeError(
+                            "Structured output validation failed after "
+                            f"{structured_output_retries + 1} attempt(s)."
+                        )
+                    if step >= max_steps:
+                        raise RuntimeError(
+                            "Structured output validation failed after "
+                            f"{structured_output_retries + 1} attempt(s): "
+                            "maximum model steps reached before repair."
+                        )
+                    structured_output_retries += 1
+                    yield await self._emit(
+                        _structured_output_event(
+                            event_type=EventType.STRUCTURED_OUTPUT_RETRY,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            spec=structured_output,
+                            validation=validation,
+                            step=step,
+                            attempt=structured_output_retries,
+                        )
+                    )
+                    continue
+
                 if not tool_calls:
                     if structured_output is not None:
-                        if assistant_step_result is None:
-                            raise RuntimeError(
-                                "Structured output validation requires an assistant step result."
-                            )
-                        validation = validate_structured_output_text(
-                            assistant_step_result.text_content,
-                            structured_output,
-                        )
-                        if validation.valid:
-                            yield await self._emit(
-                                _structured_output_event(
-                                    event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
-                                    session=session,
-                                    registered_agent=registered_agent,
-                                    environment_name=environment_name,
-                                    spec=structured_output,
-                                    validation=validation,
-                                    step=step,
-                                    attempt=structured_output_retries + 1,
-                                )
-                            )
-                            break
+                        validation = structured_output_tool_required_validation()
                         yield await self._emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_FAILED,
@@ -3566,6 +3633,8 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
     name = require_clean_nonblank(spec.name, "name")
+    if name == STRUCTURED_OUTPUT_TOOL_NAME:
+        raise ValueError(f"Tool name is reserved for structured output: {name}")
     validated_spec = ToolSpec(
         name=name,
         description=spec.description,
@@ -4342,6 +4411,118 @@ def _model_stream_event_to_runtime_event(
             ),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _with_structured_output_tool_instruction(
+    messages: list[Message],
+    spec: StructuredOutputSpec,
+) -> list[Message]:
+    copied_messages = copy_context_messages(messages)
+    instruction = Message.text(
+        MessageRole.SYSTEM,
+        structured_output_tool_instruction(spec),
+    )
+    insert_at = 0
+    while (
+        insert_at < len(copied_messages) and copied_messages[insert_at].role == MessageRole.SYSTEM
+    ):
+        insert_at += 1
+    copied_messages.insert(insert_at, instruction)
+    return copied_messages
+
+
+def _has_structured_output_tool_call(
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> bool:
+    return any(tool_call.name == STRUCTURED_OUTPUT_TOOL_NAME for tool_call in tool_calls)
+
+
+def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> int:
+    return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
+
+
+def _validate_structured_output_tool_round(
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    spec: StructuredOutputSpec,
+) -> StructuredOutputValidation:
+    internal_calls = [
+        tool_call for tool_call in tool_calls if tool_call.name == STRUCTURED_OUTPUT_TOOL_NAME
+    ]
+    if len(internal_calls) != 1:
+        return _structured_output_tool_error(
+            "Call the structured-output tool exactly once when submitting final output."
+        )
+    if len(tool_calls) != 1:
+        return _structured_output_tool_error(
+            "Call the structured-output tool by itself, not in the same tool round as other tools."
+        )
+    return validate_structured_output_tool_arguments(internal_calls[0].arguments, spec)
+
+
+def _structured_output_tool_round_outcomes(
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    spec: StructuredOutputSpec,
+    validation: StructuredOutputValidation,
+) -> list[runtime_records.ToolCallOutcome]:
+    if validation.valid:
+        return [
+            runtime_records.ToolCallOutcome(
+                call=tool_calls[0],
+                result=ToolResult(
+                    content="Structured output accepted.",
+                    structured={"output": copy_json_value(validation.output, "output")},
+                ),
+            )
+        ]
+
+    repair_lead = structured_output_repair_lead(spec)
+    error_summary = _structured_output_error_summary(validation)
+    outcomes: list[runtime_records.ToolCallOutcome] = []
+    for tool_call in tool_calls:
+        if tool_call.name == STRUCTURED_OUTPUT_TOOL_NAME:
+            content = f"Structured output rejected: {error_summary}\n\n{repair_lead}"
+        else:
+            content = (
+                "Tool was not executed because the structured-output finalizer was "
+                "called in the same tool round. Retry the needed work before submitting "
+                "final structured output."
+            )
+        outcomes.append(
+            runtime_records.ToolCallOutcome(
+                call=tool_call,
+                result=ToolResult(
+                    content=content,
+                    structured={
+                        "structured_output_errors": [
+                            error.model_dump(mode="json") for error in validation.errors
+                        ],
+                    },
+                    is_error=True,
+                ),
+            )
+        )
+    return outcomes
+
+
+def _structured_output_tool_error(message: str) -> StructuredOutputValidation:
+    return StructuredOutputValidation(
+        valid=False,
+        errors=[
+            StructuredOutputError(
+                path="$",
+                message=message,
+                schema_path="$",
+            )
+        ],
+    )
+
+
+def _structured_output_error_summary(validation: StructuredOutputValidation) -> str:
+    if not validation.errors:
+        return "unknown validation error."
+    return "; ".join(f"{error.path}: {error.message}" for error in validation.errors[:3])
 
 
 def _structured_output_event(

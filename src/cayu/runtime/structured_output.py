@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationInfo, fi
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 
+STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
+
 
 class StructuredOutputSpec(BaseModel):
     """Provider-neutral JSON structured output requirement."""
@@ -118,13 +120,23 @@ def validate_structured_output_text(
             ],
         )
 
+    return validate_structured_output_value(output, spec)
+
+
+def validate_structured_output_value(
+    output: Any,
+    spec: StructuredOutputSpec,
+) -> StructuredOutputValidation:
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    copied_output = copy_json_value(output, "output")
     validator = Draft202012Validator(spec.json_schema)
     errors = sorted(
-        validator.iter_errors(output),
+        validator.iter_errors(copied_output),
         key=lambda error: (list(error.path), list(error.schema_path), error.message),
     )
     if not errors:
-        return StructuredOutputValidation(valid=True, output=output)
+        return StructuredOutputValidation(valid=True, output=copied_output)
 
     return StructuredOutputValidation(
         valid=False,
@@ -149,14 +161,89 @@ def structured_output_repair_prompt(
     if type(validation) is not StructuredOutputValidation:
         raise TypeError("Structured output validation must be a StructuredOutputValidation.")
 
-    lead = spec.repair_prompt or (
-        "Your previous final response did not match the required structured output "
-        "schema. Return only valid JSON that matches the schema. Do not include "
-        "Markdown fences or explanatory text."
-    )
+    lead = structured_output_repair_lead(spec)
     schema_text = json.dumps(spec.json_schema, indent=2, sort_keys=True)
     error_lines = "\n".join(f"- {error.path}: {error.message}" for error in validation.errors)
     return f"{lead}\n\nSchema:\n{schema_text}\n\nValidation errors:\n{error_lines}"
+
+
+def structured_output_repair_lead(spec: StructuredOutputSpec) -> str:
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    return spec.repair_prompt or (
+        "Your previous response did not satisfy the required structured output contract. "
+        f"Call the `{STRUCTURED_OUTPUT_TOOL_NAME}` tool with an `output` argument that "
+        "matches the schema. Do not return the final structured output as plain text."
+    )
+
+
+def structured_output_tool_instruction(spec: StructuredOutputSpec) -> str:
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    schema_text = json.dumps(spec.json_schema, indent=2, sort_keys=True)
+    return (
+        "When you have the final answer for this request, call the "
+        f"`{STRUCTURED_OUTPUT_TOOL_NAME}` tool. Put the final structured value in the "
+        "`output` argument. Do not use that tool for intermediate work, and do not call "
+        "it in the same tool round as any other tool.\n\n"
+        f"Required output JSON Schema:\n{schema_text}"
+    )
+
+
+def structured_output_tool_spec(spec: StructuredOutputSpec) -> dict[str, Any]:
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    return {
+        "name": STRUCTURED_OUTPUT_TOOL_NAME,
+        "description": (
+            "Submit the final structured output for this run. Use this only when the "
+            "final answer is ready. The value must be provided in the `output` field."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "output": copy_json_value(spec.json_schema, "json_schema"),
+            },
+            "required": ["output"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def validate_structured_output_tool_arguments(
+    arguments: dict[str, Any],
+    spec: StructuredOutputSpec,
+) -> StructuredOutputValidation:
+    if type(arguments) is not dict:
+        raise TypeError("Structured output tool arguments must be an object.")
+    if "output" not in arguments:
+        return StructuredOutputValidation(
+            valid=False,
+            errors=[
+                StructuredOutputError(
+                    path="$/output",
+                    message="Structured output tool arguments require `output`.",
+                    schema_path="$/required",
+                )
+            ],
+        )
+    return validate_structured_output_value(arguments["output"], spec)
+
+
+def structured_output_tool_required_validation() -> StructuredOutputValidation:
+    return StructuredOutputValidation(
+        valid=False,
+        errors=[
+            StructuredOutputError(
+                path="$",
+                message=(
+                    "Final structured output must be submitted with the "
+                    f"`{STRUCTURED_OUTPUT_TOOL_NAME}` tool."
+                ),
+                schema_path="$",
+            )
+        ],
+    )
 
 
 def structured_output_spec_payload(spec: StructuredOutputSpec) -> dict[str, Any]:

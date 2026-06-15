@@ -245,37 +245,44 @@ or guessing from transcript shape.
 
 ## Structured Output
 
-`StructuredOutputSpec` is the provider-neutral validation foundation for final
-JSON responses. It can be attached to `RunRequest`, `ResumeRequest`,
-`DispatchRequest`, `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`.
-The spec contains a `json_schema` object, an optional name, a bounded
-`max_retries`, and an optional repair prompt.
+`StructuredOutputSpec` is the provider-neutral contract for final JSON output.
+It can be attached to `RunRequest`, `ResumeRequest`, `DispatchRequest`,
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. The spec contains a
+`json_schema` object, an optional name, a bounded `max_retries`, and an optional
+repair prompt.
 
-The runtime validates only final assistant responses: if a model step returns
-tool calls, Cayu executes or resolves that tool round first and waits for the
-next no-tool-call assistant response before validating. This prevents
-structured-output validation from cutting through provider tool-call/tool-result
-history.
+When the spec is present, Cayu adds a runtime-owned
+`__cayu_submit_structured_output` tool to provider requests and injects
+provider-facing system guidance. The tool takes a single `output` argument. Cayu
+validates that value against the spec's schema. The tool is internal runtime
+plumbing: it is not registered by the app, does not execute user code, does not
+go through tool approval, and does not count against user tool-call limits.
 
-On a valid final response, Cayu emits `structured_output.validated` with parsed
-JSON output and then completes the session. On an invalid final response, Cayu
-emits `structured_output.failed`. If retries remain, it appends a synthetic user
-repair message to the durable provider-neutral transcript, emits
-`structured_output.retry`, and calls the model again with the repair prompt in
-context. Cayu writes that repair message only when another model step is
+If the model calls the final-output tool by itself with a valid value, Cayu
+appends a tool result to the durable transcript, emits
+`structured_output.validated` with parsed JSON output, and completes the
+session. If the submitted value is invalid, Cayu appends an error tool result,
+emits `structured_output.failed`, emits `structured_output.retry` when retries
+and model steps remain, and calls the model again with the provider-valid tool
+result in context. Cayu writes those tool results before completing, retrying,
+or failing so provider tool-call/tool-result history remains valid.
+
+If the model calls the final-output tool in the same round as other tools, Cayu
+rejects the entire round with error tool results and does not execute side
+effects. The model can retry the needed work and submit final structured output
+in a later round.
+
+If the model ignores the final-output tool and returns plain final text, Cayu
+treats that as a structured-output failure even when the text happens to be
+valid JSON. If retries remain, it appends a synthetic user repair message to the
+durable provider-neutral transcript, emits `structured_output.retry`, and calls
+the model again. Cayu writes that repair message only when another model step is
 available. If retries are exhausted, or no model step remains for repair, the
 session fails with `session.failed`.
 
-The durable transcript keeps the assistant's invalid output and the repair user
-message. That is intentional: replay, debugging, and resume should explain why
-the model was called again.
-
-This foundation does not yet add the runtime-owned final-output tool that guides
-the model from the first request to return final structured data through a tool
-call. That output-tool strategy is the next layer. Provider adapters may later
-use `ModelRequest.options["structured_output"]` for native JSON-schema
-enforcement, but Cayu's runtime validation remains the provider-neutral
-correctness boundary.
+Provider adapters may later use `ModelRequest.options["structured_output"]` for
+native JSON-schema enforcement, but Cayu's runtime-owned final-output tool and
+runtime validation remain the provider-neutral correctness boundary.
 
 ## Usage Metrics
 

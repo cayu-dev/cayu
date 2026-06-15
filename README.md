@@ -251,9 +251,9 @@ be viewed as `continue`, `final`, `length`, `filtered`, `failed`, `think_only`,
 or `invalid`. These fields are intended for dashboards, stop policies,
 structured-output policies, and future subagent orchestration.
 
-Add a structured-output validation foundation to a run or resume with
-`StructuredOutputSpec`. Cayu validates the final assistant response against your
-JSON Schema after tool rounds are complete:
+Add structured output to a run or resume with `StructuredOutputSpec`. Cayu
+injects a runtime-owned final-output tool, validates the submitted value against
+your JSON Schema, and emits durable structured-output events:
 
 ```python
 from cayu import Message, RunRequest, StructuredOutputSpec
@@ -277,17 +277,27 @@ request = RunRequest(
 )
 ```
 
-If validation fails, Cayu emits `structured_output.failed`. If retries and model
-steps remain, it appends a durable repair user message, emits
-`structured_output.retry`, and calls the model again. On success,
-`structured_output.validated` includes the parsed JSON output. If retries are
-exhausted, or no model step remains for repair, the session fails.
+When `structured_output` is present, the model sees an internal
+`__cayu_submit_structured_output` tool and provider-facing guidance telling it to
+call that tool when the final answer is ready. The tool takes one argument,
+`output`, whose value must match your schema. Cayu writes a tool result to close
+that provider tool round before completing or retrying, so transcript history
+remains valid.
 
-This is the provider-neutral validation foundation. It does not yet add the
-runtime-owned final-output tool that tells the model from the first request to
-return the final answer through a structured-output tool call. That output-tool
-strategy is the next layer; provider-native schema enforcement can also be added
-by providers later using the same request option.
+If tool-submitted output is invalid, Cayu emits `structured_output.failed`,
+returns an error tool result, emits `structured_output.retry` when retries and
+model steps remain, and lets the model repair on the next step. If the model
+ignores the final-output tool and returns plain final text, Cayu treats that as
+a structured-output failure and retries with a durable repair user message when
+possible. On success, `structured_output.validated` includes the parsed JSON
+output. If retries are exhausted, or no model step remains for repair, the
+session fails.
+
+The final-output tool is runtime-owned, not an app-registered tool: it does not
+run user code, does not go through tool approval, and does not count against
+user tool-call limits. If the model calls it in the same round as other tools,
+Cayu rejects the whole round with tool-result errors instead of executing side
+effects.
 
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
