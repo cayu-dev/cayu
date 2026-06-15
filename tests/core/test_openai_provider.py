@@ -22,6 +22,7 @@ from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, ToolCal
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     HttpxOpenAITransport,
+    ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
     OpenAIAPIError,
@@ -312,6 +313,8 @@ async def test_openai_provider_emits_text_and_completed_events() -> None:
     ]
     assert events[0].delta == "hello"
     assert events[1].payload["status"] == "completed"
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.STOP
     assert transport.calls[0]["url"] == "https://api.openai.com/v1/responses"
     assert transport.calls[0]["headers"]["authorization"] == "Bearer test-key"
     assert transport.calls[0]["payload"]["store"] is False
@@ -398,6 +401,8 @@ async def test_openai_provider_emits_tool_call_events() -> None:
         "arguments": {"text": "hello"},
     }
     assert events[1].payload["status"] == "completed"
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.TOOL_CALLS
 
 
 @pytest.mark.anyio
@@ -842,6 +847,9 @@ async def test_openai_stream_events_emits_incomplete_terminal_response() -> None
     assert events[0].delta == "partial"
     assert events[1].payload["status"] == "incomplete"
     assert events[1].payload["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.LENGTH
+    assert events[1].completion.raw_finish_reason == "max_output_tokens"
 
 
 @pytest.mark.anyio
@@ -886,6 +894,85 @@ async def test_openai_stream_events_uses_done_function_call_arguments() -> None:
         "name": "echo",
         "arguments": {"text": "from done event"},
     }
+
+
+@pytest.mark.anyio
+async def test_openai_stream_completion_uses_fallback_output_items_for_finish_reason() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": "",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "name": "echo",
+            "arguments": '{"text":"from done event"}',
+            "sequence_number": 2,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+            },
+        }
+
+    events = [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.TOOL_CALLS
+    assert events[1].payload["provider_state"] == [
+        {
+            "provider": "openai",
+            "state": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": '{"text":"from done event"}',
+                "status": "completed",
+            },
+        }
+    ]
+
+
+def test_openai_completion_respects_explicit_empty_output_items() -> None:
+    response = {
+        "id": "resp_1",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": "{}",
+            }
+        ],
+    }
+
+    event = openai_module._completed_event_from_response(
+        response,
+        completion_output_items=[],
+    )
+
+    assert event.completion is not None
+    assert event.completion.finish_reason == ModelFinishReason.STOP
 
 
 @pytest.mark.anyio

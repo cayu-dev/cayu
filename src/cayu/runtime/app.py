@@ -33,11 +33,13 @@ from cayu.core.messages import (
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
 from cayu.providers import (
+    ModelCompletion,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
     copy_model_stream_event,
+    normalize_model_completion,
 )
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
@@ -83,6 +85,12 @@ from cayu.runtime.hooks import (
     RuntimeHookContext,
     RuntimeHookPhase,
     ToolCallHookContext,
+)
+from cayu.runtime.model_steps import (
+    AssistantStepResult,
+    assistant_text_content,
+    classify_assistant_step,
+    provider_state_count,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -1673,7 +1681,8 @@ class CayuApp:
                     if event is not None:
                         yield event
                     if result is not None:
-                        assistant_message, tool_calls = result
+                        assistant_message = result.assistant_message
+                        tool_calls = result.tool_calls
 
                 if assistant_message is not None:
                     messages.append(assistant_message)
@@ -2090,9 +2099,7 @@ class CayuApp:
         environment_name: str | None,
         step: int,
         retry_policy: RetryPolicy,
-    ) -> AsyncIterator[
-        tuple[Event | None, tuple[Message | None, list[runtime_records.ToolCallRequest]] | None]
-    ]:
+    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         attempt = 1
         while True:
@@ -2115,7 +2122,7 @@ class CayuApp:
                 None,
             )
             try:
-                result: tuple[Message | None, list[runtime_records.ToolCallRequest]] | None = None
+                result: AssistantStepResult | None = None
                 async for event, step_result in self._run_model_step_once(
                     provider=provider,
                     model_request=model_request,
@@ -2192,12 +2199,12 @@ class CayuApp:
         step: int,
         attempt: int,
         max_attempts: int,
-    ) -> AsyncIterator[
-        tuple[Event | None, tuple[Message | None, list[runtime_records.ToolCallRequest]] | None]
-    ]:
+    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[transcript_helpers.AssistantTextPart | ToolCallPart] = []
         tool_calls: list[runtime_records.ToolCallRequest] = []
         provider_state_parts: list[ProviderStatePart] = []
+        completed_stream_event: ModelStreamEvent | None = None
+        step_result: AssistantStepResult | None = None
         model_completed = False
         try:
             async for raw_stream_event in provider.stream(model_request):
@@ -2232,9 +2239,35 @@ class CayuApp:
                     )
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
                     model_completed = True
+                    completed_stream_event = stream_event
                     provider_state_parts = transcript_helpers.provider_state_parts(
                         stream_event.payload,
                     )
+                    assistant_message = transcript_helpers.assistant_message(
+                        content_parts=assistant_parts,
+                        provider_state_parts=provider_state_parts,
+                    )
+                    step_result = _assistant_step_result(
+                        session_id=session.id,
+                        step=step,
+                        assistant_message=assistant_message,
+                        tool_calls=tool_calls,
+                        completion=_stream_event_completion(completed_stream_event),
+                    )
+                    classification = classify_assistant_step(step_result)
+                    event = _model_stream_event_to_runtime_event(
+                        stream_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        provider_name=registered_provider.name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        classification=classification.payload(),
+                    )
+                    yield await self._emit(event), None
+                    continue
 
                 event = _model_stream_event_to_runtime_event(
                     stream_event,
@@ -2287,12 +2320,11 @@ class CayuApp:
                 cause=RuntimeError(message),
             )
         await self._raise_if_session_interrupted(session.id)
-
-        assistant_message = transcript_helpers.assistant_message(
-            content_parts=assistant_parts,
-            provider_state_parts=provider_state_parts,
-        )
-        yield None, (assistant_message, tool_calls)
+        if completed_stream_event is None:
+            raise RuntimeError("Model provider completed without completion metadata.")
+        if step_result is None:
+            raise RuntimeError("Model provider completed without an assistant step result.")
+        yield None, step_result
 
     async def _sleep_before_retry(
         self,
@@ -4108,6 +4140,7 @@ def _model_stream_event_to_runtime_event(
     step: int,
     attempt: int,
     max_attempts: int,
+    classification: dict[str, str] | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -4126,6 +4159,14 @@ def _model_stream_event_to_runtime_event(
         )
     if stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
+        completion = _stream_event_completion(stream_event)
+        payload["completion"] = {
+            "finish_reason": completion.finish_reason.value,
+            "raw_finish_reason": completion.raw_finish_reason,
+            "status": completion.status,
+        }
+        if classification is not None:
+            payload["step_classification"] = classification
         usage_metrics = usage_metrics_payload(
             normalize_usage_metrics(
                 provider_name=provider_name,
@@ -4162,6 +4203,37 @@ def _model_stream_event_to_runtime_event(
             ),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _stream_event_completion(stream_event: ModelStreamEvent) -> ModelCompletion:
+    if type(stream_event) is not ModelStreamEvent:
+        raise TypeError("Model stream events must be ModelStreamEvent instances.")
+    if stream_event.type != ModelStreamEventType.COMPLETED:
+        raise ValueError("Only completed model stream events have completion metadata.")
+    if stream_event.completion is not None:
+        return stream_event.completion
+    return normalize_model_completion(stream_event.payload)
+
+
+def _assistant_step_result(
+    *,
+    session_id: str,
+    step: int,
+    assistant_message: Message | None,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    completion: ModelCompletion,
+) -> AssistantStepResult:
+    text_content = assistant_text_content(assistant_message)
+    return AssistantStepResult(
+        session_id=session_id,
+        step=step,
+        assistant_message=assistant_message,
+        tool_calls=list(tool_calls),
+        completion=completion,
+        text_content=text_content,
+        has_user_visible_content=bool(text_content.strip()),
+        provider_state_count=provider_state_count(assistant_message),
+    )
 
 
 def _retry_attempt_payload(

@@ -242,6 +242,15 @@ exact provider payload. If a provider reports usage fields Cayu does not
 understand yet, the event still keeps raw `usage` even when `usage_metrics` is
 absent.
 
+`model.completed` events also include provider-neutral `completion` metadata and
+runtime `step_classification` telemetry. `completion.finish_reason` normalizes
+provider stop reasons into values such as `stop`, `tool_calls`, `length`,
+`content_filter`, `error`, or `unknown`, while keeping raw provider values beside
+it. `step_classification` tells apps whether the assembled assistant step should
+be viewed as `continue`, `final`, `length`, `filtered`, `failed`, `think_only`,
+or `invalid`. These fields are intended for dashboards, stop policies,
+structured-output policies, and future subagent orchestration.
+
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
 `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,

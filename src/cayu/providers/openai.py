@@ -25,7 +25,14 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
-from cayu.providers.base import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.base import (
+    ModelCompletion,
+    ModelFinishReason,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelStreamEventType,
+)
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
@@ -504,6 +511,7 @@ def _completed_event_from_response(
     response: Mapping[str, Any],
     provider_state_items: list[dict[str, Any]] | None = None,
     *,
+    completion_output_items: list[Mapping[str, Any]] | None = None,
     reasoning_state: str = "inline",
 ) -> ModelStreamEvent:
     if provider_state_items is None:
@@ -515,19 +523,77 @@ def _completed_event_from_response(
                 *provider_state_items,
                 {"provider": "openai", "state": {"type": "response_ref", "id": response_id}},
             ]
-    return ModelStreamEvent.completed(
-        {
-            "id": _optional_string(response, "id"),
-            "model": _optional_string(response, "model"),
-            "status": _optional_string(response, "status"),
-            "provider_state": provider_state_items,
-            "usage": copy_json_value(response.get("usage"), "usage"),
-            "incomplete_details": copy_json_value(
-                response.get("incomplete_details"),
-                "incomplete_details",
-            ),
-        }
+    payload = {
+        "id": _optional_string(response, "id"),
+        "model": _optional_string(response, "model"),
+        "status": _optional_string(response, "status"),
+        "provider_state": provider_state_items,
+        "usage": copy_json_value(response.get("usage"), "usage"),
+        "incomplete_details": copy_json_value(
+            response.get("incomplete_details"),
+            "incomplete_details",
+        ),
+    }
+    return ModelStreamEvent(
+        type=ModelStreamEventType.COMPLETED,
+        payload=payload,
+        completion=_openai_completion_from_response(
+            response,
+            output_items=completion_output_items,
+        ),
     )
+
+
+def _openai_completion_from_response(
+    response: Mapping[str, Any],
+    *,
+    output_items: list[Mapping[str, Any]] | None = None,
+) -> ModelCompletion:
+    status = _optional_string(response, "status")
+    raw_finish_reason = _openai_raw_finish_reason(response)
+    if status == "failed":
+        finish_reason = ModelFinishReason.ERROR
+    elif status == "incomplete":
+        finish_reason = _openai_incomplete_finish_reason(raw_finish_reason)
+    elif _output_items_have_function_call(
+        output_items if output_items is not None else _openai_output_items(response)
+    ):
+        finish_reason = ModelFinishReason.TOOL_CALLS
+    elif status == "completed":
+        finish_reason = ModelFinishReason.STOP
+    else:
+        finish_reason = ModelFinishReason.UNKNOWN
+    return ModelCompletion(
+        finish_reason=finish_reason,
+        raw_finish_reason=raw_finish_reason,
+        status=status,
+    )
+
+
+def _openai_raw_finish_reason(response: Mapping[str, Any]) -> str | None:
+    incomplete_details = response.get("incomplete_details")
+    if isinstance(incomplete_details, Mapping):
+        return _optional_string(incomplete_details, "reason")
+    return None
+
+
+def _openai_incomplete_finish_reason(raw_finish_reason: str | None) -> ModelFinishReason:
+    if raw_finish_reason in {"max_output_tokens", "max_tokens", "length"}:
+        return ModelFinishReason.LENGTH
+    if raw_finish_reason in {"content_filter", "safety", "refusal"}:
+        return ModelFinishReason.CONTENT_FILTER
+    return ModelFinishReason.UNKNOWN
+
+
+def _openai_output_items(response: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    output = response.get("output")
+    if not isinstance(output, list):
+        return []
+    return [item for item in output if isinstance(item, Mapping)]
+
+
+def _output_items_have_function_call(output_items: list[Mapping[str, Any]]) -> bool:
+    return any(item.get("type") == "function_call" for item in output_items)
 
 
 def _stream_completed_event(
@@ -539,8 +605,12 @@ def _stream_completed_event(
     response = _stream_response_object(event)
     if response.get("output") is None:
         provider_state_items = _provider_state_items_from_output_items(fallback_output_items)
+        completion_output_items = list(_sorted_output_items(fallback_output_items))
         return _completed_event_from_response(
-            response, provider_state_items, reasoning_state=reasoning_state
+            response,
+            provider_state_items,
+            completion_output_items=completion_output_items,
+            reasoning_state=reasoning_state,
         )
     return _completed_event_from_response(response, reasoning_state=reasoning_state)
 
@@ -570,12 +640,17 @@ def _provider_state_items_from_output_items(
     output_items: Mapping[int, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     provider_state_items: list[dict[str, Any]] = []
-    for output_index in sorted(output_items):
-        item = output_items[output_index]
+    for item in _sorted_output_items(output_items):
         provider_state_items.append(
             {"provider": "openai", "state": copy_json_value(item, "output_item")}
         )
     return provider_state_items
+
+
+def _sorted_output_items(
+    output_items: Mapping[int, Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    return [output_items[output_index] for output_index in sorted(output_items)]
 
 
 def _record_stream_output_item_added(

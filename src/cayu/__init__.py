@@ -61,7 +61,7 @@ from cayu.mcp import (
     mcp_cayu_tool_name,
 )
 from cayu.observability import LoggingEventSink
-from cayu.providers import AnthropicProvider, OpenAIProvider
+from cayu.providers import AnthropicProvider, ModelCompletion, ModelFinishReason, OpenAIProvider
 from cayu.runners import (
     DEFAULT_E2B_CWD,
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -317,6 +317,8 @@ __all__ = [
     "MicrosandboxRunner",
     "MicrosandboxWorkspace",
     "ModelCompactor",
+    "ModelCompletion",
+    "ModelFinishReason",
     "ModelPricing",
     "OpenAIProvider",
     "PdfArtifactReader",

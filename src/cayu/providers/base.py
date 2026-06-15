@@ -3,9 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.messages import Message, copy_message
@@ -16,6 +16,41 @@ class ModelStreamEventType(StrEnum):
     TOOL_CALL = "tool_call"
     COMPLETED = "completed"
     ERROR = "error"
+
+
+class ModelFinishReason(StrEnum):
+    STOP = "stop"
+    TOOL_CALLS = "tool_calls"
+    LENGTH = "length"
+    CONTENT_FILTER = "content_filter"
+    ERROR = "error"
+    UNKNOWN = "unknown"
+
+
+class ModelCompletion(BaseModel):
+    """Provider-neutral completion metadata for a model step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finish_reason: ModelFinishReason
+    raw_finish_reason: str | None = None
+    status: str | None = None
+
+    @field_validator("finish_reason", mode="before")
+    @classmethod
+    def validate_finish_reason(cls, value: object) -> ModelFinishReason:
+        if isinstance(value, ModelFinishReason):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("`finish_reason` must be a string.")
+        return ModelFinishReason(require_clean_nonblank(value, "finish_reason"))
+
+    @field_validator("raw_finish_reason", "status")
+    @classmethod
+    def validate_optional_clean_string(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
 
 
 class ModelRequest(BaseModel):
@@ -55,6 +90,7 @@ class ModelStreamEvent(BaseModel):
     type: ModelStreamEventType
     delta: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    completion: ModelCompletion | None = None
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -69,6 +105,16 @@ class ModelStreamEvent(BaseModel):
         if not isinstance(value, str):
             raise ValueError("`type` must be a string.")
         return ModelStreamEventType(require_clean_nonblank(value, "type"))
+
+    @model_validator(mode="after")
+    def validate_completion(self) -> ModelStreamEvent:
+        if self.type == ModelStreamEventType.COMPLETED:
+            if self.completion is None:
+                self.completion = normalize_model_completion(self.payload)
+            return self
+        if self.completion is not None:
+            raise ValueError("Only completed model stream events can include completion metadata.")
+        return self
 
     @classmethod
     def text_delta(cls, delta: str) -> ModelStreamEvent:
@@ -94,9 +140,10 @@ class ModelStreamEvent(BaseModel):
 
     @classmethod
     def completed(cls, payload: dict[str, Any] | None = None) -> ModelStreamEvent:
+        payload = {} if payload is None else payload
         return cls(
             type=ModelStreamEventType.COMPLETED,
-            payload={} if payload is None else payload,
+            payload=payload,
         )
 
     @classmethod
@@ -121,7 +168,97 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
         type=event_type,
         delta=event.delta,
         payload=copy_json_value(event.payload, "payload"),
+        completion=copy_model_completion(event.completion),
     )
+
+
+def copy_model_completion(completion: ModelCompletion | None) -> ModelCompletion | None:
+    if completion is None:
+        return None
+    if type(completion) is not ModelCompletion:
+        raise TypeError("Model completion must be a ModelCompletion instance.")
+    return ModelCompletion(
+        finish_reason=completion.finish_reason,
+        raw_finish_reason=completion.raw_finish_reason,
+        status=completion.status,
+    )
+
+
+def normalize_model_completion(payload: dict[str, Any]) -> ModelCompletion:
+    """Normalize known provider completion payloads without discarding raw fields."""
+
+    if type(payload) is not dict:
+        raise ValueError("Model completed payload must be a dictionary.")
+    status = _optional_payload_string(payload, "status")
+    raw_finish_reason = _raw_finish_reason(payload)
+    finish_reason = _normalized_finish_reason(
+        raw_finish_reason=raw_finish_reason,
+        status=status,
+        incomplete_details=payload.get("incomplete_details"),
+    )
+    return ModelCompletion(
+        finish_reason=finish_reason,
+        raw_finish_reason=raw_finish_reason,
+        status=status,
+    )
+
+
+def _raw_finish_reason(payload: dict[str, Any]) -> str | None:
+    for key in ("finish_reason", "stop_reason", "reason"):
+        value = _optional_payload_string(payload, key)
+        if value is not None:
+            return value
+    incomplete_details = payload.get("incomplete_details")
+    if isinstance(incomplete_details, dict):
+        return _optional_payload_string(incomplete_details, "reason")
+    return None
+
+
+def _normalized_finish_reason(
+    *,
+    raw_finish_reason: str | None,
+    status: str | None,
+    incomplete_details: object,
+) -> ModelFinishReason:
+    if status == "failed":
+        return ModelFinishReason.ERROR
+    if status == "incomplete":
+        reason = raw_finish_reason
+        if reason in {"max_output_tokens", "max_tokens", "length"}:
+            return ModelFinishReason.LENGTH
+        if reason in {"content_filter", "safety", "refusal"}:
+            return ModelFinishReason.CONTENT_FILTER
+        return ModelFinishReason.UNKNOWN
+    if raw_finish_reason is None:
+        return ModelFinishReason.UNKNOWN
+    if raw_finish_reason in {"stop", "end_turn"}:
+        return ModelFinishReason.STOP
+    if raw_finish_reason in {"tool_calls", "tool_use"}:
+        return ModelFinishReason.TOOL_CALLS
+    if raw_finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+        return ModelFinishReason.LENGTH
+    if raw_finish_reason in {"content_filter", "safety", "refusal"}:
+        return ModelFinishReason.CONTENT_FILTER
+    if raw_finish_reason in {"error", "failed"}:
+        return ModelFinishReason.ERROR
+    if isinstance(incomplete_details, dict):
+        reason = _optional_payload_string(cast("dict[str, Any]", incomplete_details), "reason")
+        if reason is not None:
+            return _normalized_finish_reason(
+                raw_finish_reason=reason,
+                status="incomplete",
+                incomplete_details=None,
+            )
+    return ModelFinishReason.UNKNOWN
+
+
+def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
+    if key not in payload or payload[key] is None:
+        return None
+    value = payload[key]
+    if type(value) is not str:
+        raise ValueError(f"Model completed payload `{key}` must be a string.")
+    return require_clean_nonblank(value, key)
 
 
 class ModelProvider(ABC):

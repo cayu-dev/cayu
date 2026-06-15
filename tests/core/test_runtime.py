@@ -8600,10 +8600,57 @@ def test_cayu_app_ignores_blank_text_deltas():
         EventType.MODEL_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
+    assert events[4].payload["completion"] == {
+        "finish_reason": "stop",
+        "raw_finish_reason": "stop",
+        "status": None,
+    }
+    assert events[4].payload["step_classification"] == {
+        "type": "invalid",
+        "reason": "assistant produced no tool calls and no user-visible content",
+    }
     assert len(provider.requests) == 1
     assert len(provider.requests[0].messages) == 1
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_records_model_step_classification_for_length_finish():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("partial"),
+            ModelStreamEvent.completed(
+                {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_length_finish",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    model_completed = events[3]
+
+    assert model_completed.type == EventType.MODEL_COMPLETED
+    assert model_completed.payload["completion"] == {
+        "finish_reason": "length",
+        "raw_finish_reason": "max_output_tokens",
+        "status": "incomplete",
+    }
+    assert model_completed.payload["step_classification"]["type"] == "length"
 
 
 def test_in_memory_session_store_rejects_duplicate_session_ids():

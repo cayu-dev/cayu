@@ -203,6 +203,46 @@ The initial `CayuApp` runtime registers agent specs, model providers, and tools,
 
 `CayuApp.run()` and `CayuApp.resume()` are event-stream APIs. Runtime failures are represented as terminal `session.failed` events rather than re-raised exceptions from the iterator. A stricter programmatic API can be added later on top of the same runtime path.
 
+## Model Step Outcomes
+
+Provider `completed` stream events keep their raw provider payload in the
+durable `model.completed` event and also include normalized completion metadata:
+
+```json
+{
+  "completion": {
+    "finish_reason": "stop",
+    "raw_finish_reason": "end_turn",
+    "status": "completed"
+  }
+}
+```
+
+`completion.finish_reason` is Cayu's provider-neutral finish reason. Current
+values are `stop`, `tool_calls`, `length`, `content_filter`, `error`, and
+`unknown`. `raw_finish_reason` and `status` preserve the provider-facing values
+when they exist.
+
+The runtime also classifies the assembled assistant step and stores that in
+`model.completed.step_classification`. The classifier is based on the assistant
+message, tool calls, provider state, and normalized completion metadata. Current
+types are:
+
+- `continue`: the assistant requested tool calls.
+- `final`: the assistant produced user-visible content and no tool calls.
+- `length`: the provider stopped because an output limit was reached.
+- `filtered`: the provider stopped because content was filtered.
+- `failed`: the provider reported a failed model step.
+- `think_only`: the provider returned continuation state but no visible text or
+  tool calls.
+- `invalid`: the step had no visible content, tool calls, or provider state.
+
+This classification is observability and policy input. The default runtime loop
+still continues on tool calls and stops when there are no tool calls. Repair
+policies, structured-output retry, length continuation, and goal/task gates
+should build on this typed step outcome instead of parsing raw provider payloads
+or guessing from transcript shape.
+
 ## Usage Metrics
 
 Provider `completed` stream events may include the provider's raw `usage` payload.

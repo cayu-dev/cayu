@@ -11,11 +11,14 @@ from cayu.providers.anthropic import (
     build_anthropic_payload,
 )
 from cayu.providers.base import (
+    ModelCompletion,
+    ModelFinishReason,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
     copy_model_stream_event,
+    normalize_model_completion,
 )
 from cayu.providers.openai import (
     HttpxOpenAITransport,
@@ -36,6 +39,8 @@ __all__ = [
     "AnthropicTransport",
     "HttpxAnthropicTransport",
     "HttpxOpenAITransport",
+    "ModelCompletion",
+    "ModelFinishReason",
     "ModelProvider",
     "ModelRequest",
     "ModelStreamEvent",
@@ -49,5 +54,6 @@ __all__ = [
     "build_anthropic_payload",
     "build_openai_payload",
     "copy_model_stream_event",
+    "normalize_model_completion",
     "openai_response_events",
 ]
