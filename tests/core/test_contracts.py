@@ -54,6 +54,7 @@ from cayu.runtime import (
     SessionStore,
     StaticToolPolicy,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
@@ -1038,13 +1039,20 @@ def test_structured_output_spec_validates_json_schema_and_options():
     }
 
     spec = StructuredOutputSpec(name="answer", json_schema=schema, max_retries=2)
+    default_spec = StructuredOutputSpec(json_schema=schema)
 
     assert spec.name == "answer"
     assert spec.json_schema == schema
     assert spec.max_retries == 2
+    assert default_spec.max_retries == 2
+    assert spec.strategy == StructuredOutputStrategy.TOOL
+
+    native_spec = StructuredOutputSpec(json_schema=schema, strategy="native")
+    assert native_spec.strategy == StructuredOutputStrategy.NATIVE
 
     schema["required"].append("mutated")
     assert spec.json_schema["required"] == ["answer"]
+    assert native_spec.json_schema["required"] == ["answer"]
 
     with pytest.raises(ValidationError, match="Invalid structured output JSON Schema"):
         StructuredOutputSpec(json_schema={"type": "not-a-json-schema-type"})
@@ -1060,6 +1068,9 @@ def test_structured_output_spec_validates_json_schema_and_options():
 
     with pytest.raises(ValidationError):
         StructuredOutputSpec(json_schema=schema, max_retries=9)
+
+    with pytest.raises(ValidationError):
+        StructuredOutputSpec(json_schema=schema, strategy="unknown")
 
 
 def test_run_and_resume_requests_copy_structured_output_spec():
@@ -1088,6 +1099,8 @@ def test_run_and_resume_requests_copy_structured_output_spec():
     assert resume.structured_output is not None
     assert request.structured_output.json_schema["required"] == ["answer"]
     assert resume.structured_output.json_schema["required"] == ["answer"]
+    assert request.structured_output.strategy == spec.strategy
+    assert resume.structured_output.strategy == spec.strategy
 
 
 def test_runtime_identity_models_reject_blank_fields():

@@ -11,6 +11,7 @@ from cayu import (
     OpenAIProvider,
     RunRequest,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
 )
 
 INVOICE_SCHEMA = {
@@ -49,6 +50,9 @@ INVOICE_SCHEMA = {
 async def main() -> None:
     provider_name = _provider_name()
     model = _model(provider_name)
+    strategy = _strategy()
+    if strategy == StructuredOutputStrategy.NATIVE and provider_name != "openai":
+        raise RuntimeError("Native structured output in this example currently requires OpenAI.")
 
     app = CayuApp()
     if provider_name == "openai":
@@ -66,15 +70,13 @@ async def main() -> None:
         AgentSpec(
             name="assistant",
             model=model,
-            system_prompt=(
-                "Extract invoice facts. Use the structured-output tool when the "
-                "final answer is ready. Do not return final JSON as plain text."
-            ),
+            system_prompt=_system_prompt(strategy),
         )
     )
 
     print("provider", provider_name)
     print("model", model)
+    print("strategy", strategy)
 
     request = RunRequest(
         agent_name="assistant",
@@ -92,10 +94,13 @@ async def main() -> None:
         structured_output=StructuredOutputSpec(
             name="invoice_status",
             json_schema=INVOICE_SCHEMA,
-            max_retries=1,
+            max_retries=2,
+            strategy=strategy,
             repair_prompt=(
                 "Call the structured-output tool again with an `output` object "
                 "that exactly matches the invoice schema."
+                if strategy == StructuredOutputStrategy.TOOL
+                else "Return only valid JSON that exactly matches the invoice schema."
             ),
         ),
     )
@@ -127,6 +132,22 @@ def _model(provider_name: str) -> str:
     if provider_name == "openai":
         return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
     return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+
+def _strategy() -> StructuredOutputStrategy:
+    strategy = os.environ.get("CAYU_STRUCTURED_OUTPUT_STRATEGY", "tool").strip().lower()
+    if strategy not in {"tool", "native"}:
+        raise RuntimeError("CAYU_STRUCTURED_OUTPUT_STRATEGY must be tool or native.")
+    return StructuredOutputStrategy(strategy)
+
+
+def _system_prompt(strategy: StructuredOutputStrategy) -> str:
+    if strategy == StructuredOutputStrategy.NATIVE:
+        return "Extract invoice facts."
+    return (
+        "Extract invoice facts. Use the structured-output tool when the final answer "
+        "is ready. Do not return final JSON as plain text."
+    )
 
 
 if __name__ == "__main__":

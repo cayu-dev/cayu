@@ -251,9 +251,9 @@ be viewed as `continue`, `final`, `length`, `filtered`, `failed`, `think_only`,
 or `invalid`. These fields are intended for dashboards, stop policies,
 structured-output policies, and future subagent orchestration.
 
-Add structured output to a run or resume with `StructuredOutputSpec`. Cayu
-injects a runtime-owned final-output tool, validates the submitted value against
-your JSON Schema, and emits durable structured-output events:
+Add structured output to a run or resume with `StructuredOutputSpec`. By
+default, Cayu injects a runtime-owned final-output tool, validates the submitted
+value against your JSON Schema, and emits durable structured-output events:
 
 ```python
 from cayu import Message, RunRequest, StructuredOutputSpec
@@ -272,19 +272,21 @@ request = RunRequest(
             "required": ["status", "confidence"],
             "additionalProperties": False,
         },
-        max_retries=1,
+        max_retries=2,
+        strategy="tool",
     ),
 )
 ```
 
-When `structured_output` is present, the model sees an internal
+When `strategy="tool"` is used, the model sees an internal
 `__cayu_submit_structured_output` tool and provider-facing guidance telling it to
 call that tool when the final answer is ready. The tool takes one argument,
 `output`, whose value must match your schema. Cayu writes a tool result to close
 that provider tool round before completing or retrying, so transcript history
 remains valid.
 
-If tool-submitted output is invalid, Cayu emits `structured_output.failed`,
+`max_retries` defaults to `2`, which allows the initial attempt plus two repair
+attempts. If tool-submitted output is invalid, Cayu emits `structured_output.failed`,
 returns an error tool result, emits `structured_output.retry` when retries and
 model steps remain, and lets the model repair on the next step. If the model
 ignores the final-output tool and returns plain final text, Cayu treats that as
@@ -298,6 +300,22 @@ run user code, does not go through tool approval, and does not count against
 user tool-call limits. If the model calls it in the same round as other tools,
 Cayu rejects the whole round with tool-result errors instead of executing side
 effects.
+
+OpenAI can also use provider-native structured output:
+
+```python
+StructuredOutputSpec(
+    name="invoice_status",
+    json_schema={...},
+    strategy="native",
+)
+```
+
+For OpenAI, Cayu maps this to the Responses API `text.format` JSON-schema mode
+and still validates the final JSON in the runtime before emitting
+`structured_output.validated`. Providers that do not advertise native structured
+output reject `strategy="native"` before making a model request. The portable
+`tool` strategy remains the default.
 
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports

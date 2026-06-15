@@ -169,6 +169,7 @@ class OpenAIProvider(ModelProvider):
     """OpenAI Responses API adapter for Cayu's provider-neutral runtime."""
 
     name = "openai"
+    supports_native_structured_output = True
 
     def __init__(
         self,
@@ -267,6 +268,9 @@ def build_openai_payload(
         raise TypeError("OpenAI payload chain must be a bool.")
 
     options = _openai_options(request.options)
+    structured_output_format = _openai_structured_output_format(request.options)
+    if structured_output_format is not None and "text" in options:
+        raise ValueError("OpenAI option text cannot be combined with native structured output.")
     payload: dict[str, Any] = {
         "model": request.model,
         "input": [],
@@ -305,6 +309,8 @@ def build_openai_payload(
     tools = [_openai_tool(tool) for tool in request.tools]
     if tools:
         payload["tools"] = tools
+    if structured_output_format is not None:
+        payload["text"] = {"format": structured_output_format}
     # Ask for encrypted reasoning content. Under store=false, reasoning output
     # items carry only an rs_ id that the server cannot resolve on the next call
     # (HTTP 404). Requesting reasoning.encrypted_content attaches an opaque blob
@@ -827,6 +833,29 @@ def _openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
         if key in _RESERVED_OPENAI_OPTIONS:
             raise ValueError(f"OpenAI option is reserved: {key}")
     return copied
+
+
+def _openai_structured_output_format(options: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = options.get("structured_output")
+    if raw is None:
+        return None
+    if type(raw) is not dict:
+        raise ValueError("ModelRequest options.structured_output must be an object.")
+    strategy = raw.get("strategy", "tool")
+    if strategy != "native":
+        return None
+    schema = raw.get("schema")
+    if type(schema) is not dict:
+        raise ValueError("Native structured output schema must be an object.")
+    name = raw.get("name") or "structured_output"
+    if not isinstance(name, str):
+        raise ValueError("Native structured output name must be a string.")
+    return {
+        "type": "json_schema",
+        "name": require_clean_nonblank(name, "structured_output.name"),
+        "schema": copy_json_value(schema, "structured_output.schema"),
+        "strict": True,
+    }
 
 
 def _system_text(messages: list[Message]) -> str:

@@ -103,6 +103,10 @@ class OtherProvider(FakeProvider):
     name = "other"
 
 
+class NativeStructuredOutputFakeProvider(FakeProvider):
+    supports_native_structured_output = True
+
+
 class MutatingProvider(FakeProvider):
     def __init__(self) -> None:
         super().__init__(
@@ -9237,6 +9241,159 @@ def test_cayu_app_does_not_count_structured_output_tool_against_tool_call_limit(
     assert events[7].payload["output"] == {"answer": "done"}
 
 
+def test_cayu_app_validates_native_structured_output_final_text():
+    store = InMemorySessionStore()
+    provider = NativeStructuredOutputFakeProvider(
+        [
+            ModelStreamEvent.text_delta('{"answer":"ok"}'),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_native_valid",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    name="answer",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    strategy="native",
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_native_valid"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[4].payload["output"] == {"answer": "ok"}
+    assert provider.requests[0].options["structured_output"]["strategy"] == "native"
+    assert provider.requests[0].tools == []
+    assert [message.role for message in provider.requests[0].messages] == ["user"]
+    assert [message.role for message in transcript] == ["user", "assistant"]
+
+
+def test_cayu_app_retries_invalid_native_structured_output_final_text():
+    store = InMemorySessionStore()
+    provider = NativeStructuredOutputFakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta('{"wrong":"value"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"fixed"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_native_retry",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    max_retries=1,
+                    strategy="native",
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_native_retry"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.STRUCTURED_OUTPUT_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[4].payload["errors"][0]["path"] == "$"
+    assert events[9].payload["output"] == {"answer": "fixed"}
+    repair_message = transcript[2].content[0].text
+    assert "Return only valid JSON" in repair_message
+    assert STRUCTURED_OUTPUT_TOOL_NAME not in repair_message
+
+
+def test_cayu_app_rejects_native_structured_output_for_unsupported_provider():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta('{"answer":"ok"}'),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_native_unsupported",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                    strategy="native",
+                ),
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_structured_output_native_unsupported"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[-1].payload["error"] == (
+        "Native structured output is not supported by provider: fake"
+    )
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert provider.requests == []
+
+
 def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -9470,6 +9627,68 @@ def test_cayu_app_validates_structured_output_only_after_tool_round_finishes():
     ]
     assert len(provider.requests) == 2
     assert events[7].payload["output"] == {"answer": "from tool"}
+
+
+def test_cayu_app_validates_native_structured_output_only_after_tool_round_finishes():
+    store = InMemorySessionStore()
+    provider = NativeStructuredOutputFakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "from tool"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"from tool"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_native_structured_output_after_tool",
+                messages=[Message.text("user", "use tool then answer with json")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                    strategy="native",
+                ),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+    assert provider.requests[0].options["structured_output"]["strategy"] == "native"
+    assert provider.requests[1].options["structured_output"]["strategy"] == "native"
+    assert events[8].payload["output"] == {"answer": "from tool"}
 
 
 def test_in_memory_session_store_rejects_duplicate_session_ids():

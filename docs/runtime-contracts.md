@@ -245,13 +245,15 @@ or guessing from transcript shape.
 
 ## Structured Output
 
-`StructuredOutputSpec` is the provider-neutral contract for final JSON output.
-It can be attached to `RunRequest`, `ResumeRequest`, `DispatchRequest`,
+`StructuredOutputSpec` is the contract for final JSON output. It can be
+attached to `RunRequest`, `ResumeRequest`, `DispatchRequest`,
 `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. The spec contains a
-`json_schema` object, an optional name, a bounded `max_retries`, and an optional
-repair prompt.
+`json_schema` object, an optional name, a bounded `max_retries`, an optional
+repair prompt, and a `strategy`. `max_retries` defaults to `2`, meaning the
+initial model attempt may be followed by two repair attempts. The default
+strategy is `tool`, which is the provider-neutral portable path.
 
-When the spec is present, Cayu adds a runtime-owned
+When `strategy="tool"` is present, Cayu adds a runtime-owned
 `__cayu_submit_structured_output` tool to provider requests and injects
 provider-facing system guidance. The tool takes a single `output` argument. Cayu
 validates that value against the spec's schema. The tool is internal runtime
@@ -280,9 +282,13 @@ the model again. Cayu writes that repair message only when another model step is
 available. If retries are exhausted, or no model step remains for repair, the
 session fails with `session.failed`.
 
-Provider adapters may later use `ModelRequest.options["structured_output"]` for
-native JSON-schema enforcement, but Cayu's runtime-owned final-output tool and
-runtime validation remain the provider-neutral correctness boundary.
+When `strategy="native"` is present, Cayu requires a provider that explicitly
+supports native structured output. OpenAI maps the spec to the Responses API
+`text.format` JSON-schema request shape. In native mode, Cayu does not inject the
+runtime final-output tool; it validates the final assistant text as JSON against
+the same schema before emitting `structured_output.validated`. Runtime
+validation remains the correctness boundary, even when the provider also
+enforces the schema.
 
 ## Usage Metrics
 

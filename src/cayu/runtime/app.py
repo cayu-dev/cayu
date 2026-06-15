@@ -129,6 +129,7 @@ from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputError,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     StructuredOutputValidation,
     copy_structured_output_spec,
     structured_output_repair_lead,
@@ -137,6 +138,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_required_validation,
     structured_output_tool_spec,
+    validate_structured_output_text,
     validate_structured_output_tool_arguments,
 )
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
@@ -1282,7 +1284,7 @@ class CayuApp:
                         environment_name=environment_name,
                         payload={
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(),
+                            "approval": pending_approval.model_dump(mode="json"),
                             "error": str(exc),
                             "error_type": type(exc).__name__,
                             "approval_id": pending_approval.approval_id,
@@ -1312,7 +1314,7 @@ class CayuApp:
                         environment_name=environment_name,
                         payload={
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(),
+                            "approval": pending_approval.model_dump(mode="json"),
                             "error": str(exc),
                             "error_type": type(exc).__name__,
                         },
@@ -1569,6 +1571,15 @@ class CayuApp:
                         payload=start_event_payload,
                     )
                 )
+            if (
+                structured_output is not None
+                and structured_output.strategy == StructuredOutputStrategy.NATIVE
+                and not getattr(provider, "supports_native_structured_output", False)
+            ):
+                raise ValueError(
+                    "Native structured output is not supported by provider: "
+                    f"{registered_provider.name}"
+                )
             if task_id is not None and start_task_on_enter:
                 task = await self._start_task(task_id=task_id, session=session)
                 task_started = True
@@ -1677,7 +1688,10 @@ class CayuApp:
                     for tool in registered_agent.tools.values()
                 ]
                 model_messages = context_messages
-                if structured_output is not None:
+                if (
+                    structured_output is not None
+                    and structured_output.strategy == StructuredOutputStrategy.TOOL
+                ):
                     model_tools.append(structured_output_tool_spec(structured_output))
                     model_messages = _with_structured_output_tool_instruction(
                         context_messages,
@@ -1719,6 +1733,7 @@ class CayuApp:
                 )
 
                 assistant_message: Message | None = None
+                assistant_step_result: AssistantStepResult | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
                 async for event, result in self._run_model_step_with_retries(
                     provider=provider,
@@ -1733,6 +1748,7 @@ class CayuApp:
                     if event is not None:
                         yield event
                     if result is not None:
+                        assistant_step_result = result
                         assistant_message = result.assistant_message
                         tool_calls = result.tool_calls
 
@@ -1768,7 +1784,11 @@ class CayuApp:
                         yield event
                     return
 
-                if structured_output is not None and _has_structured_output_tool_call(tool_calls):
+                if (
+                    structured_output is not None
+                    and structured_output.strategy == StructuredOutputStrategy.TOOL
+                    and _has_structured_output_tool_call(tool_calls)
+                ):
                     validation = _validate_structured_output_tool_round(
                         tool_calls=tool_calls,
                         spec=structured_output,
@@ -1840,7 +1860,32 @@ class CayuApp:
 
                 if not tool_calls:
                     if structured_output is not None:
-                        validation = structured_output_tool_required_validation()
+                        if structured_output.strategy == StructuredOutputStrategy.NATIVE:
+                            if assistant_step_result is None:
+                                raise RuntimeError(
+                                    "Native structured output validation requires an "
+                                    "assistant step result."
+                                )
+                            validation = validate_structured_output_text(
+                                assistant_step_result.text_content,
+                                structured_output,
+                            )
+                            if validation.valid:
+                                yield await self._emit(
+                                    _structured_output_event(
+                                        event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
+                                        session=session,
+                                        registered_agent=registered_agent,
+                                        environment_name=environment_name,
+                                        spec=structured_output,
+                                        validation=validation,
+                                        step=step,
+                                        attempt=structured_output_retries + 1,
+                                    )
+                                )
+                                break
+                        else:
+                            validation = structured_output_tool_required_validation()
                         yield await self._emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_FAILED,
@@ -1977,7 +2022,7 @@ class CayuApp:
                                 environment_name=environment_name,
                                 tool_name=approval.tool_name,
                                 payload={
-                                    "approval": approval.model_dump(),
+                                    "approval": approval.model_dump(mode="json"),
                                 },
                             )
                         )
@@ -2147,7 +2192,7 @@ class CayuApp:
                     environment_name=environment_name,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                        "approval": exc.approval.model_dump(),
+                        "approval": exc.approval.model_dump(mode="json"),
                     },
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
@@ -2902,7 +2947,7 @@ class CayuApp:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
-                                "approval": approval.model_dump(),
+                                "approval": approval.model_dump(mode="json"),
                             },
                         )
                     ),
@@ -2998,7 +3043,9 @@ class CayuApp:
             ),
             structured_output=copy_structured_output_spec(structured_output),
         )
-        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump()
+        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
+            mode="json"
+        )
         await self.session_store.checkpoint(session.id, checkpoint)
         return (
             approval,

@@ -94,6 +94,7 @@ from cayu.runtime.stop_policy import (
 from cayu.runtime.structured_output import (
     StructuredOutputError,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     StructuredOutputValidation,
 )
 from cayu.runtime.tasks import (
@@ -184,6 +185,7 @@ __all__ = [
     "StopLimit",
     "StructuredOutputError",
     "StructuredOutputSpec",
+    "StructuredOutputStrategy",
     "StructuredOutputValidation",
     "Task",
     "TaskCreate",

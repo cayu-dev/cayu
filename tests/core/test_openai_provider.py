@@ -204,6 +204,80 @@ def test_build_openai_payload_passes_provider_cache_options() -> None:
     assert payload["prompt_cache_retention"] == "24h"
 
 
+def test_build_openai_payload_maps_native_structured_output_to_text_format() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "answer")],
+        options={
+            "structured_output": {
+                "name": "answer_schema",
+                "schema": schema,
+                "strategy": "native",
+                "max_retries": 1,
+                "repair_prompt": None,
+            }
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "answer_schema",
+            "schema": schema,
+            "strict": True,
+        }
+    }
+    assert "tools" not in payload
+
+
+def test_build_openai_payload_ignores_tool_strategy_structured_output_option() -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "answer")],
+        options={
+            "structured_output": {
+                "name": "answer_schema",
+                "schema": {"type": "object"},
+                "strategy": "tool",
+                "max_retries": 1,
+                "repair_prompt": None,
+            }
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert "text" not in payload
+
+
+def test_build_openai_payload_rejects_openai_text_override_with_native_structured_output() -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "answer")],
+        options={
+            "openai": {"text": {"format": {"type": "text"}}},
+            "structured_output": {
+                "name": "answer_schema",
+                "schema": {"type": "object"},
+                "strategy": "native",
+                "max_retries": 1,
+                "repair_prompt": None,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with native structured output"):
+        build_openai_payload(request)
+
+
 def test_build_openai_payload_translates_file_attachments() -> None:
     attachment = file_attachment(
         artifact_id="art_pdf",

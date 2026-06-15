@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -12,6 +13,11 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
 
 
+class StructuredOutputStrategy(StrEnum):
+    TOOL = "tool"
+    NATIVE = "native"
+
+
 class StructuredOutputSpec(BaseModel):
     """Provider-neutral JSON structured output requirement."""
 
@@ -19,8 +25,18 @@ class StructuredOutputSpec(BaseModel):
 
     json_schema: dict[str, Any]
     name: str | None = None
-    max_retries: StrictInt = Field(default=1, ge=0, le=8)
+    max_retries: StrictInt = Field(default=2, ge=0, le=8)
     repair_prompt: str | None = None
+    strategy: StructuredOutputStrategy = StructuredOutputStrategy.TOOL
+
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def validate_strategy(cls, value: object) -> StructuredOutputStrategy:
+        if isinstance(value, StructuredOutputStrategy):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("Structured output strategy must be a string.")
+        return StructuredOutputStrategy(require_clean_nonblank(value, "strategy"))
 
     @field_validator("json_schema", mode="before")
     @classmethod
@@ -82,6 +98,7 @@ def copy_structured_output_spec(
         name=spec.name,
         max_retries=spec.max_retries,
         repair_prompt=spec.repair_prompt,
+        strategy=spec.strategy,
     )
 
 
@@ -170,7 +187,15 @@ def structured_output_repair_prompt(
 def structured_output_repair_lead(spec: StructuredOutputSpec) -> str:
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
-    return spec.repair_prompt or (
+    if spec.repair_prompt is not None:
+        return spec.repair_prompt
+    if spec.strategy == StructuredOutputStrategy.NATIVE:
+        return (
+            "Your previous response did not satisfy the required structured output contract. "
+            "Return only valid JSON that matches the schema. Do not include Markdown fences "
+            "or explanatory text."
+        )
+    return (
         "Your previous response did not satisfy the required structured output contract. "
         f"Call the `{STRUCTURED_OUTPUT_TOOL_NAME}` tool with an `output` argument that "
         "matches the schema. Do not return the final structured output as plain text."
@@ -249,11 +274,17 @@ def structured_output_tool_required_validation() -> StructuredOutputValidation:
 def structured_output_spec_payload(spec: StructuredOutputSpec) -> dict[str, Any]:
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    strategy = (
+        spec.strategy.value
+        if isinstance(spec.strategy, StructuredOutputStrategy)
+        else spec.strategy
+    )
     return {
         "name": spec.name,
         "schema": copy_json_value(spec.json_schema, "json_schema"),
         "max_retries": spec.max_retries,
         "repair_prompt": spec.repair_prompt,
+        "strategy": strategy,
     }
 
 
