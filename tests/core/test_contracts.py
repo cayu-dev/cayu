@@ -53,6 +53,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
     StaticToolPolicy,
+    StructuredOutputSpec,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
@@ -145,16 +146,27 @@ def test_event_requires_namespace_for_custom_types():
 
 
 def test_dispatch_request_validates_boundary_data():
+    structured_output = StructuredOutputSpec(
+        json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+    )
     request = DispatchRequest(
         session_id="sess_dispatch",
         messages=[Message.text("user", "continue")],
         dispatch_id="dispatch_1",
         metadata={"source": "test"},
+        structured_output=structured_output,
     )
+    structured_output.json_schema["required"].append("mutated")
 
     assert request.session_id == "sess_dispatch"
     assert request.dispatch_id == "dispatch_1"
     assert request.metadata == {"source": "test"}
+    assert request.structured_output is not None
+    assert request.structured_output.json_schema["required"] == ["answer"]
 
     with pytest.raises(ValidationError, match="cannot be blank"):
         DispatchRequest(
@@ -1016,6 +1028,66 @@ def test_environment_spec_accepts_name_and_metadata():
     assert environment.runner is None
     assert environment.vault is None
     assert environment.mcp_servers == ()
+
+
+def test_structured_output_spec_validates_json_schema_and_options():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    spec = StructuredOutputSpec(name="answer", json_schema=schema, max_retries=2)
+
+    assert spec.name == "answer"
+    assert spec.json_schema == schema
+    assert spec.max_retries == 2
+
+    schema["required"].append("mutated")
+    assert spec.json_schema["required"] == ["answer"]
+
+    with pytest.raises(ValidationError, match="Invalid structured output JSON Schema"):
+        StructuredOutputSpec(json_schema={"type": "not-a-json-schema-type"})
+
+    with pytest.raises(ValidationError, match="JSON Schema must be an object"):
+        StructuredOutputSpec(json_schema=["not", "an", "object"])  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        StructuredOutputSpec(json_schema={"bad": object()})  # type: ignore[dict-item]
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        StructuredOutputSpec(name=" ", json_schema=schema)
+
+    with pytest.raises(ValidationError):
+        StructuredOutputSpec(json_schema=schema, max_retries=9)
+
+
+def test_run_and_resume_requests_copy_structured_output_spec():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    spec = StructuredOutputSpec(json_schema=schema)
+    request = RunRequest(
+        agent_name="assistant",
+        messages=[Message.text("user", "start")],
+        structured_output=spec,
+    )
+    resume = ResumeRequest(
+        session_id="sess_structured",
+        messages=[Message.text("user", "continue")],
+        structured_output=spec,
+    )
+
+    spec.json_schema["required"].append("mutated")
+
+    assert request.structured_output is not spec
+    assert resume.structured_output is not spec
+    assert request.structured_output is not None
+    assert resume.structured_output is not None
+    assert request.structured_output.json_schema["required"] == ["answer"]
+    assert resume.structured_output.json_schema["required"] == ["answer"]
 
 
 def test_runtime_identity_models_reject_blank_fields():

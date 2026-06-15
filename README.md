@@ -251,6 +251,44 @@ be viewed as `continue`, `final`, `length`, `filtered`, `failed`, `think_only`,
 or `invalid`. These fields are intended for dashboards, stop policies,
 structured-output policies, and future subagent orchestration.
 
+Add a structured-output validation foundation to a run or resume with
+`StructuredOutputSpec`. Cayu validates the final assistant response against your
+JSON Schema after tool rounds are complete:
+
+```python
+from cayu import Message, RunRequest, StructuredOutputSpec
+
+request = RunRequest(
+    agent_name="assistant",
+    messages=[Message.text("user", "Return the invoice status.")],
+    structured_output=StructuredOutputSpec(
+        name="invoice_status",
+        json_schema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["paid", "unpaid", "unknown"]},
+                "confidence": {"type": "number"},
+            },
+            "required": ["status", "confidence"],
+            "additionalProperties": False,
+        },
+        max_retries=1,
+    ),
+)
+```
+
+If validation fails, Cayu emits `structured_output.failed`. If retries and model
+steps remain, it appends a durable repair user message, emits
+`structured_output.retry`, and calls the model again. On success,
+`structured_output.validated` includes the parsed JSON output. If retries are
+exhausted, or no model step remains for repair, the session fails.
+
+This is the provider-neutral validation foundation. It does not yet add the
+runtime-owned final-output tool that tells the model from the first request to
+return the final answer through a structured-output tool call. That output-tool
+strategy is the next layer; provider-native schema enforcement can also be added
+by providers later using the same request option.
+
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
 `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,

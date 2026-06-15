@@ -35,6 +35,10 @@ class EventType(StrEnum):
     MODEL_ERROR = "model.error"
     MODEL_RETRY = "model.retry"
 
+    STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
+    STRUCTURED_OUTPUT_FAILED = "structured_output.failed"
+    STRUCTURED_OUTPUT_RETRY = "structured_output.retry"
+
     CONTEXT_COMPACTION_STARTED = "context.compaction.started"
     CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"
     CONTEXT_COMPACTION_FAILED = "context.compaction.failed"

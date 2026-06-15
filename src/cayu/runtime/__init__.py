@@ -91,6 +91,11 @@ from cayu.runtime.stop_policy import (
     first_reached_limit,
     has_run_limits,
 )
+from cayu.runtime.structured_output import (
+    StructuredOutputError,
+    StructuredOutputSpec,
+    StructuredOutputValidation,
+)
 from cayu.runtime.tasks import (
     InMemoryTaskStore,
     Task,
@@ -177,6 +182,9 @@ __all__ = [
     "StaticToolPolicy",
     "StopDecision",
     "StopLimit",
+    "StructuredOutputError",
+    "StructuredOutputSpec",
+    "StructuredOutputValidation",
     "Task",
     "TaskCreate",
     "TaskOrder",

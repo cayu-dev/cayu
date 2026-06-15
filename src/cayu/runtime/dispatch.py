@@ -14,6 +14,7 @@ from cayu.core.messages import Message, copy_message
 from cayu.runtime.costs import CostBudget, copy_cost_budget
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
 
 
 class DispatchStatus(StrEnum):
@@ -38,6 +39,7 @@ class DispatchRequest(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
     @field_validator("messages")
     @classmethod
@@ -51,6 +53,14 @@ class DispatchRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("structured_output")
+    @classmethod
+    def copy_structured_output(
+        cls,
+        value: StructuredOutputSpec | None,
+    ) -> StructuredOutputSpec | None:
+        return copy_structured_output_spec(value)
 
     @field_validator("session_id", "dispatch_id", "task_id", "model")
     @classmethod
@@ -148,6 +158,7 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         limits=copy_run_limits(request.limits),
         cost_budget=copy_cost_budget(request.cost_budget),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
+        structured_output=copy_structured_output_spec(request.structured_output),
     )
 
 

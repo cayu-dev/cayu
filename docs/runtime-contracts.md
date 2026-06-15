@@ -243,6 +243,40 @@ policies, structured-output retry, length continuation, and goal/task gates
 should build on this typed step outcome instead of parsing raw provider payloads
 or guessing from transcript shape.
 
+## Structured Output
+
+`StructuredOutputSpec` is the provider-neutral validation foundation for final
+JSON responses. It can be attached to `RunRequest`, `ResumeRequest`,
+`DispatchRequest`, `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`.
+The spec contains a `json_schema` object, an optional name, a bounded
+`max_retries`, and an optional repair prompt.
+
+The runtime validates only final assistant responses: if a model step returns
+tool calls, Cayu executes or resolves that tool round first and waits for the
+next no-tool-call assistant response before validating. This prevents
+structured-output validation from cutting through provider tool-call/tool-result
+history.
+
+On a valid final response, Cayu emits `structured_output.validated` with parsed
+JSON output and then completes the session. On an invalid final response, Cayu
+emits `structured_output.failed`. If retries remain, it appends a synthetic user
+repair message to the durable provider-neutral transcript, emits
+`structured_output.retry`, and calls the model again with the repair prompt in
+context. Cayu writes that repair message only when another model step is
+available. If retries are exhausted, or no model step remains for repair, the
+session fails with `session.failed`.
+
+The durable transcript keeps the assistant's invalid output and the repair user
+message. That is intentional: replay, debugging, and resume should explain why
+the model was called again.
+
+This foundation does not yet add the runtime-owned final-output tool that guides
+the model from the first request to return final structured data through a tool
+call. That output-tool strategy is the next layer. Provider adapters may later
+use `ModelRequest.options["structured_output"]` for native JSON-schema
+enforcement, but Cayu's runtime validation remains the provider-neutral
+correctness boundary.
+
 ## Usage Metrics
 
 Provider `completed` stream events may include the provider's raw `usage` payload.

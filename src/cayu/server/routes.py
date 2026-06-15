@@ -31,6 +31,7 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
 )
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import TaskCreate, TaskQuery
 from cayu.server.sse import event_to_sse_data
 
@@ -51,6 +52,7 @@ class RunBody(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
 
 class ResumeBody(BaseModel):
@@ -59,6 +61,7 @@ class ResumeBody(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
 
 class InterruptSessionBody(BaseModel):
@@ -80,6 +83,7 @@ class ToolApprovalBody(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
 
 class ToolApprovalRecoveryBody(BaseModel):
@@ -95,6 +99,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
 
 def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
@@ -177,6 +182,7 @@ def create_router(
             limits=body.limits,
             cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
         )
 
         async def generate():
@@ -201,6 +207,7 @@ def create_router(
             limits=body.limits,
             cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
         )
 
         async def generate():
@@ -280,6 +287,7 @@ def create_router(
             limits=body.limits,
             cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
         )
 
         async def generate():
@@ -311,6 +319,7 @@ def create_router(
             limits=body.limits,
             cost_budget=body.cost_budget,
             retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
         )
 
         async def generate():

@@ -55,6 +55,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
     StaticToolPolicy,
+    StructuredOutputSpec,
     TaskCreate,
     TaskStatus,
     ToolApprovalDecision,
@@ -3958,6 +3959,158 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert asyncio.run(store.load_checkpoint("sess_tool_approval_allow")) == {}
+
+
+def test_cayu_app_preserves_structured_output_across_tool_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"approved"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+    structured_output = StructuredOutputSpec(
+        name="approval_answer",
+        json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_structured_output",
+                messages=[Message.text("user", "use the tool")],
+                structured_output=structured_output,
+            ),
+        )
+    )
+    approval = interrupt_events[4].payload["approval"]
+    approval_id = approval["approval_id"]
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval_structured_output"))
+
+    assert checkpoint is not None
+    assert checkpoint["pending_tool_approval"]["structured_output"]["name"] == ("approval_answer")
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_tool_approval_structured_output",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[8].payload["output"] == {"answer": "approved"}
+    assert provider.requests[1].options["structured_output"]["name"] == "approval_answer"
+
+
+def test_cayu_app_rejects_conflicting_structured_output_on_tool_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"approved"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_approval_structured_output_conflict",
+                messages=[Message.text("user", "use the tool")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                ),
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    with pytest.raises(ValueError, match="does not match the pending run contract"):
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_tool_approval_structured_output_conflict",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                    structured_output=StructuredOutputSpec(
+                        json_schema={
+                            "type": "object",
+                            "properties": {"different": {"type": "string"}},
+                            "required": ["different"],
+                        },
+                    ),
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load("sess_tool_approval_structured_output_conflict"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert tool.calls == []
 
 
 def test_cayu_app_cost_budget_stops_approval_before_tool_side_effects():
@@ -8651,6 +8804,291 @@ def test_cayu_app_records_model_step_classification_for_length_finish():
         "status": "incomplete",
     }
     assert model_completed.payload["step_classification"]["type"] == "length"
+
+
+def test_cayu_app_validates_structured_output_final_response():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta('{"answer":"ok"}'),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_valid",
+                messages=[Message.text("user", "answer with json")],
+                structured_output=StructuredOutputSpec(
+                    name="answer",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_valid"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[4].payload == {
+        "name": "answer",
+        "step": 1,
+        "attempt": 1,
+        "max_retries": 1,
+        "valid": True,
+        "errors": [],
+        "output": {"answer": "ok"},
+    }
+    assert provider.requests[0].options["structured_output"]["name"] == "answer"
+    assert provider.requests[0].options["structured_output"]["schema"]["required"] == ["answer"]
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[-1].content[0].text == '{"answer":"ok"}'
+
+
+def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("not json"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"fixed"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_retry",
+                messages=[Message.text("user", "answer with json")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    max_retries=1,
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_retry"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.STRUCTURED_OUTPUT_RETRY,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert (
+        events[4]
+        .payload["errors"][0]["message"]
+        .startswith("Final assistant output is not valid JSON")
+    )
+    assert events[5].payload["attempt"] == 1
+    assert events[9].payload["attempt"] == 2
+    assert len(provider.requests) == 2
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    repair_message = transcript[2].content[0].text
+    assert "Return only valid JSON" in repair_message
+    assert "Validation errors:" in repair_message
+    assert provider.requests[1].messages[-1].role == "user"
+    assert provider.requests[1].messages[-1].content[0].text == repair_message
+
+
+def test_cayu_app_fails_structured_output_after_retries_exhausted():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("not json"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_failed",
+                messages=[Message.text("user", "answer with json")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                    max_retries=0,
+                ),
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_structured_output_failed"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[-1].payload["error"] == (
+        "Structured output validation failed after 1 attempt(s)."
+    )
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+
+
+def test_cayu_app_does_not_write_structured_output_repair_without_remaining_step():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("not json"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_no_step_for_repair",
+                messages=[Message.text("user", "answer with json")],
+                max_steps=1,
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                    max_retries=1,
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_no_step_for_repair"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert EventType.STRUCTURED_OUTPUT_RETRY not in [event.type for event in events]
+    assert events[-1].payload["error"] == (
+        "Structured output validation failed after 1 attempt(s): "
+        "maximum model steps reached before repair."
+    )
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[-1].content[0].text == "not json"
+
+
+def test_cayu_app_validates_structured_output_only_after_tool_round_finishes():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "from tool"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"from tool"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_after_tool",
+                messages=[Message.text("user", "use tool then answer with json")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    }
+                ),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+    assert events[8].payload["output"] == {"answer": "from tool"}
 
 
 def test_in_memory_session_store_rejects_duplicate_session_ids():

@@ -9,6 +9,7 @@ from cayu._validation import copy_json_value, require_clean_nonblank, require_no
 from cayu.runtime.costs import CostBudget, copy_cost_budget
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
 
 
 class ToolApprovalDecision(StrEnum):
@@ -35,6 +36,7 @@ class ToolApprovalRequest(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
     @field_validator("session_id", "approval_id")
     @classmethod
@@ -52,6 +54,14 @@ class ToolApprovalRequest(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("structured_output")
+    @classmethod
+    def copy_structured_output(
+        cls,
+        value: StructuredOutputSpec | None,
+    ) -> StructuredOutputSpec | None:
+        return copy_structured_output_spec(value)
 
 
 class ToolApprovalRecoveryRequest(BaseModel):
@@ -72,6 +82,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
 
     @field_validator("session_id", "approval_id", "tool_call_id")
     @classmethod
@@ -98,6 +109,14 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         return copy_json_value(value, info.field_name)
+
+    @field_validator("structured_output")
+    @classmethod
+    def copy_structured_output(
+        cls,
+        value: StructuredOutputSpec | None,
+    ) -> StructuredOutputSpec | None:
+        return copy_structured_output_spec(value)
 
 
 class PendingToolCallApproval(BaseModel):
@@ -152,6 +171,7 @@ class PendingToolApproval(BaseModel):
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[PendingToolCallApproval]
+    structured_output: StructuredOutputSpec | None = None
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
@@ -175,6 +195,14 @@ class PendingToolApproval(BaseModel):
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
         return copy_json_value(value, info.field_name)
+
+    @field_validator("structured_output")
+    @classmethod
+    def copy_structured_output(
+        cls,
+        value: StructuredOutputSpec | None,
+    ) -> StructuredOutputSpec | None:
+        return copy_structured_output_spec(value)
 
     @field_validator("tool_calls")
     @classmethod
@@ -201,6 +229,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         limits=copy_run_limits(request.limits),
         cost_budget=copy_cost_budget(request.cost_budget),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
+        structured_output=copy_structured_output_spec(request.structured_output),
     )
 
 
@@ -223,6 +252,7 @@ def copy_tool_approval_recovery_request(
         limits=copy_run_limits(request.limits),
         cost_budget=copy_cost_budget(request.cost_budget),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
+        structured_output=copy_structured_output_spec(request.structured_output),
     )
 
 
@@ -241,6 +271,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         reason=approval.reason,
         metadata=copy_json_value(approval.metadata, "metadata"),
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
+        structured_output=copy_structured_output_spec(approval.structured_output),
     )
 
 

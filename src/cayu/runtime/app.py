@@ -124,6 +124,14 @@ from cayu.runtime.stop_policy import (
     first_reached_limit,
     has_run_limits,
 )
+from cayu.runtime.structured_output import (
+    StructuredOutputSpec,
+    StructuredOutputValidation,
+    copy_structured_output_spec,
+    structured_output_repair_prompt,
+    structured_output_spec_payload,
+    validate_structured_output_text,
+)
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
@@ -482,6 +490,7 @@ class CayuApp:
             limits=request.limits,
             cost_budget=request.cost_budget,
             retry_policy=self._effective_retry_policy(request.retry_policy),
+            structured_output=request.structured_output,
             request_metadata=request.metadata,
             task_id=request.task_id,
             start_event_type=EventType.SESSION_STARTED,
@@ -672,6 +681,7 @@ class CayuApp:
             limits=request.limits,
             cost_budget=request.cost_budget,
             retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
@@ -834,6 +844,7 @@ class CayuApp:
             limits=request.limits,
             cost_budget=request.cost_budget,
             retry_policy=self._effective_retry_policy(request.retry_policy),
+            structured_output=request.structured_output,
             request_metadata=request.metadata,
             task_id=task_id,
             start_event_type=EventType.SESSION_RESUMED,
@@ -952,6 +963,10 @@ class CayuApp:
             raise ValueError(
                 f"Tool approval id does not match pending approval: {request.approval_id}"
             )
+        _effective_approval_structured_output(
+            structured_output=request.structured_output,
+            pending_approval=pending_approval,
+        )
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
@@ -1235,6 +1250,10 @@ class CayuApp:
                 limits=request.limits,
                 cost_budget=request.cost_budget,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
+                structured_output=_effective_approval_structured_output(
+                    structured_output=request.structured_output,
+                    pending_approval=pending_approval,
+                ),
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
                 start_event_type=None,
@@ -1366,6 +1385,10 @@ class CayuApp:
             raise ValueError(
                 f"Tool approval id does not match pending approval: {request.approval_id}"
             )
+        _effective_approval_structured_output(
+            structured_output=request.structured_output,
+            pending_approval=pending_approval,
+        )
 
         pending_tool_call = approval_support.pending_tool_call_for_recovery(
             approval=pending_approval,
@@ -1454,6 +1477,7 @@ class CayuApp:
             limits=request.limits,
             cost_budget=request.cost_budget,
             retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
         )
         async for event in self._continue_tool_approval_resolution(
             request=approval_request,
@@ -1479,6 +1503,7 @@ class CayuApp:
         limits: RunLimits,
         cost_budget: CostBudget | None,
         retry_policy: RetryPolicy,
+        structured_output: StructuredOutputSpec | None,
         request_metadata: dict[str, Any],
         task_id: str | None,
         start_event_type: EventType | None,
@@ -1495,6 +1520,8 @@ class CayuApp:
         limits = copy_run_limits(limits)
         cost_budget = copy_cost_budget(cost_budget)
         retry_policy = copy_retry_policy(retry_policy)
+        structured_output = copy_structured_output_spec(structured_output)
+        structured_output_retries = 0
         run_baseline: SessionUsageSummary | None = None
         cost_baseline: SessionCostSummary | None = None
         if (limits.scope == "run" and has_run_limits(limits)) or (
@@ -1653,6 +1680,11 @@ class CayuApp:
                             else {}
                         ),
                         "step": step,
+                        "structured_output": (
+                            structured_output_spec_payload(structured_output)
+                            if structured_output is not None
+                            else None
+                        ),
                         RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
                             messages=context_messages,
                             session=session,
@@ -1667,6 +1699,7 @@ class CayuApp:
                 )
 
                 assistant_message: Message | None = None
+                assistant_step_result: AssistantStepResult | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
                 async for event, result in self._run_model_step_with_retries(
                     provider=provider,
@@ -1681,6 +1714,7 @@ class CayuApp:
                     if event is not None:
                         yield event
                     if result is not None:
+                        assistant_step_result = result
                         assistant_message = result.assistant_message
                         tool_calls = result.tool_calls
 
@@ -1717,6 +1751,78 @@ class CayuApp:
                     return
 
                 if not tool_calls:
+                    if structured_output is not None:
+                        if assistant_step_result is None:
+                            raise RuntimeError(
+                                "Structured output validation requires an assistant step result."
+                            )
+                        validation = validate_structured_output_text(
+                            assistant_step_result.text_content,
+                            structured_output,
+                        )
+                        if validation.valid:
+                            yield await self._emit(
+                                _structured_output_event(
+                                    event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
+                                    spec=structured_output,
+                                    validation=validation,
+                                    step=step,
+                                    attempt=structured_output_retries + 1,
+                                )
+                            )
+                            break
+                        yield await self._emit(
+                            _structured_output_event(
+                                event_type=EventType.STRUCTURED_OUTPUT_FAILED,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                spec=structured_output,
+                                validation=validation,
+                                step=step,
+                                attempt=structured_output_retries + 1,
+                            )
+                        )
+                        if structured_output_retries >= structured_output.max_retries:
+                            raise RuntimeError(
+                                "Structured output validation failed after "
+                                f"{structured_output_retries + 1} attempt(s)."
+                            )
+                        if step >= max_steps:
+                            raise RuntimeError(
+                                "Structured output validation failed after "
+                                f"{structured_output_retries + 1} attempt(s): "
+                                "maximum model steps reached before repair."
+                            )
+                        structured_output_retries += 1
+                        repair_message = Message.text(
+                            "user",
+                            structured_output_repair_prompt(
+                                spec=structured_output,
+                                validation=validation,
+                            ),
+                        )
+                        messages.append(repair_message)
+                        await self.session_store.append_transcript_messages(
+                            session.id,
+                            [repair_message],
+                        )
+                        yield await self._emit(
+                            _structured_output_event(
+                                event_type=EventType.STRUCTURED_OUTPUT_RETRY,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                spec=structured_output,
+                                validation=validation,
+                                step=step,
+                                attempt=structured_output_retries,
+                            )
+                        )
+                        continue
                     break
 
                 tool_outcomes: list[runtime_records.ToolCallOutcome] = []
@@ -1793,6 +1899,7 @@ class CayuApp:
                             policy_outcomes=approval_plan.policy_outcomes,
                             task_id=task_id,
                             policy_result=approval_plan.policy_result,
+                            structured_output=structured_output,
                         )
                         yield await self._emit(checkpoint_event)
                         yield await self._emit(
@@ -2716,6 +2823,7 @@ class CayuApp:
                     policy_outcomes=None,
                     task_id=task_id,
                     policy_result=resolved_policy_result,
+                    structured_output=None,
                 )
                 yield (await self._emit(checkpoint_event), None)
                 yield (
@@ -2799,6 +2907,7 @@ class CayuApp:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
         task_id: str | None,
         policy_result: ToolPolicyResult,
+        structured_output: StructuredOutputSpec | None,
     ) -> tuple[PendingToolApproval, Event]:
         checkpoint = await self.session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
@@ -2820,6 +2929,7 @@ class CayuApp:
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
             ),
+            structured_output=copy_structured_output_spec(structured_output),
         )
         checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump()
         await self.session_store.checkpoint(session.id, checkpoint)
@@ -3510,6 +3620,34 @@ def _validate_tool_approval_recovery_request(
     return copy_tool_approval_recovery_request(request)
 
 
+def _effective_approval_structured_output(
+    *,
+    structured_output: StructuredOutputSpec | None,
+    pending_approval: PendingToolApproval,
+) -> StructuredOutputSpec | None:
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if structured_output is None:
+        return copy_structured_output_spec(pending_approval.structured_output)
+    if pending_approval.structured_output is None:
+        return copy_structured_output_spec(structured_output)
+    if not _structured_output_specs_equal(
+        structured_output,
+        pending_approval.structured_output,
+    ):
+        raise ValueError("Tool approval structured_output does not match the pending run contract.")
+    return copy_structured_output_spec(pending_approval.structured_output)
+
+
+def _structured_output_specs_equal(
+    left: StructuredOutputSpec,
+    right: StructuredOutputSpec,
+) -> bool:
+    if type(left) is not StructuredOutputSpec or type(right) is not StructuredOutputSpec:
+        raise TypeError("Structured output comparison requires StructuredOutputSpec values.")
+    return left.model_dump(mode="json") == right.model_dump(mode="json")
+
+
 def _session_identity(*, provider_name: str, model: str) -> SessionIdentity:
     return SessionIdentity(
         provider_name=provider_name,
@@ -3597,6 +3735,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         limits=copy_run_limits(request.limits),
         cost_budget=copy_cost_budget(request.cost_budget),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
+        structured_output=copy_structured_output_spec(request.structured_output),
     )
 
 
@@ -4203,6 +4342,46 @@ def _model_stream_event_to_runtime_event(
             ),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _structured_output_event(
+    *,
+    event_type: EventType,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    spec: StructuredOutputSpec,
+    validation: StructuredOutputValidation,
+    step: int,
+    attempt: int,
+) -> Event:
+    if event_type not in {
+        EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.STRUCTURED_OUTPUT_RETRY,
+    }:
+        raise ValueError(f"Unsupported structured output event type: {event_type}")
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    if type(validation) is not StructuredOutputValidation:
+        raise TypeError("Structured output validation must be a StructuredOutputValidation.")
+    payload: dict[str, Any] = {
+        "name": spec.name,
+        "step": step,
+        "attempt": attempt,
+        "max_retries": spec.max_retries,
+        "valid": validation.valid,
+        "errors": [error.model_dump(mode="json") for error in validation.errors],
+    }
+    if validation.valid:
+        payload["output"] = copy_json_value(validation.output, "output")
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=payload,
+    )
 
 
 def _stream_event_completion(stream_event: ModelStreamEvent) -> ModelCompletion:
