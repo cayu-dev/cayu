@@ -25,6 +25,10 @@ class EventType(StrEnum):
 
     BUDGET_CHECKED = "budget.checked"
     BUDGET_LIMIT_REACHED = "budget.limit_reached"
+    BUDGET_RESERVED = "budget.reserved"
+    BUDGET_RECONCILED = "budget.reconciled"
+    BUDGET_RESERVATION_FAILED = "budget.reservation_failed"
+    BUDGET_RESERVATION_RELEASED = "budget.reservation_released"
 
     TASK_CREATED = "task.created"
     TASK_STARTED = "task.started"

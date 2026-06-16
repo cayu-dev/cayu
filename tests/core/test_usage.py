@@ -9,8 +9,10 @@ from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
+    BudgetReservation,
     CayuApp,
     CostBudget,
+    InMemoryBudgetLedger,
     InMemorySessionStore,
     ModelPricing,
     PricingCatalog,
@@ -32,7 +34,7 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
-from cayu.storage import SQLiteSessionStore
+from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore
 
 
 def test_normalize_openai_usage_metrics() -> None:
@@ -150,6 +152,179 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
                 ),
             )
         )
+    with pytest.raises(ValueError, match="require priced"):
+        BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+            allow_unpriced=True,
+            reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+        )
+
+
+def _reservation_budget_limit(max_cost: str = "1") -> BudgetLimit:
+    return BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal(max_cost),
+        pricing=PricingCatalog(
+            prices=(
+                ModelPricing(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                    cache_read_input_per_million=Decimal("0.25"),
+                    cache_write_input_per_million=Decimal("1.25"),
+                ),
+            )
+        ),
+        reservation=BudgetReservation(
+            max_input_tokens=100_000,
+            max_output_tokens=50_000,
+            max_cache_read_input_tokens=40_000,
+            max_cache_write_input_tokens=8_000,
+        ),
+    )
+
+
+def test_budget_reservation_requires_reserved_tokens() -> None:
+    with pytest.raises(ValueError, match="at least one token"):
+        BudgetReservation(max_input_tokens=0, max_output_tokens=0)
+
+
+def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
+    async def run():
+        ledger = InMemoryBudgetLedger()
+        limit = _reservation_budget_limit(max_cost="0.50")
+        first = await ledger.reserve(
+            limit=limit,
+            session_id="sess_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert first.accepted is True
+        assert first.requested == Decimal("0.22")
+        assert first.record is not None
+        second = await ledger.reserve(
+            limit=limit,
+            session_id="sess_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert second.accepted is True
+        third = await ledger.reserve(
+            limit=limit,
+            session_id="sess_3",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert third.accepted is False
+        reconciled = await ledger.reconcile(
+            reservation_id=first.record.reservation_id,
+            actual_amount=Decimal("0.05"),
+            reason="actual usage",
+        )
+        assert reconciled.status == "reconciled"
+        assert reconciled.released_amount == Decimal("0.17")
+        retry = await ledger.reserve(
+            limit=limit,
+            session_id="sess_3",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert retry.accepted is True
+        assert retry.record is not None
+        released = await ledger.release(
+            reservation_id=retry.record.reservation_id,
+            reason="model failed",
+        )
+        assert released.status == "released"
+        return third, retry, released
+
+    third, retry, released = asyncio.run(run())
+
+    assert "reservation failed" in third.message.lower()
+    assert retry.actual == Decimal("0.49")
+    assert released.released_amount == Decimal("0.22")
+
+
+def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None:
+    async def run():
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            first = await ledger.reserve(
+                limit=limit,
+                session_id="sess_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.accepted is True
+            assert first.record is not None
+            blocked = await ledger.reserve(
+                limit=limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert blocked.accepted is False
+            reconciled = await ledger.reconcile(
+                reservation_id=first.record.reservation_id,
+                actual_amount=Decimal("0.01"),
+                reason="actual usage",
+            )
+            retry = await ledger.reserve(
+                limit=limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert retry.accepted is True
+            assert retry.record is not None
+            released = await ledger.release(
+                reservation_id=retry.record.reservation_id,
+                reason="unused",
+            )
+            return blocked, reconciled, released
+        finally:
+            await ledger.close()
+
+    blocked, reconciled, released = asyncio.run(run())
+
+    assert blocked.actual == Decimal("0.44")
+    assert reconciled.released_amount == Decimal("0.21")
+    assert released.status == "released"
+
+
+def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path) -> None:
+    async def run():
+        path = tmp_path / "shared.sqlite"
+        ledger = SQLiteBudgetLedger(path)
+        await ledger.close()
+        session_store = SQLiteSessionStore(path)
+        try:
+            session = await session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_shared_budget_db",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            return session
+        finally:
+            await session_store.close()
+
+    session = asyncio.run(run())
+
+    assert session.id == "sess_shared_budget_db"
 
 
 def test_in_memory_budget_store_filters_app_and_agent_events() -> None:

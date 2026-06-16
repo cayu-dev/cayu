@@ -536,7 +536,7 @@ agent-scoped estimated-cost limits:
 ```python
 from decimal import Decimal
 
-from cayu import BudgetLimit, BudgetPolicy, CayuApp
+from cayu import BudgetLimit, BudgetPolicy, BudgetReservation, CayuApp, SQLiteBudgetLedger
 
 app = CayuApp(
     budget_policy=BudgetPolicy(
@@ -571,10 +571,42 @@ or intentionally allows unpriced usage.
 the same event store already configured for sessions. With `SQLiteSessionStore`,
 budget accounting survives process restarts and multiple workers that share the
 same database. Enforcement is cooperative: Cayu checks before model calls and
-again after model completions. Strict concurrent hard caps require a future
-reservation/reconciliation budget ledger. `InMemoryBudgetStore` is available for
-tests, examples, and custom single-process apps that intentionally want a
-separate in-memory budget ledger.
+again after model completions.
+
+For strict concurrent hard caps, add a conservative per-step reservation and a
+shared ledger. Cayu reserves the configured worst-case step cost before the
+provider call, reconciles it to actual normalized usage after
+`model.completed`, and refuses the step before calling the provider if the
+reservation would exceed the limit:
+
+```python
+app = CayuApp(
+    budget_policy=BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("25.00"),
+                pricing=pricing,
+                reservation=BudgetReservation(
+                    max_input_tokens=80_000,
+                    max_output_tokens=8_000,
+                    max_cache_read_input_tokens=80_000,
+                ),
+            ),
+        )
+    ),
+    budget_ledger=SQLiteBudgetLedger("budget.sqlite"),
+)
+```
+
+Reservation amounts are application-provided upper bounds, not provider
+guarantees. Set them high enough for the model step you are willing to fund.
+Reservation limits require matching pricing and cannot use `allow_unpriced=True`.
+`SQLiteBudgetLedger` is the built-in shared ledger for multi-worker apps.
+`InMemoryBudgetLedger` is the default and is suitable for tests, examples, and
+single-process apps only. `InMemoryBudgetStore` is also available for custom
+single-process apps that intentionally want separate in-memory budget
+accounting.
 
 Configure provider-step retries with `RetryPolicy` on `CayuApp` or on one
 request. Retries are disabled by default. A retry only wraps the model provider

@@ -58,12 +58,20 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.budgets import (
     BudgetCheck,
+    BudgetLedger,
+    BudgetLimit,
     BudgetPolicy,
+    BudgetReservationRecord,
+    BudgetReservationResult,
     BudgetStore,
+    InMemoryBudgetLedger,
     SessionBudgetStore,
+    budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_payload,
     budget_limits_for_session,
+    budget_reconciliation_payload,
+    budget_reservation_payload,
     copy_budget_policy,
 )
 from cayu.runtime.context import (
@@ -207,6 +215,12 @@ class _ActiveSessionRun:
     task_finished: bool
 
 
+@dataclass(frozen=True)
+class _BudgetStepReservation:
+    limit: BudgetLimit
+    record: BudgetReservationRecord
+
+
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -243,6 +257,7 @@ class CayuApp:
         dispatcher: Dispatcher | None = None,
         budget_policy: BudgetPolicy | None = None,
         budget_store: BudgetStore | None = None,
+        budget_ledger: BudgetLedger | None = None,
         retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
@@ -259,6 +274,8 @@ class CayuApp:
             raise TypeError("dispatcher must be a Dispatcher.")
         if budget_store is not None and not isinstance(budget_store, BudgetStore):
             raise TypeError("budget_store must be a BudgetStore.")
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
+            raise TypeError("budget_ledger must be a BudgetLedger.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
@@ -297,6 +314,7 @@ class CayuApp:
         self.budget_store = (
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
+        self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._event_sinks = sinks
@@ -1771,25 +1789,93 @@ class CayuApp:
                     },
                 )
 
-                assistant_message: Message | None = None
-                assistant_step_result: AssistantStepResult | None = None
-                tool_calls: list[runtime_records.ToolCallRequest] = []
-                async for event, result in self._run_model_step_with_retries(
-                    provider=provider,
-                    model_request=model_request,
+                (
+                    budget_reservations,
+                    reservation_failure,
+                    reservation_events,
+                ) = await self._reserve_budget_for_model_step(
                     session=session,
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     environment_name=environment_name,
-                    step=step,
-                    retry_policy=retry_policy,
-                ):
-                    if event is not None:
+                )
+                for event in reservation_events:
+                    yield event
+                if reservation_failure is not None:
+                    async for event in self._stop_session_for_budget_reservation_failed(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        result=reservation_failure,
+                        messages=messages,
+                    ):
                         yield event
-                    if result is not None:
-                        assistant_step_result = result
-                        assistant_message = result.assistant_message
-                        tool_calls = result.tool_calls
+                    return
+
+                assistant_message: Message | None = None
+                assistant_step_result: AssistantStepResult | None = None
+                tool_calls: list[runtime_records.ToolCallRequest] = []
+                model_completed_event: Event | None = None
+                try:
+                    async for event, result in self._run_model_step_with_retries(
+                        provider=provider,
+                        model_request=model_request,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        environment_name=environment_name,
+                        step=step,
+                        retry_policy=retry_policy,
+                    ):
+                        if event is not None:
+                            if event.type == EventType.MODEL_COMPLETED:
+                                model_completed_event = event
+                            yield event
+                        if result is not None:
+                            assistant_step_result = result
+                            assistant_message = result.assistant_message
+                            tool_calls = result.tool_calls
+                except _SessionInterruptedByRequest:
+                    async for event in self._release_budget_reservations(
+                        budget_reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        reason="session interrupted",
+                    ):
+                        yield event
+                    raise
+                except asyncio.CancelledError:
+                    async for event in self._release_budget_reservations(
+                        budget_reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        reason="model step cancelled",
+                    ):
+                        yield event
+                    raise
+                except Exception:
+                    async for event in self._release_budget_reservations(
+                        budget_reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        reason="model step did not complete",
+                    ):
+                        yield event
+                    raise
+
+                if model_completed_event is not None:
+                    async for event in self._reconcile_budget_reservations(
+                        budget_reservations,
+                        model_completed_event=model_completed_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    ):
+                        yield event
 
                 if assistant_message is not None:
                     messages.append(assistant_message)
@@ -2713,6 +2799,127 @@ class CayuApp:
                 return check, emitted_events
         return None, emitted_events
 
+    async def _reserve_budget_for_model_step(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+    ) -> tuple[list[_BudgetStepReservation], BudgetReservationResult | None, list[Event]]:
+        limits = [
+            limit
+            for limit in budget_limits_for_session(
+                policy=self.budget_policy,
+                agent_name=registered_agent.spec.name,
+            )
+            if limit.reservation is not None
+        ]
+        if not limits:
+            return [], None, []
+
+        reservations: list[_BudgetStepReservation] = []
+        emitted_events: list[Event] = []
+        for limit in limits:
+            result = await self.budget_ledger.reserve(
+                limit=limit,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                provider_name=registered_provider.name,
+                model=session.model,
+            )
+            event_type = (
+                EventType.BUDGET_RESERVED
+                if result.accepted
+                else EventType.BUDGET_RESERVATION_FAILED
+            )
+            emitted_events.append(
+                await self._emit(
+                    Event(
+                        type=event_type,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=budget_reservation_payload(result),
+                    )
+                )
+            )
+            if not result.accepted:
+                release_events = [
+                    event
+                    async for event in self._release_budget_reservations(
+                        reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        reason="reservation failed",
+                    )
+                ]
+                emitted_events.extend(release_events)
+                return reservations, result, emitted_events
+            if result.record is None:
+                raise RuntimeError("Accepted budget reservation did not return a record.")
+            reservations.append(_BudgetStepReservation(limit=limit, record=result.record))
+        return reservations, None, emitted_events
+
+    async def _reconcile_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        model_completed_event: Event,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> AsyncIterator[Event]:
+        for reservation in reservations:
+            try:
+                actual_amount = budget_actual_cost_for_event(
+                    limit=reservation.limit,
+                    event=model_completed_event,
+                )
+                reason = "model completed"
+            except ValueError:
+                actual_amount = reservation.record.reserved_amount
+                reason = "model completed without priced usage; charged reserved amount"
+            reconciliation = await self.budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=actual_amount,
+                reason=reason,
+            )
+            yield await self._emit(
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=budget_reconciliation_payload(reconciliation),
+                )
+            )
+
+    async def _release_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        reason: str,
+    ) -> AsyncIterator[Event]:
+        for reservation in reservations:
+            reconciliation = await self.budget_ledger.release(
+                reservation_id=reservation.record.reservation_id,
+                reason=reason,
+            )
+            yield await self._emit(
+                Event(
+                    type=EventType.BUDGET_RESERVATION_RELEASED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=budget_reconciliation_payload(reconciliation),
+                )
+            )
+
     async def _stop_session_for_limit_reached(
         self,
         *,
@@ -2775,6 +2982,48 @@ class CayuApp:
             session=interrupted_session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+        ):
+            yield event
+
+    async def _stop_session_for_budget_reservation_failed(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        result: BudgetReservationResult,
+        messages: list[Message],
+    ) -> AsyncIterator[Event]:
+        payload = budget_reservation_payload(result)
+        yield await self._emit(
+            Event(
+                type=EventType.BUDGET_LIMIT_REACHED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=payload,
+            )
+        )
+        session_events = await self.session_store.load_events(session.id)
+        usage_summary = session_usage_summary(session.id, session_events)
+        decision = StopDecision(
+            limit=StopLimit.ESTIMATED_COST,
+            maximum=result.maximum,
+            actual=result.actual,
+            message=result.message,
+        )
+        async for event in self._stop_session_for_limit_reached(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            decision=decision,
+            usage_summary=usage_summary,
+            cost_summary=None,
+            messages=messages,
+            tool_calls=[],
+            completed_tool_outcomes=[],
         ):
             yield event
 

@@ -423,10 +423,25 @@ opts into unpriced usage with `allow_unpriced=True`.
 event stream already configured for sessions, so `SQLiteSessionStore` can back
 budget accounting across process restarts and multiple workers that share the
 same database. Enforcement is cooperative: Cayu checks before model calls and
-again after model completions. Strict concurrent hard caps require a future
-reservation/reconciliation budget ledger. `InMemoryBudgetStore` is available for
-tests, examples, and custom single-process apps that intentionally want a
-separate in-memory budget ledger.
+again after model completions.
+
+Strict concurrent hard caps use `BudgetLimit.reservation` plus a
+`BudgetLedger`. A reservation declares the maximum input, output, cache-read,
+and cache-write tokens the application is willing to fund for one provider step.
+Before the provider call, Cayu prices that worst-case step with the same
+`PricingCatalog` and atomically reserves it in the ledger. Accepted reservations
+emit `budget.reserved`; failed reservations emit `budget.reservation_failed`,
+then `budget.limit_reached`, and stop before the provider request. After
+`model.completed`, Cayu reconciles the reservation to actual normalized usage
+and emits `budget.reconciled`. If the model step fails before completion, Cayu
+releases the reservation and emits `budget.reservation_released`.
+
+`InMemoryBudgetLedger` is the default and is only strict inside one process.
+Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`
+or their own `BudgetLedger` implementation. Reservation amounts are
+application-provided upper bounds; Cayu does not infer how large a future model
+step will be. Reservation limits require matching pricing and cannot use
+`allow_unpriced=True`.
 
 When a limit is reached, the runtime emits `session.limit_reached`, updates the
 session to `interrupted`, and emits `session.interrupted` with

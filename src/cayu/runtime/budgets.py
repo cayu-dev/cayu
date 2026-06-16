@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import (
     BaseModel,
@@ -23,6 +24,31 @@ from cayu.runtime.sessions import EventQuery, SessionStore
 
 BudgetScope = Literal["app", "agent"]
 BudgetWindow = Literal["all_time"]
+BudgetReservationStatus = Literal["active", "reconciled", "released"]
+_TOKENS_PER_MILLION = Decimal("1000000")
+
+
+class BudgetReservation(BaseModel):
+    """Conservative per-model-step reservation configured by the app."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_input_tokens: StrictInt = Field(ge=0)
+    max_output_tokens: StrictInt = Field(ge=0)
+    max_cache_read_input_tokens: StrictInt = Field(default=0, ge=0)
+    max_cache_write_input_tokens: StrictInt = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_nonzero_reservation(self) -> BudgetReservation:
+        if (
+            self.max_input_tokens
+            + self.max_output_tokens
+            + self.max_cache_read_input_tokens
+            + self.max_cache_write_input_tokens
+            <= 0
+        ):
+            raise ValueError("Budget reservation must reserve at least one token.")
+        return self
 
 
 class BudgetLimit(BaseModel):
@@ -37,6 +63,7 @@ class BudgetLimit(BaseModel):
     window: BudgetWindow = "all_time"
     key: str | None = None
     allow_unpriced: StrictBool = False
+    reservation: BudgetReservation | None = None
 
     @field_validator("currency")
     @classmethod
@@ -63,7 +90,18 @@ class BudgetLimit(BaseModel):
             raise ValueError("App budget limits must not set key.")
         if self.scope == "agent" and self.key is None:
             raise ValueError("Agent budget limits require key.")
+        if self.reservation is not None and self.allow_unpriced:
+            raise ValueError("Budget reservations require priced model usage.")
         return self
+
+    @field_validator("reservation")
+    @classmethod
+    def copy_reservation(cls, value: BudgetReservation | None) -> BudgetReservation | None:
+        if value is None:
+            return None
+        if type(value) is not BudgetReservation:
+            raise TypeError("reservation must be a BudgetReservation.")
+        return copy_budget_reservation(value)
 
 
 class BudgetPolicy(BaseModel):
@@ -132,6 +170,130 @@ class BudgetCheck(BaseModel):
         return value
 
 
+class BudgetReservationRecord(BaseModel):
+    """One reserved budget amount for a model step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
+    scope: BudgetScope
+    key: str | None = None
+    window: BudgetWindow = "all_time"
+    currency: str
+    session_id: str
+    agent_name: str
+    provider_name: str
+    model: str
+    reserved_amount: Decimal = Field(ge=0)
+    actual_amount: Decimal | None = Field(default=None, ge=0)
+    status: BudgetReservationStatus = "active"
+    reason: str | None = None
+
+    @field_validator(
+        "reservation_id",
+        "currency",
+        "session_id",
+        "agent_name",
+        "provider_name",
+        "model",
+    )
+    @classmethod
+    def validate_nonblank_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("key", "reason")
+    @classmethod
+    def validate_optional_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("currency")
+    @classmethod
+    def validate_record_currency(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name).upper()
+
+    @field_validator("reserved_amount", "actual_amount")
+    @classmethod
+    def validate_record_decimal(cls, value: Decimal | None, info) -> Decimal | None:
+        if value is None:
+            return None
+        if not value.is_finite():
+            raise ValueError(f"{info.field_name} must be finite.")
+        return value
+
+
+class BudgetReservationResult(BaseModel):
+    """Result of attempting to reserve budget before a model step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: StrictBool
+    scope: BudgetScope
+    key: str | None = None
+    window: BudgetWindow = "all_time"
+    currency: str
+    maximum: Decimal = Field(gt=0)
+    requested: Decimal = Field(ge=0)
+    actual: Decimal = Field(ge=0)
+    message: str
+    record: BudgetReservationRecord | None = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_result_key(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("currency", "message")
+    @classmethod
+    def validate_result_strings(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        return value.upper() if info.field_name == "currency" else value
+
+    @field_validator("maximum", "requested", "actual")
+    @classmethod
+    def validate_result_decimal(cls, value: Decimal, info) -> Decimal:
+        if not value.is_finite():
+            raise ValueError(f"{info.field_name} must be finite.")
+        return value
+
+
+class BudgetReconciliation(BaseModel):
+    """Result of reconciling a reservation after the model step completes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: str
+    status: BudgetReservationStatus
+    reserved_amount: Decimal = Field(ge=0)
+    actual_amount: Decimal | None = Field(default=None, ge=0)
+    released_amount: Decimal = Field(ge=0)
+    reason: str | None = None
+
+    @field_validator("reservation_id")
+    @classmethod
+    def validate_reconciliation_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reconciliation_reason(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("reserved_amount", "actual_amount", "released_amount")
+    @classmethod
+    def validate_reconciliation_decimal(cls, value: Decimal | None, info) -> Decimal | None:
+        if value is None:
+            return None
+        if not value.is_finite():
+            raise ValueError(f"{info.field_name} must be finite.")
+        return value
+
+
 class BudgetStore(ABC):
     """Durable source for cross-session budget accounting."""
 
@@ -148,6 +310,41 @@ class BudgetStore(ABC):
         window: BudgetWindow,
     ) -> list[Event]:
         """Return events that contribute to the given budget scope."""
+
+
+class BudgetLedger(ABC):
+    """Atomic reservation ledger for strict budget enforcement."""
+
+    @abstractmethod
+    async def reserve(
+        self,
+        *,
+        limit: BudgetLimit,
+        session_id: str,
+        agent_name: str,
+        provider_name: str,
+        model: str,
+    ) -> BudgetReservationResult:
+        """Reserve budget for one model step if capacity remains."""
+
+    @abstractmethod
+    async def reconcile(
+        self,
+        *,
+        reservation_id: str,
+        actual_amount: Decimal,
+        reason: str | None = None,
+    ) -> BudgetReconciliation:
+        """Replace an active reservation with the actual charged amount."""
+
+    @abstractmethod
+    async def release(
+        self,
+        *,
+        reservation_id: str,
+        reason: str,
+    ) -> BudgetReconciliation:
+        """Release an active reservation without charging it."""
 
 
 class InMemoryBudgetStore(BudgetStore):
@@ -226,6 +423,125 @@ class SessionBudgetStore(BudgetStore):
             if len(page) < 5000:
                 break
         return [copy_event(record.event) for record in records]
+
+
+class InMemoryBudgetLedger(BudgetLedger):
+    """In-memory reservation ledger for single-process apps and tests."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, BudgetReservationRecord] = {}
+        self._lock = asyncio.Lock()
+
+    async def reserve(
+        self,
+        *,
+        limit: BudgetLimit,
+        session_id: str,
+        agent_name: str,
+        provider_name: str,
+        model: str,
+    ) -> BudgetReservationResult:
+        request = _budget_reservation_amount(
+            limit=limit,
+            provider_name=provider_name,
+            model=model,
+        )
+        async with self._lock:
+            current = _ledger_used_amount(
+                self._records.values(),
+                scope=limit.scope,
+                key=limit.key,
+                window=limit.window,
+                currency=limit.currency,
+            )
+            projected = current + request
+            if projected > limit.max_estimated_cost:
+                return _reservation_result(
+                    limit=limit,
+                    accepted=False,
+                    requested=request,
+                    actual=projected,
+                    message=(
+                        "Budget reservation failed: "
+                        f"{projected} > {limit.max_estimated_cost} {limit.currency}."
+                    ),
+                )
+            record = BudgetReservationRecord(
+                scope=limit.scope,
+                key=limit.key,
+                window=limit.window,
+                currency=limit.currency,
+                session_id=session_id,
+                agent_name=agent_name,
+                provider_name=provider_name,
+                model=model,
+                reserved_amount=request,
+            )
+            self._records[record.reservation_id] = record
+            return _reservation_result(
+                limit=limit,
+                accepted=True,
+                requested=request,
+                actual=projected,
+                message=(
+                    f"Budget reserved: {request} {limit.currency} for {provider_name}/{model}."
+                ),
+                record=record,
+            )
+
+    async def reconcile(
+        self,
+        *,
+        reservation_id: str,
+        actual_amount: Decimal,
+        reason: str | None = None,
+    ) -> BudgetReconciliation:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        actual_amount = _validate_amount(actual_amount, "actual_amount")
+        async with self._lock:
+            record = self._active_record(reservation_id)
+            reconciled = _reconciled_record(record, actual_amount=actual_amount, reason=reason)
+            self._records[reservation_id] = reconciled
+            return _reconciliation_from_record(reconciled)
+
+    async def release(
+        self,
+        *,
+        reservation_id: str,
+        reason: str,
+    ) -> BudgetReconciliation:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        reason = require_clean_nonblank(reason, "reason")
+        async with self._lock:
+            record = self._active_record(reservation_id)
+            released = record.model_copy(
+                update={
+                    "status": "released",
+                    "reason": reason,
+                },
+                deep=True,
+            )
+            self._records[reservation_id] = released
+            return _reconciliation_from_record(released)
+
+    def _active_record(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._records.get(reservation_id)
+        if record is None:
+            raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if record.status != "active":
+            raise ValueError(f"Budget reservation is not active: {reservation_id}")
+        return record
+
+
+def copy_budget_reservation(reservation: BudgetReservation) -> BudgetReservation:
+    if type(reservation) is not BudgetReservation:
+        raise TypeError("reservation must be a BudgetReservation.")
+    return BudgetReservation(
+        max_input_tokens=reservation.max_input_tokens,
+        max_output_tokens=reservation.max_output_tokens,
+        max_cache_read_input_tokens=reservation.max_cache_read_input_tokens,
+        max_cache_write_input_tokens=reservation.max_cache_write_input_tokens,
+    )
 
 
 def copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
@@ -337,6 +653,9 @@ def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
         window=limit.window,
         key=limit.key,
         allow_unpriced=limit.allow_unpriced,
+        reservation=(
+            None if limit.reservation is None else copy_budget_reservation(limit.reservation)
+        ),
     )
 
 
@@ -368,3 +687,183 @@ def _budget_preflight_error(
             f"does not match requested {limit.currency}."
         )
     return None
+
+
+def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any]:
+    if type(result) is not BudgetReservationResult:
+        raise TypeError("result must be a BudgetReservationResult.")
+    payload: dict[str, Any] = {
+        "accepted": result.accepted,
+        "scope": result.scope,
+        "key": result.key,
+        "window": result.window,
+        "currency": result.currency,
+        "maximum": str(result.maximum),
+        "requested": str(result.requested),
+        "actual": str(result.actual),
+        "message": result.message,
+    }
+    if result.record is not None:
+        payload["reservation_id"] = result.record.reservation_id
+        payload["session_id"] = result.record.session_id
+        payload["agent_name"] = result.record.agent_name
+        payload["provider_name"] = result.record.provider_name
+        payload["model"] = result.record.model
+    return payload
+
+
+def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[str, Any]:
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("reconciliation must be a BudgetReconciliation.")
+    return {
+        "reservation_id": reconciliation.reservation_id,
+        "status": reconciliation.status,
+        "reserved_amount": str(reconciliation.reserved_amount),
+        "actual_amount": (
+            None if reconciliation.actual_amount is None else str(reconciliation.actual_amount)
+        ),
+        "released_amount": str(reconciliation.released_amount),
+        "reason": reconciliation.reason,
+    }
+
+
+def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> Decimal:
+    if type(limit) is not BudgetLimit:
+        raise TypeError("limit must be a BudgetLimit.")
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    summary = estimate_session_cost(
+        session_id=_budget_summary_id(limit),
+        events=[event],
+        pricing=limit.pricing,
+        currency=limit.currency,
+    )
+    if summary.unpriced_model_steps > 0:
+        raise ValueError("Cannot reconcile budget reservation from unpriced model usage.")
+    return summary.total_cost
+
+
+def _budget_reservation_amount(
+    *,
+    limit: BudgetLimit,
+    provider_name: str,
+    model: str,
+) -> Decimal:
+    if limit.reservation is None:
+        raise ValueError("Budget limit does not define a reservation policy.")
+    price = limit.pricing.match_price(provider_name=provider_name, model=model)
+    if price is None:
+        raise ValueError(f"Budget reservation cannot be priced for {provider_name}/{model}.")
+    if price.currency.upper() != limit.currency.upper():
+        raise ValueError(
+            f"Budget reservation currency {price.currency} does not match {limit.currency}."
+        )
+    cache_read_price = (
+        price.cache_read_input_per_million
+        if price.cache_read_input_per_million is not None
+        else price.input_per_million
+    )
+    cache_write_price = (
+        price.cache_write_input_per_million
+        if price.cache_write_input_per_million is not None
+        else price.input_per_million
+    )
+    reservation = limit.reservation
+    return (
+        _token_cost(reservation.max_input_tokens, price.input_per_million)
+        + _token_cost(reservation.max_output_tokens, price.output_per_million)
+        + _token_cost(reservation.max_cache_read_input_tokens, cache_read_price)
+        + _token_cost(reservation.max_cache_write_input_tokens, cache_write_price)
+    )
+
+
+def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
+    return Decimal(tokens) * price_per_million / _TOKENS_PER_MILLION
+
+
+def _ledger_used_amount(
+    records: Iterable[BudgetReservationRecord],
+    *,
+    scope: BudgetScope,
+    key: str | None,
+    window: BudgetWindow,
+    currency: str,
+) -> Decimal:
+    total = Decimal("0")
+    for record in records:
+        if (
+            record.scope != scope
+            or record.key != key
+            or record.window != window
+            or record.currency.upper() != currency.upper()
+        ):
+            continue
+        if record.status == "active":
+            total += record.reserved_amount
+        elif record.status == "reconciled":
+            total += record.actual_amount or Decimal("0")
+    return total
+
+
+def _reservation_result(
+    *,
+    limit: BudgetLimit,
+    accepted: bool,
+    requested: Decimal,
+    actual: Decimal,
+    message: str,
+    record: BudgetReservationRecord | None = None,
+) -> BudgetReservationResult:
+    return BudgetReservationResult(
+        accepted=accepted,
+        scope=limit.scope,
+        key=limit.key,
+        window=limit.window,
+        currency=limit.currency,
+        maximum=limit.max_estimated_cost,
+        requested=requested,
+        actual=actual,
+        message=message,
+        record=record,
+    )
+
+
+def _reconciled_record(
+    record: BudgetReservationRecord,
+    *,
+    actual_amount: Decimal,
+    reason: str | None,
+) -> BudgetReservationRecord:
+    return record.model_copy(
+        update={
+            "actual_amount": actual_amount,
+            "status": "reconciled",
+            "reason": reason,
+        },
+        deep=True,
+    )
+
+
+def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconciliation:
+    actual_amount = record.actual_amount
+    released_amount = Decimal("0")
+    if record.status == "released":
+        released_amount = record.reserved_amount
+    elif actual_amount is not None and record.reserved_amount > actual_amount:
+        released_amount = record.reserved_amount - actual_amount
+    return BudgetReconciliation(
+        reservation_id=record.reservation_id,
+        status=record.status,
+        reserved_amount=record.reserved_amount,
+        actual_amount=actual_amount,
+        released_amount=released_amount,
+        reason=record.reason,
+    )
+
+
+def _validate_amount(value: Decimal, field_name: str) -> Decimal:
+    if type(value) is not Decimal:
+        value = Decimal(str(value))
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{field_name} must be a finite non-negative Decimal.")
+    return value
