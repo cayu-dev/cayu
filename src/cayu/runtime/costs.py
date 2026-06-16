@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.runtime.usage import UsageMetrics, usage_metrics_from_event_payload
 
@@ -179,6 +179,33 @@ class SessionCostSummary(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class CausalBudgetCostSummary(BaseModel):
+    """Estimated cost for all sessions sharing one causal budget id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    causal_budget_id: str
+    session_ids: list[str] = Field(default_factory=list)
+    session_count: StrictInt = Field(default=0, ge=0)
+    currency: str
+    model_steps: StrictInt = Field(ge=0)
+    priced_model_steps: StrictInt = Field(ge=0)
+    unpriced_model_steps: StrictInt = Field(ge=0)
+    total_cost: Decimal = Field(ge=0)
+    line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
+    session_costs: tuple[SessionCostSummary, ...] = Field(default_factory=tuple)
+
+    @field_validator("causal_budget_id", "currency")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("session_ids", mode="before")
+    @classmethod
+    def copy_session_ids(cls, value: list[str], info) -> list[str]:
+        return _copy_string_list(value, info.field_name)
+
+
 def copy_pricing_catalog(catalog: PricingCatalog) -> PricingCatalog:
     if type(catalog) is not PricingCatalog:
         raise TypeError("Pricing catalog must be a PricingCatalog instance.")
@@ -252,6 +279,47 @@ def estimate_session_cost(
         unpriced_model_steps=unpriced_model_steps,
         total_cost=total_cost,
         line_items=tuple(line_items),
+    )
+
+
+def estimate_causal_budget_cost(
+    *,
+    causal_budget_id: str,
+    session_ids: list[str],
+    events: list[Event],
+    pricing: PricingCatalog,
+    currency: str = "USD",
+) -> CausalBudgetCostSummary:
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    copied_session_ids = _copy_string_list(session_ids, "session_ids")
+    known_session_ids = set(copied_session_ids)
+    filtered_events = [event for event in events if event.session_id in known_session_ids]
+    summary = estimate_session_cost(
+        session_id=causal_budget_id,
+        events=filtered_events,
+        pricing=pricing,
+        currency=currency,
+    )
+    session_costs = tuple(
+        estimate_session_cost(
+            session_id=session_id,
+            events=[event for event in filtered_events if event.session_id == session_id],
+            pricing=pricing,
+            currency=currency,
+        )
+        for session_id in copied_session_ids
+    )
+    return CausalBudgetCostSummary(
+        causal_budget_id=causal_budget_id,
+        session_ids=copied_session_ids,
+        session_count=len(copied_session_ids),
+        currency=summary.currency,
+        model_steps=summary.model_steps,
+        priced_model_steps=summary.priced_model_steps,
+        unpriced_model_steps=summary.unpriced_model_steps,
+        total_cost=summary.total_cost,
+        line_items=summary.line_items,
+        session_costs=session_costs,
     )
 
 
@@ -373,3 +441,15 @@ def _optional_nonblank(value: object) -> str | None:
     if type(value) is str and value.strip():
         return value
     return None
+
+
+def _copy_string_list(value: list[str], field_name: str) -> list[str]:
+    copied = copy_json_value(value, field_name)
+    if type(copied) is not list:
+        raise ValueError(f"{field_name} must be a list.")
+    result: list[str] = []
+    for index, item in enumerate(copied):
+        if type(item) is not str:
+            raise ValueError(f"{field_name}[{index}] must be a string.")
+        result.append(require_clean_nonblank(item, f"{field_name}[{index}]"))
+    return result

@@ -71,6 +71,40 @@ class SessionUsageSummary(BaseModel):
         return result
 
 
+class CausalBudgetUsageSummary(BaseModel):
+    """Usage totals for all sessions sharing one causal budget id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    causal_budget_id: str
+    session_ids: list[str] = Field(default_factory=list)
+    session_count: StrictInt = Field(default=0, ge=0)
+    model_steps: StrictInt = Field(default=0, ge=0)
+    tool_calls: StrictInt = Field(default=0, ge=0)
+    provider_names: list[str] = Field(default_factory=list)
+    models: list[str] = Field(default_factory=list)
+    usage: UsageMetrics = Field(default_factory=UsageMetrics)
+    session_summaries: tuple[SessionUsageSummary, ...] = Field(default_factory=tuple)
+
+    @field_validator("causal_budget_id")
+    @classmethod
+    def validate_causal_budget_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("session_ids", "provider_names", "models", mode="before")
+    @classmethod
+    def copy_string_lists(cls, value: list[str], info) -> list[str]:
+        copied = copy_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"{info.field_name} must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"{info.field_name}[{index}] must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return result
+
+
 def normalize_usage_metrics(
     *,
     provider_name: str | None,
@@ -184,6 +218,36 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
     )
 
 
+def causal_budget_usage_summary(
+    *,
+    causal_budget_id: str,
+    session_ids: list[str],
+    events: list[Event],
+) -> CausalBudgetUsageSummary:
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    session_ids = _copy_string_list(session_ids, "session_ids")
+    known_session_ids = set(session_ids)
+    filtered_events = [event for event in events if event.session_id in known_session_ids]
+    summary = session_usage_summary(causal_budget_id, filtered_events)
+    return CausalBudgetUsageSummary(
+        causal_budget_id=causal_budget_id,
+        session_ids=session_ids,
+        session_count=len(session_ids),
+        model_steps=summary.model_steps,
+        tool_calls=summary.tool_calls,
+        provider_names=summary.provider_names,
+        models=summary.models,
+        usage=summary.usage,
+        session_summaries=tuple(
+            session_usage_summary(
+                session_id,
+                [event for event in filtered_events if event.session_id == session_id],
+            )
+            for session_id in session_ids
+        ),
+    )
+
+
 def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | None:
     metrics = payload.get("usage_metrics")
     if type(metrics) is dict:
@@ -210,6 +274,18 @@ def _add_usage(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
             + right.cache.uncached_input_tokens,
         ),
     )
+
+
+def _copy_string_list(value: list[str], field_name: str) -> list[str]:
+    copied = copy_json_value(value, field_name)
+    if type(copied) is not list:
+        raise ValueError(f"{field_name} must be a list.")
+    result: list[str] = []
+    for index, item in enumerate(copied):
+        if type(item) is not str:
+            raise ValueError(f"{field_name}[{index}] must be a string.")
+        result.append(require_clean_nonblank(item, f"{field_name}[{index}]"))
+    return result
 
 
 def _nonnegative_int(value: Any) -> int:

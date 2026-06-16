@@ -235,6 +235,25 @@ The optional server exposes the same summary at
 budget and stop policies should build on them instead of parsing raw provider
 responses.
 
+For work-item views that span forks or task-linked sessions, use the causal
+budget summaries:
+
+```python
+usage = await app.get_causal_budget_usage("job_123")
+cost = await app.get_causal_budget_cost("job_123", pricing)
+
+print(usage.session_ids)
+print(usage.usage.total_tokens)
+print(cost.total_cost)
+```
+
+The optional server exposes the same grouped views at
+`GET /api/causal-budgets/{causal_budget_id}/usage` and
+`POST /api/causal-budgets/{causal_budget_id}/cost`. These summaries use the
+same normalized usage and caller-supplied pricing as per-session summaries, but
+include every session whose stored `causal_budget_id` matches and include
+per-session breakdowns for debugging forks.
+
 The raw provider `usage` payload remains available on each durable
 `model.completed` event for dashboards, audits, and provider-specific
 diagnostics. `usage_metrics` is Cayu's stable summary shape; raw `usage` is the
@@ -340,6 +359,11 @@ event for the latest session invocation, and compact details such as `limit`,
 exist in durable events. Estimated cost remains a separate
 `POST /api/sessions/{session_id}/cost` call because pricing is supplied by the
 application.
+
+For a work item that may fork into several sessions, use
+`GET /api/causal-budgets/{causal_budget_id}/usage` and
+`POST /api/causal-budgets/{causal_budget_id}/cost` to inspect the combined
+usage/cost and the session ids included in that causal budget.
 
 Programmatic apps can combine the server and app APIs without the dashboard:
 
@@ -454,6 +478,12 @@ catalog because Cayu does not hardcode provider prices:
   }
 }
 ```
+
+For grouped work-item cost, send the same pricing body to
+`POST /api/causal-budgets/{causal_budget_id}/cost`. The response includes
+`causal_budget_id`, `session_ids`, `session_count`, and the same estimated cost
+fields as session cost summaries, plus `session_costs` for per-session
+breakdown.
 
 Run `examples/usage_cost_summary.py` for a deterministic local session report
 that emits retry events and prints normalized usage, cache counters, and

@@ -370,6 +370,29 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump(mode="json")
 
+    @router.get("/causal-budgets/{causal_budget_id}/usage")
+    async def get_causal_budget_usage(causal_budget_id: NonBlankString):
+        try:
+            summary = await cayu_app.get_causal_budget_usage(causal_budget_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Causal budget not found") from exc
+        return summary.model_dump()
+
+    @router.post("/causal-budgets/{causal_budget_id}/cost")
+    async def estimate_causal_budget_cost(
+        causal_budget_id: NonBlankString,
+        body: SessionCostBody,
+    ):
+        try:
+            summary = await cayu_app.get_causal_budget_cost(
+                causal_budget_id,
+                body.pricing,
+                currency=body.currency,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Causal budget not found") from exc
+        return summary.model_dump(mode="json")
+
     @router.get("/sessions/{session_id}/summary")
     async def get_session_summary(session_id: NonBlankString):
         session = await session_store.load(session_id)

@@ -355,6 +355,13 @@ events. The optional FastAPI server exposes the same value at
 records; retry, budget, and stop policies should consume them instead of parsing
 provider-specific payloads directly.
 
+`CayuApp.get_causal_budget_usage(causal_budget_id)` derives the same normalized
+usage totals across every session whose stored `causal_budget_id` matches. The
+summary includes `session_ids`, `session_count`, and per-session
+`session_summaries` so callers can see which parent/fork/task-linked sessions
+are included. The optional server exposes this grouped view at
+`GET /api/causal-budgets/{causal_budget_id}/usage`.
+
 `PricingCatalog` and `ModelPricing` estimate session cost from durable
 `model.completed` events. Pricing is caller supplied; Cayu does not hardcode
 provider prices. `CayuApp.get_session_cost(session_id, pricing)` walks each
@@ -370,6 +377,14 @@ The optional FastAPI server exposes the same estimator at
 `PricingCatalog` and optional `currency`; the response is the JSON form of
 `SessionCostSummary`, with decimal cost values serialized as strings for stable
 API output.
+
+`CayuApp.get_causal_budget_cost(causal_budget_id, pricing)` uses the same
+pricing contract and line-item estimator across all sessions in that causal
+budget. The optional server exposes this at
+`POST /api/causal-budgets/{causal_budget_id}/cost`; the response includes
+`causal_budget_id`, `session_ids`, `session_count`, and the same estimated-cost
+fields as per-session cost summaries, plus `session_costs` for per-session
+breakdown.
 
 For compact health views, use the server's
 `GET /api/sessions/{session_id}/summary`. The summary endpoint includes outcome

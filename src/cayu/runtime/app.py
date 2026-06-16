@@ -84,10 +84,12 @@ from cayu.runtime.context import (
     copy_context_messages,
 )
 from cayu.runtime.costs import (
+    CausalBudgetCostSummary,
     CostBudget,
     PricingCatalog,
     SessionCostSummary,
     copy_cost_budget,
+    estimate_causal_budget_cost,
     estimate_session_cost,
 )
 from cayu.runtime.dispatch import (
@@ -128,6 +130,8 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionOrder,
+    SessionQuery,
     SessionStatus,
     SessionStore,
     copy_fork_session_request,
@@ -168,8 +172,10 @@ from cayu.runtime.tool_policy import (
     ToolPolicyResult,
 )
 from cayu.runtime.usage import (
+    CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
+    causal_budget_usage_summary,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_payload,
@@ -771,6 +777,67 @@ class CayuApp:
         ]
         return session_usage_summary(session_id, events)
 
+    async def get_causal_budget_usage(
+        self,
+        causal_budget_id: str,
+    ) -> CausalBudgetUsageSummary:
+        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        sessions = await self._list_all_sessions(
+            SessionQuery(
+                causal_budget_id=causal_budget_id,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        if not sessions:
+            raise KeyError(f"Causal budget not found: {causal_budget_id}") from None
+        usage_event_records = await self._query_all_event_records(
+            EventQuery(
+                causal_budget_id=causal_budget_id,
+                event_type=EventType.MODEL_COMPLETED,
+            )
+        )
+        tool_event_records = await self._query_all_event_records(
+            EventQuery(
+                causal_budget_id=causal_budget_id,
+                event_type=EventType.TOOL_CALL_STARTED,
+            )
+        )
+        events = [
+            record.event
+            for record in sorted(
+                [*usage_event_records, *tool_event_records],
+                key=lambda record: record.sequence,
+            )
+        ]
+        return causal_budget_usage_summary(
+            causal_budget_id=causal_budget_id,
+            session_ids=[session.id for session in sessions],
+            events=events,
+        )
+
+    async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
+        sessions: list[Session] = []
+        offset = query.offset
+        while True:
+            page = await self.session_store.list_sessions(
+                SessionQuery(
+                    status=query.status,
+                    agent_name=query.agent_name,
+                    environment_name=query.environment_name,
+                    parent_session_id=query.parent_session_id,
+                    causal_budget_id=query.causal_budget_id,
+                    limit=query.limit,
+                    offset=offset,
+                    order_by=query.order_by,
+                )
+            )
+            if not page:
+                return sessions
+            sessions.extend(page)
+            if len(page) < query.limit:
+                return sessions
+            offset += len(page)
+
     async def _query_all_event_records(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []
         after_sequence = query.after_sequence
@@ -778,6 +845,7 @@ class CayuApp:
             page = await self.session_store.query_events(
                 EventQuery(
                     session_id=query.session_id,
+                    causal_budget_id=query.causal_budget_id,
                     event_type=query.event_type,
                     agent_name=query.agent_name,
                     environment_name=query.environment_name,
@@ -809,6 +877,36 @@ class CayuApp:
         return estimate_session_cost(
             session_id=session_id,
             events=events,
+            pricing=pricing,
+            currency=currency,
+        )
+
+    async def get_causal_budget_cost(
+        self,
+        causal_budget_id: str,
+        pricing: PricingCatalog,
+        *,
+        currency: str = "USD",
+    ) -> CausalBudgetCostSummary:
+        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        sessions = await self._list_all_sessions(
+            SessionQuery(
+                causal_budget_id=causal_budget_id,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        if not sessions:
+            raise KeyError(f"Causal budget not found: {causal_budget_id}") from None
+        records = await self._query_all_event_records(
+            EventQuery(
+                causal_budget_id=causal_budget_id,
+                event_type=EventType.MODEL_COMPLETED,
+            )
+        )
+        return estimate_causal_budget_cost(
+            causal_budget_id=causal_budget_id,
+            session_ids=[session.id for session in sessions],
+            events=[record.event for record in records],
             pricing=pricing,
             currency=currency,
         )

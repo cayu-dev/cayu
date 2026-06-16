@@ -45,6 +45,7 @@ from cayu.runtime.context import (
     trim_context_turns,
 )
 from cayu.runtime.costs import (
+    CausalBudgetCostSummary,
     CostBudget,
     CostLineItem,
     ModelPricing,
@@ -52,6 +53,7 @@ from cayu.runtime.costs import (
     SessionCostSummary,
     copy_cost_budget,
     copy_pricing_catalog,
+    estimate_causal_budget_cost,
     estimate_session_cost,
 )
 from cayu.runtime.dispatch import (
@@ -133,8 +135,10 @@ from cayu.runtime.tool_policy import (
 )
 from cayu.runtime.usage import (
     CacheUsageMetrics,
+    CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
+    causal_budget_usage_summary,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_from_event_payload,
@@ -155,6 +159,8 @@ __all__ = [
     "BudgetStore",
     "BudgetWindow",
     "CacheUsageMetrics",
+    "CausalBudgetCostSummary",
+    "CausalBudgetUsageSummary",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
     "CheckpointTransform",
@@ -239,6 +245,7 @@ __all__ = [
     "TranscriptQuery",
     "TranscriptRecord",
     "UsageMetrics",
+    "causal_budget_usage_summary",
     "classify_retryable_error",
     "copy_cost_budget",
     "copy_dispatch_handle",
@@ -247,6 +254,7 @@ __all__ = [
     "copy_retry_policy",
     "copy_run_limits",
     "default_compaction_prompt",
+    "estimate_causal_budget_cost",
     "estimate_session_cost",
     "first_reached_limit",
     "has_run_limits",

@@ -233,6 +233,122 @@ def test_server_exposes_session_cost_estimate() -> None:
     }
 
 
+def test_server_exposes_causal_budget_usage_and_cost() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    for session_id in ("causal_parent", "causal_child"):
+        asyncio.run(
+            _collect_run(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    causal_budget_id="job_shared",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    client = TestClient(create_server(app))
+    usage_response = client.get("/api/causal-budgets/job_shared/usage")
+    cost_response = client.post(
+        "/api/causal-budgets/job_shared/cost",
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_per_million": "1",
+                        "output_per_million": "2",
+                        "cache_read_input_per_million": "0.25",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert usage_response.status_code == 200
+    assert usage_response.json() == {
+        "causal_budget_id": "job_shared",
+        "session_ids": ["causal_parent", "causal_child"],
+        "session_count": 2,
+        "model_steps": 2,
+        "tool_calls": 0,
+        "provider_names": ["fake"],
+        "models": ["fake-model"],
+        "usage": {
+            "provider_name": None,
+            "model": None,
+            "input_tokens": 20,
+            "output_tokens": 4,
+            "total_tokens": 24,
+            "reasoning_output_tokens": 0,
+            "cache": {
+                "read_tokens": 0,
+                "write_tokens": 0,
+                "cached_input_tokens": 8,
+                "uncached_input_tokens": 12,
+            },
+        },
+        "session_summaries": [
+            {
+                "session_id": "causal_parent",
+                "model_steps": 1,
+                "tool_calls": 0,
+                "provider_names": ["fake"],
+                "models": ["fake-model"],
+                "usage": {
+                    "provider_name": None,
+                    "model": None,
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 4,
+                        "uncached_input_tokens": 6,
+                    },
+                },
+            },
+            {
+                "session_id": "causal_child",
+                "model_steps": 1,
+                "tool_calls": 0,
+                "provider_names": ["fake"],
+                "models": ["fake-model"],
+                "usage": {
+                    "provider_name": None,
+                    "model": None,
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 4,
+                        "uncached_input_tokens": 6,
+                    },
+                },
+            },
+        ],
+    }
+    assert cost_response.status_code == 200
+    assert cost_response.json()["causal_budget_id"] == "job_shared"
+    assert cost_response.json()["session_ids"] == ["causal_parent", "causal_child"]
+    assert cost_response.json()["session_count"] == 2
+    assert cost_response.json()["model_steps"] == 2
+    assert cost_response.json()["total_cost"] == "0.000020"
+    assert [item["session_id"] for item in cost_response.json()["session_costs"]] == [
+        "causal_parent",
+        "causal_child",
+    ]
+
+
 def test_server_session_cost_reports_unpriced_steps() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)

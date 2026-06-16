@@ -21,7 +21,11 @@ from cayu.runtime import (
     SessionIdentity,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore, budget_check_from_events
-from cayu.runtime.costs import copy_cost_budget, estimate_session_cost
+from cayu.runtime.costs import (
+    copy_cost_budget,
+    estimate_causal_budget_cost,
+    estimate_session_cost,
+)
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopLimit,
@@ -30,6 +34,7 @@ from cayu.runtime.stop_policy import (
     has_run_limits,
 )
 from cayu.runtime.usage import (
+    causal_budget_usage_summary,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_from_event_payload,
@@ -554,6 +559,108 @@ def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> 
     assert causal_events[0].session_id == "sess_builder"
 
 
+def test_cayu_app_exposes_causal_budget_usage_and_cost() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        app = CayuApp(session_store=session_store)
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_parent",
+                causal_budget_id="job_shared",
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_child",
+                causal_budget_id="job_shared",
+                messages=[Message.text("user", "child")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_other",
+                causal_budget_id="job_other",
+                messages=[Message.text("user", "other")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        for session_id, input_tokens in (
+            ("sess_parent", 1000),
+            ("sess_child", 500),
+            ("sess_other", 9000),
+        ):
+            await session_store.append_event(
+                session_id,
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": input_tokens,
+                            "output_tokens": 100,
+                            "total_tokens": input_tokens + 100,
+                        }
+                    },
+                ),
+            )
+        await session_store.append_event(
+            "sess_child",
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="sess_child",
+                tool_name="read_file",
+            ),
+        )
+        pricing = PricingCatalog(
+            prices=(
+                ModelPricing(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("2"),
+                    output_per_million=Decimal("8"),
+                ),
+            )
+        )
+        usage = await app.get_causal_budget_usage("job_shared")
+        cost = await app.get_causal_budget_cost("job_shared", pricing)
+        return usage, cost
+
+    usage, cost = asyncio.run(run())
+
+    assert usage.causal_budget_id == "job_shared"
+    assert usage.session_ids == ["sess_parent", "sess_child"]
+    assert usage.session_count == 2
+    assert usage.model_steps == 2
+    assert usage.tool_calls == 1
+    assert usage.usage.input_tokens == 1500
+    assert usage.usage.output_tokens == 200
+    assert [item.session_id for item in usage.session_summaries] == [
+        "sess_parent",
+        "sess_child",
+    ]
+    assert usage.session_summaries[0].usage.input_tokens == 1000
+    assert usage.session_summaries[1].usage.input_tokens == 500
+    assert cost.causal_budget_id == "job_shared"
+    assert cost.session_ids == ["sess_parent", "sess_child"]
+    assert cost.session_count == 2
+    assert cost.model_steps == 2
+    assert cost.total_cost == Decimal("0.0046")
+    assert [item.session_id for item in cost.session_costs] == [
+        "sess_parent",
+        "sess_child",
+    ]
+    assert cost.session_costs[0].total_cost == Decimal("0.0028")
+    assert cost.session_costs[1].total_cost == Decimal("0.0018")
+
+
 def test_budget_check_fails_closed_for_unpriced_model_steps() -> None:
     pricing = PricingCatalog(
         prices=(
@@ -690,6 +797,61 @@ def test_session_usage_summary_aggregates_model_steps_and_tools() -> None:
     assert summary.usage.cache.uncached_input_tokens == 90
 
 
+def test_causal_budget_usage_summary_aggregates_related_sessions() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_parent",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                }
+            },
+        ),
+        Event(type=EventType.TOOL_CALL_STARTED, session_id="sess_child", tool_name="read_file"),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_child",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60,
+                }
+            },
+        ),
+    ]
+
+    summary = causal_budget_usage_summary(
+        causal_budget_id="job_shared",
+        session_ids=["sess_parent", "sess_child"],
+        events=events,
+    )
+
+    assert summary.causal_budget_id == "job_shared"
+    assert summary.session_ids == ["sess_parent", "sess_child"]
+    assert summary.session_count == 2
+    assert summary.model_steps == 2
+    assert summary.tool_calls == 1
+    assert summary.provider_names == ["openai"]
+    assert summary.models == ["gpt-5.5"]
+    assert summary.usage.input_tokens == 150
+    assert summary.usage.output_tokens == 30
+    assert summary.usage.total_tokens == 180
+    assert [item.session_id for item in summary.session_summaries] == [
+        "sess_parent",
+        "sess_child",
+    ]
+    assert summary.session_summaries[0].usage.input_tokens == 100
+    assert summary.session_summaries[1].tool_calls == 1
+
+
 def test_estimate_session_cost_prices_each_model_step() -> None:
     events = [
         Event(
@@ -771,6 +933,77 @@ def test_estimate_session_cost_prices_each_model_step() -> None:
     assert summary.line_items[1].output_cost == Decimal("0.0015")
     assert summary.line_items[1].total_cost == Decimal("0.00384")
     assert summary.total_cost == Decimal("0.00684")
+
+
+def test_estimate_causal_budget_cost_prices_related_sessions() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_parent",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "cache": {
+                        "read_tokens": 200,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 200,
+                        "uncached_input_tokens": 800,
+                    },
+                }
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_child",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "model": "gpt-5.5",
+                    "input_tokens": 500,
+                    "output_tokens": 50,
+                    "total_tokens": 550,
+                }
+            },
+        ),
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("2"),
+                output_per_million=Decimal("8"),
+                cache_read_input_per_million=Decimal("0.5"),
+            ),
+        )
+    )
+
+    summary = estimate_causal_budget_cost(
+        causal_budget_id="job_shared",
+        session_ids=["sess_parent", "sess_child"],
+        events=events,
+        pricing=pricing,
+    )
+
+    assert summary.causal_budget_id == "job_shared"
+    assert summary.session_ids == ["sess_parent", "sess_child"]
+    assert summary.session_count == 2
+    assert summary.model_steps == 2
+    assert summary.priced_model_steps == 2
+    assert summary.unpriced_model_steps == 0
+    assert summary.line_items[0].total_cost == Decimal("0.0025")
+    assert summary.line_items[1].total_cost == Decimal("0.0014")
+    assert summary.total_cost == Decimal("0.0039")
+    assert [item.session_id for item in summary.session_costs] == [
+        "sess_parent",
+        "sess_child",
+    ]
+    assert summary.session_costs[0].total_cost == Decimal("0.0025")
+    assert summary.session_costs[1].total_cost == Decimal("0.0014")
 
 
 def test_estimate_session_cost_reports_unpriced_model_steps() -> None:
