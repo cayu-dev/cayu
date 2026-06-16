@@ -22,7 +22,7 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
 )
-from cayu.storage import _sqlite_support
+from cayu.storage import migrations as schema_migrations
 
 
 class FakeProvider(ModelProvider):
@@ -290,7 +290,7 @@ def test_sqlite_session_store_locks_checkpoint_during_atomic_status_checkpoint_t
                 try:
                     connection.execute(
                         """
-                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                         VALUES (?, ?, ?)
                         ON CONFLICT(session_id) DO UPDATE SET
                             state_json = excluded.state_json,
@@ -564,7 +564,7 @@ def test_sqlite_session_store_fork_reads_checkpoint_inside_write_transaction(tmp
                 ):
                     connection.execute(
                         """
-                        UPDATE checkpoints
+                        UPDATE cayu_checkpoints
                         SET state_json = ?
                         WHERE session_id = ?
                         """,
@@ -634,7 +634,7 @@ def test_sqlite_session_store_exposes_queryable_event_identity_columns(tmp_path)
             """
             SELECT session_id, event_type, agent_name, environment_name,
                    tool_name, payload_json
-            FROM events
+            FROM cayu_events
             WHERE tool_name = ?
             """,
             ("read_file",),
@@ -721,28 +721,32 @@ def test_sqlite_session_store_persists_updated_session_model_across_reopen(tmp_p
     asyncio.run(assert_reopened())
 
 
-def test_sqlite_session_store_rejects_older_pre_public_schema_version(tmp_path):
+def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path):
+    # validate-at-startup (ADR 0001 Q4): a store opened in validate mode against an
+    # empty database fails fast instead of silently creating the schema.
     db_path = tmp_path / "sessions.sqlite"
-    connection = sqlite3.connect(db_path)
-    try:
-        connection.execute("PRAGMA user_version = 3")
-    finally:
-        connection.close()
-
-    with pytest.raises(RuntimeError, match="unsupported pre-public Cayu schema version: 3"):
-        SQLiteSessionStore(db_path)
+    with pytest.raises(schema_migrations.SchemaUninitialized):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
-def test_sqlite_session_store_rejects_unversioned_existing_tables(tmp_path):
+def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
+    # The cayu_ prefix (ADR 0001 Decision 5) means an app's own unprefixed tables in
+    # the same database no longer block initialization — they simply coexist.
     db_path = tmp_path / "sessions.sqlite"
     connection = sqlite3.connect(db_path)
     try:
         connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+        connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="existing tables but no Cayu schema version"):
-        SQLiteSessionStore(db_path)
+    store = SQLiteSessionStore(db_path)
+
+    async def assert_initialized() -> None:
+        assert await store.list_sessions() == []
+        await _close(store)
+
+    asyncio.run(assert_initialized())
 
 
 def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
@@ -762,7 +766,9 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
     finally:
         connection.close()
 
-    assert version == _sqlite_support.SCHEMA_VERSION
+    # user_version now mirrors the ADR 0001 schema revision (the cross-backend
+    # source of truth is the cayu_schema_migrations table).
+    assert version == schema_migrations.BASELINE_REVISION
 
 
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):
@@ -888,13 +894,24 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
     asyncio.run(run_app())
 
 
-def test_sqlite_session_store_rejects_newer_schema_version(tmp_path):
+def test_sqlite_session_store_rejects_incompatibly_new_database(tmp_path):
+    # A database migrated past a breaking revision this binary doesn't understand
+    # (compatible_from floor above the app's latest) fails fast (ADR 0001 Decision 7).
     db_path = tmp_path / "newer.sqlite"
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("PRAGMA user_version = 999")
+        connection.execute(
+            "CREATE TABLE cayu_schema_migrations ("
+            "revision INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
+            "compatible_from INTEGER NOT NULL, checksum TEXT, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO cayu_schema_migrations VALUES "
+            "(999, 'breaking', 999, NULL, '2026-01-01T00:00:00+00:00')"
+        )
+        connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="newer Cayu schema"):
+    with pytest.raises(schema_migrations.SchemaTooNew):
         SQLiteSessionStore(db_path)

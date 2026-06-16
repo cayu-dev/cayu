@@ -363,6 +363,8 @@ __all__ = [
     "PdfArtifactReader",
     "PendingToolApproval",
     "PendingToolCallApproval",
+    "PostgresSessionStore",
+    "PostgresTaskStore",
     "PricingCatalog",
     "ProviderStatePart",
     "ReadFileOptions",
@@ -469,3 +471,13 @@ __all__ = [
     "trim_context_turns",
     "usage_metrics_from_event_payload",
 ]
+
+
+def __getattr__(name: str):
+    # Postgres stores require the optional ``postgres`` extra (psycopg). Import
+    # them lazily so ``import cayu`` does not depend on psycopg being installed.
+    if name in {"PostgresSessionStore", "PostgresTaskStore"}:
+        from cayu.storage import postgres
+
+        return getattr(postgres, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

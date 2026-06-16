@@ -52,6 +52,7 @@ from cayu.runtime.tasks import (
     copy_task_query,
 )
 from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migrations as schema
 
 
 def _event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
@@ -66,15 +67,23 @@ def _event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
 class SQLiteSessionStore(SessionStore):
     """SQLite-backed session store for durable local runtime state."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+    ) -> None:
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
             db_path = Path(require_nonblank(path, "path"))
         else:
             raise TypeError("SQLiteSessionStore path must be a string or Path.")
+        if not isinstance(schema_mode, schema.SchemaMode):
+            raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
+        self._schema_mode = schema_mode
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
@@ -93,7 +102,7 @@ class SQLiteSessionStore(SessionStore):
                 with self._connection:
                     self._connection.execute(
                         """
-                        INSERT INTO sessions (
+                        INSERT INTO cayu_sessions (
                             id,
                             agent_name,
                             provider_name,
@@ -172,7 +181,7 @@ class SQLiteSessionStore(SessionStore):
                 transcript_rows = self._connection.execute(
                     """
                     SELECT message_json
-                    FROM transcript_messages
+                    FROM cayu_transcript_messages
                     WHERE session_id = ?
                     ORDER BY sequence ASC
                     """,
@@ -205,7 +214,7 @@ class SQLiteSessionStore(SessionStore):
 
                 self._connection.execute(
                     """
-                    INSERT INTO sessions (
+                    INSERT INTO cayu_sessions (
                         id,
                         agent_name,
                         provider_name,
@@ -227,7 +236,7 @@ class SQLiteSessionStore(SessionStore):
                 if copied_messages:
                     self._connection.executemany(
                         """
-                        INSERT INTO transcript_messages (
+                        INSERT INTO cayu_transcript_messages (
                             session_id,
                             role,
                             message_json
@@ -246,7 +255,7 @@ class SQLiteSessionStore(SessionStore):
                 if copied_checkpoint is not None:
                     self._connection.execute(
                         """
-                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                         VALUES (?, ?, ?)
                         """,
                         (
@@ -279,7 +288,7 @@ class SQLiteSessionStore(SessionStore):
                        causal_budget_id, runtime_name, runtime_version, environment_name,
                        status, created_at,
                        updated_at, metadata_json
-                FROM sessions
+                FROM cayu_sessions
                 WHERE id = ?
                 """,
                 (session_id,),
@@ -298,7 +307,7 @@ class SQLiteSessionStore(SessionStore):
             with self._connection:
                 cursor = self._connection.execute(
                     """
-                    UPDATE sessions
+                    UPDATE cayu_sessions
                     SET status = ?, updated_at = ?
                     WHERE id = ?
                     """,
@@ -320,7 +329,7 @@ class SQLiteSessionStore(SessionStore):
             with self._connection:
                 cursor = self._connection.execute(
                     """
-                    UPDATE sessions
+                    UPDATE cayu_sessions
                     SET model = ?, updated_at = ?
                     WHERE id = ?
                     """,
@@ -358,7 +367,7 @@ class SQLiteSessionStore(SessionStore):
             with self._connection:
                 cursor = self._connection.execute(
                     f"""
-                    UPDATE sessions
+                    UPDATE cayu_sessions
                     SET status = ?, updated_at = ?
                     WHERE id = ? AND status IN ({placeholders})
                     """,
@@ -417,7 +426,7 @@ class SQLiteSessionStore(SessionStore):
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 cursor = self._connection.execute(
                     f"""
-                    UPDATE sessions
+                    UPDATE cayu_sessions
                     SET status = ?, updated_at = ?
                     WHERE id = ? AND status IN ({placeholders})
                     """,
@@ -438,7 +447,7 @@ class SQLiteSessionStore(SessionStore):
                 if transformed_checkpoint is not None:
                     self._connection.execute(
                         """
-                        INSERT INTO checkpoints (session_id, state_json, updated_at)
+                        INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                         VALUES (?, ?, ?)
                         ON CONFLICT(session_id) DO UPDATE SET
                             state_json = excluded.state_json,
@@ -496,7 +505,7 @@ class SQLiteSessionStore(SessionStore):
                 with self._connection:
                     self._connection.executemany(
                         """
-                        INSERT INTO events (
+                        INSERT INTO cayu_events (
                             session_id,
                             event_id,
                             event_type,
@@ -545,7 +554,7 @@ class SQLiteSessionStore(SessionStore):
             rows = self._connection.execute(
                 """
                 SELECT event_json
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                 ORDER BY sequence ASC
                 """,
@@ -559,28 +568,28 @@ class SQLiteSessionStore(SessionStore):
         params: list[object] = []
 
         if query.after_sequence is not None:
-            clauses.append("events.sequence > ?")
+            clauses.append("cayu_events.sequence > ?")
             params.append(query.after_sequence)
         if query.session_id is not None:
-            clauses.append("events.session_id = ?")
+            clauses.append("cayu_events.session_id = ?")
             params.append(query.session_id)
         if query.causal_budget_id is not None:
-            clauses.append("sessions.causal_budget_id = ?")
+            clauses.append("cayu_sessions.causal_budget_id = ?")
             params.append(query.causal_budget_id)
         if query.event_type is not None:
-            clauses.append("events.event_type = ?")
+            clauses.append("cayu_events.event_type = ?")
             params.append(str(query.event_type))
         if query.agent_name is not None:
-            clauses.append("events.agent_name = ?")
+            clauses.append("cayu_events.agent_name = ?")
             params.append(query.agent_name)
         if query.environment_name is not None:
-            clauses.append("events.environment_name = ?")
+            clauses.append("cayu_events.environment_name = ?")
             params.append(query.environment_name)
         if query.workflow_name is not None:
-            clauses.append("events.workflow_name = ?")
+            clauses.append("cayu_events.workflow_name = ?")
             params.append(query.workflow_name)
         if query.tool_name is not None:
-            clauses.append("events.tool_name = ?")
+            clauses.append("cayu_events.tool_name = ?")
             params.append(query.tool_name)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -589,11 +598,11 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT events.sequence, events.event_json
-                FROM events
-                JOIN sessions ON sessions.id = events.session_id
+                SELECT cayu_events.sequence, cayu_events.event_json
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                 {where_sql}
-                ORDER BY events.sequence ASC
+                ORDER BY cayu_events.sequence ASC
                 LIMIT ?
                 """,
                 params,
@@ -615,7 +624,7 @@ class SQLiteSessionStore(SessionStore):
             total_row = self._connection.execute(
                 """
                 SELECT COUNT(*) AS total_events
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                 """,
                 (session_id,),
@@ -623,7 +632,7 @@ class SQLiteSessionStore(SessionStore):
             count_rows = self._connection.execute(
                 """
                 SELECT event_type, COUNT(*) AS count
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                 GROUP BY event_type
                 ORDER BY event_type ASC
@@ -633,7 +642,7 @@ class SQLiteSessionStore(SessionStore):
             latest_row = self._connection.execute(
                 """
                 SELECT sequence, event_json
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                 ORDER BY sequence DESC
                 LIMIT 1
@@ -665,13 +674,13 @@ class SQLiteSessionStore(SessionStore):
             terminal_row = self._connection.execute(
                 """
                 SELECT sequence, event_json
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                   AND event_type IN ('session.completed', 'session.failed', 'session.interrupted')
                   AND sequence > COALESCE(
                       (
                           SELECT MAX(sequence)
-                          FROM events
+                          FROM cayu_events
                           WHERE session_id = ?
                             AND event_type IN ('session.started', 'session.resumed')
                       ),
@@ -685,13 +694,13 @@ class SQLiteSessionStore(SessionStore):
             retry_row = self._connection.execute(
                 """
                 SELECT sequence, event_json
-                FROM events
+                FROM cayu_events
                 WHERE session_id = ?
                   AND event_type = 'model.retry'
                   AND sequence > COALESCE(
                       (
                           SELECT MAX(sequence)
-                          FROM events
+                          FROM cayu_events
                           WHERE session_id = ?
                             AND event_type IN ('session.started', 'session.resumed')
                       ),
@@ -741,7 +750,7 @@ class SQLiteSessionStore(SessionStore):
                        causal_budget_id, runtime_name, runtime_version, environment_name,
                        status, created_at,
                        updated_at, metadata_json
-                FROM sessions
+                FROM cayu_sessions
                 {where_sql}
                 ORDER BY {order_sql}, id ASC
                 LIMIT ? OFFSET ?
@@ -766,7 +775,7 @@ class SQLiteSessionStore(SessionStore):
             with self._connection:
                 self._connection.executemany(
                     """
-                    INSERT INTO transcript_messages (
+                    INSERT INTO cayu_transcript_messages (
                         session_id,
                         role,
                         message_json
@@ -803,7 +812,7 @@ class SQLiteSessionStore(SessionStore):
                 if copied_messages:
                     self._connection.executemany(
                         """
-                        INSERT INTO transcript_messages (
+                        INSERT INTO cayu_transcript_messages (
                             session_id,
                             role,
                             message_json
@@ -821,7 +830,7 @@ class SQLiteSessionStore(SessionStore):
                     )
                 self._connection.execute(
                     """
-                    INSERT INTO checkpoints (session_id, state_json, updated_at)
+                    INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                     VALUES (?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         state_json = excluded.state_json,
@@ -842,7 +851,7 @@ class SQLiteSessionStore(SessionStore):
             rows = self._connection.execute(
                 """
                 SELECT message_json
-                FROM transcript_messages
+                FROM cayu_transcript_messages
                 WHERE session_id = ?
                 ORDER BY sequence ASC
                 """,
@@ -866,7 +875,7 @@ class SQLiteSessionStore(SessionStore):
                     SELECT
                         role,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM transcript_messages
+                    FROM cayu_transcript_messages
                     WHERE session_id = ?
                 )
                 SELECT COUNT(*) AS total_records
@@ -890,7 +899,7 @@ class SQLiteSessionStore(SessionStore):
                         role,
                         message_json,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM transcript_messages
+                    FROM cayu_transcript_messages
                     WHERE session_id = ?
                 )
                 SELECT transcript_index, message_json
@@ -925,7 +934,7 @@ class SQLiteSessionStore(SessionStore):
             with self._connection:
                 self._connection.execute(
                     """
-                    INSERT INTO checkpoints (session_id, state_json, updated_at)
+                    INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                     VALUES (?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         state_json = excluded.state_json,
@@ -947,7 +956,7 @@ class SQLiteSessionStore(SessionStore):
         row = self._connection.execute(
             """
             SELECT state_json
-            FROM checkpoints
+            FROM cayu_checkpoints
             WHERE session_id = ?
             """,
             (session_id,),
@@ -964,7 +973,7 @@ class SQLiteSessionStore(SessionStore):
         return sqlite_support.connect(path)
 
     def _initialize_schema(self) -> None:
-        sqlite_support.initialize_schema(self._connection)
+        sqlite_support.reconcile_schema(self._connection, self._schema_mode)
 
     def _load_unlocked(self, session_id: str) -> Session | None:
         row = self._connection.execute(
@@ -972,7 +981,7 @@ class SQLiteSessionStore(SessionStore):
             SELECT id, agent_name, provider_name, model, parent_session_id,
                    causal_budget_id, runtime_name, runtime_version, environment_name, status, created_at,
                    updated_at, metadata_json
-            FROM sessions
+            FROM cayu_sessions
             WHERE id = ?
             """,
             (session_id,),
@@ -983,7 +992,7 @@ class SQLiteSessionStore(SessionStore):
 
     def _session_exists_unlocked(self, session_id: str) -> bool:
         row = self._connection.execute(
-            "SELECT 1 FROM sessions WHERE id = ?",
+            "SELECT 1 FROM cayu_sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         return row is not None
@@ -995,7 +1004,7 @@ class SQLiteSessionStore(SessionStore):
     ) -> str | None:
         for event_id in event_ids:
             row = self._connection.execute(
-                "SELECT 1 FROM events WHERE session_id = ? AND event_id = ?",
+                "SELECT 1 FROM cayu_events WHERE session_id = ? AND event_id = ?",
                 (session_id, event_id),
             ).fetchone()
             if row is not None:
@@ -1006,15 +1015,23 @@ class SQLiteSessionStore(SessionStore):
 class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+    ) -> None:
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
             db_path = Path(require_nonblank(path, "path"))
         else:
             raise TypeError("SQLiteTaskStore path must be a string or Path.")
+        if not isinstance(schema_mode, schema.SchemaMode):
+            raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
+        self._schema_mode = schema_mode
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
@@ -1027,7 +1044,7 @@ class SQLiteTaskStore(TaskStore):
                 with self._connection:
                     self._connection.execute(
                         """
-                        INSERT INTO tasks (
+                        INSERT INTO cayu_tasks (
                             id,
                             type,
                             title,
@@ -1089,7 +1106,7 @@ class SQLiteTaskStore(TaskStore):
             rows = self._connection.execute(
                 f"""
                 SELECT *
-                FROM tasks
+                FROM cayu_tasks
                 {where_sql}
                 ORDER BY {order_sql}, id ASC
                 LIMIT ? OFFSET ?
@@ -1112,7 +1129,7 @@ class SQLiteTaskStore(TaskStore):
             with self._connection:
                 cursor = self._connection.execute(
                     """
-                    UPDATE tasks
+                    UPDATE cayu_tasks
                     SET status = ?,
                         session_id = COALESCE(?, session_id),
                         started_at = COALESCE(started_at, ?),
@@ -1180,11 +1197,11 @@ class SQLiteTaskStore(TaskStore):
         return sqlite_support.connect(path)
 
     def _initialize_schema(self) -> None:
-        sqlite_support.initialize_schema(self._connection)
+        sqlite_support.reconcile_schema(self._connection, self._schema_mode)
 
     def _load_task_unlocked(self, task_id: str) -> Task | None:
         row = self._connection.execute(
-            "SELECT * FROM tasks WHERE id = ?",
+            "SELECT * FROM cayu_tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -1199,7 +1216,7 @@ class SQLiteTaskStore(TaskStore):
 
     def _task_exists_unlocked(self, task_id: str) -> bool:
         row = self._connection.execute(
-            "SELECT 1 FROM tasks WHERE id = ?",
+            "SELECT 1 FROM cayu_tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         return row is not None
@@ -1216,7 +1233,7 @@ class SQLiteTaskStore(TaskStore):
         with self._connection:
             cursor = self._connection.execute(
                 """
-                UPDATE tasks
+                UPDATE cayu_tasks
                 SET status = ?,
                     result_json = ?,
                     error_json = ?,

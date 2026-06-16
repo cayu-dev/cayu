@@ -16,8 +16,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
-
-SCHEMA_VERSION = 7
+from cayu.storage import migrations as schema
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -32,126 +31,212 @@ def connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+# Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
+# (Decision 5) so Cayu state never collides with an app's own tables. The
+# cayu_schema_migrations bookkeeping table is created separately by the migrator.
+_BASELINE_DDL = """
+    CREATE TABLE IF NOT EXISTS cayu_sessions (
+        id TEXT PRIMARY KEY,
+        agent_name TEXT NOT NULL,
+        provider_name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        parent_session_id TEXT REFERENCES cayu_sessions(id) ON DELETE SET NULL,
+        causal_budget_id TEXT NOT NULL,
+        runtime_name TEXT NOT NULL,
+        runtime_version TEXT,
+        environment_name TEXT,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        event_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        agent_name TEXT,
+        environment_name TEXT,
+        workflow_name TEXT,
+        tool_name TEXT,
+        payload_json TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        UNIQUE(session_id, event_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_checkpoints (
+        session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        message_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_tasks (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT,
+        description TEXT,
+        status TEXT NOT NULL,
+        session_id TEXT,
+        parent_task_id TEXT,
+        assigned_agent_name TEXT,
+        input_json TEXT NOT NULL,
+        result_json TEXT,
+        error_json TEXT,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_sessions_status
+        ON cayu_sessions(status);
+    CREATE INDEX IF NOT EXISTS idx_cayu_sessions_agent_name
+        ON cayu_sessions(agent_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_sessions_environment_name
+        ON cayu_sessions(environment_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_sessions_causal_budget_id
+        ON cayu_sessions(causal_budget_id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence
+        ON cayu_events(session_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp
+        ON cayu_events(event_type, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name
+        ON cayu_events(agent_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_environment_name
+        ON cayu_events(environment_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_name
+        ON cayu_events(workflow_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_tool_name
+        ON cayu_events(tool_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_sequence
+        ON cayu_transcript_messages(session_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_role_sequence
+        ON cayu_transcript_messages(session_id, role, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status
+        ON cayu_tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_type
+        ON cayu_tasks(type);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_session_id
+        ON cayu_tasks(session_id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_task_id
+        ON cayu_tasks(parent_task_id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_assigned_agent_name
+        ON cayu_tasks(assigned_agent_name);
+"""
+
+# Bookkeeping table created/owned by the migrator (separate from a revision's DDL).
+_MIGRATIONS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS cayu_schema_migrations (
+        revision INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,
+        compatible_from INTEGER NOT NULL,
+        checksum TEXT,
+        applied_at TEXT NOT NULL
+    )
+"""
+
+# Per-revision forward-migration DDL, keyed by revision number. The baseline
+# (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
+# additive/breaking revisions append their ALTER/CREATE scripts.
+_MIGRATION_STEPS: dict[int, str] = {}
+
+
+def reconcile_schema(
+    connection: sqlite3.Connection,
+    schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+) -> None:
+    """Reconcile the SQLite schema with this binary per ``schema_mode`` (ADR 0001).
+
+    SQLite's single writer plus ``PRAGMA busy_timeout`` provides the cross-process
+    coordination that the Postgres backend gets from an advisory lock.
+
+    - ``validate``: read the recorded revision and fail fast unless this binary can
+      operate against it. Never runs DDL.
+    - ``create``: initialize the baseline schema on an empty database; otherwise
+      validate. The default for SQLite (dev / test / local durability).
+    - ``migrate``: apply pending forward revisions, then validate.
+    """
+    if schema_mode is not schema.SchemaMode.VALIDATE:
+        connection.execute(_MIGRATIONS_TABLE_DDL)
+        connection.commit()
+    state = read_schema_state(connection)
+    if schema_mode is schema.SchemaMode.VALIDATE:
+        schema.validate(state)
+    elif schema_mode is schema.SchemaMode.CREATE:
+        if state.revision == schema.UNINITIALIZED:
+            _apply_baseline(connection)
+        else:
+            schema.validate(state)
+    else:  # MIGRATE
+        _apply_pending(connection, state)
+        schema.validate(read_schema_state(connection))
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"SQLite store database was created by a newer Cayu schema version: {version}"
-        )
-    if version == 0 and _has_user_tables(connection):
-        raise RuntimeError(
-            "SQLite store database has existing tables but no Cayu schema version. "
-            "Recreate the database with the current Cayu version."
-        )
-    if version not in (0, SCHEMA_VERSION):
-        raise RuntimeError(
-            "SQLite store database uses an unsupported pre-public Cayu schema "
-            f"version: {version}. Recreate the database with the current Cayu version."
-        )
+    reconcile_schema(connection, schema.SchemaMode.CREATE)
 
-    with connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                agent_name TEXT NOT NULL,
-                provider_name TEXT NOT NULL,
-                model TEXT NOT NULL,
-                parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
-                causal_budget_id TEXT NOT NULL,
-                runtime_name TEXT NOT NULL,
-                runtime_version TEXT,
-                environment_name TEXT,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                metadata_json TEXT NOT NULL
-            );
 
-            CREATE TABLE IF NOT EXISTS events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                event_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                agent_name TEXT,
-                environment_name TEXT,
-                workflow_name TEXT,
-                tool_name TEXT,
-                payload_json TEXT NOT NULL,
-                event_json TEXT NOT NULL,
-                UNIQUE(session_id, event_id)
-            );
+def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
+    """Read the recorded schema state without applying DDL or failing fast."""
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_schema_migrations'"
+    ).fetchone()
+    if exists is None:
+        return schema.SchemaState(revision=schema.UNINITIALIZED, compatible_from=0)
+    row = connection.execute(
+        "SELECT revision, compatible_from FROM cayu_schema_migrations "
+        "ORDER BY revision DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return schema.SchemaState(revision=schema.UNINITIALIZED, compatible_from=0)
+    return schema.SchemaState(revision=row[0], compatible_from=row[1])
 
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                state_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
 
-            CREATE TABLE IF NOT EXISTS transcript_messages (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                message_json TEXT NOT NULL
-            );
+def _apply_baseline(connection: sqlite3.Connection) -> None:
+    connection.executescript(_BASELINE_DDL)
+    _record_revision(connection, schema.revision(schema.BASELINE_REVISION))
+    # user_version mirrors the revision as a cheap SQLite-native marker; the
+    # cayu_schema_migrations table remains the cross-backend source of truth.
+    connection.execute(f"PRAGMA user_version = {schema.BASELINE_REVISION}")
+    connection.commit()
 
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                type TEXT NOT NULL,
-                title TEXT,
-                description TEXT,
-                status TEXT NOT NULL,
-                session_id TEXT,
-                parent_task_id TEXT,
-                assigned_agent_name TEXT,
-                input_json TEXT NOT NULL,
-                result_json TEXT,
-                error_json TEXT,
-                metadata_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT
-            );
 
-            CREATE INDEX IF NOT EXISTS idx_sessions_status
-                ON sessions(status);
-            CREATE INDEX IF NOT EXISTS idx_sessions_agent_name
-                ON sessions(agent_name);
-            CREATE INDEX IF NOT EXISTS idx_sessions_environment_name
-                ON sessions(environment_name);
-            CREATE INDEX IF NOT EXISTS idx_sessions_causal_budget_id
-                ON sessions(causal_budget_id);
-            CREATE INDEX IF NOT EXISTS idx_events_session_sequence
-                ON events(session_id, sequence);
-            CREATE INDEX IF NOT EXISTS idx_events_type_timestamp
-                ON events(event_type, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_events_agent_name
-                ON events(agent_name);
-            CREATE INDEX IF NOT EXISTS idx_events_environment_name
-                ON events(environment_name);
-            CREATE INDEX IF NOT EXISTS idx_events_workflow_name
-                ON events(workflow_name);
-            CREATE INDEX IF NOT EXISTS idx_events_tool_name
-                ON events(tool_name);
-            CREATE INDEX IF NOT EXISTS idx_transcript_messages_session_sequence
-                ON transcript_messages(session_id, sequence);
-            CREATE INDEX IF NOT EXISTS idx_transcript_messages_session_role_sequence
-                ON transcript_messages(session_id, role, sequence);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status
-                ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_type
-                ON tasks(type);
-            CREATE INDEX IF NOT EXISTS idx_tasks_session_id
-                ON tasks(session_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id
-                ON tasks(parent_task_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_assigned_agent_name
-                ON tasks(assigned_agent_name);
-            """
-        )
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) -> None:
+    current = state.revision
+    if current == schema.UNINITIALIZED:
+        _apply_baseline(connection)
+        current = schema.BASELINE_REVISION
+    for rev in schema.pending(current):
+        ddl = _MIGRATION_STEPS.get(rev.revision)
+        if ddl:
+            connection.executescript(ddl)
+        _record_revision(connection, rev)
+        connection.execute(f"PRAGMA user_version = {rev.revision}")
+        connection.commit()
+
+
+def _record_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO cayu_schema_migrations "
+        "(revision, kind, compatible_from, checksum, applied_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            rev.revision,
+            str(rev.kind),
+            rev.compatible_from,
+            None,
+            format_datetime(datetime.now(UTC)),
+        ),
+    )
 
 
 def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> Session:
@@ -300,16 +385,3 @@ def task_order_sql(order_by: TaskOrder) -> str:
     if order_by == TaskOrder.UPDATED_AT_ASC:
         return "updated_at ASC"
     return "updated_at DESC"
-
-
-def _has_user_tables(connection: sqlite3.Connection) -> bool:
-    row = connection.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'table'
-          AND name NOT LIKE 'sqlite_%'
-        LIMIT 1
-        """
-    ).fetchone()
-    return row is not None
