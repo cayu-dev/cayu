@@ -252,21 +252,33 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
 
     client = TestClient(create_server(app))
     usage_response = client.get("/api/causal-budgets/job_shared/usage")
+    pricing_body = {
+        "pricing": {
+            "prices": [
+                {
+                    "provider_name": "fake",
+                    "model": "fake-model",
+                    "input_per_million": "1",
+                    "output_per_million": "2",
+                    "cache_read_input_per_million": "0.25",
+                }
+            ]
+        },
+    }
     cost_response = client.post(
         "/api/causal-budgets/job_shared/cost",
-        json={
-            "pricing": {
-                "prices": [
-                    {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "input_per_million": "1",
-                        "output_per_million": "2",
-                        "cache_read_input_per_million": "0.25",
-                    }
-                ]
-            }
-        },
+        json=pricing_body,
+    )
+
+    async def unexpected_app_summary_call(*args, **kwargs):
+        raise AssertionError("causal summary route must use one session snapshot")
+
+    app.get_causal_budget_usage = unexpected_app_summary_call
+    app.get_causal_budget_cost = unexpected_app_summary_call
+
+    summary_response = client.post(
+        "/api/causal-budgets/job_shared/summary",
+        json=pricing_body,
     )
 
     assert usage_response.status_code == 200
@@ -347,6 +359,32 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
         "causal_parent",
         "causal_child",
     ]
+    assert summary_response.status_code == 200
+    summary_body = summary_response.json()
+    assert summary_body["causal_budget_id"] == "job_shared"
+    assert summary_body["session_count"] == 2
+    assert [item["session"]["id"] for item in summary_body["sessions"]] == [
+        "causal_parent",
+        "causal_child",
+    ]
+    assert [item["outcome"]["reason"] for item in summary_body["sessions"]] == [
+        "completed",
+        "completed",
+    ]
+    for item in summary_body["sessions"]:
+        assert item["events"]["total_events"] > 0
+        assert item["events"]["counts_by_type"]["model.completed"] == 1
+        assert item["events"]["counts_by_type"]["session.completed"] == 1
+        assert item["events"]["latest_event"]["type"] == "session.completed"
+    assert summary_body["usage"]["usage"]["total_tokens"] == 24
+    assert summary_body["cost"]["total_cost"] == "0.000020"
+
+    missing_summary_response = client.post(
+        "/api/causal-budgets/missing/summary",
+        json=pricing_body,
+    )
+    assert missing_summary_response.status_code == 404
+    assert missing_summary_response.json() == {"detail": "Causal budget not found"}
 
 
 def test_server_session_cost_reports_unpriced_steps() -> None:

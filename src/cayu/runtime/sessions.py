@@ -884,27 +884,7 @@ class InMemorySessionStore(SessionStore):
             records = [
                 record for record in self._event_records if record.event.session_id == session_id
             ]
-            counts_by_type: dict[str, int] = {}
-            latest_record: EventRecord | None = None
-            for record in records:
-                event_type = str(record.event.type)
-                counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
-                if latest_record is None or record.sequence > latest_record.sequence:
-                    latest_record = record
-
-            return EventSummary(
-                session_id=session_id,
-                total_events=len(records),
-                counts_by_type=counts_by_type,
-                latest_event=(
-                    None
-                    if latest_record is None
-                    else EventRecord(
-                        sequence=latest_record.sequence,
-                        event=latest_record.event,
-                    )
-                ),
-            )
+            return event_summary_from_records(session_id, records)
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -913,39 +893,10 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
 
-            latest_lifecycle_sequence = 0
-            for record in reversed(self._event_records):
-                if record.event.session_id != session_id:
-                    continue
-                if _is_outcome_lifecycle_event(record.event):
-                    latest_lifecycle_sequence = record.sequence
-                    break
-
-            terminal_record: EventRecord | None = None
-            for record in reversed(self._event_records):
-                if record.event.session_id != session_id:
-                    continue
-                if record.sequence <= latest_lifecycle_sequence:
-                    break
-                if _is_outcome_terminal_event(record.event):
-                    terminal_record = record
-                    break
-
-            retry_record: EventRecord | None = None
-            for record in reversed(self._event_records):
-                if record.event.session_id != session_id:
-                    continue
-                if record.sequence <= latest_lifecycle_sequence:
-                    break
-                if record.event.type == EventType.MODEL_RETRY:
-                    retry_record = record
-                    break
-
-            return session_outcome(
-                session,
-                terminal_event=terminal_record,
-                latest_retry_event=retry_record,
-            )
+            records = [
+                record for record in self._event_records if record.event.session_id == session_id
+            ]
+            return session_outcome_from_records(session, records)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
         query = copy_session_query(query)
@@ -1036,6 +987,64 @@ class InMemorySessionStore(SessionStore):
 
 def _validate_event(event: Event) -> Event:
     return copy_event(event)
+
+
+def event_summary_from_records(
+    session_id: str,
+    records: list[EventRecord],
+) -> EventSummary:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    counts_by_type: dict[str, int] = {}
+    latest_record: EventRecord | None = None
+    for record in records:
+        if record.event.session_id != session_id:
+            continue
+        event_type = str(record.event.type)
+        counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
+        if latest_record is None or record.sequence > latest_record.sequence:
+            latest_record = record
+    return EventSummary(
+        session_id=session_id,
+        total_events=sum(counts_by_type.values()),
+        counts_by_type=counts_by_type,
+        latest_event=_copy_event_record(latest_record),
+    )
+
+
+def session_outcome_from_records(
+    session: Session,
+    records: list[EventRecord],
+) -> SessionOutcome:
+    session = copy_session(session)
+    session_records = [record for record in records if record.event.session_id == session.id]
+
+    latest_lifecycle_sequence = 0
+    for record in reversed(session_records):
+        if _is_outcome_lifecycle_event(record.event):
+            latest_lifecycle_sequence = record.sequence
+            break
+
+    terminal_record: EventRecord | None = None
+    for record in reversed(session_records):
+        if record.sequence <= latest_lifecycle_sequence:
+            break
+        if _is_outcome_terminal_event(record.event):
+            terminal_record = record
+            break
+
+    retry_record: EventRecord | None = None
+    for record in reversed(session_records):
+        if record.sequence <= latest_lifecycle_sequence:
+            break
+        if record.event.type == EventType.MODEL_RETRY:
+            retry_record = record
+            break
+
+    return session_outcome(
+        session,
+        terminal_event=terminal_record,
+        latest_retry_event=retry_record,
+    )
 
 
 def session_outcome(

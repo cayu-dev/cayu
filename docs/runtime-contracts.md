@@ -386,6 +386,14 @@ budget. The optional server exposes this at
 fields as per-session cost summaries, plus `session_costs` for per-session
 breakdown.
 
+The optional server also exposes
+`POST /api/causal-budgets/{causal_budget_id}/summary` for one-call work-item
+observability. It accepts the same pricing body as the causal cost endpoint and
+returns the included sessions, each session's derived outcome and event counts,
+the grouped usage summary, and the grouped cost summary. This endpoint is a
+composition of durable session/event data; it does not add another accounting or
+budget-enforcement path.
+
 For compact health views, use the server's
 `GET /api/sessions/{session_id}/summary`. The summary endpoint includes outcome
 data derived through `SessionStore.summarize_outcome(session_id)`: current

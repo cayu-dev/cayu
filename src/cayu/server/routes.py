@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, StringConstraints, ValidationError
 from sse_starlette.sse import EventSourceResponse
 
+from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.runtime.approvals import (
     ToolApprovalDecision,
@@ -17,7 +18,13 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
-from cayu.runtime.costs import CostBudget, PricingCatalog
+from cayu.runtime.costs import (
+    CostBudget,
+    PricingCatalog,
+)
+from cayu.runtime.costs import (
+    estimate_causal_budget_cost as build_causal_budget_cost_summary,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     EventQuery,
@@ -25,14 +32,19 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
+    Session,
+    SessionOrder,
     SessionOutcome,
     SessionQuery,
     SessionStatus,
     TranscriptQuery,
+    event_summary_from_records,
+    session_outcome_from_records,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import TaskCreate, TaskQuery
+from cayu.runtime.usage import causal_budget_usage_summary
 from cayu.server.sse import event_to_sse_data
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -136,6 +148,24 @@ def _serialize_session_outcome(outcome: SessionOutcome) -> dict[str, Any]:
             if outcome.latest_retry_event is None
             else _serialize_event_record(outcome.latest_retry_event)
         ),
+    }
+
+
+def _serialize_session(session: Session) -> dict[str, Any]:
+    return {
+        "id": session.id,
+        "status": session.status.value,
+        "agent_name": session.agent_name,
+        "provider_name": session.provider_name,
+        "model": session.model,
+        "parent_session_id": session.parent_session_id,
+        "causal_budget_id": session.causal_budget_id,
+        "runtime_name": session.runtime_name,
+        "runtime_version": session.runtime_version,
+        "environment_name": session.environment_name,
+        "created_at": session.created_at.isoformat(),
+        "updated_at": session.updated_at.isoformat(),
+        "metadata": session.metadata,
     }
 
 
@@ -393,6 +423,83 @@ def create_router(
             raise HTTPException(status_code=404, detail="Causal budget not found") from exc
         return summary.model_dump(mode="json")
 
+    @router.post("/causal-budgets/{causal_budget_id}/summary")
+    async def get_causal_budget_summary(
+        causal_budget_id: NonBlankString,
+        body: SessionCostBody,
+    ):
+        sessions = await _list_all_causal_sessions(causal_budget_id)
+        if not sessions:
+            raise HTTPException(status_code=404, detail="Causal budget not found")
+
+        session_ids = [session.id for session in sessions]
+        causal_event_records = await _query_all_causal_event_records(causal_budget_id)
+        usage_event_records = [
+            record
+            for record in causal_event_records
+            if record.event.type == EventType.MODEL_COMPLETED
+        ]
+        tool_event_records = [
+            record
+            for record in causal_event_records
+            if record.event.type == EventType.TOOL_CALL_STARTED
+        ]
+        usage_events = [
+            record.event
+            for record in sorted(
+                [*usage_event_records, *tool_event_records],
+                key=lambda record: record.sequence,
+            )
+        ]
+        usage_summary = causal_budget_usage_summary(
+            causal_budget_id=causal_budget_id,
+            session_ids=session_ids,
+            events=usage_events,
+        )
+        cost_summary = build_causal_budget_cost_summary(
+            causal_budget_id=causal_budget_id,
+            session_ids=session_ids,
+            events=[record.event for record in usage_event_records],
+            pricing=body.pricing,
+            currency=body.currency,
+        )
+        session_items = []
+        for session in sessions:
+            session_event_records = [
+                record for record in causal_event_records if record.event.session_id == session.id
+            ]
+            outcome = session_outcome_from_records(
+                session,
+                session_event_records,
+            )
+            event_summary = event_summary_from_records(
+                session.id,
+                session_event_records,
+            )
+            session_items.append(
+                {
+                    "session": _serialize_session(session),
+                    "outcome": _serialize_session_outcome(outcome),
+                    "events": {
+                        "total_events": event_summary.total_events,
+                        "counts_by_type": event_summary.counts_by_type,
+                        "latest_event": (
+                            None
+                            if event_summary.latest_event is None
+                            else _serialize_event_record(event_summary.latest_event)
+                        ),
+                    },
+                }
+            )
+
+        return {
+            "causal_budget_id": causal_budget_id,
+            "session_count": len(sessions),
+            "sessions": session_items,
+            "usage": usage_summary.model_dump(),
+            "cost": cost_summary.model_dump(mode="json"),
+        }
+
     @router.get("/sessions/{session_id}/summary")
     async def get_session_summary(session_id: NonBlankString):
         session = await session_store.load(session_id)
@@ -407,21 +514,7 @@ def create_router(
         usage_summary = await cayu_app.get_session_usage(session_id)
 
         return {
-            "session": {
-                "id": session.id,
-                "status": session.status.value,
-                "agent_name": session.agent_name,
-                "provider_name": session.provider_name,
-                "model": session.model,
-                "parent_session_id": session.parent_session_id,
-                "causal_budget_id": session.causal_budget_id,
-                "runtime_name": session.runtime_name,
-                "runtime_version": session.runtime_version,
-                "environment_name": session.environment_name,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-            },
+            "session": _serialize_session(session),
             "events": {
                 "total_events": event_summary.total_events,
                 "counts_by_type": event_summary.counts_by_type,
@@ -437,6 +530,43 @@ def create_router(
             "outcome": _serialize_session_outcome(outcome),
             "usage": usage_summary.model_dump(),
         }
+
+    async def _list_all_causal_sessions(causal_budget_id: str) -> list[Session]:
+        sessions: list[Session] = []
+        offset = 0
+        while True:
+            page = await session_store.list_sessions(
+                SessionQuery(
+                    causal_budget_id=causal_budget_id,
+                    limit=1000,
+                    offset=offset,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+            if not page:
+                return sessions
+            sessions.extend(page)
+            if len(page) < 1000:
+                return sessions
+            offset += len(page)
+
+    async def _query_all_causal_event_records(causal_budget_id: str) -> list[EventRecord]:
+        records: list[EventRecord] = []
+        after_sequence = None
+        while True:
+            page = await session_store.query_events(
+                EventQuery(
+                    causal_budget_id=causal_budget_id,
+                    after_sequence=after_sequence,
+                    limit=5000,
+                )
+            )
+            if not page:
+                return records
+            records.extend(page)
+            if len(page) < 5000:
+                return records
+            after_sequence = page[-1].sequence
 
     @router.get("/sessions/{session_id}/events")
     async def list_session_events(

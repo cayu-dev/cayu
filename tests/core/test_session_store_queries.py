@@ -14,6 +14,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
+from cayu.runtime.sessions import event_summary_from_records, session_outcome_from_records
 
 StoreFactory = Callable[[object], SessionStore]
 
@@ -365,6 +366,17 @@ def test_session_stores_summarize_outcome_from_terminal_and_retry_events(
         assert outcome.terminal_event.event.id == "event_interrupted"
         assert outcome.latest_retry_event is not None
         assert outcome.latest_retry_event.event.id == "event_retry"
+        records = await store.query_events(EventQuery(session_id="sess_outcome", limit=100))
+        session = await store.load("sess_outcome")
+        assert session is not None
+        helper_summary = event_summary_from_records("sess_outcome", records)
+        helper_outcome = session_outcome_from_records(session, records)
+        assert helper_summary.total_events == 3
+        assert helper_summary.counts_by_type["model.retry"] == 1
+        assert helper_summary.counts_by_type["session.interrupted"] == 1
+        assert helper_summary.latest_event is not None
+        assert helper_summary.latest_event.event.id == "event_hook_after_terminal"
+        assert helper_outcome == outcome
 
         with pytest.raises(KeyError, match="Session not found"):
             await store.summarize_outcome("missing_session")

@@ -254,6 +254,11 @@ same normalized usage and caller-supplied pricing as per-session summaries, but
 include every session whose stored `causal_budget_id` matches and include
 per-session breakdowns for debugging forks.
 
+For a one-call work-item view, use
+`POST /api/causal-budgets/{causal_budget_id}/summary`. It accepts the same
+pricing body as the cost endpoint and returns included sessions, per-session
+outcomes, event counts, grouped usage, and grouped estimated cost.
+
 The raw provider `usage` payload remains available on each durable
 `model.completed` event for dashboards, audits, and provider-specific
 diagnostics. `usage_metrics` is Cayu's stable summary shape; raw `usage` is the
@@ -363,7 +368,9 @@ application.
 For a work item that may fork into several sessions, use
 `GET /api/causal-budgets/{causal_budget_id}/usage` and
 `POST /api/causal-budgets/{causal_budget_id}/cost` to inspect the combined
-usage/cost and the session ids included in that causal budget.
+usage/cost and the session ids included in that causal budget. Use
+`POST /api/causal-budgets/{causal_budget_id}/summary` when an app needs the
+combined usage/cost plus included session status and outcome data in one call.
 
 Programmatic apps can combine the server and app APIs without the dashboard:
 
@@ -484,6 +491,9 @@ For grouped work-item cost, send the same pricing body to
 `causal_budget_id`, `session_ids`, `session_count`, and the same estimated cost
 fields as session cost summaries, plus `session_costs` for per-session
 breakdown.
+
+For grouped work-item status plus cost, send the same body to
+`POST /api/causal-budgets/{causal_budget_id}/summary`.
 
 Run `examples/usage_cost_summary.py` for a deterministic local session report
 that emits retry events and prints normalized usage, cache counters, and
