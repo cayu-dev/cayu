@@ -473,8 +473,8 @@ PYTHONPATH=src python examples/openai_local_tools.py
 Those environment variables are example pricing inputs only. Use prices from
 your own provider account and deployment.
 
-Set hard run limits with `RunLimits` and estimated-cost budgets with
-`CostBudget` on `RunRequest`, `ResumeRequest`, `DispatchRequest`, or
+Set hard run limits with `RunLimits` and per-request estimated-cost budgets
+with `CostBudget` on `RunRequest`, `ResumeRequest`, `DispatchRequest`, or
 tool-approval continuation requests:
 
 ```python
@@ -528,6 +528,53 @@ include the cumulative `cost_summary`; decimal cost values are serialized as
 strings for JSON stability. If the model requested tools in the same step, Cayu
 records skipped tool results before interrupting so the provider-neutral
 transcript remains valid for resume.
+
+For app-level spend control across sessions, configure a `BudgetPolicy` on
+`CayuApp`. The first built-in budget window is `all_time`, with app-wide and
+agent-scoped estimated-cost limits:
+
+```python
+from decimal import Decimal
+
+from cayu import BudgetLimit, BudgetPolicy, CayuApp
+
+app = CayuApp(
+    budget_policy=BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("25.00"),
+                pricing=pricing,
+            ),
+            BudgetLimit(
+                scope="agent",
+                key="assistant",
+                max_estimated_cost=Decimal("5.00"),
+                pricing=pricing,
+            ),
+        )
+    )
+)
+```
+
+App budgets use the same caller-supplied pricing catalog as `CostBudget`.
+Before each model step and after each completed model step, Cayu evaluates the
+matching app/agent budget limits, verifies that the current provider/model has
+pricing unless `allow_unpriced=True`, emits `budget.checked`, and stops with
+`budget.limit_reached` plus the normal `session.limit_reached` /
+`session.interrupted` events if a limit is reached. The session remains
+resumable, but resuming under the same exhausted app/agent budget will stop
+again until the app changes the policy, raises the limit, fixes missing pricing,
+or intentionally allows unpriced usage.
+
+`CayuApp` uses `SessionBudgetStore` by default, so budget accounting reads from
+the same event store already configured for sessions. With `SQLiteSessionStore`,
+budget accounting survives process restarts and multiple workers that share the
+same database. Enforcement is cooperative: Cayu checks before model calls and
+again after model completions. Strict concurrent hard caps require a future
+reservation/reconciliation budget ledger. `InMemoryBudgetStore` is available for
+tests, examples, and custom single-process apps that intentionally want a
+separate in-memory budget ledger.
 
 Configure provider-step retries with `RetryPolicy` on `CayuApp` or on one
 request. Retries are disabled by default. A retry only wraps the model provider

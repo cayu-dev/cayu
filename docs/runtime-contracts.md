@@ -403,6 +403,31 @@ a newly observed model step has no matching pricing entry; Cayu interrupts
 instead of silently treating unknown usage as free. Apps that intentionally allow
 missing prices can set `allow_unpriced=True` for that request.
 
+App-level budgets are configured separately on `CayuApp` through
+`BudgetPolicy`. A policy contains app-wide and agent-scoped `BudgetLimit`
+entries. In the first budget contract, limits use the `all_time` window and are
+estimated from the same normalized usage and caller-supplied `PricingCatalog`
+used by `CostBudget`.
+
+The runtime checks matching budget limits before every model step and again
+after each completed model step. A pre-model check also verifies that the
+current provider/model has matching pricing unless `allow_unpriced=True`. Each
+check emits `budget.checked`. If a budget is reached, the runtime emits
+`budget.limit_reached` and then follows the same controlled stop path as request
+limits: `session.limit_reached`, `session.interrupted`, and a resumable
+interrupted session. A resume under the same exhausted app/agent budget stops
+again until the app changes policy, raises the limit, fixes missing pricing, or
+opts into unpriced usage with `allow_unpriced=True`.
+
+`SessionBudgetStore` is the default budget store. It reads from the same durable
+event stream already configured for sessions, so `SQLiteSessionStore` can back
+budget accounting across process restarts and multiple workers that share the
+same database. Enforcement is cooperative: Cayu checks before model calls and
+again after model completions. Strict concurrent hard caps require a future
+reservation/reconciliation budget ledger. `InMemoryBudgetStore` is available for
+tests, examples, and custom single-process apps that intentionally want a
+separate in-memory budget ledger.
+
 When a limit is reached, the runtime emits `session.limit_reached`, updates the
 session to `interrupted`, and emits `session.interrupted` with
 `interruption_type="limit_reached"`. This is a controlled pause, not a runtime

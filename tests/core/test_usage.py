@@ -3,15 +3,22 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
+    BudgetLimit,
+    BudgetPolicy,
     CayuApp,
     CostBudget,
+    InMemorySessionStore,
     ModelPricing,
     PricingCatalog,
     RunRequest,
+    SessionBudgetStore,
     SessionIdentity,
 )
+from cayu.runtime.budgets import InMemoryBudgetStore, budget_check_from_events
 from cayu.runtime.costs import copy_cost_budget, estimate_session_cost
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -25,6 +32,7 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
+from cayu.storage import SQLiteSessionStore
 
 
 def test_normalize_openai_usage_metrics() -> None:
@@ -73,6 +81,294 @@ def test_normalize_openai_chat_usage_shape() -> None:
     assert metrics.cache.read_tokens == 40
     assert metrics.cache.cached_input_tokens == 40
     assert metrics.cache.uncached_input_tokens == 60
+
+
+def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+
+    policy = BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=pricing,
+            ),
+            BudgetLimit(
+                scope="agent",
+                key="builder",
+                max_estimated_cost=Decimal("2"),
+                pricing=pricing,
+            ),
+        )
+    )
+
+    assert len(policy.limits) == 2
+    from_mapping = BudgetPolicy(
+        limits=(
+            {
+                "scope": "app",
+                "max_estimated_cost": "3",
+                "pricing": pricing.model_dump(mode="json"),
+            },
+        )
+    )
+    assert from_mapping.limits[0].max_estimated_cost == Decimal("3")
+    with pytest.raises(ValueError, match="must not set key"):
+        BudgetLimit(
+            scope="app",
+            key="global",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+        )
+    with pytest.raises(ValueError, match="require key"):
+        BudgetLimit(
+            scope="agent",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=pricing,
+                ),
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("2"),
+                    pricing=pricing,
+                ),
+            )
+        )
+
+
+def test_in_memory_budget_store_filters_app_and_agent_events() -> None:
+    async def run():
+        store = InMemoryBudgetStore()
+        await store.append_event(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_1",
+                agent_name="builder",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            )
+        )
+        await store.append_event(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_2",
+                agent_name="researcher",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 2,
+                        "output_tokens": 0,
+                        "total_tokens": 2,
+                    }
+                },
+            )
+        )
+        app_events = await store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window="all_time",
+        )
+        builder_events = await store.load_events_for_budget(
+            scope="agent",
+            key="builder",
+            window="all_time",
+        )
+        return app_events, builder_events
+
+    app_events, builder_events = asyncio.run(run())
+
+    assert len(app_events) == 2
+    assert len(builder_events) == 1
+    assert builder_events[0].agent_name == "builder"
+
+
+def test_session_budget_store_reads_model_events_from_session_store() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_builder",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.append_event(
+            "sess_builder",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_builder",
+                agent_name="builder",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            ),
+        )
+        await session_store.append_event(
+            "sess_builder",
+            Event(
+                type=EventType.BUDGET_CHECKED,
+                session_id="sess_builder",
+                agent_name="builder",
+                payload={"ignored": True},
+            ),
+        )
+        budget_store = SessionBudgetStore(session_store)
+        return await budget_store.load_events_for_budget(
+            scope="agent",
+            key="builder",
+            window="all_time",
+        )
+
+    events = asyncio.run(run())
+
+    assert len(events) == 1
+    assert events[0].type == EventType.MODEL_COMPLETED
+
+
+def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> None:
+    async def run():
+        session_store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        try:
+            await session_store.create(
+                RunRequest(
+                    agent_name="builder",
+                    session_id="sess_builder",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await session_store.create(
+                RunRequest(
+                    agent_name="researcher",
+                    session_id="sess_researcher",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await session_store.append_event(
+                "sess_builder",
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_builder",
+                    agent_name="builder",
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 1,
+                            "output_tokens": 0,
+                            "total_tokens": 1,
+                        }
+                    },
+                ),
+            )
+            await session_store.append_event(
+                "sess_researcher",
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_researcher",
+                    agent_name="researcher",
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 2,
+                            "output_tokens": 0,
+                            "total_tokens": 2,
+                        }
+                    },
+                ),
+            )
+            budget_store = SessionBudgetStore(session_store)
+            app_events = await budget_store.load_events_for_budget(
+                scope="app",
+                key=None,
+                window="all_time",
+            )
+            builder_events = await budget_store.load_events_for_budget(
+                scope="agent",
+                key="builder",
+                window="all_time",
+            )
+            return app_events, builder_events
+        finally:
+            await session_store.close()
+
+    app_events, builder_events = asyncio.run(run())
+
+    assert len(app_events) == 2
+    assert len(builder_events) == 1
+    assert builder_events[0].session_id == "sess_builder"
+
+
+def test_budget_check_fails_closed_for_unpriced_model_steps() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="fake",
+                model="other-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+    check = budget_check_from_events(
+        limit=BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+        ),
+        events=[
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_1",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            )
+        ],
+    )
+
+    assert check.limit_reached is True
+    assert check.unpriced_model_steps == 1
+    assert "no matching pricing" in check.message
 
 
 def test_normalize_anthropic_usage_metrics() -> None:

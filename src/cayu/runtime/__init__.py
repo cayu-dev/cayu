@@ -9,6 +9,16 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
+from cayu.runtime.budgets import (
+    BudgetCheck,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetScope,
+    BudgetStore,
+    BudgetWindow,
+    InMemoryBudgetStore,
+    SessionBudgetStore,
+)
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     CompactionPromptBuilder,
@@ -125,6 +135,12 @@ from cayu.runtime.usage import (
 
 __all__ = [
     "AllowAllToolPolicy",
+    "BudgetCheck",
+    "BudgetLimit",
+    "BudgetPolicy",
+    "BudgetScope",
+    "BudgetStore",
+    "BudgetWindow",
     "CacheUsageMetrics",
     "CayuApp",
     "CheckpointCompactionContextPolicy",
@@ -148,6 +164,7 @@ __all__ = [
     "EventSink",
     "EventSummary",
     "ForkSessionRequest",
+    "InMemoryBudgetStore",
     "InMemoryEventSink",
     "InMemorySessionStore",
     "InMemoryTaskStore",
@@ -172,6 +189,7 @@ __all__ = [
     "RuntimeHookContext",
     "RuntimeHookPhase",
     "Session",
+    "SessionBudgetStore",
     "SessionCostSummary",
     "SessionIdentity",
     "SessionOrder",

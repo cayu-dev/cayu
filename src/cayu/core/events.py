@@ -23,6 +23,9 @@ class EventType(StrEnum):
     SESSION_FORKED = "session.forked"
     SESSION_LIMIT_REACHED = "session.limit_reached"
 
+    BUDGET_CHECKED = "budget.checked"
+    BUDGET_LIMIT_REACHED = "budget.limit_reached"
+
     TASK_CREATED = "task.created"
     TASK_STARTED = "task.started"
     TASK_COMPLETED = "task.completed"

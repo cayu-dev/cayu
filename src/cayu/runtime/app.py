@@ -56,6 +56,16 @@ from cayu.runtime.approvals import (
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
 )
+from cayu.runtime.budgets import (
+    BudgetCheck,
+    BudgetPolicy,
+    BudgetStore,
+    SessionBudgetStore,
+    budget_check_from_events,
+    budget_check_payload,
+    budget_limits_for_session,
+    copy_budget_policy,
+)
 from cayu.runtime.context import (
     ContextBuildError,
     ContextCompactionTelemetry,
@@ -231,6 +241,8 @@ class CayuApp:
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
         dispatcher: Dispatcher | None = None,
+        budget_policy: BudgetPolicy | None = None,
+        budget_store: BudgetStore | None = None,
         retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
@@ -245,6 +257,8 @@ class CayuApp:
             raise TypeError("task_store must be a TaskStore.")
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
+        if budget_store is not None and not isinstance(budget_store, BudgetStore):
+            raise TypeError("budget_store must be a BudgetStore.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
@@ -279,6 +293,10 @@ class CayuApp:
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
+        self.budget_policy = copy_budget_policy(budget_policy)
+        self.budget_store = (
+            budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
+        )
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._event_sinks = sinks
@@ -1600,6 +1618,27 @@ class CayuApp:
             )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
+                budget_decision, budget_events = await self._first_budget_decision(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                )
+                for event in budget_events:
+                    yield event
+                if budget_decision is not None:
+                    async for event in self._stop_session_for_budget_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        check=budget_decision,
+                        messages=messages,
+                        tool_calls=[],
+                        completed_tool_outcomes=[],
+                    ):
+                        yield event
+                    return
                 decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
                     limits=limits,
@@ -1777,6 +1816,28 @@ class CayuApp:
                         decision=decision,
                         usage_summary=usage_summary,
                         cost_summary=cost_summary,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                        completed_tool_outcomes=[],
+                    ):
+                        yield event
+                    return
+
+                budget_decision, budget_events = await self._first_budget_decision(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                )
+                for event in budget_events:
+                    yield event
+                if budget_decision is not None:
+                    async for event in self._stop_session_for_budget_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        check=budget_decision,
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
@@ -2610,6 +2671,48 @@ class CayuApp:
                 return cost_decision, usage_summary, cost_summary
         return None, usage_summary, cost_summary
 
+    async def _first_budget_decision(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+    ) -> tuple[BudgetCheck | None, list[Event]]:
+        limits = budget_limits_for_session(
+            policy=self.budget_policy,
+            agent_name=registered_agent.spec.name,
+        )
+        if not limits:
+            return None, []
+        emitted_events: list[Event] = []
+        for limit in limits:
+            events = await self.budget_store.load_events_for_budget(
+                scope=limit.scope,
+                key=limit.key,
+                window=limit.window,
+            )
+            check = budget_check_from_events(
+                limit=limit,
+                events=events,
+                provider_name=session.provider_name,
+                model=session.model,
+            )
+            emitted_events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.BUDGET_CHECKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=budget_check_payload(check),
+                    )
+                )
+            )
+            if check.limit_reached:
+                return check, emitted_events
+        return None, emitted_events
+
     async def _stop_session_for_limit_reached(
         self,
         *,
@@ -2672,6 +2775,50 @@ class CayuApp:
             session=interrupted_session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+        ):
+            yield event
+
+    async def _stop_session_for_budget_limit_reached(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        check: BudgetCheck,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+    ) -> AsyncIterator[Event]:
+        payload = _budget_limit_reached_payload(check)
+        yield await self._emit(
+            Event(
+                type=EventType.BUDGET_LIMIT_REACHED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=payload,
+            )
+        )
+        decision = StopDecision(
+            limit=StopLimit.ESTIMATED_COST,
+            maximum=check.maximum,
+            actual=check.actual,
+            message=check.message,
+        )
+        session_events = await self.session_store.load_events(session.id)
+        usage_summary = session_usage_summary(session.id, session_events)
+        async for event in self._stop_session_for_limit_reached(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            decision=decision,
+            usage_summary=usage_summary,
+            cost_summary=check.cost_summary,
+            messages=messages,
+            tool_calls=tool_calls,
+            completed_tool_outcomes=completed_tool_outcomes,
         ):
             yield event
 
@@ -3343,6 +3490,8 @@ class CayuApp:
 
     async def _emit(self, event: Event) -> Event:
         await self.session_store.append_event(event.session_id, event)
+        if event.type == EventType.MODEL_COMPLETED:
+            await self.budget_store.append_event(event)
         for sink in self._event_sinks:
             try:
                 await sink.emit(event.model_copy(deep=True))
@@ -4024,6 +4173,12 @@ def _limit_reached_payload(
     if cost_summary is not None:
         payload["cost_summary"] = cost_summary.model_dump(mode="json")
     return payload
+
+
+def _budget_limit_reached_payload(check: BudgetCheck) -> dict[str, Any]:
+    if type(check) is not BudgetCheck:
+        raise TypeError("check must be a BudgetCheck.")
+    return budget_check_payload(check)
 
 
 def _first_cost_limit_decision(
