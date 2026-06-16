@@ -99,6 +99,7 @@ class SQLiteSessionStore(SessionStore):
                             provider_name,
                             model,
                             parent_session_id,
+                            causal_budget_id,
                             runtime_name,
                             runtime_version,
                             environment_name,
@@ -107,7 +108,7 @@ class SQLiteSessionStore(SessionStore):
                             updated_at,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
@@ -115,6 +116,7 @@ class SQLiteSessionStore(SessionStore):
                             session.provider_name,
                             session.model,
                             session.parent_session_id,
+                            session.causal_budget_id,
                             session.runtime_name,
                             session.runtime_version,
                             session.environment_name,
@@ -209,6 +211,7 @@ class SQLiteSessionStore(SessionStore):
                         provider_name,
                         model,
                         parent_session_id,
+                        causal_budget_id,
                         runtime_name,
                         runtime_version,
                         environment_name,
@@ -217,7 +220,7 @@ class SQLiteSessionStore(SessionStore):
                         updated_at,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
@@ -272,8 +275,9 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             row = self._connection.execute(
                 """
-                SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
-                       runtime_version, environment_name, status, created_at,
+                SELECT id, agent_name, provider_name, model, parent_session_id,
+                       causal_budget_id, runtime_name, runtime_version, environment_name,
+                       status, created_at,
                        updated_at, metadata_json
                 FROM sessions
                 WHERE id = ?
@@ -555,25 +559,28 @@ class SQLiteSessionStore(SessionStore):
         params: list[object] = []
 
         if query.after_sequence is not None:
-            clauses.append("sequence > ?")
+            clauses.append("events.sequence > ?")
             params.append(query.after_sequence)
         if query.session_id is not None:
-            clauses.append("session_id = ?")
+            clauses.append("events.session_id = ?")
             params.append(query.session_id)
+        if query.causal_budget_id is not None:
+            clauses.append("sessions.causal_budget_id = ?")
+            params.append(query.causal_budget_id)
         if query.event_type is not None:
-            clauses.append("event_type = ?")
+            clauses.append("events.event_type = ?")
             params.append(str(query.event_type))
         if query.agent_name is not None:
-            clauses.append("agent_name = ?")
+            clauses.append("events.agent_name = ?")
             params.append(query.agent_name)
         if query.environment_name is not None:
-            clauses.append("environment_name = ?")
+            clauses.append("events.environment_name = ?")
             params.append(query.environment_name)
         if query.workflow_name is not None:
-            clauses.append("workflow_name = ?")
+            clauses.append("events.workflow_name = ?")
             params.append(query.workflow_name)
         if query.tool_name is not None:
-            clauses.append("tool_name = ?")
+            clauses.append("events.tool_name = ?")
             params.append(query.tool_name)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -582,10 +589,11 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT sequence, event_json
+                SELECT events.sequence, events.event_json
                 FROM events
+                JOIN sessions ON sessions.id = events.session_id
                 {where_sql}
-                ORDER BY sequence ASC
+                ORDER BY events.sequence ASC
                 LIMIT ?
                 """,
                 params,
@@ -718,6 +726,9 @@ class SQLiteSessionStore(SessionStore):
         if query.parent_session_id is not None:
             clauses.append("parent_session_id = ?")
             params.append(query.parent_session_id)
+        if query.causal_budget_id is not None:
+            clauses.append("causal_budget_id = ?")
+            params.append(query.causal_budget_id)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = sqlite_support.session_order_sql(query.order_by)
@@ -726,8 +737,9 @@ class SQLiteSessionStore(SessionStore):
         async with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
-                       runtime_version, environment_name, status, created_at,
+                SELECT id, agent_name, provider_name, model, parent_session_id,
+                       causal_budget_id, runtime_name, runtime_version, environment_name,
+                       status, created_at,
                        updated_at, metadata_json
                 FROM sessions
                 {where_sql}
@@ -957,8 +969,8 @@ class SQLiteSessionStore(SessionStore):
     def _load_unlocked(self, session_id: str) -> Session | None:
         row = self._connection.execute(
             """
-            SELECT id, agent_name, provider_name, model, parent_session_id, runtime_name,
-                   runtime_version, environment_name, status, created_at,
+            SELECT id, agent_name, provider_name, model, parent_session_id,
+                   causal_budget_id, runtime_name, runtime_version, environment_name, status, created_at,
                    updated_at, metadata_json
             FROM sessions
             WHERE id = ?

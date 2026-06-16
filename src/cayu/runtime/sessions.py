@@ -9,7 +9,15 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
@@ -36,6 +44,9 @@ class RunRequest(BaseModel):
     messages: list[Message]
     # Optional caller-provided id for a new session. It must be unique.
     session_id: str | None = None
+    # Durable budget/accounting identity shared by related sessions. Defaults to
+    # task_id when present, otherwise session_id. Forks inherit the source value.
+    causal_budget_id: str | None = None
     task_id: str | None = None
     environment_name: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -68,7 +79,7 @@ class RunRequest(BaseModel):
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("session_id", "task_id", "environment_name")
+    @field_validator("session_id", "causal_budget_id", "task_id", "environment_name")
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -220,6 +231,7 @@ class Session(BaseModel):
     provider_name: str
     model: str
     parent_session_id: str | None = None
+    causal_budget_id: str
     runtime_name: str = "cayu"
     runtime_version: str | None = None
     environment_name: str | None = None
@@ -228,12 +240,32 @@ class Session(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def default_causal_budget_id(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            value = dict(value)
+            session_id = value.get("id")
+            if session_id is None:
+                session_id = str(uuid4())
+                value["id"] = session_id
+            if value.get("causal_budget_id") is None and isinstance(session_id, str):
+                value["causal_budget_id"] = session_id
+        return value
+
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
 
-    @field_validator("id", "agent_name", "provider_name", "model", "runtime_name")
+    @field_validator(
+        "id",
+        "agent_name",
+        "provider_name",
+        "model",
+        "causal_budget_id",
+        "runtime_name",
+    )
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
@@ -270,11 +302,12 @@ class SessionQuery(BaseModel):
     agent_name: str | None = None
     environment_name: str | None = None
     parent_session_id: str | None = None
+    causal_budget_id: str | None = None
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0)
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
 
-    @field_validator("agent_name", "environment_name", "parent_session_id")
+    @field_validator("agent_name", "environment_name", "parent_session_id", "causal_budget_id")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -351,6 +384,7 @@ class EventQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str | None = None
+    causal_budget_id: str | None = None
     event_type: EventType | str | None = None
     agent_name: str | None = None
     environment_name: str | None = None
@@ -361,6 +395,7 @@ class EventQuery(BaseModel):
 
     @field_validator(
         "session_id",
+        "causal_budget_id",
         "agent_name",
         "environment_name",
         "workflow_name",
@@ -579,6 +614,7 @@ class InMemorySessionStore(SessionStore):
                 agent_name=request.agent_name,
                 provider_name=identity.provider_name,
                 model=identity.model,
+                causal_budget_id=request.causal_budget_id or request.task_id or session_id,
                 runtime_name=identity.runtime_name,
                 runtime_version=identity.runtime_version,
                 environment_name=request.environment_name,
@@ -829,6 +865,7 @@ class InMemorySessionStore(SessionStore):
                 record
                 for record in self._event_records
                 if _event_record_matches(record, query, event_type)
+                and _event_record_matches_session(record, query, self._sessions)
             ]
             return [
                 EventRecord(
@@ -1160,6 +1197,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         agent_name=request.agent_name,
         messages=[copy_message(message) for message in messages],
         session_id=request.session_id,
+        causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         environment_name=request.environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),
@@ -1224,6 +1262,7 @@ def copy_session(session: Session) -> Session:
         provider_name=session.provider_name,
         model=session.model,
         parent_session_id=session.parent_session_id,
+        causal_budget_id=session.causal_budget_id,
         runtime_name=session.runtime_name,
         runtime_version=session.runtime_version,
         environment_name=session.environment_name,
@@ -1269,6 +1308,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
+        causal_budget_id=query.causal_budget_id,
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -1282,6 +1322,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         raise TypeError("Event queries must be EventQuery instances.")
     return EventQuery(
         session_id=query.session_id,
+        causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
@@ -1309,6 +1350,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.agent_name is not None and session.agent_name != query.agent_name:
         return False
     if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
+        return False
+    if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
         return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
@@ -1352,3 +1395,14 @@ def _event_record_matches(
     if query.workflow_name is not None and event.workflow_name != query.workflow_name:
         return False
     return not (query.tool_name is not None and event.tool_name != query.tool_name)
+
+
+def _event_record_matches_session(
+    record: EventRecord,
+    query: EventQuery,
+    sessions: dict[str, Session],
+) -> bool:
+    if query.causal_budget_id is None:
+        return True
+    session = sessions.get(record.event.session_id)
+    return session is not None and session.causal_budget_id == query.causal_budget_id

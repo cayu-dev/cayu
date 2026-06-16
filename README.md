@@ -530,8 +530,8 @@ records skipped tool results before interrupting so the provider-neutral
 transcript remains valid for resume.
 
 For app-level spend control across sessions, configure a `BudgetPolicy` on
-`CayuApp`. The first built-in budget window is `all_time`, with app-wide and
-agent-scoped estimated-cost limits:
+`CayuApp`. The first built-in budget window is `all_time`, with app-wide,
+agent-scoped, and causal estimated-cost limits:
 
 ```python
 from decimal import Decimal
@@ -552,6 +552,12 @@ app = CayuApp(
                 max_estimated_cost=Decimal("5.00"),
                 pricing=pricing,
             ),
+            BudgetLimit(
+                scope="causal",
+                key="job_123",
+                max_estimated_cost=Decimal("2.50"),
+                pricing=pricing,
+            ),
         )
     )
 )
@@ -559,13 +565,19 @@ app = CayuApp(
 
 App budgets use the same caller-supplied pricing catalog as `CostBudget`.
 Before each model step and after each completed model step, Cayu evaluates the
-matching app/agent budget limits, verifies that the current provider/model has
-pricing unless `allow_unpriced=True`, emits `budget.checked`, and stops with
+matching budget limits, verifies that the current provider/model has pricing
+unless `allow_unpriced=True`, emits `budget.checked`, and stops with
 `budget.limit_reached` plus the normal `session.limit_reached` /
-`session.interrupted` events if a limit is reached. The session remains
-resumable, but resuming under the same exhausted app/agent budget will stop
-again until the app changes the policy, raises the limit, fixes missing pricing,
-or intentionally allows unpriced usage.
+`session.interrupted` events if a limit is reached. `scope="app"` applies to all
+sessions. `scope="agent"` applies when `key` matches the agent name.
+`scope="causal"` applies when `key` matches `RunRequest.causal_budget_id`.
+If omitted, a root session's `causal_budget_id` defaults to `task_id` when the
+run is linked to a task, otherwise to its session id. Forked sessions inherit
+the source session's causal budget id, so a parent run and its children can
+share one work-item budget. The session remains resumable, but resuming under
+the same exhausted matching budget will stop again until the app changes the
+policy, raises the limit, fixes missing pricing, or intentionally allows
+unpriced usage.
 
 `CayuApp` uses `SessionBudgetStore` by default, so budget accounting reads from
 the same event store already configured for sessions. With `SQLiteSessionStore`,
@@ -606,7 +618,8 @@ Reservation limits require matching pricing and cannot use `allow_unpriced=True`
 `InMemoryBudgetLedger` is the default and is suitable for tests, examples, and
 single-process apps only. `InMemoryBudgetStore` is also available for custom
 single-process apps that intentionally want separate in-memory budget
-accounting.
+accounting, but causal budgets require the session-aware `SessionBudgetStore`
+because they depend on persisted session identity.
 
 Configure provider-step retries with `RetryPolicy` on `CayuApp` or on one
 request. Retries are disabled by default. A retry only wraps the model provider

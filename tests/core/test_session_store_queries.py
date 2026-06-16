@@ -23,6 +23,50 @@ def _identity() -> SessionIdentity:
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_default_causal_budget_id_from_task_or_session(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        explicit = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_explicit_causal",
+                causal_budget_id="job_explicit",
+                task_id="task_explicit",
+                messages=[Message.text("user", "explicit")],
+            ),
+            identity=_identity(),
+        )
+        task_scoped = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_causal",
+                task_id="task_shared",
+                messages=[Message.text("user", "task")],
+            ),
+            identity=_identity(),
+        )
+        session_scoped = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_default_causal",
+                messages=[Message.text("user", "default")],
+            ),
+            identity=_identity(),
+        )
+
+        assert explicit.causal_budget_id == "job_explicit"
+        assert task_scoped.causal_budget_id == "task_shared"
+        assert session_scoped.causal_budget_id == "sess_default_causal"
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_list_sessions_with_filters_and_pagination(
     store_factory: StoreFactory,
     tmp_path,
@@ -34,6 +78,7 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
             RunRequest(
                 agent_name="builder",
                 session_id="sess_builder_1",
+                causal_budget_id="job_build",
                 environment_name="local",
                 messages=[Message.text("user", "build")],
             ),
@@ -43,6 +88,7 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
             RunRequest(
                 agent_name="builder",
                 session_id="sess_builder_2",
+                causal_budget_id="job_build",
                 environment_name="hosted",
                 messages=[Message.text("user", "build again")],
             ),
@@ -52,6 +98,7 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
             RunRequest(
                 agent_name="reviewer",
                 session_id="sess_reviewer",
+                causal_budget_id="job_review",
                 environment_name="hosted",
                 messages=[Message.text("user", "review")],
             ),
@@ -73,6 +120,9 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         paged_sessions = await store.list_sessions(
             SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
         )
+        causal_sessions = await store.list_sessions(
+            SessionQuery(causal_budget_id="job_build", order_by=SessionOrder.CREATED_AT_ASC)
+        )
 
         assert [session.id for session in builder_sessions] == [
             "sess_builder_1",
@@ -84,6 +134,10 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         ]
         assert [session.id for session in completed_sessions] == ["sess_builder_2"]
         assert [session.id for session in paged_sessions] == ["sess_builder_2"]
+        assert [session.id for session in causal_sessions] == [
+            "sess_builder_1",
+            "sess_builder_2",
+        ]
         await _close_store(store)
 
     asyncio.run(run_store_operations())
@@ -101,6 +155,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             RunRequest(
                 agent_name="builder",
                 session_id="sess_builder",
+                causal_budget_id="job_build",
                 environment_name="local",
                 messages=[Message.text("user", "build")],
             ),
@@ -110,6 +165,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             RunRequest(
                 agent_name="reviewer",
                 session_id="sess_reviewer",
+                causal_budget_id="job_review",
                 environment_name="hosted",
                 messages=[Message.text("user", "review")],
             ),
@@ -159,6 +215,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
+        causal_records = await store.query_events(EventQuery(causal_budget_id="job_build"))
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
@@ -174,6 +231,11 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         assert [record.event.id for record in started_records] == [
             "event_1",
             "event_4",
+        ]
+        assert [record.event.id for record in causal_records] == [
+            "event_1",
+            "event_2",
+            "event_3",
         ]
         assert [record.event.id for record in cursor_records] == [
             "event_3",

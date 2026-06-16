@@ -244,6 +244,17 @@ def test_static_tool_policy_allows_by_default_and_denies_explicit_names():
     assert denied_result.reason == "Tool denied by policy: write_file"
 
 
+def test_session_defaults_causal_budget_id_to_session_id():
+    session = Session(
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
+
+    assert session.id
+    assert session.causal_budget_id == session.id
+
+
 def test_static_tool_policy_allowlist_blocks_unlisted_tools_and_deny_wins():
     session = Session(
         id="sess_policy",

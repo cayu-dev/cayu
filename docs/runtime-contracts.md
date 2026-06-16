@@ -404,10 +404,17 @@ instead of silently treating unknown usage as free. Apps that intentionally allo
 missing prices can set `allow_unpriced=True` for that request.
 
 App-level budgets are configured separately on `CayuApp` through
-`BudgetPolicy`. A policy contains app-wide and agent-scoped `BudgetLimit`
-entries. In the first budget contract, limits use the `all_time` window and are
-estimated from the same normalized usage and caller-supplied `PricingCatalog`
-used by `CostBudget`.
+`BudgetPolicy`. A policy contains app-wide, agent-scoped, and causal
+`BudgetLimit` entries. In the first budget contract, limits use the `all_time`
+window and are estimated from the same normalized usage and caller-supplied
+`PricingCatalog` used by `CostBudget`.
+
+`scope="app"` applies to all sessions and must not set `key`. `scope="agent"`
+applies when `key` matches the agent name. `scope="causal"` applies when `key`
+matches `RunRequest.causal_budget_id`. If omitted, a root session's
+`causal_budget_id` defaults to `task_id` when the run is linked to a task,
+otherwise to its session id. Forked sessions inherit the source session's causal
+budget id, so parent and child sessions can share a single work-item budget.
 
 The runtime checks matching budget limits before every model step and again
 after each completed model step. A pre-model check also verifies that the
@@ -415,7 +422,7 @@ current provider/model has matching pricing unless `allow_unpriced=True`. Each
 check emits `budget.checked`. If a budget is reached, the runtime emits
 `budget.limit_reached` and then follows the same controlled stop path as request
 limits: `session.limit_reached`, `session.interrupted`, and a resumable
-interrupted session. A resume under the same exhausted app/agent budget stops
+interrupted session. A resume under the same exhausted matching budget stops
 again until the app changes policy, raises the limit, fixes missing pricing, or
 opts into unpriced usage with `allow_unpriced=True`.
 
@@ -441,7 +448,9 @@ Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`
 or their own `BudgetLedger` implementation. Reservation amounts are
 application-provided upper bounds; Cayu does not infer how large a future model
 step will be. Reservation limits require matching pricing and cannot use
-`allow_unpriced=True`.
+`allow_unpriced=True`. `InMemoryBudgetStore` only supports simple app/agent
+event filtering. Causal budgets require `SessionBudgetStore` or another
+session-aware `BudgetStore` because they depend on persisted session identity.
 
 When a limit is reached, the runtime emits `session.limit_reached`, updates the
 session to `interrupted`, and emits `session.interrupted` with

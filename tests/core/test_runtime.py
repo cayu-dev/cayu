@@ -1645,6 +1645,97 @@ def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unav
     assert len(provider.requests) == 1
 
 
+def test_cayu_app_causal_budget_is_shared_by_forked_sessions():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 750_000,
+                        "output_tokens": 0,
+                        "total_tokens": 750_000,
+                    },
+                }
+            )
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="causal",
+                    key="job_shared",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=fake_cost_budget("10").pricing,
+                    reservation=BudgetReservation(
+                        max_input_tokens=1_000_000,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        ),
+        budget_ledger=InMemoryBudgetLedger(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    parent_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_causal_budget_parent",
+                causal_budget_id="job_shared",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    fork_events = asyncio.run(
+        collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_causal_budget_parent",
+                session_id="sess_causal_budget_child",
+            ),
+        )
+    )
+    child_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_causal_budget_child",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+    child_session = asyncio.run(store.load("sess_causal_budget_child"))
+
+    assert parent_events[-1].type == EventType.SESSION_COMPLETED
+    assert fork_events[0].type == EventType.SESSION_FORKED
+    assert fork_events[0].payload["causal_budget_id"] == "job_shared"
+    assert [event.type for event in child_events] == [
+        EventType.SESSION_RESUMED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_RESERVATION_FAILED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    failed = next(
+        event for event in child_events if event.type == EventType.BUDGET_RESERVATION_FAILED
+    )
+    assert failed.payload["scope"] == "causal"
+    assert failed.payload["key"] == "job_shared"
+    assert failed.payload["actual"] == "1.75"
+    assert child_session is not None
+    assert child_session.causal_budget_id == "job_shared"
+    assert child_session.status == SessionStatus.INTERRUPTED
+    assert len(provider.requests) == 1
+
+
 def test_cayu_app_budget_reservation_is_released_when_model_step_fails():
     store = InMemorySessionStore()
     provider = FakeProvider(

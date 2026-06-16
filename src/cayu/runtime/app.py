@@ -956,6 +956,7 @@ class CayuApp:
             provider_name=registered_provider.name,
             model=model,
             parent_session_id=source_session.id,
+            causal_budget_id=source_session.causal_budget_id,
             runtime_name=source_session.runtime_name,
             runtime_version=source_session.runtime_version,
             environment_name=environment_name,
@@ -979,6 +980,7 @@ class CayuApp:
                     "source_session_id": source_session.id,
                     "source_status": source_session.status.value,
                     "parent_session_id": created.parent_session_id,
+                    "causal_budget_id": created.causal_budget_id,
                     "transcript_cursor": request.transcript_cursor,
                     "copy_checkpoint": request.copy_checkpoint,
                     "agent_name": created.agent_name,
@@ -2768,6 +2770,7 @@ class CayuApp:
         limits = budget_limits_for_session(
             policy=self.budget_policy,
             agent_name=registered_agent.spec.name,
+            causal_budget_id=session.causal_budget_id,
         )
         if not limits:
             return None, []
@@ -2812,6 +2815,7 @@ class CayuApp:
             for limit in budget_limits_for_session(
                 policy=self.budget_policy,
                 agent_name=registered_agent.spec.name,
+                causal_budget_id=session.causal_budget_id,
             )
             if limit.reservation is not None
         ]
@@ -4242,6 +4246,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         agent_name=request.agent_name,
         messages=[message.model_copy(deep=True) for message in request.messages],
         session_id=request.session_id,
+        causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         environment_name=environment_name,
         metadata=copy_json_value(request.metadata, "metadata"),

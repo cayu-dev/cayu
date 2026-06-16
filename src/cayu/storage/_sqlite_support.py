@@ -17,7 +17,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -58,6 +58,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
                 provider_name TEXT NOT NULL,
                 model TEXT NOT NULL,
                 parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                causal_budget_id TEXT NOT NULL,
                 runtime_name TEXT NOT NULL,
                 runtime_version TEXT,
                 environment_name TEXT,
@@ -120,6 +121,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
                 ON sessions(agent_name);
             CREATE INDEX IF NOT EXISTS idx_sessions_environment_name
                 ON sessions(environment_name);
+            CREATE INDEX IF NOT EXISTS idx_sessions_causal_budget_id
+                ON sessions(causal_budget_id);
             CREATE INDEX IF NOT EXISTS idx_events_session_sequence
                 ON events(session_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_events_type_timestamp
@@ -153,11 +156,13 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
 
 def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> Session:
     now = datetime.now(UTC)
+    session_id = request.session_id if request.session_id is not None else str(uuid4())
     return Session(
-        id=request.session_id if request.session_id is not None else str(uuid4()),
+        id=session_id,
         agent_name=request.agent_name,
         provider_name=identity.provider_name,
         model=identity.model,
+        causal_budget_id=request.causal_budget_id or request.task_id or session_id,
         runtime_name=identity.runtime_name,
         runtime_version=identity.runtime_version,
         environment_name=request.environment_name,
@@ -175,6 +180,7 @@ def session_to_row_values(session: Session) -> tuple[object, ...]:
         session.provider_name,
         session.model,
         session.parent_session_id,
+        session.causal_budget_id,
         session.runtime_name,
         session.runtime_version,
         session.environment_name,
@@ -236,6 +242,7 @@ def session_from_row(row: sqlite3.Row) -> Session:
         provider_name=row["provider_name"],
         model=row["model"],
         parent_session_id=row["parent_session_id"],
+        causal_budget_id=row["causal_budget_id"],
         runtime_name=row["runtime_name"],
         runtime_version=row["runtime_version"],
         environment_name=row["environment_name"],

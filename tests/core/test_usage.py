@@ -110,10 +110,16 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
                 max_estimated_cost=Decimal("2"),
                 pricing=pricing,
             ),
+            BudgetLimit(
+                scope="causal",
+                key="job_1",
+                max_estimated_cost=Decimal("3"),
+                pricing=pricing,
+            ),
         )
     )
 
-    assert len(policy.limits) == 2
+    assert len(policy.limits) == 3
     from_mapping = BudgetPolicy(
         limits=(
             {
@@ -134,6 +140,12 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
     with pytest.raises(ValueError, match="require key"):
         BudgetLimit(
             scope="agent",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+        )
+    with pytest.raises(ValueError, match="require key"):
+        BudgetLimit(
+            scope="causal",
             max_estimated_cost=Decimal("1"),
             pricing=pricing,
         )
@@ -388,6 +400,16 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
             RunRequest(
                 agent_name="builder",
                 session_id="sess_builder",
+                causal_budget_id="job_shared",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_other_job",
+                causal_budget_id="job_other",
                 messages=[Message.text("user", "hello")],
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
@@ -410,25 +432,41 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
             ),
         )
         await session_store.append_event(
-            "sess_builder",
+            "sess_other_job",
             Event(
-                type=EventType.BUDGET_CHECKED,
-                session_id="sess_builder",
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_other_job",
                 agent_name="builder",
-                payload={"ignored": True},
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 2,
+                        "output_tokens": 0,
+                        "total_tokens": 2,
+                    }
+                },
             ),
         )
         budget_store = SessionBudgetStore(session_store)
-        return await budget_store.load_events_for_budget(
+        agent_events = await budget_store.load_events_for_budget(
             scope="agent",
             key="builder",
             window="all_time",
         )
+        causal_events = await budget_store.load_events_for_budget(
+            scope="causal",
+            key="job_shared",
+            window="all_time",
+        )
+        return agent_events, causal_events
 
-    events = asyncio.run(run())
+    agent_events, causal_events = asyncio.run(run())
 
-    assert len(events) == 1
-    assert events[0].type == EventType.MODEL_COMPLETED
+    assert len(agent_events) == 2
+    assert len(causal_events) == 1
+    assert causal_events[0].type == EventType.MODEL_COMPLETED
+    assert causal_events[0].session_id == "sess_builder"
 
 
 def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> None:
@@ -439,6 +477,7 @@ def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> 
                 RunRequest(
                     agent_name="builder",
                     session_id="sess_builder",
+                    causal_budget_id="job_shared",
                     messages=[Message.text("user", "hello")],
                 ),
                 identity=SessionIdentity(provider_name="fake", model="fake-model"),
@@ -447,6 +486,7 @@ def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> 
                 RunRequest(
                     agent_name="researcher",
                     session_id="sess_researcher",
+                    causal_budget_id="job_other",
                     messages=[Message.text("user", "hello")],
                 ),
                 identity=SessionIdentity(provider_name="fake", model="fake-model"),
@@ -496,15 +536,22 @@ def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> 
                 key="builder",
                 window="all_time",
             )
-            return app_events, builder_events
+            causal_events = await budget_store.load_events_for_budget(
+                scope="causal",
+                key="job_shared",
+                window="all_time",
+            )
+            return app_events, builder_events, causal_events
         finally:
             await session_store.close()
 
-    app_events, builder_events = asyncio.run(run())
+    app_events, builder_events, causal_events = asyncio.run(run())
 
     assert len(app_events) == 2
     assert len(builder_events) == 1
     assert builder_events[0].session_id == "sess_builder"
+    assert len(causal_events) == 1
+    assert causal_events[0].session_id == "sess_builder"
 
 
 def test_budget_check_fails_closed_for_unpriced_model_steps() -> None:

@@ -49,6 +49,7 @@ _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
 class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
+    causal_budget_id: NonBlankString | None = None
     limits: RunLimits = Field(default_factory=RunLimits)
     cost_budget: CostBudget | None = None
     retry_policy: RetryPolicy | None = None
@@ -176,6 +177,7 @@ def create_router(
         request = RunRequest(
             agent_name=body.agent,
             session_id=session_id,
+            causal_budget_id=body.causal_budget_id,
             task_id=task_id,
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
@@ -339,6 +341,7 @@ def create_router(
                 "provider_name": s.provider_name,
                 "model": s.model,
                 "parent_session_id": s.parent_session_id,
+                "causal_budget_id": s.causal_budget_id,
                 "runtime_name": s.runtime_name,
                 "runtime_version": s.runtime_version,
                 "created_at": s.created_at.isoformat(),
@@ -388,6 +391,7 @@ def create_router(
                 "provider_name": session.provider_name,
                 "model": session.model,
                 "parent_session_id": session.parent_session_id,
+                "causal_budget_id": session.causal_budget_id,
                 "runtime_name": session.runtime_name,
                 "runtime_version": session.runtime_version,
                 "environment_name": session.environment_name,
@@ -505,6 +509,7 @@ def create_router(
                 "provider_name": session.provider_name,
                 "model": session.model,
                 "parent_session_id": session.parent_session_id,
+                "causal_budget_id": session.causal_budget_id,
                 "runtime_name": session.runtime_name,
                 "runtime_version": session.runtime_version,
                 "created_at": session.created_at.isoformat(),

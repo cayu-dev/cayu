@@ -22,7 +22,7 @@ from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
 from cayu.runtime.sessions import EventQuery, SessionStore
 
-BudgetScope = Literal["app", "agent"]
+BudgetScope = Literal["app", "agent", "causal"]
 BudgetWindow = Literal["all_time"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -88,8 +88,8 @@ class BudgetLimit(BaseModel):
     def validate_scope_key(self) -> BudgetLimit:
         if self.scope == "app" and self.key is not None:
             raise ValueError("App budget limits must not set key.")
-        if self.scope == "agent" and self.key is None:
-            raise ValueError("Agent budget limits require key.")
+        if self.scope in ("agent", "causal") and self.key is None:
+            raise ValueError(f"{self.scope.title()} budget limits require key.")
         if self.reservation is not None and self.allow_unpriced:
             raise ValueError("Budget reservations require priced model usage.")
         return self
@@ -375,6 +375,11 @@ class InMemoryBudgetStore(BudgetStore):
         if scope == "agent":
             budget_key = require_clean_nonblank(key or "", "key")
             return [event for event in events if event.agent_name == budget_key]
+        if scope == "causal":
+            raise ValueError(
+                "InMemoryBudgetStore cannot resolve causal budget scope. "
+                "Use SessionBudgetStore for causal budgets."
+            )
         raise ValueError(f"Unsupported budget scope: {scope}")
 
 
@@ -400,8 +405,11 @@ class SessionBudgetStore(BudgetStore):
         if window != "all_time":
             raise ValueError(f"Unsupported budget window: {window}")
         agent_name: str | None = None
+        causal_budget_id: str | None = None
         if scope == "agent":
             agent_name = require_clean_nonblank(key or "", "key")
+        elif scope == "causal":
+            causal_budget_id = require_clean_nonblank(key or "", "key")
         elif scope != "app":
             raise ValueError(f"Unsupported budget scope: {scope}")
 
@@ -411,6 +419,7 @@ class SessionBudgetStore(BudgetStore):
             page = await self._session_store.query_events(
                 EventQuery(
                     event_type=EventType.MODEL_COMPLETED,
+                    causal_budget_id=causal_budget_id,
                     agent_name=agent_name,
                     after_sequence=after_sequence,
                     limit=5000,
@@ -560,14 +569,20 @@ def budget_limits_for_session(
     *,
     policy: BudgetPolicy | None,
     agent_name: str,
+    causal_budget_id: str,
 ) -> tuple[BudgetLimit, ...]:
     policy = copy_budget_policy(policy)
     if policy is None:
         return ()
     agent_name = require_clean_nonblank(agent_name, "agent_name")
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
     matched: list[BudgetLimit] = []
     for limit in policy.limits:
-        if limit.scope == "app" or (limit.scope == "agent" and limit.key == agent_name):
+        if (
+            limit.scope == "app"
+            or (limit.scope == "agent" and limit.key == agent_name)
+            or (limit.scope == "causal" and limit.key == causal_budget_id)
+        ):
             matched.append(_copy_budget_limit(limit))
     return tuple(matched)
 
