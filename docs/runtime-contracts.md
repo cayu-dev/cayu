@@ -243,6 +243,36 @@ policies, structured-output retry, length continuation, and goal/task gates
 should build on this typed step outcome instead of parsing raw provider payloads
 or guessing from transcript shape.
 
+## Before-Stop Loop Policies
+
+`LoopPolicy.before_stop(...)` is the runtime seam immediately before Cayu marks a
+no-tool-call assistant step as complete. It receives a `BeforeStopContext` with
+the current `Session`, `AssistantStepResult`, `StepClassification`, step number,
+max steps, and request metadata. Policies are ordinary Python objects and can be
+registered on `CayuApp`, on an agent, or on an individual `RunRequest`,
+`ResumeRequest`, `DispatchRequest`, or tool-approval continuation request.
+The generic before-stop seam runs for ordinary final assistant steps. When a
+`StructuredOutputSpec` is active, structured-output validation owns the final
+retry/completion path so the generic before-stop policy does not compete with
+the runtime final-output contract.
+
+Policies run in deterministic order: app policies, then agent policies, then
+request policies. The first non-`complete` decision wins. Supported decisions:
+
+- `complete`: allow normal session completion.
+- `continue`: append the returned user `Message` to the durable transcript and
+  call the model again, as long as another model step remains.
+- `interrupt`: mark the session `interrupted` with a durable
+  `session.interrupted` event so the caller can resume later.
+- `fail`: fail the session through the normal `session.failed` path.
+
+Cayu emits durable `custom.loop.before_stop.started`,
+`custom.loop.before_stop.completed`, `custom.loop.before_stop.selected`, and
+`custom.loop.before_stop.failed` events for configured policies. A policy
+exception fails the session; this is intentional because before-stop policies
+control whether the runtime is allowed to complete. Side-effect-only behavior
+belongs in runtime hooks instead.
+
 ## Structured Output
 
 `StructuredOutputSpec` is the contract for final JSON output. It can be

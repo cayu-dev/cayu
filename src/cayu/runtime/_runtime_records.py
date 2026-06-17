@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolResult
@@ -11,6 +11,9 @@ from cayu.providers import ModelProvider
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
+
+if TYPE_CHECKING:
+    from cayu.runtime.loop_policies import LoopPolicy
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class RegisteredAgentState:
     context_policy: ContextPolicy
     tool_policy: ToolPolicy
     runtime_hooks: tuple[RuntimeHook, ...]
+    loop_policies: tuple[LoopPolicy, ...]
 
 
 @dataclass(frozen=True)

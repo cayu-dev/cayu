@@ -71,6 +71,12 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
     ToolCallHookContext,
 )
+from cayu.runtime.loop_policies import (
+    BeforeStopAction,
+    BeforeStopContext,
+    BeforeStopDecision,
+    LoopPolicy,
+)
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -144,6 +150,9 @@ from cayu.runtime.usage import (
 
 __all__ = [
     "AllowAllToolPolicy",
+    "BeforeStopAction",
+    "BeforeStopContext",
+    "BeforeStopDecision",
     "BudgetCheck",
     "BudgetLedger",
     "BudgetLimit",
@@ -187,6 +196,7 @@ __all__ = [
     "InMemoryTaskStore",
     "InlineDispatcher",
     "InterruptSessionRequest",
+    "LoopPolicy",
     "MessageWindowContextPolicy",
     "ModelCompactor",
     "ModelPricing",

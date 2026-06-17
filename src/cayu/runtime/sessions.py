@@ -18,11 +18,13 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, copy_message
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
@@ -38,7 +40,7 @@ class SessionStatus(StrEnum):
 
 
 class RunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     agent_name: str
     messages: list[Message]
@@ -55,6 +57,10 @@ class RunRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
+        default_factory=tuple,
+        exclude=True,
+    )
 
     @field_validator("messages")
     @classmethod
@@ -79,6 +85,11 @@ class RunRequest(BaseModel):
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
 
+    @field_validator("loop_policies", mode="before")
+    @classmethod
+    def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
+        return validate_loop_policies(value, field_name="loop_policies")
+
     @field_validator("agent_name")
     @classmethod
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
@@ -97,7 +108,7 @@ class RunRequest(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     session_id: str
     messages: list[Message]
@@ -108,6 +119,10 @@ class ResumeRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
+        default_factory=tuple,
+        exclude=True,
+    )
 
     @field_validator("messages")
     @classmethod
@@ -134,6 +149,11 @@ class ResumeRequest(BaseModel):
     @classmethod
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
+
+    @field_validator("loop_policies", mode="before")
+    @classmethod
+    def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
+        return validate_loop_policies(value, field_name="loop_policies")
 
     @field_validator("session_id", "model")
     @classmethod
@@ -1242,6 +1262,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
 
@@ -1261,6 +1282,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
 

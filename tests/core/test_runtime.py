@@ -22,6 +22,8 @@ from cayu.providers import (
 )
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
+    BeforeStopContext,
+    BeforeStopDecision,
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
@@ -45,6 +47,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     InMemoryTaskStore,
     InterruptSessionRequest,
+    LoopPolicy,
     MessageWindowContextPolicy,
     ModelCompactor,
     ModelPricing,
@@ -441,6 +444,34 @@ class UpperTool(Tool):
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult(content=args["text"].upper())
+
+
+class ContinueBeforeStopPolicy(LoopPolicy):
+    def __init__(self, message: str = "Please repair the final answer.") -> None:
+        self.message = message
+        self.calls = 0
+
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        self.calls += 1
+        if context.step == 1:
+            return BeforeStopDecision.continue_with(
+                Message.text("user", self.message),
+                reason="needs repair",
+            )
+        return BeforeStopDecision.complete("second step is final")
+
+
+class InterruptBeforeStopPolicy(LoopPolicy):
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        return BeforeStopDecision.interrupt(
+            "needs operator review",
+            metadata={"classification": context.classification.type.value},
+        )
+
+
+class FailBeforeStopPolicy(LoopPolicy):
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        return BeforeStopDecision.fail("completion gate failed")
 
 
 async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -979,6 +1010,188 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert len(provider.requests) == 1
+
+
+def test_cayu_app_before_stop_policy_can_continue_with_durable_message():
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("draft"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("final"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        policy = ContinueBeforeStopPolicy("Return a corrected final answer.")
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_before_stop_continue",
+                messages=[Message.text("user", "answer")],
+                loop_policies=(policy,),
+            ),
+        )
+        session = await store.load("sess_before_stop_continue")
+        transcript = await store.load_transcript("sess_before_stop_continue")
+        return events, session, transcript, provider, policy
+
+    events, session, transcript, provider, policy = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert len(provider.requests) == 2
+    assert policy.calls == 2
+    assert any(event.type == "custom.loop.before_stop.selected" for event in events)
+    assert [message.role for message in transcript] == ["user", "assistant", "user", "assistant"]
+    assert transcript[2].content[0].text == "Return a corrected final answer."
+    assert provider.requests[1].messages[-1].content[0].text == "Return a corrected final answer."
+
+
+def test_cayu_app_before_stop_policy_can_interrupt_and_resume():
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("needs review"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("resumed final"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        interrupted_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_before_stop_interrupt",
+                messages=[Message.text("user", "answer")],
+                loop_policies=(InterruptBeforeStopPolicy(),),
+            ),
+        )
+        interrupted_session = await store.load("sess_before_stop_interrupt")
+        resumed_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_before_stop_interrupt",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        resumed_session = await store.load("sess_before_stop_interrupt")
+        return interrupted_events, interrupted_session, resumed_events, resumed_session, provider
+
+    interrupted_events, interrupted_session, resumed_events, resumed_session, provider = (
+        asyncio.run(run())
+    )
+
+    assert interrupted_session is not None
+    assert interrupted_session.status == SessionStatus.INTERRUPTED
+    assert interrupted_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert interrupted_events[-1].payload["reason"] == "needs operator review"
+    assert resumed_session is not None
+    assert resumed_session.status == SessionStatus.COMPLETED
+    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 2
+
+
+def test_cayu_app_before_stop_policy_can_fail_session():
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("bad final"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_before_stop_fail",
+                messages=[Message.text("user", "answer")],
+                loop_policies=(FailBeforeStopPolicy(),),
+            ),
+        )
+        session = await store.load("sess_before_stop_fail")
+        return events, session
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "completion gate failed" in events[-1].payload["error"]
+
+
+def test_cayu_app_before_stop_policy_order_uses_first_non_complete_decision():
+    class CompletePolicy(LoopPolicy):
+        async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+            return BeforeStopDecision.complete("looks okay")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("draft"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("final"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            loop_policies=(CompletePolicy(),),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            loop_policies=(CompletePolicy(),),
+        )
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_before_stop_order",
+                messages=[Message.text("user", "answer")],
+                loop_policies=(ContinueBeforeStopPolicy("Continue from request."),),
+            ),
+        )
+        selected = [event for event in events if event.type == "custom.loop.before_stop.selected"]
+        completed = [event for event in events if event.type == "custom.loop.before_stop.completed"]
+        return selected, completed, provider
+
+    selected, completed, provider = asyncio.run(run())
+
+    assert len(selected) == 1
+    assert selected[0].payload["scope"] == "request"
+    assert selected[0].payload["action"] == "continue"
+    assert [event.payload["scope"] for event in completed[:3]] == ["app", "agent", "request"]
+    assert len(provider.requests) == 2
 
 
 def test_cayu_app_budget_limit_stops_before_tool_side_effects():

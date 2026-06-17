@@ -45,6 +45,7 @@ from cayu.runtime import (
     DispatchRequest,
     DispatchStatus,
     InMemoryEventSink,
+    LoopPolicy,
     ResumeRequest,
     RetryPolicy,
     RetryReason,
@@ -55,6 +56,8 @@ from cayu.runtime import (
     StaticToolPolicy,
     StructuredOutputSpec,
     StructuredOutputStrategy,
+    ToolApprovalRecoveryRequest,
+    ToolApprovalRequest,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
@@ -186,6 +189,39 @@ def test_dispatch_request_validates_boundary_data():
             session_id="sess_dispatch",
             messages=[Message.text("user", "continue")],
             metadata={"bad": object()},
+        )
+
+
+def test_runtime_only_loop_policies_do_not_break_request_json_schema():
+    class NoopLoopPolicy(LoopPolicy):
+        pass
+
+    schema_classes = [
+        RunRequest,
+        ResumeRequest,
+        DispatchRequest,
+        ToolApprovalRequest,
+        ToolApprovalRecoveryRequest,
+    ]
+    for schema_class in schema_classes:
+        schema = schema_class.model_json_schema()
+        assert "loop_policies" not in schema.get("properties", {})
+
+    policy = NoopLoopPolicy()
+    request = RunRequest(
+        agent_name="assistant",
+        messages=[Message.text("user", "hello")],
+        loop_policies=(policy,),
+    )
+
+    assert request.loop_policies == (policy,)
+    assert "loop_policies" not in request.model_dump()
+
+    with pytest.raises(TypeError, match="LoopPolicy"):
+        RunRequest(
+            agent_name="assistant",
+            messages=[Message.text("user", "hello")],
+            loop_policies=(object(),),
         )
 
 

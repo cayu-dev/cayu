@@ -109,8 +109,17 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
     ToolCallHookContext,
 )
+from cayu.runtime.loop_policies import (
+    BeforeStopAction,
+    BeforeStopContext,
+    BeforeStopDecision,
+    LoopPolicy,
+    copy_before_stop_decision,
+    validate_loop_policies,
+)
 from cayu.runtime.model_steps import (
     AssistantStepResult,
+    StepClassification,
     assistant_text_content,
     classify_assistant_step,
     provider_state_count,
@@ -268,6 +277,7 @@ class CayuApp:
         budget_ledger: BudgetLedger | None = None,
         retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
+        loop_policies: Iterable[LoopPolicy] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
         max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
@@ -287,6 +297,7 @@ class CayuApp:
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
+        policies = validate_loop_policies(loop_policies, field_name="loop_policies")
         if event_sinks is None:
             sinks = []
         else:
@@ -325,6 +336,7 @@ class CayuApp:
         self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
+        self._loop_policies = tuple(policies)
         self._event_sinks = sinks
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
@@ -343,6 +355,7 @@ class CayuApp:
         context_policy: ContextPolicy | None = None,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
+        loop_policies: Iterable[LoopPolicy] | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -364,6 +377,10 @@ class CayuApp:
         stored_runtime_hooks = _validate_runtime_hooks(
             runtime_hooks,
             field_name="runtime_hooks",
+        )
+        stored_loop_policies = validate_loop_policies(
+            loop_policies,
+            field_name="loop_policies",
         )
 
         if tools is None:
@@ -391,6 +408,7 @@ class CayuApp:
             context_policy=stored_context_policy,
             tool_policy=stored_tool_policy,
             runtime_hooks=stored_runtime_hooks,
+            loop_policies=stored_loop_policies,
         )
         return spec
 
@@ -544,6 +562,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
+            request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
             task_id=request.task_id,
             start_event_type=EventType.SESSION_STARTED,
@@ -735,6 +754,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
+            loop_policies=request.loop_policies,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
@@ -990,6 +1010,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
+            request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
             task_id=task_id,
             start_event_type=EventType.SESSION_RESUMED,
@@ -1399,6 +1420,7 @@ class CayuApp:
                     structured_output=request.structured_output,
                     pending_approval=pending_approval,
                 ),
+                request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
                 start_event_type=None,
@@ -1623,6 +1645,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
+            loop_policies=request.loop_policies,
         )
         async for event in self._continue_tool_approval_resolution(
             request=approval_request,
@@ -1649,6 +1672,7 @@ class CayuApp:
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
+        request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         task_id: str | None,
         start_event_type: EventType | None,
@@ -1670,6 +1694,10 @@ class CayuApp:
         )
         retry_policy = copy_retry_policy(retry_policy)
         structured_output = copy_structured_output_spec(structured_output)
+        request_loop_policies = validate_loop_policies(
+            request_loop_policies,
+            field_name="request_loop_policies",
+        )
         structured_output_retries = 0
         run_baseline: SessionUsageSummary | None = None
         if (limits.scope == "run" and has_run_limits(limits)) or _has_run_budget_limit(
@@ -2180,6 +2208,73 @@ class CayuApp:
                             )
                         )
                         continue
+                    if assistant_step_result is None:
+                        raise RuntimeError("Before-stop policies require an assistant step result.")
+                    before_stop_decision: BeforeStopDecision | None = None
+                    async for event, policy_decision in self._run_before_stop_policies(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        step_result=assistant_step_result,
+                        step=step,
+                        max_steps=max_steps,
+                        request_metadata=request_metadata,
+                        request_loop_policies=request_loop_policies,
+                    ):
+                        yield event
+                        if policy_decision is not None:
+                            before_stop_decision = policy_decision
+                    if before_stop_decision is not None:
+                        if before_stop_decision.action == BeforeStopAction.CONTINUE:
+                            if step >= max_steps:
+                                raise RuntimeError(
+                                    "Before-stop policy requested continue, but maximum "
+                                    "model steps were reached."
+                                )
+                            if before_stop_decision.message is None:
+                                raise RuntimeError(
+                                    "Before-stop continue decision requires a message."
+                                )
+                            repair_message = before_stop_decision.message
+                            messages.append(repair_message)
+                            await self.session_store.append_transcript_messages(
+                                session.id,
+                                [repair_message],
+                            )
+                            continue
+                        if before_stop_decision.action == BeforeStopAction.INTERRUPT:
+                            session = await self.session_store.update_status(
+                                session.id,
+                                SessionStatus.INTERRUPTED,
+                            )
+                            async for event in self._emit_terminal_event_with_hooks(
+                                event=Event(
+                                    type=EventType.SESSION_INTERRUPTED,
+                                    session_id=session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    payload={
+                                        "interruption_type": (
+                                            _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED
+                                        ),
+                                        "reason": before_stop_decision.reason,
+                                        "policy_metadata": copy_json_value(
+                                            before_stop_decision.metadata,
+                                            "policy_metadata",
+                                        ),
+                                    },
+                                ),
+                                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            ):
+                                yield event
+                            return
+                        if before_stop_decision.action == BeforeStopAction.FAIL:
+                            raise RuntimeError(
+                                f"Before-stop policy failed session: {before_stop_decision.reason}"
+                            )
                     break
 
                 tool_outcomes: list[runtime_records.ToolCallOutcome] = []
@@ -4163,6 +4258,128 @@ class CayuApp:
                 )
             )
 
+    async def _run_before_stop_policies(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        step_result: AssistantStepResult,
+        step: int,
+        max_steps: int,
+        request_metadata: dict[str, Any],
+        request_loop_policies: tuple[LoopPolicy, ...],
+    ) -> AsyncIterator[tuple[Event, BeforeStopDecision | None]]:
+        classification = classify_assistant_step(step_result)
+        policy_groups = (
+            ("app", self._loop_policies),
+            ("agent", registered_agent.loop_policies),
+            (
+                "request",
+                validate_loop_policies(
+                    request_loop_policies,
+                    field_name="request_loop_policies",
+                ),
+            ),
+        )
+        for scope, policies in policy_groups:
+            for policy in policies:
+                if not _loop_policy_supports_before_stop(policy):
+                    continue
+                policy_name = require_clean_nonblank(policy.name, "loop_policy.name")
+                yield (
+                    await self._emit(
+                        _before_stop_policy_event(
+                            event_type="custom.loop.before_stop.started",
+                            policy_name=policy_name,
+                            scope=scope,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            step=step,
+                            classification=classification,
+                            payload={},
+                        )
+                    ),
+                    None,
+                )
+                context = BeforeStopContext(
+                    session=session,
+                    step_result=step_result,
+                    classification=classification,
+                    step=step,
+                    max_steps=max_steps,
+                    metadata=request_metadata,
+                )
+                try:
+                    decision = copy_before_stop_decision(await policy.before_stop(context))
+                except Exception as exc:
+                    yield (
+                        await self._emit(
+                            _before_stop_policy_event(
+                                event_type="custom.loop.before_stop.failed",
+                                policy_name=policy_name,
+                                scope=scope,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                step=step,
+                                classification=classification,
+                                payload={
+                                    "error": str(exc),
+                                    "error_type": type(exc).__name__,
+                                },
+                            )
+                        ),
+                        None,
+                    )
+                    raise
+                yield (
+                    await self._emit(
+                        _before_stop_policy_event(
+                            event_type="custom.loop.before_stop.completed",
+                            policy_name=policy_name,
+                            scope=scope,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            step=step,
+                            classification=classification,
+                            payload={
+                                "action": decision.action.value,
+                                "reason": decision.reason,
+                                "metadata": copy_json_value(decision.metadata, "metadata"),
+                            },
+                        )
+                    ),
+                    None,
+                )
+                if decision.action != BeforeStopAction.COMPLETE:
+                    yield (
+                        await self._emit(
+                            _before_stop_policy_event(
+                                event_type="custom.loop.before_stop.selected",
+                                policy_name=policy_name,
+                                scope=scope,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                step=step,
+                                classification=classification,
+                                payload={
+                                    "action": decision.action.value,
+                                    "reason": decision.reason,
+                                    "metadata": copy_json_value(
+                                        decision.metadata,
+                                        "metadata",
+                                    ),
+                                },
+                            )
+                        ),
+                        decision,
+                    )
+                    return
+
     async def _emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
         if type(events) is not list:
             raise TypeError("Runtime events must be a list.")
@@ -4394,6 +4611,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
 
@@ -4489,6 +4707,40 @@ def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
     if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
         return "after_tool_call"
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
+
+
+def _loop_policy_supports_before_stop(policy: LoopPolicy) -> bool:
+    policy_method = type(policy).before_stop
+    default_method = LoopPolicy.before_stop
+    return policy_method is not default_method
+
+
+def _before_stop_policy_event(
+    *,
+    event_type: str,
+    policy_name: str,
+    scope: str,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    step: int,
+    classification: StepClassification,
+    payload: dict[str, Any],
+) -> Event:
+    event_payload = {
+        "policy": policy_name,
+        "scope": scope,
+        "step": step,
+        "classification": classification.payload(),
+        **copy_json_value(payload, "payload"),
+    }
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload=event_payload,
+    )
 
 
 def _clear_current_task_cancellation() -> None:

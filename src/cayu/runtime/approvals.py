@@ -4,9 +4,11 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
@@ -25,7 +27,7 @@ class ToolApprovalRecoveryOutcome(StrEnum):
 class ToolApprovalRequest(BaseModel):
     """Caller decision for a pending tool approval."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     session_id: str
     approval_id: str
@@ -37,6 +39,10 @@ class ToolApprovalRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
+        default_factory=tuple,
+        exclude=True,
+    )
 
     @field_validator("session_id", "approval_id")
     @classmethod
@@ -68,11 +74,16 @@ class ToolApprovalRequest(BaseModel):
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
 
+    @field_validator("loop_policies", mode="before")
+    @classmethod
+    def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
+        return validate_loop_policies(value, field_name="loop_policies")
+
 
 class ToolApprovalRecoveryRequest(BaseModel):
     """Caller-supplied terminal outcome for an approved tool with unknown result."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     session_id: str
     approval_id: str
@@ -88,6 +99,10 @@ class ToolApprovalRecoveryRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
+        default_factory=tuple,
+        exclude=True,
+    )
 
     @field_validator("session_id", "approval_id", "tool_call_id")
     @classmethod
@@ -127,6 +142,11 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @classmethod
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
+
+    @field_validator("loop_policies", mode="before")
+    @classmethod
+    def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
+        return validate_loop_policies(value, field_name="loop_policies")
 
 
 class PendingToolCallApproval(BaseModel):
@@ -240,6 +260,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
 
@@ -263,6 +284,7 @@ def copy_tool_approval_recovery_request(
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
 

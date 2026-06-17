@@ -275,6 +275,32 @@ be viewed as `continue`, `final`, `length`, `filtered`, `failed`, `think_only`,
 or `invalid`. These fields are intended for dashboards, stop policies,
 structured-output policies, and future subagent orchestration.
 
+For programmable completion gates, add a before-stop loop policy. It runs only
+when the model produced no tool calls and Cayu is about to complete the session:
+
+```python
+from cayu import BeforeStopDecision, CayuApp, LoopPolicy, Message
+
+
+class EmptyAnswerRepairPolicy(LoopPolicy):
+    async def before_stop(self, context):
+        if context.classification.type == "invalid":
+            return BeforeStopDecision.continue_with(
+                Message.text("user", "Produce a visible final answer."),
+                reason="empty final answer",
+            )
+        return BeforeStopDecision.complete()
+
+
+app = CayuApp(loop_policies=[EmptyAnswerRepairPolicy()])
+```
+
+Policies can also interrupt or fail the session. Cayu records durable
+`custom.loop.before_stop.*` events for configured policies. The framework does
+not ship a built-in goal judge or task gate; those should be app code built on
+this seam. Runs with `StructuredOutputSpec` use the structured-output retry and
+completion path instead of generic before-stop policies.
+
 Add structured output to a run or resume with `StructuredOutputSpec`. By
 default, Cayu injects a runtime-owned final-output tool, validates the submitted
 value against your JSON Schema, and emits durable structured-output events:
