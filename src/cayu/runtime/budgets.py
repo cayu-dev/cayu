@@ -20,9 +20,8 @@ from pydantic import (
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
-from cayu.runtime.sessions import EventQuery, SessionStore
 
-BudgetScope = Literal["app", "agent", "causal"]
+BudgetScope = Literal["app", "agent", "causal", "session", "run"]
 BudgetWindow = Literal["all_time"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -56,7 +55,7 @@ class BudgetLimit(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    scope: BudgetScope
+    scope: BudgetScope = "session"
     max_estimated_cost: Decimal = Field(gt=0)
     pricing: PricingCatalog
     currency: str = "USD"
@@ -86,8 +85,8 @@ class BudgetLimit(BaseModel):
 
     @model_validator(mode="after")
     def validate_scope_key(self) -> BudgetLimit:
-        if self.scope == "app" and self.key is not None:
-            raise ValueError("App budget limits must not set key.")
+        if self.scope in ("app", "session", "run") and self.key is not None:
+            raise ValueError(f"{self.scope.title()} budget limits must not set key.")
         if self.scope in ("agent", "causal") and self.key is None:
             raise ValueError(f"{self.scope.title()} budget limits require key.")
         if self.reservation is not None and self.allow_unpriced:
@@ -126,6 +125,11 @@ class BudgetPolicy(BaseModel):
     def validate_unique_limits(self) -> BudgetPolicy:
         seen: set[tuple[str, str, str | None]] = set()
         for limit in self.limits:
+            if limit.scope in {"session", "run"}:
+                raise ValueError(
+                    f"{limit.scope.title()} budget limits are request-scoped, "
+                    "not app policy limits."
+                )
             key = (limit.scope, limit.window, limit.key)
             if key in seen:
                 raise ValueError("Budget policy contains duplicate scope/window/key limits.")
@@ -386,7 +390,9 @@ class InMemoryBudgetStore(BudgetStore):
 class SessionBudgetStore(BudgetStore):
     """Budget store backed by the existing durable session event stream."""
 
-    def __init__(self, session_store: SessionStore) -> None:
+    def __init__(self, session_store: Any) -> None:
+        from cayu.runtime.sessions import SessionStore
+
         if not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
         self._session_store = session_store
@@ -402,6 +408,8 @@ class SessionBudgetStore(BudgetStore):
         key: str | None,
         window: BudgetWindow,
     ) -> list[Event]:
+        from cayu.runtime.sessions import EventQuery
+
         if window != "all_time":
             raise ValueError(f"Unsupported budget window: {window}")
         agent_name: str | None = None
@@ -565,6 +573,28 @@ def copy_budget_policy(policy: BudgetPolicy | None) -> BudgetPolicy | None:
     return BudgetPolicy(limits=tuple(_copy_budget_limit(limit) for limit in policy.limits))
 
 
+def copy_budget_limits(
+    limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+    *,
+    field_name: str = "budget_limits",
+) -> tuple[BudgetLimit, ...]:
+    if limits is None:
+        return ()
+    if isinstance(limits, str | bytes):
+        raise ValueError(f"{field_name} must be an iterable of BudgetLimit values.")
+    return tuple(_coerce_budget_limit(limit) for limit in limits)
+
+
+def copy_request_budget_limits(
+    limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+) -> tuple[BudgetLimit, ...]:
+    copied = copy_budget_limits(limits, field_name="budget_limits")
+    for limit in copied:
+        if limit.reservation is not None:
+            raise ValueError("Request budget limits must not use reservations.")
+    return copied
+
+
 def budget_limits_for_session(
     *,
     policy: BudgetPolicy | None,
@@ -585,6 +615,29 @@ def budget_limits_for_session(
         ):
             matched.append(_copy_budget_limit(limit))
     return tuple(matched)
+
+
+def request_budget_limits_for_session(
+    *,
+    limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+    agent_name: str,
+    causal_budget_id: str,
+) -> tuple[BudgetLimit, ...]:
+    copied = copy_request_budget_limits(limits)
+    agent_name = require_clean_nonblank(agent_name, "agent_name")
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    for limit in copied:
+        if limit.scope == "agent" and limit.key != agent_name:
+            raise ValueError(
+                f"Request agent budget limit key {limit.key!r} does not match "
+                f"session agent {agent_name!r}."
+            )
+        if limit.scope == "causal" and limit.key != causal_budget_id:
+            raise ValueError(
+                f"Request causal budget limit key {limit.key!r} does not match "
+                f"session causal_budget_id {causal_budget_id!r}."
+            )
+    return copied
 
 
 def budget_check_from_events(
@@ -659,7 +712,7 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
 
 def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
     if type(limit) is not BudgetLimit:
-        raise TypeError("Budget policy limits must be BudgetLimit instances.")
+        raise TypeError("Budget limits must be BudgetLimit instances.")
     return BudgetLimit(
         scope=limit.scope,
         max_estimated_cost=limit.max_estimated_cost,
@@ -679,7 +732,7 @@ def _coerce_budget_limit(limit: BudgetLimit | Mapping[str, Any]) -> BudgetLimit:
         return _copy_budget_limit(limit)
     if isinstance(limit, Mapping):
         return BudgetLimit.model_validate(dict(limit))
-    raise TypeError("Budget policy limits must be BudgetLimit instances or mappings.")
+    raise TypeError("Budget limits must be BudgetLimit instances or mappings.")
 
 
 def _budget_summary_id(limit: BudgetLimit) -> str:

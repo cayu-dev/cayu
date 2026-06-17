@@ -46,12 +46,10 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
-    CostBudget,
     CostLineItem,
     ModelPricing,
     PricingCatalog,
     SessionCostSummary,
-    copy_cost_budget,
     copy_pricing_catalog,
     estimate_causal_budget_cost,
     estimate_session_cost,
@@ -170,7 +168,6 @@ __all__ = [
     "ContextCompactor",
     "ContextPolicy",
     "ContextRequest",
-    "CostBudget",
     "CostLineItem",
     "DefaultContextPolicy",
     "DispatchHandle",
@@ -247,7 +244,6 @@ __all__ = [
     "UsageMetrics",
     "causal_budget_usage_summary",
     "classify_retryable_error",
-    "copy_cost_budget",
     "copy_dispatch_handle",
     "copy_dispatch_request",
     "copy_pricing_catalog",

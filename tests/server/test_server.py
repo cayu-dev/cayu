@@ -109,7 +109,7 @@ def test_server_exposes_session_usage_summary() -> None:
     }
 
 
-def test_server_run_accepts_cost_budget() -> None:
+def test_server_run_accepts_budget_limits() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -120,19 +120,22 @@ def test_server_run_accepts_cost_budget() -> None:
         "/api/run",
         json={
             "prompt": "hello",
-            "cost_budget": {
-                "max_estimated_cost": "0.000001",
-                "pricing": {
-                    "prices": [
-                        {
-                            "provider_name": "fake",
-                            "model": "fake-model",
-                            "input_per_million": "1",
-                            "output_per_million": "1",
-                        }
-                    ]
-                },
-            },
+            "budget_limits": [
+                {
+                    "scope": "session",
+                    "max_estimated_cost": "0.000001",
+                    "pricing": {
+                        "prices": [
+                            {
+                                "provider_name": "fake",
+                                "model": "fake-model",
+                                "input_per_million": "1",
+                                "output_per_million": "1",
+                            }
+                        ]
+                    },
+                }
+            ],
         },
     ) as response:
         assert response.status_code == 200
@@ -141,6 +144,43 @@ def test_server_run_accepts_cost_budget() -> None:
     sessions = client.get("/api/sessions").json()
     assert len(sessions) == 1
     assert sessions[0]["status"] == "interrupted"
+
+
+def test_server_run_rejects_request_budget_reservations() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    response = client.post(
+        "/api/run",
+        json={
+            "prompt": "hello",
+            "budget_limits": [
+                {
+                    "scope": "session",
+                    "max_estimated_cost": "0.01",
+                    "pricing": {
+                        "prices": [
+                            {
+                                "provider_name": "fake",
+                                "model": "fake-model",
+                                "input_per_million": "1",
+                                "output_per_million": "1",
+                            }
+                        ]
+                    },
+                    "reservation": {
+                        "max_input_tokens": 1,
+                        "max_output_tokens": 0,
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Request budget limits must not use reservations" in response.text
 
 
 def test_server_session_usage_returns_404_for_missing_session() -> None:

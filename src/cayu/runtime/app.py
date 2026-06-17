@@ -73,6 +73,8 @@ from cayu.runtime.budgets import (
     budget_reconciliation_payload,
     budget_reservation_payload,
     copy_budget_policy,
+    copy_request_budget_limits,
+    request_budget_limits_for_session,
 )
 from cayu.runtime.context import (
     ContextBuildError,
@@ -85,10 +87,8 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
-    CostBudget,
     PricingCatalog,
     SessionCostSummary,
-    copy_cost_budget,
     estimate_causal_budget_cost,
     estimate_session_cost,
 )
@@ -539,7 +539,7 @@ class CayuApp:
             messages_to_append=messages,
             max_steps=request.max_steps,
             limits=request.limits,
-            cost_budget=request.cost_budget,
+            budget_limits=request.budget_limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
             request_metadata=request.metadata,
@@ -730,7 +730,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
-            cost_budget=request.cost_budget,
+            budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
         )
@@ -985,7 +985,7 @@ class CayuApp:
             messages_to_append=request.messages,
             max_steps=request.max_steps,
             limits=request.limits,
-            cost_budget=request.cost_budget,
+            budget_limits=request.budget_limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
             request_metadata=request.metadata,
@@ -1180,21 +1180,18 @@ class CayuApp:
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
                 limits = copy_run_limits(request.limits)
-                cost_budget = copy_cost_budget(request.cost_budget)
+                budget_limits = request_budget_limits_for_session(
+                    limits=request.budget_limits,
+                    agent_name=registered_agent.spec.name,
+                    causal_budget_id=session.causal_budget_id,
+                )
                 run_baseline = (
                     session_usage_summary(session.id, approval_events)
                     if limits.scope == "run" and has_run_limits(limits)
                     else None
                 )
-                cost_baseline = (
-                    estimate_session_cost(
-                        session_id=session.id,
-                        events=approval_events,
-                        pricing=cost_budget.pricing,
-                        currency=cost_budget.currency,
-                    )
-                    if cost_budget is not None and cost_budget.scope == "run"
-                    else None
+                budget_baseline_events = (
+                    approval_events if _has_run_budget_limit(budget_limits) else []
                 )
                 recorded_tool_outcomes = list(recorded_outcomes.values())
                 pending_tool_calls: list[runtime_records.ToolCallRequest] = []
@@ -1221,11 +1218,12 @@ class CayuApp:
                     executable_pending_tool_calls += 1
                 decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
+                    registered_agent=registered_agent,
                     limits=limits,
-                    cost_budget=cost_budget,
+                    budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
-                    cost_baseline=cost_baseline,
+                    budget_baseline_events=budget_baseline_events,
                     pending_tool_calls=executable_pending_tool_calls,
                 )
                 if decision is not None:
@@ -1393,7 +1391,7 @@ class CayuApp:
                 messages_to_append=[],
                 max_steps=request.max_steps,
                 limits=request.limits,
-                cost_budget=request.cost_budget,
+                budget_limits=request.budget_limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 structured_output=_effective_approval_structured_output(
                     structured_output=request.structured_output,
@@ -1620,7 +1618,7 @@ class CayuApp:
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
-            cost_budget=request.cost_budget,
+            budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
         )
@@ -1646,7 +1644,7 @@ class CayuApp:
         messages_to_append: list[Message],
         max_steps: int,
         limits: RunLimits,
-        cost_budget: CostBudget | None,
+        budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
         request_metadata: dict[str, Any],
@@ -1663,27 +1661,23 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None
         run_started_at = time.monotonic()
         limits = copy_run_limits(limits)
-        cost_budget = copy_cost_budget(cost_budget)
+        budget_limits = request_budget_limits_for_session(
+            limits=budget_limits,
+            agent_name=registered_agent.spec.name,
+            causal_budget_id=session.causal_budget_id,
+        )
         retry_policy = copy_retry_policy(retry_policy)
         structured_output = copy_structured_output_spec(structured_output)
         structured_output_retries = 0
         run_baseline: SessionUsageSummary | None = None
-        cost_baseline: SessionCostSummary | None = None
-        if (limits.scope == "run" and has_run_limits(limits)) or (
-            cost_budget is not None and cost_budget.scope == "run"
+        if (limits.scope == "run" and has_run_limits(limits)) or _has_run_budget_limit(
+            budget_limits
         ):
             baseline_events = await self.session_store.load_events(session.id)
         else:
             baseline_events = []
         if limits.scope == "run" and has_run_limits(limits):
             run_baseline = session_usage_summary(session.id, baseline_events)
-        if cost_budget is not None and cost_budget.scope == "run":
-            cost_baseline = estimate_session_cost(
-                session_id=session.id,
-                events=baseline_events,
-                pricing=cost_budget.pricing,
-                currency=cost_budget.currency,
-            )
         if structured_output is not None and STRUCTURED_OUTPUT_TOOL_NAME in registered_agent.tools:
             raise ValueError(
                 f"Tool name is reserved for structured output: {STRUCTURED_OUTPUT_TOOL_NAME}"
@@ -1759,11 +1753,12 @@ class CayuApp:
                     return
                 decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
+                    registered_agent=registered_agent,
                     limits=limits,
-                    cost_budget=cost_budget,
+                    budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
-                    cost_baseline=cost_baseline,
+                    budget_baseline_events=baseline_events,
                 )
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
@@ -1986,11 +1981,12 @@ class CayuApp:
 
                 decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
+                    registered_agent=registered_agent,
                     limits=limits,
-                    cost_budget=cost_budget,
+                    budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
-                    cost_baseline=cost_baseline,
+                    budget_baseline_events=baseline_events,
                     pending_tool_calls=_user_tool_call_count(tool_calls),
                 )
                 if decision is not None:
@@ -2223,11 +2219,12 @@ class CayuApp:
 
                 decision, usage_summary, cost_summary = await self._first_limit_decision(
                     session=session,
+                    registered_agent=registered_agent,
                     limits=limits,
-                    cost_budget=cost_budget,
+                    budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
-                    cost_baseline=cost_baseline,
+                    budget_baseline_events=baseline_events,
                     pending_tool_calls=len(tool_calls),
                 )
                 if decision is not None:
@@ -2316,11 +2313,12 @@ class CayuApp:
                         await self._raise_if_session_interrupted(session.id)
                         decision, usage_summary, cost_summary = await self._first_limit_decision(
                             session=session,
+                            registered_agent=registered_agent,
                             limits=limits,
-                            cost_budget=cost_budget,
+                            budget_limits=budget_limits,
                             run_started_at=run_started_at,
                             run_baseline=run_baseline,
-                            cost_baseline=cost_baseline,
+                            budget_baseline_events=baseline_events,
                             pending_tool_calls=1,
                         )
                         if decision is not None:
@@ -2806,14 +2804,20 @@ class CayuApp:
         self,
         *,
         session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
         limits: RunLimits,
-        cost_budget: CostBudget | None,
+        budget_limits: tuple[BudgetLimit, ...],
         run_started_at: float,
         run_baseline: SessionUsageSummary | None = None,
-        cost_baseline: SessionCostSummary | None = None,
+        budget_baseline_events: list[Event] | None = None,
         pending_tool_calls: int = 0,
     ) -> tuple[StopDecision | None, SessionUsageSummary, SessionCostSummary | None]:
-        if not has_run_limits(limits) and cost_budget is None:
+        budget_limits = request_budget_limits_for_session(
+            limits=budget_limits,
+            agent_name=registered_agent.spec.name,
+            causal_budget_id=session.causal_budget_id,
+        )
+        if not has_run_limits(limits) and not budget_limits:
             return None, SessionUsageSummary(session_id=session.id), None
         events = await self.session_store.load_events(session.id)
         usage_summary = session_usage_summary(session.id, events)
@@ -2840,18 +2844,36 @@ class CayuApp:
             return decision, usage_summary, None
 
         cost_summary: SessionCostSummary | None = None
-        if cost_budget is not None:
+        for budget_limit in budget_limits:
+            budget_events = events
+            budget_baseline: SessionCostSummary | None = None
+            if budget_limit.scope in {"app", "agent", "causal"}:
+                budget_events = await self.budget_store.load_events_for_budget(
+                    scope=budget_limit.scope,
+                    key=budget_limit.key,
+                    window=budget_limit.window,
+                )
+            elif budget_limit.scope == "run":
+                budget_baseline = estimate_session_cost(
+                    session_id=session.id,
+                    events=budget_baseline_events or [],
+                    pricing=budget_limit.pricing,
+                    currency=budget_limit.currency,
+                )
+            elif budget_limit.scope != "session":
+                raise ValueError(f"Unsupported request budget scope: {budget_limit.scope}")
+
             cost_summary = estimate_session_cost(
                 session_id=session.id,
-                events=events,
-                pricing=cost_budget.pricing,
-                currency=cost_budget.currency,
+                events=budget_events,
+                pricing=budget_limit.pricing,
+                currency=budget_limit.currency,
             )
-            cost_decision = _first_cost_limit_decision(
+            cost_decision = _first_budget_limit_decision(
                 session=session,
-                cost_budget=cost_budget,
+                limit=budget_limit,
                 cost_summary=cost_summary,
-                cost_baseline=cost_baseline,
+                cost_baseline=budget_baseline,
             )
             if cost_decision is not None:
                 return cost_decision, usage_summary, cost_summary
@@ -4350,7 +4372,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
-        cost_budget=copy_cost_budget(request.cost_budget),
+        budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
     )
@@ -4533,17 +4555,21 @@ def _budget_limit_reached_payload(check: BudgetCheck) -> dict[str, Any]:
     return budget_check_payload(check)
 
 
-def _first_cost_limit_decision(
+def _has_run_budget_limit(limits: tuple[BudgetLimit, ...]) -> bool:
+    return any(limit.scope == "run" for limit in limits)
+
+
+def _first_budget_limit_decision(
     *,
     session: Session,
-    cost_budget: CostBudget,
+    limit: BudgetLimit,
     cost_summary: SessionCostSummary,
     cost_baseline: SessionCostSummary | None,
 ) -> StopDecision | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
-    if type(cost_budget) is not CostBudget:
-        raise TypeError("cost_budget must be a CostBudget instance.")
+    if type(limit) is not BudgetLimit:
+        raise TypeError("limit must be a BudgetLimit instance.")
     if type(cost_summary) is not SessionCostSummary:
         raise TypeError("cost_summary must be a SessionCostSummary.")
     if cost_baseline is not None and type(cost_baseline) is not SessionCostSummary:
@@ -4551,48 +4577,48 @@ def _first_cost_limit_decision(
 
     actual_cost = cost_summary.total_cost
     unpriced_model_steps = cost_summary.unpriced_model_steps
-    if cost_budget.scope == "run" and cost_baseline is not None:
+    if limit.scope == "run" and cost_baseline is not None:
         actual_cost = max(cost_summary.total_cost - cost_baseline.total_cost, Decimal("0"))
         unpriced_model_steps = max(
             cost_summary.unpriced_model_steps - cost_baseline.unpriced_model_steps,
             0,
         )
 
-    if unpriced_model_steps > 0 and not cost_budget.allow_unpriced:
+    if unpriced_model_steps > 0 and not limit.allow_unpriced:
         return StopDecision(
             limit=StopLimit.ESTIMATED_COST,
-            maximum=cost_budget.max_estimated_cost,
+            maximum=limit.max_estimated_cost,
             actual=actual_cost,
             message=(
                 "Estimated cost budget cannot be verified because "
                 f"{unpriced_model_steps} model step(s) have no matching pricing."
             ),
         )
-    preflight_error = _cost_budget_preflight_error(session=session, cost_budget=cost_budget)
+    preflight_error = _budget_limit_preflight_error(session=session, limit=limit)
     if preflight_error is not None:
         return StopDecision(
             limit=StopLimit.ESTIMATED_COST,
-            maximum=cost_budget.max_estimated_cost,
+            maximum=limit.max_estimated_cost,
             actual=actual_cost,
             message=preflight_error,
         )
-    if actual_cost >= cost_budget.max_estimated_cost:
+    if actual_cost >= limit.max_estimated_cost:
         return StopDecision(
             limit=StopLimit.ESTIMATED_COST,
-            maximum=cost_budget.max_estimated_cost,
+            maximum=limit.max_estimated_cost,
             actual=actual_cost,
             message=(
                 "Estimated cost budget reached: "
-                f"{actual_cost} >= {cost_budget.max_estimated_cost} {cost_budget.currency}."
+                f"{actual_cost} >= {limit.max_estimated_cost} {limit.currency}."
             ),
         )
     return None
 
 
-def _cost_budget_preflight_error(*, session: Session, cost_budget: CostBudget) -> str | None:
-    if cost_budget.allow_unpriced:
+def _budget_limit_preflight_error(*, session: Session, limit: BudgetLimit) -> str | None:
+    if limit.allow_unpriced:
         return None
-    price = cost_budget.pricing.match_price(
+    price = limit.pricing.match_price(
         provider_name=session.provider_name,
         model=session.model,
     )
@@ -4601,11 +4627,11 @@ def _cost_budget_preflight_error(*, session: Session, cost_budget: CostBudget) -
             "Estimated cost budget cannot be verified because "
             f"{session.provider_name}/{session.model} has no matching pricing."
         )
-    if price.currency.upper() != cost_budget.currency.upper():
+    if price.currency.upper() != limit.currency.upper():
         return (
             "Estimated cost budget cannot be verified because "
             f"{session.provider_name}/{session.model} pricing currency {price.currency} "
-            f"does not match requested {cost_budget.currency}."
+            f"does not match requested {limit.currency}."
         )
     return None
 

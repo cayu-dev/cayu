@@ -31,7 +31,6 @@ from cayu.runtime import (
     ContextCompactor,
     ContextPolicy,
     ContextRequest,
-    CostBudget,
     Dispatcher,
     DispatchHandle,
     DispatchRequest,
@@ -450,13 +449,13 @@ async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Ev
     return [event async for event in app.resume(request)]
 
 
-def fake_cost_budget(
+def fake_budget_limit(
     max_estimated_cost: str,
     *,
     scope: Literal["session", "run"] = "session",
     allow_unpriced: bool = False,
-) -> CostBudget:
-    return CostBudget(
+) -> BudgetLimit:
+    return BudgetLimit(
         max_estimated_cost=Decimal(max_estimated_cost),
         pricing=PricingCatalog(
             prices=(
@@ -847,7 +846,7 @@ def test_cayu_app_stops_on_token_limit_after_final_model_answer():
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cayu_app_stops_on_estimated_cost_budget_after_final_model_answer():
+def test_cayu_app_stops_on_estimated_cost_limit_after_final_model_answer():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -875,7 +874,7 @@ def test_cayu_app_stops_on_estimated_cost_budget_after_final_model_answer():
                 agent_name="assistant",
                 session_id="sess_cost_limit",
                 messages=[Message.text("user", "answer")],
-                cost_budget=fake_cost_budget("0.002"),
+                budget_limits=(fake_budget_limit("0.002"),),
             ),
         )
     )
@@ -899,7 +898,7 @@ def test_cayu_app_stops_on_estimated_cost_budget_after_final_model_answer():
     assert session.status == SessionStatus.INTERRUPTED
 
 
-def test_cayu_app_cost_budget_stops_before_tool_side_effects():
+def test_cayu_app_budget_limit_stops_before_tool_side_effects():
     store = InMemorySessionStore()
     tool = SideEffectTool()
     provider = FakeProvider(
@@ -935,7 +934,7 @@ def test_cayu_app_cost_budget_stops_before_tool_side_effects():
                 agent_name="assistant",
                 session_id="sess_cost_limit_tool",
                 messages=[Message.text("user", "do it")],
-                cost_budget=fake_cost_budget("0.002"),
+                budget_limits=(fake_budget_limit("0.002"),),
             ),
         )
     )
@@ -1301,7 +1300,7 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
     assert len(provider.requests) == 2
 
 
-def test_cayu_app_cost_budget_fails_closed_when_model_step_is_unpriced():
+def test_cayu_app_budget_limit_fails_closed_when_model_step_is_unpriced():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -1329,17 +1328,19 @@ def test_cayu_app_cost_budget_fails_closed_when_model_step_is_unpriced():
                 agent_name="assistant",
                 session_id="sess_cost_limit_unpriced",
                 messages=[Message.text("user", "answer")],
-                cost_budget=CostBudget(
-                    max_estimated_cost=Decimal("100"),
-                    pricing=PricingCatalog(
-                        prices=(
-                            ModelPricing(
-                                provider_name="fake",
-                                model="other-model",
-                                input_per_million=Decimal("1"),
-                                output_per_million=Decimal("1"),
-                            ),
-                        )
+                budget_limits=(
+                    BudgetLimit(
+                        max_estimated_cost=Decimal("100"),
+                        pricing=PricingCatalog(
+                            prices=(
+                                ModelPricing(
+                                    provider_name="fake",
+                                    model="other-model",
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("1"),
+                                ),
+                            )
+                        ),
                     ),
                 ),
             ),
@@ -1357,7 +1358,7 @@ def test_cayu_app_cost_budget_fails_closed_when_model_step_is_unpriced():
     assert events[1].payload["cost_summary"]["unpriced_model_steps"] == 0
 
 
-def test_cayu_app_cost_budget_allows_unpriced_steps_when_explicitly_configured():
+def test_cayu_app_budget_limit_allows_unpriced_steps_when_explicitly_configured():
     provider = FakeProvider(
         [
             ModelStreamEvent.text_delta("final answer"),
@@ -1384,19 +1385,21 @@ def test_cayu_app_cost_budget_allows_unpriced_steps_when_explicitly_configured()
                 agent_name="assistant",
                 session_id="sess_cost_limit_unpriced_allowed",
                 messages=[Message.text("user", "answer")],
-                cost_budget=CostBudget(
-                    max_estimated_cost=Decimal("100"),
-                    pricing=PricingCatalog(
-                        prices=(
-                            ModelPricing(
-                                provider_name="fake",
-                                model="other-model",
-                                input_per_million=Decimal("1"),
-                                output_per_million=Decimal("1"),
-                            ),
-                        )
+                budget_limits=(
+                    BudgetLimit(
+                        max_estimated_cost=Decimal("100"),
+                        pricing=PricingCatalog(
+                            prices=(
+                                ModelPricing(
+                                    provider_name="fake",
+                                    model="other-model",
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("1"),
+                                ),
+                            )
+                        ),
+                        allow_unpriced=True,
                     ),
-                    allow_unpriced=True,
                 ),
             ),
         )
@@ -1450,7 +1453,7 @@ def test_cayu_app_app_budget_applies_across_sessions():
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("1"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                 ),
             )
         ),
@@ -1506,6 +1509,73 @@ def test_cayu_app_app_budget_applies_across_sessions():
     assert len(provider.requests) == 1
 
 
+def test_cayu_app_request_app_budget_limit_applies_across_sessions():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_app_budget_first",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    second_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_app_budget_second",
+                messages=[Message.text("user", "second")],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=fake_budget_limit("10").pricing,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert [event.type for event in second_events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert second_events[1].payload["limit"] == "estimated_cost"
+    assert second_events[1].payload["actual"] == "1"
+    assert second_events[1].payload["cost_summary"]["total_cost"] == "1"
+    assert len(provider.requests) == 1
+
+
 def test_cayu_app_budget_reservation_reconciles_model_step():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -1529,7 +1599,7 @@ def test_cayu_app_budget_reservation_reconciles_model_step():
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("2"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                     reservation=BudgetReservation(
                         max_input_tokens=1_000_000,
                         max_output_tokens=0,
@@ -1594,7 +1664,7 @@ def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unav
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("1"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                     reservation=BudgetReservation(
                         max_input_tokens=1_000_000,
                         max_output_tokens=0,
@@ -1669,7 +1739,7 @@ def test_cayu_app_causal_budget_is_shared_by_forked_sessions():
                     scope="causal",
                     key="job_shared",
                     max_estimated_cost=Decimal("1"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                     reservation=BudgetReservation(
                         max_input_tokens=1_000_000,
                         max_output_tokens=0,
@@ -1736,6 +1806,74 @@ def test_cayu_app_causal_budget_is_shared_by_forked_sessions():
     assert len(provider.requests) == 1
 
 
+def test_cayu_app_request_causal_budget_limit_applies_to_matching_causal_history():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_causal_budget_first",
+                causal_budget_id="job_request",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    second_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_causal_budget_second",
+                causal_budget_id="job_request",
+                messages=[Message.text("user", "second")],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="causal",
+                        key="job_request",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=fake_budget_limit("10").pricing,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert [event.type for event in second_events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert second_events[1].payload["actual"] == "1"
+    assert len(provider.requests) == 1
+
+
 def test_cayu_app_budget_reservation_is_released_when_model_step_fails():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -1762,7 +1900,7 @@ def test_cayu_app_budget_reservation_is_released_when_model_step_fails():
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("1"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                     reservation=BudgetReservation(
                         max_input_tokens=1_000_000,
                         max_output_tokens=0,
@@ -1842,7 +1980,7 @@ def test_cayu_app_agent_budget_only_applies_to_matching_agent():
                     scope="agent",
                     key="builder",
                     max_estimated_cost=Decimal("1"),
-                    pricing=fake_cost_budget("10").pricing,
+                    pricing=fake_budget_limit("10").pricing,
                 ),
             )
         ),
@@ -1876,6 +2014,72 @@ def test_cayu_app_agent_budget_only_applies_to_matching_agent():
     assert EventType.BUDGET_CHECKED not in [event.type for event in researcher_events]
     assert researcher_events[-1].type == EventType.SESSION_COMPLETED
     assert len(provider.requests) == 2
+
+
+def test_cayu_app_request_agent_budget_limit_applies_to_matching_agent_history():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="builder", model="fake-model"))
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_request_agent_budget_first",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    second_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_request_agent_budget_second",
+                messages=[Message.text("user", "second")],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="agent",
+                        key="builder",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=fake_budget_limit("10").pricing,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert [event.type for event in second_events] == [
+        EventType.SESSION_STARTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert second_events[1].payload["actual"] == "1"
+    assert len(provider.requests) == 1
 
 
 def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
@@ -1961,7 +2165,7 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
     assert len(provider.requests) == 0
 
 
-def test_cayu_app_run_scoped_cost_budget_ignores_prior_session_cost():
+def test_cayu_app_run_scoped_budget_limit_ignores_prior_session_cost():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -2014,7 +2218,7 @@ def test_cayu_app_run_scoped_cost_budget_ignores_prior_session_cost():
             ResumeRequest(
                 session_id="sess_run_scope_cost",
                 messages=[Message.text("user", "second")],
-                cost_budget=fake_cost_budget("0.002", scope="run"),
+                budget_limits=(fake_budget_limit("0.002", scope="run"),),
             ),
         )
     )
@@ -4691,7 +4895,7 @@ def test_cayu_app_rejects_conflicting_structured_output_on_tool_approval():
     assert tool.calls == []
 
 
-def test_cayu_app_cost_budget_stops_approval_before_tool_side_effects():
+def test_cayu_app_budget_limit_stops_approval_before_tool_side_effects():
     store = InMemorySessionStore()
     tool = SideEffectTool()
     provider = FakeProvider(
@@ -4746,7 +4950,7 @@ def test_cayu_app_cost_budget_stops_approval_before_tool_side_effects():
                 session_id="sess_tool_approval_cost_limit",
                 approval_id=approval_id,
                 decision=ToolApprovalDecision.APPROVE,
-                cost_budget=fake_cost_budget("0.002"),
+                budget_limits=(fake_budget_limit("0.002"),),
             ),
         )
     )
@@ -5431,7 +5635,7 @@ def test_cayu_app_approval_limit_replays_recorded_tool_outcomes_before_stopping(
                 session_id="sess_approval_recorded_outcome_limit",
                 approval_id=approval_id,
                 decision=ToolApprovalDecision.APPROVE,
-                cost_budget=fake_cost_budget("0.001"),
+                budget_limits=(fake_budget_limit("0.001"),),
             ),
         )
     )

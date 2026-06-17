@@ -410,27 +410,37 @@ this primitive only after the app has supplied pricing appropriate for its
 deployment.
 
 `RunLimits` provides hard token/tool/time stop controls for runtime calls.
-`CostBudget` provides an estimated-cost stop control backed by a caller-supplied
-`PricingCatalog`. Both can be attached to `RunRequest`, `ResumeRequest`,
-`DispatchRequest`, `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`.
-`scope="session"` is the default: token, tool-call, and cost limits are
-session-cumulative because they are evaluated from durable `model.completed` and
-`tool.call.started` events. `scope="run"` evaluates token, tool-call, and cost
-limits against the delta since the current `run(...)`, `resume(...)`, dispatch,
-or approval-continuation invocation started. `max_elapsed_seconds` is always
-scoped to the current runtime invocation and resets for each call.
+`BudgetLimit` provides estimated-cost stop controls backed by a caller-supplied
+`PricingCatalog`. Request-scoped `BudgetLimit` entries can be attached through
+`budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `scope="session"` is
+the default: token, tool-call, and cost limits are session-cumulative because
+they are evaluated from durable `model.completed` and `tool.call.started`
+events. `scope="run"` evaluates token, tool-call, and cost limits against the
+delta since the current `run(...)`, `resume(...)`, dispatch, or
+approval-continuation invocation started. `max_elapsed_seconds` is always scoped
+to the current runtime invocation and resets for each call.
 
-Cost budgets are estimates, not billing records. They use normalized usage
-metrics and the app's pricing table. By default, `CostBudget` fails closed when
-a newly observed model step has no matching pricing entry; Cayu interrupts
-instead of silently treating unknown usage as free. Apps that intentionally allow
-missing prices can set `allow_unpriced=True` for that request.
+Budget limits are estimates, not billing records. They use normalized usage
+metrics and the app's pricing table. By default, a request-scoped `BudgetLimit`
+fails closed when a newly observed model step has no matching pricing entry;
+Cayu interrupts instead of silently treating unknown usage as free. Apps that
+intentionally allow missing prices can set `allow_unpriced=True` for that
+request.
+
+Request `budget_limits` may use `scope="session"` or `scope="run"` for direct
+request budgets. They may also use `scope="agent"` or `scope="causal"` for
+dynamic work-item budgets passed by the caller; those keys must match the
+current agent name or current `causal_budget_id`. `scope="app"` is accepted for
+intentional per-request global checks, but durable app-wide policy normally
+belongs on `CayuApp(budget_policy=...)`. Request budget limits must not include
+reservations; strict concurrent reservations are app-policy/ledger behavior.
 
 App-level budgets are configured separately on `CayuApp` through
 `BudgetPolicy`. A policy contains app-wide, agent-scoped, and causal
 `BudgetLimit` entries. In the first budget contract, limits use the `all_time`
 window and are estimated from the same normalized usage and caller-supplied
-`PricingCatalog` used by `CostBudget`.
+`PricingCatalog` used by request-scoped `BudgetLimit` entries.
 
 `scope="app"` applies to all sessions and must not set `key`. `scope="agent"`
 applies when `key` matches the agent name. `scope="causal"` applies when `key`

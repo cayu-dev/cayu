@@ -7,7 +7,7 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from cayu.core.events import EventType
@@ -18,10 +18,8 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
-from cayu.runtime.costs import (
-    CostBudget,
-    PricingCatalog,
-)
+from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.costs import PricingCatalog
 from cayu.runtime.costs import (
     estimate_causal_budget_cost as build_causal_budget_cost_summary,
 )
@@ -63,18 +61,28 @@ class RunBody(BaseModel):
     agent: NonBlankString = "assistant"
     causal_budget_id: NonBlankString | None = None
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
 
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
 
 class InterruptSessionBody(BaseModel):
@@ -94,9 +102,14 @@ class ToolApprovalBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
 
 class ToolApprovalRecoveryBody(BaseModel):
@@ -110,9 +123,14 @@ class ToolApprovalRecoveryBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
 
 def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
@@ -212,7 +230,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
-            cost_budget=body.cost_budget,
+            budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
         )
@@ -237,7 +255,7 @@ def create_router(
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
-            cost_budget=body.cost_budget,
+            budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
         )
@@ -317,7 +335,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
-            cost_budget=body.cost_budget,
+            budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
         )
@@ -349,7 +367,7 @@ def create_router(
             metadata=body.metadata,
             max_steps=20,
             limits=body.limits,
-            cost_budget=body.cost_budget,
+            budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
         )

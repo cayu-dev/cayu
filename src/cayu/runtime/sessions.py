@@ -22,7 +22,7 @@ from pydantic import (
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, copy_message
-from cayu.runtime.costs import CostBudget, copy_cost_budget
+from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
@@ -52,7 +52,7 @@ class RunRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
 
@@ -73,6 +73,11 @@ class RunRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
     @field_validator("agent_name")
     @classmethod
@@ -100,7 +105,7 @@ class ResumeRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
-    cost_budget: CostBudget | None = None
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
 
@@ -124,6 +129,11 @@ class ResumeRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
 
     @field_validator("session_id", "model")
     @classmethod
@@ -1212,7 +1222,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
-        cost_budget=copy_cost_budget(request.cost_budget),
+        budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
     )
@@ -1231,7 +1241,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
-        cost_budget=copy_cost_budget(request.cost_budget),
+        budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
     )

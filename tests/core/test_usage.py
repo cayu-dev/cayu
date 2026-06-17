@@ -11,7 +11,6 @@ from cayu.runtime import (
     BudgetPolicy,
     BudgetReservation,
     CayuApp,
-    CostBudget,
     InMemoryBudgetLedger,
     InMemorySessionStore,
     ModelPricing,
@@ -20,9 +19,13 @@ from cayu.runtime import (
     SessionBudgetStore,
     SessionIdentity,
 )
-from cayu.runtime.budgets import InMemoryBudgetStore, budget_check_from_events
+from cayu.runtime.budgets import (
+    InMemoryBudgetStore,
+    budget_check_from_events,
+    copy_request_budget_limits,
+    request_budget_limits_for_session,
+)
 from cayu.runtime.costs import (
-    copy_cost_budget,
     estimate_causal_budget_cost,
     estimate_session_cost,
 )
@@ -165,6 +168,16 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("2"),
+                    pricing=pricing,
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="request-scoped"):
+        BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="session",
+                    max_estimated_cost=Decimal("1"),
                     pricing=pricing,
                 ),
             )
@@ -1200,7 +1213,7 @@ def test_estimate_session_cost_respects_explicit_zero_cache_prices() -> None:
     assert summary.total_cost == Decimal("0.001")
 
 
-def test_cost_budget_validates_currency_and_copies_pricing() -> None:
+def test_request_budget_limits_validate_currency_and_copy_pricing() -> None:
     pricing = PricingCatalog(
         prices=(
             ModelPricing(
@@ -1212,20 +1225,89 @@ def test_cost_budget_validates_currency_and_copies_pricing() -> None:
         )
     )
 
-    budget = CostBudget(
+    budget = BudgetLimit(
+        scope="run",
         max_estimated_cost=Decimal("0.01"),
         pricing=pricing,
         currency="usd",
-        scope="run",
     )
-    copied = copy_cost_budget(budget)
+    (copied,) = copy_request_budget_limits((budget,))
 
-    assert copied is not None
     assert copied is not budget
     assert copied.currency == "USD"
     assert copied.scope == "run"
     assert copied.pricing is not budget.pricing
     assert copied.pricing.prices[0] is not budget.pricing.prices[0]
+
+
+def test_request_budget_limits_reject_reservations() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
+    )
+
+    budget = BudgetLimit(
+        scope="session",
+        max_estimated_cost=Decimal("0.01"),
+        pricing=pricing,
+        reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+    )
+
+    with pytest.raises(ValueError, match="must not use reservations"):
+        copy_request_budget_limits((budget,))
+
+
+def test_request_budget_limits_validate_agent_and_causal_keys() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
+    )
+
+    limits = request_budget_limits_for_session(
+        limits=(
+            BudgetLimit(
+                scope="agent",
+                key="assistant",
+                max_estimated_cost=Decimal("0.01"),
+                pricing=pricing,
+            ),
+            BudgetLimit(
+                scope="causal",
+                key="job_1",
+                max_estimated_cost=Decimal("0.02"),
+                pricing=pricing,
+            ),
+        ),
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )
+
+    assert [limit.scope for limit in limits] == ["agent", "causal"]
+    with pytest.raises(ValueError, match="does not match"):
+        request_budget_limits_for_session(
+            limits=(
+                BudgetLimit(
+                    scope="agent",
+                    key="other",
+                    max_estimated_cost=Decimal("0.01"),
+                    pricing=pricing,
+                ),
+            ),
+            agent_name="assistant",
+            causal_budget_id="job_1",
+        )
 
 
 def test_usage_metrics_from_event_payload_rejects_non_usage_payload() -> None:

@@ -96,30 +96,6 @@ class PricingCatalog(BaseModel):
         return sorted(matches, key=_pricing_specificity, reverse=True)[0]
 
 
-class CostBudget(BaseModel):
-    """Estimated-cost budget for one session run or resume call."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    max_estimated_cost: Decimal = Field(gt=0)
-    pricing: PricingCatalog
-    currency: str = "USD"
-    scope: Literal["session", "run"] = "session"
-    allow_unpriced: StrictBool = False
-
-    @field_validator("currency")
-    @classmethod
-    def validate_currency(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name).upper()
-
-    @field_validator("max_estimated_cost")
-    @classmethod
-    def validate_cost(cls, value: Decimal, info) -> Decimal:
-        if not value.is_finite():
-            raise ValueError(f"{info.field_name} must be finite.")
-        return value
-
-
 class CostLineItem(BaseModel):
     """Estimated cost for one model.completed event."""
 
@@ -210,20 +186,6 @@ def copy_pricing_catalog(catalog: PricingCatalog) -> PricingCatalog:
     if type(catalog) is not PricingCatalog:
         raise TypeError("Pricing catalog must be a PricingCatalog instance.")
     return PricingCatalog(prices=tuple(price.model_copy(deep=True) for price in catalog.prices))
-
-
-def copy_cost_budget(cost_budget: CostBudget | None) -> CostBudget | None:
-    if cost_budget is None:
-        return None
-    if type(cost_budget) is not CostBudget:
-        raise TypeError("Cost budget must be a CostBudget instance.")
-    return CostBudget(
-        max_estimated_cost=cost_budget.max_estimated_cost,
-        pricing=copy_pricing_catalog(cost_budget.pricing),
-        currency=cost_budget.currency,
-        scope=cost_budget.scope,
-        allow_unpriced=cost_budget.allow_unpriced,
-    )
 
 
 def estimate_session_cost(

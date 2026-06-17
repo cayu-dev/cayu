@@ -513,14 +513,14 @@ PYTHONPATH=src python examples/openai_local_tools.py
 Those environment variables are example pricing inputs only. Use prices from
 your own provider account and deployment.
 
-Set hard run limits with `RunLimits` and per-request estimated-cost budgets
-with `CostBudget` on `RunRequest`, `ResumeRequest`, `DispatchRequest`, or
+Set hard run limits with `RunLimits` and per-request estimated-cost limits with
+`BudgetLimit` on `RunRequest`, `ResumeRequest`, `DispatchRequest`, or
 tool-approval continuation requests:
 
 ```python
 from decimal import Decimal
 
-from cayu import CostBudget, Message, RunLimits, RunRequest
+from cayu import BudgetLimit, Message, RunLimits, RunRequest
 
 request = RunRequest(
     agent_name="assistant",
@@ -531,10 +531,12 @@ request = RunRequest(
         max_elapsed_seconds=300,
         scope="session",
     ),
-    cost_budget=CostBudget(
-        max_estimated_cost=Decimal("0.50"),
-        pricing=pricing,
-        scope="session",
+    budget_limits=(
+        BudgetLimit(
+            scope="session",
+            max_estimated_cost=Decimal("0.50"),
+            pricing=pricing,
+        ),
     ),
 )
 ```
@@ -545,16 +547,23 @@ default and treats token/tool-call limits as lifetime session budgets.
 `scope="run"` evaluates token/tool-call limits against only the current
 `run(...)`, `resume(...)`, dispatch, or approval-continuation invocation. Elapsed
 time is always evaluated for the active runtime invocation and resets on each
-call. Cost budgets use the same scope names: `scope="session"` enforces a
-lifetime estimated-cost budget, while `scope="run"` compares only estimated cost
-added during the current invocation.
+call. Estimated-cost budget limits use the same scope names: `scope="session"`
+enforces a lifetime estimated-cost budget, while `scope="run"` compares only
+estimated cost added during the current invocation.
 
-Cost budgets are estimates derived from normalized usage metrics and the pricing
-catalog supplied by your app. They are not provider invoices. By default,
-`CostBudget` fails closed when a newly observed model step has no matching
-pricing entry, because Cayu cannot prove that the budget is still safe. Set
-`allow_unpriced=True` only when your app intentionally allows missing prices for
-that run.
+Budget limits are estimates derived from normalized usage metrics and the
+pricing catalog supplied by your app. They are not provider invoices. By
+default, request-scoped `BudgetLimit` fails closed when a newly observed model
+step has no matching pricing entry, because Cayu cannot prove that the budget is
+still safe. Set `allow_unpriced=True` only when your app intentionally allows
+missing prices for that run.
+
+Request `budget_limits` can also use `scope="agent"` or `scope="causal"` when a
+caller needs dynamic spend control for one API call or work item without
+changing the app's global policy. The `key` must match the current agent name
+for `agent` limits or the current `causal_budget_id` for `causal` limits.
+`scope="app"` is accepted for deliberate per-request global checks, but app-wide
+limits usually belong in `BudgetPolicy`.
 
 When a limit is reached, Cayu emits `session.limit_reached`, marks the session
 `interrupted`, emits `session.interrupted` with
@@ -603,7 +612,8 @@ app = CayuApp(
 )
 ```
 
-App budgets use the same caller-supplied pricing catalog as `CostBudget`.
+App budgets use the same caller-supplied pricing catalog as request
+`BudgetLimit` entries.
 Before each model step and after each completed model step, Cayu evaluates the
 matching budget limits, verifies that the current provider/model has pricing
 unless `allow_unpriced=True`, emits `budget.checked`, and stops with
