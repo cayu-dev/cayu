@@ -69,6 +69,7 @@ from cayu.runners import (
     DEFAULT_MICROSANDBOX_IMAGE,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+    DEFAULT_SBX_CWD,
     E2B_SANDBOX_ID_MAX_BYTES,
     MICROSANDBOX_NAME_MAX_BYTES,
     E2BCloseAction,
@@ -80,6 +81,8 @@ from cayu.runners import (
     MicrosandboxRunner,
     RunnerCancelledError,
     RunnerCleanupPolicy,
+    SbxCloseAction,
+    SbxRunner,
 )
 from cayu.runtime import (
     AllowAllToolPolicy,
@@ -260,6 +263,7 @@ __all__ = [
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
+    "DEFAULT_SBX_CWD",
     "E2B_SANDBOX_ID_MAX_BYTES",
     "FILE_ATTACHMENT_TYPE",
     "MCP_PROTOCOL_VERSION",
@@ -387,6 +391,8 @@ __all__ = [
     "SQLiteBudgetLedger",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "SbxCloseAction",
+    "SbxRunner",
     "SecretEnv",
     "SecretNotFound",
     "SecretRedactor",
