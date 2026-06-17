@@ -400,6 +400,8 @@ class EventQuery(BaseModel):
     environment_name: str | None = None
     workflow_name: str | None = None
     tool_name: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
     after_sequence: StrictInt | None = Field(default=None, ge=0)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
 
@@ -429,6 +431,21 @@ class EventQuery(BaseModel):
         if isinstance(value, EventType):
             return value
         return Event(type=value, session_id="query").type
+
+    @field_validator("since", "until")
+    @classmethod
+    def validate_query_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> EventQuery:
+        if self.since is not None and self.until is not None and self.since >= self.until:
+            raise ValueError("EventQuery since must be before until.")
+        return self
 
 
 class TranscriptRecord(BaseModel):
@@ -1347,6 +1364,8 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,
         tool_name=query.tool_name,
+        since=query.since,
+        until=query.until,
         after_sequence=query.after_sequence,
         limit=query.limit,
     )
@@ -1404,6 +1423,11 @@ def _event_record_matches(
     if query.after_sequence is not None and record.sequence <= query.after_sequence:
         return False
     if query.session_id is not None and event.session_id != query.session_id:
+        return False
+    event_timestamp = event.timestamp.astimezone(UTC)
+    if query.since is not None and event_timestamp < query.since:
+        return False
+    if query.until is not None and event_timestamp >= query.until:
         return False
     if event_type is not None and str(event.type) != event_type:
         return False

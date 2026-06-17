@@ -9,6 +9,7 @@ They skip automatically when Docker is unavailable (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 
@@ -486,6 +487,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
                     session_id="sess_builder",
                     agent_name="builder",
                     environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
                 ),
                 Event(
                     id="event_2",
@@ -494,6 +496,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
                     agent_name="builder",
                     environment_name="local",
                     tool_name="read_file",
+                    timestamp=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
                 ),
                 Event(
                     id="event_3",
@@ -501,6 +504,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
                     session_id="sess_builder",
                     agent_name="builder",
                     environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, 10, tzinfo=UTC),
                     payload={"finish_reason": "stop"},
                 ),
             ],
@@ -513,10 +517,24 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
                 session_id="sess_reviewer",
                 agent_name="reviewer",
                 environment_name="hosted",
+                timestamp=datetime(2026, 1, 1, 12, 15, tzinfo=UTC),
             ),
         )
 
         all_records = await store.query_events(EventQuery(limit=10))
+        since_records = await store.query_events(
+            EventQuery(since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC), limit=10)
+        )
+        until_records = await store.query_events(
+            EventQuery(until=datetime(2026, 1, 1, 12, 10, tzinfo=UTC), limit=10)
+        )
+        window_records = await store.query_events(
+            EventQuery(
+                since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
+                until=datetime(2026, 1, 1, 12, 15, tzinfo=UTC),
+                limit=10,
+            )
+        )
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
@@ -525,6 +543,9 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         )
 
         assert [r.sequence for r in all_records] == [1, 2, 3, 4]
+        assert [r.event.id for r in since_records] == ["event_2", "event_3", "event_4"]
+        assert [r.event.id for r in until_records] == ["event_1", "event_2"]
+        assert [r.event.id for r in window_records] == ["event_2", "event_3"]
         assert [r.event.id for r in builder_records] == ["event_1", "event_2", "event_3"]
         assert [r.event.id for r in read_file_records] == ["event_2"]
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]

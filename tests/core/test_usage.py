@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -10,6 +11,7 @@ from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
+    BudgetWindow,
     CayuApp,
     InMemoryBudgetLedger,
     InMemorySessionStore,
@@ -23,6 +25,7 @@ from cayu.runtime.budgets import (
     InMemoryBudgetStore,
     budget_check_from_events,
     copy_request_budget_limits,
+    events_for_budget_window,
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import (
@@ -43,6 +46,14 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore
+
+
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
 
 
 def test_normalize_openai_usage_metrics() -> None:
@@ -192,10 +203,15 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
         )
 
 
-def _reservation_budget_limit(max_cost: str = "1") -> BudgetLimit:
+def _reservation_budget_limit(
+    max_cost: str = "1",
+    *,
+    window: BudgetWindow | str | None = None,
+) -> BudgetLimit:
     return BudgetLimit(
         scope="app",
         max_estimated_cost=Decimal(max_cost),
+        window=BudgetWindow.all_time() if window is None else window,
         pricing=PricingCatalog(
             prices=(
                 ModelPricing(
@@ -282,6 +298,103 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
     assert released.released_amount == Decimal("0.22")
 
 
+def test_in_memory_budget_ledger_keeps_active_reservations_inside_rolling_window() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock)
+        rolling_limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        all_time_limit = _reservation_budget_limit(max_cost="0.25")
+        rolling_first = await ledger.reserve(
+            limit=rolling_limit,
+            session_id="sess_rolling_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        all_time_first = await ledger.reserve(
+            limit=all_time_limit,
+            session_id="sess_all_time_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
+        rolling_blocked = await ledger.reserve(
+            limit=rolling_limit,
+            session_id="sess_rolling_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        all_time_second = await ledger.reserve(
+            limit=all_time_limit,
+            session_id="sess_all_time_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        return rolling_first, rolling_blocked, all_time_first, all_time_second
+
+    rolling_first, rolling_blocked, all_time_first, all_time_second = asyncio.run(run())
+
+    assert rolling_first.accepted is True
+    assert rolling_blocked.accepted is False
+    assert rolling_blocked.actual == Decimal("0.44")
+    assert all_time_first.accepted is True
+    assert all_time_second.accepted is False
+    assert all_time_second.actual == Decimal("0.44")
+
+
+def test_in_memory_budget_ledger_uses_reconciliation_time_for_rolling_window() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock)
+        limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        first = await ledger.reserve(
+            limit=limit,
+            session_id="sess_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert first.record is not None
+        await ledger.reconcile(
+            reservation_id=first.record.reservation_id,
+            actual_amount=Decimal("0.22"),
+            occurred_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
+        )
+        clock.value = datetime(2026, 1, 1, 12, 2, 30, tzinfo=UTC)
+        blocked = await ledger.reserve(
+            limit=limit,
+            session_id="sess_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        clock.value = datetime(2026, 1, 1, 12, 3, 1, tzinfo=UTC)
+        accepted = await ledger.reserve(
+            limit=limit,
+            session_id="sess_3",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        return blocked, accepted
+
+    blocked, accepted = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+    assert accepted.accepted is True
+    assert accepted.actual == Decimal("0.22")
+
+
 def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None:
     async def run():
         ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
@@ -331,6 +444,153 @@ def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None
     assert blocked.actual == Decimal("0.44")
     assert reconciled.released_amount == Decimal("0.21")
     assert released.status == "released"
+
+
+def test_sqlite_budget_ledger_persists_rolling_window_key(tmp_path) -> None:
+    async def run():
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+        try:
+            rolling_limit = _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.rolling(seconds=60),
+            )
+            all_time_limit = _reservation_budget_limit(max_cost="0.25")
+            first = await ledger.reserve(
+                limit=rolling_limit,
+                session_id="sess_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            blocked = await ledger.reserve(
+                limit=rolling_limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            all_time = await ledger.reserve(
+                limit=all_time_limit,
+                session_id="sess_3",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return first, blocked, all_time
+        finally:
+            await ledger.close()
+
+    first, blocked, all_time = asyncio.run(run())
+
+    assert first.accepted is True
+    assert first.window.storage_key == "rolling:60s"
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+    assert all_time.accepted is True
+    assert all_time.window.storage_key == "all_time"
+
+
+def test_sqlite_budget_ledger_keeps_active_reservations_inside_rolling_window(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite", clock=clock)
+        try:
+            rolling_limit = _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.rolling(seconds=60),
+            )
+            all_time_limit = _reservation_budget_limit(max_cost="0.25")
+            rolling_first = await ledger.reserve(
+                limit=rolling_limit,
+                session_id="sess_rolling_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            all_time_first = await ledger.reserve(
+                limit=all_time_limit,
+                session_id="sess_all_time_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
+            rolling_blocked = await ledger.reserve(
+                limit=rolling_limit,
+                session_id="sess_rolling_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            all_time_second = await ledger.reserve(
+                limit=all_time_limit,
+                session_id="sess_all_time_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return rolling_first, rolling_blocked, all_time_first, all_time_second
+        finally:
+            await ledger.close()
+
+    rolling_first, rolling_blocked, all_time_first, all_time_second = asyncio.run(run())
+
+    assert rolling_first.accepted is True
+    assert rolling_blocked.accepted is False
+    assert rolling_blocked.actual == Decimal("0.44")
+    assert all_time_first.accepted is True
+    assert all_time_second.accepted is False
+    assert all_time_second.actual == Decimal("0.44")
+
+
+def test_sqlite_budget_ledger_uses_reconciliation_time_for_rolling_window(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite", clock=clock)
+        try:
+            limit = _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.rolling(seconds=60),
+            )
+            first = await ledger.reserve(
+                limit=limit,
+                session_id="sess_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.record is not None
+            await ledger.reconcile(
+                reservation_id=first.record.reservation_id,
+                actual_amount=Decimal("0.22"),
+                occurred_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
+            )
+            clock.value = datetime(2026, 1, 1, 12, 2, 30, tzinfo=UTC)
+            blocked = await ledger.reserve(
+                limit=limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            clock.value = datetime(2026, 1, 1, 12, 3, 1, tzinfo=UTC)
+            accepted = await ledger.reserve(
+                limit=limit,
+                session_id="sess_3",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return blocked, accepted
+        finally:
+            await ledger.close()
+
+    blocked, accepted = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+    assert accepted.accepted is True
+    assert accepted.actual == Decimal("0.22")
 
 
 def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path) -> None:
@@ -411,6 +671,84 @@ def test_in_memory_budget_store_filters_app_and_agent_events() -> None:
     assert builder_events[0].agent_name == "builder"
 
 
+def test_in_memory_budget_store_filters_rolling_window_events() -> None:
+    async def run():
+        store = InMemoryBudgetStore()
+        await store.append_event(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_old",
+                agent_name="builder",
+                timestamp=datetime.now(UTC) - timedelta(seconds=120),
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            )
+        )
+        await store.append_event(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_recent",
+                agent_name="builder",
+                timestamp=datetime.now(UTC),
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 2,
+                        "output_tokens": 0,
+                        "total_tokens": 2,
+                    }
+                },
+            )
+        )
+
+        all_time_events = await store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+        rolling_events = await store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        return all_time_events, rolling_events
+
+    all_time_events, rolling_events = asyncio.run(run())
+
+    assert [event.session_id for event in all_time_events] == ["sess_old", "sess_recent"]
+    assert [event.session_id for event in rolling_events] == ["sess_recent"]
+
+
+def test_events_for_budget_window_uses_caller_supplied_now() -> None:
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    boundary_event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_boundary",
+        timestamp=now - timedelta(seconds=60),
+    )
+    old_event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_old",
+        timestamp=now - timedelta(seconds=61),
+    )
+
+    filtered = events_for_budget_window(
+        [old_event, boundary_event],
+        BudgetWindow.rolling(seconds=60),
+        now=now,
+    )
+
+    assert [event.session_id for event in filtered] == ["sess_boundary"]
+
+
 def test_session_budget_store_reads_model_events_from_session_store() -> None:
     async def run():
         session_store = InMemorySessionStore()
@@ -438,6 +776,7 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
                 type=EventType.MODEL_COMPLETED,
                 session_id="sess_builder",
                 agent_name="builder",
+                timestamp=datetime.now(UTC) - timedelta(seconds=120),
                 payload={
                     "usage_metrics": {
                         "provider_name": "fake",
@@ -455,6 +794,7 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
                 type=EventType.MODEL_COMPLETED,
                 session_id="sess_other_job",
                 agent_name="builder",
+                timestamp=datetime.now(UTC),
                 payload={
                     "usage_metrics": {
                         "provider_name": "fake",
@@ -477,14 +817,20 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
             key="job_shared",
             window="all_time",
         )
-        return agent_events, causal_events
+        rolling_events = await budget_store.load_events_for_budget(
+            scope="agent",
+            key="builder",
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        return agent_events, causal_events, rolling_events
 
-    agent_events, causal_events = asyncio.run(run())
+    agent_events, causal_events, rolling_events = asyncio.run(run())
 
     assert len(agent_events) == 2
     assert len(causal_events) == 1
     assert causal_events[0].type == EventType.MODEL_COMPLETED
     assert causal_events[0].session_id == "sess_builder"
+    assert [event.session_id for event in rolling_events] == ["sess_other_job"]
 
 
 def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> None:

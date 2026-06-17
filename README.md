@@ -579,13 +579,21 @@ records skipped tool results before interrupting so the provider-neutral
 transcript remains valid for resume.
 
 For app-level spend control across sessions, configure a `BudgetPolicy` on
-`CayuApp`. The first built-in budget window is `all_time`, with app-wide,
-agent-scoped, and causal estimated-cost limits:
+`CayuApp`. Budget windows default to all-time accounting, and can also use
+rolling duration windows for app-wide, agent-scoped, and causal estimated-cost
+limits:
 
 ```python
 from decimal import Decimal
 
-from cayu import BudgetLimit, BudgetPolicy, BudgetReservation, CayuApp, SQLiteBudgetLedger
+from cayu import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    BudgetWindow,
+    CayuApp,
+    SQLiteBudgetLedger,
+)
 
 app = CayuApp(
     budget_policy=BudgetPolicy(
@@ -599,6 +607,7 @@ app = CayuApp(
                 scope="agent",
                 key="assistant",
                 max_estimated_cost=Decimal("5.00"),
+                window=BudgetWindow.rolling(seconds=3600),
                 pricing=pricing,
             ),
             BudgetLimit(
@@ -613,7 +622,9 @@ app = CayuApp(
 ```
 
 App budgets use the same caller-supplied pricing catalog as request
-`BudgetLimit` entries.
+`BudgetLimit` entries. Rolling windows are UTC timestamp duration windows over
+durable model events, for example "the last hour." They are not calendar-day or
+calendar-month reset windows.
 Before each model step and after each completed model step, Cayu evaluates the
 matching budget limits, verifies that the current provider/model has pricing
 unless `allow_unpriced=True`, emits `budget.checked`, and stops with
@@ -630,10 +641,11 @@ policy, raises the limit, fixes missing pricing, or intentionally allows
 unpriced usage.
 
 `CayuApp` uses `SessionBudgetStore` by default, so budget accounting reads from
-the same event store already configured for sessions. With `SQLiteSessionStore`,
-budget accounting survives process restarts and multiple workers that share the
-same database. Enforcement is cooperative: Cayu checks before model calls and
-again after model completions.
+the same event store already configured for sessions, including timestamp
+filters for rolling windows. With `SQLiteSessionStore`, budget accounting
+survives process restarts and multiple workers that share the same database.
+Enforcement is cooperative: Cayu checks before model calls and again after model
+completions.
 
 For strict concurrent hard caps, add a conservative per-step reservation and a
 shared ledger. Cayu reserves the configured worst-case step cost before the
@@ -664,6 +676,9 @@ app = CayuApp(
 Reservation amounts are application-provided upper bounds, not provider
 guarantees. Set them high enough for the model step you are willing to fund.
 Reservation limits require matching pricing and cannot use `allow_unpriced=True`.
+With rolling budget windows, unresolved active reservations continue to consume
+capacity until they are reconciled or released; reconciled spend ages out by the
+reconciliation/model-completion timestamp.
 `SQLiteBudgetLedger` is the built-in shared ledger for multi-worker apps.
 `InMemoryBudgetLedger` is the default and is suitable for tests, examples, and
 single-process apps only. `InMemoryBudgetStore` is also available for custom

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from cayu.runtime.budgets import (
     BudgetReservationRecord,
     BudgetReservationResult,
     _budget_reservation_amount,
+    _clock_or_utc_now,
     _reconciled_record,
     _reconciliation_from_record,
     _reservation_result,
@@ -26,7 +28,7 @@ from . import _sqlite_support as sqlite_support
 class SQLiteBudgetLedger(BudgetLedger):
     """SQLite-backed atomic budget reservation ledger."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, clock: Callable[[], datetime] | None = None) -> None:
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
@@ -36,6 +38,7 @@ class SQLiteBudgetLedger(BudgetLedger):
 
         self.path = db_path
         self._lock = asyncio.Lock()
+        self._clock = _clock_or_utc_now(clock)
         self._connection = sqlite_support.connect(db_path)
         self._connection.row_factory = sqlite3.Row
         sqlite_support.initialize_schema(self._connection)
@@ -65,7 +68,8 @@ class SQLiteBudgetLedger(BudgetLedger):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                current = self._used_amount_unlocked(limit)
+                now = self._clock()
+                current = self._used_amount_unlocked(limit, now=now)
                 projected = current + requested
                 if projected > limit.max_estimated_cost:
                     self._connection.rollback()
@@ -90,6 +94,8 @@ class SQLiteBudgetLedger(BudgetLedger):
                     provider_name=provider_name,
                     model=model,
                     reserved_amount=requested,
+                    created_at=now,
+                    updated_at=now,
                 )
                 self._insert_record_unlocked(record)
                 self._connection.commit()
@@ -114,9 +120,15 @@ class SQLiteBudgetLedger(BudgetLedger):
         reservation_id: str,
         actual_amount: Decimal,
         reason: str | None = None,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
+        reconciled_at = (
+            sqlite_support.parse_datetime(sqlite_support.format_datetime(occurred_at))
+            if occurred_at is not None
+            else self._clock()
+        )
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -125,6 +137,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     record,
                     actual_amount=actual_amount,
                     reason=reason,
+                    updated_at=reconciled_at,
                 )
                 self._update_record_unlocked(reconciled)
                 self._connection.commit()
@@ -141,6 +154,7 @@ class SQLiteBudgetLedger(BudgetLedger):
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         reason = require_clean_nonblank(reason, "reason")
+        released_at = self._clock()
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -149,6 +163,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     update={
                         "status": "released",
                         "reason": reason,
+                        "updated_at": released_at,
                     },
                     deep=True,
                 )
@@ -193,7 +208,9 @@ class SQLiteBudgetLedger(BudgetLedger):
                 """
             )
 
-    def _used_amount_unlocked(self, limit: BudgetLimit) -> Decimal:
+    def _used_amount_unlocked(self, limit: BudgetLimit, *, now: datetime) -> Decimal:
+        since = limit.window.since(now=now)
+        cutoff = None if since is None else sqlite_support.format_datetime(since)
         rows = self._connection.execute(
             """
             SELECT reserved_amount, actual_amount, status
@@ -203,12 +220,19 @@ class SQLiteBudgetLedger(BudgetLedger):
               AND window = ?
               AND currency = ?
               AND status IN ('active', 'reconciled')
+              AND (
+                    ? IS NULL
+                    OR status = 'active'
+                    OR updated_at >= ?
+                  )
             """,
             (
                 limit.scope,
                 limit.key,
-                limit.window,
+                limit.window.storage_key,
                 limit.currency.upper(),
+                cutoff,
+                cutoff,
             ),
         ).fetchall()
         total = Decimal("0")
@@ -220,7 +244,8 @@ class SQLiteBudgetLedger(BudgetLedger):
         return total
 
     def _insert_record_unlocked(self, record: BudgetReservationRecord) -> None:
-        now = sqlite_support.format_datetime(datetime.now(UTC))
+        now = sqlite_support.format_datetime(record.created_at)
+        updated_at = sqlite_support.format_datetime(record.updated_at)
         self._connection.execute(
             """
             INSERT INTO budget_reservations (
@@ -246,7 +271,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 record.reservation_id,
                 record.scope,
                 record.key,
-                record.window,
+                record.window.storage_key,
                 record.currency,
                 record.session_id,
                 record.agent_name,
@@ -257,12 +282,12 @@ class SQLiteBudgetLedger(BudgetLedger):
                 record.status,
                 record.reason,
                 now,
-                now,
+                updated_at,
             ),
         )
 
     def _update_record_unlocked(self, record: BudgetReservationRecord) -> None:
-        updated_at = sqlite_support.format_datetime(datetime.now(UTC))
+        updated_at = sqlite_support.format_datetime(record.updated_at)
         cursor = self._connection.execute(
             """
             UPDATE budget_reservations
@@ -288,7 +313,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             """
             SELECT reservation_id, scope, budget_key, window, currency, session_id,
                    agent_name, provider_name, model, reserved_amount, actual_amount,
-                   status, reason
+                   status, reason, created_at, updated_at
             FROM budget_reservations
             WHERE reservation_id = ?
             """,
@@ -310,6 +335,8 @@ class SQLiteBudgetLedger(BudgetLedger):
             actual_amount=(None if row["actual_amount"] is None else Decimal(row["actual_amount"])),
             status=row["status"],
             reason=row["reason"],
+            created_at=sqlite_support.parse_datetime(row["created_at"]),
+            updated_at=sqlite_support.parse_datetime(row["updated_at"]),
         )
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")

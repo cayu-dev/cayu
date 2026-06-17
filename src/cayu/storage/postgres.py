@@ -659,6 +659,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if query.causal_budget_id is not None:
             clauses.append("cayu_sessions.causal_budget_id = %s")
             params.append(query.causal_budget_id)
+        if query.since is not None:
+            clauses.append("cayu_events.timestamp >= %s")
+            params.append(pg_support.to_utc(query.since))
+        if query.until is not None:
+            clauses.append("cayu_events.timestamp < %s")
+            params.append(pg_support.to_utc(query.until))
         if query.event_type is not None:
             clauses.append("cayu_events.event_type = %s")
             params.append(str(query.event_type))

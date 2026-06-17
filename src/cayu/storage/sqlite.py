@@ -576,6 +576,12 @@ class SQLiteSessionStore(SessionStore):
         if query.causal_budget_id is not None:
             clauses.append("cayu_sessions.causal_budget_id = ?")
             params.append(query.causal_budget_id)
+        if query.since is not None:
+            clauses.append("cayu_events.timestamp >= ?")
+            params.append(sqlite_support.format_datetime(query.since))
+        if query.until is not None:
+            clauses.append("cayu_events.timestamp < ?")
+            params.append(sqlite_support.format_datetime(query.until))
         if query.event_type is not None:
             clauses.append("cayu_events.event_type = ?")
             params.append(str(query.event_type))

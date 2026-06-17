@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
@@ -22,9 +23,49 @@ from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
-BudgetWindow = Literal["all_time"]
+BudgetWindowKind = Literal["all_time", "rolling"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
+_ALL_TIME_WINDOW = "all_time"
+_ROLLING_PREFIX = "rolling:"
+_ROLLING_SUFFIX = "s"
+
+
+class BudgetWindow(BaseModel):
+    """Time window used when selecting events for budget accounting."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: BudgetWindowKind = "all_time"
+    duration_seconds: StrictInt | None = Field(default=None, ge=1)
+
+    @classmethod
+    def all_time(cls) -> BudgetWindow:
+        return cls(kind="all_time")
+
+    @classmethod
+    def rolling(cls, *, seconds: int) -> BudgetWindow:
+        return cls(kind="rolling", duration_seconds=seconds)
+
+    @model_validator(mode="after")
+    def validate_duration(self) -> BudgetWindow:
+        if self.kind == "all_time" and self.duration_seconds is not None:
+            raise ValueError("All-time budget windows must not set duration_seconds.")
+        if self.kind == "rolling" and self.duration_seconds is None:
+            raise ValueError("Rolling budget windows require duration_seconds.")
+        return self
+
+    @property
+    def storage_key(self) -> str:
+        if self.kind == "all_time":
+            return "all_time"
+        return f"rolling:{self.duration_seconds}s"
+
+    def since(self, now: datetime | None = None) -> datetime | None:
+        if self.kind == "all_time":
+            return None
+        reference = datetime.now(UTC) if now is None else _utc_datetime(now, "now")
+        return reference - timedelta(seconds=self.duration_seconds or 0)
 
 
 class BudgetReservation(BaseModel):
@@ -59,7 +100,7 @@ class BudgetLimit(BaseModel):
     max_estimated_cost: Decimal = Field(gt=0)
     pricing: PricingCatalog
     currency: str = "USD"
-    window: BudgetWindow = "all_time"
+    window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     key: str | None = None
     allow_unpriced: StrictBool = False
     reservation: BudgetReservation | None = None
@@ -75,6 +116,11 @@ class BudgetLimit(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("window", mode="before")
+    @classmethod
+    def copy_window(cls, value) -> BudgetWindow:
+        return copy_budget_window(value)
 
     @field_validator("max_estimated_cost")
     @classmethod
@@ -130,7 +176,7 @@ class BudgetPolicy(BaseModel):
                     f"{limit.scope.title()} budget limits are request-scoped, "
                     "not app policy limits."
                 )
-            key = (limit.scope, limit.window, limit.key)
+            key = (limit.scope, limit.window.storage_key, limit.key)
             if key in seen:
                 raise ValueError("Budget policy contains duplicate scope/window/key limits.")
             seen.add(key)
@@ -144,7 +190,7 @@ class BudgetCheck(BaseModel):
 
     scope: BudgetScope
     key: str | None = None
-    window: BudgetWindow = "all_time"
+    window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     currency: str
     maximum: Decimal = Field(gt=0)
     actual: Decimal = Field(ge=0)
@@ -160,6 +206,11 @@ class BudgetCheck(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("window", mode="before")
+    @classmethod
+    def copy_window(cls, value) -> BudgetWindow:
+        return copy_budget_window(value)
 
     @field_validator("currency")
     @classmethod
@@ -182,7 +233,7 @@ class BudgetReservationRecord(BaseModel):
     reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
     scope: BudgetScope
     key: str | None = None
-    window: BudgetWindow = "all_time"
+    window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     currency: str
     session_id: str
     agent_name: str
@@ -192,6 +243,8 @@ class BudgetReservationRecord(BaseModel):
     actual_amount: Decimal | None = Field(default=None, ge=0)
     status: BudgetReservationStatus = "active"
     reason: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @field_validator(
         "reservation_id",
@@ -212,6 +265,11 @@ class BudgetReservationRecord(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("window", mode="before")
+    @classmethod
+    def copy_window(cls, value) -> BudgetWindow:
+        return copy_budget_window(value)
+
     @field_validator("currency")
     @classmethod
     def validate_record_currency(cls, value: str, info) -> str:
@@ -226,6 +284,11 @@ class BudgetReservationRecord(BaseModel):
             raise ValueError(f"{info.field_name} must be finite.")
         return value
 
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def validate_record_timestamp(cls, value: datetime, info) -> datetime:
+        return _utc_datetime(value, info.field_name)
+
 
 class BudgetReservationResult(BaseModel):
     """Result of attempting to reserve budget before a model step."""
@@ -235,7 +298,7 @@ class BudgetReservationResult(BaseModel):
     accepted: StrictBool
     scope: BudgetScope
     key: str | None = None
-    window: BudgetWindow = "all_time"
+    window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     currency: str
     maximum: Decimal = Field(gt=0)
     requested: Decimal = Field(ge=0)
@@ -249,6 +312,11 @@ class BudgetReservationResult(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("window", mode="before")
+    @classmethod
+    def copy_window(cls, value) -> BudgetWindow:
+        return copy_budget_window(value)
 
     @field_validator("currency", "message")
     @classmethod
@@ -338,6 +406,7 @@ class BudgetLedger(ABC):
         reservation_id: str,
         actual_amount: Decimal,
         reason: str | None = None,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         """Replace an active reservation with the actual charged amount."""
 
@@ -370,10 +439,9 @@ class InMemoryBudgetStore(BudgetStore):
         key: str | None,
         window: BudgetWindow,
     ) -> list[Event]:
-        if window != "all_time":
-            raise ValueError(f"Unsupported budget window: {window}")
         async with self._lock:
             events = [copy_event(event) for event in self._events]
+        events = events_for_budget_window(events, window)
         if scope == "app":
             return events
         if scope == "agent":
@@ -410,8 +478,8 @@ class SessionBudgetStore(BudgetStore):
     ) -> list[Event]:
         from cayu.runtime.sessions import EventQuery
 
-        if window != "all_time":
-            raise ValueError(f"Unsupported budget window: {window}")
+        window = copy_budget_window(window)
+        since = window.since()
         agent_name: str | None = None
         causal_budget_id: str | None = None
         if scope == "agent":
@@ -429,6 +497,7 @@ class SessionBudgetStore(BudgetStore):
                     event_type=EventType.MODEL_COMPLETED,
                     causal_budget_id=causal_budget_id,
                     agent_name=agent_name,
+                    since=since,
                     after_sequence=after_sequence,
                     limit=5000,
                 )
@@ -445,9 +514,10 @@ class SessionBudgetStore(BudgetStore):
 class InMemoryBudgetLedger(BudgetLedger):
     """In-memory reservation ledger for single-process apps and tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._records: dict[str, BudgetReservationRecord] = {}
         self._lock = asyncio.Lock()
+        self._clock = _clock_or_utc_now(clock)
 
     async def reserve(
         self,
@@ -463,6 +533,7 @@ class InMemoryBudgetLedger(BudgetLedger):
             provider_name=provider_name,
             model=model,
         )
+        now = self._clock()
         async with self._lock:
             current = _ledger_used_amount(
                 self._records.values(),
@@ -470,6 +541,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                 key=limit.key,
                 window=limit.window,
                 currency=limit.currency,
+                now=now,
             )
             projected = current + request
             if projected > limit.max_estimated_cost:
@@ -493,6 +565,8 @@ class InMemoryBudgetLedger(BudgetLedger):
                 provider_name=provider_name,
                 model=model,
                 reserved_amount=request,
+                created_at=now,
+                updated_at=now,
             )
             self._records[record.reservation_id] = record
             return _reservation_result(
@@ -512,12 +586,19 @@ class InMemoryBudgetLedger(BudgetLedger):
         reservation_id: str,
         actual_amount: Decimal,
         reason: str | None = None,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
+        reconciled_at = _utc_datetime(occurred_at, "occurred_at") if occurred_at else self._clock()
         async with self._lock:
             record = self._active_record(reservation_id)
-            reconciled = _reconciled_record(record, actual_amount=actual_amount, reason=reason)
+            reconciled = _reconciled_record(
+                record,
+                actual_amount=actual_amount,
+                reason=reason,
+                updated_at=reconciled_at,
+            )
             self._records[reservation_id] = reconciled
             return _reconciliation_from_record(reconciled)
 
@@ -529,12 +610,14 @@ class InMemoryBudgetLedger(BudgetLedger):
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         reason = require_clean_nonblank(reason, "reason")
+        released_at = self._clock()
         async with self._lock:
             record = self._active_record(reservation_id)
             released = record.model_copy(
                 update={
                     "status": "released",
                     "reason": reason,
+                    "updated_at": released_at,
                 },
                 deep=True,
             )
@@ -559,6 +642,32 @@ def copy_budget_reservation(reservation: BudgetReservation) -> BudgetReservation
         max_cache_read_input_tokens=reservation.max_cache_read_input_tokens,
         max_cache_write_input_tokens=reservation.max_cache_write_input_tokens,
     )
+
+
+def copy_budget_window(value: BudgetWindow | Mapping[str, Any] | str | None) -> BudgetWindow:
+    if value is None:
+        return BudgetWindow.all_time()
+    if type(value) is BudgetWindow:
+        return value.model_copy(deep=True)
+    if isinstance(value, str):
+        return _budget_window_from_string(value)
+    if isinstance(value, Mapping):
+        return BudgetWindow.model_validate(dict(value))
+    raise TypeError("Budget window must be a BudgetWindow, mapping, string, or None.")
+
+
+def events_for_budget_window(
+    events: Iterable[Event],
+    window: BudgetWindow | Mapping[str, Any] | str | None,
+    *,
+    now: datetime | None = None,
+) -> list[Event]:
+    window = copy_budget_window(window)
+    since = window.since(now=now)
+    copied = [copy_event(event) for event in events]
+    if since is None:
+        return copied
+    return [event for event in copied if _event_in_window(event, since)]
 
 
 def copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
@@ -698,7 +807,8 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
     return {
         "scope": check.scope,
         "key": check.key,
-        "window": check.window,
+        "window": check.window.storage_key,
+        "window_details": check.window.model_dump(mode="json"),
         "currency": check.currency,
         "maximum": str(check.maximum),
         "actual": str(check.actual),
@@ -737,7 +847,7 @@ def _coerce_budget_limit(limit: BudgetLimit | Mapping[str, Any]) -> BudgetLimit:
 
 def _budget_summary_id(limit: BudgetLimit) -> str:
     key = "all" if limit.key is None else limit.key
-    return f"budget:{limit.scope}:{limit.window}:{key}"
+    return f"budget:{limit.scope}:{limit.window.storage_key}:{key}"
 
 
 def _budget_preflight_error(
@@ -764,7 +874,8 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
         "accepted": result.accepted,
         "scope": result.scope,
         "key": result.key,
-        "window": result.window,
+        "window": result.window.storage_key,
+        "window_details": result.window.model_dump(mode="json"),
         "currency": result.currency,
         "maximum": str(result.maximum),
         "requested": str(result.requested),
@@ -856,19 +967,23 @@ def _ledger_used_amount(
     key: str | None,
     window: BudgetWindow,
     currency: str,
+    now: datetime | None = None,
 ) -> Decimal:
     total = Decimal("0")
+    since = window.since(now=now)
     for record in records:
         if (
             record.scope != scope
             or record.key != key
-            or record.window != window
+            or record.window.storage_key != window.storage_key
             or record.currency.upper() != currency.upper()
         ):
             continue
         if record.status == "active":
             total += record.reserved_amount
         elif record.status == "reconciled":
+            if since is not None and record.updated_at < since:
+                continue
             total += record.actual_amount or Decimal("0")
     return total
 
@@ -901,12 +1016,17 @@ def _reconciled_record(
     *,
     actual_amount: Decimal,
     reason: str | None,
+    updated_at: datetime | None = None,
 ) -> BudgetReservationRecord:
+    reconciled_at = (
+        _utc_datetime(updated_at, "updated_at") if updated_at is not None else datetime.now(UTC)
+    )
     return record.model_copy(
         update={
             "actual_amount": actual_amount,
             "status": "reconciled",
             "reason": reason,
+            "updated_at": reconciled_at,
         },
         deep=True,
     )
@@ -935,3 +1055,39 @@ def _validate_amount(value: Decimal, field_name: str) -> Decimal:
     if not value.is_finite() or value < 0:
         raise ValueError(f"{field_name} must be a finite non-negative Decimal.")
     return value
+
+
+def _budget_window_from_string(value: str) -> BudgetWindow:
+    text = require_clean_nonblank(value, "window")
+    if text == _ALL_TIME_WINDOW:
+        return BudgetWindow.all_time()
+    if text.startswith(_ROLLING_PREFIX) and text.endswith(_ROLLING_SUFFIX):
+        raw_seconds = text[len(_ROLLING_PREFIX) : -len(_ROLLING_SUFFIX)]
+        try:
+            seconds = int(raw_seconds)
+        except ValueError as exc:
+            raise ValueError(f"Invalid rolling budget window: {text}") from exc
+        return BudgetWindow.rolling(seconds=seconds)
+    raise ValueError(f"Unsupported budget window: {text}")
+
+
+def _utc_datetime(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware.")
+    return value.astimezone(UTC)
+
+
+def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], datetime]:
+    if clock is None:
+        return lambda: datetime.now(UTC)
+    if not callable(clock):
+        raise TypeError("clock must be callable.")
+
+    def _checked_clock() -> datetime:
+        return _utc_datetime(clock(), "clock()")
+
+    return _checked_clock
+
+
+def _event_in_window(event: Event, since: datetime) -> bool:
+    return _utc_datetime(event.timestamp, "event.timestamp") >= since

@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
@@ -74,6 +75,7 @@ from cayu.runtime.budgets import (
     budget_reservation_payload,
     copy_budget_policy,
     copy_request_budget_limits,
+    events_for_budget_window,
     request_budget_limits_for_session,
 )
 from cayu.runtime.context import (
@@ -2847,6 +2849,7 @@ class CayuApp:
         for budget_limit in budget_limits:
             budget_events = events
             budget_baseline: SessionCostSummary | None = None
+            budget_window_now = datetime.now(UTC)
             if budget_limit.scope in {"app", "agent", "causal"}:
                 budget_events = await self.budget_store.load_events_for_budget(
                     scope=budget_limit.scope,
@@ -2854,14 +2857,29 @@ class CayuApp:
                     window=budget_limit.window,
                 )
             elif budget_limit.scope == "run":
+                budget_events = events_for_budget_window(
+                    events,
+                    budget_limit.window,
+                    now=budget_window_now,
+                )
                 budget_baseline = estimate_session_cost(
                     session_id=session.id,
-                    events=budget_baseline_events or [],
+                    events=events_for_budget_window(
+                        budget_baseline_events or [],
+                        budget_limit.window,
+                        now=budget_window_now,
+                    ),
                     pricing=budget_limit.pricing,
                     currency=budget_limit.currency,
                 )
             elif budget_limit.scope != "session":
                 raise ValueError(f"Unsupported request budget scope: {budget_limit.scope}")
+            else:
+                budget_events = events_for_budget_window(
+                    events,
+                    budget_limit.window,
+                    now=budget_window_now,
+                )
 
             cost_summary = estimate_session_cost(
                 session_id=session.id,
@@ -3009,6 +3027,7 @@ class CayuApp:
                 reservation_id=reservation.record.reservation_id,
                 actual_amount=actual_amount,
                 reason=reason,
+                occurred_at=model_completed_event.timestamp,
             )
             yield await self._emit(
                 Event(

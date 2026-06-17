@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 import pytest
 
@@ -182,6 +183,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
                     session_id="sess_builder",
                     agent_name="builder",
                     environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
                 ),
                 Event(
                     id="event_2",
@@ -190,6 +192,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
                     agent_name="builder",
                     environment_name="local",
                     tool_name="read_file",
+                    timestamp=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
                 ),
                 Event(
                     id="event_3",
@@ -197,6 +200,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
                     session_id="sess_builder",
                     agent_name="builder",
                     environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, 10, tzinfo=UTC),
                     payload={"finish_reason": "stop"},
                 ),
             ],
@@ -209,10 +213,24 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
                 session_id="sess_reviewer",
                 agent_name="reviewer",
                 environment_name="hosted",
+                timestamp=datetime(2026, 1, 1, 12, 15, tzinfo=UTC),
             ),
         )
 
         all_records = await store.query_events(EventQuery(limit=10))
+        since_records = await store.query_events(
+            EventQuery(since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC), limit=10)
+        )
+        until_records = await store.query_events(
+            EventQuery(until=datetime(2026, 1, 1, 12, 10, tzinfo=UTC), limit=10)
+        )
+        window_records = await store.query_events(
+            EventQuery(
+                since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
+                until=datetime(2026, 1, 1, 12, 15, tzinfo=UTC),
+                limit=10,
+            )
+        )
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
@@ -223,6 +241,13 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         event_summary = await store.summarize_events("sess_builder")
 
         assert [record.sequence for record in all_records] == [1, 2, 3, 4]
+        assert [record.event.id for record in since_records] == [
+            "event_2",
+            "event_3",
+            "event_4",
+        ]
+        assert [record.event.id for record in until_records] == ["event_1", "event_2"]
+        assert [record.event.id for record in window_records] == ["event_2", "event_3"]
         assert [record.event.id for record in builder_records] == [
             "event_1",
             "event_2",

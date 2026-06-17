@@ -438,9 +438,13 @@ reservations; strict concurrent reservations are app-policy/ledger behavior.
 
 App-level budgets are configured separately on `CayuApp` through
 `BudgetPolicy`. A policy contains app-wide, agent-scoped, and causal
-`BudgetLimit` entries. In the first budget contract, limits use the `all_time`
-window and are estimated from the same normalized usage and caller-supplied
-`PricingCatalog` used by request-scoped `BudgetLimit` entries.
+`BudgetLimit` entries. Budget windows default to `BudgetWindow.all_time()`.
+`BudgetWindow.rolling(seconds=...)` evaluates only durable model events whose
+UTC event timestamp is inside the trailing window at the time Cayu checks the
+limit. Rolling windows are duration windows, not calendar-day/month windows;
+calendar windows need a separate timezone/reset contract. Budget limits are
+estimated from the same normalized usage and caller-supplied `PricingCatalog`
+used by request-scoped `BudgetLimit` entries.
 
 `scope="app"` applies to all sessions and must not set `key`. `scope="agent"`
 applies when `key` matches the agent name. `scope="causal"` applies when `key`
@@ -460,10 +464,11 @@ again until the app changes policy, raises the limit, fixes missing pricing, or
 opts into unpriced usage with `allow_unpriced=True`.
 
 `SessionBudgetStore` is the default budget store. It reads from the same durable
-event stream already configured for sessions, so `SQLiteSessionStore` can back
-budget accounting across process restarts and multiple workers that share the
-same database. Enforcement is cooperative: Cayu checks before model calls and
-again after model completions.
+event stream already configured for sessions, including timestamp filters for
+rolling windows, so `SQLiteSessionStore` can back budget accounting across
+process restarts and multiple workers that share the same database. Enforcement
+is cooperative: Cayu checks before model calls and again after model
+completions.
 
 Strict concurrent hard caps use `BudgetLimit.reservation` plus a
 `BudgetLedger`. A reservation declares the maximum input, output, cache-read,
@@ -475,6 +480,9 @@ then `budget.limit_reached`, and stop before the provider request. After
 `model.completed`, Cayu reconciles the reservation to actual normalized usage
 and emits `budget.reconciled`. If the model step fails before completion, Cayu
 releases the reservation and emits `budget.reservation_released`.
+With rolling budget windows, unresolved active reservations continue to consume
+capacity until they are reconciled or released; reconciled spend ages out by the
+reconciliation/model-completion timestamp.
 
 `InMemoryBudgetLedger` is the default and is only strict inside one process.
 Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`

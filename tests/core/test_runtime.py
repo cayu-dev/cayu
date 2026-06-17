@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -24,6 +25,7 @@ from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
+    BudgetWindow,
     CayuApp,
     CheckpointCompactionContextPolicy,
     CompactionRequest,
@@ -454,9 +456,11 @@ def fake_budget_limit(
     *,
     scope: Literal["session", "run"] = "session",
     allow_unpriced: bool = False,
+    window: BudgetWindow | str | None = None,
 ) -> BudgetLimit:
     return BudgetLimit(
         max_estimated_cost=Decimal(max_estimated_cost),
+        window=BudgetWindow.all_time() if window is None else window,
         pricing=PricingCatalog(
             prices=(
                 ModelPricing(
@@ -896,6 +900,85 @@ def test_cayu_app_stops_on_estimated_cost_limit_after_final_model_answer():
     session = asyncio.run(store.load("sess_cost_limit"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_request_session_budget_uses_rolling_window():
+    async def run():
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_rolling_request_budget",
+                messages=[Message.text("user", "old")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            "sess_rolling_request_budget",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_rolling_request_budget",
+                timestamp=datetime.now(UTC) - timedelta(seconds=120),
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    }
+                },
+            ),
+        )
+        await store.update_status("sess_rolling_request_budget", SessionStatus.COMPLETED)
+
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("new answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000,
+                        },
+                    }
+                ),
+            ]
+        )
+        app = CayuApp(session_store=store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_rolling_request_budget",
+                messages=[Message.text("user", "continue")],
+                budget_limits=(
+                    fake_budget_limit(
+                        "0.50",
+                        window=BudgetWindow.rolling(seconds=60),
+                    ),
+                ),
+            ),
+        )
+        session = await store.load("sess_rolling_request_budget")
+        return events, session, provider
+
+    events, session, provider = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert len(provider.requests) == 1
 
 
 def test_cayu_app_budget_limit_stops_before_tool_side_effects():
