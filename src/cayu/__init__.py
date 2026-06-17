@@ -63,6 +63,8 @@ from cayu.mcp import (
 from cayu.observability import LoggingEventSink
 from cayu.providers import AnthropicProvider, ModelCompletion, ModelFinishReason, OpenAIProvider
 from cayu.runners import (
+    DEFAULT_DOCKER_CWD,
+    DEFAULT_DOCKER_IMAGE,
     DEFAULT_E2B_CWD,
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     DEFAULT_MICROSANDBOX_CWD,
@@ -72,6 +74,8 @@ from cayu.runners import (
     DEFAULT_SBX_CWD,
     E2B_SANDBOX_ID_MAX_BYTES,
     MICROSANDBOX_NAME_MAX_BYTES,
+    DockerCloseAction,
+    DockerRunner,
     E2BCloseAction,
     E2BRunner,
     ExecCommand,
@@ -241,6 +245,8 @@ from cayu.workspaces import (
 
 __all__ = [
     "DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES",
+    "DEFAULT_DOCKER_CWD",
+    "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_E2B_CWD",
     "DEFAULT_E2B_WORKSPACE_LIST_DEPTH",
     "DEFAULT_E2B_WORKSPACE_LIST_LIMIT",
@@ -313,6 +319,8 @@ __all__ = [
     "DispatchRuntime",
     "DispatchStatus",
     "Dispatcher",
+    "DockerCloseAction",
+    "DockerRunner",
     "E2BCloseAction",
     "E2BRunner",
     "E2BWorkspace",

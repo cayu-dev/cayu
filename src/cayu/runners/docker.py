@@ -4,7 +4,6 @@ import asyncio
 import posixpath
 import shlex
 import shutil
-import tempfile
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -27,19 +26,19 @@ from cayu.runners.base import (
     RunnerCancelledError,
 )
 
-DEFAULT_SBX_AGENT = "shell"
-DEFAULT_SBX_CWD = "/workspace"
-SBX_COMMAND_STATE_DIR = "/tmp/cayu-sbx-commands"
+DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
+DEFAULT_DOCKER_CWD = "/workspace"
+DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
 
-SbxCloseAction = Literal["remove", "stop", "none"]
+DockerCloseAction = Literal["remove", "stop", "none"]
 
 
-def _require_sbx(sbx_path: str | None) -> str:
-    candidate = sbx_path or shutil.which("sbx")
+def _require_docker(docker_path: str | None) -> str:
+    candidate = docker_path or shutil.which("docker")
     if not candidate:
         raise RuntimeError(
-            "sbx CLI not found. Install Docker Sandboxes "
-            "(https://docs.docker.com/ai/sandboxes/) or pass sbx_path=."
+            "docker CLI not found. Install Docker "
+            "(https://docs.docker.com/get-docker/) or pass docker_path=."
         )
     return candidate
 
@@ -53,8 +52,14 @@ def _validate_close_action(action: str) -> str:
 def _validate_guest_cwd(cwd: str) -> str:
     value = require_clean_nonblank(cwd, "default_cwd")
     if not posixpath.isabs(value):
-        raise ValueError("SbxRunner default_cwd must be an absolute guest path.")
+        raise ValueError("DockerRunner default_cwd must be an absolute guest path.")
     return posixpath.normpath(value)
+
+
+def _validate_runtime(runtime: str | None) -> str | None:
+    if runtime is None:
+        return None
+    return require_clean_nonblank(runtime, "runtime")
 
 
 def _is_same_or_child(path: str, root: str) -> bool:
@@ -63,8 +68,8 @@ def _is_same_or_child(path: str, root: str) -> bool:
     return path == root or path.startswith(f"{root.rstrip('/')}/")
 
 
-def _build_sbx_exec_argv(
-    sbx_path: str,
+def _build_docker_exec_argv(
+    docker_path: str,
     name: str,
     command: ExecCommand,
     *,
@@ -73,7 +78,7 @@ def _build_sbx_exec_argv(
     has_stdin: bool,
     pid_file: str,
 ) -> list[str]:
-    argv: list[str] = [sbx_path, "exec"]
+    argv: list[str] = [docker_path, "exec"]
     if has_stdin:
         argv.append("-i")
     argv += ["-w", cwd]
@@ -93,9 +98,11 @@ def _build_sbx_exec_argv(
     return argv
 
 
-async def _run_sbx(sbx_path: str, args: list[str], *, timeout_s: int | None = None) -> ExecResult:
+async def _run_docker(
+    docker_path: str, args: list[str], *, timeout_s: int | None = None
+) -> ExecResult:
     return await run_subprocess(
-        SubprocessCommand(argv=[sbx_path, *args]),
+        SubprocessCommand(argv=[docker_path, *args]),
         env=copy_runner_env(None, inherit_env=True),
         timeout_s=timeout_s,
     )
@@ -122,10 +129,11 @@ def _supervised_command_body(
     process_group: bool,
 ) -> str:
     quoted_pid_file = shlex.quote(pid_file)
+    quoted_command_script = shlex.quote(command_script)
     process_group_flag = "1" if process_group else "0"
     return (
         f'printf \'%s %s\\n\' "$$" "{process_group_flag}" > {quoted_pid_file} || exit 1; '
-        f"sh -c {shlex.quote(command_script)}; "
+        f"sh -c {quoted_command_script}; "
         "status=$?; "
         f"rm -f {quoted_pid_file}; "
         'exit "$status"'
@@ -142,71 +150,68 @@ def _kill_supervised_command_script(pid_file: str) -> str:
         f"if ! test -f {quoted_pid_file}; then exit 1; fi; "
         f"read pid process_group < {quoted_pid_file} 2>/dev/null || exit 1; "
         "case \"$pid\" in ''|*[!0-9]*) exit 1 ;; esac; "
-        'case "$process_group" in 1) '
+        'if test "$process_group" = 1; then '
         'kill -TERM "-$pid" 2>/dev/null || kill -TERM -- "-$pid" 2>/dev/null || '
-        'kill -TERM "$pid" 2>/dev/null || true ;; '
-        '*) kill -TERM "$pid" 2>/dev/null || true ;; '
-        "esac; "
+        'kill -TERM "$pid" 2>/dev/null || true; '
         "sleep 0.2; "
-        'case "$process_group" in 1) '
         'kill -KILL "-$pid" 2>/dev/null || kill -KILL -- "-$pid" 2>/dev/null || '
-        'kill -KILL "$pid" 2>/dev/null || true ;; '
-        '*) kill -KILL "$pid" 2>/dev/null || true ;; '
-        "esac; "
+        'kill -KILL "$pid" 2>/dev/null || true; '
+        "else "
+        'kill -TERM "$pid" 2>/dev/null || true; '
+        "sleep 0.2; "
+        'kill -KILL "$pid" 2>/dev/null || true; '
+        "fi; "
         f"rm -f {quoted_pid_file}; "
         "exit 0"
     )
 
 
-class _SbxCommandHandle:
-    def __init__(self, *, sbx_path: str, name: str, pid_file: str) -> None:
-        self.sbx_path = sbx_path
+class _DockerCommandHandle:
+    def __init__(self, *, docker_path: str, name: str, pid_file: str) -> None:
+        self.docker_path = docker_path
         self.name = name
         self.pid_file = pid_file
 
     async def kill(self) -> bool:
-        result = await _run_sbx(
-            self.sbx_path,
+        result = await _run_docker(
+            self.docker_path,
             ["exec", self.name, "sh", "-c", _kill_supervised_command_script(self.pid_file)],
         )
         return result.exit_code == 0
 
 
-class SbxRunner(Runner):
-    """Executes commands inside a Docker Sandbox (sbx) microVM.
+class DockerRunner(Runner):
+    """Executes commands inside a plain Docker container via the ``docker`` CLI.
 
-    Requires the ``sbx`` CLI (https://docs.docker.com/ai/sandboxes/). The runner
-    does not inherit the trusted host environment into the sandbox; pass explicit
-    ``env`` per call. File I/O is expected via RunnerWorkspace (exec-based), so the
-    sandbox guest needs python3.
+    Isolation is a parameter: pass ``runtime="runsc"`` (gVisor) or ``"kata"``
+    (microVM) to ``create`` for a hardened boundary; the default (``runc``) is a
+    convenience tier, **not** a security boundary. The host ``docker`` process
+    inherits the host environment (the CLI needs it); the containerized command
+    receives only the explicit per-call ``env`` via ``-e``.
     """
 
-    isolation = "sbx"
+    isolation = "docker"
 
     def __init__(
         self,
         name: str,
         *,
-        mount_path: str,
-        default_cwd: str = DEFAULT_SBX_CWD,
-        close_action: SbxCloseAction = "none",
-        sbx_path: str | None = None,
-        owns_mount: bool = False,
+        default_cwd: str = DEFAULT_DOCKER_CWD,
+        close_action: DockerCloseAction = "none",
+        docker_path: str | None = None,
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
-        self.mount_path = require_clean_nonblank(mount_path, "mount_path")
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
-        self.sbx_path = _require_sbx(sbx_path)
+        self.docker_path = _require_docker(docker_path)
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
-        self._owns_mount = owns_mount
         self._closed = False
         self._exec_closed = False
         self._exec_closed_reason: str | None = None
@@ -216,76 +221,87 @@ class SbxRunner(Runner):
         cls,
         name: str,
         *,
-        default_cwd: str = DEFAULT_SBX_CWD,
-        close_action: SbxCloseAction = "remove",
-        setup_commands: tuple[str, ...] = (),
-        sbx_path: str | None = None,
-        replace: bool = True,
+        image: str = DEFAULT_DOCKER_IMAGE,
+        runtime: str | None = None,
         mount_path: str | None = None,
+        default_cwd: str | None = None,
+        close_action: DockerCloseAction = "remove",
+        setup_commands: tuple[str, ...] = (),
+        docker_path: str | None = None,
+        replace: bool = True,
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
-    ) -> SbxRunner:
-        """Create a sandbox via the sbx CLI and return a runner bound to it.
+    ) -> DockerRunner:
+        """Start a long-lived container and return a runner bound to it.
 
-        A throwaway host dir is mounted only to satisfy `sbx create`; the agent's
-        workspace is the isolated in-sandbox `default_cwd`. `setup_commands` run as
-        root (e.g. to install whois + python3).
+        With ``mount_path`` the host dir is bind-mounted at the same absolute path
+        (convenience; pair with ``LocalWorkspace``). Without it, an in-container
+        ``default_cwd`` is created (hardened; pair with ``RunnerWorkspace``, which
+        needs python3 — install it via ``setup_commands``). ``runtime`` is passed
+        to ``docker run --runtime`` (e.g. ``runsc``/``kata``). ``setup_commands``
+        run as root.
         """
-        sbx = _require_sbx(sbx_path)
+        docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
-        default_cwd = _validate_guest_cwd(default_cwd)
+        image = require_clean_nonblank(image, "image")
+        runtime = _validate_runtime(runtime)
         _validate_close_action(close_action)
         cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
-        owns_mount = mount_path is None
-        if owns_mount:
-            mount_path = tempfile.mkdtemp(prefix="cayu-sbx-")
+        if default_cwd is None:
+            default_cwd = mount_path if mount_path is not None else DEFAULT_DOCKER_CWD
+        default_cwd = _validate_guest_cwd(default_cwd)
         try:
             if replace:
-                await _run_sbx(sbx, ["rm", "--force", name])
-            created = await _run_sbx(sbx, ["create", "--name", name, DEFAULT_SBX_AGENT, mount_path])
-            if created.exit_code != 0:
+                await _run_docker(docker, ["rm", "-f", name])
+            run_argv = ["run", "-d"]
+            if runtime:
+                run_argv += ["--runtime", runtime]
+            run_argv += ["--name", name]
+            if mount_path is not None:
+                run_argv += ["--mount", f"type=bind,source={mount_path},target={mount_path}"]
+            run_argv += [image, "sleep", "infinity"]
+            started = await _run_docker(docker, run_argv)
+            if started.exit_code != 0:
                 raise RuntimeError(
-                    f"sbx create failed (exit {created.exit_code}): {created.stderr[:300]}"
+                    f"docker run failed (exit {started.exit_code}): {started.stderr[:300]}"
                 )
-            # Create the in-sandbox workspace root and make it writable by the
-            # sandbox's default (non-root) exec user — mkdir runs as root.
-            made = await _run_sbx(
-                sbx,
-                [
-                    "exec",
-                    "-u",
-                    "root",
-                    name,
-                    "sh",
-                    "-c",
-                    f"mkdir -p {shlex.quote(default_cwd)} && chmod 0777 {shlex.quote(default_cwd)}",
-                ],
-            )
-            if made.exit_code != 0:
-                raise RuntimeError(f"sbx workspace mkdir failed: {made.stderr[:300]}")
+            # Isolated mode: create the in-container workspace root (runs as root;
+            # plain docker's default exec user is root, so no chmod needed). Bind
+            # mode reuses the existing host dir, so skip (and never chmod the host).
+            if mount_path is None:
+                made = await _run_docker(
+                    docker,
+                    [
+                        "exec",
+                        "-u",
+                        "root",
+                        name,
+                        "sh",
+                        "-c",
+                        f"mkdir -p {shlex.quote(default_cwd)}",
+                    ],
+                )
+                if made.exit_code != 0:
+                    raise RuntimeError(f"docker workspace mkdir failed: {made.stderr[:300]}")
             for cmd in setup_commands:
-                res = await _run_sbx(
-                    sbx, ["exec", "-u", "root", name, "sh", "-c", cmd], timeout_s=300
+                res = await _run_docker(
+                    docker, ["exec", "-u", "root", name, "sh", "-c", cmd], timeout_s=300
                 )
                 if res.exit_code != 0:
-                    raise RuntimeError(f"sbx setup command failed: {cmd!r}: {res.stderr[:300]}")
+                    raise RuntimeError(f"docker setup command failed: {cmd!r}: {res.stderr[:300]}")
         except BaseException:
-            await _run_sbx(sbx, ["rm", "--force", name])
-            if owns_mount:
-                shutil.rmtree(mount_path, ignore_errors=True)
+            await _run_docker(docker, ["rm", "-f", name])
             raise
         return cls(
             name,
-            mount_path=mount_path,
             default_cwd=default_cwd,
             close_action=close_action,
-            sbx_path=sbx,
-            owns_mount=owns_mount,
+            docker_path=docker,
             cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
@@ -302,18 +318,22 @@ class SbxRunner(Runner):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         if type(command) is not ExecCommand:
-            raise TypeError("SbxRunner command must be an ExecCommand.")
+            raise TypeError("DockerRunner command must be an ExecCommand.")
         if self._closed:
-            raise RuntimeError("SbxRunner is closed.")
+            raise RuntimeError("DockerRunner is closed.")
         if self._exec_closed:
             reason = self._exec_closed_reason or "runner exec path is closed"
-            raise RuntimeError(f"SbxRunner is closed: {reason}")
+            raise RuntimeError(f"DockerRunner is closed: {reason}")
         environment = copy_runner_env(env, inherit_env=False)
         command_id = uuid4().hex
-        pid_file = f"{SBX_COMMAND_STATE_DIR}/{command_id}.pid"
-        handle = _SbxCommandHandle(sbx_path=self.sbx_path, name=self.name, pid_file=pid_file)
-        argv = _build_sbx_exec_argv(
-            self.sbx_path,
+        pid_file = f"{DOCKER_COMMAND_STATE_DIR}/{command_id}.pid"
+        handle = _DockerCommandHandle(
+            docker_path=self.docker_path,
+            name=self.name,
+            pid_file=pid_file,
+        )
+        argv = _build_docker_exec_argv(
+            self.docker_path,
             self.name,
             command,
             cwd=self.resolve_cwd(cwd),
@@ -321,8 +341,8 @@ class SbxRunner(Runner):
             has_stdin=stdin is not None,
             pid_file=pid_file,
         )
-        # The host sbx process inherits the host env (the CLI needs PATH/HOME/
-        # docker config); the sandbox command's env is passed via -e only.
+        # The host docker process inherits the host env (the CLI needs PATH/HOME/
+        # DOCKER_HOST/docker config); the container command's env is via -e only.
         host_env = copy_runner_env(None, inherit_env=True)
         try:
             result = await run_subprocess(
@@ -336,7 +356,7 @@ class SbxRunner(Runner):
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self,
                 handle=handle,
-                adapter="sbx",
+                adapter="docker",
                 timeout_s=self.cancel_timeout_s,
                 policy=self.cancellation_cleanup,
             )
@@ -346,7 +366,7 @@ class SbxRunner(Runner):
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self,
                 handle=handle,
-                adapter="sbx",
+                adapter="docker",
                 timeout_s=self.cancel_timeout_s,
                 policy=self.timeout_cleanup,
             )
@@ -358,37 +378,33 @@ class SbxRunner(Runner):
         if self._closed:
             return
         if self.close_action == "remove":
-            await self._remove_sandbox()
-            if self._owns_mount:
-                shutil.rmtree(self.mount_path, ignore_errors=True)
+            await self._remove_container()
         elif self.close_action == "stop":
-            await self._stop_sandbox()
+            await self._stop_container()
         self._closed = True
 
     async def kill(self) -> bool:
-        """Remove the sbx sandbox for shared runner cleanup diagnostics."""
+        """Remove the Docker container for shared runner cleanup diagnostics."""
 
         if self._closed:
             return True
-        await self._remove_sandbox()
-        if self._owns_mount:
-            shutil.rmtree(self.mount_path, ignore_errors=True)
+        await self._remove_container()
         self._closed = True
         return True
 
-    async def _remove_sandbox(self) -> None:
-        result = await _run_sbx(self.sbx_path, ["rm", "--force", self.name])
+    async def _remove_container(self) -> None:
+        result = await _run_docker(self.docker_path, ["rm", "-f", self.name])
         if result.exit_code != 0:
             raise RuntimeError(
-                f"sbx rm failed for sandbox '{self.name}' "
+                f"docker rm failed for container '{self.name}' "
                 f"(exit {result.exit_code}): {result.stderr[:300]}"
             )
 
-    async def _stop_sandbox(self) -> None:
-        result = await _run_sbx(self.sbx_path, ["stop", self.name])
+    async def _stop_container(self) -> None:
+        result = await _run_docker(self.docker_path, ["stop", self.name])
         if result.exit_code != 0:
             raise RuntimeError(
-                f"sbx stop failed for sandbox '{self.name}' "
+                f"docker stop failed for container '{self.name}' "
                 f"(exit {result.exit_code}): {result.stderr[:300]}"
             )
 
@@ -401,7 +417,7 @@ class SbxRunner(Runner):
         if artifact.get("action") == "kill_command" and artifact.get("status") != "completed":
             self._exec_closed = True
             self._exec_closed_reason = (
-                "sbx command cleanup did not complete; command state is unknown"
+                "docker command cleanup did not complete; command state is unknown"
             )
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
@@ -415,7 +431,7 @@ class SbxRunner(Runner):
             raise ValueError("Runner cwd escapes the runner root.")
         return resolved
 
-    async def __aenter__(self) -> SbxRunner:
+    async def __aenter__(self) -> DockerRunner:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:

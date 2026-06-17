@@ -12,6 +12,12 @@ from cayu.runners.base import (
     Runner,
     RunnerCancelledError,
 )
+from cayu.runners.docker import (
+    DEFAULT_DOCKER_CWD,
+    DEFAULT_DOCKER_IMAGE,
+    DockerCloseAction,
+    DockerRunner,
+)
 from cayu.runners.e2b import (
     DEFAULT_E2B_CWD,
     E2B_SANDBOX_ID_MAX_BYTES,
@@ -33,6 +39,8 @@ from cayu.runners.sbx import (
 )
 
 __all__ = [
+    "DEFAULT_DOCKER_CWD",
+    "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_E2B_CWD",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
     "DEFAULT_MICROSANDBOX_CWD",
@@ -42,6 +50,8 @@ __all__ = [
     "DEFAULT_SBX_CWD",
     "E2B_SANDBOX_ID_MAX_BYTES",
     "MICROSANDBOX_NAME_MAX_BYTES",
+    "DockerCloseAction",
+    "DockerRunner",
     "E2BCloseAction",
     "E2BRunner",
     "ExecCommand",

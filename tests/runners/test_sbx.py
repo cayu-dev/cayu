@@ -57,7 +57,9 @@ def test_build_exec_argv_process():
     assert argv[6] == "-c"
     assert "setsid" in argv[7]
     assert "/tmp/cayu-sbx-commands/cmd.pid" in argv[7]
-    assert "exec whois x.ai" in argv[7]
+    assert "whois x.ai" in argv[7]
+    assert " & " not in argv[7]
+    assert "> /tmp/cayu-sbx-commands/cmd.pid || exit 1" in argv[7]
 
 
 def test_build_exec_argv_shell_env_stdin():
@@ -84,8 +86,9 @@ def test_build_exec_argv_shell_env_stdin():
     assert argv[9] == "-c"
     assert "setsid" in argv[10]
     assert "/tmp/cayu-sbx-commands/cmd.pid" in argv[10]
-    assert "exec sh -c" in argv[10]
     assert "echo hi" in argv[10]
+    assert " & " not in argv[10]
+    assert "> /tmp/cayu-sbx-commands/cmd.pid || exit 1" in argv[10]
 
 
 def test_exec_forwards_to_run_subprocess(monkeypatch):
@@ -106,10 +109,30 @@ def test_exec_forwards_to_run_subprocess(monkeypatch):
     assert calls["argv"][6] == "-c"
     assert "setsid" in calls["argv"][7]
     assert SBX_COMMAND_STATE_DIR in calls["argv"][7]
-    assert "exec whoami" in calls["argv"][7]
+    assert "whoami" in calls["argv"][7]
+    assert " & " not in calls["argv"][7]
     assert calls["kwargs"]["timeout_s"] == 12
     assert calls["kwargs"]["output_limit_bytes"] == 999
     assert "PATH" in calls["kwargs"]["env"]
+
+
+def test_exec_keeps_stdin_attached_to_supervised_command(monkeypatch):
+    calls = {}
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls["argv"] = command.argv
+        calls["kwargs"] = kwargs
+        return ExecResult(stdout=kwargs["stdin"])
+
+    monkeypatch.setattr("cayu.runners.sbx.run_subprocess", fake_run_subprocess)
+    r = SbxRunner("a1", mount_path="/tmp/m", sbx_path="/usr/bin/sbx")
+
+    result = asyncio.run(r.exec(ExecCommand.process("cat"), stdin="hello", timeout_s=12))
+
+    assert result.stdout == "hello"
+    assert "-i" in calls["argv"]
+    assert " & " not in calls["argv"][-1]
+    assert calls["kwargs"]["stdin"] == "hello"
 
 
 def test_create_issues_expected_sbx_calls(monkeypatch):
