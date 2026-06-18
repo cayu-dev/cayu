@@ -46,6 +46,7 @@ class RunRequest(BaseModel):
     messages: list[Message]
     # Optional caller-provided id for a new session. It must be unique.
     session_id: str | None = None
+    parent_session_id: str | None = None
     # Durable budget/accounting identity shared by related sessions. Defaults to
     # task_id when present, otherwise session_id. Forks inherit the source value.
     causal_budget_id: str | None = None
@@ -95,7 +96,13 @@ class RunRequest(BaseModel):
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("session_id", "causal_budget_id", "task_id", "environment_name")
+    @field_validator(
+        "session_id",
+        "parent_session_id",
+        "causal_budget_id",
+        "task_id",
+        "environment_name",
+    )
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -654,6 +661,13 @@ class InMemorySessionStore(SessionStore):
             session_id = request.session_id or str(uuid4())
             if session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
+            if request.parent_session_id == session_id:
+                raise ValueError("Session cannot be its own parent.")
+            if (
+                request.parent_session_id is not None
+                and request.parent_session_id not in self._sessions
+            ):
+                raise ValueError(f"Parent session not found: {request.parent_session_id}")
 
             now = datetime.now(UTC)
             session = Session(
@@ -661,6 +675,7 @@ class InMemorySessionStore(SessionStore):
                 agent_name=request.agent_name,
                 provider_name=identity.provider_name,
                 model=identity.model,
+                parent_session_id=request.parent_session_id,
                 causal_budget_id=request.causal_budget_id or request.task_id or session_id,
                 runtime_name=identity.runtime_name,
                 runtime_version=identity.runtime_version,
@@ -1253,6 +1268,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         agent_name=request.agent_name,
         messages=[copy_message(message) for message in messages],
         session_id=request.session_id,
+        parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         environment_name=request.environment_name,

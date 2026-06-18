@@ -61,6 +61,7 @@ from cayu.runtime import (
     RuntimeHookContext,
     Session,
     SessionIdentity,
+    SessionQuery,
     SessionStatus,
     StaticToolPolicy,
     StructuredOutputSpec,
@@ -82,6 +83,7 @@ from cayu.runtime import (
 )
 from cayu.runtime.context import validate_context_messages
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.tools import SubagentSpec, SubagentTool
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -2787,6 +2789,569 @@ def test_cayu_app_dispatches_existing_session_inline():
     session = asyncio.run(store.load("sess_dispatch_source"))
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+
+
+def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review only the authentication changes.",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("auth review complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent received review"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    subagent_tool = SubagentTool(
+        app,
+        agents={
+            "reviewer": SubagentSpec(
+                agent_name="reviewer",
+                description="Review delegated work.",
+            )
+        },
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[subagent_tool],
+    )
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_subagent_parent",
+                causal_budget_id="job_subagent",
+                messages=[Message.text("user", "Implement and review auth.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    child_sessions = asyncio.run(
+        store.list_sessions(
+            SessionQuery(
+                parent_session_id="sess_subagent_parent",
+            )
+        )
+    )
+    assert len(child_sessions) == 1
+    child = child_sessions[0]
+    assert child.agent_name == "reviewer"
+    assert child.parent_session_id == "sess_subagent_parent"
+    assert child.causal_budget_id == "job_subagent"
+    assert child.status == SessionStatus.COMPLETED
+    assert child.metadata["subagent"] == {
+        "agent": "reviewer",
+        "agent_name": "reviewer",
+        "context_mode": "task_only",
+        "parent_session_id": "sess_subagent_parent",
+    }
+
+    child_transcript = asyncio.run(store.load_transcript(child.id))
+    assert [message.role for message in child_transcript] == ["user", "assistant"]
+    assert child_transcript[0].content[0].text == "Review only the authentication changes."
+    assert child_transcript[1].content[0].text == "auth review complete"
+
+    parent_transcript = asyncio.run(store.load_transcript("sess_subagent_parent"))
+    assert [message.role for message in parent_transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    tool_result = parent_transcript[2].content[0]
+    assert tool_result.content == "auth review complete"
+    assert tool_result.structured is not None
+    assert tool_result.structured["child_session_id"] == child.id
+    assert tool_result.structured["parent_session_id"] == "sess_subagent_parent"
+    assert tool_result.structured["causal_budget_id"] == "job_subagent"
+
+    assert [request.messages[0].content[0].text for request in provider.requests] == [
+        "Implement and review auth.",
+        "Review only the authentication changes.",
+        "Implement and review auth.",
+    ]
+    assert provider.requests[2].messages[-1].role == "tool"
+
+
+def test_subagent_tool_returns_child_failure_as_tool_error():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.error("review provider unavailable")],
+            [
+                ModelStreamEvent.text_delta("parent recovered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[
+            SubagentTool(
+                app,
+                agents={
+                    "reviewer": SubagentSpec(
+                        agent_name="reviewer",
+                        description="Review delegated work.",
+                    )
+                },
+            )
+        ],
+    )
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_subagent_parent_failure",
+                causal_budget_id="job_subagent_failure",
+                messages=[Message.text("user", "Implement and review auth.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    child_sessions = asyncio.run(
+        store.list_sessions(
+            SessionQuery(
+                parent_session_id="sess_subagent_parent_failure",
+            )
+        )
+    )
+    assert len(child_sessions) == 1
+    assert child_sessions[0].status == SessionStatus.FAILED
+    parent_transcript = asyncio.run(store.load_transcript("sess_subagent_parent_failure"))
+    tool_result = parent_transcript[2].content[0]
+    assert tool_result.is_error is True
+    assert "review provider unavailable" in tool_result.content
+    assert tool_result.structured["child_session_id"] == child_sessions[0].id
+    assert tool_result.structured["status"] == "session.failed"
+    assert provider.requests[2].messages[-1].role == "tool"
+
+
+def test_subagent_tool_caps_child_result_text():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("abcdef"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent received capped result"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[
+            SubagentTool(
+                app,
+                agents={
+                    "reviewer": SubagentSpec(
+                        agent_name="reviewer",
+                        result_max_chars=4,
+                    )
+                },
+            )
+        ],
+    )
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_subagent_capped",
+                messages=[Message.text("user", "Review auth.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    parent_transcript = asyncio.run(store.load_transcript("sess_subagent_capped"))
+    tool_result = parent_transcript[2].content[0]
+    assert tool_result.content == "abcd"
+    assert tool_result.structured["result_truncated"] is True
+    assert tool_result.structured["result_max_chars"] == 4
+
+
+def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
+    class BlockingChildProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            request_index = len(self.requests)
+            if request_index == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if request_index == 2:
+                self.child_model_started.set()
+                await asyncio.Event().wait()
+                return
+            raise AssertionError(f"Unexpected request {request_index}")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = BlockingChildProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            description="Review delegated work.",
+                        )
+                    },
+                )
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_subagent_parent_interrupt",
+                    messages=[Message.text("user", "Implement and review auth.")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_subagent_parent_interrupt",
+                    reason="stop delegated work",
+                )
+            )
+        ]
+        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_parent_interrupt")
+        )
+        child_events = await store.load_events(child_sessions[0].id)
+        return interrupt_events, parent_events, child_sessions, child_events
+
+    interrupt_events, parent_events, child_sessions, child_events = asyncio.run(run())
+
+    assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert parent_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert len(child_sessions) == 1
+    assert child_sessions[0].status == SessionStatus.INTERRUPTED
+    child_interrupted_events = [
+        event for event in child_events if event.type == EventType.SESSION_INTERRUPTED
+    ]
+    assert len(child_interrupted_events) == 1
+    assert child_interrupted_events[0].payload["metadata"] == {"source": "subagent_tool"}
+
+
+def test_subagent_tool_interrupts_child_session_during_startup_window():
+    class DelayedChildStartupStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.child_running = asyncio.Event()
+            self.release_child_startup = asyncio.Event()
+
+        async def transition_status(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+        ) -> Session:
+            session = await super().transition_status(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+            )
+            if (
+                session.parent_session_id == "sess_subagent_parent_startup_interrupt"
+                and to_status == SessionStatus.RUNNING
+            ):
+                self.child_running.set()
+                await self.release_child_startup.wait()
+            return session
+
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform,
+        ) -> Session:
+            session = await super().transition_status_and_checkpoint(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
+            )
+            if (
+                session.parent_session_id == "sess_subagent_parent_startup_interrupt"
+                and to_status == SessionStatus.INTERRUPTING
+            ):
+                self.release_child_startup.set()
+            return session
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("should not finish"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+
+    async def run():
+        store = DelayedChildStartupStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            description="Review delegated work.",
+                        )
+                    },
+                )
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_subagent_parent_startup_interrupt",
+                    messages=[Message.text("user", "Implement and review auth.")],
+                ),
+            )
+        )
+        await asyncio.wait_for(store.child_running.wait(), timeout=1)
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_subagent_parent_startup_interrupt",
+                    reason="stop while child starts",
+                )
+            )
+        ]
+        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_parent_startup_interrupt")
+        )
+        child_events = await store.load_events(child_sessions[0].id)
+        return interrupt_events, parent_events, child_sessions, child_events
+
+    interrupt_events, parent_events, child_sessions, child_events = asyncio.run(run())
+
+    assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert parent_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert len(child_sessions) == 1
+    assert child_sessions[0].status == SessionStatus.INTERRUPTED
+    assert [
+        event.type for event in child_events if event.type == EventType.SESSION_INTERRUPTED
+    ] == [EventType.SESSION_INTERRUPTED]
+
+
+def test_subagent_tool_child_cleanup_failure_does_not_mask_parent_interruption():
+    class BlockingChildProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            request_index = len(self.requests)
+            if request_index == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if request_index == 2:
+                self.child_model_started.set()
+                await asyncio.Event().wait()
+                return
+            raise AssertionError(f"Unexpected request {request_index}")
+
+    class FailingInterruptRuntime:
+        def __init__(self, app: CayuApp) -> None:
+            self.app = app
+
+        def run(self, request: RunRequest) -> AsyncIterator[Event]:
+            return self.app.run(request)
+
+        async def interrupt_session(
+            self,
+            request: InterruptSessionRequest,
+        ) -> AsyncIterator[Event]:
+            raise RuntimeError("child interrupt cleanup unavailable")
+            yield  # pragma: no cover
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = BlockingChildProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        subagent_runtime = FailingInterruptRuntime(app)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    subagent_runtime,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            description="Review delegated work.",
+                        )
+                    },
+                )
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_subagent_parent_cleanup_failure",
+                    messages=[Message.text("user", "Implement and review auth.")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_subagent_parent_cleanup_failure",
+                    reason="stop delegated work",
+                )
+            )
+        ]
+        parent_events = await asyncio.wait_for(parent_task, timeout=1)
+        parent_transcript = await store.load_transcript("sess_subagent_parent_cleanup_failure")
+        parent_session_events = await store.load_events("sess_subagent_parent_cleanup_failure")
+        return interrupt_events, parent_events, parent_transcript, parent_session_events
+
+    interrupt_events, parent_events, parent_transcript, parent_session_events = asyncio.run(run())
+
+    assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert parent_events[-1].type == EventType.SESSION_INTERRUPTED
+    tool_result = parent_transcript[2].content[0]
+    assert tool_result.is_error is True
+    assert tool_result.artifacts == [
+        {
+            "type": "cayu.subagent_cleanup_error.v1",
+            "child_session_id": tool_result.artifacts[0]["child_session_id"],
+            "error": "child interrupt cleanup unavailable",
+            "error_type": "RuntimeError",
+        }
+    ]
+    failed_tool_events = [
+        event for event in parent_session_events if event.type == EventType.TOOL_CALL_FAILED
+    ]
+    assert failed_tool_events
+    assert failed_tool_events[0].payload["result"]["artifacts"] == tool_result.artifacts
 
 
 def test_cayu_app_dispatch_returns_inline_handle():

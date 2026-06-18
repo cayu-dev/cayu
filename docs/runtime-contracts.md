@@ -95,6 +95,24 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 `DispatchRequest` asks a `Dispatcher` to submit work for an existing session and return a `DispatchHandle`. Dispatch is separate from fork: fork decides what state a branch starts from, while dispatch decides how a session run is placed. The default `InlineDispatcher` runs immediately in the current process by resuming the target session through the normal runtime loop, then returns a completed, failed, or interrupted handle based on the terminal session event. It is useful for tests, local execution, and proving orchestration logic, but it is not durable background execution. Production apps can provide another `Dispatcher` that submits work to an external queue or hosted runtime and returns a queued/submitted handle while events are observed through the session store. `CayuApp.dispatch_inline(...)` is the explicit local streaming API for callers that want to consume ordinary `session.resumed`, model, tool, task, interrupt, and terminal session events directly. `DispatchRequest.task_id` optionally links dispatched work to a task; using it with inline execution requires `CayuApp(task_store=...)`.
 
+`SubagentTool` is model-facing delegation over the same session substrate, not a
+separate runtime. The foreground implementation creates a new child `RunRequest`
+with `parent_session_id` set to the calling session and `causal_budget_id`
+inherited from the caller, then runs the configured child agent through the
+normal Cayu loop. The child agent has its own `AgentSpec`, tools, policies,
+model, context policy, and durable events. The parent receives only a bounded
+`ToolResult` containing the child session id, status, and model-facing result;
+`SubagentSpec.result_max_chars` caps the child text copied into the parent
+transcript.
+Consumers that need child progress should observe the event sink or query
+sessions by `parent_session_id`; child events are not rewritten as parent
+events.
+The initial subagent context mode is `task_only`: the child receives the
+delegated task as a user message and does not copy the parent's transcript.
+Transcript-copying remains the job of `ForkSessionRequest`; future subagent
+context modes can compose with fork when a child truly needs inherited
+conversation state.
+
 `RuntimeHook` provides lifecycle automation around durable runtime boundaries. Terminal session phases are `after_session_completed`, `after_session_failed`, and `after_session_interrupted`. These hooks run only after the terminal session status and terminal event have already been persisted. A hook failure does not rewrite the terminal session status; Cayu records `hook.failed` and continues to later hooks. Successful hooks emit `hook.started` and `hook.completed`, including the hook scope, terminal event id/type, and JSON-safe action summaries. `RuntimeHookContext` exposes copied session/event data plus controlled helpers for `fork_session`, `create_task`, `dispatch`, `dispatch_inline`, and custom event emission.
 
 `after_tool_call` runs after Cayu has persisted a terminal tool result event from the model/tool loop, such as `tool.call.completed`, `tool.call.failed`, or `tool.call.blocked`. It receives `ToolCallHookContext`, which exposes copied session data, the persisted tool event, tool name/id, copied arguments, copied `ToolResult`, optional task id, and the same controlled helpers as terminal hooks. Mutating context arguments or results does not mutate the durable transcript or the tool result sent back to the model. This phase is for policy telemetry, audit trails, memory extraction, and follow-up work; it is not a tool-result rewrite hook.
@@ -632,6 +650,7 @@ The first built-in tools are:
 - `list_files`: list files in the active workspace, capped by `limit`
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
+- `subagent`: delegate a bounded task to a configured child Cayu agent and return the child result as a tool result
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 

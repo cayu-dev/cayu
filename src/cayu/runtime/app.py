@@ -544,31 +544,63 @@ class CayuApp:
                 model=registered_agent.spec.model,
             ),
         )
-        await self.session_store.update_status(session.id, SessionStatus.RUNNING)
+        try:
+            session = await self.session_store.transition_status(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+        except ValueError:
+            loaded_session = await self.session_store.load(session.id)
+            if (
+                loaded_session is not None
+                and loaded_session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES
+            ):
+                async for event in self._handle_session_interrupted(
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                return
+            raise
+
         messages = transcript_helpers.initial_messages(
             system_prompt=registered_agent.spec.system_prompt,
             request_messages=request.messages,
         )
-
-        async for event in self._run_session(
-            session=session,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            messages=messages,
-            messages_to_append=messages,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=self._effective_retry_policy(request.retry_policy),
-            structured_output=request.structured_output,
-            request_loop_policies=request.loop_policies,
-            request_metadata=request.metadata,
-            task_id=request.task_id,
-            start_event_type=EventType.SESSION_STARTED,
-            start_event_payload={"agent_name": registered_agent.spec.name},
-        ):
-            yield event
+        try:
+            async for event in self._run_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                messages=messages,
+                messages_to_append=messages,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                structured_output=request.structured_output,
+                request_loop_policies=request.loop_policies,
+                request_metadata=request.metadata,
+                task_id=request.task_id,
+                start_event_type=EventType.SESSION_STARTED,
+                start_event_payload={"agent_name": registered_agent.spec.name},
+            ):
+                yield event
+        except asyncio.CancelledError:
+            if await self._session_interrupt_requested(session.id):
+                async for event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                return
+            raise
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
         if type(request) is not ResumeRequest:
@@ -3599,6 +3631,7 @@ class CayuApp:
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
+                causal_budget_id=session.causal_budget_id,
                 workspace_id=_workspace_id(registered_environment),
                 artifact_store_id=_artifact_store_id(registered_environment),
                 workspace=_workspace(registered_environment),
@@ -4602,6 +4635,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         agent_name=request.agent_name,
         messages=[message.model_copy(deep=True) for message in request.messages],
         session_id=request.session_id,
+        parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         environment_name=environment_name,
@@ -4946,6 +4980,9 @@ def _limit_reached_tool_round_results(
 def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]:
     if isinstance(exc, RunnerCancelledError):
         return copy_json_value(exc.artifacts, "artifacts")
+    artifacts = getattr(exc, "artifacts", None)
+    if artifacts is not None:
+        return copy_json_value(artifacts, "artifacts")
     return []
 
 

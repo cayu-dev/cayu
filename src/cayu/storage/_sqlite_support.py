@@ -247,6 +247,7 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         agent_name=request.agent_name,
         provider_name=identity.provider_name,
         model=identity.model,
+        parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id or request.task_id or session_id,
         runtime_name=identity.runtime_name,
         runtime_version=identity.runtime_version,

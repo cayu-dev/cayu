@@ -276,6 +276,72 @@ def test_postgres_session_store_transforms_current_checkpoint_during_fork(postgr
     _run(postgres_dsn, ops)
 
 
+def test_postgres_session_store_persists_run_request_parent_session_id(postgres_dsn):
+    async def ops(store):
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_run_parent",
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=_identity(),
+        )
+        child = await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_pg_run_child",
+                parent_session_id="sess_pg_run_parent",
+                causal_budget_id="job_pg_run_parent",
+                messages=[Message.text("user", "child")],
+            ),
+            identity=_identity(),
+        )
+
+        assert child.parent_session_id == "sess_pg_run_parent"
+        loaded = await store.load("sess_pg_run_child")
+        assert loaded is not None
+        assert loaded.parent_session_id == "sess_pg_run_parent"
+        assert loaded.causal_budget_id == "job_pg_run_parent"
+        children = await store.list_sessions(SessionQuery(parent_session_id="sess_pg_run_parent"))
+        assert [session.id for session in children] == ["sess_pg_run_child"]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_rejects_missing_parent_session_id(postgres_dsn):
+    async def ops(store):
+        with pytest.raises(ValueError, match="Parent session not found"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="sess_pg_missing_parent_child",
+                    parent_session_id="sess_pg_missing_parent",
+                    messages=[Message.text("user", "child")],
+                ),
+                identity=_identity(),
+            )
+        assert await store.load("sess_pg_missing_parent_child") is None
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_rejects_self_parent_session_id(postgres_dsn):
+    async def ops(store):
+        with pytest.raises(ValueError, match="own parent"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="sess_pg_self_parent",
+                    parent_session_id="sess_pg_self_parent",
+                    messages=[Message.text("user", "child")],
+                ),
+                identity=_identity(),
+            )
+        assert await store.load("sess_pg_self_parent") is None
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_session_store_fork_honors_transcript_cursor(postgres_dsn):
     async def ops(store):
         source = await store.create(

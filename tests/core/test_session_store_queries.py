@@ -69,6 +69,41 @@ def test_session_stores_default_causal_budget_id_from_task_or_session(
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_reject_invalid_parent_session_id(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        with pytest.raises(ValueError, match="Parent session not found"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="sess_missing_parent_child",
+                    parent_session_id="sess_missing_parent",
+                    messages=[Message.text("user", "child")],
+                ),
+                identity=_identity(),
+            )
+        assert await store.load("sess_missing_parent_child") is None
+        with pytest.raises(ValueError, match="own parent"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id="sess_self_parent",
+                    parent_session_id="sess_self_parent",
+                    messages=[Message.text("user", "child")],
+                ),
+                identity=_identity(),
+            )
+        assert await store.load("sess_self_parent") is None
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_list_sessions_with_filters_and_pagination(
     store_factory: StoreFactory,
     tmp_path,

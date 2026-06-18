@@ -164,6 +164,7 @@ class ToolContext(BaseModel):
     session_id: str
     agent_name: str | None = None
     environment_name: str | None = None
+    causal_budget_id: str | None = None
     workspace_id: str | None = None
     artifact_store_id: str | None = None
     workspace: Any = Field(default=None, exclude=True)
@@ -183,7 +184,13 @@ class ToolContext(BaseModel):
     def validate_nonblank_session_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("agent_name", "environment_name", "workspace_id", "artifact_store_id")
+    @field_validator(
+        "agent_name",
+        "environment_name",
+        "causal_budget_id",
+        "workspace_id",
+        "artifact_store_id",
+    )
     @classmethod
     def validate_optional_nonblank_ids(
         cls,

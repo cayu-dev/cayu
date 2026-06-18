@@ -987,6 +987,44 @@ async for event in app.dispatch_inline(
     print(event.type)
 ```
 
+For model-facing delegation, register a `SubagentTool`. A subagent call creates
+a normal child session with `parent_session_id` and the same `causal_budget_id`,
+runs the configured child agent foreground, and returns the child result as a
+tool result to the parent. `SubagentSpec.result_max_chars` bounds the child text
+copied back into the parent transcript. The initial context mode is `task_only`:
+the child receives the delegated task, not a full copy of the parent transcript.
+Child events are ordinary durable session events: observe them through event
+sinks or session queries by `parent_session_id`.
+
+```python
+from cayu import AgentSpec, CayuApp, SubagentSpec, SubagentTool
+
+app = CayuApp()
+
+subagents = SubagentTool(
+    app,
+    agents={
+        "reviewer": SubagentSpec(
+            agent_name="security_reviewer",
+            description="Review implementation risks.",
+            result_max_chars=8000,
+        )
+    },
+)
+
+app.register_agent(
+    AgentSpec(name="builder", model="gpt-5.5"),
+    tools=[subagents],
+)
+app.register_agent(
+    AgentSpec(
+        name="security_reviewer",
+        model="gpt-5.5",
+        system_prompt="Review delegated work and return concrete risks only.",
+    )
+)
+```
+
 Add runtime hooks for lifecycle automation. Hooks run after terminal session state is already durable, so they are useful for follow-up work such as extracting knowledge from a completed builder session:
 
 ```python

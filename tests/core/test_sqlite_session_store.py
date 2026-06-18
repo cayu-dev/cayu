@@ -429,6 +429,50 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
     asyncio.run(assert_persisted())
 
 
+def test_sqlite_session_store_persists_run_request_parent_session_id(tmp_path):
+    db_path = tmp_path / "run-parent.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_run_parent",
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=_identity(),
+        )
+        child = await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_sqlite_run_child",
+                parent_session_id="sess_sqlite_run_parent",
+                causal_budget_id="job_sqlite_run_parent",
+                messages=[Message.text("user", "child")],
+            ),
+            identity=_identity(),
+        )
+        assert child.parent_session_id == "sess_sqlite_run_parent"
+        await _close(store)
+
+    asyncio.run(run_operations())
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def assert_persisted() -> None:
+        child = await reopened.load("sess_sqlite_run_child")
+        assert child is not None
+        assert child.parent_session_id == "sess_sqlite_run_parent"
+        assert child.causal_budget_id == "job_sqlite_run_parent"
+        children = await reopened.list_sessions(
+            SessionQuery(parent_session_id="sess_sqlite_run_parent")
+        )
+        assert [session.id for session in children] == ["sess_sqlite_run_child"]
+        await _close(reopened)
+
+    asyncio.run(assert_persisted())
+
+
 def test_sqlite_session_store_rejects_fork_status_mismatch(tmp_path):
     store = SQLiteSessionStore(tmp_path / "fork-status.sqlite")
 

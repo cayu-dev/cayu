@@ -98,6 +98,8 @@ class SQLiteSessionStore(SessionStore):
         identity = copy_session_identity(identity)
         async with self._lock:
             session = sqlite_support.session_from_request(request, identity=identity)
+            if session.parent_session_id == session.id:
+                raise ValueError("Session cannot be its own parent.")
             try:
                 with self._connection:
                     self._connection.execute(
@@ -138,6 +140,12 @@ class SQLiteSessionStore(SessionStore):
             except sqlite3.IntegrityError as exc:
                 if self._session_exists_unlocked(session.id):
                     raise ValueError(f"Session already exists: {session.id}") from exc
+                if session.parent_session_id is not None and not self._session_exists_unlocked(
+                    session.parent_session_id
+                ):
+                    raise ValueError(
+                        f"Parent session not found: {session.parent_session_id}"
+                    ) from exc
                 raise
             return session.model_copy(deep=True)
 

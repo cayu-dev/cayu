@@ -339,6 +339,7 @@ def test_tool_context_carries_services_without_serializing_them(tmp_path):
         "session_id": "sess_1",
         "agent_name": "assistant",
         "environment_name": "local-dev",
+        "causal_budget_id": None,
         "workspace_id": "local",
         "artifact_store_id": "artifacts",
         "metadata": {},

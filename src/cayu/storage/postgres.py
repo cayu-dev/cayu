@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
-from psycopg.errors import UniqueViolation
+from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg_pool import AsyncConnectionPool
 
 from cayu._validation import (
@@ -247,6 +247,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             agent_name=request.agent_name,
             provider_name=identity.provider_name,
             model=identity.model,
+            parent_session_id=request.parent_session_id,
             causal_budget_id=request.causal_budget_id or request.task_id or session_id,
             runtime_name=identity.runtime_name,
             runtime_version=identity.runtime_version,
@@ -256,6 +257,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             updated_at=now,
             metadata=copy_json_value(request.metadata, "metadata"),
         )
+        if session.parent_session_id == session.id:
+            raise ValueError("Session cannot be its own parent.")
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -270,6 +273,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             except UniqueViolation as exc:
                 await conn.rollback()
                 raise ValueError(f"Session already exists: {session.id}") from exc
+            except ForeignKeyViolation as exc:
+                await conn.rollback()
+                if session.parent_session_id is not None:
+                    raise ValueError(
+                        f"Parent session not found: {session.parent_session_id}"
+                    ) from exc
+                raise
         return session.model_copy(deep=True)
 
     async def create_fork(
