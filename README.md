@@ -988,16 +988,27 @@ async for event in app.dispatch_inline(
 ```
 
 For model-facing delegation, register a `SubagentTool`. A subagent call creates
-a normal child session with `parent_session_id` and the same `causal_budget_id`,
-runs the configured child agent foreground, and returns the child result as a
-tool result to the parent. `SubagentSpec.result_max_chars` bounds the child text
-copied back into the parent transcript. The initial context mode is `task_only`:
-the child receives the delegated task, not a full copy of the parent transcript.
-Child events are ordinary durable session events: observe them through event
-sinks or session queries by `parent_session_id`.
+a normal child session with `parent_session_id` and the same `causal_budget_id`.
+Foreground subagents run to completion and return the child result as a tool
+result to the parent. Background subagents start the child session, return the
+`child_session_id` immediately, and keep running in the active runtime process.
+Register `SubagentResultTool` when the parent model should later fetch one
+child result or wait for all background children it started.
+`SubagentSpec.result_max_chars` bounds foreground child text copied back into the
+parent transcript. The initial context mode is `task_only`: the child receives
+the delegated task, not a full copy of the parent transcript. Child events are
+ordinary durable session events: observe them through event sinks or session
+queries by `parent_session_id`.
 
 ```python
-from cayu import AgentSpec, CayuApp, SubagentSpec, SubagentTool
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    SubagentExecutionMode,
+    SubagentResultTool,
+    SubagentSpec,
+    SubagentTool,
+)
 
 app = CayuApp()
 
@@ -1008,13 +1019,18 @@ subagents = SubagentTool(
             agent_name="security_reviewer",
             description="Review implementation risks.",
             result_max_chars=8000,
+        ),
+        "background_reviewer": SubagentSpec(
+            agent_name="security_reviewer",
+            description="Review implementation risks without blocking the parent.",
+            mode=SubagentExecutionMode.BACKGROUND,
         )
     },
 )
 
 app.register_agent(
     AgentSpec(name="builder", model="gpt-5.5"),
-    tools=[subagents],
+    tools=[subagents, SubagentResultTool(app.session_store)],
 )
 app.register_agent(
     AgentSpec(

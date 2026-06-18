@@ -14,7 +14,13 @@ from cayu.tools.files import (
     WriteFileTool,
     default_artifact_readers,
 )
-from cayu.tools.subagents import SubagentContextMode, SubagentSpec, SubagentTool
+from cayu.tools.subagents import (
+    SubagentContextMode,
+    SubagentExecutionMode,
+    SubagentResultTool,
+    SubagentSpec,
+    SubagentTool,
+)
 
 __all__ = [
     "ArtifactReadRequest",
@@ -27,6 +33,8 @@ __all__ = [
     "ReadFileOptions",
     "ReadFileTool",
     "SubagentContextMode",
+    "SubagentExecutionMode",
+    "SubagentResultTool",
     "SubagentSpec",
     "SubagentTool",
     "TextArtifactReader",

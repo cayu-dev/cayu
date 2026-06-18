@@ -263,6 +263,11 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 
 
+def _is_background_subagent_session(session: Session) -> bool:
+    subagent = session.metadata.get("subagent")
+    return isinstance(subagent, dict) and subagent.get("mode") == "background"
+
+
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
 
@@ -629,6 +634,11 @@ class CayuApp:
                 loaded_session.id
             )
             if existing_interrupt_event is not None:
+                await self._interrupt_background_subagent_children(
+                    parent_session_id=loaded_session.id,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                )
                 yield existing_interrupt_event
                 return
             raise RuntimeError(
@@ -640,6 +650,11 @@ class CayuApp:
                 loaded_session.id
             )
             if existing_interrupt_event is not None:
+                await self._interrupt_background_subagent_children(
+                    parent_session_id=loaded_session.id,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                )
                 yield existing_interrupt_event
                 return
             raise TimeoutError(f"Session interruption is still finalizing: {loaded_session.id}")
@@ -669,6 +684,11 @@ class CayuApp:
                 if existing_interrupt_event is not None:
                     request_marker_active = False
                     self._sessions_requesting_interruption.discard(loaded_session.id)
+                    await self._interrupt_background_subagent_children(
+                        parent_session_id=session.id,
+                        reason=request.reason,
+                        metadata=request.metadata,
+                    )
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
@@ -679,6 +699,11 @@ class CayuApp:
                 if existing_interrupt_event is not None:
                     request_marker_active = False
                     self._sessions_requesting_interruption.discard(loaded_session.id)
+                    await self._interrupt_background_subagent_children(
+                        parent_session_id=session.id,
+                        reason=request.reason,
+                        metadata=request.metadata,
+                    )
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
@@ -693,6 +718,11 @@ class CayuApp:
                 if existing_interrupt_event is not None:
                     request_marker_active = False
                     self._sessions_requesting_interruption.discard(loaded_session.id)
+                    await self._interrupt_background_subagent_children(
+                        parent_session_id=reloaded_session.id,
+                        reason=request.reason,
+                        metadata=request.metadata,
+                    )
                     yield existing_interrupt_event
                     return
                 if self._has_active_session_tasks(reloaded_session.id):
@@ -728,6 +758,11 @@ class CayuApp:
             existing_interrupt_event = await self._latest_session_interrupted_event(session.id)
             if existing_interrupt_event is not None:
                 await self._clear_pending_session_interrupt(session.id)
+                await self._interrupt_background_subagent_children(
+                    parent_session_id=session.id,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                )
                 yield existing_interrupt_event
                 return
             terminal_event_stream = self._emit_terminal_event_with_hooks(
@@ -749,6 +784,11 @@ class CayuApp:
                 raise RuntimeError("Session interruption produced no terminal event.") from exc
 
             await self._clear_pending_session_interrupt(session.id)
+            await self._interrupt_background_subagent_children(
+                parent_session_id=session.id,
+                reason=request.reason,
+                metadata=request.metadata,
+            )
             yield first_terminal_event
             async for event in terminal_event_stream:
                 yield event
@@ -4004,6 +4044,34 @@ class CayuApp:
             task.cancel()
             signalled = True
         return signalled
+
+    async def _interrupt_background_subagent_children(
+        self,
+        *,
+        parent_session_id: str,
+        reason: str | None,
+        metadata: dict[str, Any],
+    ) -> None:
+        children = await self.session_store.list_sessions(
+            SessionQuery(parent_session_id=parent_session_id, limit=1000)
+        )
+        for child in children:
+            if not _is_background_subagent_session(child):
+                continue
+            if child.status not in _INTERRUPTIBLE_SESSION_STATUSES:
+                continue
+            async for _event in self.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=child.id,
+                    reason=reason or "Parent session interrupted.",
+                    metadata={
+                        "source": "background_subagent_parent_interrupt",
+                        "parent_session_id": parent_session_id,
+                        "parent_metadata": copy_json_value(metadata, "metadata"),
+                    },
+                )
+            ):
+                pass
 
     def _active_session_run_records(self, session_id: str) -> tuple[_ActiveSessionRun, ...]:
         return tuple(self._active_session_runs.get(session_id, {}).values())

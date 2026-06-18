@@ -96,17 +96,25 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 `DispatchRequest` asks a `Dispatcher` to submit work for an existing session and return a `DispatchHandle`. Dispatch is separate from fork: fork decides what state a branch starts from, while dispatch decides how a session run is placed. The default `InlineDispatcher` runs immediately in the current process by resuming the target session through the normal runtime loop, then returns a completed, failed, or interrupted handle based on the terminal session event. It is useful for tests, local execution, and proving orchestration logic, but it is not durable background execution. Production apps can provide another `Dispatcher` that submits work to an external queue or hosted runtime and returns a queued/submitted handle while events are observed through the session store. `CayuApp.dispatch_inline(...)` is the explicit local streaming API for callers that want to consume ordinary `session.resumed`, model, tool, task, interrupt, and terminal session events directly. `DispatchRequest.task_id` optionally links dispatched work to a task; using it with inline execution requires `CayuApp(task_store=...)`.
 
 `SubagentTool` is model-facing delegation over the same session substrate, not a
-separate runtime. The foreground implementation creates a new child `RunRequest`
-with `parent_session_id` set to the calling session and `causal_budget_id`
-inherited from the caller, then runs the configured child agent through the
-normal Cayu loop. The child agent has its own `AgentSpec`, tools, policies,
-model, context policy, and durable events. The parent receives only a bounded
-`ToolResult` containing the child session id, status, and model-facing result;
-`SubagentSpec.result_max_chars` caps the child text copied into the parent
-transcript.
+separate runtime. It creates a new child `RunRequest` with `parent_session_id`
+set to the calling session and `causal_budget_id` inherited from the caller,
+then runs the configured child agent through the normal Cayu loop. The child
+agent has its own `AgentSpec`, tools, policies, model, context policy, and
+durable events. Foreground subagents wait for the child terminal event; the
+parent receives only a bounded `ToolResult` containing the child session id,
+status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
+text copied into the parent transcript. Background subagents return after the
+child emits its first runtime event, so the parent receives the child session id
+without waiting for completion. The active runtime process must keep running for
+in-process background child work to finish; external queue placement remains a
+dispatcher responsibility.
 Consumers that need child progress should observe the event sink or query
 sessions by `parent_session_id`; child events are not rewritten as parent
-events.
+events. If the parent model needs a background child result later, register
+`SubagentResultTool`. It is parent-scoped: the model can fetch one returned
+`child_session_id` or `all=true` for background subagents created by the current
+parent session. Interrupting an active parent session also interrupts running
+background subagent children.
 The initial subagent context mode is `task_only`: the child receives the
 delegated task as a user message and does not copy the parent's transcript.
 Transcript-copying remains the job of `ForkSessionRequest`; future subagent
@@ -650,7 +658,8 @@ The first built-in tools are:
 - `list_files`: list files in the active workspace, capped by `limit`
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
-- `subagent`: delegate a bounded task to a configured child Cayu agent and return the child result as a tool result
+- `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, while background mode returns the child session id after startup
+- `subagent_result`: fetch one background subagent result by `child_session_id`, or wait for all background subagents started by the current parent session
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 

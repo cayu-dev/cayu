@@ -21,7 +21,6 @@ from cayu import (
 async def main() -> None:
     provider_name = _provider_name()
     model = _model(provider_name)
-    mode = _mode()
 
     app = CayuApp()
     if provider_name == "openai":
@@ -38,70 +37,79 @@ async def main() -> None:
     subagents = SubagentTool(
         app,
         agents={
-            "reviewer": SubagentSpec(
-                agent_name="reviewer",
-                description="Review short implementation plans and return concrete risks.",
-                mode=mode,
+            "security_reviewer": SubagentSpec(
+                agent_name="security_reviewer",
+                description="Review security and abuse risks.",
+                mode=SubagentExecutionMode.BACKGROUND,
                 result_max_chars=4_000,
-            )
+            ),
+            "product_reviewer": SubagentSpec(
+                agent_name="product_reviewer",
+                description="Review product and user-experience risks.",
+                mode=SubagentExecutionMode.BACKGROUND,
+                result_max_chars=4_000,
+            ),
         },
     )
-    subagent_result = SubagentResultTool(app.session_store)
-    if mode == SubagentExecutionMode.BACKGROUND:
-        builder_prompt = (
-            "You are testing Cayu background subagents. Call the subagent tool exactly "
-            "once with agent='reviewer' to review the user's plan. The subagent tool "
-            "returns a child_session_id immediately. Then call subagent_result with "
-            "that child_session_id and wait=true. After subagent_result returns, give "
-            "a concise final answer that includes one point from the reviewer."
-        )
-        tools = [subagents, subagent_result]
-    else:
-        builder_prompt = (
-            "You are testing Cayu foreground subagents. Call the subagent tool exactly "
-            "once with agent='reviewer' to review the user's plan. After the tool "
-            "result returns, give a concise final answer that includes one point from "
-            "the reviewer. Do not call any other tools."
-        )
-        tools = [subagents]
+    subagent_result = SubagentResultTool(app.session_store, default_timeout_s=90)
+
     app.register_agent(
         AgentSpec(
             name="builder",
             model=model,
-            system_prompt=builder_prompt,
+            system_prompt=(
+                "You are testing Cayu parallel background subagents. First, call "
+                "the subagent tool twice in the same assistant step: once with "
+                "agent='security_reviewer' and once with agent='product_reviewer'. "
+                "Both tasks should review the user's plan from their specialty. "
+                "After both subagent tool results return with child_session_id values, "
+                "continue with one short sentence saying what you can draft while they "
+                "run. Then call subagent_result with all=true and wait=true. After "
+                "subagent_result returns, give a concise final answer combining both "
+                "reviewers' most important points."
+            ),
         ),
-        tools=tools,
+        tools=[subagents, subagent_result],
     )
     app.register_agent(
         AgentSpec(
-            name="reviewer",
+            name="security_reviewer",
             model=model,
             system_prompt=(
-                "You are a focused reviewer. Return two concise risks and one practical "
-                "suggestion. Do not mention that you are a subagent."
+                "You are a security reviewer. Return two concrete security risks "
+                "and one mitigation. Be concise."
+            ),
+        )
+    )
+    app.register_agent(
+        AgentSpec(
+            name="product_reviewer",
+            model=model,
+            system_prompt=(
+                "You are a product reviewer. Return two concrete user-experience "
+                "or workflow risks and one mitigation. Be concise."
             ),
         )
     )
 
-    session_id = f"demo_{provider_name}_subagent"
+    session_id = f"demo_{provider_name}_parallel_subagents"
     print("provider", provider_name)
     print("model", model)
-    print("subagent_mode", mode)
     print("session_id", session_id)
 
     async for event in app.run(
         RunRequest(
             agent_name="builder",
             session_id=session_id,
-            causal_budget_id=f"job_{provider_name}_subagent",
+            causal_budget_id=f"job_{provider_name}_parallel_subagents",
             messages=[
                 Message.text(
                     "user",
                     (
-                        "Plan: add a file upload endpoint that stores PDFs, lets the "
-                        "agent inspect them, and summarizes the document for users. "
-                        "Ask the reviewer to review this plan, then answer with the "
-                        "reviewer's most important point."
+                        "Plan: build an invoice ingestion agent that accepts PDFs and "
+                        "images, stores files durably, extracts invoice fields, asks "
+                        "for approval before sending payment reminders, and lets "
+                        "operators inspect the trace later."
                     ),
                 )
             ],
@@ -117,6 +125,7 @@ async def main() -> None:
     children = await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
     print("child_sessions", [child.id for child in children])
     for child in children:
+        events = await app.session_store.load_events(child.id)
         print(
             "child",
             child.id,
@@ -124,26 +133,12 @@ async def main() -> None:
             child.agent_name,
             "status",
             child.status,
+            "events",
+            len(events),
             "parent",
             child.parent_session_id,
             "causal_budget",
             child.causal_budget_id,
-        )
-        events = await app.session_store.load_events(child.id)
-        print("child_event_count", len(events))
-
-    if mode == SubagentExecutionMode.BACKGROUND:
-        for _ in range(100):
-            children = await app.session_store.list_sessions(
-                SessionQuery(parent_session_id=session_id)
-            )
-            if children and all(child.status != "running" for child in children):
-                break
-            await asyncio.sleep(0.1)
-        children = await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
-        print(
-            "background_child_statuses",
-            [(child.id, str(child.status)) for child in children],
         )
 
 
@@ -165,13 +160,6 @@ def _model(provider_name: str) -> str:
     if provider_name == "openai":
         return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
     return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
-
-
-def _mode() -> SubagentExecutionMode:
-    mode = os.environ.get("CAYU_SUBAGENT_MODE", "foreground").strip().lower()
-    if mode not in {"foreground", "background"}:
-        raise RuntimeError("CAYU_SUBAGENT_MODE must be foreground or background.")
-    return SubagentExecutionMode(mode)
 
 
 if __name__ == "__main__":

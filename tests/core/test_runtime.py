@@ -83,7 +83,12 @@ from cayu.runtime import (
 )
 from cayu.runtime.context import validate_context_messages
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.tools import SubagentSpec, SubagentTool
+from cayu.tools import (
+    SubagentExecutionMode,
+    SubagentResultTool,
+    SubagentSpec,
+    SubagentTool,
+)
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -2863,6 +2868,7 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
         "agent": "reviewer",
         "agent_name": "reviewer",
         "context_mode": "task_only",
+        "mode": "foreground",
         "parent_session_id": "sess_subagent_parent",
     }
 
@@ -2891,6 +2897,470 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
         "Implement and review auth.",
     ]
     assert provider.requests[2].messages[-1].role == "tool"
+
+
+def test_subagent_tool_background_starts_child_without_waiting_for_completion():
+    class BackgroundProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = asyncio.Event()
+            self.release_child = asyncio.Event()
+            self.parent_final_requested = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            first_text = request.messages[0].content[0].text
+            if first_text == "parent task" and len(request.messages) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_background_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "background review task",
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text == "background review task":
+                self.child_model_started.set()
+                await self.release_child.wait()
+                yield ModelStreamEvent.text_delta("background review complete")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            if first_text == "parent task" and request.messages[-1].role == "tool":
+                self.parent_final_requested.set()
+                yield ModelStreamEvent.text_delta("parent continued before child finished")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            raise AssertionError("Unexpected background subagent provider request.")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = BackgroundProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                        )
+                    },
+                )
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_subagent_background_parent",
+                causal_budget_id="job_subagent_background",
+                messages=[Message.text("user", "parent task")],
+            ),
+        )
+        assert parent_events[-1].type == EventType.SESSION_COMPLETED
+        assert provider.parent_final_requested.is_set()
+
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_background_parent")
+        )
+        assert len(child_sessions) == 1
+        child = child_sessions[0]
+        assert child.causal_budget_id == "job_subagent_background"
+        assert child.status == SessionStatus.RUNNING
+
+        parent_transcript = await store.load_transcript("sess_subagent_background_parent")
+        tool_result = parent_transcript[2].content[0]
+        assert tool_result.is_error is False
+        assert tool_result.structured["mode"] == "background"
+        assert tool_result.structured["status"] == "started"
+        assert tool_result.structured["child_session_id"] == child.id
+
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        provider.release_child.set()
+        for _ in range(20):
+            loaded_child = await store.load(child.id)
+            if loaded_child is not None and loaded_child.status == SessionStatus.COMPLETED:
+                return parent_events, child.id
+            await asyncio.sleep(0)
+        raise AssertionError("Background child session did not complete.")
+
+    parent_events, child_session_id = asyncio.run(run())
+
+    assert parent_events[-1].type == EventType.SESSION_COMPLETED
+    assert child_session_id.startswith("sess_subagent_background_parent_subagent_")
+
+
+def test_subagent_result_tool_waits_for_background_child_result():
+    class BackgroundResultProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = asyncio.Event()
+            self.release_child = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            first_text = request.messages[0].content[0].text
+            if first_text == "parent task" and len(request.messages) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_background_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "background review task",
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text == "background review task":
+                self.child_model_started.set()
+                await self.release_child.wait()
+                yield ModelStreamEvent.text_delta("background review complete")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            if first_text == "parent task" and len(request.messages) == 3:
+                tool_result = request.messages[-1].content[0]
+                child_session_id = tool_result.structured["child_session_id"]
+                self.release_child.set()
+                yield ModelStreamEvent.tool_call(
+                    id="call_subagent_result",
+                    name="subagent_result",
+                    arguments={
+                        "child_session_id": child_session_id,
+                        "wait": True,
+                        "timeout_s": 1,
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text == "parent task" and len(request.messages) == 5:
+                yield ModelStreamEvent.text_delta("parent used background result")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            raise AssertionError("Unexpected background result provider request.")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = BackgroundResultProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                        )
+                    },
+                ),
+                SubagentResultTool(store),
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_subagent_background_result_parent",
+                    messages=[Message.text("user", "parent task")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        parent_transcript = await store.load_transcript("sess_subagent_background_result_parent")
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_background_result_parent")
+        )
+        return parent_events, parent_transcript, child_sessions
+
+    parent_events, parent_transcript, child_sessions = asyncio.run(run())
+
+    assert parent_events[-1].type == EventType.SESSION_COMPLETED
+    assert len(child_sessions) == 1
+    assert child_sessions[0].status == SessionStatus.COMPLETED
+    result_tool_message = parent_transcript[4]
+    result_tool_part = result_tool_message.content[0]
+    assert result_tool_part.tool_name == "subagent_result"
+    assert result_tool_part.content == "background review complete"
+    assert result_tool_part.structured["retrieval_status"] == "ready"
+    assert result_tool_part.structured["status"] == "completed"
+
+
+def test_subagent_result_tool_can_wait_for_all_background_children():
+    class MultiBackgroundProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = {"task a": asyncio.Event(), "task b": asyncio.Event()}
+            self.release_children = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            first_text = request.messages[0].content[0].text
+            if first_text == "parent task" and len(request.messages) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_background_subagent_a",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "task a"},
+                )
+                yield ModelStreamEvent.tool_call(
+                    id="call_background_subagent_b",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "task b"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text in {"task a", "task b"}:
+                self.child_model_started[first_text].set()
+                await self.release_children.wait()
+                yield ModelStreamEvent.text_delta(f"{first_text} done")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            if first_text == "parent task" and len(request.messages) == 3:
+                self.release_children.set()
+                yield ModelStreamEvent.tool_call(
+                    id="call_all_subagent_results",
+                    name="subagent_result",
+                    arguments={"all": True, "wait": True, "timeout_s": 1},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text == "parent task" and len(request.messages) == 5:
+                yield ModelStreamEvent.text_delta("parent used both background results")
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+            raise AssertionError("Unexpected multi-background provider request.")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = MultiBackgroundProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                        )
+                    },
+                ),
+                SubagentResultTool(store),
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_subagent_background_all_parent",
+                    messages=[Message.text("user", "parent task")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.child_model_started["task a"].wait(), timeout=1)
+        await asyncio.wait_for(provider.child_model_started["task b"].wait(), timeout=1)
+        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        parent_transcript = await store.load_transcript("sess_subagent_background_all_parent")
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_background_all_parent")
+        )
+        return parent_events, parent_transcript, child_sessions
+
+    parent_events, parent_transcript, child_sessions = asyncio.run(run())
+
+    assert parent_events[-1].type == EventType.SESSION_COMPLETED
+    assert len(child_sessions) == 2
+    assert {child.status for child in child_sessions} == {SessionStatus.COMPLETED}
+    result_tool_part = parent_transcript[4].content[0]
+    assert result_tool_part.tool_name == "subagent_result"
+    assert result_tool_part.structured["retrieval_status"] == "ready"
+    assert len(result_tool_part.structured["children"]) == 2
+    result_texts = {child["result_text"] for child in result_tool_part.structured["children"]}
+    assert result_texts == {"task a done", "task b done"}
+
+
+def test_interrupting_parent_interrupts_running_background_subagents():
+    class BackgroundInterruptProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.child_model_started = asyncio.Event()
+            self.parent_second_step_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            first_text = request.messages[0].content[0].text
+            if first_text == "parent task" and len(request.messages) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="call_background_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "background review task",
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if first_text == "background review task":
+                self.child_model_started.set()
+                await asyncio.Event().wait()
+                return
+            if first_text == "parent task" and request.messages[-1].role == "tool":
+                self.parent_second_step_started.set()
+                await asyncio.Event().wait()
+                return
+            raise AssertionError("Unexpected background interrupt provider request.")
+
+    async def run():
+        store = InMemorySessionStore()
+        provider = BackgroundInterruptProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="fake-model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            mode=SubagentExecutionMode.BACKGROUND,
+                        )
+                    },
+                ),
+                SubagentResultTool(store),
+            ],
+        )
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+
+        parent_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="parent",
+                    session_id="sess_background_parent_interrupt",
+                    messages=[Message.text("user", "parent task")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
+        await asyncio.wait_for(provider.parent_second_step_started.wait(), timeout=1)
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_background_parent_interrupt",
+                    reason="stop parent and background children",
+                )
+            )
+        ]
+        parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        child_sessions = await store.list_sessions(
+            SessionQuery(parent_session_id="sess_background_parent_interrupt")
+        )
+        child_events = await store.load_events(child_sessions[0].id)
+        return interrupt_events, parent_events, child_sessions, child_events
+
+    interrupt_events, parent_events, child_sessions, child_events = asyncio.run(run())
+
+    assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert parent_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert len(child_sessions) == 1
+    assert child_sessions[0].status == SessionStatus.INTERRUPTED
+    child_interrupted = [
+        event for event in child_events if event.type == EventType.SESSION_INTERRUPTED
+    ]
+    assert len(child_interrupted) == 1
+    assert child_interrupted[0].payload["metadata"]["source"] == (
+        "background_subagent_parent_interrupt"
+    )
+
+
+def test_subagent_tool_background_reports_start_failure_as_tool_error():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_background_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "Review the changes.",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent handled missing child"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[
+            SubagentTool(
+                app,
+                agents={
+                    "reviewer": SubagentSpec(
+                        agent_name="missing_reviewer",
+                        mode=SubagentExecutionMode.BACKGROUND,
+                    )
+                },
+            )
+        ],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_subagent_background_missing_child",
+                messages=[Message.text("user", "Review auth.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    parent_transcript = asyncio.run(store.load_transcript("sess_subagent_background_missing_child"))
+    tool_result = parent_transcript[2].content[0]
+    assert tool_result.is_error is True
+    assert tool_result.structured["mode"] == "background"
+    assert tool_result.structured["status"] == "start_failed"
+    child_sessions = asyncio.run(
+        store.list_sessions(
+            SessionQuery(parent_session_id="sess_subagent_background_missing_child")
+        )
+    )
+    assert child_sessions == []
 
 
 def test_subagent_tool_returns_child_failure_as_tool_error():
