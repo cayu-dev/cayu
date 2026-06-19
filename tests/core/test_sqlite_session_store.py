@@ -860,8 +860,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_session_labels'"
         ).fetchone()
         watcher_table = connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'cayu_event_watcher_state'"
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_event_watcher_state'"
         ).fetchone()
         revisions = connection.execute(
             "SELECT revision, compatible_from FROM cayu_schema_migrations ORDER BY revision"

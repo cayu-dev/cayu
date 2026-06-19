@@ -364,9 +364,7 @@ class CayuApp:
         )
         self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
         self.event_watcher_store = (
-            event_watcher_store
-            if event_watcher_store is not None
-            else InMemoryEventWatcherStore()
+            event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)

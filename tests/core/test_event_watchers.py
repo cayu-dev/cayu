@@ -112,8 +112,7 @@ def test_event_watcher_fetches_matching_events_in_batches() -> None:
         session_store = CountingSessionStore()
         await _create_session(session_store)
         events = [
-            await _append_event(session_store, payload={"number": number})
-            for number in range(3)
+            await _append_event(session_store, payload={"number": number}) for number in range(3)
         ]
         handled: list[str] = []
 
@@ -148,8 +147,7 @@ def test_event_watcher_large_batch_uses_capped_event_query_pages() -> None:
         session_store = CountingSessionStore()
         await _create_session(session_store)
         events = [
-            await _append_event(session_store, payload={"number": number})
-            for number in range(5001)
+            await _append_event(session_store, payload={"number": number}) for number in range(5001)
         ]
         handled: list[str] = []
 
@@ -443,11 +441,20 @@ def test_postgres_event_watcher_store_serializes_first_claim(postgres_dsn: str) 
         await _create_session(session_store)
         event = await _append_event(session_store)
         records = await session_store.query_events(EventQuery(limit=1))
-        first_store = PostgresEventWatcherStore(
+        setup_store = PostgresEventWatcherStore(
             postgres_dsn,
             min_size=1,
             max_size=2,
             schema_mode=SchemaMode.CREATE,
+        )
+        await setup_store.load_state("schema-ready")
+        await setup_store.close()
+
+        first_store = PostgresEventWatcherStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
         )
         second_store = PostgresEventWatcherStore(
             postgres_dsn,
