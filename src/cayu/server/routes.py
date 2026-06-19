@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
 from sse_starlette.sse import EventSourceResponse
 
-from cayu._validation import copy_label_map
+from cayu._validation import copy_label_map, require_clean_nonblank
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.runtime.approvals import (
@@ -193,6 +193,40 @@ def _serialize_session(session: Session) -> dict[str, Any]:
         "labels": session.labels,
         "metadata": session.metadata,
     }
+
+
+def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
+    if values is None:
+        return {}
+    labels: dict[str, str] = {}
+    for raw in values:
+        if type(raw) is not str or "=" not in raw:
+            raise HTTPException(
+                status_code=422,
+                detail="Session label filters must use `key=value`.",
+            )
+        key, value = raw.split("=", 1)
+        try:
+            parsed = copy_label_map({key: value}, "label")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        parsed_key, parsed_value = next(iter(parsed.items()))
+        if parsed_key in labels:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Duplicate session label filter: {parsed_key}",
+            )
+        labels[parsed_key] = parsed_value
+    return labels
+
+
+def _clean_optional_query_value(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return require_clean_nonblank(value, field_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any]:
@@ -388,8 +422,40 @@ def create_router(
         return EventSourceResponse(generate())
 
     @router.get("/sessions")
-    async def list_sessions(limit: int = 50):
-        sessions = await session_store.list_sessions(SessionQuery(limit=limit))
+    async def list_sessions(
+        limit: Annotated[int, Query(ge=1, le=1000)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        status: SessionStatus | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        parent_session_id: str | None = None,
+        causal_budget_id: str | None = None,
+        order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
+        label: Annotated[list[str] | None, Query()] = None,
+    ):
+        labels = _parse_session_label_filters(label)
+        sessions = await session_store.list_sessions(
+            SessionQuery(
+                status=status,
+                agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                environment_name=_clean_optional_query_value(
+                    environment_name,
+                    "environment_name",
+                ),
+                parent_session_id=_clean_optional_query_value(
+                    parent_session_id,
+                    "parent_session_id",
+                ),
+                causal_budget_id=_clean_optional_query_value(
+                    causal_budget_id,
+                    "causal_budget_id",
+                ),
+                labels=labels,
+                limit=limit,
+                offset=offset,
+                order_by=order_by,
+            )
+        )
         return [
             {
                 "id": s.id,
