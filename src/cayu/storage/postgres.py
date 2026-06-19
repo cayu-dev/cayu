@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, LiteralString, cast
 
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
@@ -16,6 +16,13 @@ from cayu._validation import (
 )
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message
+from cayu.runtime.event_watchers import (
+    EventWatcherClaim,
+    EventWatcherDelivery,
+    EventWatcherDeliveryStatus,
+    EventWatcherState,
+    EventWatcherStore,
+)
 from cayu.runtime.sessions import (
     CheckpointTransform,
     EventQuery,
@@ -110,6 +117,25 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session "
         "ON cayu_session_labels(key, value, session_id)",
+    ),
+    3: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
+            watcher_name TEXT PRIMARY KEY,
+            cursor_sequence BIGINT NOT NULL,
+            pending_event_id TEXT,
+            pending_event_sequence BIGINT,
+            pending_attempt INTEGER NOT NULL,
+            pending_claim_id TEXT,
+            delivery_status TEXT,
+            lease_expires_at TIMESTAMPTZ,
+            last_error TEXT,
+            dead_lettered_count INTEGER NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery "
+        "ON cayu_event_watcher_state(delivery_status, lease_expires_at)",
     ),
 }
 
@@ -271,6 +297,287 @@ class _PostgresStoreBase:
         if self._owns_pool and self._opened:
             await self._pool.close()
             self._opened = False
+
+
+class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
+    """Postgres-backed durable watcher state for hosted multi-worker apps."""
+
+    async def load_state(self, watcher_name: str) -> EventWatcherState:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT
+                    watcher_name,
+                    cursor_sequence,
+                    pending_event_id,
+                    pending_event_sequence,
+                    pending_attempt,
+                    pending_claim_id,
+                    delivery_status,
+                    lease_expires_at,
+                    last_error,
+                    dead_lettered_count,
+                    updated_at
+                FROM cayu_event_watcher_state
+                WHERE watcher_name = %s
+                """,
+                (watcher_name,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return EventWatcherState(watcher_name=watcher_name)
+            return _event_watcher_state_from_row(row)
+
+    async def claim_event(
+        self,
+        *,
+        watcher_name: str,
+        record: EventRecord,
+        lease_seconds: float,
+    ) -> EventWatcherClaim | None:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        lease_seconds = _validate_positive_float(lease_seconds, "lease_seconds")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            state = await self._load_watcher_state_for_update(cur, watcher_name, now=now)
+            if state.cursor_sequence >= record.sequence:
+                await conn.commit()
+                return None
+            if (
+                state.delivery_status is EventWatcherDeliveryStatus.LEASED
+                and state.lease_expires_at is not None
+                and state.lease_expires_at > now
+            ):
+                await conn.commit()
+                return None
+
+            attempt = (
+                state.pending_attempt + 1
+                if state.pending_event_id == record.event.id
+                and state.pending_event_sequence == record.sequence
+                else 1
+            )
+            claim = EventWatcherClaim(
+                watcher_name=watcher_name,
+                event_id=record.event.id,
+                event_sequence=record.sequence,
+                attempt=attempt,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+            await self._upsert_watcher_state(
+                cur,
+                state.model_copy(
+                    update={
+                        "pending_event_id": claim.event_id,
+                        "pending_event_sequence": claim.event_sequence,
+                        "pending_attempt": claim.attempt,
+                        "pending_claim_id": claim.claim_id,
+                        "delivery_status": EventWatcherDeliveryStatus.LEASED,
+                        "lease_expires_at": claim.lease_expires_at,
+                        "last_error": None,
+                        "updated_at": now,
+                    },
+                    deep=True,
+                ),
+            )
+            await conn.commit()
+            return claim
+
+    async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
+        if type(claim) is not EventWatcherClaim:
+            raise TypeError("claim must be an EventWatcherClaim.")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            state = await self._matching_watcher_state_for_update(cur, claim, now=now)
+            updated = state.model_copy(
+                update={
+                    "cursor_sequence": claim.event_sequence,
+                    "pending_event_id": None,
+                    "pending_event_sequence": None,
+                    "pending_attempt": 0,
+                    "pending_claim_id": None,
+                    "delivery_status": EventWatcherDeliveryStatus.SUCCEEDED,
+                    "lease_expires_at": None,
+                    "last_error": None,
+                    "updated_at": now,
+                },
+                deep=True,
+            )
+            await self._upsert_watcher_state(cur, updated)
+            await conn.commit()
+            return _event_watcher_delivery_from_claim(
+                claim,
+                status=EventWatcherDeliveryStatus.SUCCEEDED,
+                cursor_sequence=updated.cursor_sequence,
+            )
+
+    async def mark_failure(
+        self,
+        claim: EventWatcherClaim,
+        *,
+        error: str,
+        max_attempts: int,
+    ) -> EventWatcherDelivery:
+        if type(claim) is not EventWatcherClaim:
+            raise TypeError("claim must be an EventWatcherClaim.")
+        error = _clean_error(error)
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer greater than or equal to 1.")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            state = await self._matching_watcher_state_for_update(cur, claim, now=now)
+            if claim.attempt >= max_attempts:
+                updated = state.model_copy(
+                    update={
+                        "cursor_sequence": claim.event_sequence,
+                        "pending_event_id": None,
+                        "pending_event_sequence": None,
+                        "pending_attempt": 0,
+                        "pending_claim_id": None,
+                        "delivery_status": EventWatcherDeliveryStatus.DEAD_LETTERED,
+                        "lease_expires_at": None,
+                        "last_error": error,
+                        "dead_lettered_count": state.dead_lettered_count + 1,
+                        "updated_at": now,
+                    },
+                    deep=True,
+                )
+                status = EventWatcherDeliveryStatus.DEAD_LETTERED
+            else:
+                updated = state.model_copy(
+                    update={
+                        "delivery_status": EventWatcherDeliveryStatus.FAILED,
+                        "pending_claim_id": None,
+                        "lease_expires_at": None,
+                        "last_error": error,
+                        "updated_at": now,
+                    },
+                    deep=True,
+                )
+                status = EventWatcherDeliveryStatus.FAILED
+            await self._upsert_watcher_state(cur, updated)
+            await conn.commit()
+            return _event_watcher_delivery_from_claim(
+                claim,
+                status=status,
+                cursor_sequence=updated.cursor_sequence,
+                error=error,
+            )
+
+    async def _load_watcher_state_for_update(
+        self,
+        cur: Any,
+        watcher_name: str,
+        *,
+        now: datetime,
+    ) -> EventWatcherState:
+        await cur.execute(
+            """
+            INSERT INTO cayu_event_watcher_state (
+                watcher_name,
+                cursor_sequence,
+                pending_attempt,
+                dead_lettered_count,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (watcher_name) DO NOTHING
+            """,
+            (watcher_name, 0, 0, 0, now),
+        )
+        await cur.execute(
+            """
+            SELECT
+                watcher_name,
+                cursor_sequence,
+                pending_event_id,
+                pending_event_sequence,
+                pending_attempt,
+                pending_claim_id,
+                delivery_status,
+                lease_expires_at,
+                last_error,
+                dead_lettered_count,
+                updated_at
+            FROM cayu_event_watcher_state
+            WHERE watcher_name = %s
+            FOR UPDATE
+            """,
+            (watcher_name,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(f"Failed to initialize event watcher state: {watcher_name}")
+        return _event_watcher_state_from_row(row)
+
+    async def _matching_watcher_state_for_update(
+        self,
+        cur: Any,
+        claim: EventWatcherClaim,
+        *,
+        now: datetime,
+    ) -> EventWatcherState:
+        state = await self._load_watcher_state_for_update(cur, claim.watcher_name, now=now)
+        if state.pending_claim_id != claim.claim_id:
+            raise ValueError("Watcher claim is no longer active.")
+        if state.pending_event_id != claim.event_id:
+            raise ValueError("Watcher claim event_id does not match active claim.")
+        if state.pending_event_sequence != claim.event_sequence:
+            raise ValueError("Watcher claim sequence does not match active claim.")
+        if state.pending_attempt != claim.attempt:
+            raise ValueError("Watcher claim attempt does not match active claim.")
+        return state
+
+    async def _upsert_watcher_state(self, cur: Any, state: EventWatcherState) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_event_watcher_state (
+                watcher_name,
+                cursor_sequence,
+                pending_event_id,
+                pending_event_sequence,
+                pending_attempt,
+                pending_claim_id,
+                delivery_status,
+                lease_expires_at,
+                last_error,
+                dead_lettered_count,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (watcher_name) DO UPDATE SET
+                cursor_sequence = excluded.cursor_sequence,
+                pending_event_id = excluded.pending_event_id,
+                pending_event_sequence = excluded.pending_event_sequence,
+                pending_attempt = excluded.pending_attempt,
+                pending_claim_id = excluded.pending_claim_id,
+                delivery_status = excluded.delivery_status,
+                lease_expires_at = excluded.lease_expires_at,
+                last_error = excluded.last_error,
+                dead_lettered_count = excluded.dead_lettered_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                state.watcher_name,
+                state.cursor_sequence,
+                state.pending_event_id,
+                state.pending_event_sequence,
+                state.pending_attempt,
+                state.pending_claim_id,
+                None if state.delivery_status is None else str(state.delivery_status),
+                pg_support.to_utc_optional(state.lease_expires_at),
+                state.last_error,
+                state.dead_lettered_count,
+                pg_support.to_utc(state.updated_at),
+            ),
+        )
 
 
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
@@ -1508,6 +1815,52 @@ def _event_record_from_row(row: tuple[Any, Any] | None) -> EventRecord | None:
     return EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
 
 
+def _event_watcher_state_from_row(row: tuple[Any, ...]) -> EventWatcherState:
+    return EventWatcherState(
+        watcher_name=row[0],
+        cursor_sequence=row[1],
+        pending_event_id=row[2],
+        pending_event_sequence=row[3],
+        pending_attempt=row[4],
+        pending_claim_id=row[5],
+        delivery_status=None if row[6] is None else EventWatcherDeliveryStatus(row[6]),
+        lease_expires_at=pg_support.to_utc_optional(row[7]),
+        last_error=row[8],
+        dead_lettered_count=row[9],
+        updated_at=pg_support.to_utc(row[10]),
+    )
+
+
+def _event_watcher_delivery_from_claim(
+    claim: EventWatcherClaim,
+    *,
+    status: EventWatcherDeliveryStatus,
+    cursor_sequence: int,
+    error: str | None = None,
+) -> EventWatcherDelivery:
+    return EventWatcherDelivery(
+        watcher_name=claim.watcher_name,
+        event_id=claim.event_id,
+        event_sequence=claim.event_sequence,
+        status=status,
+        attempt=claim.attempt,
+        cursor_sequence=cursor_sequence,
+        error=error,
+    )
+
+
+def _validate_positive_float(value: float, field_name: str) -> float:
+    if type(value) not in {int, float} or value <= 0:
+        raise ValueError(f"{field_name} must be greater than 0.")
+    return float(value)
+
+
+def _clean_error(value: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError("error must be a non-empty string.")
+    return value
+
+
 # Lifecycle/terminal event-type strings used to derive a session outcome. Sourced from
 # the EventType enum (not hardcoded literals) so the SQL stays in sync with the contract.
 # These are constants, never user input, so they are safe to read in queries via params.
@@ -1525,6 +1878,7 @@ _TERMINAL_EVENT_TYPES = [
 # Re-exported so callers can construct a pool explicitly when desired.
 __all__ = [
     "AsyncConnectionPool",
+    "PostgresEventWatcherStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
 ]

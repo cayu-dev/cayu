@@ -15,6 +15,7 @@ from cayu import TaskCreate, TaskOrder, TaskQuery, TaskStatus
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_event_watcher_state",
     "cayu_events",
     "cayu_transcript_messages",
     "cayu_checkpoints",

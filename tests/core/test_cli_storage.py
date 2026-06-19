@@ -14,7 +14,8 @@ def test_storage_status_reports_uninitialized(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "uninitialized" in out
     # A fresh DB shows every known revision as pending.
-    assert f"pending migrations: {schema.BASELINE_REVISION}, {schema.LATEST_REVISION}" in out
+    pending = ", ".join(str(rev.revision) for rev in schema.REVISIONS)
+    assert f"pending migrations: {pending}" in out
 
 
 def test_storage_migrate_then_status_is_up_to_date(tmp_path, capsys):

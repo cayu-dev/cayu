@@ -127,10 +127,19 @@ from cayu.runtime import (
     EventQuery,
     EventRecord,
     EventSummary,
+    EventWatcher,
+    EventWatcherClaim,
+    EventWatcherContext,
+    EventWatcherDelivery,
+    EventWatcherDeliveryStatus,
+    EventWatcherRunResult,
+    EventWatcherState,
+    EventWatcherStore,
     ForkSessionRequest,
     InlineDispatcher,
     InMemoryBudgetLedger,
     InMemoryBudgetStore,
+    InMemoryEventWatcherStore,
     InMemoryTaskStore,
     InterruptSessionRequest,
     LabelSelectorOperator,
@@ -204,7 +213,12 @@ from cayu.runtime import (
     trim_context_turns,
     usage_metrics_from_event_payload,
 )
-from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore, SQLiteTaskStore
+from cayu.storage import (
+    SQLiteBudgetLedger,
+    SQLiteEventWatcherStore,
+    SQLiteSessionStore,
+    SQLiteTaskStore,
+)
 from cayu.tools import (
     ArtifactReader,
     ArtifactReadRequest,
@@ -344,6 +358,14 @@ __all__ = [
     "EventRecord",
     "EventSummary",
     "EventType",
+    "EventWatcher",
+    "EventWatcherClaim",
+    "EventWatcherContext",
+    "EventWatcherDelivery",
+    "EventWatcherDeliveryStatus",
+    "EventWatcherRunResult",
+    "EventWatcherState",
+    "EventWatcherStore",
     "ExecCommand",
     "ExecCommandTool",
     "ExecResult",
@@ -353,6 +375,7 @@ __all__ = [
     "ImageArtifactReader",
     "InMemoryBudgetLedger",
     "InMemoryBudgetStore",
+    "InMemoryEventWatcherStore",
     "InMemoryTaskStore",
     "InlineDispatcher",
     "InterruptSessionRequest",
@@ -391,6 +414,7 @@ __all__ = [
     "PdfArtifactReader",
     "PendingToolApproval",
     "PendingToolCallApproval",
+    "PostgresEventWatcherStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
     "PricingCatalog",
@@ -413,6 +437,7 @@ __all__ = [
     "RuntimeHookContext",
     "RuntimeHookPhase",
     "SQLiteBudgetLedger",
+    "SQLiteEventWatcherStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
     "SbxCloseAction",
@@ -510,7 +535,7 @@ __all__ = [
 def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so ``import cayu`` does not depend on psycopg being installed.
-    if name in {"PostgresSessionStore", "PostgresTaskStore"}:
+    if name in {"PostgresEventWatcherStore", "PostgresSessionStore", "PostgresTaskStore"}:
         from cayu.storage import postgres
 
         return getattr(postgres, name)

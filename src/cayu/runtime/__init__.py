@@ -66,6 +66,17 @@ from cayu.runtime.dispatch import (
     copy_dispatch_request,
 )
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
+from cayu.runtime.event_watchers import (
+    EventWatcher,
+    EventWatcherClaim,
+    EventWatcherContext,
+    EventWatcherDelivery,
+    EventWatcherDeliveryStatus,
+    EventWatcherRunResult,
+    EventWatcherState,
+    EventWatcherStore,
+    InMemoryEventWatcherStore,
+)
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookContext,
@@ -192,10 +203,19 @@ __all__ = [
     "EventRecord",
     "EventSink",
     "EventSummary",
+    "EventWatcher",
+    "EventWatcherClaim",
+    "EventWatcherContext",
+    "EventWatcherDelivery",
+    "EventWatcherDeliveryStatus",
+    "EventWatcherRunResult",
+    "EventWatcherState",
+    "EventWatcherStore",
     "ForkSessionRequest",
     "InMemoryBudgetLedger",
     "InMemoryBudgetStore",
     "InMemoryEventSink",
+    "InMemoryEventWatcherStore",
     "InMemorySessionStore",
     "InMemoryTaskStore",
     "InlineDispatcher",

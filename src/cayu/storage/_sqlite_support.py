@@ -105,6 +105,20 @@ _BASELINE_DDL = """
         completed_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
+        watcher_name TEXT PRIMARY KEY,
+        cursor_sequence INTEGER NOT NULL,
+        pending_event_id TEXT,
+        pending_event_sequence INTEGER,
+        pending_attempt INTEGER NOT NULL,
+        pending_claim_id TEXT,
+        delivery_status TEXT,
+        lease_expires_at TEXT,
+        last_error TEXT,
+        dead_lettered_count INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_cayu_sessions_status
         ON cayu_sessions(status);
     CREATE INDEX IF NOT EXISTS idx_cayu_sessions_agent_name
@@ -141,6 +155,8 @@ _BASELINE_DDL = """
         ON cayu_tasks(parent_task_id);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_assigned_agent_name
         ON cayu_tasks(assigned_agent_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
+        ON cayu_event_watcher_state(delivery_status, lease_expires_at);
 """
 
 # Bookkeeping table created/owned by the migrator (separate from a revision's DDL).
@@ -168,6 +184,24 @@ _MIGRATION_STEPS: dict[int, str] = {
 
         CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session
             ON cayu_session_labels(key, value, session_id);
+    """,
+    3: """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
+            watcher_name TEXT PRIMARY KEY,
+            cursor_sequence INTEGER NOT NULL,
+            pending_event_id TEXT,
+            pending_event_sequence INTEGER,
+            pending_attempt INTEGER NOT NULL,
+            pending_claim_id TEXT,
+            delivery_status TEXT,
+            lease_expires_at TEXT,
+            last_error TEXT,
+            dead_lettered_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
+            ON cayu_event_watcher_state(delivery_status, lease_expires_at);
     """,
 }
 

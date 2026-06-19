@@ -97,6 +97,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         completed_at TIMESTAMPTZ
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
+        watcher_name TEXT PRIMARY KEY,
+        cursor_sequence BIGINT NOT NULL,
+        pending_event_id TEXT,
+        pending_event_sequence BIGINT,
+        pending_attempt INTEGER NOT NULL,
+        pending_claim_id TEXT,
+        delivery_status TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        last_error TEXT,
+        dead_lettered_count INTEGER NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_status ON cayu_sessions(status)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_agent_name ON cayu_sessions(agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_environment_name "
@@ -120,6 +135,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_task_id ON cayu_tasks(parent_task_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_assigned_agent_name "
     "ON cayu_tasks(assigned_agent_name)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery "
+    "ON cayu_event_watcher_state(delivery_status, lease_expires_at)",
 )
 
 # Bookkeeping table created/owned by the migrator (separate from a revision's DDL).

@@ -28,6 +28,7 @@ from cayu.runtime import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_event_watcher_state",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",

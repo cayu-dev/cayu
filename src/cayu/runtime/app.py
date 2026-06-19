@@ -103,6 +103,18 @@ from cayu.runtime.dispatch import (
     copy_dispatch_request,
 )
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.event_watchers import (
+    EVENT_WATCHER_QUERY_PAGE_LIMIT,
+    EventWatcher,
+    EventWatcherContext,
+    EventWatcherDeliveryStatus,
+    EventWatcherRunResult,
+    EventWatcherStore,
+    InMemoryEventWatcherStore,
+    event_query_after_cursor,
+    event_watcher_error_payload,
+    run_event_watcher_handler,
+)
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookContext,
@@ -286,6 +298,7 @@ class CayuApp:
         budget_policy: BudgetPolicy | None = None,
         budget_store: BudgetStore | None = None,
         budget_ledger: BudgetLedger | None = None,
+        event_watcher_store: EventWatcherStore | None = None,
         retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -305,6 +318,11 @@ class CayuApp:
             raise TypeError("budget_store must be a BudgetStore.")
         if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
             raise TypeError("budget_ledger must be a BudgetLedger.")
+        if event_watcher_store is not None and not isinstance(
+            event_watcher_store,
+            EventWatcherStore,
+        ):
+            raise TypeError("event_watcher_store must be an EventWatcherStore.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
@@ -345,6 +363,11 @@ class CayuApp:
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
         self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self.event_watcher_store = (
+            event_watcher_store
+            if event_watcher_store is not None
+            else InMemoryEventWatcherStore()
+        )
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
@@ -964,6 +987,108 @@ class CayuApp:
             if len(page) < query.limit:
                 return records
             after_sequence = page[-1].sequence
+
+    async def run_event_watchers(
+        self,
+        watchers: Iterable[EventWatcher],
+        *,
+        limit: int = 100,
+    ) -> list[EventWatcherRunResult]:
+        """Process durable event watchers once.
+
+        Watchers run over already-persisted events. Delivery is ordered and
+        at-least-once: a cursor advances only after the handler succeeds or the
+        event reaches the watcher's dead-letter threshold.
+        """
+        watcher_list = _validate_event_watchers(watchers)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be an integer greater than or equal to 1.")
+
+        remaining = limit
+        results: list[EventWatcherRunResult] = []
+        for watcher in watcher_list:
+            deliveries = []
+            blocked_by_active_lease = False
+            processed_for_watcher = 0
+            while remaining > 0 and processed_for_watcher < watcher.batch_size:
+                state = await self.event_watcher_store.load_state(watcher.name)
+                page_limit = min(
+                    remaining,
+                    watcher.batch_size - processed_for_watcher,
+                    EVENT_WATCHER_QUERY_PAGE_LIMIT,
+                )
+                records = await self.session_store.query_events(
+                    event_query_after_cursor(
+                        watcher.query,
+                        state.cursor_sequence,
+                        limit=page_limit,
+                    )
+                )
+                if not records:
+                    break
+
+                should_fetch_next_page = True
+                for record in records:
+                    claim = await self.event_watcher_store.claim_event(
+                        watcher_name=watcher.name,
+                        record=record,
+                        lease_seconds=watcher.lease_seconds,
+                    )
+                    if claim is None:
+                        refreshed_state = await self.event_watcher_store.load_state(watcher.name)
+                        if refreshed_state.cursor_sequence >= record.sequence:
+                            continue
+                        blocked_by_active_lease = True
+                        should_fetch_next_page = False
+                        break
+
+                    try:
+                        await run_event_watcher_handler(
+                            watcher,
+                            EventWatcherContext(
+                                watcher_name=watcher.name,
+                                record=record,
+                                attempt=claim.attempt,
+                            ),
+                        )
+                    except Exception as exc:
+                        delivery = await self.event_watcher_store.mark_failure(
+                            claim,
+                            error=event_watcher_error_payload(exc),
+                            max_attempts=watcher.max_attempts,
+                        )
+                        deliveries.append(delivery)
+                        remaining -= 1
+                        processed_for_watcher += 1
+                        if delivery.status is not EventWatcherDeliveryStatus.DEAD_LETTERED:
+                            should_fetch_next_page = False
+                            break
+                        continue
+
+                    delivery = await self.event_watcher_store.mark_success(claim)
+                    deliveries.append(delivery)
+                    remaining -= 1
+                    processed_for_watcher += 1
+
+                    if remaining <= 0 or processed_for_watcher >= watcher.batch_size:
+                        should_fetch_next_page = False
+                        break
+
+                if len(records) < page_limit:
+                    break
+                if not should_fetch_next_page:
+                    break
+
+            results.append(
+                EventWatcherRunResult(
+                    watcher_name=watcher.name,
+                    deliveries=deliveries,
+                    blocked_by_active_lease=blocked_by_active_lease,
+                )
+            )
+            if remaining <= 0:
+                break
+        return results
 
     async def get_session_cost(
         self,
@@ -5848,3 +5973,20 @@ def _validate_runtime_hooks(
             raise TypeError(f"{field_name} must contain RuntimeHook instances.")
         require_clean_nonblank(hook.name, "runtime_hook.name")
     return tuple(hook_list)
+
+
+def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWatcher, ...]:
+    if isinstance(watchers, str | bytes):
+        raise TypeError("watchers must be an iterable of EventWatcher instances.")
+    try:
+        watcher_list = list(watchers)
+    except TypeError as exc:
+        raise TypeError("watchers must be an iterable of EventWatcher instances.") from exc
+    names: set[str] = set()
+    for watcher in watcher_list:
+        if type(watcher) is not EventWatcher:
+            raise TypeError("watchers must contain EventWatcher instances.")
+        if watcher.name in names:
+            raise ValueError(f"Duplicate event watcher name: {watcher.name}")
+        names.add(watcher.name)
+    return tuple(watcher_list)

@@ -215,6 +215,45 @@ to redact known secret values. Applications can disable the default sink with
 `CayuApp(enable_logging=False)`, pass additional sinks through
 `CayuApp(event_sinks=[...])`.
 
+## Event Watchers
+
+Event watchers are durable app-side processors for events that were already
+persisted by the runtime. They are for side effects that should survive worker
+restarts, such as sending a budget alert email after `budget.limit_reached`,
+posting a webhook when a task completes, or dispatching follow-up work after a
+session finishes.
+
+They are deliberately separate from runtime hooks and event sinks:
+
+- hooks run inside the model/tool loop and can affect runtime decisions;
+- event sinks fan out live events for logs, CLIs, dashboards, or webhooks;
+- event watchers pull durable events later and record delivery state.
+
+Watchers are trusted application code. The model cannot install arbitrary
+watchers or scripts. A watcher has a stable name, an `EventQuery` filter, and a
+handler. `CayuApp.run_event_watchers([...])` processes matching events with
+ordered at-least-once delivery. The watcher cursor advances only after the
+handler succeeds or the event reaches `max_attempts` and is dead-lettered. If a
+handler fails below the attempt ceiling, the cursor stays on that event and the
+next watcher run retries it before later matching events.
+Watcher throughput is controlled by `EventWatcher.batch_size` and the
+`run_event_watchers(..., limit=...)` call; `EventQuery.limit` is ignored for
+delivery because the watcher owns the cursor.
+
+`InMemoryEventWatcherStore` is useful for tests and single-process examples.
+`SQLiteEventWatcherStore` persists watcher cursors, leases, attempts, last
+errors, and dead-letter counts for durable local apps.
+`PostgresEventWatcherStore` provides the same contract for hosted multi-worker
+apps and uses transactional row locks to serialize claims for the same watcher.
+A live lease prevents two workers with the same watcher name from handling the
+same event at the same time; an expired lease can be claimed again, so handlers
+must be idempotent. Use a stable idempotency key such as
+`(watcher_name, event.id)` when calling external systems.
+
+Changing a watcher filter while reusing the same watcher name changes the
+meaning of its cursor. Use a new watcher name when the event selection changes
+semantically.
+
 ## Agent
 
 Turns messages into event streams using:

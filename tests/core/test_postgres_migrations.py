@@ -26,6 +26,7 @@ def _request(agent_name: str) -> RunRequest:
 
 
 _TABLES = (
+    "cayu_event_watcher_state",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",

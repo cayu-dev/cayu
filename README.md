@@ -850,6 +850,51 @@ async def inspect_session(session_id: str):
     return events, transcript
 ```
 
+Process durable events with an app-side watcher:
+
+```python
+from pathlib import Path
+
+from cayu import (
+    CayuApp,
+    EventQuery,
+    EventType,
+    EventWatcher,
+    EventWatcherContext,
+    SQLiteEventWatcherStore,
+    SQLiteSessionStore,
+)
+
+db = Path(".cayu") / "runtime.sqlite"
+app = CayuApp(
+    session_store=SQLiteSessionStore(db),
+    event_watcher_store=SQLiteEventWatcherStore(db),
+)
+
+async def send_budget_alert(context: EventWatcherContext) -> None:
+    event = context.record.event
+    # Use (context.watcher_name, event.id) as the external idempotency key.
+    await send_email(
+        subject="Cayu budget threshold reached",
+        body=f"{event.session_id}: {event.payload}",
+    )
+
+budget_alerts = EventWatcher(
+    name="budget-alert-email",
+    query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+    handler=send_budget_alert,
+)
+
+await app.run_event_watchers([budget_alerts])
+```
+
+Event watchers are not model-facing tools. They are trusted app code that pulls
+from the durable event log, records cursor/attempt state, retries failures, and
+dead-letters events after the configured attempt ceiling.
+Use `InMemoryEventWatcherStore` for tests/single-process examples,
+`SQLiteEventWatcherStore` for durable local apps, and
+`PostgresEventWatcherStore` for hosted multi-worker deployments.
+
 Use durable local task storage for optional background work tracking:
 
 ```python
