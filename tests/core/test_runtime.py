@@ -2739,6 +2739,20 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     ]
 
 
+def test_session_query_validates_label_selector_requirements():
+    query = SessionQuery(
+        label_selectors=[
+            {"key": "project", "operator": "in", "values": ["ap_q2", "research"]},
+            {"key": "workflow", "operator": "exists"},
+        ]
+    )
+
+    assert [selector.key for selector in query.label_selectors] == ["project", "workflow"]
+
+    with pytest.raises(ValidationError):
+        SessionQuery(label_selectors={"key": "project", "operator": "exists"})
+
+
 def test_cayu_app_dispatches_existing_session_inline():
     store = InMemorySessionStore()
     provider = FakeProvider(

@@ -24,11 +24,16 @@ from cayu.runtime.costs import PricingCatalog
 from cayu.runtime.costs import (
     estimate_causal_budget_cost as build_causal_budget_cost_summary,
 )
+from cayu.runtime.costs import (
+    estimate_session_cost as build_session_cost_summary,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     InterruptSessionRequest,
+    LabelSelectorOperator,
+    LabelSelectorRequirement,
     ResumeRequest,
     RunRequest,
     Session,
@@ -99,6 +104,11 @@ class InterruptSessionBody(BaseModel):
 
 class SessionCostBody(BaseModel):
     pricing: PricingCatalog
+    currency: NonBlankString = "USD"
+
+
+class SessionsSummaryBody(BaseModel):
+    pricing: PricingCatalog | None = None
     currency: NonBlankString = "USD"
 
 
@@ -218,6 +228,107 @@ def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
             )
         labels[parsed_key] = parsed_value
     return labels
+
+
+def _parse_session_label_selectors(
+    values: list[str] | None,
+) -> tuple[LabelSelectorRequirement, ...]:
+    if values is None:
+        return ()
+    selectors: list[LabelSelectorRequirement] = []
+    for raw in values:
+        if type(raw) is not str:
+            raise HTTPException(status_code=422, detail="Label selector must be a string.")
+        for expression in _split_label_selector(raw):
+            selectors.append(_parse_label_selector_expression(expression))
+    return tuple(selectors)
+
+
+def _split_label_selector(value: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(value):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                raise HTTPException(status_code=422, detail="Invalid label selector.")
+        elif char == "," and depth == 0:
+            part = value[start:index].strip()
+            if not part:
+                raise HTTPException(status_code=422, detail="Invalid label selector.")
+            parts.append(part)
+            start = index + 1
+    if depth != 0:
+        raise HTTPException(status_code=422, detail="Invalid label selector.")
+    part = value[start:].strip()
+    if not part:
+        raise HTTPException(status_code=422, detail="Invalid label selector.")
+    parts.append(part)
+    return parts
+
+
+def _parse_label_selector_expression(expression: str) -> LabelSelectorRequirement:
+    try:
+        if expression.startswith("!"):
+            key = expression[1:].strip()
+            return LabelSelectorRequirement(
+                key=key,
+                operator=LabelSelectorOperator.NOT_EXISTS,
+            )
+        if " notin " in expression:
+            key, raw_values = expression.split(" notin ", 1)
+            return LabelSelectorRequirement(
+                key=key.strip(),
+                operator=LabelSelectorOperator.NOT_IN,
+                values=_parse_label_selector_values(raw_values),
+            )
+        if " in " in expression:
+            key, raw_values = expression.split(" in ", 1)
+            return LabelSelectorRequirement(
+                key=key.strip(),
+                operator=LabelSelectorOperator.IN,
+                values=_parse_label_selector_values(raw_values),
+            )
+        if "!=" in expression:
+            key, value = expression.split("!=", 1)
+            return LabelSelectorRequirement(
+                key=key.strip(),
+                operator=LabelSelectorOperator.NOT_IN,
+                values=(value.strip(),),
+            )
+        if "==" in expression:
+            key, value = expression.split("==", 1)
+            return LabelSelectorRequirement(
+                key=key.strip(),
+                operator=LabelSelectorOperator.IN,
+                values=(value.strip(),),
+            )
+        if "=" in expression:
+            key, value = expression.split("=", 1)
+            return LabelSelectorRequirement(
+                key=key.strip(),
+                operator=LabelSelectorOperator.IN,
+                values=(value.strip(),),
+            )
+        return LabelSelectorRequirement(
+            key=expression.strip(),
+            operator=LabelSelectorOperator.EXISTS,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _parse_label_selector_values(raw_values: str) -> tuple[str, ...]:
+    raw_values = raw_values.strip()
+    if not raw_values.startswith("(") or not raw_values.endswith(")"):
+        raise HTTPException(status_code=422, detail="Label selector values must use `(a,b)`.")
+    values = tuple(value.strip() for value in raw_values[1:-1].split(","))
+    if any(not value for value in values):
+        raise HTTPException(status_code=422, detail="Label selector values cannot be blank.")
+    return values
 
 
 def _clean_optional_query_value(value: str | None, field_name: str) -> str | None:
@@ -432,8 +543,10 @@ def create_router(
         causal_budget_id: str | None = None,
         order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
         label: Annotated[list[str] | None, Query()] = None,
+        label_selector: Annotated[list[str] | None, Query()] = None,
     ):
         labels = _parse_session_label_filters(label)
+        label_selectors = _parse_session_label_selectors(label_selector)
         sessions = await session_store.list_sessions(
             SessionQuery(
                 status=status,
@@ -451,6 +564,7 @@ def create_router(
                     "causal_budget_id",
                 ),
                 labels=labels,
+                label_selectors=label_selectors,
                 limit=limit,
                 offset=offset,
                 order_by=order_by,
@@ -473,6 +587,129 @@ def create_router(
             }
             for s in sessions
         ]
+
+    @router.post("/sessions/summary")
+    async def get_sessions_summary(
+        body: SessionsSummaryBody | None = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        status: SessionStatus | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        parent_session_id: str | None = None,
+        causal_budget_id: str | None = None,
+        order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC,
+        label: Annotated[list[str] | None, Query()] = None,
+        label_selector: Annotated[list[str] | None, Query()] = None,
+    ):
+        body = body or SessionsSummaryBody()
+        labels = _parse_session_label_filters(label)
+        label_selectors = _parse_session_label_selectors(label_selector)
+        sessions = await session_store.list_sessions(
+            SessionQuery(
+                status=status,
+                agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                environment_name=_clean_optional_query_value(
+                    environment_name,
+                    "environment_name",
+                ),
+                parent_session_id=_clean_optional_query_value(
+                    parent_session_id,
+                    "parent_session_id",
+                ),
+                causal_budget_id=_clean_optional_query_value(
+                    causal_budget_id,
+                    "causal_budget_id",
+                ),
+                labels=labels,
+                label_selectors=label_selectors,
+                limit=limit,
+                offset=offset,
+                order_by=order_by,
+            )
+        )
+        session_event_records_by_id: dict[str, list[EventRecord]] = {}
+        session_ids = [session.id for session in sessions]
+        all_event_records = await _query_all_session_event_records(session_ids)
+        for record in all_event_records:
+            session_event_records_by_id.setdefault(record.event.session_id, []).append(record)
+        for session in sessions:
+            session_event_records_by_id.setdefault(session.id, [])
+
+        usage_event_records = [
+            record
+            for record in all_event_records
+            if record.event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}
+        ]
+        usage_events = [
+            record.event
+            for record in sorted(usage_event_records, key=lambda record: record.sequence)
+        ]
+        usage_summary = causal_budget_usage_summary(
+            causal_budget_id="session-query",
+            session_ids=session_ids,
+            events=usage_events,
+        ).model_dump()
+        usage_summary.pop("causal_budget_id", None)
+
+        cost_summary = None
+        if body.pricing is not None:
+            model_events = [
+                record.event
+                for record in sorted(all_event_records, key=lambda record: record.sequence)
+                if record.event.type == EventType.MODEL_COMPLETED
+            ]
+            aggregate_cost = build_session_cost_summary(
+                session_id="session-query",
+                events=model_events,
+                pricing=body.pricing,
+                currency=body.currency,
+            ).model_dump(mode="json")
+            aggregate_cost.pop("session_id", None)
+            aggregate_cost["session_ids"] = session_ids
+            aggregate_cost["session_count"] = len(session_ids)
+            aggregate_cost["session_costs"] = [
+                build_session_cost_summary(
+                    session_id=session.id,
+                    events=[
+                        record.event
+                        for record in session_event_records_by_id[session.id]
+                        if record.event.type == EventType.MODEL_COMPLETED
+                    ],
+                    pricing=body.pricing,
+                    currency=body.currency,
+                ).model_dump(mode="json")
+                for session in sessions
+            ]
+            cost_summary = aggregate_cost
+
+        session_items = []
+        for session in sessions:
+            records = session_event_records_by_id[session.id]
+            outcome = session_outcome_from_records(session, records)
+            event_summary = event_summary_from_records(session.id, records)
+            session_items.append(
+                {
+                    "session": _serialize_session(session),
+                    "outcome": _serialize_session_outcome(outcome),
+                    "events": {
+                        "total_events": event_summary.total_events,
+                        "counts_by_type": event_summary.counts_by_type,
+                        "latest_event": (
+                            None
+                            if event_summary.latest_event is None
+                            else _serialize_event_record(event_summary.latest_event)
+                        ),
+                    },
+                }
+            )
+
+        return {
+            "session_count": len(sessions),
+            "sessions": session_items,
+            "usage": usage_summary,
+            "cost": cost_summary,
+        }
 
     @router.get("/sessions/{session_id}/usage")
     async def get_session_usage(session_id: NonBlankString):
@@ -643,6 +880,26 @@ def create_router(
             if len(page) < 1000:
                 return sessions
             offset += len(page)
+
+    async def _query_all_session_event_records(session_ids: list[str]) -> list[EventRecord]:
+        if not session_ids:
+            return []
+        records: list[EventRecord] = []
+        after_sequence = None
+        while True:
+            page = await session_store.query_events(
+                EventQuery(
+                    session_ids=tuple(session_ids),
+                    after_sequence=after_sequence,
+                    limit=5000,
+                )
+            )
+            if not page:
+                return records
+            records.extend(page)
+            if len(page) < 5000:
+                return records
+            after_sequence = page[-1].sequence
 
     async def _query_all_causal_event_records(causal_budget_id: str) -> list[EventRecord]:
         records: list[EventRecord] = []

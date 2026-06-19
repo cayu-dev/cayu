@@ -870,6 +870,79 @@ def test_sqlite_session_store_migrates_revision_one_database_to_session_labels(t
     assert version == schema_migrations.LATEST_REVISION
 
 
+def test_sqlite_session_store_filters_session_label_selectors(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+
+    async def assert_selectors() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_sqlite_selector_invoice",
+                labels={"owner": "org_123", "project": "ap_q2", "workflow": "invoice"},
+                messages=[Message.text("user", "invoice")],
+            ),
+            identity=_identity(),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_sqlite_selector_research",
+                labels={"owner": "org_123", "project": "research"},
+                messages=[Message.text("user", "research")],
+            ),
+            identity=_identity(),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_sqlite_selector_unowned",
+                labels={"project": "ap_q2"},
+                messages=[Message.text("user", "review")],
+            ),
+            identity=_identity(),
+        )
+
+        exists = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[{"key": "workflow", "operator": "exists"}],
+                order_by="created_at_asc",
+            )
+        )
+        in_selector = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[
+                    {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
+                ],
+                order_by="created_at_asc",
+            )
+        )
+        not_in = await store.list_sessions(
+            SessionQuery(
+                labels={"owner": "org_123"},
+                label_selectors=[{"key": "project", "operator": "not_in", "values": ["research"]}],
+                order_by="created_at_asc",
+            )
+        )
+        not_exists = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[{"key": "owner", "operator": "not_exists"}],
+                order_by="created_at_asc",
+            )
+        )
+
+        assert [session.id for session in exists] == ["sess_sqlite_selector_invoice"]
+        assert [session.id for session in in_selector] == [
+            "sess_sqlite_selector_invoice",
+            "sess_sqlite_selector_research",
+            "sess_sqlite_selector_unowned",
+        ]
+        assert [session.id for session in not_in] == ["sess_sqlite_selector_invoice"]
+        assert [session.id for session in not_exists] == ["sess_sqlite_selector_unowned"]
+        await _close(store)
+
+    asyncio.run(assert_selectors())
+
+
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):
     store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
     app = CayuApp(session_store=store)

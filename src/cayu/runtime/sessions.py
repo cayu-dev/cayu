@@ -344,6 +344,79 @@ class SessionOrder(StrEnum):
     UPDATED_AT_DESC = "updated_at_desc"
 
 
+class LabelSelectorOperator(StrEnum):
+    EXISTS = "exists"
+    NOT_EXISTS = "not_exists"
+    IN = "in"
+    NOT_IN = "not_in"
+
+
+class LabelSelectorRequirement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    operator: LabelSelectorOperator
+    values: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return next(iter(copy_label_map({value: "_"}, "label selector").keys()))
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def copy_values(cls, value) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if type(value) is str:
+            raise ValueError("`values` must be a sequence of strings.")
+        values = tuple(value)
+        copied: list[str] = []
+        for index, item in enumerate(values):
+            if type(item) is not str:
+                raise ValueError("`values` must contain only strings.")
+            copied_value = next(
+                iter(copy_label_map({f"value_{index}": item}, "label selector value").values())
+            )
+            if copied_value in copied:
+                raise ValueError("`values` must not contain duplicates.")
+            copied.append(copied_value)
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_operator_values(self) -> LabelSelectorRequirement:
+        if self.operator in {LabelSelectorOperator.EXISTS, LabelSelectorOperator.NOT_EXISTS}:
+            if self.values:
+                raise ValueError(f"`{self.operator}` label selector must not include values.")
+        elif not self.values:
+            raise ValueError(f"`{self.operator}` label selector requires at least one value.")
+        return self
+
+
+def copy_label_selector_requirements(
+    value: Any,
+    field_name: str = "label_selectors",
+) -> tuple[LabelSelectorRequirement, ...]:
+    if value is None:
+        return ()
+    if type(value) is LabelSelectorRequirement:
+        return (value.model_copy(deep=True),)
+    if type(value) in {str, dict}:
+        raise ValueError(f"`{field_name}` must be a sequence of label selector requirements.")
+    try:
+        values = tuple(value)
+    except TypeError as exc:
+        raise ValueError(
+            f"`{field_name}` must be a sequence of label selector requirements."
+        ) from exc
+    return tuple(
+        item.model_copy(deep=True)
+        if type(item) is LabelSelectorRequirement
+        else LabelSelectorRequirement.model_validate(item)
+        for item in values
+    )
+
+
 class SessionQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -353,6 +426,7 @@ class SessionQuery(BaseModel):
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    label_selectors: tuple[LabelSelectorRequirement, ...] = Field(default_factory=tuple)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0)
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
@@ -372,6 +446,11 @@ class SessionQuery(BaseModel):
     @classmethod
     def copy_query_labels(cls, value) -> dict[str, str]:
         return copy_label_map(value, "labels")
+
+    @field_validator("label_selectors", mode="before")
+    @classmethod
+    def copy_query_label_selectors(cls, value) -> tuple[LabelSelectorRequirement, ...]:
+        return copy_label_selector_requirements(value)
 
 
 class EventRecord(BaseModel):
@@ -439,6 +518,7 @@ class EventQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str | None = None
+    session_ids: tuple[str, ...] = Field(default_factory=tuple)
     causal_budget_id: str | None = None
     event_type: EventType | str | None = None
     agent_name: str | None = None
@@ -468,6 +548,22 @@ class EventQuery(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("session_ids", mode="before")
+    @classmethod
+    def copy_session_ids(cls, value) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if type(value) is str:
+            raise ValueError("`session_ids` must be a sequence of strings.")
+        values = tuple(value)
+        copied: list[str] = []
+        for index, item in enumerate(values):
+            clean_item = require_clean_nonblank(item, f"session_ids[{index}]")
+            if clean_item in copied:
+                raise ValueError("`session_ids` must not contain duplicates.")
+            copied.append(clean_item)
+        return tuple(copied)
+
     @field_validator("event_type")
     @classmethod
     def validate_event_type(cls, value: EventType | str | None) -> EventType | str | None:
@@ -488,6 +584,8 @@ class EventQuery(BaseModel):
 
     @model_validator(mode="after")
     def validate_time_range(self) -> EventQuery:
+        if self.session_id is not None and self.session_ids:
+            raise ValueError("Use either `session_id` or `session_ids`, not both.")
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError("EventQuery since must be before until.")
         return self
@@ -1405,6 +1503,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
         labels=copy_label_map(query.labels, "labels"),
+        label_selectors=copy_label_selector_requirements(query.label_selectors),
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -1418,6 +1517,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         raise TypeError("Event queries must be EventQuery instances.")
     return EventQuery(
         session_id=query.session_id,
+        session_ids=query.session_ids,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         agent_name=query.agent_name,
@@ -1454,9 +1554,28 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     for key, value in query.labels.items():
         if session.labels.get(key) != value:
             return False
+    for selector in query.label_selectors:
+        if not _label_selector_matches(session.labels, selector):
+            return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
     )
+
+
+def _label_selector_matches(
+    labels: dict[str, str],
+    selector: LabelSelectorRequirement,
+) -> bool:
+    value = labels.get(selector.key)
+    if selector.operator == LabelSelectorOperator.EXISTS:
+        return value is not None
+    if selector.operator == LabelSelectorOperator.NOT_EXISTS:
+        return value is None
+    if selector.operator == LabelSelectorOperator.IN:
+        return value in selector.values
+    if selector.operator == LabelSelectorOperator.NOT_IN:
+        return value is None or value not in selector.values
+    raise ValueError(f"Unsupported label selector operator: {selector.operator}")
 
 
 def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Session]:
@@ -1486,6 +1605,8 @@ def _event_record_matches(
     if query.after_sequence is not None and record.sequence <= query.after_sequence:
         return False
     if query.session_id is not None and event.session_id != query.session_id:
+        return False
+    if query.session_ids and event.session_id not in query.session_ids:
         return False
     event_timestamp = event.timestamp.astimezone(UTC)
     if query.since is not None and event_timestamp < query.since:

@@ -570,6 +570,33 @@ def test_postgres_session_store_preserves_and_filters_session_labels(postgres_ds
             )
         )
         missing_sessions = await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+        exists_sessions = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[{"key": "workflow", "operator": "exists"}],
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        in_sessions = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[
+                    {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
+                ],
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        not_in_sessions = await store.list_sessions(
+            SessionQuery(
+                labels={"owner": "org_123"},
+                label_selectors=[{"key": "project", "operator": "not_in", "values": ["research"]}],
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        not_exists_sessions = await store.list_sessions(
+            SessionQuery(
+                label_selectors=[{"key": "owner", "operator": "not_exists"}],
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
 
         assert loaded is not None
         assert loaded.labels == {
@@ -583,6 +610,14 @@ def test_postgres_session_store_preserves_and_filters_session_labels(postgres_ds
         ]
         assert [session.id for session in exact_sessions] == ["sess_pg_labels_invoice"]
         assert missing_sessions == []
+        assert [session.id for session in exists_sessions] == ["sess_pg_labels_invoice"]
+        assert [session.id for session in in_sessions] == [
+            "sess_pg_labels_invoice",
+            "sess_pg_labels_research",
+            "sess_pg_labels_other_owner",
+        ]
+        assert [session.id for session in not_in_sessions] == ["sess_pg_labels_invoice"]
+        assert [session.id for session in not_exists_sessions] == []
 
     _run(postgres_dsn, ops)
 
@@ -665,6 +700,9 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
             )
         )
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
+        session_ids_records = await store.query_events(
+            EventQuery(session_ids=("sess_reviewer", "sess_builder"), limit=10)
+        )
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
         cursor_records = await store.query_events(
@@ -676,6 +714,12 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         assert [r.event.id for r in until_records] == ["event_1", "event_2"]
         assert [r.event.id for r in window_records] == ["event_2", "event_3"]
         assert [r.event.id for r in builder_records] == ["event_1", "event_2", "event_3"]
+        assert [r.event.id for r in session_ids_records] == [
+            "event_1",
+            "event_2",
+            "event_3",
+            "event_4",
+        ]
         assert [r.event.id for r in read_file_records] == ["event_2"]
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]
         assert [r.event.id for r in cursor_records] == ["event_3", "event_4"]
@@ -946,6 +990,73 @@ def test_postgres_session_store_summarize_events(postgres_dsn):
 
         with pytest.raises(KeyError, match="Session not found"):
             await store.summarize_events("missing_session")
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_batches_large_event_session_id_queries(postgres_dsn, monkeypatch):
+    import cayu.storage.postgres as postgres_module
+
+    monkeypatch.setattr(postgres_module, "_EVENT_QUERY_SESSION_IDS_BATCH_SIZE", 2)
+
+    async def ops(store):
+        for index in range(5):
+            session_id = f"sess_batch_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="builder",
+                    session_id=session_id,
+                    environment_name="local",
+                    messages=[Message.text("user", f"batch {index}")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=f"event_batch_{index}",
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="builder",
+                    environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, index, tzinfo=UTC),
+                ),
+            )
+
+        session_ids = (
+            "sess_batch_4",
+            "sess_batch_0",
+            "sess_batch_2",
+            "sess_batch_1",
+            "sess_batch_3",
+        )
+        records = await store.query_events(EventQuery(session_ids=session_ids, limit=10))
+        limited_records = await store.query_events(EventQuery(session_ids=session_ids, limit=3))
+        cursor_records = await store.query_events(
+            EventQuery(
+                session_ids=session_ids,
+                after_sequence=records[1].sequence,
+                limit=10,
+            )
+        )
+
+        assert [record.event.id for record in records] == [
+            "event_batch_0",
+            "event_batch_1",
+            "event_batch_2",
+            "event_batch_3",
+            "event_batch_4",
+        ]
+        assert [record.event.id for record in limited_records] == [
+            "event_batch_0",
+            "event_batch_1",
+            "event_batch_2",
+        ]
+        assert [record.event.id for record in cursor_records] == [
+            "event_batch_2",
+            "event_batch_3",
+            "event_batch_4",
+        ]
 
     _run(postgres_dsn, ops)
 

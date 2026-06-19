@@ -21,6 +21,7 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
+    LabelSelectorOperator,
     RunRequest,
     Session,
     SessionIdentity,
@@ -62,6 +63,37 @@ from cayu.storage import migrations as schema
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
+_EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
+
+
+def _event_query_session_id_batches(
+    session_ids: tuple[str, ...],
+) -> list[tuple[str, ...]]:
+    return [
+        session_ids[index : index + _EVENT_QUERY_SESSION_IDS_BATCH_SIZE]
+        for index in range(0, len(session_ids), _EVENT_QUERY_SESSION_IDS_BATCH_SIZE)
+    ]
+
+
+def _event_query_with_session_ids(
+    query: EventQuery,
+    *,
+    session_ids: tuple[str, ...],
+) -> EventQuery:
+    return EventQuery(
+        session_ids=session_ids,
+        causal_budget_id=query.causal_budget_id,
+        event_type=query.event_type,
+        agent_name=query.agent_name,
+        environment_name=query.environment_name,
+        workflow_name=query.workflow_name,
+        tool_name=query.tool_name,
+        since=query.since,
+        until=query.until,
+        after_sequence=query.after_sequence,
+        limit=query.limit,
+    )
+
 
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
@@ -687,6 +719,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
+        if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+            return await self._query_events_by_session_id_batches(query)
+
         clauses: list[str] = []
         params: list[object] = []
 
@@ -696,6 +731,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if query.session_id is not None:
             clauses.append("cayu_events.session_id = %s")
             params.append(query.session_id)
+        if query.session_ids:
+            placeholders = ", ".join("%s" for _ in query.session_ids)
+            clauses.append(f"cayu_events.session_id IN ({placeholders})")
+            params.extend(query.session_ids)
         if query.causal_budget_id is not None:
             clauses.append("cayu_sessions.causal_budget_id = %s")
             params.append(query.causal_budget_id)
@@ -744,6 +783,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             )
             rows = await cur.fetchall()
             return [EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))) for row in rows]
+
+    async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
+        records: list[EventRecord] = []
+        for batch in _event_query_session_id_batches(query.session_ids):
+            records.extend(
+                await self.query_events(
+                    _event_query_with_session_ids(query, session_ids=batch),
+                )
+            )
+        records.sort(key=lambda record: record.sequence)
+        return records[: query.limit]
 
     async def summarize_events(self, session_id: str) -> EventSummary:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -885,6 +935,49 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 """
             )
             params.extend([key, value])
+        for selector in query.label_selectors:
+            if selector.operator == LabelSelectorOperator.EXISTS:
+                clauses.append(
+                    """
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_session_labels
+                        WHERE cayu_session_labels.session_id = cayu_sessions.id
+                          AND cayu_session_labels.key = %s
+                    )
+                    """
+                )
+                params.append(selector.key)
+            elif selector.operator == LabelSelectorOperator.NOT_EXISTS:
+                clauses.append(
+                    """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM cayu_session_labels
+                        WHERE cayu_session_labels.session_id = cayu_sessions.id
+                          AND cayu_session_labels.key = %s
+                    )
+                    """
+                )
+                params.append(selector.key)
+            else:
+                placeholders = ", ".join("%s" for _ in selector.values)
+                exists_sql = f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_session_labels
+                        WHERE cayu_session_labels.session_id = cayu_sessions.id
+                          AND cayu_session_labels.key = %s
+                          AND cayu_session_labels.value IN ({placeholders})
+                    )
+                    """
+                if selector.operator == LabelSelectorOperator.IN:
+                    clauses.append(exists_sql)
+                elif selector.operator == LabelSelectorOperator.NOT_IN:
+                    clauses.append(f"NOT {exists_sql}")
+                else:
+                    raise ValueError(f"Unsupported label selector operator: {selector.operator}")
+                params.extend([selector.key, *selector.values])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = pg_support.session_order_sql(query.order_by)

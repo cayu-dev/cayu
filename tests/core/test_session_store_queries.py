@@ -374,6 +374,9 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             )
         )
         builder_records = await store.query_events(EventQuery(session_id="sess_builder"))
+        session_ids_records = await store.query_events(
+            EventQuery(session_ids=("sess_reviewer", "sess_builder"), limit=10)
+        )
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
         causal_records = await store.query_events(EventQuery(causal_budget_id="job_build"))
@@ -394,6 +397,12 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_1",
             "event_2",
             "event_3",
+        ]
+        assert [record.event.id for record in session_ids_records] == [
+            "event_1",
+            "event_2",
+            "event_3",
+            "event_4",
         ]
         assert [record.event.id for record in read_file_records] == ["event_2"]
         assert [record.event.id for record in started_records] == [
@@ -444,6 +453,75 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         ]
         with pytest.raises(KeyError, match="Session not found"):
             await store.summarize_events("missing_session")
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_session_store_batches_large_event_session_id_queries(tmp_path, monkeypatch):
+    import cayu.storage.sqlite as sqlite_module
+
+    monkeypatch.setattr(sqlite_module, "_EVENT_QUERY_SESSION_IDS_BATCH_SIZE", 2)
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+
+    async def run_store_operations() -> None:
+        for index in range(5):
+            session_id = f"sess_batch_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="builder",
+                    session_id=session_id,
+                    environment_name="local",
+                    messages=[Message.text("user", f"batch {index}")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=f"event_batch_{index}",
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="builder",
+                    environment_name="local",
+                    timestamp=datetime(2026, 1, 1, 12, index, tzinfo=UTC),
+                ),
+            )
+
+        session_ids = (
+            "sess_batch_4",
+            "sess_batch_0",
+            "sess_batch_2",
+            "sess_batch_1",
+            "sess_batch_3",
+        )
+        records = await store.query_events(EventQuery(session_ids=session_ids, limit=10))
+        limited_records = await store.query_events(EventQuery(session_ids=session_ids, limit=3))
+        cursor_records = await store.query_events(
+            EventQuery(
+                session_ids=session_ids,
+                after_sequence=records[1].sequence,
+                limit=10,
+            )
+        )
+
+        assert [record.event.id for record in records] == [
+            "event_batch_0",
+            "event_batch_1",
+            "event_batch_2",
+            "event_batch_3",
+            "event_batch_4",
+        ]
+        assert [record.event.id for record in limited_records] == [
+            "event_batch_0",
+            "event_batch_1",
+            "event_batch_2",
+        ]
+        assert [record.event.id for record in cursor_records] == [
+            "event_batch_2",
+            "event_batch_3",
+            "event_batch_4",
+        ]
         await _close_store(store)
 
     asyncio.run(run_store_operations())

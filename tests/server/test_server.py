@@ -14,7 +14,13 @@ from fastapi.testclient import TestClient
 from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity, SessionStatus
+from cayu.runtime import (
+    EventQuery,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
 from cayu.server import create_server
 
 
@@ -294,6 +300,85 @@ def test_server_lists_sessions_with_typed_and_label_filters_together() -> None:
     assert [session["id"] for session in response.json()] == ["sess_builder_invoice"]
 
 
+def test_server_lists_sessions_with_label_selectors() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    client = TestClient(create_server(app))
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_selector_invoice",
+                labels={"organization": "org_123", "project": "ap_q2", "workflow": "invoice"},
+                messages=[Message.text("user", "invoice")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_selector_research",
+                labels={"organization": "org_123", "project": "research"},
+                messages=[Message.text("user", "research")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_selector_unowned",
+                labels={"project": "ap_q2"},
+                messages=[Message.text("user", "review")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(seed())
+
+    exists_response = client.get(
+        "/api/sessions",
+        params={"label_selector": "workflow"},
+    )
+    in_response = client.get(
+        "/api/sessions",
+        params={"label_selector": "project in (ap_q2,research)"},
+    )
+    equals_response = client.get(
+        "/api/sessions",
+        params={"label_selector": "project==ap_q2"},
+    )
+    not_in_response = client.get(
+        "/api/sessions",
+        params=[
+            ("label", "organization=org_123"),
+            ("label_selector", "project notin (research)"),
+        ],
+    )
+    not_exists_response = client.get(
+        "/api/sessions",
+        params={"label_selector": "!organization"},
+    )
+
+    assert exists_response.status_code == 200
+    assert [session["id"] for session in exists_response.json()] == ["sess_selector_invoice"]
+    assert in_response.status_code == 200
+    assert {session["id"] for session in in_response.json()} == {
+        "sess_selector_invoice",
+        "sess_selector_research",
+        "sess_selector_unowned",
+    }
+    assert equals_response.status_code == 200
+    assert {session["id"] for session in equals_response.json()} == {
+        "sess_selector_invoice",
+        "sess_selector_unowned",
+    }
+    assert not_in_response.status_code == 200
+    assert [session["id"] for session in not_in_response.json()] == ["sess_selector_invoice"]
+    assert not_exists_response.status_code == 200
+    assert [session["id"] for session in not_exists_response.json()] == ["sess_selector_unowned"]
+
+
 def test_server_session_label_filters_allow_reserved_query_keys() -> None:
     app = CayuApp()
     client = TestClient(create_server(app))
@@ -313,6 +398,138 @@ def test_server_rejects_invalid_session_label_filters() -> None:
     assert client.get("/api/sessions?label=owner=org_123&label=owner=org_456").status_code == 422
     assert client.get("/api/sessions?agent_name=%20").status_code == 422
     assert client.get("/api/sessions?status=not-a-status").status_code == 422
+    assert client.get("/api/sessions?label_selector=project%20in%20ap_q2").status_code == 422
+
+
+def test_server_exposes_filtered_sessions_summary() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    for session_id, labels in (
+        ("summary_filter_invoice", {"organization": "org_123", "project": "ap_q2"}),
+        ("summary_filter_research", {"organization": "org_123", "project": "research"}),
+        ("summary_filter_other", {"organization": "org_999", "project": "ap_q2"}),
+    ):
+        asyncio.run(
+            _collect_run(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    labels=labels,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/summary",
+        params=[
+            ("label", "organization=org_123"),
+            ("label_selector", "project in (ap_q2,research)"),
+            ("order_by", "created_at_asc"),
+        ],
+        json={
+            "pricing": {
+                "prices": [
+                    {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_per_million": "1",
+                        "output_per_million": "2",
+                        "cache_read_input_per_million": "0.25",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_count"] == 2
+    assert [item["session"]["id"] for item in body["sessions"]] == [
+        "summary_filter_invoice",
+        "summary_filter_research",
+    ]
+    assert body["usage"]["session_count"] == 2
+    assert body["usage"]["usage"]["total_tokens"] == 24
+    assert body["cost"]["session_count"] == 2
+    assert body["cost"]["total_cost"] == "0.000020"
+    assert [item["session_id"] for item in body["cost"]["session_costs"]] == [
+        "summary_filter_invoice",
+        "summary_filter_research",
+    ]
+
+
+def test_server_filtered_sessions_summary_queries_events_in_one_batch() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    for session_id in ("summary_batch_one", "summary_batch_two"):
+        asyncio.run(
+            _collect_run(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    labels={"organization": "org_123"},
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    queries: list[EventQuery] = []
+    original_query_events = app.session_store.query_events
+
+    async def query_events(query: EventQuery | None = None):
+        copied = EventQuery() if query is None else query
+        queries.append(copied)
+        return await original_query_events(query)
+
+    app.session_store.query_events = query_events
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/summary",
+        params={"label": "organization=org_123", "order_by": "created_at_asc"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session_count"] == 2
+    assert len(queries) == 1
+    assert queries[0].session_ids == ("summary_batch_one", "summary_batch_two")
+    assert queries[0].session_id is None
+
+
+def test_server_sessions_summary_allows_omitted_body() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="summary_no_body",
+                labels={"organization": "org_123"},
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    client = TestClient(create_server(app))
+    response = client.post(
+        "/api/sessions/summary",
+        params={"label": "organization=org_123"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_count"] == 1
+    assert body["sessions"][0]["session"]["id"] == "summary_no_body"
+    assert body["usage"]["usage"]["total_tokens"] == 12
+    assert body["cost"] is None
 
 
 def test_server_run_rejects_request_budget_reservations() -> None:
