@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from cayu._validation import copy_label_map
 from cayu.runtime.sessions import (
     Session,
     SessionOrder,
@@ -55,6 +56,14 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_session_labels (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (session_id, key)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state JSONB NOT NULL,
@@ -94,6 +103,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_sessions(environment_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_causal_budget_id "
     "ON cayu_sessions(causal_budget_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session "
+    "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
     "ON cayu_events(session_id, session_order)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
@@ -153,7 +164,11 @@ def session_insert_values(session: Session) -> tuple[object, ...]:
     )
 
 
-def session_from_row(row: tuple[Any, ...]) -> Session:
+def session_label_insert_values(session: Session) -> list[tuple[str, str, str]]:
+    return [(session.id, key, value) for key, value in sorted(session.labels.items())]
+
+
+def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None) -> Session:
     return Session(
         id=row[0],
         agent_name=row[1],
@@ -168,6 +183,7 @@ def session_from_row(row: tuple[Any, ...]) -> Session:
         created_at=to_utc(row[10]),
         updated_at=to_utc(row[11]),
         metadata=_loads(row[12]),
+        labels=copy_label_map(labels, "labels"),
     )
 
 

@@ -29,6 +29,7 @@ pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
     "cayu_events",
+    "cayu_session_labels",
     "cayu_transcript_messages",
     "cayu_checkpoints",
     "cayu_tasks",
@@ -520,6 +521,68 @@ def test_postgres_session_store_lists_sessions_with_filters_and_pagination(postg
         assert [s.id for s in hosted_sessions] == ["sess_builder_2", "sess_reviewer"]
         assert [s.id for s in completed_sessions] == ["sess_builder_2"]
         assert [s.id for s in paged_sessions] == ["sess_builder_2"]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_preserves_and_filters_session_labels(postgres_dsn):
+    async def ops(store):
+        created = await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_pg_labels_invoice",
+                labels={
+                    "owner": "org_123",
+                    "project": "ap_q2",
+                    "workflow": "invoice-ingestion",
+                },
+                messages=[Message.text("user", "ingest invoice")],
+            ),
+            identity=_identity(),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_pg_labels_research",
+                labels={"owner": "org_123", "project": "research"},
+                messages=[Message.text("user", "research")],
+            ),
+            identity=_identity(),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_pg_labels_other_owner",
+                labels={"owner": "org_999", "project": "ap_q2"},
+                messages=[Message.text("user", "review")],
+            ),
+            identity=_identity(),
+        )
+
+        loaded = await store.load(created.id)
+        owner_sessions = await store.list_sessions(
+            SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
+        )
+        exact_sessions = await store.list_sessions(
+            SessionQuery(
+                labels={"owner": "org_123", "project": "ap_q2"},
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        missing_sessions = await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+
+        assert loaded is not None
+        assert loaded.labels == {
+            "owner": "org_123",
+            "project": "ap_q2",
+            "workflow": "invoice-ingestion",
+        }
+        assert [session.id for session in owner_sessions] == [
+            "sess_pg_labels_invoice",
+            "sess_pg_labels_research",
+        ]
+        assert [session.id for session in exact_sessions] == ["sess_pg_labels_invoice"]
+        assert missing_sessions == []
 
     _run(postgres_dsn, ops)
 

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import EventQuery, SessionOrder, SessionQuery, SQLiteSessionStore, TranscriptQuery
 from cayu.core import Event, EventType, Message
@@ -178,6 +179,112 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         await _close_store(store)
 
     asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_preserve_and_filter_session_labels(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        owner_labels = {
+            "owner": "org_123",
+            "project": "ap_q2",
+            "workflow": "invoice-ingestion",
+        }
+        created = await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_labels_invoice",
+                labels=owner_labels,
+                messages=[Message.text("user", "ingest invoice")],
+            ),
+            identity=_identity(),
+        )
+        owner_labels["owner"] = "mutated"
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_labels_research",
+                labels={"owner": "org_123", "project": "research"},
+                messages=[Message.text("user", "research")],
+            ),
+            identity=_identity(),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_labels_other_owner",
+                labels={"owner": "org_999", "project": "ap_q2"},
+                messages=[Message.text("user", "review")],
+            ),
+            identity=_identity(),
+        )
+
+        assert created.labels == {
+            "owner": "org_123",
+            "project": "ap_q2",
+            "workflow": "invoice-ingestion",
+        }
+        loaded = await store.load("sess_labels_invoice")
+        assert loaded is not None
+        assert loaded.labels == created.labels
+
+        owner_sessions = await store.list_sessions(
+            SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
+        )
+        project_sessions = await store.list_sessions(
+            SessionQuery(labels={"project": "ap_q2"}, order_by=SessionOrder.CREATED_AT_ASC)
+        )
+        exact_sessions = await store.list_sessions(
+            SessionQuery(
+                labels={"owner": "org_123", "project": "ap_q2"},
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        missing_sessions = await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+
+        assert [session.id for session in owner_sessions] == [
+            "sess_labels_invoice",
+            "sess_labels_research",
+        ]
+        assert [session.id for session in project_sessions] == [
+            "sess_labels_invoice",
+            "sess_labels_other_owner",
+        ]
+        assert [session.id for session in exact_sessions] == ["sess_labels_invoice"]
+        assert missing_sessions == []
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_session_labels_are_strict_clean_string_maps():
+    with pytest.raises(ValidationError, match="labels.bad"):
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_bad_label_value",
+            labels={"bad": 123},
+            messages=[Message.text("user", "hi")],
+        )
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        SessionQuery(labels={" owner": "org_123"})
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_blank_label_value",
+            labels={"owner": " "},
+            messages=[Message.text("user", "hi")],
+        )
+    with pytest.raises(ValidationError, match="reserved for Cayu"):
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_reserved_label",
+            labels={"cayu:causal-budget": "budget_123"},
+            messages=[Message.text("user", "hi")],
+        )
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])

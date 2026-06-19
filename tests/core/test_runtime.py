@@ -2684,6 +2684,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_fork_source",
+                labels={"owner": "org_123", "project": "feature_a"},
                 messages=[Message.text("user", "first request")],
             ),
         )
@@ -2711,6 +2712,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     assert fork.status == SessionStatus.COMPLETED
     assert fork.provider_name == source.provider_name == "fake"
     assert fork.model == source.model == "fake-model"
+    assert fork.labels == source.labels == {"owner": "org_123", "project": "feature_a"}
     assert fork.metadata == {"purpose": "alternate path"}
 
     fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))

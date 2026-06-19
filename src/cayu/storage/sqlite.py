@@ -137,6 +137,14 @@ class SQLiteSessionStore(SessionStore):
                             sqlite_support.json_dumps(session.metadata),
                         ),
                     )
+                    if session.labels:
+                        self._connection.executemany(
+                            """
+                            INSERT INTO cayu_session_labels (session_id, key, value)
+                            VALUES (?, ?, ?)
+                            """,
+                            sqlite_support.session_label_row_values(session),
+                        )
             except sqlite3.IntegrityError as exc:
                 if self._session_exists_unlocked(session.id):
                     raise ValueError(f"Session already exists: {session.id}") from exc
@@ -241,6 +249,14 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
+                if fork.labels:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO cayu_session_labels (session_id, key, value)
+                        VALUES (?, ?, ?)
+                        """,
+                        sqlite_support.session_label_row_values(fork),
+                    )
                 if copied_messages:
                     self._connection.executemany(
                         """
@@ -303,7 +319,10 @@ class SQLiteSessionStore(SessionStore):
             ).fetchone()
             if row is None:
                 return None
-            return sqlite_support.session_from_row(row)
+            return sqlite_support.session_from_row(
+                row,
+                labels=self._load_labels_unlocked(session_id),
+            )
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -752,6 +771,19 @@ class SQLiteSessionStore(SessionStore):
         if query.causal_budget_id is not None:
             clauses.append("causal_budget_id = ?")
             params.append(query.causal_budget_id)
+        for key, value in query.labels.items():
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_session_labels
+                    WHERE cayu_session_labels.session_id = cayu_sessions.id
+                      AND cayu_session_labels.key = ?
+                      AND cayu_session_labels.value = ?
+                )
+                """
+            )
+            params.extend([key, value])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = sqlite_support.session_order_sql(query.order_by)
@@ -771,7 +803,16 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 params,
             ).fetchall()
-            return [sqlite_support.session_from_row(row) for row in rows]
+            labels_by_session_id = self._load_labels_for_sessions_unlocked(
+                [row["id"] for row in rows]
+            )
+            return [
+                sqlite_support.session_from_row(
+                    row,
+                    labels=labels_by_session_id.get(row["id"], {}),
+                )
+                for row in rows
+            ]
 
     async def append_transcript_messages(
         self,
@@ -1002,7 +1043,45 @@ class SQLiteSessionStore(SessionStore):
         ).fetchone()
         if row is None:
             return None
-        return sqlite_support.session_from_row(row)
+        return sqlite_support.session_from_row(
+            row,
+            labels=self._load_labels_unlocked(session_id),
+        )
+
+    def _load_labels_unlocked(self, session_id: str) -> dict[str, str]:
+        rows = self._connection.execute(
+            """
+            SELECT key, value
+            FROM cayu_session_labels
+            WHERE session_id = ?
+            ORDER BY key ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def _load_labels_for_sessions_unlocked(
+        self,
+        session_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in session_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT session_id, key, value
+            FROM cayu_session_labels
+            WHERE session_id IN ({placeholders})
+            ORDER BY session_id ASC, key ASC
+            """,
+            session_ids,
+        ).fetchall()
+        labels_by_session_id: dict[str, dict[str, str]] = {
+            session_id: {} for session_id in session_ids
+        }
+        for row in rows:
+            labels_by_session_id[row["session_id"]][row["key"]] = row["value"]
+        return labels_by_session_id
 
     def _session_exists_unlocked(self, session_id: str) -> bool:
         row = self._connection.execute(

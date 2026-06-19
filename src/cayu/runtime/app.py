@@ -1154,6 +1154,7 @@ class CayuApp:
             runtime_version=source_session.runtime_version,
             environment_name=environment_name,
             status=source_session.status,
+            labels=source_session.labels,
             metadata=copy_json_value(request.metadata, "metadata"),
         )
         created = await self.session_store.create_fork(

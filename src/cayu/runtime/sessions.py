@@ -20,7 +20,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, copy_message
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
@@ -52,6 +52,7 @@ class RunRequest(BaseModel):
     causal_budget_id: str | None = None
     task_id: str | None = None
     environment_name: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -72,6 +73,11 @@ class RunRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_request_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels", allow_reserved=False)
 
     @field_validator("structured_output")
     @classmethod
@@ -275,6 +281,7 @@ class Session(BaseModel):
     status: SessionStatus = SessionStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -294,6 +301,11 @@ class Session(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
 
     @field_validator(
         "id",
@@ -340,6 +352,7 @@ class SessionQuery(BaseModel):
     environment_name: str | None = None
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0)
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
@@ -354,6 +367,11 @@ class SessionQuery(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_query_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
 
 
 class EventRecord(BaseModel):
@@ -683,6 +701,7 @@ class InMemorySessionStore(SessionStore):
                 status=SessionStatus.PENDING,
                 created_at=now,
                 updated_at=now,
+                labels=request.labels,
                 metadata=deepcopy(request.metadata),
             )
             self._sessions[session.id] = session
@@ -1272,6 +1291,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         environment_name=request.environment_name,
+        labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
@@ -1343,6 +1363,7 @@ def copy_session(session: Session) -> Session:
         status=session.status,
         created_at=session.created_at,
         updated_at=session.updated_at,
+        labels=copy_label_map(session.labels, "labels"),
         metadata=copy_json_value(session.metadata, "metadata"),
     )
 
@@ -1383,6 +1404,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
+        labels=copy_label_map(query.labels, "labels"),
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -1429,6 +1451,9 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
         return False
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
         return False
+    for key, value in query.labels.items():
+        if session.labels.get(key) != value:
+            return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
     )

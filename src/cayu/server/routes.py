@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
 from sse_starlette.sse import EventSourceResponse
 
+from cayu._validation import copy_label_map
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.runtime.approvals import (
@@ -60,6 +61,7 @@ class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
     causal_budget_id: NonBlankString | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -69,6 +71,11 @@ class RunBody(BaseModel):
     @classmethod
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels", allow_reserved=False)
 
 
 class ResumeBody(BaseModel):
@@ -183,6 +190,7 @@ def _serialize_session(session: Session) -> dict[str, Any]:
         "environment_name": session.environment_name,
         "created_at": session.created_at.isoformat(),
         "updated_at": session.updated_at.isoformat(),
+        "labels": session.labels,
         "metadata": session.metadata,
     }
 
@@ -227,6 +235,7 @@ def create_router(
             session_id=session_id,
             causal_budget_id=body.causal_budget_id,
             task_id=task_id,
+            labels=body.labels,
             messages=[Message.text("user", body.prompt)],
             max_steps=20,
             limits=body.limits,
@@ -392,6 +401,7 @@ def create_router(
                 "causal_budget_id": s.causal_budget_id,
                 "runtime_name": s.runtime_name,
                 "runtime_version": s.runtime_version,
+                "labels": s.labels,
                 "created_at": s.created_at.isoformat(),
                 "updated_at": s.updated_at.isoformat(),
             }
@@ -683,6 +693,7 @@ def create_router(
                 "causal_budget_id": session.causal_budget_id,
                 "runtime_name": session.runtime_name,
                 "runtime_version": session.runtime_version,
+                "labels": session.labels,
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,

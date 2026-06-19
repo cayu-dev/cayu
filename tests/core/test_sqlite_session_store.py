@@ -22,6 +22,7 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
 )
+from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
 
@@ -812,7 +813,61 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
 
     # user_version now mirrors the ADR 0001 schema revision (the cross-backend
     # source of truth is the cayu_schema_migrations table).
-    assert version == schema_migrations.BASELINE_REVISION
+    assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_session_store_migrates_revision_one_database_to_session_labels(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(sqlite_support._BASELINE_DDL)
+        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.execute("DROP TABLE cayu_session_labels")
+        connection.execute(
+            "INSERT INTO cayu_schema_migrations "
+            "(revision, kind, compatible_from, checksum, applied_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1, str(schema_migrations.RevisionKind.BREAKING), 1, None, "2026-01-01T00:00:00+00:00"),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def assert_migrated() -> None:
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_migrated_labels",
+                labels={"owner": "org_123"},
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        loaded = await store.load(created.id)
+        assert loaded is not None
+        assert loaded.labels == {"owner": "org_123"}
+        await _close(store)
+
+    asyncio.run(assert_migrated())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        label_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_session_labels'"
+        ).fetchone()
+        revisions = connection.execute(
+            "SELECT revision, compatible_from FROM cayu_schema_migrations ORDER BY revision"
+        ).fetchall()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert label_table is not None
+    assert revisions == [(1, 1), (2, 2)]
+    assert version == schema_migrations.LATEST_REVISION
 
 
 def test_cayu_app_can_use_sqlite_session_store(tmp_path):

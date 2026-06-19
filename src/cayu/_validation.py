@@ -3,6 +3,10 @@ from __future__ import annotations
 from math import isfinite
 from typing import Any
 
+_MAX_LABEL_KEY_LENGTH = 128
+_MAX_LABEL_VALUE_LENGTH = 512
+_RESERVED_LABEL_PREFIX = "cayu:"
+
 
 def require_nonblank(value: str, field_name: str) -> str:
     if type(value) is not str:
@@ -37,6 +41,41 @@ def require_clean_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[
             raise ValueError(f"`{field_name}` keys must be strings.")
         require_clean_nonblank(key, f"{field_name} key")
     return value
+
+
+def copy_label_map(
+    value: Any,
+    field_name: str,
+    *,
+    allow_reserved: bool = True,
+) -> dict[str, str]:
+    if value is None:
+        return {}
+    if type(value) is not dict:
+        raise ValueError(f"`{field_name}` must be a dictionary.")
+    copied: dict[str, str] = {}
+    for key, item in value.items():
+        if type(key) is not str:
+            raise ValueError(f"`{field_name}` keys must be strings.")
+        clean_key = require_clean_nonblank(key, f"{field_name} key")
+        if len(clean_key) > _MAX_LABEL_KEY_LENGTH:
+            raise ValueError(
+                f"`{field_name}` keys must be at most {_MAX_LABEL_KEY_LENGTH} characters."
+            )
+        if not allow_reserved and clean_key.startswith(_RESERVED_LABEL_PREFIX):
+            raise ValueError(
+                f"`{field_name}` keys starting with `{_RESERVED_LABEL_PREFIX}` "
+                "are reserved for Cayu."
+            )
+        if type(item) is not str:
+            raise ValueError(f"`{field_name}.{clean_key}` must be a string.")
+        clean_value = require_clean_nonblank(item, f"{field_name}.{clean_key}")
+        if len(clean_value) > _MAX_LABEL_VALUE_LENGTH:
+            raise ValueError(
+                f"`{field_name}` values must be at most {_MAX_LABEL_VALUE_LENGTH} characters."
+            )
+        copied[clean_key] = clean_value
+    return copied
 
 
 def require_finite(value: float, field_name: str) -> float:

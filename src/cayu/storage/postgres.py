@@ -66,7 +66,20 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from pg_support.SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
-_MIGRATION_STEPS: dict[int, tuple[str, ...]] = {}
+_MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
+    2: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_labels (
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (session_id, key)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session "
+        "ON cayu_session_labels(key, value, session_id)",
+    ),
+}
 
 
 async def read_schema_state(cur: Any) -> schema.SchemaState:
@@ -188,7 +201,7 @@ class _PostgresStoreBase:
                     schema.validate(state)
                 elif self._schema_mode is schema.SchemaMode.CREATE:
                     if state.revision == schema.UNINITIALIZED:
-                        await self._apply_baseline(cur)
+                        await self._apply_pending(cur, state)
                     else:
                         schema.validate(state)
                 else:  # MIGRATE
@@ -256,6 +269,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             created_at=now,
             updated_at=now,
             metadata=copy_json_value(request.metadata, "metadata"),
+            labels=request.labels,
         )
         if session.parent_session_id == session.id:
             raise ValueError("Session cannot be its own parent.")
@@ -269,6 +283,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         """,
                         pg_support.session_insert_values(session),
                     )
+                    if session.labels:
+                        await cur.executemany(
+                            """
+                            INSERT INTO cayu_session_labels (session_id, key, value)
+                            VALUES (%s, %s, %s)
+                            """,
+                            pg_support.session_label_insert_values(session),
+                        )
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -359,6 +381,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         """,
                         pg_support.session_insert_values(fork),
                     )
+                    if fork.labels:
+                        await cur.executemany(
+                            """
+                            INSERT INTO cayu_session_labels (session_id, key, value)
+                            VALUES (%s, %s, %s)
+                            """,
+                            pg_support.session_label_insert_values(fork),
+                        )
                     if copied_messages:
                         await cur.executemany(
                             """
@@ -842,6 +872,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if query.causal_budget_id is not None:
             clauses.append("causal_budget_id = %s")
             params.append(query.causal_budget_id)
+        for key, value in query.labels.items():
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_session_labels
+                    WHERE cayu_session_labels.session_id = cayu_sessions.id
+                      AND cayu_session_labels.key = %s
+                      AND cayu_session_labels.value = %s
+                )
+                """
+            )
+            params.extend([key, value])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = pg_support.session_order_sql(query.order_by)
@@ -865,7 +908,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 params,
             )
             rows = await cur.fetchall()
-            return [pg_support.session_from_row(row) for row in rows]
+            labels_by_session_id = await self._load_labels_for_sessions(
+                cur,
+                [row[0] for row in rows],
+            )
+            return [
+                pg_support.session_from_row(
+                    row,
+                    labels=labels_by_session_id.get(row[0], {}),
+                )
+                for row in rows
+            ]
 
     async def append_transcript_messages(
         self,
@@ -1042,7 +1095,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         row = await cur.fetchone()
         if row is None:
             return None
-        return pg_support.session_from_row(row)
+        return pg_support.session_from_row(
+            row,
+            labels=await self._load_labels(cur, session_id),
+        )
 
     async def _load_for_update(self, cur: Any, session_id: str) -> Session | None:
         await cur.execute(
@@ -1052,7 +1108,45 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         row = await cur.fetchone()
         if row is None:
             return None
-        return pg_support.session_from_row(row)
+        return pg_support.session_from_row(
+            row,
+            labels=await self._load_labels(cur, session_id),
+        )
+
+    async def _load_labels(self, cur: Any, session_id: str) -> dict[str, str]:
+        await cur.execute(
+            """
+            SELECT key, value
+            FROM cayu_session_labels
+            WHERE session_id = %s
+            ORDER BY key ASC
+            """,
+            (session_id,),
+        )
+        return {row[0]: row[1] for row in await cur.fetchall()}
+
+    async def _load_labels_for_sessions(
+        self,
+        cur: Any,
+        session_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        if not session_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT session_id, key, value
+            FROM cayu_session_labels
+            WHERE session_id = ANY(%s)
+            ORDER BY session_id ASC, key ASC
+            """,
+            (session_ids,),
+        )
+        labels_by_session_id: dict[str, dict[str, str]] = {
+            session_id: {} for session_id in session_ids
+        }
+        for row in await cur.fetchall():
+            labels_by_session_id[row[0]][row[1]] = row[2]
+        return labels_by_session_id
 
     async def _load_checkpoint(self, cur: Any, session_id: str) -> dict[str, Any] | None:
         await cur.execute(

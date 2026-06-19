@@ -65,6 +65,7 @@ class Revision:
 # ``compatible_from`` at the prior value, a breaking one sets it to its own number.
 REVISIONS: tuple[Revision, ...] = (
     Revision(revision=1, kind=RevisionKind.BREAKING, compatible_from=1),
+    Revision(revision=2, kind=RevisionKind.BREAKING, compatible_from=2),
 )
 
 #: The revision an empty database is initialized to.

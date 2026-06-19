@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_json_value, copy_label_map
 from cayu.runtime.sessions import (
     RunRequest,
     Session,
@@ -66,6 +66,13 @@ _BASELINE_DDL = """
         UNIQUE(session_id, event_id)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_session_labels (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (session_id, key)
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state_json TEXT NOT NULL,
@@ -106,6 +113,8 @@ _BASELINE_DDL = """
         ON cayu_sessions(environment_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_sessions_causal_budget_id
         ON cayu_sessions(causal_budget_id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session
+        ON cayu_session_labels(key, value, session_id);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence
         ON cayu_events(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp
@@ -148,7 +157,19 @@ _MIGRATIONS_TABLE_DDL = """
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from _BASELINE_DDL, so it is not listed here; future
 # additive/breaking revisions append their ALTER/CREATE scripts.
-_MIGRATION_STEPS: dict[int, str] = {}
+_MIGRATION_STEPS: dict[int, str] = {
+    2: """
+        CREATE TABLE IF NOT EXISTS cayu_session_labels (
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (session_id, key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session
+            ON cayu_session_labels(key, value, session_id);
+    """,
+}
 
 
 def reconcile_schema(
@@ -174,7 +195,7 @@ def reconcile_schema(
         schema.validate(state)
     elif schema_mode is schema.SchemaMode.CREATE:
         if state.revision == schema.UNINITIALIZED:
-            _apply_baseline(connection)
+            _apply_pending(connection, state)
         else:
             schema.validate(state)
     else:  # MIGRATE
@@ -256,6 +277,7 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         created_at=now,
         updated_at=now,
         metadata=copy_json_value(request.metadata, "metadata"),
+        labels=copy_label_map(request.labels, "labels"),
     )
 
 
@@ -275,6 +297,10 @@ def session_to_row_values(session: Session) -> tuple[object, ...]:
         format_datetime(session.updated_at),
         json_dumps(session.metadata),
     )
+
+
+def session_label_row_values(session: Session) -> list[tuple[str, str, str]]:
+    return [(session.id, key, value) for key, value in sorted(session.labels.items())]
 
 
 def task_to_row_values(task: Task) -> tuple[object, ...]:
@@ -321,7 +347,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
     )
 
 
-def session_from_row(row: sqlite3.Row) -> Session:
+def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> Session:
     return Session(
         id=row["id"],
         agent_name=row["agent_name"],
@@ -336,6 +362,7 @@ def session_from_row(row: sqlite3.Row) -> Session:
         created_at=parse_datetime(row["created_at"]),
         updated_at=parse_datetime(row["updated_at"]),
         metadata=json.loads(row["metadata_json"]),
+        labels=copy_label_map(labels, "labels"),
     )
 
 

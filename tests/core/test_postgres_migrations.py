@@ -27,6 +27,7 @@ def _request(agent_name: str) -> RunRequest:
 
 _TABLES = (
     "cayu_events",
+    "cayu_session_labels",
     "cayu_transcript_messages",
     "cayu_checkpoints",
     "cayu_tasks",
@@ -37,6 +38,10 @@ _TABLES = (
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
+
+
+def _expected_revisions() -> list[tuple[int, str, int]]:
+    return [(rev.revision, str(rev.kind), rev.compatible_from) for rev in schema.REVISIONS]
 
 
 async def _drop_all(dsn: str) -> None:
@@ -82,10 +87,8 @@ def test_create_mode_initializes_and_records_baseline(postgres_dsn: str) -> None
             assert session.id
         finally:
             await store.close()
-        # The baseline revision is recorded exactly once with its kind + floor.
-        assert await _recorded_revisions(postgres_dsn) == [
-            (schema.BASELINE_REVISION, str(schema.RevisionKind.BREAKING), 1)
-        ]
+        # A new database is initialized through every known revision.
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
 
     asyncio.run(runner())
 
@@ -117,15 +120,13 @@ def test_migrate_mode_initializes_baseline_idempotently(postgres_dsn: str) -> No
             await first.create(_request("a"), identity=_identity())
         finally:
             await first.close()
-        # Re-running migrate is a no-op: still exactly the baseline revision.
+        # Re-running migrate is a no-op: still exactly the known revisions.
         second = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         try:
             await second.create(_request("b"), identity=_identity())
         finally:
             await second.close()
-        assert await _recorded_revisions(postgres_dsn) == [
-            (schema.BASELINE_REVISION, str(schema.RevisionKind.BREAKING), 1)
-        ]
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
 
     asyncio.run(runner())
 
@@ -143,9 +144,7 @@ def test_session_and_task_stores_share_one_baseline(postgres_dsn: str) -> None:
         finally:
             await sessions.close()
             await tasks.close()
-        # The advisory lock serialized init: the baseline is recorded once, not twice.
-        assert await _recorded_revisions(postgres_dsn) == [
-            (schema.BASELINE_REVISION, str(schema.RevisionKind.BREAKING), 1)
-        ]
+        # The advisory lock serialized init: revisions are recorded once, not twice.
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
 
     asyncio.run(runner())

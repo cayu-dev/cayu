@@ -13,8 +13,8 @@ def test_storage_status_reports_uninitialized(tmp_path, capsys):
     assert main(["storage", "status", "--sqlite", str(db)]) == 0
     out = capsys.readouterr().out
     assert "uninitialized" in out
-    # A fresh DB shows the baseline revision as pending.
-    assert f"pending migrations: {schema.BASELINE_REVISION}" in out
+    # A fresh DB shows every known revision as pending.
+    assert f"pending migrations: {schema.BASELINE_REVISION}, {schema.LATEST_REVISION}" in out
 
 
 def test_storage_migrate_then_status_is_up_to_date(tmp_path, capsys):
@@ -22,7 +22,7 @@ def test_storage_migrate_then_status_is_up_to_date(tmp_path, capsys):
 
     assert main(["storage", "migrate", "--sqlite", str(db)]) == 0
     migrate_out = capsys.readouterr().out
-    assert f"revision {schema.BASELINE_REVISION}" in migrate_out
+    assert f"revision {schema.LATEST_REVISION}" in migrate_out
 
     assert main(["storage", "status", "--sqlite", str(db)]) == 0
     status_out = capsys.readouterr().out
