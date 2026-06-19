@@ -60,6 +60,7 @@ dependencies = [
     { name = "httpx" },
     { name = "jsonschema" },
     { name = "pydantic" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
 [package.optional-dependencies]
@@ -138,6 +139,7 @@ requires-dist = [
     { name = "sse-starlette", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "sse-starlette", marker = "extra == 'server'", specifier = ">=2.0" },
     { name = "testcontainers", extras = ["postgres"], marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.0" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a8" },
     { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },

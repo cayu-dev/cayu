@@ -209,8 +209,9 @@ class SQLiteBudgetLedger(BudgetLedger):
             )
 
     def _used_amount_unlocked(self, limit: BudgetLimit, *, now: datetime) -> Decimal:
-        since = limit.window.since(now=now)
+        since, until = limit.window.bounds(now=now)
         cutoff = None if since is None else sqlite_support.format_datetime(since)
+        upper_cutoff = None if until is None else sqlite_support.format_datetime(until)
         rows = self._connection.execute(
             """
             SELECT reserved_amount, actual_amount, status
@@ -225,6 +226,11 @@ class SQLiteBudgetLedger(BudgetLedger):
                     OR status = 'active'
                     OR updated_at >= ?
                   )
+              AND (
+                    ? IS NULL
+                    OR status = 'active'
+                    OR updated_at < ?
+                  )
             """,
             (
                 limit.scope,
@@ -233,6 +239,8 @@ class SQLiteBudgetLedger(BudgetLedger):
                 limit.currency.upper(),
                 cutoff,
                 cutoff,
+                upper_cutoff,
+                upper_cutoff,
             ),
         ).fetchall()
         total = Decimal("0")

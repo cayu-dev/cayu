@@ -5,8 +5,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     BaseModel,
@@ -23,12 +24,14 @@ from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
-BudgetWindowKind = Literal["all_time", "rolling"]
+BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
+BudgetCalendarPeriod = Literal["day", "week", "month"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
 _ALL_TIME_WINDOW = "all_time"
 _ROLLING_PREFIX = "rolling:"
 _ROLLING_SUFFIX = "s"
+_CALENDAR_PREFIX = "calendar:"
 
 
 class BudgetWindow(BaseModel):
@@ -38,6 +41,8 @@ class BudgetWindow(BaseModel):
 
     kind: BudgetWindowKind = "all_time"
     duration_seconds: StrictInt | None = Field(default=None, ge=1)
+    period: BudgetCalendarPeriod | None = None
+    timezone: str | None = None
 
     @classmethod
     def all_time(cls) -> BudgetWindow:
@@ -47,25 +52,75 @@ class BudgetWindow(BaseModel):
     def rolling(cls, *, seconds: int) -> BudgetWindow:
         return cls(kind="rolling", duration_seconds=seconds)
 
+    @classmethod
+    def calendar(
+        cls,
+        *,
+        period: BudgetCalendarPeriod,
+        timezone: str = "UTC",
+    ) -> BudgetWindow:
+        return cls(kind="calendar", period=period, timezone=timezone)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        timezone = require_clean_nonblank(value, info.field_name)
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown budget window timezone: {timezone}") from exc
+        return timezone
+
     @model_validator(mode="after")
-    def validate_duration(self) -> BudgetWindow:
-        if self.kind == "all_time" and self.duration_seconds is not None:
-            raise ValueError("All-time budget windows must not set duration_seconds.")
-        if self.kind == "rolling" and self.duration_seconds is None:
-            raise ValueError("Rolling budget windows require duration_seconds.")
+    def validate_window_fields(self) -> BudgetWindow:
+        if self.kind == "all_time":
+            if (
+                self.duration_seconds is not None
+                or self.period is not None
+                or self.timezone is not None
+            ):
+                raise ValueError("All-time budget windows must not set window details.")
+        elif self.kind == "rolling":
+            if self.duration_seconds is None:
+                raise ValueError("Rolling budget windows require duration_seconds.")
+            if self.period is not None or self.timezone is not None:
+                raise ValueError("Rolling budget windows must not set calendar details.")
+        elif self.kind == "calendar":
+            if self.duration_seconds is not None:
+                raise ValueError("Calendar budget windows must not set duration_seconds.")
+            if self.period is None:
+                raise ValueError("Calendar budget windows require period.")
+            if self.timezone is None:
+                raise ValueError("Calendar budget windows require timezone.")
         return self
 
     @property
     def storage_key(self) -> str:
         if self.kind == "all_time":
             return "all_time"
-        return f"rolling:{self.duration_seconds}s"
+        if self.kind == "rolling":
+            return f"rolling:{self.duration_seconds}s"
+        return f"calendar:{self.period}:{self.timezone}"
 
     def since(self, now: datetime | None = None) -> datetime | None:
-        if self.kind == "all_time":
-            return None
+        return self.bounds(now=now)[0]
+
+    def until(self, now: datetime | None = None) -> datetime | None:
+        return self.bounds(now=now)[1]
+
+    def bounds(self, now: datetime | None = None) -> tuple[datetime | None, datetime | None]:
         reference = datetime.now(UTC) if now is None else _utc_datetime(now, "now")
-        return reference - timedelta(seconds=self.duration_seconds or 0)
+        if self.kind == "all_time":
+            return None, None
+        if self.kind == "rolling":
+            return reference - timedelta(seconds=self.duration_seconds or 0), reference
+        return _calendar_window_bounds(
+            reference,
+            period=self.period or "day",
+            timezone=self.timezone or "UTC",
+        )
 
 
 class BudgetReservation(BaseModel):
@@ -479,7 +534,7 @@ class SessionBudgetStore(BudgetStore):
         from cayu.runtime.sessions import EventQuery
 
         window = copy_budget_window(window)
-        since = window.since()
+        since, until = window.bounds()
         agent_name: str | None = None
         causal_budget_id: str | None = None
         if scope == "agent":
@@ -498,6 +553,7 @@ class SessionBudgetStore(BudgetStore):
                     causal_budget_id=causal_budget_id,
                     agent_name=agent_name,
                     since=since,
+                    until=until,
                     after_sequence=after_sequence,
                     limit=5000,
                 )
@@ -663,11 +719,11 @@ def events_for_budget_window(
     now: datetime | None = None,
 ) -> list[Event]:
     window = copy_budget_window(window)
-    since = window.since(now=now)
+    since, until = window.bounds(now=now)
     copied = [copy_event(event) for event in events]
-    if since is None:
+    if since is None and until is None:
         return copied
-    return [event for event in copied if _event_in_window(event, since)]
+    return [event for event in copied if _event_in_window(event, since=since, until=until)]
 
 
 def copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
@@ -970,7 +1026,7 @@ def _ledger_used_amount(
     now: datetime | None = None,
 ) -> Decimal:
     total = Decimal("0")
-    since = window.since(now=now)
+    since, until = window.bounds(now=now)
     for record in records:
         if (
             record.scope != scope
@@ -983,6 +1039,8 @@ def _ledger_used_amount(
             total += record.reserved_amount
         elif record.status == "reconciled":
             if since is not None and record.updated_at < since:
+                continue
+            if until is not None and record.updated_at >= until:
                 continue
             total += record.actual_amount or Decimal("0")
     return total
@@ -1068,6 +1126,14 @@ def _budget_window_from_string(value: str) -> BudgetWindow:
         except ValueError as exc:
             raise ValueError(f"Invalid rolling budget window: {text}") from exc
         return BudgetWindow.rolling(seconds=seconds)
+    if text.startswith(_CALENDAR_PREFIX):
+        parts = text.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(f"Invalid calendar budget window: {text}")
+        return BudgetWindow.calendar(
+            period=_calendar_period(parts[1]),
+            timezone=parts[2],
+        )
     raise ValueError(f"Unsupported budget window: {text}")
 
 
@@ -1089,5 +1155,45 @@ def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], date
     return _checked_clock
 
 
-def _event_in_window(event: Event, since: datetime) -> bool:
-    return _utc_datetime(event.timestamp, "event.timestamp") >= since
+def _event_in_window(
+    event: Event,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> bool:
+    timestamp = _utc_datetime(event.timestamp, "event.timestamp")
+    if since is not None and timestamp < since:
+        return False
+    return not (until is not None and timestamp >= until)
+
+
+def _calendar_period(value: str) -> BudgetCalendarPeriod:
+    if value in {"day", "week", "month"}:
+        return cast("BudgetCalendarPeriod", value)
+    raise ValueError(f"Unsupported calendar budget period: {value}")
+
+
+def _calendar_window_bounds(
+    now: datetime,
+    *,
+    period: BudgetCalendarPeriod,
+    timezone: str,
+) -> tuple[datetime, datetime]:
+    zone = ZoneInfo(timezone)
+    local_now = now.astimezone(zone)
+    if period == "day":
+        local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_end = local_start + timedelta(days=1)
+    elif period == "week":
+        local_day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_start = local_day_start - timedelta(days=local_now.weekday())
+        local_end = local_start + timedelta(days=7)
+    elif period == "month":
+        local_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if local_start.month == 12:
+            local_end = local_start.replace(year=local_start.year + 1, month=1)
+        else:
+            local_end = local_start.replace(month=local_start.month + 1)
+    else:
+        raise ValueError(f"Unsupported calendar budget period: {period}")
+    return local_start.astimezone(UTC), local_end.astimezone(UTC)

@@ -24,6 +24,7 @@ from cayu.runtime import (
 from cayu.runtime.budgets import (
     InMemoryBudgetStore,
     budget_check_from_events,
+    copy_budget_window,
     copy_request_budget_limits,
     events_for_budget_window,
     request_budget_limits_for_session,
@@ -201,6 +202,37 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
             allow_unpriced=True,
             reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
         )
+
+
+def test_budget_window_calendar_bounds_and_storage_key() -> None:
+    window = BudgetWindow.calendar(period="day", timezone="America/New_York")
+    since, until = window.bounds(now=datetime(2026, 6, 19, 13, 30, tzinfo=UTC))
+
+    assert window.storage_key == "calendar:day:America/New_York"
+    assert since == datetime(2026, 6, 19, 4, 0, tzinfo=UTC)
+    assert until == datetime(2026, 6, 20, 4, 0, tzinfo=UTC)
+
+    copied = BudgetWindow.model_validate({"kind": "calendar", "period": "month", "timezone": "UTC"})
+    assert copied.storage_key == "calendar:month:UTC"
+    assert copy_budget_window("calendar:week:UTC") == BudgetWindow.calendar(
+        period="week",
+        timezone="UTC",
+    )
+    assert BudgetWindow.calendar(period="week", timezone="UTC").bounds(
+        now=datetime(2026, 6, 19, 13, 30, tzinfo=UTC)
+    ) == (
+        datetime(2026, 6, 15, 0, 0, tzinfo=UTC),
+        datetime(2026, 6, 22, 0, 0, tzinfo=UTC),
+    )
+
+
+def test_budget_window_rejects_invalid_calendar_fields() -> None:
+    with pytest.raises(ValueError, match="Unknown budget window timezone"):
+        BudgetWindow.calendar(period="day", timezone="Not/AZone")
+    with pytest.raises(ValueError, match="Calendar budget windows require timezone"):
+        BudgetWindow(kind="calendar", period="day")
+    with pytest.raises(ValueError, match="Rolling budget windows must not set calendar details"):
+        BudgetWindow(kind="rolling", duration_seconds=60, timezone="UTC")
 
 
 def _reservation_budget_limit(
@@ -393,6 +425,51 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_rolling_window() -
     assert blocked.actual == Decimal("0.44")
     assert accepted.accepted is True
     assert accepted.actual == Decimal("0.22")
+
+
+def test_in_memory_budget_ledger_uses_reconciliation_time_for_calendar_window() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock)
+        limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.calendar(period="day", timezone="UTC"),
+        )
+        first = await ledger.reserve(
+            limit=limit,
+            session_id="sess_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert first.record is not None
+        await ledger.reconcile(
+            reservation_id=first.record.reservation_id,
+            actual_amount=Decimal("0.22"),
+            occurred_at=datetime(2026, 1, 1, 23, 59, tzinfo=UTC),
+        )
+        clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
+        next_day = await ledger.reserve(
+            limit=limit,
+            session_id="sess_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        active = await ledger.reserve(
+            limit=limit,
+            session_id="sess_3",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        return next_day, active
+
+    next_day, active = asyncio.run(run())
+
+    assert next_day.accepted is True
+    assert active.accepted is False
+    assert active.actual == Decimal("0.44")
 
 
 def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None:
@@ -593,6 +670,55 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_rolling_window(tmp_pa
     assert accepted.actual == Decimal("0.22")
 
 
+def test_sqlite_budget_ledger_uses_reconciliation_time_for_calendar_window(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite", clock=clock)
+        try:
+            limit = _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.calendar(period="day", timezone="UTC"),
+            )
+            first = await ledger.reserve(
+                limit=limit,
+                session_id="sess_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.record is not None
+            await ledger.reconcile(
+                reservation_id=first.record.reservation_id,
+                actual_amount=Decimal("0.22"),
+                occurred_at=datetime(2026, 1, 1, 23, 59, tzinfo=UTC),
+            )
+            clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
+            next_day = await ledger.reserve(
+                limit=limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            active = await ledger.reserve(
+                limit=limit,
+                session_id="sess_3",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return next_day, active
+        finally:
+            await ledger.close()
+
+    next_day, active = asyncio.run(run())
+
+    assert next_day.accepted is True
+    assert next_day.window.storage_key == "calendar:day:UTC"
+    assert active.accepted is False
+    assert active.actual == Decimal("0.44")
+
+
 def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path) -> None:
     async def run():
         path = tmp_path / "shared.sqlite"
@@ -749,6 +875,33 @@ def test_events_for_budget_window_uses_caller_supplied_now() -> None:
     assert [event.session_id for event in filtered] == ["sess_boundary"]
 
 
+def test_events_for_budget_window_filters_calendar_day() -> None:
+    now = datetime(2026, 6, 19, 13, 30, tzinfo=UTC)
+    previous_day = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_previous_day",
+        timestamp=datetime(2026, 6, 19, 3, 59, 59, tzinfo=UTC),
+    )
+    current_day = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_current_day",
+        timestamp=datetime(2026, 6, 19, 4, 0, tzinfo=UTC),
+    )
+    next_day = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_next_day",
+        timestamp=datetime(2026, 6, 20, 4, 0, tzinfo=UTC),
+    )
+
+    filtered = events_for_budget_window(
+        [previous_day, current_day, next_day],
+        BudgetWindow.calendar(period="day", timezone="America/New_York"),
+        now=now,
+    )
+
+    assert [event.session_id for event in filtered] == ["sess_current_day"]
+
+
 def test_session_budget_store_reads_model_events_from_session_store() -> None:
     async def run():
         session_store = InMemorySessionStore()
@@ -831,6 +984,57 @@ def test_session_budget_store_reads_model_events_from_session_store() -> None:
     assert causal_events[0].type == EventType.MODEL_COMPLETED
     assert causal_events[0].session_id == "sess_builder"
     assert [event.session_id for event in rolling_events] == ["sess_other_job"]
+
+
+def test_session_budget_store_filters_calendar_window_events() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        window = BudgetWindow.calendar(period="day", timezone="UTC")
+        since, until = window.bounds()
+        assert since is not None
+        assert until is not None
+        for session_id in ("sess_previous", "sess_current", "sess_next"):
+            await session_store.create(
+                RunRequest(
+                    agent_name="builder",
+                    session_id=session_id,
+                    messages=[Message.text("user", session_id)],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+        for session_id, timestamp in (
+            ("sess_previous", since - timedelta(seconds=1)),
+            ("sess_current", since + ((until - since) / 2)),
+            ("sess_next", until),
+        ):
+            await session_store.append_event(
+                session_id,
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    agent_name="builder",
+                    timestamp=timestamp,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 1,
+                            "output_tokens": 0,
+                            "total_tokens": 1,
+                        }
+                    },
+                ),
+            )
+        budget_store = SessionBudgetStore(session_store)
+        return await budget_store.load_events_for_budget(
+            scope="agent",
+            key="builder",
+            window=window,
+        )
+
+    events = asyncio.run(run())
+
+    assert [event.session_id for event in events] == ["sess_current"]
 
 
 def test_session_budget_store_reads_model_events_from_sqlite_store(tmp_path) -> None:

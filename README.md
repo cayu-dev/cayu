@@ -606,8 +606,8 @@ transcript remains valid for resume.
 
 For app-level spend control across sessions, configure a `BudgetPolicy` on
 `CayuApp`. Budget windows default to all-time accounting, and can also use
-rolling duration windows for app-wide, agent-scoped, and causal estimated-cost
-limits:
+rolling duration windows or local calendar reset windows for app-wide,
+agent-scoped, and causal estimated-cost limits:
 
 ```python
 from decimal import Decimal
@@ -637,6 +637,12 @@ app = CayuApp(
                 pricing=pricing,
             ),
             BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("100.00"),
+                window=BudgetWindow.calendar(period="day", timezone="America/New_York"),
+                pricing=pricing,
+            ),
+            BudgetLimit(
                 scope="causal",
                 key="job_123",
                 max_estimated_cost=Decimal("2.50"),
@@ -649,8 +655,11 @@ app = CayuApp(
 
 App budgets use the same caller-supplied pricing catalog as request
 `BudgetLimit` entries. Rolling windows are UTC timestamp duration windows over
-durable model events, for example "the last hour." They are not calendar-day or
-calendar-month reset windows.
+durable model events, for example "the last hour." Calendar windows evaluate the
+current local `day`, `week`, or `month` for an explicit IANA timezone; days reset
+at local midnight, weeks start on Monday, and months start on the first day of
+the month. Calendar budget windows are enforcement controls. Notify-only budget
+alerts should be implemented as application event/hook policy.
 Before each model step and after each completed model step, Cayu evaluates the
 matching budget limits, verifies that the current provider/model has pricing
 unless `allow_unpriced=True`, emits `budget.checked`, and stops with
@@ -668,10 +677,10 @@ unpriced usage.
 
 `CayuApp` uses `SessionBudgetStore` by default, so budget accounting reads from
 the same event store already configured for sessions, including timestamp
-filters for rolling windows. With `SQLiteSessionStore`, budget accounting
-survives process restarts and multiple workers that share the same database.
-Enforcement is cooperative: Cayu checks before model calls and again after model
-completions.
+filters for rolling and calendar windows. With `SQLiteSessionStore`, budget
+accounting survives process restarts and multiple workers that share the same
+database. Enforcement is cooperative: Cayu checks before model calls and again
+after model completions.
 
 For strict concurrent hard caps, add a conservative per-step reservation and a
 shared ledger. Cayu reserves the configured worst-case step cost before the
@@ -702,9 +711,9 @@ app = CayuApp(
 Reservation amounts are application-provided upper bounds, not provider
 guarantees. Set them high enough for the model step you are willing to fund.
 Reservation limits require matching pricing and cannot use `allow_unpriced=True`.
-With rolling budget windows, unresolved active reservations continue to consume
-capacity until they are reconciled or released; reconciled spend ages out by the
-reconciliation/model-completion timestamp.
+With rolling or calendar budget windows, unresolved active reservations continue
+to consume capacity until they are reconciled or released; reconciled spend ages
+out by the reconciliation/model-completion timestamp.
 `SQLiteBudgetLedger` is the built-in shared ledger for multi-worker apps.
 `InMemoryBudgetLedger` is the default and is suitable for tests, examples, and
 single-process apps only. `InMemoryBudgetStore` is also available for custom
