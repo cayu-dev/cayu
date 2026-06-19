@@ -10,6 +10,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import (
+    BudgetAction,
     BudgetCheck,
     BudgetLedger,
     BudgetLimit,
@@ -155,6 +156,7 @@ __all__ = [
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",
+    "BudgetAction",
     "BudgetCheck",
     "BudgetLedger",
     "BudgetLimit",

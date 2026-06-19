@@ -26,6 +26,7 @@ from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_sess
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
 BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
 BudgetCalendarPeriod = Literal["day", "week", "month"]
+BudgetAction = Literal["interrupt", "notify"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
 _ALL_TIME_WINDOW = "all_time"
@@ -159,6 +160,7 @@ class BudgetLimit(BaseModel):
     key: str | None = None
     allow_unpriced: StrictBool = False
     reservation: BudgetReservation | None = None
+    action: BudgetAction = "interrupt"
 
     @field_validator("currency")
     @classmethod
@@ -192,6 +194,8 @@ class BudgetLimit(BaseModel):
             raise ValueError(f"{self.scope.title()} budget limits require key.")
         if self.reservation is not None and self.allow_unpriced:
             raise ValueError("Budget reservations require priced model usage.")
+        if self.reservation is not None and self.action != "interrupt":
+            raise ValueError("Budget reservations require action='interrupt'.")
         return self
 
     @field_validator("reservation")
@@ -224,14 +228,20 @@ class BudgetPolicy(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_limits(self) -> BudgetPolicy:
-        seen: set[tuple[str, str, str | None]] = set()
+        seen: set[tuple[str, str, str | None, str, Decimal]] = set()
         for limit in self.limits:
             if limit.scope in {"session", "run"}:
                 raise ValueError(
                     f"{limit.scope.title()} budget limits are request-scoped, "
                     "not app policy limits."
                 )
-            key = (limit.scope, limit.window.storage_key, limit.key)
+            key = (
+                limit.scope,
+                limit.window.storage_key,
+                limit.key,
+                limit.action,
+                limit.max_estimated_cost,
+            )
             if key in seen:
                 raise ValueError("Budget policy contains duplicate scope/window/key limits.")
             seen.add(key)
@@ -249,6 +259,7 @@ class BudgetCheck(BaseModel):
     currency: str
     maximum: Decimal = Field(gt=0)
     actual: Decimal = Field(ge=0)
+    action: BudgetAction = "interrupt"
     model_steps: StrictInt = Field(ge=0)
     unpriced_model_steps: StrictInt = Field(ge=0)
     limit_reached: StrictBool
@@ -849,6 +860,7 @@ def budget_check_from_events(
         currency=limit.currency,
         maximum=limit.max_estimated_cost,
         actual=summary.total_cost,
+        action=limit.action,
         model_steps=summary.model_steps,
         unpriced_model_steps=summary.unpriced_model_steps,
         limit_reached=limit_reached,
@@ -868,6 +880,7 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
         "currency": check.currency,
         "maximum": str(check.maximum),
         "actual": str(check.actual),
+        "action": check.action,
         "model_steps": check.model_steps,
         "unpriced_model_steps": check.unpriced_model_steps,
         "limit_reached": check.limit_reached,
@@ -887,6 +900,7 @@ def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
         window=limit.window,
         key=limit.key,
         allow_unpriced=limit.allow_unpriced,
+        action=limit.action,
         reservation=(
             None if limit.reservation is None else copy_budget_reservation(limit.reservation)
         ),

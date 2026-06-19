@@ -579,10 +579,11 @@ estimated cost added during the current invocation.
 
 Budget limits are estimates derived from normalized usage metrics and the
 pricing catalog supplied by your app. They are not provider invoices. By
-default, request-scoped `BudgetLimit` fails closed when a newly observed model
-step has no matching pricing entry, because Cayu cannot prove that the budget is
-still safe. Set `allow_unpriced=True` only when your app intentionally allows
-missing prices for that run.
+default, request-scoped interrupt budgets fail closed when a newly observed
+model step has no matching pricing entry, because Cayu cannot prove that the
+budget is still safe. Request-scoped notify budgets emit `budget.limit_reached`
+for the same unverifiable usage and continue. Set `allow_unpriced=True` only
+when your app intentionally allows missing prices for that run.
 
 Request `budget_limits` can also use `scope="agent"` or `scope="causal"` when a
 caller needs dynamic spend control for one API call or work item without
@@ -591,12 +592,19 @@ for `agent` limits or the current `causal_budget_id` for `causal` limits.
 `scope="app"` is accepted for deliberate per-request global checks, but app-wide
 limits usually belong in `BudgetPolicy`.
 
-When a limit is reached, Cayu emits `session.limit_reached`, marks the session
-`interrupted`, emits `session.interrupted` with
+`BudgetLimit.action` defaults to `"interrupt"`. With `action="notify"`, Cayu
+emits a durable `budget.limit_reached` event when the threshold is reached, but
+does not emit `session.limit_reached`, does not interrupt the session, and does
+not close pending tool rounds. Use notify budgets for alerts and dashboards; use
+the default interrupt action for enforcement.
+
+When an interrupt limit is reached, Cayu emits `session.limit_reached`, marks
+the session `interrupted`, emits `session.interrupted` with
 `interruption_type="limit_reached"`, and leaves the session resumable. Resuming
-with the same exhausted session-scoped token or tool-call budget will interrupt
-again immediately; pass a higher budget, omit that limit, or use `scope="run"`
-if "continue" should mean "give this invocation a fresh token/tool/cost budget."
+with the same exhausted session-scoped token or tool-call/cost budget will
+interrupt again immediately; pass a higher budget, omit that limit, or use
+`scope="run"` if "continue" should mean "give this invocation a fresh
+token/tool/cost budget."
 In a limit event, `actual` is the value evaluated for the selected scope, while
 `usage_summary` remains the cumulative session summary. Cost-limit events also
 include the cumulative `cost_summary`; decimal cost values are serialized as
@@ -638,6 +646,13 @@ app = CayuApp(
             ),
             BudgetLimit(
                 scope="app",
+                max_estimated_cost=Decimal("80.00"),
+                window=BudgetWindow.calendar(period="day", timezone="America/New_York"),
+                pricing=pricing,
+                action="notify",
+            ),
+            BudgetLimit(
+                scope="app",
                 max_estimated_cost=Decimal("100.00"),
                 window=BudgetWindow.calendar(period="day", timezone="America/New_York"),
                 pricing=pricing,
@@ -658,14 +673,18 @@ App budgets use the same caller-supplied pricing catalog as request
 durable model events, for example "the last hour." Calendar windows evaluate the
 current local `day`, `week`, or `month` for an explicit IANA timezone; days reset
 at local midnight, weeks start on Monday, and months start on the first day of
-the month. Calendar budget windows are enforcement controls. Notify-only budget
-alerts should be implemented as application event/hook policy.
+the month. Rolling and calendar windows can be used together as separate
+`BudgetLimit` entries when an app needs both spend-velocity protection and
+daily/monthly accounting.
 Before each model step and after each completed model step, Cayu evaluates the
 matching budget limits, verifies that the current provider/model has pricing
-unless `allow_unpriced=True`, emits `budget.checked`, and stops with
-`budget.limit_reached` plus the normal `session.limit_reached` /
-`session.interrupted` events if a limit is reached. `scope="app"` applies to all
-sessions. `scope="agent"` applies when `key` matches the agent name.
+unless `allow_unpriced=True`, and emits `budget.checked`. If an interrupt budget
+is reached, Cayu stops with `budget.limit_reached` plus the normal
+`session.limit_reached` / `session.interrupted` events. If a notify budget is
+reached, Cayu emits `budget.limit_reached` with `action="notify"` and continues.
+App-policy notify events are emitted once per matching threshold/window; later
+`budget.checked` events continue to show the above-limit state. `scope="app"`
+applies to all sessions. `scope="agent"` applies when `key` matches the agent name.
 `scope="causal"` applies when `key` matches `RunRequest.causal_budget_id`.
 If omitted, a root session's `causal_budget_id` defaults to `task_id` when the
 run is linked to a task, otherwise to its session id. Forked sessions inherit
@@ -711,6 +730,8 @@ app = CayuApp(
 Reservation amounts are application-provided upper bounds, not provider
 guarantees. Set them high enough for the model step you are willing to fund.
 Reservation limits require matching pricing and cannot use `allow_unpriced=True`.
+Reservation limits also require `action="interrupt"` because reservations are
+hard-cap accounting, not observe-only alerts.
 With rolling or calendar budget windows, unresolved active reservations continue
 to consume capacity until they are reconciled or released; reconciled spend ages
 out by the reconciliation/model-completion timestamp.

@@ -238,6 +238,12 @@ class _BudgetStepReservation:
     record: BudgetReservationRecord
 
 
+@dataclass(frozen=True)
+class _BudgetLimitOutcome:
+    decision: StopDecision
+    check: BudgetCheck
+
+
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -939,12 +945,15 @@ class CayuApp:
             page = await self.session_store.query_events(
                 EventQuery(
                     session_id=query.session_id,
+                    session_ids=query.session_ids,
                     causal_budget_id=query.causal_budget_id,
                     event_type=query.event_type,
                     agent_name=query.agent_name,
                     environment_name=query.environment_name,
                     workflow_name=query.workflow_name,
                     tool_name=query.tool_name,
+                    since=query.since,
+                    until=query.until,
                     after_sequence=after_sequence,
                     limit=query.limit,
                 )
@@ -1289,6 +1298,7 @@ class CayuApp:
                 budget_baseline_events = (
                     approval_events if _has_run_budget_limit(budget_limits) else []
                 )
+                request_budget_notify_events: list[Event] = []
                 recorded_tool_outcomes = list(recorded_outcomes.values())
                 pending_tool_calls: list[runtime_records.ToolCallRequest] = []
                 executable_pending_tool_calls = 0
@@ -1312,16 +1322,25 @@ class CayuApp:
                     ):
                         continue
                     executable_pending_tool_calls += 1
-                decision, usage_summary, cost_summary = await self._first_limit_decision(
+                (
+                    decision,
+                    usage_summary,
+                    cost_summary,
+                    budget_events,
+                ) = await self._first_limit_decision(
                     session=session,
                     registered_agent=registered_agent,
+                    environment_name=environment_name,
                     limits=limits,
                     budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     budget_baseline_events=budget_baseline_events,
                     pending_tool_calls=executable_pending_tool_calls,
+                    budget_notify_events=request_budget_notify_events,
                 )
+                for event in budget_events:
+                    yield event
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
                         session=session,
@@ -1781,6 +1800,7 @@ class CayuApp:
             baseline_events = []
         if limits.scope == "run" and has_run_limits(limits):
             run_baseline = session_usage_summary(session.id, baseline_events)
+        request_budget_notify_events: list[Event] = []
         if structured_output is not None and STRUCTURED_OUTPUT_TOOL_NAME in registered_agent.tools:
             raise ValueError(
                 f"Tool name is reserved for structured output: {STRUCTURED_OUTPUT_TOOL_NAME}"
@@ -1854,15 +1874,24 @@ class CayuApp:
                     ):
                         yield event
                     return
-                decision, usage_summary, cost_summary = await self._first_limit_decision(
+                (
+                    decision,
+                    usage_summary,
+                    cost_summary,
+                    budget_events,
+                ) = await self._first_limit_decision(
                     session=session,
                     registered_agent=registered_agent,
+                    environment_name=environment_name,
                     limits=limits,
                     budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     budget_baseline_events=baseline_events,
+                    budget_notify_events=request_budget_notify_events,
                 )
+                for event in budget_events:
+                    yield event
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
                         session=session,
@@ -2082,16 +2111,25 @@ class CayuApp:
                         [assistant_message],
                     )
 
-                decision, usage_summary, cost_summary = await self._first_limit_decision(
+                (
+                    decision,
+                    usage_summary,
+                    cost_summary,
+                    budget_events,
+                ) = await self._first_limit_decision(
                     session=session,
                     registered_agent=registered_agent,
+                    environment_name=environment_name,
                     limits=limits,
                     budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     budget_baseline_events=baseline_events,
                     pending_tool_calls=_user_tool_call_count(tool_calls),
+                    budget_notify_events=request_budget_notify_events,
                 )
+                for event in budget_events:
+                    yield event
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
                         session=session,
@@ -2387,16 +2425,25 @@ class CayuApp:
                             yield event
                     raise
 
-                decision, usage_summary, cost_summary = await self._first_limit_decision(
+                (
+                    decision,
+                    usage_summary,
+                    cost_summary,
+                    budget_events,
+                ) = await self._first_limit_decision(
                     session=session,
                     registered_agent=registered_agent,
+                    environment_name=environment_name,
                     limits=limits,
                     budget_limits=budget_limits,
                     run_started_at=run_started_at,
                     run_baseline=run_baseline,
                     budget_baseline_events=baseline_events,
                     pending_tool_calls=len(tool_calls),
+                    budget_notify_events=request_budget_notify_events,
                 )
+                for event in budget_events:
+                    yield event
                 if decision is not None:
                     async for event in self._stop_session_for_limit_reached(
                         session=session,
@@ -2481,16 +2528,25 @@ class CayuApp:
                 try:
                     for tool_call in tool_calls:
                         await self._raise_if_session_interrupted(session.id)
-                        decision, usage_summary, cost_summary = await self._first_limit_decision(
+                        (
+                            decision,
+                            usage_summary,
+                            cost_summary,
+                            budget_events,
+                        ) = await self._first_limit_decision(
                             session=session,
                             registered_agent=registered_agent,
+                            environment_name=environment_name,
                             limits=limits,
                             budget_limits=budget_limits,
                             run_started_at=run_started_at,
                             run_baseline=run_baseline,
                             budget_baseline_events=baseline_events,
                             pending_tool_calls=1,
+                            budget_notify_events=request_budget_notify_events,
                         )
+                        for event in budget_events:
+                            yield event
                         if decision is not None:
                             async for event in self._stop_session_for_limit_reached(
                                 session=session,
@@ -2975,20 +3031,22 @@ class CayuApp:
         *,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
         run_started_at: float,
         run_baseline: SessionUsageSummary | None = None,
         budget_baseline_events: list[Event] | None = None,
         pending_tool_calls: int = 0,
-    ) -> tuple[StopDecision | None, SessionUsageSummary, SessionCostSummary | None]:
+        budget_notify_events: list[Event] | None = None,
+    ) -> tuple[StopDecision | None, SessionUsageSummary, SessionCostSummary | None, list[Event]]:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
             agent_name=registered_agent.spec.name,
             causal_budget_id=session.causal_budget_id,
         )
         if not has_run_limits(limits) and not budget_limits:
-            return None, SessionUsageSummary(session_id=session.id), None
+            return None, SessionUsageSummary(session_id=session.id), None, []
         events = await self.session_store.load_events(session.id)
         usage_summary = session_usage_summary(session.id, events)
         usage_for_limits = usage_summary
@@ -3011,9 +3069,10 @@ class CayuApp:
             pending_tool_calls=pending_tool_calls,
         )
         if decision is not None:
-            return decision, usage_summary, None
+            return decision, usage_summary, None, []
 
         cost_summary: SessionCostSummary | None = None
+        emitted_events: list[Event] = []
         for budget_limit in budget_limits:
             budget_events = events
             budget_baseline: SessionCostSummary | None = None
@@ -3055,15 +3114,31 @@ class CayuApp:
                 pricing=budget_limit.pricing,
                 currency=budget_limit.currency,
             )
-            cost_decision = _first_budget_limit_decision(
+            budget_outcome = _first_budget_limit_outcome(
                 session=session,
                 limit=budget_limit,
                 cost_summary=cost_summary,
                 cost_baseline=budget_baseline,
             )
-            if cost_decision is not None:
-                return cost_decision, usage_summary, cost_summary
-        return None, usage_summary, cost_summary
+            if budget_outcome is None:
+                continue
+            if budget_limit.action == "notify":
+                if not _budget_notify_already_emitted_in_invocation(
+                    budget_notify_events or [],
+                    check=budget_outcome.check,
+                ):
+                    event = await self._emit_budget_limit_reached(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        check=budget_outcome.check,
+                    )
+                    emitted_events.append(event)
+                    if budget_notify_events is not None:
+                        budget_notify_events.append(event)
+                continue
+            return budget_outcome.decision, usage_summary, cost_summary, emitted_events
+        return None, usage_summary, cost_summary, emitted_events
 
     async def _first_budget_decision(
         self,
@@ -3105,8 +3180,81 @@ class CayuApp:
                 )
             )
             if check.limit_reached:
+                if limit.action == "notify":
+                    if not await self._budget_notify_already_emitted(
+                        limit=limit,
+                        check=check,
+                    ):
+                        emitted_events.append(
+                            await self._emit_budget_limit_reached(
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                check=check,
+                            )
+                        )
+                    continue
                 return check, emitted_events
         return None, emitted_events
+
+    async def _budget_notify_already_emitted(
+        self,
+        *,
+        limit: BudgetLimit,
+        check: BudgetCheck,
+    ) -> bool:
+        if type(limit) is not BudgetLimit:
+            raise TypeError("limit must be a BudgetLimit instance.")
+        if type(check) is not BudgetCheck:
+            raise TypeError("check must be a BudgetCheck instance.")
+        if limit.action != "notify":
+            return False
+
+        since, until = limit.window.bounds()
+        agent_name: str | None = None
+        causal_budget_id: str | None = None
+        if limit.scope == "agent":
+            agent_name = require_clean_nonblank(limit.key or "", "key")
+        elif limit.scope == "causal":
+            causal_budget_id = require_clean_nonblank(limit.key or "", "key")
+        elif limit.scope != "app":
+            return False
+
+        records = await self._query_all_event_records(
+            EventQuery(
+                causal_budget_id=causal_budget_id,
+                event_type=EventType.BUDGET_LIMIT_REACHED,
+                agent_name=agent_name,
+                since=since,
+                until=until,
+                limit=5000,
+            )
+        )
+        for record in records:
+            if _budget_limit_reached_payload_matches(
+                record.event.payload,
+                check=check,
+            ):
+                return True
+        return False
+
+    async def _emit_budget_limit_reached(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        check: BudgetCheck,
+    ) -> Event:
+        return await self._emit(
+            Event(
+                type=EventType.BUDGET_LIMIT_REACHED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=_budget_limit_reached_payload(check),
+            )
+        )
 
     async def _reserve_budget_for_model_step(
         self,
@@ -4929,17 +5077,50 @@ def _budget_limit_reached_payload(check: BudgetCheck) -> dict[str, Any]:
     return budget_check_payload(check)
 
 
+def _budget_limit_reached_payload_matches(
+    payload: dict[str, Any],
+    *,
+    check: BudgetCheck,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if type(check) is not BudgetCheck:
+        raise TypeError("check must be a BudgetCheck.")
+    return (
+        payload.get("scope") == check.scope
+        and payload.get("key") == check.key
+        and payload.get("window") == check.window.storage_key
+        and payload.get("currency") == check.currency
+        and payload.get("maximum") == str(check.maximum)
+        and payload.get("action") == check.action
+    )
+
+
+def _budget_notify_already_emitted_in_invocation(
+    events: list[Event],
+    *,
+    check: BudgetCheck,
+) -> bool:
+    if type(check) is not BudgetCheck:
+        raise TypeError("check must be a BudgetCheck.")
+    return any(
+        event.type == EventType.BUDGET_LIMIT_REACHED
+        and _budget_limit_reached_payload_matches(event.payload, check=check)
+        for event in events
+    )
+
+
 def _has_run_budget_limit(limits: tuple[BudgetLimit, ...]) -> bool:
     return any(limit.scope == "run" for limit in limits)
 
 
-def _first_budget_limit_decision(
+def _first_budget_limit_outcome(
     *,
     session: Session,
     limit: BudgetLimit,
     cost_summary: SessionCostSummary,
     cost_baseline: SessionCostSummary | None,
-) -> StopDecision | None:
+) -> _BudgetLimitOutcome | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
     if type(limit) is not BudgetLimit:
@@ -4959,7 +5140,7 @@ def _first_budget_limit_decision(
         )
 
     if unpriced_model_steps > 0 and not limit.allow_unpriced:
-        return StopDecision(
+        decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=limit.max_estimated_cost,
             actual=actual_cost,
@@ -4968,16 +5149,34 @@ def _first_budget_limit_decision(
                 f"{unpriced_model_steps} model step(s) have no matching pricing."
             ),
         )
+        return _BudgetLimitOutcome(
+            decision=decision,
+            check=_budget_check_from_stop_decision(
+                limit=limit,
+                decision=decision,
+                cost_summary=cost_summary,
+                unpriced_model_steps=unpriced_model_steps,
+            ),
+        )
     preflight_error = _budget_limit_preflight_error(session=session, limit=limit)
     if preflight_error is not None:
-        return StopDecision(
+        decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=limit.max_estimated_cost,
             actual=actual_cost,
             message=preflight_error,
         )
+        return _BudgetLimitOutcome(
+            decision=decision,
+            check=_budget_check_from_stop_decision(
+                limit=limit,
+                decision=decision,
+                cost_summary=cost_summary,
+                unpriced_model_steps=unpriced_model_steps,
+            ),
+        )
     if actual_cost >= limit.max_estimated_cost:
-        return StopDecision(
+        decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
             maximum=limit.max_estimated_cost,
             actual=actual_cost,
@@ -4986,7 +5185,43 @@ def _first_budget_limit_decision(
                 f"{actual_cost} >= {limit.max_estimated_cost} {limit.currency}."
             ),
         )
+        return _BudgetLimitOutcome(
+            decision=decision,
+            check=_budget_check_from_stop_decision(
+                limit=limit,
+                decision=decision,
+                cost_summary=cost_summary,
+                unpriced_model_steps=unpriced_model_steps,
+            ),
+        )
     return None
+
+
+def _budget_check_from_stop_decision(
+    *,
+    limit: BudgetLimit,
+    decision: StopDecision,
+    cost_summary: SessionCostSummary,
+    unpriced_model_steps: int,
+) -> BudgetCheck:
+    if decision.limit != StopLimit.ESTIMATED_COST:
+        raise ValueError("Budget checks can only be created for estimated-cost decisions.")
+    if type(decision.actual) is not Decimal:
+        raise TypeError("Estimated-cost decisions must use Decimal actual values.")
+    return BudgetCheck(
+        scope=limit.scope,
+        key=limit.key,
+        window=limit.window,
+        currency=limit.currency,
+        maximum=limit.max_estimated_cost,
+        actual=decision.actual,
+        action=limit.action,
+        model_steps=cost_summary.model_steps,
+        unpriced_model_steps=unpriced_model_steps,
+        limit_reached=True,
+        message=decision.message,
+        cost_summary=cost_summary,
+    )
 
 
 def _budget_limit_preflight_error(*, session: Session, limit: BudgetLimit) -> str | None:

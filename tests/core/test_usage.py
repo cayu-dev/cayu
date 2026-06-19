@@ -140,6 +140,23 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
     )
 
     assert len(policy.limits) == 3
+    tiered_policy = BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=pricing,
+                action="notify",
+            ),
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("2"),
+                pricing=pricing,
+                action="interrupt",
+            ),
+        )
+    )
+    assert [limit.action for limit in tiered_policy.limits] == ["notify", "interrupt"]
     from_mapping = BudgetPolicy(
         limits=(
             {
@@ -179,7 +196,7 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
                 ),
                 BudgetLimit(
                     scope="app",
-                    max_estimated_cost=Decimal("2"),
+                    max_estimated_cost=Decimal("1"),
                     pricing=pricing,
                 ),
             )
@@ -200,6 +217,14 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
             max_estimated_cost=Decimal("1"),
             pricing=pricing,
             allow_unpriced=True,
+            reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+        )
+    with pytest.raises(ValueError, match="action='interrupt'"):
+        BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+            action="notify",
             reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
         )
 

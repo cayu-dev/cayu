@@ -495,6 +495,7 @@ def fake_budget_limit(
     scope: Literal["session", "run"] = "session",
     allow_unpriced: bool = False,
     window: BudgetWindow | str | None = None,
+    action: Literal["interrupt", "notify"] = "interrupt",
 ) -> BudgetLimit:
     return BudgetLimit(
         max_estimated_cost=Decimal(max_estimated_cost),
@@ -511,6 +512,7 @@ def fake_budget_limit(
         ),
         scope=scope,
         allow_unpriced=allow_unpriced,
+        action=action,
     )
 
 
@@ -938,6 +940,125 @@ def test_cayu_app_stops_on_estimated_cost_limit_after_final_model_answer():
     session = asyncio.run(store.load("sess_cost_limit"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_request_notify_budget_emits_event_without_stopping_session():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "total_tokens": 1100,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_notify_budget",
+                messages=[Message.text("user", "answer")],
+                budget_limits=(fake_budget_limit("0.002", action="notify"),),
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_request_notify_budget"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[4].payload["action"] == "notify"
+    assert events[4].payload["limit_reached"] is True
+    assert events[4].payload["maximum"] == "0.002"
+    assert events[4].payload["actual"] == "0.002"
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_request_notify_budget_dedupes_during_tool_round():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="upper",
+                    arguments={"text": "one"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="upper",
+                    arguments={"text": "two"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 100,
+                            "total_tokens": 1100,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UpperTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_notify_budget_tool_round",
+                messages=[Message.text("user", "call tools")],
+                budget_limits=(fake_budget_limit("0.002", action="notify"),),
+                max_steps=2,
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_request_notify_budget_tool_round"))
+    budget_events = [event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED]
+
+    assert [event.payload["action"] for event in budget_events] == ["notify"]
+    assert [event.type for event in events].count(EventType.TOOL_CALL_COMPLETED) == 2
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
 
 
 def test_cayu_app_request_session_budget_uses_rolling_window():
@@ -1740,9 +1861,9 @@ def test_cayu_app_app_budget_applies_across_sessions():
                     {
                         "finish_reason": "stop",
                         "usage": {
-                            "input_tokens": 1,
+                            "input_tokens": 1_000_000,
                             "output_tokens": 0,
-                            "total_tokens": 1,
+                            "total_tokens": 1_000_000,
                         },
                     }
                 ),
@@ -1810,6 +1931,174 @@ def test_cayu_app_app_budget_applies_across_sessions():
     assert second_session is not None
     assert second_session.status == SessionStatus.INTERRUPTED
     assert len(provider.requests) == 1
+
+
+def test_cayu_app_notify_budget_emits_event_without_stopping_session():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("first"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=fake_budget_limit("10").pricing,
+                    action="notify",
+                ),
+            )
+        ),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_app_budget_notify",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_app_budget_notify"))
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.BUDGET_CHECKED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[6].payload["action"] == "notify"
+    assert events[6].payload["limit_reached"] is True
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert len(provider.requests) == 1
+
+
+def test_cayu_app_policy_can_notify_before_stricter_interrupt_budget():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=fake_budget_limit("10").pricing,
+                    action="notify",
+                ),
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("2"),
+                    pricing=fake_budget_limit("10").pricing,
+                    action="interrupt",
+                ),
+            )
+        ),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_budget_notify_then_interrupt_first",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    second_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_budget_notify_then_interrupt_second",
+                messages=[Message.text("user", "second")],
+            ),
+        )
+    )
+    first_session = asyncio.run(store.load("sess_budget_notify_then_interrupt_first"))
+    second_session = asyncio.run(store.load("sess_budget_notify_then_interrupt_second"))
+
+    assert EventType.BUDGET_LIMIT_REACHED in [event.type for event in first_events]
+    first_notify_events = [
+        event
+        for event in first_events
+        if event.type == EventType.BUDGET_LIMIT_REACHED and event.payload["action"] == "notify"
+    ]
+    assert len(first_notify_events) == 1
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert [event.type for event in second_events] == [
+        EventType.SESSION_STARTED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_CHECKED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert second_events[8].payload["action"] == "interrupt"
+    assert first_session is not None
+    assert first_session.status == SessionStatus.COMPLETED
+    assert second_session is not None
+    assert second_session.status == SessionStatus.INTERRUPTED
+    assert len(provider.requests) == 2
 
 
 def test_cayu_app_request_app_budget_limit_applies_across_sessions():
@@ -8560,6 +8849,52 @@ def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
         "model.completed",
         "tool.call.started",
     ]
+
+
+def test_cayu_app_query_all_event_records_preserves_filters():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+
+    async def run() -> None:
+        for session_id in ("query_all_a", "query_all_b"):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+        await store.append_event(
+            "query_all_a",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="query_all_a",
+                timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+            ),
+        )
+        await store.append_event(
+            "query_all_b",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="query_all_b",
+                timestamp=datetime(2026, 1, 1, 13, 0, tzinfo=UTC),
+            ),
+        )
+
+        records = await app._query_all_event_records(
+            EventQuery(
+                session_ids=("query_all_b",),
+                event_type=EventType.MODEL_COMPLETED,
+                since=datetime(2026, 1, 1, 12, 30, tzinfo=UTC),
+                until=datetime(2026, 1, 1, 13, 30, tzinfo=UTC),
+                limit=1,
+            )
+        )
+
+        assert [record.event.session_id for record in records] == ["query_all_b"]
+
+    asyncio.run(run())
 
 
 def test_model_compactor_rejects_tool_calls_from_compaction_model():
