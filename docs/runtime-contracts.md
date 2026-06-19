@@ -450,6 +450,62 @@ the grouped usage summary, and the grouped cost summary. This endpoint is a
 composition of durable session/event data; it does not add another accounting or
 budget-enforcement path.
 
+Sessions also carry app-owned `labels`: stable key/value dimensions such as
+`organization`, `project`, `owner`, `workflow`, `customer`, or `environment`.
+Labels are for application grouping and filtering, not for runtime control flow.
+Use labels when the dimension belongs to the app domain and more dimensions may
+appear over time. Use `causal_budget_id` when the dimension is the execution
+accounting group for one work item and its forked/subagent sessions. A common
+shape is:
+
+```python
+RunRequest(
+    agent_name="assistant",
+    session_id="invoice_1042_root",
+    causal_budget_id="invoice_1042",
+    labels={
+        "organization": "org_123",
+        "project": "ap_q2",
+        "workflow": "invoice-review",
+    },
+    messages=[Message.text("user", "Review invoice 1042.")],
+)
+```
+
+`SessionQuery.labels` performs exact key/value matching. `label_selectors`
+support existence and set-style matching through `LabelSelectorRequirement`:
+
+```python
+SessionQuery(
+    labels={"organization": "org_123"},
+    label_selectors=[
+        {"key": "project", "operator": "in", "values": ["ap_q2", "research"]},
+        {"key": "archived", "operator": "not_exists"},
+    ],
+)
+```
+
+The optional server exposes the same filtering on `GET /api/sessions` through
+repeated `label=key=value` and `label_selector=...` query parameters. Supported
+selector forms are `workflow`, `!archived`, `project=ap_q2`,
+`project!=legacy`, `project in (ap_q2,research)`, and
+`project notin (legacy,archived)`.
+
+For many-session health views, use `POST /api/sessions/summary` with the same
+typed filters, exact labels, and label selectors as `GET /api/sessions`. It
+returns the matched sessions, per-session outcome and event counts, aggregate
+normalized usage, and optional aggregate/per-session cost when the request body
+includes a `PricingCatalog`. This is the right endpoint for app dashboards like
+"usage and cost for org 123's AP Q2 invoice sessions" where there may not be one
+shared causal budget id.
+
+```bash
+curl -X POST \
+  "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)" \
+  -H "Content-Type: application/json" \
+  -d '{"pricing":{"prices":[{"provider_name":"openai","model":"gpt-5.5","match":"prefix","input_per_million":"2.00","output_per_million":"8.00","cache_read_input_per_million":"0.50"}]}}'
+```
+
 For compact health views, use the server's
 `GET /api/sessions/{session_id}/summary`. The summary endpoint includes outcome
 data derived through `SessionStore.summarize_outcome(session_id)`: current
