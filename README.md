@@ -968,6 +968,31 @@ Every `session.interrupted` event includes a normalized `interruption_type`:
 `tool_approval_required` for approval pauses, and `runtime_interrupted` for
 runtime/status-driven interruption repairs.
 
+On worker startup, recover sessions that were left incomplete by a deploy,
+process crash, or machine restart:
+
+```python
+from cayu import IncompleteSessionsRecoveryRequest, SessionStatus
+
+results = await app.recover_incomplete_sessions(
+    IncompleteSessionsRecoveryRequest(
+        statuses={SessionStatus.INTERRUPTING},
+        reason="worker restart",
+    )
+)
+for result in results:
+    print(result.session_id, result.status, result.actions)
+```
+
+Recovery does not call the model and does not execute tools. It repairs any
+pending ordinary tool round from durable terminal tool events when possible,
+preserves pending tool approvals for `resolve_tool_approval(...)`, finalizes
+stale `interrupting` sessions, and marks abandoned `pending`/`running` sessions
+as `interrupted` so they can be resumed deliberately later. Batch recovery
+requires explicit `statuses`; supported values are `interrupting`, `running`,
+and `pending`. Include `running` or `pending` only when your app knows those
+in-flight sessions are abandoned, such as a single-worker restart.
+
 Provider streams and runner/tool calls that are currently awaited are stopped
 through normal asyncio cancellation. `E2BRunner` and `MicrosandboxRunner`
 separate user/runtime interruption from command timeout:

@@ -148,6 +148,10 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     ForkSessionRequest,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     ResumeRequest,
@@ -159,6 +163,8 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     copy_fork_session_request,
+    copy_incomplete_session_recovery_request,
+    copy_incomplete_sessions_recovery_request,
     copy_interrupt_session_request,
     copy_resume_request,
     copy_run_request,
@@ -829,6 +835,58 @@ class CayuApp:
             if request_marker_active:
                 self._sessions_requesting_interruption.discard(loaded_session.id)
         return
+
+    async def recover_incomplete_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        request = copy_incomplete_session_recovery_request(request)
+        session = await self.session_store.load(request.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {request.session_id}") from None
+        return await self._recover_incomplete_session(
+            session=session,
+            reason=request.reason,
+            metadata=request.metadata,
+        )
+
+    async def recover_incomplete_sessions(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> list[IncompleteSessionRecoveryResult]:
+        request = copy_incomplete_sessions_recovery_request(request)
+        sessions: list[Session] = []
+        seen_session_ids: set[str] = set()
+        for status in (
+            SessionStatus.INTERRUPTING,
+            SessionStatus.RUNNING,
+            SessionStatus.PENDING,
+        ):
+            if status not in request.statuses:
+                continue
+            if len(sessions) >= request.limit:
+                break
+            candidates = await self.session_store.list_sessions(
+                SessionQuery(status=status, limit=min(1000, request.limit - len(sessions)))
+            )
+            for candidate in candidates:
+                if candidate.id in seen_session_ids:
+                    continue
+                seen_session_ids.add(candidate.id)
+                sessions.append(candidate)
+                if len(sessions) >= request.limit:
+                    break
+
+        results: list[IncompleteSessionRecoveryResult] = []
+        for session in sessions:
+            results.append(
+                await self._recover_incomplete_session(
+                    session=session,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                )
+            )
+        return results
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
@@ -4208,6 +4266,162 @@ class CayuApp:
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
         copied_checkpoint.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, None)
         await self.session_store.checkpoint(session_id, copied_checkpoint)
+
+    async def _require_session(self, session_id: str) -> Session:
+        loaded = await self.session_store.load(session_id)
+        if loaded is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        return loaded
+
+    async def _recover_incomplete_session(
+        self,
+        *,
+        session: Session,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> IncompleteSessionRecoveryResult:
+        reason = require_clean_nonblank(reason, "reason")
+        metadata = copy_json_value(metadata, "metadata")
+        previous_status = session.status
+        actions: list[IncompleteSessionRecoveryAction] = []
+        events: list[Event] = []
+
+        if self._has_active_session_tasks(session.id):
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=(),
+                message="Session has active work in this CayuApp process; recovery skipped.",
+            )
+
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if (
+            session.status in _RESUMABLE_SESSION_STATUSES
+            and pending_approval is None
+            and pending_tool_round is None
+        ):
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                events=(),
+                message="Session is terminal; recovery skipped.",
+            )
+
+        registered_agent = self._get_registered_agent(session.agent_name)
+        registered_environment = self._get_registered_environment_for_session(
+            session.environment_name
+        )
+        environment_name = _environment_name(registered_environment)
+
+        if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+            if pending_approval is not None:
+                interrupt_payload = {
+                    "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                    "approval": pending_approval.model_dump(mode="json"),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            else:
+                interrupt_payload = {
+                    "reason": reason,
+                    "metadata": metadata,
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "recovered": True,
+                }
+            try:
+                session = await self.session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.PENDING, SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        interrupt_payload
+                    ),
+                )
+            except ValueError:
+                session = await self._require_session(session.id)
+                if session.status in _RESUMABLE_SESSION_STATUSES:
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=session.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                        events=(),
+                        message="Session changed during recovery; recovery skipped.",
+                    )
+                raise
+            session = await self._require_session(session.id)
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+
+        if pending_tool_round is not None:
+            transcript = await self.session_store.load_transcript(session.id)
+            async for event in self._recover_pending_tool_round(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=transcript,
+            ):
+                events.append(event)
+            actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+            session = await self._require_session(session.id)
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        if pending_approval is not None:
+            if session.status == SessionStatus.INTERRUPTING:
+                async for event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                ):
+                    events.append(event)
+                session = await self._require_session(session.id)
+            actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=tuple(actions),
+                events=tuple(events),
+                pending_approval_id=pending_approval.approval_id,
+                message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
+            )
+
+        if session.status == SessionStatus.INTERRUPTING:
+            async for event in self._handle_session_interrupted(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+            ):
+                events.append(event)
+            session = await self._require_session(session.id)
+            if previous_status == SessionStatus.INTERRUPTING:
+                actions.append(IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT)
+            else:
+                actions.append(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED)
+        elif not actions:
+            actions.append(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL)
+
+        message = "Recovered incomplete session."
+        if actions == [IncompleteSessionRecoveryAction.SKIPPED_TERMINAL]:
+            message = "Session is terminal; recovery skipped."
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=previous_status,
+            status=session.status,
+            actions=tuple(actions),
+            events=tuple(events),
+            message=message,
+        )
 
     async def _handle_session_interrupted(
         self,

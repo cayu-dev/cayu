@@ -514,6 +514,103 @@ class SessionOutcome(BaseModel):
         return copy_json_value(value, "retry")
 
 
+class IncompleteSessionRecoveryAction(StrEnum):
+    SKIPPED_ACTIVE = "skipped_active"
+    SKIPPED_TERMINAL = "skipped_terminal"
+    PENDING_APPROVAL = "pending_approval"
+    REPAIRED_TOOL_ROUND = "repaired_tool_round"
+    INTERRUPTED_ABANDONED = "interrupted_abandoned"
+    FINALIZED_INTERRUPT = "finalized_interrupt"
+
+
+class IncompleteSessionRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    reason: str = "worker_recovered_incomplete_session"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("session_id", "reason")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+
+class IncompleteSessionsRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    statuses: set[SessionStatus]
+    limit: StrictInt = Field(default=100, ge=1, le=1000)
+    reason: str = "worker_recovered_incomplete_session"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("statuses", mode="before")
+    @classmethod
+    def copy_statuses(cls, value) -> set[SessionStatus]:
+        if value is None:
+            raise ValueError("statuses is required for batch incomplete-session recovery.")
+        if not isinstance(value, (set, list, tuple)):
+            raise ValueError("statuses must be a set of SessionStatus values.")
+        statuses: set[SessionStatus] = set()
+        for status in value:
+            if not isinstance(status, SessionStatus):
+                status = SessionStatus(status)
+            statuses.add(status)
+        if not statuses:
+            raise ValueError("statuses must not be empty.")
+        recoverable_statuses = {
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }
+        unsupported_statuses = statuses - recoverable_statuses
+        if unsupported_statuses:
+            unsupported = ", ".join(sorted(status.value for status in unsupported_statuses))
+            supported = ", ".join(sorted(status.value for status in recoverable_statuses))
+            raise ValueError(
+                f"statuses contains unsupported recovery status values: {unsupported}. "
+                f"Supported values are: {supported}."
+            )
+        return statuses
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_clean_nonblank(value, "reason")
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+
+class IncompleteSessionRecoveryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    previous_status: SessionStatus
+    status: SessionStatus
+    actions: tuple[IncompleteSessionRecoveryAction, ...]
+    events: tuple[Event, ...] = Field(default_factory=tuple)
+    pending_approval_id: str | None = None
+    message: str
+
+    @field_validator("session_id", "message")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("events")
+    @classmethod
+    def copy_events(cls, value) -> tuple[Event, ...]:
+        return tuple(copy_event(event) for event in value)
+
+
 class EventQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1425,6 +1522,33 @@ def copy_interrupt_session_request(request: InterruptSessionRequest) -> Interrup
         raise TypeError("Session interruption requires an InterruptSessionRequest.")
     return InterruptSessionRequest(
         session_id=request.session_id,
+        reason=request.reason,
+        metadata=copy_json_value(request.metadata, "metadata"),
+    )
+
+
+def copy_incomplete_session_recovery_request(
+    request: IncompleteSessionRecoveryRequest,
+) -> IncompleteSessionRecoveryRequest:
+    if type(request) is not IncompleteSessionRecoveryRequest:
+        raise TypeError("Incomplete session recovery requires an IncompleteSessionRecoveryRequest.")
+    return IncompleteSessionRecoveryRequest(
+        session_id=request.session_id,
+        reason=request.reason,
+        metadata=copy_json_value(request.metadata, "metadata"),
+    )
+
+
+def copy_incomplete_sessions_recovery_request(
+    request: IncompleteSessionsRecoveryRequest,
+) -> IncompleteSessionsRecoveryRequest:
+    if type(request) is not IncompleteSessionsRecoveryRequest:
+        raise TypeError(
+            "Incomplete sessions recovery requires an IncompleteSessionsRecoveryRequest."
+        )
+    return IncompleteSessionsRecoveryRequest(
+        statuses=set(request.statuses),
+        limit=request.limit,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
     )

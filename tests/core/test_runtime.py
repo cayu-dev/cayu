@@ -42,6 +42,9 @@ from cayu.runtime import (
     EventQuery,
     EventSink,
     ForkSessionRequest,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
     InMemoryBudgetLedger,
     InMemoryEventSink,
     InMemorySessionStore,
@@ -283,6 +286,17 @@ class FailingSecondTerminalToolEventStore(InMemorySessionStore):
                 if self.completed_tool_events == 2:
                     raise RuntimeError("second terminal tool event unavailable")
         await super().append_events(session_id, events)
+
+
+class RecordingListSessionsStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_queries: list[SessionQuery] = []
+
+    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+        copied_query = SessionQuery() if query is None else query.model_copy(deep=True)
+        self.session_queries.append(copied_query)
+        return await super().list_sessions(query)
 
 
 class MemoryWorkspace(Workspace):
@@ -6572,6 +6586,478 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
     ]
     assert transcript[2].content[0].content == "recorded"
     assert "outcome is unknown" in transcript[4].content[0].content
+
+
+def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_session():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_abandoned_running",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_abandoned_running", SessionStatus.RUNNING)
+        return await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="sess_abandoned_running",
+                reason="worker restart",
+                metadata={"worker": "w1"},
+            )
+        )
+
+    result = asyncio.run(setup_and_recover())
+    session = asyncio.run(store.load("sess_abandoned_running"))
+    events = asyncio.run(store.load_events("sess_abandoned_running"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert result.previous_status == SessionStatus.RUNNING
+    assert result.status == SessionStatus.INTERRUPTED
+    assert result.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
+    assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert events[-1].payload == {
+        "reason": "worker restart",
+        "metadata": {"worker": "w1"},
+        "interruption_type": "runtime_interrupted",
+        "recovered": True,
+    }
+
+
+def test_cayu_app_recover_incomplete_session_skips_terminal_without_registered_agent():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="removed_agent",
+                session_id="sess_recover_terminal_missing_agent",
+                messages=[Message.text("user", "done")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_recover_terminal_missing_agent", SessionStatus.COMPLETED)
+        return await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recover_terminal_missing_agent")
+        )
+
+    result = asyncio.run(setup_and_recover())
+
+    assert result.previous_status == SessionStatus.COMPLETED
+    assert result.status == SessionStatus.COMPLETED
+    assert result.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+    assert result.events == ()
+    assert result.message == "Session is terminal; recovery skipped."
+
+
+def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_stale_interrupting",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_stale_interrupting", SessionStatus.INTERRUPTING)
+        await store.checkpoint(
+            "sess_stale_interrupting",
+            {
+                "pending_session_interrupt": {
+                    "reason": "deploy",
+                    "metadata": {"worker": "old"},
+                    "interruption_type": "operator_requested",
+                }
+            },
+        )
+        return await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_stale_interrupting")
+        )
+
+    result = asyncio.run(setup_and_recover())
+    session = asyncio.run(store.load("sess_stale_interrupting"))
+    checkpoint = asyncio.run(store.load_checkpoint("sess_stale_interrupting"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert checkpoint == {}
+    assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
+    assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
+    assert result.events[0].payload == {
+        "reason": "deploy",
+        "metadata": {"worker": "old"},
+        "interruption_type": "operator_requested",
+    }
+
+
+def test_cayu_app_recover_incomplete_session_is_idempotent_after_interrupt_finalized():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_and_recover_twice():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recover_interrupt_twice",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_recover_interrupt_twice", SessionStatus.INTERRUPTING)
+        await store.checkpoint(
+            "sess_recover_interrupt_twice",
+            {
+                "pending_session_interrupt": {
+                    "reason": "deploy",
+                    "metadata": {},
+                    "interruption_type": "operator_requested",
+                }
+            },
+        )
+        first = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recover_interrupt_twice")
+        )
+        second = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recover_interrupt_twice")
+        )
+        events = await store.load_events("sess_recover_interrupt_twice")
+        return first, second, events
+
+    first, second, events = asyncio.run(setup_and_recover_twice())
+
+    interrupted_events = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+    assert len(interrupted_events) == 1
+    assert first.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
+    assert [event.type for event in first.events] == [EventType.SESSION_INTERRUPTED]
+    assert second.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+    assert second.events == ()
+    assert second.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_recover_incomplete_session_repairs_tool_round_before_interrupting():
+    store = FailingAfterPendingToolRoundCheckpointStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recover_incomplete_tool_round",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_recover_incomplete_tool_round"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    asyncio.run(store.update_status("sess_recover_incomplete_tool_round", SessionStatus.RUNNING))
+
+    result = asyncio.run(
+        app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recover_incomplete_tool_round")
+        )
+    )
+    session = asyncio.run(store.load("sess_recover_incomplete_tool_round"))
+    transcript = asyncio.run(store.load_transcript("sess_recover_incomplete_tool_round"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert result.actions == (
+        IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+        IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+    )
+    assert tool.calls == []
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    assert transcript[2].content[0].tool_call_id == "call_1"
+    assert "was not executed" in transcript[2].content[0].content
+    assert asyncio.run(store.load_checkpoint("sess_recover_incomplete_tool_round")) == {}
+
+
+def test_cayu_app_recover_incomplete_session_uses_recorded_tool_result():
+    store = FailingOrdinaryToolResultCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recover_incomplete_recorded_tool_result",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_recover_incomplete_recorded_tool_result"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    asyncio.run(
+        store.update_status(
+            "sess_recover_incomplete_recorded_tool_result",
+            SessionStatus.RUNNING,
+        )
+    )
+
+    result = asyncio.run(
+        app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="sess_recover_incomplete_recorded_tool_result"
+            )
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_recover_incomplete_recorded_tool_result"))
+
+    assert result.actions == (
+        IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+        IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+    )
+    assert tool.calls == [{}]
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    assert transcript[2].content[0].tool_call_id == "call_1"
+    assert transcript[2].content[0].content == "recorded"
+    assert transcript[2].content[0].is_error is False
+    assert asyncio.run(store.load_checkpoint("sess_recover_incomplete_recorded_tool_result")) == {}
+
+
+def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={"value": "requires approval"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recover_incomplete_pending_approval",
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+    )
+    approval_event = next(
+        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    approval_id = approval_event.payload["approval"]["approval_id"]
+    asyncio.run(
+        store.update_status(
+            "sess_recover_incomplete_pending_approval",
+            SessionStatus.RUNNING,
+        )
+    )
+
+    result = asyncio.run(
+        app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recover_incomplete_pending_approval")
+        )
+    )
+    session = asyncio.run(store.load("sess_recover_incomplete_pending_approval"))
+    checkpoint = asyncio.run(store.load_checkpoint("sess_recover_incomplete_pending_approval"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert result.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
+    assert result.pending_approval_id == approval_id
+    assert result.status == SessionStatus.INTERRUPTED
+    assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
+    assert checkpoint is not None
+    assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+    assert "pending_session_interrupt" not in checkpoint
+    assert tool.calls == []
+
+
+def test_incomplete_sessions_recovery_request_requires_explicit_statuses():
+    with pytest.raises(ValidationError, match="statuses"):
+        IncompleteSessionsRecoveryRequest(limit=10)
+
+
+def test_incomplete_sessions_recovery_request_rejects_empty_or_terminal_statuses():
+    with pytest.raises(ValidationError, match="must not be empty"):
+        IncompleteSessionsRecoveryRequest(statuses=set(), limit=10)
+
+    with pytest.raises(ValidationError, match="unsupported recovery status"):
+        IncompleteSessionsRecoveryRequest(statuses={SessionStatus.COMPLETED}, limit=10)
+
+
+def test_cayu_app_recover_incomplete_sessions_with_explicit_interrupting_status():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_session(session_id: str, status: SessionStatus) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", session_id)],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, status)
+
+    async def setup_and_recover():
+        await create_session("sess_batch_interrupting", SessionStatus.INTERRUPTING)
+        await create_session("sess_batch_running", SessionStatus.RUNNING)
+        await create_session("sess_batch_pending", SessionStatus.PENDING)
+        await create_session("sess_batch_completed", SessionStatus.COMPLETED)
+        return await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(
+                statuses={SessionStatus.INTERRUPTING},
+                limit=10,
+            )
+        )
+
+    results = asyncio.run(setup_and_recover())
+
+    assert [result.session_id for result in results] == ["sess_batch_interrupting"]
+    assert results[0].status == SessionStatus.INTERRUPTED
+    assert results[0].actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
+
+
+def test_cayu_app_recover_incomplete_sessions_fetches_only_requested_limit():
+    store = RecordingListSessionsStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_session(session_id: str) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", session_id)],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTING)
+
+    async def setup_and_recover():
+        await create_session("sess_batch_limit_1")
+        await create_session("sess_batch_limit_2")
+        return await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(
+                statuses={SessionStatus.INTERRUPTING},
+                limit=1,
+            )
+        )
+
+    results = asyncio.run(setup_and_recover())
+
+    assert len(results) == 1
+    assert len(store.session_queries) == 1
+    assert store.session_queries[0].status == SessionStatus.INTERRUPTING
+    assert store.session_queries[0].limit == 1
+    assert store.session_queries[0].offset == 0
+
+
+def test_cayu_app_recover_incomplete_sessions_can_include_abandoned_running_and_pending():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_session(session_id: str, status: SessionStatus) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", session_id)],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, status)
+
+    async def setup_and_recover():
+        await create_session("sess_batch_running", SessionStatus.RUNNING)
+        await create_session("sess_batch_pending", SessionStatus.PENDING)
+        await create_session("sess_batch_completed", SessionStatus.COMPLETED)
+        return await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(
+                statuses={SessionStatus.RUNNING, SessionStatus.PENDING},
+                limit=10,
+            )
+        )
+
+    results = asyncio.run(setup_and_recover())
+
+    assert {result.session_id for result in results} == {
+        "sess_batch_running",
+        "sess_batch_pending",
+    }
+    assert {(result.session_id, result.status, result.actions) for result in results} == {
+        (
+            "sess_batch_running",
+            SessionStatus.INTERRUPTED,
+            (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+        ),
+        (
+            "sess_batch_pending",
+            SessionStatus.INTERRUPTED,
+            (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+        ),
+    }
 
 
 def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
