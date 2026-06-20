@@ -47,6 +47,7 @@ from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.approvals import (
     PendingToolApproval,
@@ -1947,6 +1948,14 @@ class CayuApp:
                         payload=start_event_payload,
                     )
                 )
+            async for event in self._recover_pending_tool_round(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=messages,
+                tail_message_count=len(messages_to_append),
+            ):
+                yield event
             if (
                 structured_output is not None
                 and structured_output.strategy == StructuredOutputStrategy.NATIVE
@@ -2227,12 +2236,39 @@ class CayuApp:
                     ):
                         yield event
 
+                pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
                     messages.append(assistant_message)
-                    await self.session_store.append_transcript_messages(
-                        session.id,
-                        [assistant_message],
-                    )
+                    if tool_calls and not (
+                        structured_output is not None
+                        and structured_output.strategy == StructuredOutputStrategy.TOOL
+                        and _has_structured_output_tool_call(tool_calls)
+                    ):
+                        (
+                            checkpoint,
+                            pending_tool_round,
+                        ) = await self._checkpoint_with_pending_tool_round(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            tool_calls=tool_calls,
+                            policy_outcomes=None,
+                            task_id=task_id,
+                            structured_output=structured_output,
+                        )
+                        await self.session_store.append_transcript_messages_and_checkpoint(
+                            session.id,
+                            [assistant_message],
+                            checkpoint,
+                        )
+                    else:
+                        await self.session_store.append_transcript_messages(
+                            session.id,
+                            [assistant_message],
+                        )
+                tool_round_id = (
+                    pending_tool_round.round_id if pending_tool_round is not None else None
+                )
 
                 (
                     decision,
@@ -2265,6 +2301,7 @@ class CayuApp:
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
+                        tool_round_id=tool_round_id,
                     ):
                         yield event
                     return
@@ -2287,6 +2324,7 @@ class CayuApp:
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
+                        tool_round_id=tool_round_id,
                     ):
                         yield event
                     return
@@ -2530,6 +2568,7 @@ class CayuApp:
                         messages=messages,
                         tool_calls=tool_calls,
                         tool_outcomes=tool_outcomes,
+                        tool_round_id=tool_round_id,
                     ):
                         yield event
                     raise
@@ -2543,6 +2582,7 @@ class CayuApp:
                             messages=messages,
                             tool_calls=tool_calls,
                             tool_outcomes=tool_outcomes,
+                            tool_round_id=tool_round_id,
                             cancellation_artifacts=_cancellation_artifacts(exc),
                         ):
                             yield event
@@ -2579,6 +2619,7 @@ class CayuApp:
                         messages=messages,
                         tool_calls=tool_calls,
                         completed_tool_outcomes=[],
+                        tool_round_id=tool_round_id,
                     ):
                         yield event
                     return
@@ -2622,6 +2663,7 @@ class CayuApp:
                             messages=messages,
                             tool_calls=tool_calls,
                             tool_outcomes=tool_outcomes,
+                            tool_round_id=tool_round_id,
                         ):
                             yield event
                         raise
@@ -2639,6 +2681,7 @@ class CayuApp:
                                 messages=messages,
                                 tool_calls=tool_calls,
                                 tool_outcomes=tool_outcomes,
+                                tool_round_id=tool_round_id,
                                 cancellation_artifacts=_cancellation_artifacts(exc),
                             ):
                                 yield event
@@ -2682,6 +2725,7 @@ class CayuApp:
                                 messages=messages,
                                 tool_calls=tool_calls,
                                 completed_tool_outcomes=tool_outcomes,
+                                tool_round_id=tool_round_id,
                             ):
                                 yield event
                             return
@@ -2693,6 +2737,7 @@ class CayuApp:
                             request_metadata=request_metadata,
                             task_id=task_id,
                             policy_result=policy_results_by_id.get(tool_call.id),
+                            tool_round_id=tool_round_id,
                         ):
                             yield event
                             if outcome is not None:
@@ -2706,6 +2751,7 @@ class CayuApp:
                         messages=messages,
                         tool_calls=tool_calls,
                         tool_outcomes=tool_outcomes,
+                        tool_round_id=tool_round_id,
                     ):
                         yield event
                     raise
@@ -2719,6 +2765,7 @@ class CayuApp:
                             messages=messages,
                             tool_calls=tool_calls,
                             tool_outcomes=tool_outcomes,
+                            tool_round_id=tool_round_id,
                             cancellation_artifacts=_cancellation_artifacts(exc),
                         ):
                             yield event
@@ -2726,17 +2773,20 @@ class CayuApp:
 
                 tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
                 messages.extend(tool_result_messages)
+                cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
                 try:
-                    await self.session_store.append_transcript_messages(
+                    await self.session_store.append_transcript_messages_and_checkpoint(
                         session.id,
                         tool_result_messages,
+                        cleared_checkpoint,
                     )
                 except asyncio.CancelledError:
                     if await self._session_interrupt_requested(session.id):
                         _clear_current_task_cancellation()
-                        await self.session_store.append_transcript_messages(
+                        await self.session_store.append_transcript_messages_and_checkpoint(
                             session.id,
                             tool_result_messages,
+                            cleared_checkpoint,
                         )
                     raise
             else:
@@ -3516,6 +3566,7 @@ class CayuApp:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         pending_approval_to_clear: PendingToolApproval | None = None,
+        tool_round_id: str | None = None,
     ) -> AsyncIterator[Event]:
         limit_payload = _limit_reached_payload(
             decision=decision,
@@ -3541,6 +3592,7 @@ class CayuApp:
                 completed_tool_outcomes=completed_tool_outcomes,
                 decision=decision,
                 pending_approval_to_clear=pending_approval_to_clear,
+                tool_round_id=tool_round_id,
             ):
                 yield event
 
@@ -3620,6 +3672,7 @@ class CayuApp:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
+        tool_round_id: str | None = None,
     ) -> AsyncIterator[Event]:
         payload = _budget_limit_reached_payload(check)
         yield await self._emit(
@@ -3650,6 +3703,7 @@ class CayuApp:
             messages=messages,
             tool_calls=tool_calls,
             completed_tool_outcomes=completed_tool_outcomes,
+            tool_round_id=tool_round_id,
         ):
             yield event
 
@@ -3664,6 +3718,7 @@ class CayuApp:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         decision: StopDecision,
         pending_approval_to_clear: PendingToolApproval | None = None,
+        tool_round_id: str | None = None,
     ) -> AsyncIterator[Event]:
         expected_tool_calls = [*tool_calls, *(outcome.call for outcome in completed_tool_outcomes)]
         if await self._tool_round_has_result_messages(session.id, expected_tool_calls):
@@ -3688,6 +3743,7 @@ class CayuApp:
         skipped_outcomes = _limit_reached_tool_round_results(
             tool_calls=remaining_tool_calls,
             decision=decision,
+            tool_round_id=tool_round_id,
         )
         for skipped_outcome in skipped_outcomes:
             yield await self._emit(
@@ -3697,6 +3753,7 @@ class CayuApp:
                     registered_environment=registered_environment,
                     tool_call_outcome=skipped_outcome,
                     decision=decision,
+                    tool_round_id=tool_round_id,
                 )
             )
         tool_result_messages = transcript_helpers.tool_result_messages(
@@ -3719,7 +3776,12 @@ class CayuApp:
                 )
             )
         else:
-            await self.session_store.append_transcript_messages(session.id, tool_result_messages)
+            cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+            await self.session_store.append_transcript_messages_and_checkpoint(
+                session.id,
+                tool_result_messages,
+                cleared_checkpoint,
+            )
 
     async def _policy_plan_for_tool_round(
         self,
@@ -3808,6 +3870,7 @@ class CayuApp:
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
         approval_id: str | None = None,
+        tool_round_id: str | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         if emit_started:
@@ -3815,6 +3878,8 @@ class CayuApp:
                 "tool_call_id": tool_call.id,
                 "arguments": deepcopy(tool_call.arguments),
             }
+            if tool_round_id is not None:
+                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             yield (
@@ -3841,6 +3906,8 @@ class CayuApp:
                 "tool_call_id": tool_call.id,
                 "result": result.model_dump(),
             }
+            if tool_round_id is not None:
+                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             async for event in self._emit_tool_call_result_with_hooks(
@@ -3883,6 +3950,8 @@ class CayuApp:
                     "metadata": resolved_policy_result.metadata,
                     "result": result.model_dump(),
                 }
+                if tool_round_id is not None:
+                    payload["tool_round_id"] = tool_round_id
                 if approval_id is not None:
                     payload["approval_id"] = approval_id
                 async for event in self._emit_tool_call_result_with_hooks(
@@ -3967,6 +4036,8 @@ class CayuApp:
             "tool_call_id": tool_call.id,
             "result": result.model_dump(),
         }
+        if tool_round_id is not None:
+            payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
         async for event in self._emit_tool_call_result_with_hooks(
@@ -4004,6 +4075,7 @@ class CayuApp:
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
             raise RuntimeError("Session already has a pending tool approval.")
+        checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
 
         approval = PendingToolApproval(
             approval_id=str(uuid4()),
@@ -4040,6 +4112,50 @@ class CayuApp:
                 },
             ),
         )
+
+    async def _checkpoint_with_pending_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+        task_id: str | None,
+        structured_output: StructuredOutputSpec | None,
+    ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        return tool_round_recovery.checkpoint_with_pending_tool_round(
+            checkpoint,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            task_id=task_id,
+            tool_calls=tool_calls,
+            policy_outcomes=policy_outcomes,
+            structured_output=structured_output,
+        )
+
+    async def _checkpoint_without_pending_tool_round(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        return tool_round_recovery.checkpoint_without_pending_tool_round(checkpoint)
+
+    async def _clear_pending_tool_round_if_matches(
+        self,
+        session_id: str,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> None:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        current = tool_round_recovery.pending_tool_round_from_checkpoint(copied_checkpoint)
+        if current is None or current.round_id != pending_round.round_id:
+            return
+        copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
+        await self.session_store.checkpoint(session_id, copied_checkpoint)
 
     async def _checkpoint_without_pending_tool_approval(
         self,
@@ -4156,6 +4272,7 @@ class CayuApp:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
+        tool_round_id: str | None = None,
         cancellation_artifacts: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Event]:
         if await self._tool_round_has_result_messages(session.id, tool_calls):
@@ -4164,6 +4281,7 @@ class CayuApp:
         interrupted_results = _interrupted_tool_round_results(
             tool_calls=tool_calls,
             completed_outcomes=tool_outcomes,
+            tool_round_id=tool_round_id,
             cancellation_artifacts=cancellation_artifacts,
         )
         if not interrupted_results and not tool_outcomes:
@@ -4176,14 +4294,132 @@ class CayuApp:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         tool_call_outcome=interrupted_result,
+                        tool_round_id=tool_round_id,
                     )
                 )
         tool_outcomes.extend(interrupted_results)
         interrupted_messages = transcript_helpers.tool_result_messages(tool_outcomes)
         messages.extend(interrupted_messages)
-        await self.session_store.append_transcript_messages(
+        cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+        await self.session_store.append_transcript_messages_and_checkpoint(
             session.id,
             interrupted_messages,
+            cleared_checkpoint,
+        )
+
+    async def _recover_pending_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        tail_message_count: int = 0,
+    ) -> AsyncIterator[Event]:
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_round is None:
+            return
+        environment_name = _environment_name(registered_environment)
+        if pending_round.agent_name != registered_agent.spec.name:
+            raise RuntimeError(
+                f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
+            )
+        if pending_round.environment_name != environment_name:
+            raise RuntimeError(
+                "Pending tool round belongs to a different environment: "
+                f"{pending_round.environment_name}."
+            )
+
+        pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        if await self._tool_round_has_result_messages(session.id, pending_tool_calls):
+            await self._clear_pending_tool_round_if_matches(session.id, pending_round)
+            yield await self._emit(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+                        "tool_round_id": pending_round.round_id,
+                        "cleared": True,
+                    },
+                )
+            )
+            return
+
+        events = await self.session_store.load_events(session.id)
+        recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=events,
+            pending_round=pending_round,
+        )
+        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        for pending_tool_call in pending_round.tool_calls:
+            recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
+            if recorded_outcome is not None:
+                tool_outcomes.append(recorded_outcome)
+                continue
+
+            tool_call = runtime_records.ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            result = tool_round_recovery.unknown_recovered_tool_result(
+                pending_tool_call=pending_tool_call,
+                pending_round=pending_round,
+                started=pending_tool_call.tool_call_id in started_ids,
+            )
+            async for event, outcome in self._emit_tool_call_result_with_hooks(
+                event=Event(
+                    type=EventType.TOOL_CALL_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload={
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": tool_call.id,
+                        "recovered": True,
+                        "result": result.model_dump(),
+                    },
+                ),
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=pending_round.task_id,
+            ):
+                yield event
+                if outcome is not None:
+                    tool_outcomes.append(outcome)
+
+        tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        insert_at = len(messages) - tail_message_count
+        if insert_at < 0:
+            raise RuntimeError("Pending tool round recovery received an invalid tail size.")
+        messages[insert_at:insert_at] = tool_result_messages
+        cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+        await self.session_store.append_transcript_messages_and_checkpoint(
+            session.id,
+            tool_result_messages,
+            cleared_checkpoint,
+        )
+        yield await self._emit(
+            Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+                    "tool_round_id": pending_round.round_id,
+                    "cleared": True,
+                    "recovered_tool_calls": len(tool_outcomes),
+                },
+            )
         )
 
     async def _tool_round_has_result_messages(
@@ -5145,6 +5381,7 @@ def _interrupted_tool_round_results(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     completed_outcomes: list[runtime_records.ToolCallOutcome],
+    tool_round_id: str | None = None,
     cancellation_artifacts: list[dict[str, Any]] | None = None,
 ) -> list[runtime_records.ToolCallOutcome]:
     completed_ids = {outcome.call.id for outcome in completed_outcomes}
@@ -5157,16 +5394,19 @@ def _interrupted_tool_round_results(
             continue
         result_artifacts = artifacts_for_interrupted_tool
         artifacts_for_interrupted_tool = []
+        structured = {
+            "interrupted": True,
+            "tool_call_id": tool_call.id,
+            "tool_name": tool_call.name,
+        }
+        if tool_round_id is not None:
+            structured["tool_round_id"] = tool_round_id
         interrupted_outcomes.append(
             runtime_records.ToolCallOutcome(
                 call=tool_call,
                 result=ToolResult(
                     content="Tool call interrupted before completion.",
-                    structured={
-                        "interrupted": True,
-                        "tool_call_id": tool_call.id,
-                        "tool_name": tool_call.name,
-                    },
+                    structured=structured,
                     artifacts=result_artifacts,
                     is_error=True,
                 ),
@@ -5380,23 +5620,27 @@ def _limit_reached_tool_round_results(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     decision: StopDecision,
+    tool_round_id: str | None = None,
 ) -> list[runtime_records.ToolCallOutcome]:
     outcomes: list[runtime_records.ToolCallOutcome] = []
     for tool_call in tool_calls:
+        structured = {
+            "skipped": True,
+            "reason": "limit_reached",
+            "limit": decision.limit.value,
+            "maximum": _limit_value_for_payload(decision.maximum),
+            "actual": _limit_value_for_payload(decision.actual),
+            "tool_call_id": tool_call.id,
+            "tool_name": tool_call.name,
+        }
+        if tool_round_id is not None:
+            structured["tool_round_id"] = tool_round_id
         outcomes.append(
             runtime_records.ToolCallOutcome(
                 call=tool_call,
                 result=ToolResult(
                     content="Tool call skipped because a run limit was reached.",
-                    structured={
-                        "skipped": True,
-                        "reason": "limit_reached",
-                        "limit": decision.limit.value,
-                        "maximum": _limit_value_for_payload(decision.maximum),
-                        "actual": _limit_value_for_payload(decision.actual),
-                        "tool_call_id": tool_call.id,
-                        "tool_name": tool_call.name,
-                    },
+                    structured=structured,
                     is_error=True,
                 ),
             )
@@ -5419,17 +5663,21 @@ def _interrupted_tool_call_event(
     registered_agent: runtime_records.RegisteredAgentState,
     registered_environment: runtime_records.RegisteredEnvironment | None,
     tool_call_outcome: runtime_records.ToolCallOutcome,
+    tool_round_id: str | None = None,
 ) -> Event:
+    payload = {
+        "tool_call_id": tool_call_outcome.call.id,
+        "result": tool_call_outcome.result.model_dump(),
+    }
+    if tool_round_id is not None:
+        payload["tool_round_id"] = tool_round_id
     return Event(
         type=EventType.TOOL_CALL_FAILED,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),
         tool_name=tool_call_outcome.call.name,
-        payload={
-            "tool_call_id": tool_call_outcome.call.id,
-            "result": tool_call_outcome.result.model_dump(),
-        },
+        payload=payload,
     )
 
 
@@ -5440,19 +5688,23 @@ def _limit_reached_tool_call_event(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     tool_call_outcome: runtime_records.ToolCallOutcome,
     decision: StopDecision,
+    tool_round_id: str | None = None,
 ) -> Event:
+    payload = {
+        "tool_call_id": tool_call_outcome.call.id,
+        "reason": "limit_reached",
+        "limit": decision.limit.value,
+        "result": tool_call_outcome.result.model_dump(),
+    }
+    if tool_round_id is not None:
+        payload["tool_round_id"] = tool_round_id
     return Event(
         type=EventType.TOOL_CALL_FAILED,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),
         tool_name=tool_call_outcome.call.name,
-        payload={
-            "tool_call_id": tool_call_outcome.call.id,
-            "reason": "limit_reached",
-            "limit": decision.limit.value,
-            "result": tool_call_outcome.result.model_dump(),
-        },
+        payload=payload,
     )
 
 

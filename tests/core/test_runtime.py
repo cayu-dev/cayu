@@ -199,7 +199,7 @@ class FailingApprovalCloseStore(InMemorySessionStore):
         messages: list[Message],
         checkpoint: dict,
     ) -> None:
-        if not self.failed_close_once:
+        if not self.failed_close_once and any(message.role == "tool" for message in messages):
             self.failed_close_once = True
             raise RuntimeError("approval close unavailable")
         await super().append_transcript_messages_and_checkpoint(
@@ -220,6 +220,68 @@ class FailingTerminalToolEventStore(InMemorySessionStore):
         ):
             self.failed_terminal_once = True
             raise RuntimeError("terminal tool event unavailable")
+        await super().append_events(session_id, events)
+
+
+class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_tool_round_close_once = False
+
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict,
+    ) -> None:
+        if not self.failed_tool_round_close_once and any(
+            message.role == "tool" for message in messages
+        ):
+            self.failed_tool_round_close_once = True
+            raise RuntimeError("ordinary tool round close unavailable")
+        await super().append_transcript_messages_and_checkpoint(
+            session_id,
+            messages,
+            checkpoint,
+        )
+
+
+class FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_pending_tool_round_once = False
+
+    async def append_transcript_messages_and_checkpoint(
+        self,
+        session_id: str,
+        messages: list[Message],
+        checkpoint: dict,
+    ) -> None:
+        await super().append_transcript_messages_and_checkpoint(
+            session_id,
+            messages,
+            checkpoint,
+        )
+        if (
+            not self.failed_pending_tool_round_once
+            and "pending_tool_round" in checkpoint
+            and any(message.role == "assistant" for message in messages)
+        ):
+            self.failed_pending_tool_round_once = True
+            raise RuntimeError("pending tool round checkpoint persisted before crash")
+
+
+class FailingSecondTerminalToolEventStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completed_tool_events = 0
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
+        for event in events:
+            if event.type == EventType.TOOL_CALL_COMPLETED:
+                self.completed_tool_events += 1
+                if self.completed_tool_events == 2:
+                    raise RuntimeError("second terminal tool event unavailable")
         await super().append_events(session_id, events)
 
 
@@ -1592,7 +1654,7 @@ def test_cayu_app_elapsed_limit_stops_after_policy_before_approval(monkeypatch):
     assert tool.calls == []
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_elapsed_limit_before_approval"))
-    assert checkpoint is None
+    assert checkpoint == {}
 
 
 def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
@@ -6117,7 +6179,9 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert events[3].payload == {
         "tool_call_id": "call_1",
         "arguments": {"text": "from tool"},
+        "tool_round_id": events[3].payload["tool_round_id"],
     }
+    assert events[4].payload["tool_round_id"] == events[3].payload["tool_round_id"]
     assert events[4].payload["result"]["content"] == "from tool"
     assert events[4].payload["result"]["structured"] == {
         "agent": "assistant",
@@ -6154,6 +6218,360 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert transcript[1].content[0].type == "tool_call"
     assert transcript[2].content[0].type == "tool_result"
     assert transcript[3].content[0].text == "done"
+
+
+def test_cayu_app_recovers_pending_tool_round_from_recorded_terminal_event():
+    store = FailingOrdinaryToolResultCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_round_recover_recorded",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_round_recover_recorded"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
+    assert initial_events[-1].type == EventType.SESSION_FAILED
+    assert tool.calls == [{}]
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_tool_round_recover_recorded",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+
+    assert tool.calls == [{}]
+    assert any(
+        event.type == EventType.SESSION_CHECKPOINTED
+        and event.payload
+        == {
+            "checkpoint": "pending_tool_round",
+            "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+            "cleared": True,
+            "recovered_tool_calls": 1,
+        }
+        for event in resume_events
+    )
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    assert asyncio.run(store.load_checkpoint("sess_tool_round_recover_recorded")) == {}
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_recorded"))
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
+    assert transcript[2].content[0].tool_call_id == "call_1"
+    assert transcript[2].content[0].content == "recorded"
+    assert provider.requests[1].messages[-3].role == "assistant"
+    assert provider.requests[1].messages[-2].role == "tool"
+    assert provider.requests[1].messages[-1].content[0].text == "continue"
+
+
+def test_cayu_app_recovers_pending_tool_round_before_tool_started():
+    store = FailingAfterPendingToolRoundCheckpointStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_round_recover_not_started",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_round_recover_not_started"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    assert not any(event.type == EventType.TOOL_CALL_STARTED for event in initial_events)
+    assert initial_events[-1].type == EventType.SESSION_FAILED
+    assert tool.calls == []
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_tool_round_recover_not_started",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+
+    assert tool.calls == []
+    recovered_failures = [
+        event
+        for event in resume_events
+        if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+    ]
+    assert len(recovered_failures) == 1
+    assert recovered_failures[0].payload["result"]["structured"] == {
+        "recovered": True,
+        "recovery_reason": "pending_tool_round_not_started",
+        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "tool_call_id": "call_1",
+        "tool_name": "side_effect",
+        "started": False,
+        "executed": False,
+        "outcome_unknown": False,
+    }
+    assert "was not executed" in recovered_failures[0].payload["result"]["content"]
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    assert asyncio.run(store.load_checkpoint("sess_tool_round_recover_not_started")) == {}
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_not_started"))
+    recovered_result = transcript[2].content[0]
+    assert recovered_result.tool_call_id == "call_1"
+    assert recovered_result.is_error is True
+    assert "was not executed" in recovered_result.content
+    assert provider.requests[1].messages[-3].role == "assistant"
+    assert provider.requests[1].messages[-2].role == "tool"
+    assert provider.requests[1].messages[-1].content[0].text == "continue"
+
+
+def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
+    store = FailingTerminalToolEventStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_round_recover_unknown",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_round_recover_unknown"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    assert any(event.type == EventType.TOOL_CALL_STARTED for event in initial_events)
+    assert not any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
+    assert initial_events[-1].type == EventType.SESSION_FAILED
+    assert tool.calls == [{}]
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_tool_round_recover_unknown",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+
+    assert tool.calls == [{}]
+    recovered_failures = [
+        event
+        for event in resume_events
+        if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+    ]
+    assert len(recovered_failures) == 1
+    assert recovered_failures[0].payload["result"]["structured"] == {
+        "recovered": True,
+        "recovery_reason": "pending_tool_round_missing_terminal_event",
+        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "tool_call_id": "call_1",
+        "tool_name": "side_effect",
+        "started": True,
+        "outcome_unknown": True,
+    }
+    assert "outcome is unknown" in recovered_failures[0].payload["result"]["content"]
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    assert asyncio.run(store.load_checkpoint("sess_tool_round_recover_unknown")) == {}
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_unknown"))
+    recovered_result = transcript[2].content[0]
+    assert recovered_result.tool_call_id == "call_1"
+    assert recovered_result.is_error is True
+    assert "outcome is unknown" in recovered_result.content
+
+
+def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id():
+    store = FailingSecondTerminalToolEventStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"round": "old"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"round": "current"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_round_recover_reused_id",
+                messages=[Message.text("user", "use the tool twice")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint("sess_tool_round_recover_reused_id"))
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+    assert [
+        event.payload["tool_round_id"]
+        for event in initial_events
+        if event.type == EventType.TOOL_CALL_STARTED
+    ] == [
+        initial_events[3].payload["tool_round_id"],
+        checkpoint["pending_tool_round"]["round_id"],
+    ]
+    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
+    assert initial_events[-1].type == EventType.SESSION_FAILED
+    assert tool.calls == [{"round": "old"}, {"round": "current"}]
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_tool_round_recover_reused_id",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+    )
+
+    assert tool.calls == [{"round": "old"}, {"round": "current"}]
+    recovered_failures = [
+        event
+        for event in resume_events
+        if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+    ]
+    assert len(recovered_failures) == 1
+    assert (
+        recovered_failures[0].payload["tool_round_id"]
+        == checkpoint["pending_tool_round"]["round_id"]
+    )
+    assert recovered_failures[0].payload["result"]["structured"] == {
+        "recovered": True,
+        "recovery_reason": "pending_tool_round_missing_terminal_event",
+        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "tool_call_id": "call_1",
+        "tool_name": "side_effect",
+        "started": True,
+        "outcome_unknown": True,
+    }
+    assert "outcome is unknown" in recovered_failures[0].payload["result"]["content"]
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_reused_id"))
+    assert [message.role for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
+    assert transcript[2].content[0].content == "recorded"
+    assert "outcome is unknown" in transcript[4].content[0].content
 
 
 def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
@@ -6208,8 +6626,10 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert tool.calls == []
     blocked_event = events[4]
     assert blocked_event.tool_name == "side_effect"
+    assert blocked_event.payload["tool_round_id"] == events[3].payload["tool_round_id"]
     assert blocked_event.payload == {
         "tool_call_id": "call_1",
+        "tool_round_id": blocked_event.payload["tool_round_id"],
         "decision": "deny",
         "reason": "Tool denied by policy: side_effect",
         "metadata": {},
@@ -14018,6 +14438,7 @@ def test_interrupt_session_stops_in_flight_tool_call():
         "interrupted": True,
         "tool_call_id": "call_1",
         "tool_name": "blocking_tool",
+        "tool_round_id": failed_tool_events[0].payload["tool_round_id"],
     }
     stored_event_types = [event.type for event in stored_events]
     assert stored_event_types.index(EventType.TOOL_CALL_FAILED) < stored_event_types.index(
@@ -14717,6 +15138,26 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
             messages: list[Message],
         ) -> None:
             await super().append_transcript_messages(session_id, messages)
+            await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
+
+        async def append_transcript_messages_and_checkpoint(
+            self,
+            session_id: str,
+            messages: list[Message],
+            checkpoint: dict,
+        ) -> None:
+            await super().append_transcript_messages_and_checkpoint(
+                session_id,
+                messages,
+                checkpoint,
+            )
+            await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
+
+        async def _interrupt_if_assistant_tool_call_appended(
+            self,
+            session_id: str,
+            messages: list[Message],
+        ) -> None:
             if self.interrupt_after_next_assistant_tool_call_append and any(
                 any(type(part) is ToolCallPart for part in message.content) for message in messages
             ):
@@ -14769,6 +15210,7 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
         "interrupted": True,
         "tool_call_id": "call_echo",
         "tool_name": "echo",
+        "tool_round_id": transcript[-1].content[0].structured["tool_round_id"],
     }
     assert transcript[-1].content[0].is_error is True
 
@@ -14821,7 +15263,7 @@ def test_interrupt_session_does_not_leave_pending_approval_when_interrupted_afte
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert EventType.TOOL_CALL_APPROVAL_REQUESTED not in [event.type for event in stored_events]
     assert [event.type for event in stored_events].count(EventType.TOOL_CALL_FAILED) == 1
-    assert checkpoint is None
+    assert checkpoint == {}
     validate_context_messages(transcript)
     assert transcript[-1].role == "tool"
     assert transcript[-1].content[0].tool_call_id == "call_echo"
@@ -14840,13 +15282,33 @@ def test_interrupt_session_preserves_tool_results_when_interrupted_before_append
             session_id: str,
             messages: list[Message],
         ) -> None:
+            await self._maybe_interrupt_before_tool_result_append(session_id, messages)
+            await super().append_transcript_messages(session_id, messages)
+
+        async def append_transcript_messages_and_checkpoint(
+            self,
+            session_id: str,
+            messages: list[Message],
+            checkpoint: dict,
+        ) -> None:
+            await self._maybe_interrupt_before_tool_result_append(session_id, messages)
+            await super().append_transcript_messages_and_checkpoint(
+                session_id,
+                messages,
+                checkpoint,
+            )
+
+        async def _maybe_interrupt_before_tool_result_append(
+            self,
+            session_id: str,
+            messages: list[Message],
+        ) -> None:
             if self.interrupt_on_next_tool_result_append and any(
                 message.role == "tool" for message in messages
             ):
                 self.interrupt_on_next_tool_result_append = False
                 await self.update_status(session_id, SessionStatus.INTERRUPTED)
                 raise asyncio.CancelledError
-            await super().append_transcript_messages(session_id, messages)
 
     store = InterruptingTranscriptStore()
     provider = FakeProvider(
