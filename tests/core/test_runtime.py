@@ -5553,6 +5553,65 @@ def test_cayu_app_links_successful_run_to_task():
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
+def test_cayu_app_links_claimed_task_to_successful_run():
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+
+    async def run_task_session() -> tuple[list[Event], object]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="task_runtime_claimed_success",
+                type="respond",
+                assigned_agent_name="assistant",
+            )
+        )
+        claimed = await task_store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
+        assert claimed.worker_id == "worker_a"
+        assert claimed.session_id is None
+
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_claimed_success",
+                task_id="task_runtime_claimed_success",
+                task_worker_id="worker_a",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        task = await task_store.load_task("task_runtime_claimed_success")
+        return events, task
+
+    events, task = asyncio.run(run_task_session())
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.TASK_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.TASK_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert task.session_id == "sess_task_claimed_success"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert events[1].payload["task_id"] == "task_runtime_claimed_success"
+
+
 def test_cayu_app_fails_task_when_run_fails():
     session_store = InMemorySessionStore()
     task_store = InMemoryTaskStore()
@@ -13708,6 +13767,37 @@ def test_cayu_app_model_events_use_runtime_environment():
         }
     ]
     assert {event.environment_name for event in model_events} == {"local"}
+
+
+def test_cayu_app_preserves_labels_when_environment_sets_name():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    session_store = InMemorySessionStore()
+    app = CayuApp(session_store=session_store)
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_environment_labels",
+                labels={"owner": "org_123", "project": "ap_q2"},
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    session = asyncio.run(session_store.load("sess_environment_labels"))
+    assert session is not None
+    assert session.environment_name == "local"
+    assert session.labels == {"owner": "org_123", "project": "ap_q2"}
 
 
 def test_cayu_app_rejects_invalid_environment_lookup_name():

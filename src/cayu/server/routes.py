@@ -1053,6 +1053,10 @@ def create_router(
                 "title": t.title,
                 "status": t.status.value,
                 "session_id": t.session_id,
+                "worker_id": t.worker_id,
+                "lease_expires_at": (
+                    t.lease_expires_at.isoformat() if t.lease_expires_at else None
+                ),
                 "created_at": t.created_at.isoformat(),
                 "completed_at": (t.completed_at.isoformat() if t.completed_at else None),
             }

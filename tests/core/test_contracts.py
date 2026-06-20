@@ -1171,6 +1171,14 @@ def test_runtime_identity_models_reject_blank_fields():
     with pytest.raises(ValidationError, match="cannot be blank"):
         RunRequest(
             agent_name="assistant",
+            task_id="task_1",
+            task_worker_id=" ",
+            messages=[Message.text("user", "start")],
+        )
+
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        RunRequest(
+            agent_name="assistant",
             environment_name=" ",
             messages=[Message.text("user", "start")],
         )
@@ -1196,6 +1204,15 @@ def test_runtime_identity_models_reject_blank_fields():
         ToolContext(session_id=" ")
 
 
+def test_run_request_requires_task_id_for_task_worker_id():
+    with pytest.raises(ValidationError, match="task_worker_id requires task_id"):
+        RunRequest(
+            agent_name="assistant",
+            task_worker_id="worker_1",
+            messages=[Message.text("user", "start")],
+        )
+
+
 def test_runtime_identity_models_reject_edge_whitespace_fields():
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
         RunRequest(agent_name=" assistant", messages=[Message.text("user", "start")])
@@ -1204,6 +1221,14 @@ def test_runtime_identity_models_reject_edge_whitespace_fields():
         RunRequest(
             agent_name="assistant",
             session_id="sess_1 ",
+            messages=[Message.text("user", "start")],
+        )
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        RunRequest(
+            agent_name="assistant",
+            task_id="task_1",
+            task_worker_id="worker_1 ",
             messages=[Message.text("user", "start")],
         )
 

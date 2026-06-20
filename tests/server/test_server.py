@@ -11,7 +11,7 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message
+from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message, TaskCreate
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -71,6 +71,43 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert len(tasks) == 1
     assert tasks[0]["type"] == "run"
     assert tasks[0]["status"] == "completed"
+    assert tasks[0]["worker_id"] is None
+    assert tasks[0]["lease_expires_at"] is None
+
+
+def test_server_task_list_exposes_worker_lease_state() -> None:
+    task_store = InMemoryTaskStore()
+
+    async def setup_task() -> None:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="leased_task",
+                type="review",
+                assigned_agent_name="assistant",
+            )
+        )
+        claimed = await task_store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
+
+    asyncio.run(setup_task())
+
+    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    tasks = client.get("/api/tasks").json()
+
+    assert tasks == [
+        {
+            "id": "leased_task",
+            "type": "review",
+            "title": None,
+            "status": "running",
+            "session_id": None,
+            "worker_id": "worker_a",
+            "lease_expires_at": tasks[0]["lease_expires_at"],
+            "created_at": tasks[0]["created_at"],
+            "completed_at": None,
+        }
+    ]
+    assert isinstance(tasks[0]["lease_expires_at"], str)
 
 
 def test_server_exposes_session_usage_summary() -> None:

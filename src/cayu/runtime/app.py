@@ -13,7 +13,12 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
@@ -625,6 +630,7 @@ class CayuApp:
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 task_id=request.task_id,
+                task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
                 start_event_payload={"agent_name": registered_agent.spec.name},
             ):
@@ -1276,6 +1282,7 @@ class CayuApp:
             request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
             task_id=task_id,
+            task_worker_id=None,
             start_event_type=EventType.SESSION_RESUMED,
             start_event_payload={
                 "agent_name": registered_agent.spec.name,
@@ -1697,6 +1704,7 @@ class CayuApp:
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
+                task_worker_id=None,
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
@@ -1949,6 +1957,7 @@ class CayuApp:
         request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         task_id: str | None,
+        task_worker_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
@@ -2024,7 +2033,11 @@ class CayuApp:
                     f"{registered_provider.name}"
                 )
             if task_id is not None and start_task_on_enter:
-                task = await self._start_task(task_id=task_id, session=session)
+                task = await self._start_task(
+                    task_id=task_id,
+                    session=session,
+                    worker_id=task_worker_id,
+                )
                 task_started = True
                 if active_run is not None:
                     active_run.task_started = True
@@ -2985,10 +2998,15 @@ class CayuApp:
         *,
         task_id: str,
         session: Session,
+        worker_id: str | None = None,
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
-        return await self.task_store.start_task(task_id, session_id=session.id)
+        return await self.task_store.start_task(
+            task_id,
+            session_id=session.id,
+            worker_id=worker_id,
+        )
 
     async def _complete_task(
         self,
@@ -5428,7 +5446,9 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
+        task_worker_id=request.task_worker_id,
         environment_name=environment_name,
+        labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),

@@ -51,6 +51,7 @@ class RunRequest(BaseModel):
     # task_id when present, otherwise session_id. Forks inherit the source value.
     causal_budget_id: str | None = None
     task_id: str | None = None
+    task_worker_id: str | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -107,6 +108,7 @@ class RunRequest(BaseModel):
         "parent_session_id",
         "causal_budget_id",
         "task_id",
+        "task_worker_id",
         "environment_name",
     )
     @classmethod
@@ -118,6 +120,12 @@ class RunRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_task_worker_handoff(self) -> RunRequest:
+        if self.task_worker_id is not None and self.task_id is None:
+            raise ValueError("RunRequest.task_worker_id requires task_id.")
+        return self
 
 
 class ResumeRequest(BaseModel):
@@ -1485,6 +1493,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
+        task_worker_id=request.task_worker_id,
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),

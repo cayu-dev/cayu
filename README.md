@@ -900,7 +900,7 @@ Use durable local task storage for optional background work tracking:
 ```python
 from pathlib import Path
 
-from cayu import SQLiteTaskStore, TaskCreate
+from cayu import SQLiteTaskStore, TaskCreate, TaskQuery
 
 tasks = SQLiteTaskStore(Path(".cayu") / "runtime.sqlite")
 task = await tasks.create_task(
@@ -927,6 +927,34 @@ request = RunRequest(
 async for event in app.run(request):
     print(event.type)
 ```
+
+For queue-style workers, claim an unattached pending task before starting the
+agent run, then pass both the task id and worker id to the run request:
+
+```python
+task = await tasks.claim_task(
+    "worker-a",
+    TaskQuery(type="process_invoice", assigned_agent_name="invoice_agent"),
+    lease_seconds=300,
+)
+
+if task is not None:
+    await tasks.heartbeat(task.id, "worker-a", extend_seconds=300)
+    async for event in app.run(
+        RunRequest(
+            agent_name=task.assigned_agent_name or "invoice_agent",
+            task_id=task.id,
+            task_worker_id="worker-a",
+            messages=[Message.text("user", "Process the claimed invoice task.")],
+        )
+    ):
+        print(event.type)
+```
+
+Use direct `RunRequest.task_id` when app code already knows the exact task to
+run. Use `claim_task(...)` when multiple workers compete for pending work.
+Claiming only applies to unattached pending tasks; once a task is attached to a
+session, session recovery and terminal runtime events own the outcome.
 
 Resume an existing completed, failed, or interrupted session by appending new messages to its durable transcript:
 

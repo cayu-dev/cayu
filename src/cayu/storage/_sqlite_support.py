@@ -203,6 +203,15 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
             ON cayu_event_watcher_state(delivery_status, lease_expires_at);
     """,
+    4: """
+        ALTER TABLE cayu_tasks ADD COLUMN worker_id TEXT;
+        ALTER TABLE cayu_tasks ADD COLUMN lease_expires_at TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_worker_id
+            ON cayu_tasks(worker_id);
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status_lease
+            ON cayu_tasks(status, lease_expires_at);
+    """,
 }
 
 
@@ -347,6 +356,8 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         task.session_id,
         task.parent_task_id,
         task.assigned_agent_name,
+        task.worker_id,
+        format_optional_datetime(task.lease_expires_at),
         json_dumps(task.input),
         None if task.result is None else json_dumps(task.result),
         None if task.error is None else json_dumps(task.error),
@@ -370,6 +381,8 @@ def task_from_row(row: sqlite3.Row) -> Task:
         session_id=row["session_id"],
         parent_task_id=row["parent_task_id"],
         assigned_agent_name=row["assigned_agent_name"],
+        worker_id=row["worker_id"],
+        lease_expires_at=parse_optional_datetime(row["lease_expires_at"]),
         input=json.loads(row["input_json"]),
         result=None if result_json is None else json.loads(result_json),
         error=None if error_json is None else json.loads(error_json),

@@ -865,13 +865,17 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         revisions = connection.execute(
             "SELECT revision, compatible_from FROM cayu_schema_migrations ORDER BY revision"
         ).fetchall()
+        task_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_tasks)").fetchall()
+        }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     finally:
         connection.close()
 
     assert label_table is not None
     assert watcher_table is not None
-    assert revisions == [(1, 1), (2, 2), (3, 3)]
+    assert {"worker_id", "lease_expires_at"}.issubset(task_columns)
+    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4)]
     assert version == schema_migrations.LATEST_REVISION
 
 

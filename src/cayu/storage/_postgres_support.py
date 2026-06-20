@@ -221,6 +221,8 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.session_id,
         task.parent_task_id,
         task.assigned_agent_name,
+        task.worker_id,
+        to_utc_optional(task.lease_expires_at),
         _dumps(task.input),
         None if task.result is None else _dumps(task.result),
         None if task.error is None else _dumps(task.error),
@@ -234,7 +236,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
 
 TASK_COLUMNS = (
     "id, type, title, description, status, session_id, parent_task_id, "
-    "assigned_agent_name, input, result, error, metadata, created_at, "
+    "assigned_agent_name, worker_id, lease_expires_at, input, result, error, metadata, created_at, "
     "updated_at, started_at, completed_at"
 )
 
@@ -249,14 +251,16 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         session_id=row[5],
         parent_task_id=row[6],
         assigned_agent_name=row[7],
-        input=_loads(row[8]),
-        result=None if row[9] is None else _loads(row[9]),
-        error=None if row[10] is None else _loads(row[10]),
-        metadata=_loads(row[11]),
-        created_at=to_utc(row[12]),
-        updated_at=to_utc(row[13]),
-        started_at=to_utc_optional(row[14]),
-        completed_at=to_utc_optional(row[15]),
+        worker_id=row[8],
+        lease_expires_at=to_utc_optional(row[9]),
+        input=_loads(row[10]),
+        result=None if row[11] is None else _loads(row[11]),
+        error=None if row[12] is None else _loads(row[12]),
+        metadata=_loads(row[13]),
+        created_at=to_utc(row[14]),
+        updated_at=to_utc(row[15]),
+        started_at=to_utc_optional(row[16]),
+        completed_at=to_utc_optional(row[17]),
     )
 
 

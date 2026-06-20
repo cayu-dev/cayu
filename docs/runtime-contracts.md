@@ -179,6 +179,10 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=...)`
+- `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
+- `heartbeat(task_id, worker_id, extend_seconds=...)`
+- `release_task(task_id, worker_id)`
+- `reclaim_expired(query=..., max_reclaims=...)`
 - `complete_task(task_id, result)`
 - `fail_task(task_id, error)`
 - `cancel_task(task_id, error=...)`
@@ -194,7 +198,14 @@ terminal statuses do not transition
 
 `InMemoryTaskStore` exists for tests and examples. `SQLiteTaskStore` is the durable local implementation.
 
-`CayuApp(task_store=...)` can link an agent run to an existing task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Session interruption does not automatically cancel the linked task. This is a task/session bridge, not a queue worker, retry engine, workflow engine, or agent communication table.
+There are two supported task execution modes:
+
+1. **Direct task/session link.** `CayuApp(task_store=...)` can link an agent run to an existing pending task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Use this when app code already decided exactly which task and session should run.
+2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `running`, records `worker_id`, and sets `lease_expires_at`. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu only attaches the session when the live lease proves that worker owns the task. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached leases to `pending`.
+
+Claim queries intentionally do not support `session_id`, `limit`, or `offset`. Queue claims always pick one unattached pending task; tasks already linked to a session are no longer free queue work. `reclaim_expired(...)` also ignores attached tasks, even if their lease timestamp has passed, because the associated session may still be running or recoverable through session recovery. Once a claimed task is attached to a session, runtime completion/failure owns the task terminal update; the app should observe the session/task events instead of releasing that task back to the queue.
+
+This is a durable ownership primitive, not a project-management system, retry scheduler, DAG engine, or agent messaging table. Apps own assignment policy, priorities, dependency graphs, retry timing, human workflows, and worker deployment. `examples/task_worker_loop.py` shows the queue-worker pattern with claim, heartbeat, run, failure, and reclaim paths.
 
 ## EventSink
 

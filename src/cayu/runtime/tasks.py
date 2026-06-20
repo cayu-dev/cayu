@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -46,6 +46,8 @@ class Task(BaseModel):
     session_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
+    worker_id: str | None = None
+    lease_expires_at: datetime | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -82,6 +84,7 @@ class Task(BaseModel):
         "session_id",
         "parent_task_id",
         "assigned_agent_name",
+        "worker_id",
     )
     @classmethod
     def validate_optional_nonblank_strings(
@@ -185,8 +188,9 @@ class TaskStore(ABC):
         task_id: str,
         *,
         session_id: str | None = None,
+        worker_id: str | None = None,
     ) -> Task:
-        """Mark a pending task as running."""
+        """Mark a pending task as running, or attach a live claimed task owned by ``worker_id``."""
 
     @abstractmethod
     async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
@@ -203,6 +207,39 @@ class TaskStore(ABC):
         error: dict[str, Any] | None = None,
     ) -> Task:
         """Mark a pending or running task as cancelled."""
+
+    @abstractmethod
+    async def claim_task(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        lease_seconds: int = 300,
+    ) -> Task | None:
+        """Atomically claim the next pending task matching ``query``."""
+
+    @abstractmethod
+    async def heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        extend_seconds: int = 300,
+    ) -> Task:
+        """Extend the active lease for a running task owned by ``worker_id``."""
+
+    @abstractmethod
+    async def release_task(self, task_id: str, worker_id: str) -> Task:
+        """Release a running task back to pending and clear worker ownership."""
+
+    @abstractmethod
+    async def reclaim_expired(
+        self,
+        *,
+        query: TaskQuery | None = None,
+        max_reclaims: int = 100,
+    ) -> list[Task]:
+        """Return expired running task leases to pending."""
 
 
 class InMemoryTaskStore(TaskStore):
@@ -242,14 +279,32 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
+        worker_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
+        if worker_id is not None:
+            worker_id = require_clean_nonblank(worker_id, "worker_id")
+            if session_id is None:
+                raise ValueError("Task worker handoff requires session_id.")
         async with self._lock:
             task = self._require_task(task_id)
-            _ensure_can_transition(task, TaskStatus.RUNNING)
             now = datetime.now(UTC)
+            if _can_attach_claimed_task(task, now=now):
+                if task.worker_id != worker_id:
+                    raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+                updated = task.model_copy(
+                    update={
+                        "session_id": (session_id if session_id is not None else task.session_id),
+                        "updated_at": now,
+                    }
+                )
+                self._tasks[task_id] = updated
+                return updated.model_copy(deep=True)
+            if worker_id is not None:
+                _raise_task_worker_start_error(task, worker_id, now=now)
+            _ensure_can_transition(task, TaskStatus.RUNNING)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
@@ -298,10 +353,137 @@ class InMemoryTaskStore(TaskStore):
                 error=copied_error,
             )
 
+    async def claim_task(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        lease_seconds: int = 300,
+    ) -> Task | None:
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        lease_seconds = _validate_positive_int(lease_seconds, "lease_seconds")
+        if query.status is not None and query.status is not TaskStatus.PENDING:
+            return None
+        async with self._lock:
+            candidates = [
+                task
+                for task in self._tasks.values()
+                if task.status is TaskStatus.PENDING
+                and task.session_id is None
+                and _task_matches_claim_filter(task, query)
+            ]
+            if not candidates:
+                return None
+            task = _sort_tasks(candidates, query.order_by)[0]
+            now = datetime.now(UTC)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "worker_id": worker_id,
+                    "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task.id] = updated
+            return updated.model_copy(deep=True)
+
+    async def heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        extend_seconds: int = 300,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
+        async with self._lock:
+            task = self._require_owned_running_task(task_id, worker_id)
+            now = datetime.now(UTC)
+            _ensure_active_task_lease(task, worker_id, now=now)
+            updated = task.model_copy(
+                update={
+                    "lease_expires_at": now + timedelta(seconds=extend_seconds),
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def release_task(self, task_id: str, worker_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        async with self._lock:
+            task = self._require_owned_running_task(task_id, worker_id)
+            if task.session_id is not None:
+                raise ValueError(
+                    f"Task {task.id} is already attached to session {task.session_id}."
+                )
+            now = datetime.now(UTC)
+            _ensure_active_task_lease(task, worker_id, now=now)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.PENDING,
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def reclaim_expired(
+        self,
+        *,
+        query: TaskQuery | None = None,
+        max_reclaims: int = 100,
+    ) -> list[Task]:
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        max_reclaims = _validate_positive_int(max_reclaims, "max_reclaims")
+        if query.status is not None and query.status is not TaskStatus.RUNNING:
+            return []
+        async with self._lock:
+            now = datetime.now(UTC)
+            expired = [
+                task
+                for task in self._tasks.values()
+                if task.status is TaskStatus.RUNNING
+                and task.session_id is None
+                and task.lease_expires_at is not None
+                and task.lease_expires_at <= now
+                and _task_matches_claim_filter(task, query)
+            ]
+            expired = _sort_tasks(expired, TaskOrder.UPDATED_AT_ASC)
+            reclaimed: list[Task] = []
+            for task in expired[:max_reclaims]:
+                updated = task.model_copy(
+                    update={
+                        "status": TaskStatus.PENDING,
+                        "worker_id": None,
+                        "lease_expires_at": None,
+                        "updated_at": now,
+                    }
+                )
+                self._tasks[task.id] = updated
+                reclaimed.append(updated.model_copy(deep=True))
+            return reclaimed
+
     def _require_task(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
+        return task
+
+    def _require_owned_running_task(self, task_id: str, worker_id: str) -> Task:
+        task = self._require_task(task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} is not running.")
+        if task.worker_id != worker_id:
+            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
         return task
 
     def _finish_task(
@@ -320,6 +502,8 @@ class InMemoryTaskStore(TaskStore):
                 "status": status,
                 "result": deepcopy(result),
                 "error": deepcopy(error),
+                "worker_id": None,
+                "lease_expires_at": None,
                 "started_at": task.started_at or now,
                 "completed_at": now,
                 "updated_at": now,
@@ -341,6 +525,8 @@ def copy_task(task: Task) -> Task:
         session_id=task.session_id,
         parent_task_id=task.parent_task_id,
         assigned_agent_name=task.assigned_agent_name,
+        worker_id=task.worker_id,
+        lease_expires_at=task.lease_expires_at,
         input=copy_json_object(task.input, "input"),
         result=None if task.result is None else copy_json_object(task.result, "result"),
         error=None if task.error is None else copy_json_object(task.error, "error"),
@@ -414,6 +600,42 @@ def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
         raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
 
+def _can_attach_claimed_task(task: Task, *, now: datetime | None = None) -> bool:
+    now = datetime.now(UTC) if now is None else now
+    return (
+        task.status is TaskStatus.RUNNING
+        and task.worker_id is not None
+        and task.session_id is None
+        and task.lease_expires_at is not None
+        and task.lease_expires_at > now
+    )
+
+
+def _ensure_active_task_lease(task: Task, worker_id: str, *, now: datetime | None = None) -> None:
+    now = datetime.now(UTC) if now is None else now
+    if task.lease_expires_at is None:
+        raise ValueError(f"Task {task.id} has no active lease.")
+    if task.lease_expires_at <= now:
+        raise ValueError(f"Task {task.id} lease for worker {worker_id} has expired.")
+
+
+def _raise_task_worker_start_error(
+    task: Task,
+    worker_id: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    if task.status is TaskStatus.RUNNING:
+        if task.session_id is not None:
+            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+        if task.worker_id != worker_id:
+            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+        _ensure_active_task_lease(task, worker_id, now=now)
+        raise ValueError(f"Task {task.id} is already running.")
+    _ensure_can_transition(task, TaskStatus.RUNNING)
+    raise ValueError(f"Task {task.id} is not claimed by worker {worker_id}.")
+
+
 def _task_matches(task: Task, query: TaskQuery) -> bool:
     if query.status is not None and task.status != query.status:
         return False
@@ -427,6 +649,26 @@ def _task_matches(task: Task, query: TaskQuery) -> bool:
         query.assigned_agent_name is not None
         and task.assigned_agent_name != query.assigned_agent_name
     )
+
+
+def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
+    if query.type is not None and task.type != query.type:
+        return False
+    if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
+        return False
+    return not (
+        query.assigned_agent_name is not None
+        and task.assigned_agent_name != query.assigned_agent_name
+    )
+
+
+def _ensure_claim_query_supported(query: TaskQuery) -> None:
+    if query.session_id is not None:
+        raise ValueError("Task claim queries do not support session_id.")
+    if query.limit != TaskQuery.model_fields["limit"].default:
+        raise ValueError("Task claim queries do not support limit.")
+    if query.offset != TaskQuery.model_fields["offset"].default:
+        raise ValueError("Task claim queries do not support offset.")
 
 
 def _sort_tasks(tasks: list[Task], order_by: TaskOrder) -> list[Task]:
@@ -445,3 +687,11 @@ def _sort_tasks(tasks: list[Task], order_by: TaskOrder) -> list[Task]:
         key=lambda task: task.updated_at,
         reverse=True,
     )
+
+
+def _validate_positive_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1.")
+    return value

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +47,10 @@ from cayu.runtime.tasks import (
     TaskQuery,
     TaskStatus,
     TaskStore,
+    _can_attach_claimed_task,
     _ensure_can_transition,
+    _ensure_claim_query_supported,
+    _raise_task_worker_start_error,
     _task_from_create,
     copy_task_create,
     copy_task_query,
@@ -1239,6 +1242,8 @@ class SQLiteTaskStore(TaskStore):
                             session_id,
                             parent_task_id,
                             assigned_agent_name,
+                            worker_id,
+                            lease_expires_at,
                             input_json,
                             result_json,
                             error_json,
@@ -1248,7 +1253,7 @@ class SQLiteTaskStore(TaskStore):
                             started_at,
                             completed_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(task),
                     )
@@ -1306,37 +1311,74 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
+        worker_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
+        if worker_id is not None:
+            worker_id = require_clean_nonblank(worker_id, "worker_id")
+            if session_id is None:
+                raise ValueError("Task worker handoff requires session_id.")
         async with self._lock:
             now = datetime.now(UTC)
-            with self._connection:
-                cursor = self._connection.execute(
-                    """
-                    UPDATE cayu_tasks
-                    SET status = ?,
-                        session_id = COALESCE(?, session_id),
-                        started_at = COALESCE(started_at, ?),
-                        updated_at = ?
-                    WHERE id = ? AND status = ?
-                    """,
-                    (
-                        str(TaskStatus.RUNNING),
-                        session_id,
-                        sqlite_support.format_datetime(now),
-                        sqlite_support.format_datetime(now),
-                        task_id,
-                        str(TaskStatus.PENDING),
-                    ),
-                )
-            if cursor.rowcount != 1:
-                task = self._require_task_unlocked(task_id)
-                _ensure_can_transition(task, TaskStatus.RUNNING)
-                raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+            if worker_id is None:
+                with self._connection:
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE cayu_tasks
+                        SET status = ?,
+                            session_id = COALESCE(?, session_id),
+                            started_at = COALESCE(started_at, ?),
+                            updated_at = ?
+                        WHERE id = ? AND status = ?
+                        """,
+                        (
+                            str(TaskStatus.RUNNING),
+                            session_id,
+                            sqlite_support.format_datetime(now),
+                            sqlite_support.format_datetime(now),
+                            task_id,
+                            str(TaskStatus.PENDING),
+                        ),
+                    )
+                if cursor.rowcount == 1:
+                    updated = self._require_task_unlocked(task_id)
+                    return updated.model_copy(deep=True)
+            task = self._require_task_unlocked(task_id)
+            if _can_attach_claimed_task(task, now=now):
+                if task.worker_id != worker_id:
+                    raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+                with self._connection:
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE cayu_tasks
+                        SET session_id = COALESCE(?, session_id),
+                            updated_at = ?
+                        WHERE id = ?
+                          AND status = ?
+                          AND worker_id = ?
+                          AND session_id IS NULL
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at > ?
+                        """,
+                        (
+                            session_id,
+                            sqlite_support.format_datetime(now),
+                            task_id,
+                            str(TaskStatus.RUNNING),
+                            worker_id,
+                            sqlite_support.format_datetime(now),
+                        ),
+                    )
+                if cursor.rowcount != 1:
+                    self._raise_task_claim_attach_error(task_id, worker_id)
+                updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
+            if worker_id is not None:
+                _raise_task_worker_start_error(task, worker_id, now=now)
+            _ensure_can_transition(task, TaskStatus.RUNNING)
+            raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
     async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -1374,6 +1416,207 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=copied_error,
             )
+
+    async def claim_task(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        lease_seconds: int = 300,
+    ) -> Task | None:
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
+        if query.status is not None and query.status is not TaskStatus.PENDING:
+            return None
+        clauses, params = self._task_filter_clauses(query)
+        where_sql = " AND ".join(["status = ?", "session_id IS NULL", *clauses])
+        order_sql = sqlite_support.task_order_sql(query.order_by)
+        now = datetime.now(UTC)
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
+
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    f"""
+                    SELECT id
+                    FROM cayu_tasks
+                    WHERE {where_sql}
+                    ORDER BY {order_sql}, id ASC
+                    LIMIT 1
+                    """,
+                    [str(TaskStatus.PENDING), *params],
+                ).fetchone()
+                if row is None:
+                    self._connection.commit()
+                    return None
+                task_id = row["id"]
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?,
+                        worker_id = ?,
+                        lease_expires_at = ?,
+                        started_at = COALESCE(started_at, ?),
+                        updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        str(TaskStatus.RUNNING),
+                        worker_id,
+                        sqlite_support.format_datetime(lease_expires_at),
+                        sqlite_support.format_datetime(now),
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        str(TaskStatus.PENDING),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self._connection.rollback()
+                    return None
+                updated = self._require_task_unlocked(task_id)
+                self._connection.commit()
+                return updated.model_copy(deep=True)
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    async def heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        extend_seconds: int = 300,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
+        now = datetime.now(UTC)
+        lease_expires_at = now + timedelta(seconds=extend_seconds)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET lease_expires_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND worker_id = ? AND status = ?
+                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                    """,
+                    (
+                        sqlite_support.format_datetime(lease_expires_at),
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        worker_id,
+                        str(TaskStatus.RUNNING),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                self._raise_task_active_lease_error(task_id, worker_id)
+            updated = self._require_task_unlocked(task_id)
+            return updated.model_copy(deep=True)
+
+    async def release_task(self, task_id: str, worker_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        now = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND worker_id = ? AND status = ?
+                      AND session_id IS NULL
+                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                    """,
+                    (
+                        str(TaskStatus.PENDING),
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        worker_id,
+                        str(TaskStatus.RUNNING),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                self._raise_task_release_error(task_id, worker_id)
+            updated = self._require_task_unlocked(task_id)
+            return updated.model_copy(deep=True)
+
+    async def reclaim_expired(
+        self,
+        *,
+        query: TaskQuery | None = None,
+        max_reclaims: int = 100,
+    ) -> list[Task]:
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        max_reclaims = _validate_task_positive_int(max_reclaims, "max_reclaims")
+        if query.status is not None and query.status is not TaskStatus.RUNNING:
+            return []
+        clauses, params = self._task_filter_clauses(query)
+        where_sql = " AND ".join(
+            [
+                "status = ?",
+                "session_id IS NULL",
+                "lease_expires_at IS NOT NULL",
+                "lease_expires_at <= ?",
+                *clauses,
+            ]
+        )
+        now = datetime.now(UTC)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                rows = self._connection.execute(
+                    f"""
+                    SELECT id
+                    FROM cayu_tasks
+                    WHERE {where_sql}
+                    ORDER BY lease_expires_at ASC, id ASC
+                    LIMIT ?
+                    """,
+                    [
+                        str(TaskStatus.RUNNING),
+                        sqlite_support.format_datetime(now),
+                        *params,
+                        max_reclaims,
+                    ],
+                ).fetchall()
+                task_ids = [row["id"] for row in rows]
+                if task_ids:
+                    self._connection.executemany(
+                        """
+                        UPDATE cayu_tasks
+                        SET status = ?,
+                            worker_id = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = ?
+                        WHERE id = ? AND status = ? AND session_id IS NULL
+                        """,
+                        [
+                            (
+                                str(TaskStatus.PENDING),
+                                sqlite_support.format_datetime(now),
+                                task_id,
+                                str(TaskStatus.RUNNING),
+                            )
+                            for task_id in task_ids
+                        ],
+                    )
+                reclaimed = [self._require_task_unlocked(task_id) for task_id in task_ids]
+                self._connection.commit()
+                return [task.model_copy(deep=True) for task in reclaimed]
+            except Exception:
+                self._connection.rollback()
+                raise
 
     async def close(self) -> None:
         async with self._lock:
@@ -1423,6 +1666,8 @@ class SQLiteTaskStore(TaskStore):
                 SET status = ?,
                     result_json = ?,
                     error_json = ?,
+                    worker_id = NULL,
+                    lease_expires_at = NULL,
                     started_at = COALESCE(started_at, ?),
                     completed_at = ?,
                     updated_at = ?
@@ -1448,3 +1693,57 @@ class SQLiteTaskStore(TaskStore):
             raise ValueError(f"Task {task.id} cannot transition from {task.status}")
         updated = self._require_task_unlocked(task_id)
         return updated.model_copy(deep=True)
+
+    def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if query.type is not None:
+            clauses.append("type = ?")
+            params.append(query.type)
+        if query.session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(query.session_id)
+        if query.parent_task_id is not None:
+            clauses.append("parent_task_id = ?")
+            params.append(query.parent_task_id)
+        if query.assigned_agent_name is not None:
+            clauses.append("assigned_agent_name = ?")
+            params.append(query.assigned_agent_name)
+        return clauses, params
+
+    def _raise_task_active_lease_error(self, task_id: str, worker_id: str) -> None:
+        task = self._require_task_unlocked(task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} is not running.")
+        now = datetime.now(UTC)
+        if task.lease_expires_at is None:
+            raise ValueError(f"Task {task.id} has no active lease.")
+        if task.lease_expires_at <= now:
+            raise ValueError(f"Task {task.id} lease for worker {worker_id} has expired.")
+        raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+
+    def _raise_task_release_error(self, task_id: str, worker_id: str) -> None:
+        task = self._require_task_unlocked(task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} is not running.")
+        if task.session_id is not None:
+            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+        self._raise_task_active_lease_error(task_id, worker_id)
+
+    def _raise_task_claim_attach_error(self, task_id: str, worker_id: str | None) -> None:
+        task = self._require_task_unlocked(task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+        if task.session_id is not None:
+            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+        if task.worker_id != worker_id:
+            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+        self._raise_task_active_lease_error(task_id, worker_id or "")
+
+
+def _validate_task_positive_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1.")
+    return value
