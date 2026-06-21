@@ -223,6 +223,8 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.assigned_agent_name,
         task.worker_id,
         to_utc_optional(task.lease_expires_at),
+        task.status_reason,
+        None if task.status_payload is None else _dumps(task.status_payload),
         _dumps(task.input),
         None if task.result is None else _dumps(task.result),
         None if task.error is None else _dumps(task.error),
@@ -236,8 +238,8 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
 
 TASK_COLUMNS = (
     "id, type, title, description, status, session_id, parent_task_id, "
-    "assigned_agent_name, worker_id, lease_expires_at, input, result, error, metadata, created_at, "
-    "updated_at, started_at, completed_at"
+    "assigned_agent_name, worker_id, lease_expires_at, status_reason, status_payload, input, "
+    "result, error, metadata, created_at, updated_at, started_at, completed_at"
 )
 
 
@@ -253,14 +255,16 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         assigned_agent_name=row[7],
         worker_id=row[8],
         lease_expires_at=to_utc_optional(row[9]),
-        input=_loads(row[10]),
-        result=None if row[11] is None else _loads(row[11]),
-        error=None if row[12] is None else _loads(row[12]),
-        metadata=_loads(row[13]),
-        created_at=to_utc(row[14]),
-        updated_at=to_utc(row[15]),
-        started_at=to_utc_optional(row[16]),
-        completed_at=to_utc_optional(row[17]),
+        status_reason=row[10],
+        status_payload=None if row[11] is None else _loads(row[11]),
+        input=_loads(row[12]),
+        result=None if row[13] is None else _loads(row[13]),
+        error=None if row[14] is None else _loads(row[14]),
+        metadata=_loads(row[15]),
+        created_at=to_utc(row[16]),
+        updated_at=to_utc(row[17]),
+        started_at=to_utc_optional(row[18]),
+        completed_at=to_utc_optional(row[19]),
     )
 
 

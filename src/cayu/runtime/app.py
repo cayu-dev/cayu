@@ -937,6 +937,48 @@ class CayuApp:
             raise RuntimeError("task_store is required to create tasks.")
         return await self.task_store.create_task(copy_task_create(request))
 
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to pause tasks.")
+        return await self.task_store.pause_task(task_id, reason=reason, payload=payload)
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to block tasks.")
+        return await self.task_store.block_task(task_id, reason=reason, payload=payload)
+
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to mark tasks needs-attention.")
+        return await self.task_store.mark_task_needs_attention(
+            task_id,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def resume_task(self, task_id: str) -> Task:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required to resume tasks.")
+        return await self.task_store.resume_task(task_id)
+
     async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
         session_id = require_clean_nonblank(session_id, "session_id")
         session = await self.session_store.load(session_id)

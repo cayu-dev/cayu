@@ -16,6 +16,9 @@ from cayu._validation import copy_json_object, require_clean_nonblank, require_n
 class TaskStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+    NEEDS_ATTENTION = "needs_attention"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -48,6 +51,8 @@ class Task(BaseModel):
     assigned_agent_name: str | None = None
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
+    status_reason: str | None = None
+    status_payload: dict[str, Any] | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -62,7 +67,7 @@ class Task(BaseModel):
     def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
         return copy_json_object(value, info.field_name)
 
-    @field_validator("result", "error", mode="before")
+    @field_validator("status_payload", "result", "error", mode="before")
     @classmethod
     def copy_optional_json_object(
         cls,
@@ -85,6 +90,7 @@ class Task(BaseModel):
         "parent_task_id",
         "assigned_agent_name",
         "worker_id",
+        "status_reason",
     )
     @classmethod
     def validate_optional_nonblank_strings(
@@ -94,7 +100,7 @@ class Task(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        if info.field_name in {"title", "description"}:
+        if info.field_name in {"title", "description", "status_reason"}:
             return require_nonblank(value, info.field_name)
         return require_clean_nonblank(value, info.field_name)
 
@@ -207,6 +213,40 @@ class TaskStore(ABC):
         error: dict[str, Any] | None = None,
     ) -> Task:
         """Mark a pending or running task as cancelled."""
+
+    @abstractmethod
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        """Pause a pending or unattached running task until app code resumes it."""
+
+    @abstractmethod
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        """Mark a pending or unattached running task as blocked on an external dependency."""
+
+    @abstractmethod
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        """Mark a pending or unattached running task as waiting for human/operator input."""
+
+    @abstractmethod
+    async def resume_task(self, task_id: str) -> Task:
+        """Return a paused, blocked, or attention-needed task to the pending queue."""
 
     @abstractmethod
     async def claim_task(
@@ -352,6 +392,67 @@ class InMemoryTaskStore(TaskStore):
                 result=None,
                 error=copied_error,
             )
+
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.PAUSED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.BLOCKED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.NEEDS_ATTENTION,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def resume_task(self, task_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            task = self._require_task(task_id)
+            _ensure_can_resume_task(task)
+            now = datetime.now(UTC)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.PENDING,
+                    "status_reason": None,
+                    "status_payload": None,
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
 
     async def claim_task(
         self,
@@ -500,6 +601,8 @@ class InMemoryTaskStore(TaskStore):
         updated = task.model_copy(
             update={
                 "status": status,
+                "status_reason": None,
+                "status_payload": None,
                 "result": deepcopy(result),
                 "error": deepcopy(error),
                 "worker_id": None,
@@ -511,6 +614,34 @@ class InMemoryTaskStore(TaskStore):
         )
         self._tasks[task_id] = updated
         return updated.model_copy(deep=True)
+
+    async def _hold_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        reason: str | None,
+        payload: dict[str, Any] | None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        reason = _copy_optional_status_reason(reason)
+        payload = _copy_optional_status_payload(payload)
+        async with self._lock:
+            task = self._require_task(task_id)
+            _ensure_can_hold_task(task, status)
+            now = datetime.now(UTC)
+            updated = task.model_copy(
+                update={
+                    "status": status,
+                    "status_reason": reason,
+                    "status_payload": deepcopy(payload),
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
 
 
 def copy_task(task: Task) -> Task:
@@ -527,6 +658,12 @@ def copy_task(task: Task) -> Task:
         assigned_agent_name=task.assigned_agent_name,
         worker_id=task.worker_id,
         lease_expires_at=task.lease_expires_at,
+        status_reason=task.status_reason,
+        status_payload=(
+            None
+            if task.status_payload is None
+            else copy_json_object(task.status_payload, "status_payload")
+        ),
         input=copy_json_object(task.input, "input"),
         result=None if task.result is None else copy_json_object(task.result, "result"),
         error=None if task.error is None else copy_json_object(task.error, "error"),
@@ -598,6 +735,27 @@ def _ensure_can_transition(task: Task, next_status: TaskStatus) -> None:
         raise ValueError(f"Task {task.id} is already terminal: {task.status}")
     if next_status == TaskStatus.RUNNING and task.status != TaskStatus.PENDING:
         raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+
+
+def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
+    if next_status not in _HELD_TASK_STATUSES:
+        raise ValueError(f"Task {task.id} cannot be held as {next_status}.")
+    _ensure_not_terminal(task)
+    if task.status is TaskStatus.RUNNING and task.session_id is not None:
+        raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+    if task.status not in {TaskStatus.PENDING, TaskStatus.RUNNING, *_HELD_TASK_STATUSES}:
+        raise ValueError(f"Task {task.id} cannot transition to {next_status} from {task.status}")
+
+
+def _ensure_can_resume_task(task: Task) -> None:
+    _ensure_not_terminal(task)
+    if task.status not in _HELD_TASK_STATUSES:
+        raise ValueError(f"Task {task.id} is not paused, blocked, or waiting for attention.")
+
+
+def _ensure_not_terminal(task: Task) -> None:
+    if task.status in _TERMINAL_TASK_STATUSES:
+        raise ValueError(f"Task {task.id} is already terminal: {task.status}")
 
 
 def _can_attach_claimed_task(task: Task, *, now: datetime | None = None) -> bool:
@@ -695,3 +853,28 @@ def _validate_positive_int(value: int, field_name: str) -> int:
     if value < 1:
         raise ValueError(f"{field_name} must be >= 1.")
     return value
+
+
+def _copy_optional_status_reason(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return require_nonblank(value, "reason")
+
+
+def _copy_optional_status_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return copy_json_object(value, "payload")
+
+
+_TERMINAL_TASK_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+}
+
+_HELD_TASK_STATUSES = {
+    TaskStatus.PAUSED,
+    TaskStatus.BLOCKED,
+    TaskStatus.NEEDS_ATTENTION,
+}

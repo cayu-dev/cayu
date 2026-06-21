@@ -212,6 +212,10 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status_lease
             ON cayu_tasks(status, lease_expires_at);
     """,
+    5: """
+        ALTER TABLE cayu_tasks ADD COLUMN status_reason TEXT;
+        ALTER TABLE cayu_tasks ADD COLUMN status_payload_json TEXT;
+    """,
 }
 
 
@@ -358,6 +362,8 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         task.assigned_agent_name,
         task.worker_id,
         format_optional_datetime(task.lease_expires_at),
+        task.status_reason,
+        None if task.status_payload is None else json_dumps(task.status_payload),
         json_dumps(task.input),
         None if task.result is None else json_dumps(task.result),
         None if task.error is None else json_dumps(task.error),
@@ -370,6 +376,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
 
 
 def task_from_row(row: sqlite3.Row) -> Task:
+    status_payload_json = row["status_payload_json"]
     result_json = row["result_json"]
     error_json = row["error_json"]
     return Task(
@@ -383,6 +390,8 @@ def task_from_row(row: sqlite3.Row) -> Task:
         assigned_agent_name=row["assigned_agent_name"],
         worker_id=row["worker_id"],
         lease_expires_at=parse_optional_datetime(row["lease_expires_at"]),
+        status_reason=row["status_reason"],
+        status_payload=(None if status_payload_json is None else json.loads(status_payload_json)),
         input=json.loads(row["input_json"]),
         result=None if result_json is None else json.loads(result_json),
         error=None if error_json is None else json.loads(error_json),

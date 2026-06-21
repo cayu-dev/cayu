@@ -87,6 +87,106 @@ def test_task_stores_lifecycle_and_terminal_guards(store_factory: StoreFactory, 
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_hold_resume_and_attention_states(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_blocked", type="review"))
+        await store.create_task(TaskCreate(task_id="task_attention", type="review"))
+        await store.create_task(TaskCreate(task_id="task_pause_claim", type="review"))
+
+        blocked = await store.block_task(
+            "task_blocked",
+            reason="Waiting on vendor API",
+            payload={"dependency": "vendor_api"},
+        )
+        assert blocked.status == TaskStatus.BLOCKED
+        assert blocked.status_reason == "Waiting on vendor API"
+        assert blocked.status_payload == {"dependency": "vendor_api"}
+        assert blocked.status_payload is not None
+        blocked.status_payload["dependency"] = "mutated"
+
+        attention = await store.mark_task_needs_attention(
+            "task_attention",
+            reason="Operator approval required",
+            payload={"field": "amount"},
+        )
+        assert attention.status == TaskStatus.NEEDS_ATTENTION
+
+        claimed = await store.claim_task(
+            "worker_a",
+            TaskQuery(type="review", order_by=TaskOrder.CREATED_AT_ASC),
+        )
+        assert claimed is not None
+        assert claimed.id == "task_pause_claim"
+
+        paused = await store.pause_task(
+            "task_pause_claim",
+            reason="Worker shutting down",
+        )
+        assert paused.status == TaskStatus.PAUSED
+        assert paused.worker_id is None
+        assert paused.lease_expires_at is None
+
+        assert await store.claim_task("worker_b", TaskQuery(type="review")) is None
+
+        resumed = await store.resume_task("task_blocked")
+        assert resumed.status == TaskStatus.PENDING
+        assert resumed.status_reason is None
+        assert resumed.status_payload is None
+
+        reloaded = await store.load_task("task_blocked")
+        assert reloaded is not None
+        assert reloaded.status == TaskStatus.PENDING
+        assert reloaded.status_payload is None
+
+        claimed_after_resume = await store.claim_task("worker_c", TaskQuery(type="review"))
+        assert claimed_after_resume is not None
+        assert claimed_after_resume.id == "task_blocked"
+
+        with pytest.raises(ValueError, match="not paused, blocked, or waiting"):
+            await store.resume_task("task_blocked")
+
+        escalated = await store.block_task(
+            "task_attention",
+            reason="Waiting on supervisor decision",
+        )
+        assert escalated.status == TaskStatus.BLOCKED
+        assert escalated.status_reason == "Waiting on supervisor decision"
+        assert escalated.status_payload is None
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_do_not_hold_attached_running_tasks(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_attached_hold", type="review"))
+        await store.start_task("task_attached_hold", session_id="sess_attached_hold")
+
+        with pytest.raises(ValueError, match="already attached to session sess_attached_hold"):
+            await store.pause_task("task_attached_hold", reason="not allowed")
+        with pytest.raises(ValueError, match="already attached to session sess_attached_hold"):
+            await store.block_task("task_attached_hold", reason="not allowed")
+        with pytest.raises(ValueError, match="already attached to session sess_attached_hold"):
+            await store.mark_task_needs_attention("task_attached_hold", reason="not allowed")
+
+        loaded = await store.load_task("task_attached_hold")
+        assert loaded is not None
+        assert loaded.status == TaskStatus.RUNNING
+        assert loaded.status_reason is None
+        assert loaded.status_payload is None
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_list_tasks_with_filters_and_pagination(
     store_factory: StoreFactory,
     tmp_path,

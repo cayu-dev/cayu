@@ -7,7 +7,8 @@ Usage:
 This example is intentionally API-key-free. It shows how app-owned worker code
 can claim durable tasks, run a Cayu agent with the claimed task id, heartbeat the
 lease while the run is active, fail a task before model execution, and reclaim
-expired leases.
+expired leases. It also shows task-level blocked/resume states for app-owned
+orchestration.
 """
 
 from __future__ import annotations
@@ -65,12 +66,23 @@ async def main() -> None:
             assigned_agent_name="assistant",
         )
     )
+    await app.create_task(
+        TaskCreate(
+            task_id="task_blocked",
+            type="summarize",
+            title="Wait for an upstream dependency",
+            assigned_agent_name="assistant",
+        )
+    )
 
     completed = await run_one_worker_task(app, task_store, worker_id="worker_a")
     print("completed", completed.id, completed.status, completed.session_id)
 
     failed = await fail_one_worker_task(task_store, worker_id="worker_a")
     print("failed", failed.id, failed.status, failed.error)
+
+    resumed = await demonstrate_block_and_resume(task_store, worker_id="worker_a")
+    print("resumed", resumed.id, resumed.status, resumed.worker_id)
 
     await demonstrate_reclaim(task_store)
 
@@ -164,6 +176,40 @@ async def fail_one_worker_task(
         task.id,
         {"message": "Worker setup failed before model execution."},
     )
+
+
+async def demonstrate_block_and_resume(
+    task_store: InMemoryTaskStore,
+    *,
+    worker_id: str,
+) -> Task:
+    task = await task_store.claim_task(
+        worker_id,
+        TaskQuery(
+            status=TaskStatus.PENDING,
+            type="summarize",
+            assigned_agent_name="assistant",
+            order_by=TaskOrder.CREATED_AT_ASC,
+        ),
+        lease_seconds=30,
+    )
+    if task is None:
+        raise RuntimeError("No task available for blocked path.")
+
+    blocked = await task_store.block_task(
+        task.id,
+        reason="Waiting for source document upload",
+        payload={"missing": "source_document"},
+    )
+    print("blocked", blocked.id, blocked.status, blocked.status_reason)
+
+    skipped = await task_store.claim_task(
+        "worker_b",
+        TaskQuery(type="summarize", assigned_agent_name="assistant"),
+    )
+    print("claim_while_blocked", skipped)
+
+    return await task_store.resume_task(task.id)
 
 
 async def demonstrate_reclaim(task_store: InMemoryTaskStore) -> None:

@@ -11,7 +11,7 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message, TaskCreate
+from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message, TaskCreate, TaskStatus
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -100,6 +100,8 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
             "type": "review",
             "title": None,
             "status": "running",
+            "status_reason": None,
+            "status_payload": None,
             "session_id": None,
             "worker_id": "worker_a",
             "lease_expires_at": tasks[0]["lease_expires_at"],
@@ -108,6 +110,50 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
         }
     ]
     assert isinstance(tasks[0]["lease_expires_at"], str)
+
+
+def test_server_task_list_filters_lifecycle_states() -> None:
+    task_store = InMemoryTaskStore()
+
+    async def setup_task() -> None:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="blocked_task",
+                type="review",
+                assigned_agent_name="assistant",
+            )
+        )
+        await task_store.create_task(
+            TaskCreate(
+                task_id="ready_task",
+                type="review",
+                assigned_agent_name="assistant",
+            )
+        )
+        await task_store.block_task(
+            "blocked_task",
+            reason="Waiting on upstream import",
+            payload={"dependency": "import_123"},
+        )
+
+    asyncio.run(setup_task())
+
+    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    response = client.get(
+        "/api/tasks",
+        params={
+            "status": TaskStatus.BLOCKED.value,
+            "type": "review",
+            "assigned_agent_name": "assistant",
+        },
+    )
+
+    assert response.status_code == 200
+    tasks = response.json()
+    assert [task["id"] for task in tasks] == ["blocked_task"]
+    assert tasks[0]["status"] == "blocked"
+    assert tasks[0]["status_reason"] == "Waiting on upstream import"
+    assert tasks[0]["status_payload"] == {"dependency": "import_123"}
 
 
 def test_server_exposes_session_usage_summary() -> None:

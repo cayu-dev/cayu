@@ -874,8 +874,13 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
 
     assert label_table is not None
     assert watcher_table is not None
-    assert {"worker_id", "lease_expires_at"}.issubset(task_columns)
-    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4)]
+    assert {
+        "worker_id",
+        "lease_expires_at",
+        "status_reason",
+        "status_payload_json",
+    }.issubset(task_columns)
+    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
     assert version == schema_migrations.LATEST_REVISION
 
 

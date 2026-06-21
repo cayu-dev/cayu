@@ -179,6 +179,10 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=...)`
+- `pause_task(task_id, reason=..., payload=...)`
+- `block_task(task_id, reason=..., payload=...)`
+- `mark_task_needs_attention(task_id, reason=..., payload=...)`
+- `resume_task(task_id)`
 - `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
 - `heartbeat(task_id, worker_id, extend_seconds=...)`
 - `release_task(task_id, worker_id)`
@@ -191,10 +195,17 @@ Valid task lifecycle is intentionally small for the foundation:
 
 ```text
 pending -> running
+pending -> paused | blocked | needs_attention
+running (unattached) -> paused | blocked | needs_attention
+paused | blocked | needs_attention -> paused | blocked | needs_attention
+paused | blocked | needs_attention -> pending
 pending -> completed | failed | cancelled
 running -> completed | failed | cancelled
+paused | blocked | needs_attention -> completed | failed | cancelled
 terminal statuses do not transition
 ```
+
+`paused`, `blocked`, and `needs_attention` are task-level orchestration states. They stop queue workers from claiming the task until trusted app code calls `resume_task(...)`. Held tasks can move directly among held states, so an app can escalate `blocked` to `needs_attention` without briefly returning the task to the claimable queue. They are not session pause states and they do not interrupt a live model loop. A running task that is already attached to a session cannot be moved into one of these held states through `TaskStore`; use session interruption/recovery for active model work instead. `status_reason` and `status_payload` describe the current held state and are cleared when the task resumes or becomes terminal.
 
 `InMemoryTaskStore` exists for tests and examples. `SQLiteTaskStore` is the durable local implementation.
 
@@ -204,6 +215,8 @@ There are two supported task execution modes:
 2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `running`, records `worker_id`, and sets `lease_expires_at`. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu only attaches the session when the live lease proves that worker owns the task. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached leases to `pending`.
 
 Claim queries intentionally do not support `session_id`, `limit`, or `offset`. Queue claims always pick one unattached pending task; tasks already linked to a session are no longer free queue work. `reclaim_expired(...)` also ignores attached tasks, even if their lease timestamp has passed, because the associated session may still be running or recoverable through session recovery. Once a claimed task is attached to a session, runtime completion/failure owns the task terminal update; the app should observe the session/task events instead of releasing that task back to the queue.
+
+Held tasks are not reclaimed by lease cleanup. If a worker claims a task and discovers a dependency or human-review requirement before attaching a session, it should call `block_task(...)`, `pause_task(...)`, or `mark_task_needs_attention(...)`; these clear worker ownership and lease state. Later, app/operator code can call `resume_task(...)` to return the task to the pending queue.
 
 This is a durable ownership primitive, not a project-management system, retry scheduler, DAG engine, or agent messaging table. Apps own assignment policy, priorities, dependency graphs, retry timing, human workflows, and worker deployment. `examples/task_worker_loop.py` shows the queue-worker pattern with claim, heartbeat, run, failure, and reclaim paths.
 

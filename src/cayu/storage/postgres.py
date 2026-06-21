@@ -56,6 +56,10 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStore,
     _can_attach_claimed_task,
+    _copy_optional_status_payload,
+    _copy_optional_status_reason,
+    _ensure_can_hold_task,
+    _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _raise_task_worker_start_error,
@@ -77,8 +81,8 @@ _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
     "task.parent_task_id, task.assigned_agent_name, task.worker_id, task.lease_expires_at, "
-    "task.input, task.result, task.error, task.metadata, task.created_at, task.updated_at, "
-    "task.started_at, task.completed_at"
+    "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
+    "task.created_at, task.updated_at, task.started_at, task.completed_at"
 )
 
 
@@ -152,6 +156,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_worker_id ON cayu_tasks(worker_id)",
         "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status_lease "
         "ON cayu_tasks(status, lease_expires_at)",
+    ),
+    5: (
+        "ALTER TABLE cayu_tasks ADD COLUMN status_reason TEXT",
+        "ALTER TABLE cayu_tasks ADD COLUMN status_payload JSONB",
     ),
 }
 
@@ -1623,7 +1631,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s
                         )
                         """,
                         pg_support.task_insert_values(task),
@@ -1783,6 +1792,85 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         return await self._finish_task(
             task_id, TaskStatus.CANCELLED, result=None, error=copied_error
         )
+
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.PAUSED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.BLOCKED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.NEEDS_ATTENTION,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def resume_task(self, task_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE cayu_tasks
+                    SET status = %s,
+                        status_reason = NULL,
+                        status_payload = NULL,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND status IN (%s, %s, %s)
+                    RETURNING {pg_support.TASK_COLUMNS}
+                    """,
+                    (
+                        str(TaskStatus.PENDING),
+                        now,
+                        task_id,
+                        str(TaskStatus.PAUSED),
+                        str(TaskStatus.BLOCKED),
+                        str(TaskStatus.NEEDS_ATTENTION),
+                    ),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    task = await self._require_task(cur, task_id)
+                    _ensure_can_resume_task(task)
+                    raise ValueError(f"Task {task.id} cannot resume from {task.status}")
+                updated = pg_support.task_from_row(row)
+            await conn.commit()
+            return updated.model_copy(deep=True)
 
     async def claim_task(
         self,
@@ -1987,6 +2075,62 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
 
     # -- internal helpers -------------------------------------------------
 
+    async def _hold_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        reason: str | None,
+        payload: dict[str, Any] | None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        reason = _copy_optional_status_reason(reason)
+        payload = _copy_optional_status_payload(payload)
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE cayu_tasks
+                    SET status = %s,
+                        status_reason = %s,
+                        status_payload = %s,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND (
+                        status = %s
+                        OR status = %s
+                        OR status = %s
+                        OR status = %s
+                        OR (status = %s AND session_id IS NULL)
+                      )
+                    RETURNING {pg_support.TASK_COLUMNS}
+                    """,
+                    (
+                        str(status),
+                        reason,
+                        None if payload is None else _dumps(payload),
+                        now,
+                        task_id,
+                        str(TaskStatus.PENDING),
+                        str(TaskStatus.PAUSED),
+                        str(TaskStatus.BLOCKED),
+                        str(TaskStatus.NEEDS_ATTENTION),
+                        str(TaskStatus.RUNNING),
+                    ),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    task = await self._require_task(cur, task_id)
+                    _ensure_can_hold_task(task, status)
+                    raise ValueError(f"Task {task.id} cannot transition to {status}")
+                updated = pg_support.task_from_row(row)
+            await conn.commit()
+            return updated.model_copy(deep=True)
+
     async def _finish_task(
         self,
         task_id: str,
@@ -2003,6 +2147,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     """
                     UPDATE cayu_tasks
                     SET status = %s,
+                        status_reason = NULL,
+                        status_payload = NULL,
                         result = %s,
                         error = %s,
                         worker_id = NULL,

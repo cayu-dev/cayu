@@ -47,7 +47,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tasks import TaskCreate, TaskQuery
+from cayu.runtime.tasks import TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
 from cayu.server.sse import event_to_sse_data
 
@@ -1042,16 +1042,38 @@ def create_router(
         }
 
     @router.get("/tasks")
-    async def list_tasks(limit: int = 50):
+    async def list_tasks(
+        status: TaskStatus | None = None,
+        task_type: str | None = Query(default=None, alias="type"),
+        session_id: str | None = None,
+        parent_task_id: str | None = None,
+        assigned_agent_name: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
         if task_store is None:
             return []
-        tasks = await task_store.list_tasks(TaskQuery(limit=limit))
+        try:
+            query = TaskQuery(
+                status=status,
+                type=task_type,
+                session_id=session_id,
+                parent_task_id=parent_task_id,
+                assigned_agent_name=assigned_agent_name,
+                limit=limit,
+                offset=offset,
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        tasks = await task_store.list_tasks(query)
         return [
             {
                 "id": t.id,
                 "type": t.type,
                 "title": t.title,
                 "status": t.status.value,
+                "status_reason": t.status_reason,
+                "status_payload": t.status_payload,
                 "session_id": t.session_id,
                 "worker_id": t.worker_id,
                 "lease_expires_at": (

@@ -68,6 +68,7 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=2, kind=RevisionKind.BREAKING, compatible_from=2),
     Revision(revision=3, kind=RevisionKind.BREAKING, compatible_from=3),
     Revision(revision=4, kind=RevisionKind.BREAKING, compatible_from=4),
+    Revision(revision=5, kind=RevisionKind.BREAKING, compatible_from=5),
 )
 
 #: The revision an empty database is initialized to.

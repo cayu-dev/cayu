@@ -48,6 +48,10 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStore,
     _can_attach_claimed_task,
+    _copy_optional_status_payload,
+    _copy_optional_status_reason,
+    _ensure_can_hold_task,
+    _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _raise_task_worker_start_error,
@@ -1244,6 +1248,8 @@ class SQLiteTaskStore(TaskStore):
                             assigned_agent_name,
                             worker_id,
                             lease_expires_at,
+                            status_reason,
+                            status_payload_json,
                             input_json,
                             result_json,
                             error_json,
@@ -1253,7 +1259,7 @@ class SQLiteTaskStore(TaskStore):
                             started_at,
                             completed_at
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(task),
                     )
@@ -1416,6 +1422,81 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=copied_error,
             )
+
+    async def pause_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.PAUSED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.BLOCKED,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def mark_task_needs_attention(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Task:
+        return await self._hold_task(
+            task_id,
+            TaskStatus.NEEDS_ATTENTION,
+            reason=reason,
+            payload=payload,
+        )
+
+    async def resume_task(self, task_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        now = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?,
+                        status_reason = NULL,
+                        status_payload_json = NULL,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status IN (?, ?, ?)
+                    """,
+                    (
+                        str(TaskStatus.PENDING),
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        str(TaskStatus.PAUSED),
+                        str(TaskStatus.BLOCKED),
+                        str(TaskStatus.NEEDS_ATTENTION),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                task = self._require_task_unlocked(task_id)
+                _ensure_can_resume_task(task)
+                raise ValueError(f"Task {task.id} cannot resume from {task.status}")
+            updated = self._require_task_unlocked(task_id)
+            return updated.model_copy(deep=True)
 
     async def claim_task(
         self,
@@ -1664,6 +1745,8 @@ class SQLiteTaskStore(TaskStore):
                 """
                 UPDATE cayu_tasks
                 SET status = ?,
+                    status_reason = NULL,
+                    status_payload_json = NULL,
                     result_json = ?,
                     error_json = ?,
                     worker_id = NULL,
@@ -1693,6 +1776,58 @@ class SQLiteTaskStore(TaskStore):
             raise ValueError(f"Task {task.id} cannot transition from {task.status}")
         updated = self._require_task_unlocked(task_id)
         return updated.model_copy(deep=True)
+
+    async def _hold_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        reason: str | None,
+        payload: dict[str, Any] | None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        reason = _copy_optional_status_reason(reason)
+        payload = _copy_optional_status_payload(payload)
+        now = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?,
+                        status_reason = ?,
+                        status_payload_json = ?,
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND (
+                        status = ?
+                        OR status = ?
+                        OR status = ?
+                        OR status = ?
+                        OR (status = ? AND session_id IS NULL)
+                      )
+                    """,
+                    (
+                        str(status),
+                        reason,
+                        None if payload is None else sqlite_support.json_dumps(payload),
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        str(TaskStatus.PENDING),
+                        str(TaskStatus.PAUSED),
+                        str(TaskStatus.BLOCKED),
+                        str(TaskStatus.NEEDS_ATTENTION),
+                        str(TaskStatus.RUNNING),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                task = self._require_task_unlocked(task_id)
+                _ensure_can_hold_task(task, status)
+                raise ValueError(f"Task {task.id} cannot transition to {status}")
+            updated = self._require_task_unlocked(task_id)
+            return updated.model_copy(deep=True)
 
     def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]:
         clauses: list[str] = []
