@@ -218,6 +218,8 @@ Claim queries intentionally do not support `session_id`, `limit`, or `offset`. Q
 
 Held tasks are not reclaimed by lease cleanup. If a worker claims a task and discovers a dependency or human-review requirement before attaching a session, it should call `block_task(...)`, `pause_task(...)`, or `mark_task_needs_attention(...)`; these clear worker ownership and lease state. Later, app/operator code can call `resume_task(...)` to return the task to the pending queue.
 
+The server exposes the same lifecycle for operator/backend integrations through `POST /api/tasks/{task_id}/pause`, `POST /api/tasks/{task_id}/block`, `POST /api/tasks/{task_id}/needs-attention`, and `POST /api/tasks/{task_id}/resume`. Hold endpoints accept optional `reason` and `payload` fields. `GET /api/tasks` stays a compact list view and does not include task input/result/error/metadata; lifecycle mutation responses return the full task detail for the task that was changed.
+
 This is a durable ownership primitive, not a project-management system, retry scheduler, DAG engine, or agent messaging table. Apps own assignment policy, priorities, dependency graphs, retry timing, human workflows, and worker deployment. `examples/task_worker_loop.py` shows the queue-worker pattern with claim, heartbeat, run, failure, and reclaim paths.
 
 ## EventSink

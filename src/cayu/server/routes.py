@@ -47,7 +47,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tasks import TaskCreate, TaskQuery, TaskStatus
+from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
 from cayu.server.sse import event_to_sse_data
 
@@ -110,6 +110,11 @@ class SessionCostBody(BaseModel):
 class SessionsSummaryBody(BaseModel):
     pricing: PricingCatalog | None = None
     currency: NonBlankString = "USD"
+
+
+class TaskHoldBody(BaseModel):
+    reason: NonBlankString | None = None
+    payload: dict[str, Any] | None = None
 
 
 class ToolApprovalBody(BaseModel):
@@ -345,6 +350,37 @@ def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any
         "index": index,
         "role": str(message.role),
         "content": [part.model_dump(mode="json") for part in message.content],
+    }
+
+
+def _serialize_task_list_item(task: Task) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "type": task.type,
+        "title": task.title,
+        "status": task.status.value,
+        "status_reason": task.status_reason,
+        "status_payload": task.status_payload,
+        "session_id": task.session_id,
+        "worker_id": task.worker_id,
+        "lease_expires_at": (task.lease_expires_at.isoformat() if task.lease_expires_at else None),
+        "created_at": task.created_at.isoformat(),
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+    }
+
+
+def _serialize_task_detail(task: Task) -> dict[str, Any]:
+    return {
+        **_serialize_task_list_item(task),
+        "description": task.description,
+        "parent_task_id": task.parent_task_id,
+        "assigned_agent_name": task.assigned_agent_name,
+        "input": task.input,
+        "result": task.result,
+        "error": task.error,
+        "metadata": task.metadata,
+        "updated_at": task.updated_at.isoformat(),
+        "started_at": task.started_at.isoformat() if task.started_at else None,
     }
 
 
@@ -1066,24 +1102,68 @@ def create_router(
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
         tasks = await task_store.list_tasks(query)
-        return [
-            {
-                "id": t.id,
-                "type": t.type,
-                "title": t.title,
-                "status": t.status.value,
-                "status_reason": t.status_reason,
-                "status_payload": t.status_payload,
-                "session_id": t.session_id,
-                "worker_id": t.worker_id,
-                "lease_expires_at": (
-                    t.lease_expires_at.isoformat() if t.lease_expires_at else None
-                ),
-                "created_at": t.created_at.isoformat(),
-                "completed_at": (t.completed_at.isoformat() if t.completed_at else None),
-            }
-            for t in tasks
-        ]
+        return [_serialize_task_list_item(t) for t in tasks]
+
+    async def _require_task_store():
+        if task_store is None:
+            raise HTTPException(status_code=404, detail="Task store is not configured.")
+        return task_store
+
+    async def _apply_task_action(action, task_id: str):
+        try:
+            task = await action(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _serialize_task_detail(task)
+
+    @router.post("/tasks/{task_id}/pause")
+    async def pause_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
+        store = await _require_task_store()
+        request_body = body or TaskHoldBody()
+        return await _apply_task_action(
+            lambda task_id: store.pause_task(
+                task_id,
+                reason=request_body.reason,
+                payload=request_body.payload,
+            ),
+            task_id,
+        )
+
+    @router.post("/tasks/{task_id}/block")
+    async def block_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
+        store = await _require_task_store()
+        request_body = body or TaskHoldBody()
+        return await _apply_task_action(
+            lambda task_id: store.block_task(
+                task_id,
+                reason=request_body.reason,
+                payload=request_body.payload,
+            ),
+            task_id,
+        )
+
+    @router.post("/tasks/{task_id}/needs-attention")
+    async def mark_task_needs_attention(
+        task_id: NonBlankString,
+        body: TaskHoldBody | None = None,
+    ):
+        store = await _require_task_store()
+        request_body = body or TaskHoldBody()
+        return await _apply_task_action(
+            lambda task_id: store.mark_task_needs_attention(
+                task_id,
+                reason=request_body.reason,
+                payload=request_body.payload,
+            ),
+            task_id,
+        )
+
+    @router.post("/tasks/{task_id}/resume")
+    async def resume_task(task_id: NonBlankString):
+        store = await _require_task_store()
+        return await _apply_task_action(store.resume_task, task_id)
 
     @router.get("/health")
     async def health():
