@@ -38,7 +38,13 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec, copy_environment
+from cayu.environments import (
+    Environment,
+    EnvironmentSpec,
+    WorkspaceInstructions,
+    copy_environment,
+    load_workspace_instructions,
+)
 from cayu.providers import (
     ModelCompletion,
     ModelProvider,
@@ -581,6 +587,9 @@ class CayuApp:
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
+        workspace_instructions = await _load_registered_workspace_instructions(
+            registered_environment,
+        )
         session = await self.session_store.create(
             request,
             identity=_session_identity(
@@ -611,7 +620,10 @@ class CayuApp:
             raise
 
         messages = transcript_helpers.initial_messages(
-            system_prompt=registered_agent.spec.system_prompt,
+            system_prompt=_render_initial_system_prompt(
+                agent_system_prompt=registered_agent.spec.system_prompt,
+                workspace_instructions=workspace_instructions,
+            ),
             request_messages=request.messages,
         )
         try:
@@ -5436,6 +5448,38 @@ def _session_agent_spec(
             "provider_options",
         ),
     )
+
+
+async def _load_registered_workspace_instructions(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> WorkspaceInstructions | None:
+    if registered_environment is None:
+        return None
+    return await load_workspace_instructions(registered_environment.environment)
+
+
+def _render_initial_system_prompt(
+    *,
+    agent_system_prompt: str | None,
+    workspace_instructions: WorkspaceInstructions | None,
+) -> str | None:
+    agent_prompt = agent_system_prompt.strip() if agent_system_prompt else ""
+    if workspace_instructions is None:
+        return agent_prompt or None
+
+    workspace_content = workspace_instructions.content.strip()
+    source_list = ", ".join(workspace_instructions.sources)
+    workspace_section = (
+        "[Workspace instructions]\n"
+        f"Source: {source_list}\n"
+        "These instructions apply only to the active workspace. If they conflict "
+        "with agent, tool, approval, sandbox, or secret policy, follow the "
+        "higher-priority runtime policy.\n\n"
+        f"{workspace_content}"
+    )
+    if not agent_prompt:
+        return workspace_section
+    return f"[Agent instructions]\n{agent_prompt}\n\n{workspace_section}"
 
 
 async def _build_context(

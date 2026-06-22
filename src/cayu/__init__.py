@@ -35,7 +35,14 @@ from cayu.core.messages import (
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
-from cayu.environments import Environment, EnvironmentSpec
+from cayu.environments import (
+    DEFAULT_WORKSPACE_INSTRUCTION_PATHS,
+    DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES,
+    Environment,
+    EnvironmentSpec,
+    WorkspaceInstructions,
+    WorkspaceInstructionsConfig,
+)
 from cayu.mcp import (
     DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S,
     DEFAULT_MCP_CLIENT_NAME,
@@ -298,6 +305,8 @@ __all__ = [
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
     "DEFAULT_SBX_CWD",
+    "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
+    "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "E2B_SANDBOX_ID_MAX_BYTES",
     "FILE_ATTACHMENT_TYPE",
     "MCP_PROTOCOL_VERSION",
@@ -508,6 +517,8 @@ __all__ = [
     "VaultError",
     "Workflow",
     "WorkflowSpec",
+    "WorkspaceInstructions",
+    "WorkspaceInstructionsConfig",
     "WorkspaceListResult",
     "WorkspaceReadResult",
     "WorkspaceToArtifactResult",

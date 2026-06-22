@@ -13,7 +13,7 @@ import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import file_attachment
 from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec
+from cayu.environments import Environment, EnvironmentSpec, WorkspaceInstructionsConfig
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -92,7 +92,7 @@ from cayu.tools import (
     SubagentSpec,
     SubagentTool,
 )
-from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
 class FakeProvider(ModelProvider):
@@ -10899,6 +10899,183 @@ def test_cayu_app_sends_agent_system_prompt_as_first_message():
         "user",
         "assistant",
     ]
+
+
+def test_cayu_app_renders_explicit_workspace_instructions_with_agent_prompt():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace_instructions="Run tests with uv run pytest.",
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="You are careful.",
+        )
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_workspace_instructions",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert [message.role for message in provider.requests[0].messages] == [
+        "system",
+        "user",
+    ]
+    system_text = provider.requests[0].messages[0].content[0].text
+    assert "[Agent instructions]\nYou are careful." in system_text
+    assert "[Workspace instructions]" in system_text
+    assert "Source: explicit" in system_text
+    assert "Run tests with uv run pytest." in system_text
+    assert provider.requests[0].messages[1].content[0].text == "hi"
+    transcript = asyncio.run(app.session_store.load_transcript("sess_workspace_instructions"))
+    assert [message.role for message in transcript] == ["system", "user", "assistant"]
+    assert transcript[0].content[0].text == system_text
+
+
+def test_cayu_app_loads_workspace_instructions_from_configured_file(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("Use pnpm and do not edit generated files.\n")
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="repo"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="repo"),
+            workspace_instructions=WorkspaceInstructionsConfig(paths=("CLAUDE.md",)),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_workspace_instruction_file",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert [message.role for message in provider.requests[0].messages] == [
+        "system",
+        "user",
+    ]
+    system_text = provider.requests[0].messages[0].content[0].text
+    assert "Source: CLAUDE.md" in system_text
+    assert "Use pnpm and do not edit generated files." in system_text
+
+
+def test_cayu_app_merges_workspace_instruction_files(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("Use uv for Python commands.\n")
+    (tmp_path / ".cayu").mkdir()
+    (tmp_path / ".cayu" / "AGENTS.md").write_text("Run focused tests before broad tests.\n")
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="repo"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="repo"),
+            workspace_instructions=WorkspaceInstructionsConfig(mode="merge"),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_merged_workspace_instruction_files",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    system_text = provider.requests[0].messages[0].content[0].text
+    assert "Source: AGENTS.md, .cayu/AGENTS.md" in system_text
+    assert "Source: AGENTS.md\nUse uv for Python commands." in system_text
+    assert "Source: .cayu/AGENTS.md\nRun focused tests before broad tests." in system_text
+
+
+def test_workspace_instruction_file_config_rejects_paths_outside_workspace():
+    with pytest.raises(ValidationError, match="must stay inside the workspace"):
+        WorkspaceInstructionsConfig(paths=("../AGENTS.md",))
+
+
+def test_cayu_app_rejects_oversized_workspace_instructions_before_session_create(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("too long")
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("hello"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="repo"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="repo"),
+            workspace_instructions=WorkspaceInstructionsConfig(
+                paths=("AGENTS.md",),
+                max_bytes=3,
+            ),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(ValueError, match="exceeds 3 bytes"):
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_oversized_workspace_instructions",
+                    messages=[Message.text("user", "hi")],
+                ),
+            )
+        )
+
+    session = asyncio.run(app.session_store.load("sess_oversized_workspace_instructions"))
+    assert session is None
+    assert provider.requests == []
 
 
 @pytest.mark.parametrize("system_prompt", [None, "", "   "])

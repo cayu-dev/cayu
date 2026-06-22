@@ -36,6 +36,8 @@ Cayu separates agent definition, execution environment, and session state:
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
 
+Environment-scoped `workspace_instructions` are optional operating guidance for the active workspace. They are rendered into the initial system/instruction message for a new session as a labeled workspace section, not as a user message. Apps can pass explicit instruction text or a `WorkspaceInstructionsConfig` that loads bounded UTF-8 files from the workspace root, such as `AGENTS.md`, `.cayu/AGENTS.md`, or app-configured paths like `CLAUDE.md`. Missing files are ignored; absolute paths and parent-directory escapes are rejected. Workspace instructions are stored in the session's initial transcript system message for reproducible resume/fork behavior.
+
 Runner and workspace implementations should share the same execution boundary.
 For a sandbox-backed environment, `exec_command` and file tools must both talk to
 the sandbox, not split command execution into the sandbox and file access into
