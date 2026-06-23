@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolResult
-from cayu.environments import Environment, EnvironmentSpec
+from cayu.environments import BoundWorkspace, Environment, EnvironmentSpec
 from cayu.providers import ModelProvider
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
@@ -50,6 +50,7 @@ class RegisteredProvider:
 class RegisteredEnvironment:
     spec: EnvironmentSpec
     environment: Environment
+    bound_workspace: BoundWorkspace | None = None
 
 
 @dataclass(frozen=True)

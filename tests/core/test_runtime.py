@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from pydantic import ValidationError
@@ -13,7 +13,13 @@ import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import file_attachment
 from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.environments import Environment, EnvironmentSpec, WorkspaceInstructionsConfig
+from cayu.environments import (
+    BoundWorkspace,
+    Environment,
+    EnvironmentSpec,
+    WorkspaceBinding,
+    WorkspaceInstructionsConfig,
+)
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -365,6 +371,81 @@ class EchoTool(Tool):
             content=args["text"],
             structured={"agent": ctx.agent_name, "echoed": args["text"]},
         )
+
+
+class WorkspaceIdTool(Tool):
+    spec = ToolSpec(
+        name="workspace_id",
+        description="Return the active workspace id.",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(
+            content=ctx.workspace_id or "none",
+            structured={"workspace_id": ctx.workspace_id},
+        )
+
+
+class RecordingWorkspaceBinding(WorkspaceBinding):
+    def __init__(
+        self,
+        *,
+        bound_workspace: Workspace | None = None,
+        fail_bind: bool = False,
+        fail_finalize: bool = False,
+    ) -> None:
+        self.bound_workspace = bound_workspace
+        self.fail_bind = fail_bind
+        self.fail_finalize = fail_finalize
+        self.bind_calls: list[dict] = []
+        self.finalize_calls: list[dict] = []
+
+    async def bind(
+        self,
+        workspace: Workspace | None,
+        runner: Any,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BoundWorkspace:
+        self.bind_calls.append(
+            {
+                "workspace": workspace,
+                "runner": runner,
+                "session_id": session_id,
+                "agent_name": agent_name,
+                "environment_name": environment_name,
+                "metadata": metadata,
+            }
+        )
+        if self.fail_bind:
+            raise RuntimeError("bind failed")
+        return BoundWorkspace(
+            workspace=self.bound_workspace if self.bound_workspace is not None else workspace,
+            runner=runner,
+            path="/bound",
+            metadata={"binding": "recording"},
+        )
+
+    async def finalize(
+        self,
+        bound: BoundWorkspace,
+        *,
+        outcome: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.finalize_calls.append(
+            {
+                "bound": bound,
+                "outcome": outcome,
+                "metadata": metadata,
+            }
+        )
+        if self.fail_finalize:
+            raise RuntimeError("finalize failed")
 
 
 class FailingTool(Tool):
@@ -735,6 +816,345 @@ def test_cayu_app_preserves_falsey_session_store_instance():
     app = CayuApp(session_store=store)
 
     assert app.session_store is store
+
+
+def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        bound_root = tmp_path / "bound"
+        bound_root.mkdir()
+        configured_workspace = LocalWorkspace(configured_root, workspace_id="configured")
+        bound_workspace = LocalWorkspace(bound_root, workspace_id="bound")
+        binding = RecordingWorkspaceBinding(bound_workspace=bound_workspace)
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=configured_workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+        )
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        return events, binding, configured_workspace, bound_workspace
+
+    events, binding, configured_workspace, bound_workspace = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(binding.bind_calls) == 1
+    assert binding.bind_calls[0]["workspace"] is configured_workspace
+    assert binding.bind_calls[0]["session_id"] == "sess_binding"
+    assert binding.bind_calls[0]["agent_name"] == "assistant"
+    assert binding.bind_calls[0]["environment_name"] == "local"
+    assert len(binding.finalize_calls) == 1
+    assert binding.finalize_calls[0]["outcome"] == "completed"
+    assert binding.finalize_calls[0]["bound"].workspace is bound_workspace
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert tool_events[0].payload["result"]["structured"] == {
+        "workspace_id": bound_workspace.id
+    }
+
+
+def test_cayu_app_binding_failure_fails_session_before_start_event():
+    async def run():
+        store = InMemorySessionStore()
+        binding = RecordingWorkspaceBinding(fail_bind=True)
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), binding=binding),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_fail",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_binding_fail")
+        return events, session, binding, provider
+
+    events, session, binding, provider = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert [event.type for event in events] == [EventType.SESSION_FAILED]
+    assert events[0].payload["error"] == "bind failed"
+    assert events[0].payload["error_type"] == "RuntimeError"
+    assert len(binding.bind_calls) == 1
+    assert binding.finalize_calls == []
+    assert provider.requests == []
+
+
+def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
+    async def run():
+        store = InMemorySessionStore()
+        binding = RecordingWorkspaceBinding(fail_finalize=True)
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), binding=binding),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_finalize_fail",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_binding_finalize_fail")
+        return events, session, binding
+
+    events, session, binding = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(binding.finalize_calls) == 1
+    assert events[-1].payload["binding_finalize_error"] == {
+        "error": "finalize failed",
+        "error_type": "RuntimeError",
+        "outcome": "completed",
+    }
+
+
+def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        bound_root = tmp_path / "bound"
+        bound_root.mkdir()
+        configured_workspace = LocalWorkspace(configured_root, workspace_id="configured")
+        bound_workspace = LocalWorkspace(bound_root, workspace_id="bound")
+        binding = RecordingWorkspaceBinding(bound_workspace=bound_workspace)
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=configured_workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        first_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_approval",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        approval_event = next(
+            event
+            for event in first_events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval_id = approval_event.payload["approval"]["approval_id"]
+        approved_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="sess_binding_approval",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+        return first_events, approved_events, binding, bound_workspace
+
+    first_events, approved_events, binding, bound_workspace = asyncio.run(run())
+
+    assert first_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert approved_events[-1].type == EventType.SESSION_COMPLETED
+    assert [call["outcome"] for call in binding.finalize_calls] == [
+        "interrupted",
+        "completed",
+    ]
+    assert len(binding.bind_calls) == 2
+    tool_events = [
+        event for event in approved_events if event.type == EventType.TOOL_CALL_COMPLETED
+    ]
+    assert tool_events[0].payload["result"]["structured"] == {
+        "workspace_id": bound_workspace.id
+    }
+
+
+def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        binding = RecordingWorkspaceBinding()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=LocalWorkspace(configured_root, workspace_id="configured"),
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        first_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_invalid_approval_retry",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        approval_event = next(
+            event
+            for event in first_events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval_id = approval_event.payload["approval"]["approval_id"]
+        bind_calls_after_interrupt = len(binding.bind_calls)
+        finalize_calls_after_interrupt = len(binding.finalize_calls)
+
+        await store.append_event(
+            "sess_binding_invalid_approval_retry",
+            Event(
+                type=EventType.TOOL_CALL_APPROVAL_DENIED,
+                session_id="sess_binding_invalid_approval_retry",
+                agent_name="assistant",
+                environment_name="local",
+                tool_name="workspace_id",
+                payload={
+                    "approval_id": approval_id,
+                    "tool_call_id": "call_1",
+                    "result": ToolResult(content="denied").model_dump(),
+                },
+            ),
+        )
+
+        retry_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="sess_binding_invalid_approval_retry",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+        session = await store.load("sess_binding_invalid_approval_retry")
+        return (
+            retry_events,
+            session,
+            binding,
+            bind_calls_after_interrupt,
+            finalize_calls_after_interrupt,
+        )
+
+    (
+        retry_events,
+        session,
+        binding,
+        bind_calls_after_interrupt,
+        finalize_calls_after_interrupt,
+    ) = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
+    assert "already denied" in retry_events[0].payload["error"]
+    assert len(binding.bind_calls) == bind_calls_after_interrupt
+    assert len(binding.finalize_calls) == finalize_calls_after_interrupt
 
 
 def test_cayu_app_run_rejects_invalid_request_type():

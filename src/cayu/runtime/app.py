@@ -1525,6 +1525,12 @@ class CayuApp:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
+            registered_environment = await _bind_registered_environment_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
                 limits = copy_run_limits(request.limits)
@@ -2059,6 +2065,11 @@ class CayuApp:
                 task_finished=task_finished,
             )
         try:
+            registered_environment = await _bind_registered_environment_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
             if start_event_type is not None:
                 yield await self._emit(
                     Event(
@@ -4905,6 +4916,11 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncIterator[Event]:
+        event = await _event_with_binding_finalized(
+            event=event,
+            session=session,
+            registered_environment=registered_environment,
+        )
         terminal_event = await self._emit(event)
         yield terminal_event
         async for hook_event in self._run_runtime_hooks(
@@ -5551,6 +5567,91 @@ def _environment_name(
     if registered_environment is None:
         return None
     return registered_environment.spec.name
+
+
+async def _bind_registered_environment_for_session(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> runtime_records.RegisteredEnvironment | None:
+    if registered_environment is None:
+        return None
+    if registered_environment.bound_workspace is not None:
+        return registered_environment
+    binding = registered_environment.environment.binding
+    if binding is None:
+        return registered_environment
+
+    environment_name = _environment_name(registered_environment)
+    bound = await binding.bind(
+        registered_environment.environment.workspace,
+        registered_environment.environment.runner,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+    )
+    bound_environment = copy_environment(registered_environment.environment)
+    bound_environment.workspace = bound.workspace
+    bound_environment.runner = bound.runner
+    return runtime_records.RegisteredEnvironment(
+        spec=registered_environment.spec,
+        environment=bound_environment,
+        bound_workspace=bound,
+    )
+
+
+async def _event_with_binding_finalized(
+    *,
+    event: Event,
+    session: Session,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> Event:
+    if registered_environment is None or registered_environment.bound_workspace is None:
+        return event
+    binding = registered_environment.environment.binding
+    if binding is None:
+        return event
+
+    outcome = _binding_outcome_for_terminal_event(event.type)
+    try:
+        await binding.finalize(
+            registered_environment.bound_workspace,
+            outcome=outcome,
+            metadata={
+                "event_type": str(event.type),
+                "session_id": session.id,
+            },
+        )
+    except Exception as exc:
+        payload = copy_json_value(event.payload, "payload")
+        payload["binding_finalize_error"] = {
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "outcome": outcome,
+        }
+        return Event(
+            type=event.type,
+            session_id=event.session_id,
+            id=event.id,
+            timestamp=event.timestamp,
+            agent_name=event.agent_name,
+            environment_name=event.environment_name,
+            workflow_name=event.workflow_name,
+            tool_name=event.tool_name,
+            payload=payload,
+        )
+    return event
+
+
+def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:
+    if event_type == EventType.SESSION_COMPLETED:
+        return "completed"
+    if event_type == EventType.SESSION_FAILED:
+        return "failed"
+    if event_type == EventType.SESSION_INTERRUPTED:
+        return "interrupted"
+    return str(event_type)
 
 
 def _context_compaction_telemetry_event(
