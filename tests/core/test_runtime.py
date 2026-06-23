@@ -16,6 +16,9 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
     WorkspaceBinding,
     WorkspaceInstructionsConfig,
@@ -448,6 +451,37 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
             raise RuntimeError("finalize failed")
 
 
+class RecordingEnvironmentFactory(EnvironmentFactory):
+    def __init__(
+        self,
+        environment: Environment,
+        *,
+        fail_create: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.environment = environment
+        self.fail_create = fail_create
+        self.metadata = metadata or {}
+        self.requests: list[EnvironmentFactoryRequest] = []
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
+        if self.fail_create:
+            raise RuntimeError("factory failed")
+        return EnvironmentFactoryResult(
+            environment=self.environment,
+            metadata=self.metadata,
+        )
+
+
+class RecordingSessionFailedHook(RuntimeHook):
+    def __init__(self) -> None:
+        self.contexts: list[RuntimeHookContext] = []
+
+    async def after_session_failed(self, context: RuntimeHookContext) -> None:
+        self.contexts.append(context)
+
+
 class FailingTool(Tool):
     spec = ToolSpec(
         name="fail",
@@ -818,6 +852,525 @@ def test_cayu_app_preserves_falsey_session_store_instance():
     assert app.session_store is store
 
 
+def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        workspace = LocalWorkspace(workspace_root, workspace_id="factory-workspace")
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic"), workspace=workspace),
+            metadata={"sandbox_id": "sbx_123"},
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+        )
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory",
+                labels={"project": "alpha"},
+                metadata={"owner": "test"},
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        session = await store.load("sess_factory")
+        return events, session, factory, workspace
+
+    events, session, factory, workspace = asyncio.run(run())
+
+    assert session is not None
+    assert session.environment_name == "dynamic"
+    assert [event.type for event in events[:3]] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_STARTED,
+    ]
+    assert events[0].payload == {
+        "factory_type": "RecordingEnvironmentFactory",
+        "requested_environment_name": "dynamic",
+        "parent_session_id": None,
+        "causal_budget_id": "sess_factory",
+        "labels": {"project": "alpha"},
+    }
+    assert events[1].payload == {
+        "factory_type": "RecordingEnvironmentFactory",
+        "requested_environment_name": "dynamic",
+        "parent_session_id": None,
+        "causal_budget_id": "sess_factory",
+        "labels": {"project": "alpha"},
+        "environment_name": "dynamic",
+        "result_metadata": {"sandbox_id": "sbx_123"},
+    }
+    assert len(factory.requests) == 1
+    assert factory.requests[0].session_id == "sess_factory"
+    assert factory.requests[0].agent_name == "assistant"
+    assert factory.requests[0].environment_name == "dynamic"
+    assert factory.requests[0].labels == {"project": "alpha"}
+    assert factory.requests[0].metadata == {"owner": "test"}
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert tool_events[0].payload["result"]["structured"] == {"workspace_id": workspace.id}
+
+
+def test_cayu_app_environment_factory_failure_fails_session_before_start_event(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            ),
+            fail_create=True,
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_fail",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_factory_fail")
+        return events, session, factory, provider
+
+    events, session, factory, provider = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[1].payload["error"] == "factory failed"
+    assert events[1].payload["error_type"] == "RuntimeError"
+    assert events[2].payload["error"] == "factory failed"
+    assert events[2].payload["error_type"] == "RuntimeError"
+    assert len(factory.requests) == 1
+    assert provider.requests == []
+
+
+def test_cayu_app_environment_factory_failure_runs_failed_session_hooks(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            ),
+            fail_create=True,
+        )
+        hook = RecordingSessionFailedHook()
+        app = CayuApp(
+            session_store=store,
+            runtime_hooks=[hook],
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_fail_hook",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, hook
+
+    events, hook = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert len(hook.contexts) == 1
+    assert hook.contexts[0].session.status == SessionStatus.FAILED
+    assert hook.contexts[0].terminal_event.type == EventType.SESSION_FAILED
+    assert hook.contexts[0].terminal_event.payload["error"] == "factory failed"
+
+
+def test_cayu_app_environment_factory_workspace_instruction_failure_fails_session(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        (workspace_root / "AGENTS.md").write_text("too long")
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+                workspace_instructions=WorkspaceInstructionsConfig(
+                    paths=("AGENTS.md",),
+                    max_bytes=3,
+                ),
+            )
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_instruction_fail",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_factory_instruction_fail")
+        return events, session, provider
+
+    events, session, provider = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    assert "exceeds 3 bytes" in events[2].payload["error"]
+    assert provider.requests == []
+
+
+def test_cayu_app_environment_factory_workspace_instruction_failure_runs_hooks(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        (workspace_root / "AGENTS.md").write_text("too long")
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+                workspace_instructions=WorkspaceInstructionsConfig(
+                    paths=("AGENTS.md",),
+                    max_bytes=3,
+                ),
+            )
+        )
+        hook = RecordingSessionFailedHook()
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=store,
+            runtime_hooks=[hook],
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_instruction_fail_hook",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, hook, provider
+
+    events, hook, provider = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_FAILED,
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert len(hook.contexts) == 1
+    assert hook.contexts[0].session.status == SessionStatus.FAILED
+    assert hook.contexts[0].terminal_event.type == EventType.SESSION_FAILED
+    assert "exceeds 3 bytes" in hook.contexts[0].terminal_event.payload["error"]
+    assert provider.requests == []
+
+
+def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="different"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            )
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_name_mismatch",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_factory_name_mismatch")
+        return events, session
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert "different environment name" in events[1].payload["error"]
+
+
+def test_cayu_app_environment_factory_output_composes_with_workspace_binding(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        bound_root = tmp_path / "bound"
+        bound_root.mkdir()
+        configured_workspace = LocalWorkspace(configured_root, workspace_id="configured")
+        bound_workspace = LocalWorkspace(bound_root, workspace_id="bound")
+        binding = RecordingWorkspaceBinding(bound_workspace=bound_workspace)
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=configured_workspace,
+                binding=binding,
+            )
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+        )
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_binding",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, binding, configured_workspace, bound_workspace
+
+    events, binding, configured_workspace, bound_workspace = asyncio.run(run())
+
+    assert [event.type for event in events[:5]] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.ENVIRONMENT_BINDING_STARTED,
+        EventType.ENVIRONMENT_BINDING_COMPLETED,
+        EventType.SESSION_STARTED,
+    ]
+    assert binding.bind_calls[0]["workspace"] is configured_workspace
+    assert binding.bind_calls[0]["environment_name"] == "dynamic"
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert tool_events[0].payload["result"]["structured"] == {"workspace_id": bound_workspace.id}
+
+
+def test_cayu_app_resume_uses_stored_factory_backed_environment(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        dynamic_root = tmp_path / "dynamic"
+        dynamic_root.mkdir()
+        static_root = tmp_path / "static"
+        static_root.mkdir()
+        dynamic_workspace = LocalWorkspace(dynamic_root, workspace_id="dynamic-workspace")
+        static_workspace = LocalWorkspace(static_root, workspace_id="static-workspace")
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic"), workspace=dynamic_workspace)
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_2",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done again"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_environment(
+            Environment(EnvironmentSpec(name="static"), workspace=static_workspace),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+        )
+
+        run_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_resume",
+                environment_name="dynamic",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        resume_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="sess_factory_resume",
+                    messages=[Message.text("user", "run again")],
+                )
+            )
+        ]
+        return run_events, resume_events, factory, dynamic_workspace
+
+    run_events, resume_events, factory, dynamic_workspace = asyncio.run(run())
+
+    assert len(factory.requests) == 2
+    assert [request.environment_name for request in factory.requests] == [
+        "dynamic",
+        "dynamic",
+    ]
+    assert run_events[0].type == EventType.ENVIRONMENT_FACTORY_STARTED
+    assert resume_events[0].type == EventType.ENVIRONMENT_FACTORY_STARTED
+    tool_events = [
+        event
+        for event in [*run_events, *resume_events]
+        if event.type == EventType.TOOL_CALL_COMPLETED
+    ]
+    assert [event.payload["result"]["structured"]["workspace_id"] for event in tool_events] == [
+        dynamic_workspace.id,
+        dynamic_workspace.id,
+    ]
+
+
 def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
     async def run():
         store = InMemorySessionStore()
@@ -910,9 +1463,7 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
     assert binding.finalize_calls[0]["bound"].workspace is bound_workspace
 
     tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
-    assert tool_events[0].payload["result"]["structured"] == {
-        "workspace_id": bound_workspace.id
-    }
+    assert tool_events[0].payload["result"]["structured"] == {"workspace_id": bound_workspace.id}
 
 
 def test_cayu_app_binding_failure_fails_session_before_start_event():
@@ -1063,9 +1614,7 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
             ),
         )
         approval_event = next(
-            event
-            for event in first_events
-            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+            event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval_id = approval_event.payload["approval"]["approval_id"]
         approved_events = [
@@ -1101,9 +1650,7 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
     tool_events = [
         event for event in approved_events if event.type == EventType.TOOL_CALL_COMPLETED
     ]
-    assert tool_events[0].payload["result"]["structured"] == {
-        "workspace_id": bound_workspace.id
-    }
+    assert tool_events[0].payload["result"]["structured"] == {"workspace_id": bound_workspace.id}
 
 
 def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
@@ -1149,9 +1696,7 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
             ),
         )
         approval_event = next(
-            event
-            for event in first_events
-            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+            event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval_id = approval_event.payload["approval"]["approval_id"]
         bind_calls_after_interrupt = len(binding.bind_calls)
@@ -1206,6 +1751,286 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
     assert "already denied" in retry_events[0].payload["error"]
     assert len(binding.bind_calls) == bind_calls_after_interrupt
     assert len(binding.finalize_calls) == finalize_calls_after_interrupt
+
+
+def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(configured_root, workspace_id="configured"),
+            )
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="workspace_id",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[WorkspaceIdTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        first_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_invalid_approval_retry",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+        approval_event = next(
+            event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval_id = approval_event.payload["approval"]["approval_id"]
+        factory_calls_after_interrupt = len(factory.requests)
+
+        await store.append_event(
+            "sess_factory_invalid_approval_retry",
+            Event(
+                type=EventType.TOOL_CALL_APPROVAL_DENIED,
+                session_id="sess_factory_invalid_approval_retry",
+                agent_name="assistant",
+                environment_name="dynamic",
+                tool_name="workspace_id",
+                payload={
+                    "approval_id": approval_id,
+                    "tool_call_id": "call_1",
+                    "result": ToolResult(content="denied").model_dump(),
+                },
+            ),
+        )
+
+        retry_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="sess_factory_invalid_approval_retry",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+        session = await store.load("sess_factory_invalid_approval_retry")
+        return retry_events, session, factory, factory_calls_after_interrupt
+
+    retry_events, session, factory, factory_calls_after_interrupt = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
+    assert "already denied" in retry_events[0].payload["error"]
+    assert len(factory.requests) == factory_calls_after_interrupt
+
+
+def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
+    async def run():
+        store = FailingTerminalToolEventStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            )
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="side_effect",
+                        arguments={"value": "secret"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        tool = SideEffectTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        interrupt_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_recovery",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_event = next(
+            event
+            for event in interrupt_events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval_id = approval_event.payload["approval"]["approval_id"]
+
+        retry_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_factory_recovery",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        recovery_events = await collect_tool_approval_recovery_events(
+            app,
+            ToolApprovalRecoveryRequest(
+                session_id="sess_factory_recovery",
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="side effect completed externally",
+            ),
+        )
+        return retry_events, recovery_events, factory
+
+    retry_events, recovery_events, factory = asyncio.run(run())
+
+    assert [event.type for event in retry_events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert [event.type for event in recovery_events[:3]] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_RESUMED,
+    ]
+    assert EventType.TOOL_CALL_COMPLETED in [event.type for event in recovery_events]
+    assert len(factory.requests) == 3
+
+
+def test_cayu_app_recovery_factory_failure_returns_to_interrupted_before_resume(tmp_path):
+    async def run():
+        store = FailingTerminalToolEventStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            )
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="side_effect",
+                        arguments={"value": "secret"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+            ]
+        )
+        tool = SideEffectTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            tool_policy=RequireApprovalPolicy(),
+        )
+
+        interrupt_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_recovery_failure",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_event = next(
+            event
+            for event in interrupt_events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        approval_id = approval_event.payload["approval"]["approval_id"]
+
+        retry_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_factory_recovery_failure",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        factory.fail_create = True
+        recovery_events = await collect_tool_approval_recovery_events(
+            app,
+            ToolApprovalRecoveryRequest(
+                session_id="sess_factory_recovery_failure",
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="side effect completed externally",
+            ),
+        )
+        session = await store.load("sess_factory_recovery_failure")
+        return retry_events, recovery_events, session
+
+    retry_events, recovery_events, session = asyncio.run(run())
+
+    assert [event.type for event in retry_events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+        EventType.SESSION_RESUMED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_STARTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert [event.type for event in recovery_events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert recovery_events[-1].payload["error"] == "factory failed"
+    assert recovery_events[-1].payload["approval_id"] == recovery_events[-1].payload[
+        "approval"
+    ]["approval_id"]
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
 
 
 def test_cayu_app_run_rejects_invalid_request_type():
@@ -14457,6 +15282,103 @@ def test_cayu_app_rejects_invalid_environment_lookup_name():
 
     with pytest.raises(ValueError, match="environment.name"):
         app.get_environment(" ")
+
+
+def test_cayu_app_registers_and_selects_default_environment_factory(tmp_path):
+    workspace_root = tmp_path / "factory"
+    workspace_root.mkdir()
+    factory = RecordingEnvironmentFactory(
+        Environment(
+            EnvironmentSpec(name="dynamic", metadata={"kind": "dynamic"}),
+            workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+        )
+    )
+    app = CayuApp()
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic", metadata={"kind": "registration"}),
+        factory,
+        default=True,
+    )
+
+    assert app.get_environment_factory() is factory
+    assert app.get_environment_factory("dynamic") is factory
+    with pytest.raises(RuntimeError, match="factory-backed"):
+        app.get_environment()
+
+
+def test_cayu_app_rejects_invalid_environment_factory_registration_inputs(tmp_path):
+    class FactoryLike:
+        pass
+
+    class EnvironmentSpecSubclass(EnvironmentSpec):
+        pass
+
+    workspace_root = tmp_path / "factory"
+    workspace_root.mkdir()
+    factory = RecordingEnvironmentFactory(
+        Environment(
+            EnvironmentSpec(name="dynamic"),
+            workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+        )
+    )
+    app = CayuApp()
+
+    with pytest.raises(TypeError, match="EnvironmentSpec"):
+        app.register_environment_factory(
+            EnvironmentSpecSubclass(name="dynamic"),
+            factory,
+        )
+
+    with pytest.raises(TypeError, match="EnvironmentFactory"):
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            FactoryLike(),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="bool"):
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default="true",  # type: ignore[arg-type]
+        )
+
+
+def test_cayu_app_rejects_duplicate_environment_and_factory_names(tmp_path):
+    workspace_root = tmp_path / "factory"
+    workspace_root.mkdir()
+    factory = RecordingEnvironmentFactory(
+        Environment(
+            EnvironmentSpec(name="dynamic"),
+            workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+        )
+    )
+    app = CayuApp()
+    app.register_environment(Environment(EnvironmentSpec(name="local")))
+
+    with pytest.raises(ValueError, match="Environment already registered"):
+        app.register_environment_factory(EnvironmentSpec(name="local"), factory)
+
+    app.register_environment_factory(EnvironmentSpec(name="dynamic"), factory)
+    with pytest.raises(ValueError, match="Environment already registered"):
+        app.register_environment(Environment(EnvironmentSpec(name="dynamic")))
+
+
+def test_cayu_app_rejects_environment_factory_lookup_for_static_environment():
+    app = CayuApp()
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+
+    with pytest.raises(RuntimeError, match="not factory-backed"):
+        app.get_environment_factory()
+
+
+def test_cayu_app_rejects_invalid_environment_factory_lookup_name():
+    app = CayuApp()
+
+    with pytest.raises(ValueError, match="environment.name"):
+        app.get_environment_factory("")
+
+    with pytest.raises(ValueError, match="environment.name"):
+        app.get_environment_factory(" ")
 
 
 def test_cayu_app_isolates_registered_environment_shell():

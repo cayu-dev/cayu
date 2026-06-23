@@ -41,6 +41,9 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
     WorkspaceInstructions,
     copy_environment,
@@ -277,6 +280,13 @@ class _BudgetLimitOutcome:
 
 @dataclass(frozen=True)
 class _EnvironmentBindingResult:
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    events: list[Event]
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _EnvironmentFactoryResolutionResult:
     registered_environment: runtime_records.RegisteredEnvironment | None
     events: list[Event]
     error: Exception | None = None
@@ -521,6 +531,32 @@ class CayuApp:
             self._default_environment_name = stored_spec.name
         return environment
 
+    def register_environment_factory(
+        self,
+        spec: EnvironmentSpec,
+        factory: EnvironmentFactory,
+        *,
+        default: bool = False,
+    ) -> EnvironmentFactory:
+        if type(spec) is not EnvironmentSpec:
+            raise TypeError("Environment factory registration requires an EnvironmentSpec.")
+        if not isinstance(factory, EnvironmentFactory):
+            raise TypeError("Environment factory registration requires an EnvironmentFactory.")
+        if not isinstance(default, bool):
+            raise TypeError("Environment factory default flag must be a bool.")
+        stored_spec = _validate_environment_spec(spec)
+        if stored_spec.name in self._environments:
+            raise ValueError(f"Environment already registered: {stored_spec.name}")
+
+        self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
+            spec=stored_spec,
+            environment=Environment(stored_spec),
+            factory=factory,
+        )
+        if default or self._default_environment_name is None:
+            self._default_environment_name = stored_spec.name
+        return factory
+
     def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         agent_name = require_clean_nonblank(name, "agent.name")
         registered_agent = self._get_registered_agent(agent_name)
@@ -545,10 +581,25 @@ class CayuApp:
         registered_environment = self._get_registered_environment(name)
         if registered_environment is None:
             raise RuntimeError("No environment registered.")
+        if registered_environment.factory is not None:
+            raise RuntimeError(
+                "Environment is factory-backed and is only concrete for a session: "
+                f"{registered_environment.spec.name}"
+            )
         return runtime_records.RegisteredEnvironment(
             spec=registered_environment.spec.model_copy(deep=True),
             environment=copy_environment(registered_environment.environment),
         )
+
+    def get_environment_factory(self, name: str | None = None) -> EnvironmentFactory:
+        registered_environment = self._get_registered_environment(name)
+        if registered_environment is None:
+            raise RuntimeError("No environment registered.")
+        if registered_environment.factory is None:
+            raise RuntimeError(
+                f"Environment is not factory-backed: {registered_environment.spec.name}"
+            )
+        return registered_environment.factory
 
     def _get_registered_provider(
         self, name: str | None = None
@@ -601,9 +652,11 @@ class CayuApp:
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
-        workspace_instructions = await _load_registered_workspace_instructions(
-            registered_environment,
-        )
+        workspace_instructions = None
+        if registered_environment is None or registered_environment.factory is None:
+            workspace_instructions = await _load_registered_workspace_instructions(
+                registered_environment,
+            )
         session = await self.session_store.create(
             request,
             identity=_session_identity(
@@ -632,6 +685,88 @@ class CayuApp:
                     yield event
                 return
             raise
+        current_task = asyncio.current_task()
+        active_factory_run: _ActiveSessionRun | None = None
+        if (
+            registered_environment is not None
+            and registered_environment.factory is not None
+            and current_task is not None
+        ):
+            active_factory_run = self._register_active_session_task(
+                session.id,
+                current_task,
+                task_id=request.task_id,
+                task_started=False,
+                task_finished=False,
+            )
+        try:
+            resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = resolution.registered_environment
+            for event in resolution.events:
+                yield event
+            if resolution.error is not None:
+                session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload={
+                            "error": str(resolution.error),
+                            "error_type": type(resolution.error).__name__,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
+
+            if workspace_instructions is None:
+                workspace_instructions = await _load_registered_workspace_instructions(
+                    registered_environment,
+                )
+        except asyncio.CancelledError:
+            if await self._session_interrupt_requested(session.id):
+                async for event in self._handle_session_interrupted(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                return
+            raise
+        except Exception as exc:
+            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
+            return
+        finally:
+            if current_task is not None and active_factory_run is not None:
+                self._unregister_active_session_task(session.id, current_task)
 
         messages = transcript_helpers.initial_messages(
             system_prompt=_render_initial_system_prompt(
@@ -1522,6 +1657,17 @@ class CayuApp:
                 events=approval_events,
                 approval=pending_approval,
             )
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                raise factory_resolution.error
             if emit_resume_event:
                 yield await self._emit(
                     approval_support.resumed_event(
@@ -1948,11 +2094,46 @@ class CayuApp:
                 approval=pending_approval,
                 tool_call_id=request.tool_call_id,
             )
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                session = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                            "approval": pending_approval.model_dump(mode="json"),
+                            "error": str(factory_resolution.error),
+                            "error_type": type(factory_resolution.error).__name__,
+                            "approval_id": pending_approval.approval_id,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
             recovery_events = [
                 approval_support.resumed_event(
                     session=session,
                     agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
+                    environment_name=environment_name,
                     approval=pending_approval,
                     decision=ToolApprovalDecision.APPROVE,
                 ),
@@ -1960,7 +2141,7 @@ class CayuApp:
                     type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
+                    environment_name=environment_name,
                     tool_name=pending_tool_call.tool_name,
                     payload={
                         "approval_id": pending_approval.approval_id,
@@ -2084,12 +2265,24 @@ class CayuApp:
                 task_finished=task_finished,
             )
         try:
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                raise factory_resolution.error
             binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
             )
             registered_environment = binding_result.registered_environment
+            environment_name = _environment_name(registered_environment)
             for event in binding_result.events:
                 yield event
             if binding_result.error is not None:
@@ -4930,6 +5123,103 @@ class CayuApp:
                     ),
                 )
         return event
+
+    async def _resolve_registered_environment_factory_for_session(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> _EnvironmentFactoryResolutionResult:
+        if registered_environment is None or registered_environment.factory is None:
+            return _EnvironmentFactoryResolutionResult(
+                registered_environment=registered_environment,
+                events=[],
+            )
+
+        factory = registered_environment.factory
+        environment_name = registered_environment.spec.name
+        base_payload = {
+            "factory_type": type(factory).__name__,
+            "requested_environment_name": environment_name,
+            "parent_session_id": session.parent_session_id,
+            "causal_budget_id": session.causal_budget_id,
+            "labels": copy_label_map(session.labels, "labels"),
+        }
+        events: list[Event] = [
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_FACTORY_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=base_payload,
+                )
+            )
+        ]
+        request = EnvironmentFactoryRequest(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            parent_session_id=session.parent_session_id,
+            causal_budget_id=session.causal_budget_id,
+            labels=session.labels,
+            metadata=session.metadata,
+        )
+        try:
+            result = await factory.create(request)
+            if type(result) is not EnvironmentFactoryResult:
+                raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
+            environment = copy_environment(result.environment)
+            if environment.spec.name != environment_name:
+                raise ValueError(
+                    "Environment factory returned a different environment name: "
+                    f"{environment.spec.name!r} != {environment_name!r}"
+                )
+        except Exception as exc:
+            events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_FACTORY_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                )
+            )
+            return _EnvironmentFactoryResolutionResult(
+                registered_environment=registered_environment,
+                events=events,
+                error=exc,
+            )
+
+        events.append(
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **base_payload,
+                        "environment_name": environment.spec.name,
+                        "result_metadata": copy_json_value(result.metadata, "result_metadata"),
+                    },
+                )
+            )
+        )
+        return _EnvironmentFactoryResolutionResult(
+            registered_environment=runtime_records.RegisteredEnvironment(
+                spec=registered_environment.spec,
+                environment=environment,
+            ),
+            events=events,
+        )
 
     async def _bind_registered_environment_for_session(
         self,

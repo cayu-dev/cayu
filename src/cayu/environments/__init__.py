@@ -17,12 +17,22 @@ from cayu.environments.bindings import (
     WorkspaceBinding,
     copy_bound_workspace,
 )
+from cayu.environments.factory import (
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    copy_environment_factory_request,
+    copy_environment_factory_result,
+)
 
 __all__ = [
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "BoundWorkspace",
     "Environment",
+    "EnvironmentFactory",
+    "EnvironmentFactoryRequest",
+    "EnvironmentFactoryResult",
     "EnvironmentSpec",
     "NativeBinding",
     "NoWorkspaceBinding",
@@ -31,5 +41,7 @@ __all__ = [
     "WorkspaceInstructionsConfig",
     "copy_bound_workspace",
     "copy_environment",
+    "copy_environment_factory_request",
+    "copy_environment_factory_result",
     "load_workspace_instructions",
 ]

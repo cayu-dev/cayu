@@ -56,6 +56,9 @@ class EventType(StrEnum):
     ENVIRONMENT_BINDING_FINALIZE_STARTED = "environment.binding.finalize_started"
     ENVIRONMENT_BINDING_FINALIZE_COMPLETED = "environment.binding.finalize_completed"
     ENVIRONMENT_BINDING_FINALIZE_FAILED = "environment.binding.finalize_failed"
+    ENVIRONMENT_FACTORY_STARTED = "environment.factory.started"
+    ENVIRONMENT_FACTORY_COMPLETED = "environment.factory.completed"
+    ENVIRONMENT_FACTORY_FAILED = "environment.factory.failed"
 
     HOOK_STARTED = "hook.started"
     HOOK_COMPLETED = "hook.completed"

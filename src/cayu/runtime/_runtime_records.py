@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolResult
-from cayu.environments import BoundWorkspace, Environment, EnvironmentSpec
+from cayu.environments import BoundWorkspace, Environment, EnvironmentFactory, EnvironmentSpec
 from cayu.providers import ModelProvider
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
@@ -50,6 +50,7 @@ class RegisteredProvider:
 class RegisteredEnvironment:
     spec: EnvironmentSpec
     environment: Environment
+    factory: EnvironmentFactory | None = None
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
 
