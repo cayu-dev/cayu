@@ -317,6 +317,7 @@ _INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
 _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 600
 _ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
+_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
@@ -2436,7 +2437,10 @@ class CayuApp:
                         raise RuntimeError(
                             "Context checkpoint event payload requires checkpoint state."
                         )
-                    await self.session_store.checkpoint(session.id, checkpoint_update)
+                    await self._checkpoint_preserving_runtime_state(
+                        session_id=session.id,
+                        checkpoint=checkpoint_update,
+                    )
                     yield await self._emit(
                         Event(
                             type=EventType.SESSION_CHECKPOINTED,
@@ -5157,16 +5161,20 @@ class CayuApp:
                 )
             )
         ]
-        request = EnvironmentFactoryRequest(
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            parent_session_id=session.parent_session_id,
-            causal_budget_id=session.causal_budget_id,
-            labels=session.labels,
-            metadata=session.metadata,
-        )
         try:
+            request = EnvironmentFactoryRequest(
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                parent_session_id=session.parent_session_id,
+                causal_budget_id=session.causal_budget_id,
+                labels=session.labels,
+                metadata=session.metadata,
+                reconnect_metadata=await self._load_environment_factory_reconnect_metadata(
+                    session_id=session.id,
+                    environment_name=environment_name,
+                ),
+            )
             result = await factory.create(request)
             if type(result) is not EnvironmentFactoryResult:
                 raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
@@ -5176,6 +5184,15 @@ class CayuApp:
                     "Environment factory returned a different environment name: "
                     f"{environment.spec.name!r} != {environment_name!r}"
                 )
+            reconnect_metadata = copy_json_value(
+                result.reconnect_metadata,
+                "reconnect_metadata",
+            )
+            await self._checkpoint_environment_factory_reconnect_metadata(
+                session_id=session.id,
+                environment_name=environment_name,
+                reconnect_metadata=reconnect_metadata,
+            )
         except Exception as exc:
             events.append(
                 await self._emit(
@@ -5209,6 +5226,7 @@ class CayuApp:
                         **base_payload,
                         "environment_name": environment.spec.name,
                         "result_metadata": copy_json_value(result.metadata, "result_metadata"),
+                        "reconnect_metadata": reconnect_metadata,
                     },
                 )
             )
@@ -5220,6 +5238,73 @@ class CayuApp:
             ),
             events=events,
         )
+
+    async def _load_environment_factory_reconnect_metadata(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+    ) -> dict[str, Any]:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return {}
+        state = checkpoint.get(_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+        if state is None:
+            return {}
+        if type(state) is not dict:
+            raise ValueError("Environment factory reconnect checkpoint must be an object.")
+        metadata = state.get(environment_name)
+        if metadata is None:
+            return {}
+        if type(metadata) is not dict:
+            raise ValueError("Environment factory reconnect metadata must be an object.")
+        return copy_json_value(metadata, "reconnect_metadata")
+
+    async def _checkpoint_environment_factory_reconnect_metadata(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        reconnect_metadata: dict[str, Any],
+    ) -> None:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        state = copied_checkpoint.get(_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+        if state is None:
+            state = {}
+        elif type(state) is not dict:
+            raise ValueError("Environment factory reconnect checkpoint must be an object.")
+        else:
+            state = copy_json_value(state, "environment_factory_reconnect")
+        state[environment_name] = copy_json_value(reconnect_metadata, "reconnect_metadata")
+        copied_checkpoint[_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = state
+        await self.session_store.checkpoint(session_id, copied_checkpoint)
+
+    async def _checkpoint_preserving_runtime_state(
+        self,
+        *,
+        session_id: str,
+        checkpoint: dict[str, Any],
+    ) -> None:
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        if _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY not in copied_checkpoint:
+            current_checkpoint = await self.session_store.load_checkpoint(session_id)
+            if current_checkpoint is not None:
+                reconnect_state = current_checkpoint.get(
+                    _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
+                )
+                if reconnect_state is not None:
+                    if type(reconnect_state) is not dict:
+                        raise ValueError(
+                            "Environment factory reconnect checkpoint must be an object."
+                        )
+                    copied_checkpoint[_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = (
+                        copy_json_value(
+                            reconnect_state,
+                            "environment_factory_reconnect",
+                        )
+                    )
+        await self.session_store.checkpoint(session_id, copied_checkpoint)
 
     async def _bind_registered_environment_for_session(
         self,

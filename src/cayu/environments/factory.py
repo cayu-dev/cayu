@@ -19,6 +19,7 @@ class EnvironmentFactoryRequest:
     causal_budget_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    reconnect_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -46,6 +47,11 @@ class EnvironmentFactoryRequest:
             )
         object.__setattr__(self, "labels", copy_label_map(self.labels, "labels"))
         object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "reconnect_metadata",
+            copy_json_value(self.reconnect_metadata, "reconnect_metadata"),
+        )
 
 
 @dataclass(frozen=True)
@@ -54,12 +60,18 @@ class EnvironmentFactoryResult:
 
     environment: Environment
     metadata: dict[str, Any] = field(default_factory=dict)
+    reconnect_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if type(self.environment) is not Environment:
             raise TypeError("EnvironmentFactoryResult.environment must be an Environment.")
         object.__setattr__(self, "environment", copy_environment(self.environment))
         object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "reconnect_metadata",
+            copy_json_value(self.reconnect_metadata, "reconnect_metadata"),
+        )
 
 
 class EnvironmentFactory(ABC):
@@ -83,6 +95,7 @@ def copy_environment_factory_request(
         causal_budget_id=request.causal_budget_id,
         labels=request.labels,
         metadata=request.metadata,
+        reconnect_metadata=request.reconnect_metadata,
     )
 
 
@@ -92,4 +105,5 @@ def copy_environment_factory_result(result: EnvironmentFactoryResult) -> Environ
     return EnvironmentFactoryResult(
         environment=result.environment,
         metadata=result.metadata,
+        reconnect_metadata=result.reconnect_metadata,
     )

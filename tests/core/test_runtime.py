@@ -458,10 +458,12 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         *,
         fail_create: bool = False,
         metadata: dict[str, Any] | None = None,
+        reconnect_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.environment = environment
         self.fail_create = fail_create
         self.metadata = metadata or {}
+        self.reconnect_metadata = reconnect_metadata or {}
         self.requests: list[EnvironmentFactoryRequest] = []
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
@@ -471,6 +473,7 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         return EnvironmentFactoryResult(
             environment=self.environment,
             metadata=self.metadata,
+            reconnect_metadata=self.reconnect_metadata,
         )
 
 
@@ -927,6 +930,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         "labels": {"project": "alpha"},
         "environment_name": "dynamic",
         "result_metadata": {"sandbox_id": "sbx_123"},
+        "reconnect_metadata": {},
     }
     assert len(factory.requests) == 1
     assert factory.requests[0].session_id == "sess_factory"
@@ -1368,6 +1372,164 @@ def test_cayu_app_resume_uses_stored_factory_backed_environment(tmp_path):
     assert [event.payload["result"]["structured"]["workspace_id"] for event in tool_events] == [
         dynamic_workspace.id,
         dynamic_workspace.id,
+    ]
+
+
+def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "dynamic"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
+            ),
+            reconnect_metadata={"sandbox_id": "sbx_1"},
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done again"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_reconnect",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        factory.reconnect_metadata = {"sandbox_id": "sbx_1", "generation": 2}
+        resume_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="sess_factory_reconnect",
+                    messages=[Message.text("user", "resume")],
+                )
+            )
+        ]
+        checkpoint = await store.load_checkpoint("sess_factory_reconnect")
+        return run_events, resume_events, factory, checkpoint
+
+    run_events, resume_events, factory, checkpoint = asyncio.run(run())
+
+    completed_events = [
+        event
+        for event in [*run_events, *resume_events]
+        if event.type == EventType.ENVIRONMENT_FACTORY_COMPLETED
+    ]
+    assert [request.reconnect_metadata for request in factory.requests] == [
+        {},
+        {"sandbox_id": "sbx_1"},
+    ]
+    assert [event.payload["reconnect_metadata"] for event in completed_events] == [
+        {"sandbox_id": "sbx_1"},
+        {"sandbox_id": "sbx_1", "generation": 2},
+    ]
+    assert checkpoint is not None
+    assert checkpoint["environment_factory_reconnect"] == {
+        "dynamic": {"sandbox_id": "sbx_1", "generation": 2}
+    }
+
+
+def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkpoint(
+    tmp_path,
+):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "dynamic"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
+            ),
+            reconnect_metadata={"sandbox_id": "sbx_compaction"},
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done again"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="You are careful.",
+            ),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RecordingCompactor(),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_reconnect_compaction",
+                messages=[
+                    Message.text("user", "old one"),
+                    Message.text("assistant", "old answer one"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        first_checkpoint = await store.load_checkpoint("sess_factory_reconnect_compaction")
+        _ = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="sess_factory_reconnect_compaction",
+                    messages=[Message.text("user", "resume")],
+                )
+            )
+        ]
+        return factory, first_checkpoint
+
+    factory, first_checkpoint = asyncio.run(run())
+
+    assert first_checkpoint is not None
+    assert first_checkpoint["environment_factory_reconnect"] == {
+        "dynamic": {"sandbox_id": "sbx_compaction"}
+    }
+    assert "context_compaction" in first_checkpoint
+    assert [request.reconnect_metadata for request in factory.requests] == [
+        {},
+        {"sandbox_id": "sbx_compaction"},
     ]
 
 
@@ -1850,7 +2012,8 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
             Environment(
                 EnvironmentSpec(name="dynamic"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
-            )
+            ),
+            reconnect_metadata={"sandbox_id": "sbx_recovery"},
         )
         provider = FakeProvider(
             [
@@ -1905,6 +2068,7 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
                 decision=ToolApprovalDecision.APPROVE,
             ),
         )
+        factory.reconnect_metadata = {"sandbox_id": "sbx_recovery", "generation": 2}
         recovery_events = await collect_tool_approval_recovery_events(
             app,
             ToolApprovalRecoveryRequest(
@@ -1915,9 +2079,10 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
                 message="side effect completed externally",
             ),
         )
-        return retry_events, recovery_events, factory
+        checkpoint = await store.load_checkpoint("sess_factory_recovery")
+        return retry_events, recovery_events, factory, checkpoint
 
-    retry_events, recovery_events, factory = asyncio.run(run())
+    retry_events, recovery_events, factory, checkpoint = asyncio.run(run())
 
     assert [event.type for event in retry_events] == [
         EventType.ENVIRONMENT_FACTORY_STARTED,
@@ -1934,6 +2099,15 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
     ]
     assert EventType.TOOL_CALL_COMPLETED in [event.type for event in recovery_events]
     assert len(factory.requests) == 3
+    assert [request.reconnect_metadata for request in factory.requests] == [
+        {},
+        {"sandbox_id": "sbx_recovery"},
+        {"sandbox_id": "sbx_recovery"},
+    ]
+    assert checkpoint is not None
+    assert checkpoint["environment_factory_reconnect"] == {
+        "dynamic": {"sandbox_id": "sbx_recovery", "generation": 2}
+    }
 
 
 def test_cayu_app_recovery_factory_failure_returns_to_interrupted_before_resume(tmp_path):
