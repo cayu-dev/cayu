@@ -51,6 +51,7 @@ class RegisteredEnvironment:
     spec: EnvironmentSpec
     environment: Environment
     bound_workspace: BoundWorkspace | None = None
+    binding_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

@@ -871,6 +871,34 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
 
     events, binding, configured_workspace, bound_workspace = asyncio.run(run())
 
+    assert [event.type for event in events[:3]] == [
+        EventType.ENVIRONMENT_BINDING_STARTED,
+        EventType.ENVIRONMENT_BINDING_COMPLETED,
+        EventType.SESSION_STARTED,
+    ]
+    assert events[0].payload == {
+        "binding_type": "RecordingWorkspaceBinding",
+        "configured_workspace_id": configured_workspace.id,
+        "has_configured_runner": False,
+    }
+    assert events[1].payload == {
+        "binding_type": "RecordingWorkspaceBinding",
+        "configured_workspace_id": configured_workspace.id,
+        "has_configured_runner": False,
+        "bound_workspace_id": bound_workspace.id,
+        "bound_path": "/bound",
+        "bound_metadata": {"binding": "recording"},
+        "has_bound_runner": False,
+    }
+    assert [event.type for event in events[-3:]] == [
+        EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+        EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[-3].payload["configured_workspace_id"] == configured_workspace.id
+    assert events[-3].payload["bound_workspace_id"] == bound_workspace.id
+    assert events[-3].payload["outcome"] == "completed"
+    assert events[-2].payload["outcome"] == "completed"
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.bind_calls) == 1
     assert binding.bind_calls[0]["workspace"] is configured_workspace
@@ -920,9 +948,15 @@ def test_cayu_app_binding_failure_fails_session_before_start_event():
 
     assert session is not None
     assert session.status == SessionStatus.FAILED
-    assert [event.type for event in events] == [EventType.SESSION_FAILED]
-    assert events[0].payload["error"] == "bind failed"
-    assert events[0].payload["error_type"] == "RuntimeError"
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_BINDING_STARTED,
+        EventType.ENVIRONMENT_BINDING_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[1].payload["error"] == "bind failed"
+    assert events[1].payload["error_type"] == "RuntimeError"
+    assert events[2].payload["error"] == "bind failed"
+    assert events[2].payload["error_type"] == "RuntimeError"
     assert len(binding.bind_calls) == 1
     assert binding.finalize_calls == []
     assert provider.requests == []
@@ -961,6 +995,14 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
 
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+    assert [event.type for event in events[-3:]] == [
+        EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+        EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[-2].payload["error"] == "finalize failed"
+    assert events[-2].payload["error_type"] == "RuntimeError"
+    assert events[-2].payload["outcome"] == "completed"
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.finalize_calls) == 1
     assert events[-1].payload["binding_finalize_error"] == {
@@ -1040,7 +1082,16 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
 
     first_events, approved_events, binding, bound_workspace = asyncio.run(run())
 
+    assert first_events[0].type == EventType.ENVIRONMENT_BINDING_STARTED
+    assert first_events[1].type == EventType.ENVIRONMENT_BINDING_COMPLETED
+    assert first_events[-3].type == EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
+    assert first_events[-2].type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
     assert first_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert approved_events[0].type == EventType.SESSION_RESUMED
+    assert approved_events[1].type == EventType.ENVIRONMENT_BINDING_STARTED
+    assert approved_events[2].type == EventType.ENVIRONMENT_BINDING_COMPLETED
+    assert approved_events[-3].type == EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
+    assert approved_events[-2].type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
     assert approved_events[-1].type == EventType.SESSION_COMPLETED
     assert [call["outcome"] for call in binding.finalize_calls] == [
         "interrupted",

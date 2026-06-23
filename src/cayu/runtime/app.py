@@ -39,6 +39,7 @@ from cayu.core.messages import (
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
+    BoundWorkspace,
     Environment,
     EnvironmentSpec,
     WorkspaceInstructions,
@@ -272,6 +273,19 @@ class _BudgetStepReservation:
 class _BudgetLimitOutcome:
     decision: StopDecision
     check: BudgetCheck
+
+
+@dataclass(frozen=True)
+class _EnvironmentBindingResult:
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    events: list[Event]
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _EnvironmentBindingFinalizeResult:
+    event: Event
+    events: list[Event]
 
 
 _RESUMABLE_SESSION_STATUSES = {
@@ -1525,11 +1539,16 @@ class CayuApp:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
-            registered_environment = await _bind_registered_environment_for_session(
+            binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
             )
+            registered_environment = binding_result.registered_environment
+            for event in binding_result.events:
+                yield event
+            if binding_result.error is not None:
+                raise binding_result.error
 
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
@@ -2065,11 +2084,16 @@ class CayuApp:
                 task_finished=task_finished,
             )
         try:
-            registered_environment = await _bind_registered_environment_for_session(
+            binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
             )
+            registered_environment = binding_result.registered_environment
+            for event in binding_result.events:
+                yield event
+            if binding_result.error is not None:
+                raise binding_result.error
             if start_event_type is not None:
                 yield await self._emit(
                     Event(
@@ -4907,6 +4931,189 @@ class CayuApp:
                 )
         return event
 
+    async def _bind_registered_environment_for_session(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> _EnvironmentBindingResult:
+        if registered_environment is None:
+            return _EnvironmentBindingResult(registered_environment=None, events=[])
+        if registered_environment.bound_workspace is not None:
+            return _EnvironmentBindingResult(
+                registered_environment=registered_environment,
+                events=[],
+            )
+        binding = registered_environment.environment.binding
+        if binding is None:
+            return _EnvironmentBindingResult(
+                registered_environment=registered_environment,
+                events=[],
+            )
+
+        environment_name = _environment_name(registered_environment)
+        events: list[Event] = []
+        base_payload = _binding_base_payload(registered_environment)
+        events.append(
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=base_payload,
+                )
+            )
+        )
+        try:
+            bound = await binding.bind(
+                registered_environment.environment.workspace,
+                registered_environment.environment.runner,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+            )
+        except Exception as exc:
+            events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                )
+            )
+            return _EnvironmentBindingResult(
+                registered_environment=registered_environment,
+                events=events,
+                error=exc,
+            )
+
+        bound_environment = copy_environment(registered_environment.environment)
+        bound_environment.workspace = bound.workspace
+        bound_environment.runner = bound.runner
+        events.append(
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_COMPLETED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **base_payload,
+                        **_bound_workspace_payload(bound),
+                    },
+                )
+            )
+        )
+        return _EnvironmentBindingResult(
+            registered_environment=runtime_records.RegisteredEnvironment(
+                spec=registered_environment.spec,
+                environment=bound_environment,
+                bound_workspace=bound,
+                binding_payload=copy_json_value(base_payload, "binding_payload"),
+            ),
+            events=events,
+        )
+
+    async def _event_with_binding_finalized(
+        self,
+        *,
+        event: Event,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> _EnvironmentBindingFinalizeResult:
+        if registered_environment is None or registered_environment.bound_workspace is None:
+            return _EnvironmentBindingFinalizeResult(event=event, events=[])
+        binding = registered_environment.environment.binding
+        if binding is None:
+            return _EnvironmentBindingFinalizeResult(event=event, events=[])
+
+        outcome = _binding_outcome_for_terminal_event(event.type)
+        environment_name = _environment_name(registered_environment)
+        base_payload = {
+            **_binding_base_payload(registered_environment),
+            **_bound_workspace_payload(registered_environment.bound_workspace),
+            "outcome": outcome,
+        }
+        events: list[Event] = [
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+                    session_id=session.id,
+                    agent_name=event.agent_name,
+                    environment_name=environment_name,
+                    payload=base_payload,
+                )
+            )
+        ]
+        try:
+            await binding.finalize(
+                registered_environment.bound_workspace,
+                outcome=outcome,
+                metadata={
+                    "event_type": str(event.type),
+                    "session_id": session.id,
+                },
+            )
+        except Exception as exc:
+            error_payload = {
+                **base_payload,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+                        session_id=session.id,
+                        agent_name=event.agent_name,
+                        environment_name=environment_name,
+                        payload=error_payload,
+                    )
+                )
+            )
+            terminal_payload = copy_json_value(event.payload, "payload")
+            terminal_payload["binding_finalize_error"] = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "outcome": outcome,
+            }
+            return _EnvironmentBindingFinalizeResult(
+                event=Event(
+                    type=event.type,
+                    session_id=event.session_id,
+                    id=event.id,
+                    timestamp=event.timestamp,
+                    agent_name=event.agent_name,
+                    environment_name=event.environment_name,
+                    workflow_name=event.workflow_name,
+                    tool_name=event.tool_name,
+                    payload=terminal_payload,
+                ),
+                events=events,
+            )
+
+        events.append(
+            await self._emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id=session.id,
+                    agent_name=event.agent_name,
+                    environment_name=environment_name,
+                    payload=base_payload,
+                )
+            )
+        )
+        return _EnvironmentBindingFinalizeResult(event=event, events=events)
+
     async def _emit_terminal_event_with_hooks(
         self,
         *,
@@ -4916,12 +5123,14 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncIterator[Event]:
-        event = await _event_with_binding_finalized(
+        finalize_result = await self._event_with_binding_finalized(
             event=event,
             session=session,
             registered_environment=registered_environment,
         )
-        terminal_event = await self._emit(event)
+        for binding_event in finalize_result.events:
+            yield binding_event
+        terminal_event = await self._emit(finalize_result.event)
         yield terminal_event
         async for hook_event in self._run_runtime_hooks(
             phase=phase,
@@ -5569,79 +5778,35 @@ def _environment_name(
     return registered_environment.spec.name
 
 
-async def _bind_registered_environment_for_session(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> runtime_records.RegisteredEnvironment | None:
-    if registered_environment is None:
+def _binding_base_payload(
+    registered_environment: runtime_records.RegisteredEnvironment,
+) -> dict[str, Any]:
+    if registered_environment.binding_payload is not None:
+        return copy_json_value(registered_environment.binding_payload, "binding_payload")
+    binding = registered_environment.environment.binding
+    return {
+        "binding_type": type(binding).__name__ if binding is not None else None,
+        "configured_workspace_id": _workspace_object_id(
+            registered_environment.environment.workspace
+        ),
+        "has_configured_runner": registered_environment.environment.runner is not None,
+    }
+
+
+def _bound_workspace_payload(bound: BoundWorkspace) -> dict[str, Any]:
+    return {
+        "bound_workspace_id": _workspace_object_id(bound.workspace),
+        "bound_path": bound.path,
+        "bound_metadata": copy_json_value(bound.metadata, "bound_metadata"),
+        "has_bound_runner": bound.runner is not None,
+    }
+
+
+def _workspace_object_id(workspace: Any) -> str | None:
+    if workspace is None:
         return None
-    if registered_environment.bound_workspace is not None:
-        return registered_environment
-    binding = registered_environment.environment.binding
-    if binding is None:
-        return registered_environment
-
-    environment_name = _environment_name(registered_environment)
-    bound = await binding.bind(
-        registered_environment.environment.workspace,
-        registered_environment.environment.runner,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-    )
-    bound_environment = copy_environment(registered_environment.environment)
-    bound_environment.workspace = bound.workspace
-    bound_environment.runner = bound.runner
-    return runtime_records.RegisteredEnvironment(
-        spec=registered_environment.spec,
-        environment=bound_environment,
-        bound_workspace=bound,
-    )
-
-
-async def _event_with_binding_finalized(
-    *,
-    event: Event,
-    session: Session,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> Event:
-    if registered_environment is None or registered_environment.bound_workspace is None:
-        return event
-    binding = registered_environment.environment.binding
-    if binding is None:
-        return event
-
-    outcome = _binding_outcome_for_terminal_event(event.type)
-    try:
-        await binding.finalize(
-            registered_environment.bound_workspace,
-            outcome=outcome,
-            metadata={
-                "event_type": str(event.type),
-                "session_id": session.id,
-            },
-        )
-    except Exception as exc:
-        payload = copy_json_value(event.payload, "payload")
-        payload["binding_finalize_error"] = {
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            "outcome": outcome,
-        }
-        return Event(
-            type=event.type,
-            session_id=event.session_id,
-            id=event.id,
-            timestamp=event.timestamp,
-            agent_name=event.agent_name,
-            environment_name=event.environment_name,
-            workflow_name=event.workflow_name,
-            tool_name=event.tool_name,
-            payload=payload,
-        )
-    return event
+    workspace_id = getattr(workspace, "id", None)
+    return workspace_id if isinstance(workspace_id, str) else None
 
 
 def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:

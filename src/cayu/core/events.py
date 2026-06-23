@@ -50,6 +50,13 @@ class EventType(StrEnum):
     CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"
     CONTEXT_COMPACTION_FAILED = "context.compaction.failed"
 
+    ENVIRONMENT_BINDING_STARTED = "environment.binding.started"
+    ENVIRONMENT_BINDING_COMPLETED = "environment.binding.completed"
+    ENVIRONMENT_BINDING_FAILED = "environment.binding.failed"
+    ENVIRONMENT_BINDING_FINALIZE_STARTED = "environment.binding.finalize_started"
+    ENVIRONMENT_BINDING_FINALIZE_COMPLETED = "environment.binding.finalize_completed"
+    ENVIRONMENT_BINDING_FINALIZE_FAILED = "environment.binding.finalize_failed"
+
     HOOK_STARTED = "hook.started"
     HOOK_COMPLETED = "hook.completed"
     HOOK_FAILED = "hook.failed"
