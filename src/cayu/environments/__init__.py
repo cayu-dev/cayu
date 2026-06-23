@@ -10,14 +10,26 @@ from cayu.environments.base import (
     copy_environment,
     load_workspace_instructions,
 )
+from cayu.environments.bindings import (
+    BoundWorkspace,
+    NativeBinding,
+    NoWorkspaceBinding,
+    WorkspaceBinding,
+    copy_bound_workspace,
+)
 
 __all__ = [
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
+    "BoundWorkspace",
     "Environment",
     "EnvironmentSpec",
+    "NativeBinding",
+    "NoWorkspaceBinding",
+    "WorkspaceBinding",
     "WorkspaceInstructions",
     "WorkspaceInstructionsConfig",
+    "copy_bound_workspace",
     "copy_environment",
     "load_workspace_instructions",
 ]

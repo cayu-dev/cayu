@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import ArtifactStore
+from cayu.environments.bindings import WorkspaceBinding
 from cayu.mcp import McpServerSpec
 from cayu.runners import Runner
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
@@ -110,6 +111,7 @@ class Environment:
         artifact_store: ArtifactStore | None = None,
         runner: Runner | None = None,
         vault: Vault | None = None,
+        binding: WorkspaceBinding | None = None,
         mcp_servers: Iterable[McpServerSpec] | None = None,
         workspace_instructions: WorkspaceInstructionsInput | None = None,
     ) -> None:
@@ -125,6 +127,8 @@ class Environment:
             raise TypeError("runner must be a Runner.")
         if vault is not None and not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
+        if binding is not None and not isinstance(binding, WorkspaceBinding):
+            raise TypeError("binding must be a WorkspaceBinding.")
 
         if mcp_servers is None:
             servers = []
@@ -140,6 +144,7 @@ class Environment:
         self.artifact_store = artifact_store
         self.runner = runner
         self.vault = vault
+        self.binding = binding
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
             workspace_instructions,
@@ -169,6 +174,7 @@ def copy_environment(environment: Environment) -> Environment:
         artifact_store=environment.artifact_store,
         runner=environment.runner,
         vault=environment.vault,
+        binding=environment.binding,
         mcp_servers=environment.mcp_servers,
         workspace_instructions=environment.workspace_instructions,
     )
