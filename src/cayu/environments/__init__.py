@@ -15,7 +15,9 @@ from cayu.environments.bindings import (
     NativeBinding,
     NoWorkspaceBinding,
     WorkspaceBinding,
+    WorkspaceSnapshot,
     copy_bound_workspace,
+    copy_workspace_snapshot,
 )
 from cayu.environments.factory import (
     EnvironmentFactory,
@@ -39,9 +41,11 @@ __all__ = [
     "WorkspaceBinding",
     "WorkspaceInstructions",
     "WorkspaceInstructionsConfig",
+    "WorkspaceSnapshot",
     "copy_bound_workspace",
     "copy_environment",
     "copy_environment_factory_request",
     "copy_environment_factory_result",
+    "copy_workspace_snapshot",
     "load_workspace_instructions",
 ]

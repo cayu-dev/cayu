@@ -12,18 +12,60 @@ from cayu.workspaces import Workspace
 
 
 @dataclass(frozen=True)
+class WorkspaceSnapshot:
+    """Serializable identity for a concrete workspace version."""
+
+    snapshot_id: str
+    workspace_id: str | None = None
+    version: str | None = None
+    source: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "snapshot_id",
+            require_clean_nonblank(self.snapshot_id, "snapshot_id"),
+        )
+        if self.workspace_id is not None:
+            object.__setattr__(
+                self,
+                "workspace_id",
+                require_clean_nonblank(self.workspace_id, "workspace_id"),
+            )
+        if self.version is not None:
+            object.__setattr__(
+                self,
+                "version",
+                require_clean_nonblank(self.version, "version"),
+            )
+        if self.source is not None:
+            object.__setattr__(
+                self,
+                "source",
+                require_clean_nonblank(self.source, "source"),
+            )
+        if type(self.metadata) is not dict:
+            raise TypeError("WorkspaceSnapshot metadata must be a dict.")
+        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+
+
+@dataclass(frozen=True)
 class BoundWorkspace:
     """Result of binding a workspace to a runner for one session.
 
     ``path`` names where the workspace is visible from the runner's point of
     view, when the binding has such a path. ``metadata`` carries binding-owned
     state such as mount ids, sandbox refs, branch names, or sync tokens.
+    ``snapshot`` identifies the concrete workspace version bound for the session
+    when the binding backend can provide one.
     """
 
     workspace: Workspace | None = None
     runner: Runner | None = None
     path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    snapshot: WorkspaceSnapshot | None = None
 
     def __post_init__(self) -> None:
         if self.workspace is not None and not isinstance(self.workspace, Workspace):
@@ -37,6 +79,9 @@ class BoundWorkspace:
         if type(self.metadata) is not dict:
             raise TypeError("BoundWorkspace metadata must be a dict.")
         object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        if self.snapshot is not None and type(self.snapshot) is not WorkspaceSnapshot:
+            raise TypeError("BoundWorkspace snapshot must be a WorkspaceSnapshot or None.")
+        object.__setattr__(self, "snapshot", copy_workspace_snapshot(self.snapshot))
 
 
 class WorkspaceBinding(ABC):
@@ -67,7 +112,7 @@ class WorkspaceBinding(ABC):
         *,
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> WorkspaceSnapshot | None:
         """Clean up or persist the binding after the session ends."""
 
 
@@ -119,8 +164,9 @@ class NativeBinding(WorkspaceBinding):
         *,
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> WorkspaceSnapshot | None:
         _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
+        return None
 
 
 class NoWorkspaceBinding(WorkspaceBinding):
@@ -157,8 +203,9 @@ class NoWorkspaceBinding(WorkspaceBinding):
         *,
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> WorkspaceSnapshot | None:
         _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
+        return None
 
 
 def copy_bound_workspace(bound: BoundWorkspace) -> BoundWorkspace:
@@ -171,6 +218,23 @@ def copy_bound_workspace(bound: BoundWorkspace) -> BoundWorkspace:
         runner=bound.runner,
         path=bound.path,
         metadata=copy_json_value(bound.metadata, "metadata"),
+        snapshot=copy_workspace_snapshot(bound.snapshot),
+    )
+
+
+def copy_workspace_snapshot(snapshot: WorkspaceSnapshot | None) -> WorkspaceSnapshot | None:
+    """Return a defensive copy of a workspace snapshot."""
+
+    if snapshot is None:
+        return None
+    if type(snapshot) is not WorkspaceSnapshot:
+        raise TypeError("Workspace snapshot copies require a WorkspaceSnapshot or None.")
+    return WorkspaceSnapshot(
+        snapshot_id=snapshot.snapshot_id,
+        workspace_id=snapshot.workspace_id,
+        version=snapshot.version,
+        source=snapshot.source,
+        metadata=copy_json_value(snapshot.metadata, "metadata"),
     )
 
 

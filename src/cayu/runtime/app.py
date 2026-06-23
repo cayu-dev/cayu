@@ -46,7 +46,9 @@ from cayu.environments import (
     EnvironmentFactoryResult,
     EnvironmentSpec,
     WorkspaceInstructions,
+    WorkspaceSnapshot,
     copy_environment,
+    copy_workspace_snapshot,
     load_workspace_instructions,
 )
 from cayu.providers import (
@@ -5430,7 +5432,7 @@ class CayuApp:
             )
         ]
         try:
-            await binding.finalize(
+            final_snapshot = await binding.finalize(
                 registered_environment.bound_workspace,
                 outcome=outcome,
                 metadata={
@@ -5438,6 +5440,7 @@ class CayuApp:
                     "session_id": session.id,
                 },
             )
+            final_snapshot = copy_workspace_snapshot(final_snapshot)
         except Exception as exc:
             error_payload = {
                 **base_payload,
@@ -5483,7 +5486,10 @@ class CayuApp:
                     session_id=session.id,
                     agent_name=event.agent_name,
                     environment_name=environment_name,
-                    payload=base_payload,
+                    payload={
+                        **base_payload,
+                        "final_snapshot": _workspace_snapshot_payload(final_snapshot),
+                    },
                 )
             )
         )
@@ -6173,7 +6179,20 @@ def _bound_workspace_payload(bound: BoundWorkspace) -> dict[str, Any]:
         "bound_workspace_id": _workspace_object_id(bound.workspace),
         "bound_path": bound.path,
         "bound_metadata": copy_json_value(bound.metadata, "bound_metadata"),
+        "bound_snapshot": _workspace_snapshot_payload(bound.snapshot),
         "has_bound_runner": bound.runner is not None,
+    }
+
+
+def _workspace_snapshot_payload(snapshot: WorkspaceSnapshot | None) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "workspace_id": snapshot.workspace_id,
+        "version": snapshot.version,
+        "source": snapshot.source,
+        "metadata": copy_json_value(snapshot.metadata, "metadata"),
     }
 
 

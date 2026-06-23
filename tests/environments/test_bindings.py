@@ -11,7 +11,9 @@ from cayu.environments import (
     NativeBinding,
     NoWorkspaceBinding,
     WorkspaceBinding,
+    WorkspaceSnapshot,
     copy_bound_workspace,
+    copy_workspace_snapshot,
 )
 from cayu.runners import ExecCommand, ExecResult, Runner
 from cayu.workspaces import Workspace, WorkspaceListResult, WorkspaceReadResult
@@ -124,11 +126,17 @@ def test_bind_request_rejects_invalid_values() -> None:
 def test_binding_finalize_methods_are_noops() -> None:
     bound = BoundWorkspace()
 
-    async def run() -> None:
-        await NativeBinding().finalize(bound, outcome="completed")
-        await NoWorkspaceBinding().finalize(bound, outcome="completed", metadata={"ok": True})
+    async def run() -> tuple[WorkspaceSnapshot | None, WorkspaceSnapshot | None]:
+        return (
+            await NativeBinding().finalize(bound, outcome="completed"),
+            await NoWorkspaceBinding().finalize(
+                bound,
+                outcome="completed",
+                metadata={"ok": True},
+            ),
+        )
 
-    asyncio.run(run())
+    assert asyncio.run(run()) == (None, None)
 
 
 def test_binding_finalize_rejects_invalid_values() -> None:
@@ -154,19 +162,32 @@ def test_bound_workspace_validates_shape_and_copies_metadata() -> None:
     workspace = StubWorkspace()
     runner = StubRunner()
     metadata = {"nested": {"value": 1}}
+    snapshot = WorkspaceSnapshot(
+        snapshot_id="snap_1",
+        workspace_id=workspace.id,
+        version="v1",
+        source="git",
+        metadata={"branch": "main"},
+    )
 
     bound = BoundWorkspace(
         workspace=workspace,
         runner=runner,
         path="/workspace",
         metadata=metadata,
+        snapshot=snapshot,
     )
 
     metadata["nested"]["value"] = 2
+    snapshot.metadata["branch"] = "dev"
     assert bound.workspace is workspace
     assert bound.runner is runner
     assert bound.path == "/workspace"
     assert bound.metadata == {"nested": {"value": 1}}
+    assert bound.snapshot is not snapshot
+    assert bound.snapshot is not None
+    assert bound.snapshot.snapshot_id == snapshot.snapshot_id
+    assert bound.snapshot.metadata == {"branch": "main"}
 
     with pytest.raises(FrozenInstanceError):
         bound.__setattr__("path", "/other")
@@ -177,6 +198,7 @@ def test_bound_workspace_rejects_invalid_values() -> None:
     invalid_runner: Any = object()
     invalid_path: Any = 123
     invalid_metadata: Any = []
+    invalid_snapshot: Any = object()
 
     with pytest.raises(TypeError, match="workspace"):
         BoundWorkspace(workspace=invalid_workspace)
@@ -190,6 +212,47 @@ def test_bound_workspace_rejects_invalid_values() -> None:
         BoundWorkspace(metadata=invalid_metadata)
     with pytest.raises(ValueError, match="metadata"):
         BoundWorkspace(metadata={"bad": object()})
+    with pytest.raises(TypeError, match="snapshot"):
+        BoundWorkspace(snapshot=invalid_snapshot)
+
+
+def test_workspace_snapshot_validates_shape_and_copies_metadata() -> None:
+    metadata = {"nested": {"value": 1}}
+
+    snapshot = WorkspaceSnapshot(
+        snapshot_id="snap_1",
+        workspace_id="workspace_1",
+        version="v1",
+        source="git",
+        metadata=metadata,
+    )
+
+    metadata["nested"]["value"] = 2
+    assert snapshot.snapshot_id == "snap_1"
+    assert snapshot.workspace_id == "workspace_1"
+    assert snapshot.version == "v1"
+    assert snapshot.source == "git"
+    assert snapshot.metadata == {"nested": {"value": 1}}
+
+    with pytest.raises(FrozenInstanceError):
+        snapshot.__setattr__("version", "v2")
+
+
+def test_workspace_snapshot_rejects_invalid_values() -> None:
+    invalid_metadata: Any = []
+
+    with pytest.raises(ValueError, match="snapshot_id"):
+        WorkspaceSnapshot(snapshot_id=" ")
+    with pytest.raises(ValueError, match="workspace_id"):
+        WorkspaceSnapshot(snapshot_id="snap_1", workspace_id=" ")
+    with pytest.raises(ValueError, match="version"):
+        WorkspaceSnapshot(snapshot_id="snap_1", version=" ")
+    with pytest.raises(ValueError, match="source"):
+        WorkspaceSnapshot(snapshot_id="snap_1", source=" ")
+    with pytest.raises(TypeError, match="metadata"):
+        WorkspaceSnapshot(snapshot_id="snap_1", metadata=invalid_metadata)
+    with pytest.raises(ValueError, match="metadata"):
+        WorkspaceSnapshot(snapshot_id="snap_1", metadata={"bad": object()})
 
 
 def test_binding_constructors_validate_values() -> None:
@@ -201,14 +264,36 @@ def test_binding_constructors_validate_values() -> None:
         NativeBinding(default_path=" ")
 
 
-def test_copy_bound_workspace_defensively_copies_metadata() -> None:
-    bound = BoundWorkspace(metadata={"token": {"cursor": "a"}})
+def test_copy_bound_workspace_defensively_copies_metadata_and_snapshot() -> None:
+    bound = BoundWorkspace(
+        metadata={"token": {"cursor": "a"}},
+        snapshot=WorkspaceSnapshot(
+            snapshot_id="snap_1",
+            metadata={"nested": {"value": 1}},
+        ),
+    )
 
     copied = copy_bound_workspace(bound)
     bound.metadata["token"]["cursor"] = "b"
+    assert bound.snapshot is not None
+    bound.snapshot.metadata["nested"]["value"] = 2
 
     assert copied is not bound
     assert copied.metadata == {"token": {"cursor": "a"}}
+    assert copied.snapshot is not None
+    assert copied.snapshot.metadata == {"nested": {"value": 1}}
+
+
+def test_copy_workspace_snapshot_defensively_copies_metadata() -> None:
+    snapshot = WorkspaceSnapshot(snapshot_id="snap_1", metadata={"token": {"cursor": "a"}})
+
+    copied = copy_workspace_snapshot(snapshot)
+    snapshot.metadata["token"]["cursor"] = "b"
+
+    assert copied is not snapshot
+    assert copied is not None
+    assert copied.metadata == {"token": {"cursor": "a"}}
+    assert copy_workspace_snapshot(None) is None
 
 
 def test_copy_bound_workspace_rejects_invalid_value() -> None:
@@ -216,6 +301,13 @@ def test_copy_bound_workspace_rejects_invalid_value() -> None:
 
     with pytest.raises(TypeError, match="BoundWorkspace"):
         copy_bound_workspace(invalid_bound)
+
+
+def test_copy_workspace_snapshot_rejects_invalid_value() -> None:
+    invalid_snapshot: Any = object()
+
+    with pytest.raises(TypeError, match="WorkspaceSnapshot"):
+        copy_workspace_snapshot(invalid_snapshot)
 
 
 def test_workspace_binding_is_abstract() -> None:

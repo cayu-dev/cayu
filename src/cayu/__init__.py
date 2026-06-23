@@ -49,9 +49,11 @@ from cayu.environments import (
     WorkspaceBinding,
     WorkspaceInstructions,
     WorkspaceInstructionsConfig,
+    WorkspaceSnapshot,
     copy_bound_workspace,
     copy_environment_factory_request,
     copy_environment_factory_result,
+    copy_workspace_snapshot,
 )
 from cayu.mcp import (
     DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S,
@@ -538,6 +540,7 @@ __all__ = [
     "WorkspaceInstructionsConfig",
     "WorkspaceListResult",
     "WorkspaceReadResult",
+    "WorkspaceSnapshot",
     "WorkspaceToArtifactResult",
     "WriteFileTool",
     "causal_budget_usage_summary",
@@ -552,6 +555,7 @@ __all__ = [
     "copy_run_limits",
     "copy_secret_env",
     "copy_workspace_file_to_artifact",
+    "copy_workspace_snapshot",
     "default_artifact_readers",
     "default_compaction_prompt",
     "estimate_causal_budget_cost",

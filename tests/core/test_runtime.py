@@ -22,6 +22,7 @@ from cayu.environments import (
     EnvironmentSpec,
     WorkspaceBinding,
     WorkspaceInstructionsConfig,
+    WorkspaceSnapshot,
 )
 from cayu.providers import (
     ModelProvider,
@@ -395,10 +396,14 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
         self,
         *,
         bound_workspace: Workspace | None = None,
+        snapshot: WorkspaceSnapshot | None = None,
+        final_snapshot: WorkspaceSnapshot | None = None,
         fail_bind: bool = False,
         fail_finalize: bool = False,
     ) -> None:
         self.bound_workspace = bound_workspace
+        self.snapshot = snapshot
+        self.final_snapshot = final_snapshot
         self.fail_bind = fail_bind
         self.fail_finalize = fail_finalize
         self.bind_calls: list[dict] = []
@@ -431,6 +436,7 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
             runner=runner,
             path="/bound",
             metadata={"binding": "recording"},
+            snapshot=self.snapshot,
         )
 
     async def finalize(
@@ -439,7 +445,7 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
         *,
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> WorkspaceSnapshot | None:
         self.finalize_calls.append(
             {
                 "bound": bound,
@@ -449,6 +455,7 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
         )
         if self.fail_finalize:
             raise RuntimeError("finalize failed")
+        return self.final_snapshot
 
 
 class RecordingEnvironmentFactory(EnvironmentFactory):
@@ -1603,6 +1610,7 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         "bound_workspace_id": bound_workspace.id,
         "bound_path": "/bound",
         "bound_metadata": {"binding": "recording"},
+        "bound_snapshot": None,
         "has_bound_runner": False,
     }
     assert [event.type for event in events[-3:]] == [
@@ -1613,7 +1621,9 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
     assert events[-3].payload["configured_workspace_id"] == configured_workspace.id
     assert events[-3].payload["bound_workspace_id"] == bound_workspace.id
     assert events[-3].payload["outcome"] == "completed"
+    assert events[-3].payload["bound_snapshot"] is None
     assert events[-2].payload["outcome"] == "completed"
+    assert events[-2].payload["final_snapshot"] is None
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.bind_calls) == 1
     assert binding.bind_calls[0]["workspace"] is configured_workspace
@@ -1626,6 +1636,97 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
 
     tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
     assert tool_events[0].payload["result"]["structured"] == {"workspace_id": bound_workspace.id}
+
+
+def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        configured_root = tmp_path / "configured"
+        configured_root.mkdir()
+        bound_root = tmp_path / "bound"
+        bound_root.mkdir()
+        configured_workspace = LocalWorkspace(configured_root, workspace_id="configured")
+        bound_workspace = LocalWorkspace(bound_root, workspace_id="bound")
+        bind_snapshot = WorkspaceSnapshot(
+            snapshot_id="snap_bind",
+            workspace_id=bound_workspace.id,
+            version="commit-a",
+            source="git",
+            metadata={"branch": "main"},
+        )
+        final_snapshot = WorkspaceSnapshot(
+            snapshot_id="snap_final",
+            workspace_id=bound_workspace.id,
+            version="commit-b",
+            source="git",
+            metadata={"dirty": False},
+        )
+        binding = RecordingWorkspaceBinding(
+            bound_workspace=bound_workspace,
+            snapshot=bind_snapshot,
+            final_snapshot=final_snapshot,
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=configured_workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_snapshot",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, binding, bind_snapshot, final_snapshot
+
+    events, binding, bind_snapshot, final_snapshot = asyncio.run(run())
+
+    binding_completed = next(
+        event for event in events if event.type == EventType.ENVIRONMENT_BINDING_COMPLETED
+    )
+    finalize_started = next(
+        event
+        for event in events
+        if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
+    )
+    finalize_completed = next(
+        event
+        for event in events
+        if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+    )
+    assert binding_completed.payload["bound_snapshot"] == {
+        "snapshot_id": bind_snapshot.snapshot_id,
+        "workspace_id": bind_snapshot.workspace_id,
+        "version": bind_snapshot.version,
+        "source": bind_snapshot.source,
+        "metadata": bind_snapshot.metadata,
+    }
+    assert finalize_started.payload["bound_snapshot"] == binding_completed.payload[
+        "bound_snapshot"
+    ]
+    assert finalize_completed.payload["final_snapshot"] == {
+        "snapshot_id": final_snapshot.snapshot_id,
+        "workspace_id": final_snapshot.workspace_id,
+        "version": final_snapshot.version,
+        "source": final_snapshot.source,
+        "metadata": final_snapshot.metadata,
+    }
+    assert binding.finalize_calls[0]["bound"].snapshot == bind_snapshot
 
 
 def test_cayu_app_binding_failure_fails_session_before_start_event():
@@ -1721,6 +1822,53 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
     assert events[-1].payload["binding_finalize_error"] == {
         "error": "finalize failed",
         "error_type": "RuntimeError",
+        "outcome": "completed",
+    }
+
+
+def test_cayu_app_invalid_binding_finalize_snapshot_is_reported_on_terminal_event():
+    async def run():
+        store = InMemorySessionStore()
+        binding = RecordingWorkspaceBinding()
+        binding.final_snapshot = object()  # type: ignore[assignment]
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), binding=binding),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_invalid_finalize_snapshot",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_binding_invalid_finalize_snapshot")
+        return events, session
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+    assert events[-2].type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
+    assert events[-2].payload["error"] == (
+        "Workspace snapshot copies require a WorkspaceSnapshot or None."
+    )
+    assert events[-2].payload["error_type"] == "TypeError"
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert events[-1].payload["binding_finalize_error"] == {
+        "error": "Workspace snapshot copies require a WorkspaceSnapshot or None.",
+        "error_type": "TypeError",
         "outcome": "completed",
     }
 
