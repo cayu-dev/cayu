@@ -1142,6 +1142,12 @@ The first MCP implementation supports stdio servers:
   a fresh MCP process for every tool call.
 - The initialize result is available as `McpToolset.initialize_result`, including
   protocol version, server info, capabilities, and server instructions.
+- The discovered MCP tool manifest is fingerprinted as `McpToolset.manifest_hash`.
+  The hash covers the server name, initialize metadata that affects tool
+  descriptions, and every advertised tool name, generated Cayu tool name,
+  description, input schema, and annotations. `McpToolAdapter` exposes the same
+  value as `mcp_manifest_hash` and includes it in structured tool results so
+  events/transcripts can show which MCP contract produced a result.
 - `McpToolAdapter` exposes one MCP tool as a normal Cayu `Tool`, so tool policies,
   approvals, events, transcript persistence, and provider adapters work through the
   same path as framework-native tools.
@@ -1152,7 +1158,9 @@ This first stdio client does not resolve `secret_env` itself. Secret resolution 
 at the environment/vault boundary before the subprocess is started. Streamable HTTP MCP,
 OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are future
 layers. MCP resources should remain explicit and policy-controlled instead of being
-dumped into model context automatically.
+dumped into model context automatically. MCP manifest hashes are audit/debug
+fingerprints, not signatures or authorization decisions; tool policy still controls
+whether a tool call may execute.
 
 ## KnowledgeStore
 

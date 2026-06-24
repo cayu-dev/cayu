@@ -57,6 +57,8 @@ async def main() -> None:
 
         print("mcp_tool", toolset.tools[0].name)
         print("mcp_server", toolset.initialize_result.server_name)
+        print("mcp_manifest_hash", toolset.manifest_hash)
+        print("mcp_adapter_manifest_hash", toolset.tools[0].mcp_manifest_hash)
         async for event in app.run(
             RunRequest(
                 agent_name="assistant",

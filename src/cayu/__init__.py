@@ -80,6 +80,7 @@ from cayu.mcp import (
     StdioMcpSession,
     connect_mcp_toolset,
     mcp_cayu_tool_name,
+    mcp_tool_manifest_hash,
 )
 from cayu.observability import LoggingEventSink
 from cayu.providers import (
@@ -590,6 +591,7 @@ __all__ = [
     "first_reached_limit",
     "has_run_limits",
     "mcp_cayu_tool_name",
+    "mcp_tool_manifest_hash",
     "normalize_usage_metrics",
     "retry_decision",
     "session_usage_summary",

@@ -22,7 +22,13 @@ from cayu.mcp.stdio import (
     StdioMcpClient,
     StdioMcpSession,
 )
-from cayu.mcp.tools import McpToolAdapter, McpToolset, connect_mcp_toolset, mcp_cayu_tool_name
+from cayu.mcp.tools import (
+    McpToolAdapter,
+    McpToolset,
+    connect_mcp_toolset,
+    mcp_cayu_tool_name,
+    mcp_tool_manifest_hash,
+)
 
 __all__ = [
     "DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S",
@@ -47,4 +53,5 @@ __all__ = [
     "StdioMcpSession",
     "connect_mcp_toolset",
     "mcp_cayu_tool_name",
+    "mcp_tool_manifest_hash",
 ]

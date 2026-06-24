@@ -910,6 +910,13 @@ Run a deterministic stdio MCP example:
 PYTHONPATH=src python examples/stdio_mcp_runtime.py
 ```
 
+`connect_mcp_toolset(...)` fingerprints the discovered MCP tool contract as
+`toolset.manifest_hash`. The same value is exposed on each `McpToolAdapter` as
+`mcp_manifest_hash` and is included in structured MCP tool results for audit and
+debugging. A changed MCP input schema, tool description, annotations, server
+instructions, or generated Cayu tool name changes the hash; the hash is not an
+authorization decision.
+
 Run the live Anthropic example with local tools:
 
 ```bash

@@ -27,6 +27,7 @@ from cayu import (
     ToolContext,
     connect_mcp_toolset,
     mcp_cayu_tool_name,
+    mcp_tool_manifest_hash,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
@@ -128,15 +129,17 @@ def test_connect_mcp_toolset_returns_cayu_tool_adapters() -> None:
                 ToolContext(session_id="sess_1", agent_name="assistant"),
                 {"text": "from adapter"},
             )
-            return toolset.initialize_result, tools, result
+            return toolset.initialize_result, toolset.manifest_hash, tools, result
         finally:
             await toolset.close()
 
-    initialize_result, tools, result = asyncio.run(run())
+    initialize_result, manifest_hash, tools, result = asyncio.run(run())
 
     assert initialize_result.server_name == "fake-mcp"
     assert len(tools) == 1
     assert tools[0].name == "mcp__local-mcp__echo"
+    assert tools[0].mcp_manifest_hash == manifest_hash
+    assert manifest_hash.startswith("sha256:")
     assert "original tool 'echo'" in tools[0].description
     assert "Use fake MCP tools only when explicitly requested." in tools[0].description
     assert tools[0].schema["required"] == ["text"]
@@ -147,6 +150,7 @@ def test_connect_mcp_toolset_returns_cayu_tool_adapters() -> None:
     assert result.structured == {
         "mcp_server": "local-mcp",
         "mcp_tool": "echo",
+        "mcp_manifest_hash": manifest_hash,
         "mcp_content": [{"type": "text", "text": "echo: from adapter"}],
         "mcp_structured_content": {"echoed": "from adapter"},
     }
@@ -168,6 +172,106 @@ def test_mcp_tool_adapter_includes_structured_content_in_model_text() -> None:
 
     assert result.content == 'Structured MCP content:\n{\n  "echoed": "structured"\n}'
     assert result.structured["mcp_structured_content"] == {"echoed": "structured"}
+
+
+def test_mcp_tool_manifest_hash_is_stable_for_equivalent_json_order() -> None:
+    server = _fake_server_spec()
+    initialize_result = McpInitializeResult(
+        protocol_version="2025-06-18",
+        server_name="fake-mcp",
+        server_version="1.0.0",
+        instructions="Use fake MCP tools only when explicitly requested.",
+    )
+    first = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo text.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "loud": {"type": "boolean"},
+                },
+                "required": ["text"],
+            },
+            annotations={"title": "Echo", "readOnlyHint": True},
+        ),
+    )
+    second = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo text.",
+            input_schema={
+                "required": ["text"],
+                "properties": {
+                    "loud": {"type": "boolean"},
+                    "text": {"type": "string"},
+                },
+                "type": "object",
+            },
+            annotations={"readOnlyHint": True, "title": "Echo"},
+        ),
+    )
+
+    assert mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=first,
+    ) == mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=second,
+    )
+
+
+def test_mcp_tool_manifest_hash_is_stable_for_equivalent_tool_order() -> None:
+    server = _fake_server_spec()
+    initialize_result = McpInitializeResult(protocol_version="2025-06-18")
+    first = (
+        McpToolDefinition(name="alpha", input_schema={"type": "object"}),
+        McpToolDefinition(name="beta", input_schema={"type": "object"}),
+    )
+    second = (
+        McpToolDefinition(name="beta", input_schema={"type": "object"}),
+        McpToolDefinition(name="alpha", input_schema={"type": "object"}),
+    )
+
+    assert mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=first,
+    ) == mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=second,
+    )
+
+
+def test_mcp_tool_manifest_hash_changes_when_schema_changes() -> None:
+    server = _fake_server_spec()
+    initialize_result = McpInitializeResult(protocol_version="2025-06-18")
+    original = (
+        McpToolDefinition(
+            name="echo",
+            input_schema={"type": "object", "required": ["text"]},
+        ),
+    )
+    changed = (
+        McpToolDefinition(
+            name="echo",
+            input_schema={"type": "object", "required": ["message"]},
+        ),
+    )
+
+    assert mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=original,
+    ) != mcp_tool_manifest_hash(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=changed,
+    )
 
 
 def test_stdio_mcp_client_replies_to_unsupported_server_requests() -> None:

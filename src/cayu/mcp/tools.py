@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from hashlib import sha1
@@ -44,6 +45,7 @@ class McpToolAdapter(Tool):
                 "MCP Cayu tool names must contain 1-64 letters, numbers, underscores, or hyphens."
             )
         self.toolset = toolset
+        self.mcp_manifest_hash = toolset.manifest_hash
         self.server = toolset.server.model_copy(deep=True)
         self.definition = definition.model_copy(deep=True)
         super().__init__(
@@ -69,6 +71,7 @@ class McpToolAdapter(Tool):
             structured={
                 "mcp_server": self.server.name,
                 "mcp_tool": self.definition.name,
+                "mcp_manifest_hash": self.mcp_manifest_hash,
                 "mcp_content": result.content,
                 "mcp_structured_content": result.structured_content,
             },
@@ -93,6 +96,11 @@ class McpToolset:
         self.server = server.model_copy(deep=True)
         self.session = session
         self.definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
+        self.manifest_hash = mcp_tool_manifest_hash(
+            server=self.server,
+            initialize_result=self.initialize_result,
+            definitions=self.definitions,
+        )
         self.tools = tuple(
             McpToolAdapter(toolset=self, definition=definition) for definition in self.definitions
         )
@@ -153,12 +161,74 @@ def mcp_cayu_tool_name(server_name: str, tool_name: str) -> str:
     return f"mcp__{server_slug[:server_budget]}__{tool_slug[:tool_budget]}_{digest}"
 
 
+def mcp_tool_manifest_hash(
+    *,
+    server: McpServerSpec,
+    initialize_result: McpInitializeResult,
+    definitions: tuple[McpToolDefinition, ...],
+) -> str:
+    """Return a stable hash of the MCP tool contract Cayu exposes."""
+
+    if type(server) is not McpServerSpec:
+        raise TypeError("server must be an McpServerSpec.")
+    if type(initialize_result) is not McpInitializeResult:
+        raise TypeError("initialize_result must be an McpInitializeResult.")
+    if not isinstance(definitions, tuple):
+        raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+    payload = _mcp_tool_manifest_payload(
+        server=server,
+        initialize_result=initialize_result,
+        definitions=definitions,
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _tool_name_slug(value: str, field_name: str) -> str:
     cleaned = require_clean_nonblank(value, field_name)
     slug = _UNSAFE_TOOL_NAME_CHARS_RE.sub("_", cleaned).strip("_")
     if not slug:
         raise ValueError(f"{field_name} does not contain provider-safe tool name characters.")
     return slug
+
+
+def _mcp_tool_manifest_payload(
+    *,
+    server: McpServerSpec,
+    initialize_result: McpInitializeResult,
+    definitions: tuple[McpToolDefinition, ...],
+) -> dict[str, Any]:
+    tools: list[dict[str, Any]] = []
+    for definition in definitions:
+        if type(definition) is not McpToolDefinition:
+            raise TypeError("definitions must contain McpToolDefinition instances.")
+        cayu_name = mcp_cayu_tool_name(server.name, definition.name)
+        tools.append(
+            {
+                "cayu_name": cayu_name,
+                "mcp_name": definition.name,
+                "description": definition.description,
+                "input_schema": definition.input_schema,
+                "annotations": definition.annotations,
+            }
+        )
+    tools.sort(key=lambda tool: (tool["cayu_name"], tool["mcp_name"]))
+    return {
+        "schema": "cayu.mcp.tool_manifest",
+        "server": {
+            "name": server.name,
+            "protocol_version": initialize_result.protocol_version,
+            "server_name": initialize_result.server_name,
+            "server_version": initialize_result.server_version,
+            "instructions": initialize_result.instructions,
+        },
+        "tools": tools,
+    }
 
 
 def _tool_description(toolset: McpToolset, definition: McpToolDefinition) -> str:
