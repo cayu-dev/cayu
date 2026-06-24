@@ -27,6 +27,10 @@ class SecretRedactor:
             values.add(_secret_value(secret))
         self._values = tuple(sorted(values, key=len, reverse=True))
 
+    @property
+    def has_values(self) -> bool:
+        return bool(self._values)
+
     def with_secret(self, secret: str | SecretStr | ResolvedSecret) -> SecretRedactor:
         value = _secret_value(secret)
         require_nonblank(value, "secret")

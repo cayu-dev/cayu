@@ -5,6 +5,7 @@ from typing import Any
 
 from cayu._validation import copy_json_value
 from cayu.core.tools import ToolResult
+from cayu.vaults import SecretRedactor
 
 
 def normalize_tool_result(result: ToolResult) -> ToolResult:
@@ -20,6 +21,21 @@ def validate_tool_result(result: ToolResult) -> ToolResult:
         content=result.content,
         structured=copy_json_value(result.structured, "structured"),
         artifacts=copy_json_value(result.artifacts, "artifacts"),
+        is_error=result.is_error,
+    )
+
+
+def redact_tool_result(result: ToolResult, redactor: SecretRedactor) -> ToolResult:
+    if type(result) is not ToolResult:
+        raise TypeError("Tool results must be ToolResult instances.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    if not redactor.has_values:
+        return result
+    return ToolResult(
+        content=redactor.redact_text(result.content),
+        structured=redactor.redact_json(result.structured),
+        artifacts=redactor.redact_json(result.artifacts),
         is_error=result.is_error,
     )
 

@@ -193,6 +193,11 @@ def test_secret_redactor_accepts_single_secret_values() -> None:
     )
 
 
+def test_secret_redactor_exposes_whether_it_has_values() -> None:
+    assert SecretRedactor().has_values is False
+    assert SecretRedactor("token").has_values is True
+
+
 def test_secret_redactor_rejects_non_json_values() -> None:
     redactor = SecretRedactor(["secret"])
 

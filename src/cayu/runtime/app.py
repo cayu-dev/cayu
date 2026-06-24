@@ -64,6 +64,7 @@ from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.approvals import (
@@ -227,6 +228,7 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_payload,
 )
+from cayu.vaults import SecretRedactor
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
@@ -349,6 +351,7 @@ class CayuApp:
         loop_policies: Iterable[LoopPolicy] | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
+        secret_redactor: SecretRedactor | None = None,
         max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
         max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
@@ -368,10 +371,15 @@ class CayuApp:
             EventWatcherStore,
         ):
             raise TypeError("event_watcher_store must be an EventWatcherStore.")
+        if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
+            raise TypeError("secret_redactor must be a SecretRedactor.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         policies = validate_loop_policies(loop_policies, field_name="loop_policies")
+        resolved_secret_redactor = (
+            secret_redactor if secret_redactor is not None else SecretRedactor()
+        )
         if event_sinks is None:
             sinks = []
         else:
@@ -387,7 +395,7 @@ class CayuApp:
         if enable_logging:
             from cayu.observability.logging import LoggingEventSink
 
-            sinks.insert(0, LoggingEventSink())
+            sinks.insert(0, LoggingEventSink(redactor=resolved_secret_redactor))
         self._max_file_attachment_bytes = _validate_positive_int(
             max_file_attachment_bytes,
             "max_file_attachment_bytes",
@@ -411,6 +419,7 @@ class CayuApp:
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
+        self._secret_redactor = resolved_secret_redactor
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
@@ -2132,15 +2141,8 @@ class CayuApp:
                 ):
                     yield event
                 return
-            recovery_events = [
-                approval_support.resumed_event(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    approval=pending_approval,
-                    decision=ToolApprovalDecision.APPROVE,
-                ),
-                Event(
+            recovery_tool_event, recovered_result = _redact_tool_result_event(
+                event=Event(
                     type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
@@ -2155,6 +2157,18 @@ class CayuApp:
                         "result": recovered_result.model_dump(),
                     },
                 ),
+                result=recovered_result,
+                redactor=self._secret_redactor,
+            )
+            recovery_events = [
+                approval_support.resumed_event(
+                    session=session,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    approval=pending_approval,
+                    decision=ToolApprovalDecision.APPROVE,
+                ),
+                recovery_tool_event,
             ]
             emitted_recovery_events = await self._emit_many(session.id, recovery_events)
             for event in emitted_recovery_events:
@@ -2702,6 +2716,10 @@ class CayuApp:
                         spec=structured_output,
                         validation=validation,
                     )
+                    structured_tool_outcomes = _redact_tool_call_outcomes(
+                        structured_tool_outcomes,
+                        self._secret_redactor,
+                    )
                     tool_result_messages = transcript_helpers.tool_result_messages(
                         structured_tool_outcomes
                     )
@@ -2721,6 +2739,7 @@ class CayuApp:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries + 1,
+                                redactor=self._secret_redactor,
                             )
                         )
                         break
@@ -2734,6 +2753,7 @@ class CayuApp:
                             validation=validation,
                             step=step,
                             attempt=structured_output_retries + 1,
+                            redactor=self._secret_redactor,
                         )
                     )
                     if structured_output_retries >= structured_output.max_retries:
@@ -2758,6 +2778,7 @@ class CayuApp:
                             validation=validation,
                             step=step,
                             attempt=structured_output_retries,
+                            redactor=self._secret_redactor,
                         )
                     )
                     continue
@@ -2785,6 +2806,7 @@ class CayuApp:
                                         validation=validation,
                                         step=step,
                                         attempt=structured_output_retries + 1,
+                                        redactor=self._secret_redactor,
                                     )
                                 )
                                 break
@@ -2800,6 +2822,7 @@ class CayuApp:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries + 1,
+                                redactor=self._secret_redactor,
                             )
                         )
                         if structured_output_retries >= structured_output.max_retries:
@@ -2814,11 +2837,15 @@ class CayuApp:
                                 "maximum model steps reached before repair."
                             )
                         structured_output_retries += 1
+                        redacted_validation = _redact_structured_output_validation(
+                            validation,
+                            self._secret_redactor,
+                        )
                         repair_message = Message.text(
                             "user",
                             structured_output_repair_prompt(
                                 spec=structured_output,
-                                validation=validation,
+                                validation=redacted_validation,
                             ),
                         )
                         messages.append(repair_message)
@@ -2836,6 +2863,7 @@ class CayuApp:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries,
+                                redactor=self._secret_redactor,
                             )
                         )
                         continue
@@ -4109,6 +4137,14 @@ class CayuApp:
             decision=decision,
             tool_round_id=tool_round_id,
         )
+        completed_tool_outcomes = _redact_tool_call_outcomes(
+            completed_tool_outcomes,
+            self._secret_redactor,
+        )
+        skipped_outcomes = _redact_tool_call_outcomes(
+            skipped_outcomes,
+            self._secret_redactor,
+        )
         for skipped_outcome in skipped_outcomes:
             yield await self._emit(
                 _limit_reached_tool_call_event(
@@ -4803,6 +4839,11 @@ class CayuApp:
             completed_outcomes=tool_outcomes,
             tool_round_id=tool_round_id,
             cancellation_artifacts=cancellation_artifacts,
+        )
+        tool_outcomes = _redact_tool_call_outcomes(tool_outcomes, self._secret_redactor)
+        interrupted_results = _redact_tool_call_outcomes(
+            interrupted_results,
+            self._secret_redactor,
         )
         if not interrupted_results and not tool_outcomes:
             return
@@ -5545,6 +5586,11 @@ class CayuApp:
         result: ToolResult,
         task_id: str | None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        event, result = _redact_tool_result_event(
+            event=event,
+            result=result,
+            redactor=self._secret_redactor,
+        )
         tool_event = await self._emit(event)
         outcome = runtime_records.ToolCallOutcome(call=tool_call, result=result)
         yield tool_event, outcome
@@ -7083,6 +7129,7 @@ def _structured_output_event(
     validation: StructuredOutputValidation,
     step: int,
     attempt: int,
+    redactor: SecretRedactor | None = None,
 ) -> Event:
     if event_type not in {
         EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -7094,6 +7141,7 @@ def _structured_output_event(
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
     if type(validation) is not StructuredOutputValidation:
         raise TypeError("Structured output validation must be a StructuredOutputValidation.")
+    validation = _redact_structured_output_validation(validation, redactor)
     payload: dict[str, Any] = {
         "name": spec.name,
         "step": step,
@@ -7221,3 +7269,60 @@ def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWat
             raise ValueError(f"Duplicate event watcher name: {watcher.name}")
         names.add(watcher.name)
     return tuple(watcher_list)
+
+
+def _redact_tool_result_event(
+    *,
+    event: Event,
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> tuple[Event, ToolResult]:
+    redacted_result = tool_results.redact_tool_result(result, redactor)
+    if not redactor.has_values:
+        return event, redacted_result
+    payload = redactor.redact_json(event.payload)
+    if type(payload) is not dict:
+        raise AssertionError("Event payload redaction returned non-object payload.")
+    payload["result"] = redacted_result.model_dump()
+    return event.model_copy(update={"payload": payload}), redacted_result
+
+
+def _redact_tool_call_outcomes(
+    outcomes: list[runtime_records.ToolCallOutcome],
+    redactor: SecretRedactor,
+) -> list[runtime_records.ToolCallOutcome]:
+    if not redactor.has_values:
+        return outcomes
+    return [_redact_tool_call_outcome(outcome, redactor) for outcome in outcomes]
+
+
+def _redact_tool_call_outcome(
+    outcome: runtime_records.ToolCallOutcome,
+    redactor: SecretRedactor,
+) -> runtime_records.ToolCallOutcome:
+    return runtime_records.ToolCallOutcome(
+        call=outcome.call,
+        result=tool_results.redact_tool_result(outcome.result, redactor),
+    )
+
+
+def _redact_structured_output_validation(
+    validation: StructuredOutputValidation,
+    redactor: SecretRedactor | None,
+) -> StructuredOutputValidation:
+    if type(validation) is not StructuredOutputValidation:
+        raise TypeError("Structured output validation must be a StructuredOutputValidation.")
+    if redactor is None or not redactor.has_values:
+        return validation
+    return StructuredOutputValidation(
+        valid=validation.valid,
+        output=redactor.redact_json(validation.output),
+        errors=[
+            StructuredOutputError(
+                path=redactor.redact_text(error.path),
+                message=redactor.redact_text(error.message),
+                schema_path=redactor.redact_text(error.schema_path),
+            )
+            for error in validation.errors
+        ],
+    )

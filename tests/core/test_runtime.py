@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import file_attachment
-from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart
+from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
@@ -694,6 +694,157 @@ async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Ev
     return [event async for event in app.resume(request)]
 
 
+def test_cayu_app_redacts_tool_results_before_events_transcript_and_context() -> None:
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "sk-runtime-secret-value"
+
+    class LeakyTool(Tool):
+        spec = ToolSpec(
+            name="leak",
+            description="Return a result containing a known secret.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            return ToolResult(
+                content=f"connected with {secret_value}",
+                structured={
+                    "token": secret_value,
+                    "nested": ["safe", f"prefix-{secret_value}-suffix"],
+                },
+                artifacts=[
+                    {
+                        "type": "debug",
+                        "metadata": {"authorization": f"Bearer {secret_value}"},
+                    }
+                ],
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_leak", name="leak", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[LeakyTool()])
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_result_redaction",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_event = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    result_payload = tool_event.payload["result"]
+    assert secret_value not in str(result_payload)
+    assert REDACTED_SECRET in result_payload["content"]
+    assert result_payload["structured"]["token"] == REDACTED_SECRET
+    assert result_payload["structured"]["nested"][1] == f"prefix-{REDACTED_SECRET}-suffix"
+    assert result_payload["artifacts"][0]["metadata"]["authorization"] == (
+        f"Bearer {REDACTED_SECRET}"
+    )
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_result_redaction"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    tool_part = tool_message.content[0]
+    assert isinstance(tool_part, ToolResultPart)
+    assert secret_value not in str(tool_part.model_dump(mode="json"))
+    assert tool_part.content == f"connected with {REDACTED_SECRET}"
+    assert tool_part.structured is not None
+    assert tool_part.structured["token"] == REDACTED_SECRET
+    assert tool_part.artifacts[0]["metadata"]["authorization"] == f"Bearer {REDACTED_SECRET}"
+
+    second_request = provider.requests[1]
+    assert secret_value not in str(
+        [message.model_dump(mode="json") for message in second_request.messages]
+    )
+
+
+def test_cayu_app_redacts_blocked_tool_result_event_payload() -> None:
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "policy-secret-value"
+
+    class SecretPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                reason=f"blocked because {secret_value}",
+                metadata={"token": secret_value},
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_echo",
+                    name="echo",
+                    arguments={"text": "hello"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+        tool_policy=SecretPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_blocked_tool_result_redaction",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    blocked_event = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
+    assert secret_value not in str(blocked_event.payload)
+    assert blocked_event.payload["reason"] == f"blocked because {REDACTED_SECRET}"
+    assert blocked_event.payload["metadata"]["token"] == REDACTED_SECRET
+    assert blocked_event.payload["result"]["content"] == f"blocked because {REDACTED_SECRET}"
+    assert blocked_event.payload["result"]["structured"]["metadata"]["token"] == REDACTED_SECRET
+
+    transcript = asyncio.run(store.load_transcript("sess_blocked_tool_result_redaction"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    assert isinstance(tool_message.content[0], ToolResultPart)
+    assert secret_value not in str(tool_message.model_dump(mode="json"))
+
+
 def fake_budget_limit(
     max_estimated_cost: str,
     *,
@@ -841,6 +992,9 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
 
     with pytest.raises(TypeError, match="event_sinks"):
         CayuApp(event_sinks="")  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="secret_redactor"):
+        CayuApp(secret_redactor="not a redactor")  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="max_file_attachment_bytes"):
         CayuApp(max_file_attachment_bytes=1.5)  # type: ignore[arg-type]
@@ -10144,6 +10298,104 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     assert session.status == SessionStatus.COMPLETED
 
 
+def test_cayu_app_redacts_manual_tool_approval_recovery_result():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "manual-recovery-secret"
+    store = FailingTerminalToolEventStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("recovered and continued"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_manual_recovery_redaction",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+
+    _ = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_manual_recovery_redaction",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+    recovery_events = asyncio.run(
+        collect_tool_approval_recovery_events(
+            app,
+            ToolApprovalRecoveryRequest(
+                session_id="sess_manual_recovery_redaction",
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message=f"side effect completed with {secret_value}",
+                structured={"token": secret_value},
+                artifacts=[{"metadata": {"token": secret_value}}],
+                reason=f"operator confirmed {secret_value}",
+                metadata={"token": secret_value},
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_manual_recovery_redaction"))
+
+    tool_event = recovery_events[1]
+    assert tool_event.type == EventType.TOOL_CALL_COMPLETED
+    assert secret_value not in str(tool_event.payload)
+    assert tool_event.payload["reason"] == f"operator confirmed {REDACTED_SECRET}"
+    assert tool_event.payload["metadata"]["token"] == REDACTED_SECRET
+    assert tool_event.payload["result"]["content"] == (
+        f"side effect completed with {REDACTED_SECRET}"
+    )
+    assert tool_event.payload["result"]["structured"]["token"] == REDACTED_SECRET
+    assert tool_event.payload["result"]["artifacts"][0]["metadata"]["token"] == REDACTED_SECRET
+
+    tool_message = next(message for message in transcript if message.role == "tool")
+    tool_part = tool_message.content[0]
+    assert isinstance(tool_part, ToolResultPart)
+    assert secret_value not in str(tool_part.model_dump(mode="json"))
+    assert tool_part.content == f"side effect completed with {REDACTED_SECRET}"
+    assert tool_part.structured == {"token": REDACTED_SECRET}
+    assert tool_part.artifacts[0]["metadata"]["token"] == REDACTED_SECRET
+    assert provider.requests[1].messages[-1].role == "tool"
+    assert secret_value not in str(
+        provider.requests[1].messages[-1].model_dump(mode="json")
+    )
+
+
 def test_cayu_app_recovery_does_not_append_terminal_event_without_session_claim():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -14168,6 +14420,59 @@ def test_cayu_app_accepts_structured_output_final_tool_call():
     assert transcript[-1].content[0].is_error is False
 
 
+def test_cayu_app_redacts_structured_output_tool_result_before_transcript():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "sk-live-structured-output-secret"
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_final",
+                name=STRUCTURED_OUTPUT_TOOL_NAME,
+                arguments={"output": {"answer": secret_value}},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_tool_redacted",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    name="answer",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_tool_redacted"))
+
+    assert events[3].type == EventType.STRUCTURED_OUTPUT_VALIDATED
+    assert events[3].payload["output"] == {"answer": REDACTED_SECRET}
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    tool_part = transcript[-1].content[0]
+    assert isinstance(tool_part, ToolResultPart)
+    assert tool_part.structured == {"output": {"answer": REDACTED_SECRET}}
+    assert secret_value not in repr(tool_part)
+
+
 def test_cayu_app_retries_invalid_structured_output_final_tool_call():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -14244,6 +14549,80 @@ def test_cayu_app_retries_invalid_structured_output_final_tool_call():
     assert "plain text" in invalid_result.content
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content[0].is_error is True
+
+
+def test_cayu_app_redacts_structured_output_tool_validation_errors():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "structured-output-error-secret"
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_final_invalid",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"answer": secret_value}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_final_valid",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"answer": "ok"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_structured_output_tool_error_redaction",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"enum": ["ok"]}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    max_retries=1,
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(
+        store.load_transcript("sess_structured_output_tool_error_redaction")
+    )
+
+    failed_event = events[3]
+    retry_event = events[4]
+    assert failed_event.type == EventType.STRUCTURED_OUTPUT_FAILED
+    assert retry_event.type == EventType.STRUCTURED_OUTPUT_RETRY
+    assert secret_value not in str(failed_event.payload)
+    assert secret_value not in str(retry_event.payload)
+    assert REDACTED_SECRET in failed_event.payload["errors"][0]["message"]
+
+    invalid_result = transcript[2].content[0]
+    assert isinstance(invalid_result, ToolResultPart)
+    assert invalid_result.tool_name == STRUCTURED_OUTPUT_TOOL_NAME
+    assert invalid_result.is_error is True
+    assert secret_value not in str(invalid_result.model_dump(mode="json"))
+    assert REDACTED_SECRET in invalid_result.content
+    assert REDACTED_SECRET in invalid_result.structured["structured_output_errors"][0]["message"]
+    assert secret_value not in str(provider.requests[1].messages[-1].model_dump(mode="json"))
 
 
 def test_cayu_app_uses_custom_repair_prompt_for_invalid_structured_output_tool_call():
@@ -14549,6 +14928,70 @@ def test_cayu_app_retries_invalid_native_structured_output_final_text():
     repair_message = transcript[2].content[0].text
     assert "Return only valid JSON" in repair_message
     assert STRUCTURED_OUTPUT_TOOL_NAME not in repair_message
+
+
+def test_cayu_app_redacts_native_structured_output_repair_prompt_errors():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "native-structured-output-error-secret"
+    store = InMemorySessionStore()
+    provider = NativeStructuredOutputFakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta(f'{{"answer":"{secret_value}"}}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta('{"answer":"ok"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret_value),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_native_structured_output_error_redaction",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"enum": ["ok"]}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    max_retries=1,
+                    strategy="native",
+                ),
+            ),
+        )
+    )
+    transcript = asyncio.run(
+        store.load_transcript("sess_native_structured_output_error_redaction")
+    )
+
+    failed_event = events[4]
+    retry_event = events[5]
+    assert failed_event.type == EventType.STRUCTURED_OUTPUT_FAILED
+    assert retry_event.type == EventType.STRUCTURED_OUTPUT_RETRY
+    assert secret_value not in str(failed_event.payload)
+    assert secret_value not in str(retry_event.payload)
+    assert REDACTED_SECRET in failed_event.payload["errors"][0]["message"]
+
+    repair_message = transcript[2].content[0].text
+    assert "Return only valid JSON" in repair_message
+    assert secret_value not in repair_message
+    assert REDACTED_SECRET in repair_message
+    assert secret_value not in str(provider.requests[1].messages[-1].model_dump(mode="json"))
 
 
 def test_cayu_app_rejects_native_structured_output_for_unsupported_provider():
@@ -17011,6 +17454,108 @@ def test_cancelled_runner_cleanup_diagnostics_are_preserved_in_tool_result():
     validate_context_messages(transcript)
     assert transcript[-1].role == "tool"
     assert transcript[-1].content[0].artifacts == [cleanup_artifact]
+
+
+def test_cancelled_runner_cleanup_diagnostics_are_redacted_in_tool_result():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "cleanup-secret-token"
+    cleanup_artifact = {
+        "type": "cayu.runner_cleanup.v1",
+        "adapter": "e2b",
+        "status": "timeout",
+        "stderr": f"failed with token {secret_value}",
+        "metadata": {"token": secret_value},
+    }
+
+    class CleanupDiagnosticTool(Tool):
+        spec = ToolSpec(
+            name="cleanup_diagnostic_tool",
+            description="Raise runner cancellation diagnostics.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.started is None or self.never_complete is None:
+                raise AssertionError("CleanupDiagnosticTool test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError as exc:
+                raise RunnerCancelledError(artifacts=[cleanup_artifact]) from exc
+            return ToolResult(content="unexpected")
+
+    tool = CleanupDiagnosticTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_1",
+                name="cleanup_diagnostic_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(secret_redactor=SecretRedactor(secret_value))
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        tool.started = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_tool_cleanup_redaction",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.started.wait()
+        _ = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_tool_cleanup_redaction",
+                    reason="operator stop",
+                )
+            )
+        ]
+        run_events = await run_task
+        stored_events = await app.session_store.load_events(
+            "sess_interrupt_tool_cleanup_redaction"
+        )
+        transcript = await app.session_store.load_transcript(
+            "sess_interrupt_tool_cleanup_redaction"
+        )
+        return run_events, stored_events, transcript
+
+    run_events, stored_events, transcript = asyncio.run(run())
+
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    failed_tool_event = next(
+        event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED
+    )
+    assert secret_value not in str(failed_tool_event.payload)
+    artifact = failed_tool_event.payload["result"]["artifacts"][0]
+    assert artifact["stderr"] == f"failed with token {REDACTED_SECRET}"
+    assert artifact["metadata"]["token"] == REDACTED_SECRET
+
+    validate_context_messages(transcript)
+    assert transcript[-1].role == "tool"
+    tool_part = transcript[-1].content[0]
+    assert isinstance(tool_part, ToolResultPart)
+    assert secret_value not in str(tool_part.model_dump(mode="json"))
+    assert tool_part.artifacts[0]["metadata"]["token"] == REDACTED_SECRET
 
 
 def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool():
