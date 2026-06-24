@@ -32,6 +32,7 @@ from cayu.providers import (
 )
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
+    AllowlistRule,
     BeforeStopContext,
     BeforeStopDecision,
     BudgetLimit,
@@ -64,6 +65,7 @@ from cayu.runtime import (
     MessageWindowContextPolicy,
     ModelCompactor,
     ModelPricing,
+    ParameterConstrainedToolPolicy,
     PricingCatalog,
     RecentTurnsContextPolicy,
     ResumeRequest,
@@ -8972,6 +8974,62 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert tool_result_part.is_error is True
 
 
+def test_cayu_app_blocks_tool_call_before_execution_with_parameter_policy():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "external"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("blocked handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"side_effect": [AllowlistRule("value", values=["internal"])]}
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_parameter_blocked_tool",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert tool.calls == []
+    blocked_event = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
+    assert blocked_event.payload["reason"] == "Parameter 'value' value is not allowed."
+    assert blocked_event.payload["metadata"] == {
+        "policy": "parameter_constrained",
+        "tool_name": "side_effect",
+        "parameter": "value",
+        "rule": "AllowlistRule",
+        "rule_index": 0,
+    }
+    tool_result_part = provider.requests[1].messages[-1].content[0]
+    assert tool_result_part.content == "Parameter 'value' value is not allowed."
+    assert tool_result_part.structured["metadata"]["policy"] == "parameter_constrained"
+    assert tool_result_part.is_error is True
+
+
 def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     store = InMemorySessionStore()
     tool = SideEffectTool()
@@ -10391,9 +10449,7 @@ def test_cayu_app_redacts_manual_tool_approval_recovery_result():
     assert tool_part.structured == {"token": REDACTED_SECRET}
     assert tool_part.artifacts[0]["metadata"]["token"] == REDACTED_SECRET
     assert provider.requests[1].messages[-1].role == "tool"
-    assert secret_value not in str(
-        provider.requests[1].messages[-1].model_dump(mode="json")
-    )
+    assert secret_value not in str(provider.requests[1].messages[-1].model_dump(mode="json"))
 
 
 def test_cayu_app_recovery_does_not_append_terminal_event_without_session_claim():
@@ -14603,9 +14659,7 @@ def test_cayu_app_redacts_structured_output_tool_validation_errors():
             ),
         )
     )
-    transcript = asyncio.run(
-        store.load_transcript("sess_structured_output_tool_error_redaction")
-    )
+    transcript = asyncio.run(store.load_transcript("sess_structured_output_tool_error_redaction"))
 
     failed_event = events[3]
     retry_event = events[4]
@@ -14975,9 +15029,7 @@ def test_cayu_app_redacts_native_structured_output_repair_prompt_errors():
             ),
         )
     )
-    transcript = asyncio.run(
-        store.load_transcript("sess_native_structured_output_error_redaction")
-    )
+    transcript = asyncio.run(store.load_transcript("sess_native_structured_output_error_redaction"))
 
     failed_event = events[4]
     retry_event = events[5]
@@ -17531,9 +17583,7 @@ def test_cancelled_runner_cleanup_diagnostics_are_redacted_in_tool_result():
             )
         ]
         run_events = await run_task
-        stored_events = await app.session_store.load_events(
-            "sess_interrupt_tool_cleanup_redaction"
-        )
+        stored_events = await app.session_store.load_events("sess_interrupt_tool_cleanup_redaction")
         transcript = await app.session_store.load_transcript(
             "sess_interrupt_tool_cleanup_redaction"
         )

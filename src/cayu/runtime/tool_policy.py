@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import StrEnum
@@ -126,6 +127,143 @@ class StaticToolPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class ParameterRule(ABC):
+    """Validates one argument path in a tool call.
+
+    A path can be a top-level argument name such as ``"to"`` or a dotted path
+    such as ``"request.url"`` for nested JSON objects.
+    """
+
+    @property
+    @abstractmethod
+    def parameter(self) -> str:
+        """Human-readable argument path this rule validates."""
+
+    @abstractmethod
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        """Return a violation reason, or ``None`` when the arguments satisfy the rule."""
+
+
+class RequiredFieldRule(ParameterRule):
+    """Require an argument path to be present and non-empty."""
+
+    def __init__(self, parameter: str) -> None:
+        self._path = _copy_parameter_path(parameter)
+        self._parameter = ".".join(self._path)
+
+    @property
+    def parameter(self) -> str:
+        return self._parameter
+
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return f"Required parameter '{self.parameter}' is missing."
+        if _is_empty_parameter_value(value):
+            return f"Required parameter '{self.parameter}' is empty."
+        return None
+
+
+class AllowlistRule(ParameterRule):
+    """Require an argument value to match one of the explicitly allowed strings."""
+
+    def __init__(self, parameter: str, *, values: Iterable[str]) -> None:
+        self._path = _copy_parameter_path(parameter)
+        self._parameter = ".".join(self._path)
+        self.values = _copy_nonempty_string_set(values, "values")
+        if not self.values:
+            raise ValueError("AllowlistRule values cannot be empty.")
+
+    @property
+    def parameter(self) -> str:
+        return self._parameter
+
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return None
+        if type(value) is not str:
+            return f"Parameter '{self.parameter}' must be a string for allowlist validation."
+        if value not in self.values:
+            return f"Parameter '{self.parameter}' value is not allowed."
+        return None
+
+
+class DenyPatternRule(ParameterRule):
+    """Reject a string argument when it matches one of the denied regex patterns."""
+
+    def __init__(self, parameter: str, *, patterns: Iterable[str]) -> None:
+        self._path = _copy_parameter_path(parameter)
+        self._parameter = ".".join(self._path)
+        pattern_list = _copy_nonempty_string_list(patterns, "patterns")
+        if not pattern_list:
+            raise ValueError("DenyPatternRule patterns cannot be empty.")
+        self.patterns = tuple(pattern_list)
+        self._compiled_patterns = tuple(re.compile(pattern) for pattern in pattern_list)
+
+    @property
+    def parameter(self) -> str:
+        return self._parameter
+
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return None
+        if type(value) is not str:
+            return f"Parameter '{self.parameter}' must be a string for pattern validation."
+        for pattern in self._compiled_patterns:
+            if pattern.search(value):
+                return f"Parameter '{self.parameter}' matches a denied pattern."
+        return None
+
+
+class ParameterConstrainedToolPolicy(ToolPolicy):
+    """Validate tool-call arguments with per-tool parameter rules.
+
+    Tools not present in ``rules`` are allowed. For constrained tools, the first
+    violated rule returns ``decision`` with a structured metadata payload. Deny
+    is the default because argument constraints are most often used as a hard
+    safety boundary, but requiring approval is also supported.
+    """
+
+    def __init__(
+        self,
+        rules: dict[str, Iterable[ParameterRule]],
+        *,
+        decision: ToolPolicyDecision = ToolPolicyDecision.DENY,
+    ) -> None:
+        if type(rules) is not dict:
+            raise TypeError("ParameterConstrainedToolPolicy rules must be a dict.")
+        decision = ToolPolicyDecision(decision)
+        if decision == ToolPolicyDecision.ALLOW:
+            raise ValueError("ParameterConstrainedToolPolicy decision cannot be ALLOW.")
+        self.decision = decision
+        self.rules: dict[str, tuple[ParameterRule, ...]] = {}
+        for tool_name, tool_rules in rules.items():
+            name = require_clean_nonblank(tool_name, "tool_name")
+            self.rules[name] = _copy_parameter_rules(tool_rules, f"rules[{name!r}]")
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        rules = self.rules.get(request.tool_name)
+        if rules is None:
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+        for index, rule in enumerate(rules):
+            violation = rule.check(request.arguments)
+            if violation is not None:
+                return ToolPolicyResult(
+                    decision=self.decision,
+                    reason=violation,
+                    metadata={
+                        "policy": "parameter_constrained",
+                        "tool_name": request.tool_name,
+                        "parameter": rule.parameter,
+                        "rule": type(rule).__name__,
+                        "rule_index": index,
+                    },
+                )
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
 def _copy_tool_name_set(value: Iterable[str], field_name: str) -> frozenset[str]:
     if isinstance(value, str | bytes):
         raise TypeError(f"{field_name} must be an iterable of tool names.")
@@ -138,3 +276,74 @@ def _copy_tool_name_set(value: Iterable[str], field_name: str) -> frozenset[str]
     for index, name in enumerate(names):
         copied.add(require_clean_nonblank(name, f"{field_name}[{index}]"))
     return frozenset(copied)
+
+
+def _copy_nonempty_string_list(value: Iterable[str], field_name: str) -> list[str]:
+    if isinstance(value, str | bytes):
+        raise TypeError(f"{field_name} must be an iterable of strings.")
+    try:
+        items = list(value)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of strings.") from exc
+    copied: list[str] = []
+    for index, item in enumerate(items):
+        copied.append(require_nonblank(item, f"{field_name}[{index}]"))
+    return copied
+
+
+def _copy_nonempty_string_set(value: Iterable[str], field_name: str) -> frozenset[str]:
+    return frozenset(_copy_nonempty_string_list(value, field_name))
+
+
+def _copy_parameter_rules(
+    value: Iterable[ParameterRule],
+    field_name: str,
+) -> tuple[ParameterRule, ...]:
+    if isinstance(value, ParameterRule):
+        raise TypeError(f"{field_name} must be an iterable of ParameterRule instances.")
+    try:
+        rules = list(value)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of ParameterRule instances.") from exc
+    copied: list[ParameterRule] = []
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, ParameterRule):
+            raise TypeError(f"{field_name}[{index}] must be a ParameterRule.")
+        copied.append(rule)
+    if not copied:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return tuple(copied)
+
+
+def _copy_parameter_path(parameter: str) -> tuple[str, ...]:
+    cleaned = require_clean_nonblank(parameter, "parameter")
+    parts = tuple(require_clean_nonblank(part, "parameter") for part in cleaned.split("."))
+    if not parts:
+        raise ValueError("parameter must contain at least one path part.")
+    return parts
+
+
+class _MissingArgument:
+    pass
+
+
+_MISSING = _MissingArgument()
+
+
+def _get_argument_path(arguments: dict[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = arguments
+    for part in path:
+        if type(current) is not dict or part not in current:
+            return _MISSING
+        current = current[part]
+    return current
+
+
+def _is_empty_parameter_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if type(value) is str:
+        return not value.strip()
+    if type(value) in {list, dict}:
+        return len(value) == 0
+    return False
