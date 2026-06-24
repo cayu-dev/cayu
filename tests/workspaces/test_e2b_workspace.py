@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from cayu.runners import E2BRunner
+from cayu.runners import E2BRunner, ExecResult
 from cayu.workspaces import DEFAULT_E2B_WORKSPACE_LIST_DEPTH, E2BWorkspace
 
 
@@ -75,7 +76,13 @@ class FakeE2BFs:
         self.dirs.add(parent)
         self.files[path] = content
 
-    async def list(self, path: str, *, depth: int | None, **kwargs: Any) -> list[FakeEntry]:
+    async def list(
+        self,
+        path: str,
+        *,
+        depth: int | None,
+        **kwargs: Any,
+    ) -> Sequence[FakeEntry]:
         self.list_calls.append((path, depth, dict(kwargs)))
         if path in self.fail_list_paths:
             raise RuntimeError("list failed")
@@ -124,6 +131,11 @@ def _workspace() -> tuple[E2BWorkspace, FakeE2BFs]:
     )
 
 
+def _replace_runner_exec(workspace: E2BWorkspace, func: Any) -> None:
+    runner = cast("Any", workspace.runner)
+    runner.exec = func
+
+
 def test_e2b_workspace_reads_writes_and_lists_native_fs() -> None:
     workspace, fs = _workspace()
 
@@ -149,6 +161,26 @@ def test_e2b_workspace_reads_writes_and_lists_native_fs() -> None:
         DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
         {"user": "sandbox-user", "request_timeout": 5.0},
     )
+
+
+def test_e2b_workspace_deletes_files_through_runner_exec() -> None:
+    workspace, fs = _workspace()
+    fs.files["/home/user/workspace/notes/a.txt"] = b"abcdef"
+    calls: list[tuple[list[str], str | None]] = []
+
+    async def fake_exec(command, *, cwd=None, **kwargs):
+        calls.append((list(command.argv or []), cwd))
+        assert command.argv == ["rm", "-f", "--", "/home/user/workspace/notes/a.txt"]
+        assert cwd is None
+        fs.files.pop("/home/user/workspace/notes/a.txt", None)
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    asyncio.run(workspace.delete("notes/a.txt"))
+
+    assert calls == [(["rm", "-f", "--", "/home/user/workspace/notes/a.txt"], None)]
+    assert "/home/user/workspace/notes/a.txt" not in fs.files
 
 
 def test_e2b_workspace_uses_default_bounds() -> None:
@@ -203,6 +235,53 @@ def test_e2b_workspace_rejects_writing_through_symlink_leaf() -> None:
         asyncio.run(workspace.write_bytes("out", b"secret"))
 
     assert "/etc/passwd" not in fs.files
+
+
+def test_e2b_workspace_rejects_writing_symlink_leaf_inside_workspace() -> None:
+    workspace, fs = _workspace()
+    fs.symlinks["/home/user/workspace/link"] = "/home/user/workspace/target.txt"
+    fs.files["/home/user/workspace/target.txt"] = b"keep"
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link", b"overwrite"))
+
+    assert fs.files["/home/user/workspace/target.txt"] == b"keep"
+
+
+def test_e2b_workspace_rejects_deleting_through_symlink_leaf() -> None:
+    workspace, fs = _workspace()
+    fs.symlinks["/home/user/workspace/out"] = "/etc/passwd"
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("out"))
+
+    assert called is False
+
+
+def test_e2b_workspace_rejects_deleting_directory_before_exec() -> None:
+    workspace, fs = _workspace()
+    fs.dirs.add("/home/user/workspace/notes")
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(IsADirectoryError, match="not a file"):
+        asyncio.run(workspace.delete("notes"))
+
+    assert called is False
 
 
 def test_e2b_workspace_skips_symlinks_when_listing() -> None:

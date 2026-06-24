@@ -76,14 +76,61 @@ try:
     candidate = pathlib.Path(rel_path)
     if candidate.is_absolute() or ".." in candidate.parts:
         fail("invalid_path", "Workspace paths must stay inside the workspace.")
-    target = (root / candidate).resolve()
+    target = root
+    for part in candidate.parts:
+        if part in {"", "."}:
+            continue
+        target = target / part
+        if target.is_symlink():
+            fail("invalid_path", "Workspace path escapes the workspace root.")
+    resolved = target.resolve(strict=False)
     try:
-        target.relative_to(root)
+        resolved.relative_to(root)
     except ValueError:
         fail("invalid_path", "Workspace path escapes the workspace root.")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
     print(json.dumps({"ok": True, "bytes": len(content)}))
+except Exception as exc:
+    fail("workspace_error", str(exc))
+"""
+
+_DELETE_SCRIPT = r"""
+import json
+import pathlib
+import sys
+
+
+def fail(error_type, message):
+    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
+    sys.exit(1)
+
+
+try:
+    rel_path = sys.argv[1]
+    root = pathlib.Path.cwd().resolve()
+    candidate = pathlib.Path(rel_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        fail("invalid_path", "Workspace paths must stay inside the workspace.")
+    target = root
+    for part in candidate.parts:
+        if part in {"", "."}:
+            continue
+        target = target / part
+        if target.is_symlink():
+            fail("invalid_path", "Workspace path escapes the workspace root.")
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        fail("invalid_path", "Workspace path escapes the workspace root.")
+    if not target.exists():
+        print(json.dumps({"ok": True, "deleted": False}))
+    elif not target.is_file():
+        fail("not_file", f"Workspace path is not a file: {rel_path}")
+    else:
+        target.unlink()
+        print(json.dumps({"ok": True, "deleted": True}))
 except Exception as exc:
     fail("workspace_error", str(exc))
 """
@@ -110,6 +157,19 @@ try:
     matches = []
     total_count = 0
     for path in sorted(root.rglob("*")):
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            continue
+        current = root
+        has_symlink = False
+        for part in rel_parts:
+            current = current / part
+            if current.is_symlink():
+                has_symlink = True
+                break
+        if has_symlink:
+            continue
         resolved = path.resolve()
         try:
             resolved.relative_to(root)
@@ -127,7 +187,7 @@ try:
             total_count += 1
             if limit is None or len(matches) < limit:
                 matches.append(rel_path)
-    print(json.dumps({"ok": True, "paths": matches, "total_count": total_count}))
+    print(json.dumps({"ok": True, "paths": sorted(matches), "total_count": total_count}))
 except Exception as exc:
     fail("workspace_error", str(exc))
 """
@@ -200,6 +260,14 @@ class RunnerWorkspace(Workspace):
         await self._run_json_script(
             _WRITE_SCRIPT,
             stdin=json.dumps(payload),
+            output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+        )
+
+    async def delete(self, path: str) -> None:
+        path = _validate_relative_path(path)
+        await self._run_json_script(
+            _DELETE_SCRIPT,
+            path,
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
 
@@ -342,4 +410,6 @@ def _raise_workspace_error(payload: dict[str, Any]) -> None:
         raise FileNotFoundError(message)
     if error_type in {"invalid_path", "invalid_pattern"}:
         raise ValueError(message)
+    if error_type == "not_file":
+        raise IsADirectoryError(message)
     raise RuntimeError(message)

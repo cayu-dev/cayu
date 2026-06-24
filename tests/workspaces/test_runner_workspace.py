@@ -36,6 +36,97 @@ def test_runner_workspace_reads_writes_and_lists_through_runner(tmp_path) -> Non
     assert list_result.truncated is False
 
 
+def test_runner_workspace_deletes_files_through_runner(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+
+    asyncio.run(workspace.write_bytes("notes/a.txt", b"abcdef"))
+    asyncio.run(workspace.delete("notes/a.txt"))
+    asyncio.run(workspace.delete("notes/missing.txt"))
+
+    assert not (tmp_path / "notes" / "a.txt").exists()
+    list_result = asyncio.run(workspace.list("**/*.txt", limit=10))
+    assert list_result.paths == ()
+    assert list_result.total_count == 0
+
+
+def test_runner_workspace_rejects_delete_symlink_leaf_inside_runner_root(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"keep")
+    (tmp_path / "link.txt").symlink_to(target)
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("link.txt"))
+
+    assert target.read_bytes() == b"keep"
+    assert (tmp_path / "link.txt").is_symlink()
+
+
+def test_runner_workspace_rejects_write_symlink_leaf_inside_runner_root(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"keep")
+    (tmp_path / "link.txt").symlink_to(target)
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link.txt", b"overwrite"))
+
+    assert target.read_bytes() == b"keep"
+    assert (tmp_path / "link.txt").is_symlink()
+
+
+def test_runner_workspace_rejects_delete_through_symlink_parent_inside_runner_root(
+    tmp_path,
+) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target = target_dir / "a.txt"
+    target.write_bytes(b"keep")
+    (tmp_path / "link").symlink_to(target_dir)
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("link/a.txt"))
+
+    assert target.read_bytes() == b"keep"
+    assert (tmp_path / "link").is_symlink()
+
+
+def test_runner_workspace_rejects_write_through_symlink_parent_inside_runner_root(
+    tmp_path,
+) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target = target_dir / "a.txt"
+    target.write_bytes(b"keep")
+    (tmp_path / "link").symlink_to(target_dir)
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link/a.txt", b"overwrite"))
+
+    assert target.read_bytes() == b"keep"
+    assert (tmp_path / "link").is_symlink()
+
+
+def test_runner_workspace_list_skips_symlink_paths_inside_runner_root(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"keep")
+    (tmp_path / "link.txt").symlink_to(target)
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    nested = target_dir / "a.txt"
+    nested.write_bytes(b"nested")
+    (tmp_path / "link_dir").symlink_to(target_dir)
+    workspace = _workspace(tmp_path)
+
+    result = asyncio.run(workspace.list("**/*.txt"))
+
+    assert result.paths == ("target.txt", "target/a.txt")
+    assert result.total_count == 2
+    assert result.truncated is False
+
+
 def test_runner_workspace_uses_default_remote_bounds(tmp_path) -> None:
     workspace = RunnerWorkspace(
         LocalRunner(tmp_path, inherit_env=False),

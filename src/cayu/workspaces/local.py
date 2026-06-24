@@ -42,8 +42,12 @@ class LocalWorkspace(Workspace):
     async def write_bytes(self, path: str, content: bytes) -> None:
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
-        target = self.resolve(path)
+        target = self.resolve_no_symlinks(path)
         await asyncio.to_thread(_write_file, target, content)
+
+    async def delete(self, path: str) -> None:
+        target = self.resolve_no_symlinks(path)
+        await asyncio.to_thread(_delete_file, target)
 
     async def list(
         self,
@@ -78,6 +82,29 @@ class LocalWorkspace(Workspace):
         except ValueError as exc:
             raise ValueError("Workspace path escapes the workspace root.") from exc
 
+    def resolve_no_symlinks(self, path: str) -> Path:
+        path = require_nonblank(path, "path")
+        candidate = Path(path)
+        if candidate.is_absolute():
+            raise ValueError("Workspace paths must be relative.")
+        target = self._resolve_without_symlinks(candidate)
+        self._ensure_inside_root(target.resolve(strict=False))
+        return target
+
+    def _resolve_without_symlinks(self, candidate: Path) -> Path:
+        current = self.root
+        for part in candidate.parts:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                current = (current / part).resolve(strict=False)
+                self._ensure_inside_root(current)
+                continue
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("Workspace path escapes the workspace root.")
+        return current
+
 
 def _has_parent_reference(pattern: str) -> bool:
     return ".." in Path(pattern).parts
@@ -86,6 +113,14 @@ def _has_parent_reference(pattern: str) -> bool:
 def _write_file(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+def _delete_file(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise IsADirectoryError(f"Workspace path is not a file: {path}")
+    path.unlink()
 
 
 def _read_file(path: Path, max_bytes: int | None) -> WorkspaceReadResult:
@@ -116,6 +151,8 @@ def _list_files(
     paths: list[str] = []
     total_count = 0
     for path in root.glob(pattern):
+        if _has_symlink_component(root, path):
+            continue
         resolved = path.resolve()
         _ensure_inside_root(root, resolved)
         if resolved == root or not resolved.is_file():
@@ -134,6 +171,19 @@ def _list_files(
         total_count=total_count,
         truncated=False,
     )
+
+
+def _has_symlink_component(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def _ensure_inside_root(root: Path, path: Path) -> None:

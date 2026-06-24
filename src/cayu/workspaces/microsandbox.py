@@ -6,7 +6,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import DEFAULT_MICROSANDBOX_CWD, MicrosandboxRunner
+from cayu.runners import DEFAULT_MICROSANDBOX_CWD, ExecCommand, MicrosandboxRunner
 from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
@@ -69,9 +69,47 @@ class MicrosandboxWorkspace(Workspace):
         fs = self._filesystem()
         await _mkdir_parents(fs, posixpath.dirname(guest_path), stop_at=self.root)
         parent_path = posixpath.dirname(guest_path)
-        await self._require_contained_real_path(parent_path)
+        parent_real_path = await self._require_contained_real_path(parent_path)
+        if parent_real_path != parent_path:
+            raise ValueError("Workspace path escapes the workspace root.")
         existing_path = await self._optional_contained_real_path(guest_path)
-        await fs.write(existing_path or guest_path, content)
+        if existing_path is not None and existing_path != guest_path:
+            raise ValueError("Workspace path escapes the workspace root.")
+        await fs.write(guest_path, content)
+
+    async def delete(self, path: str) -> None:
+        guest_path = self.resolve(path)
+        parent_path = posixpath.dirname(guest_path)
+        try:
+            parent_real_path = await self._require_contained_real_path(parent_path)
+        except FileNotFoundError:
+            return
+        if parent_real_path != parent_path:
+            raise ValueError("Workspace path escapes the workspace root.")
+        existing_path = await self._optional_contained_real_path(guest_path)
+        if existing_path is None:
+            return
+        if existing_path != guest_path:
+            raise ValueError("Workspace path escapes the workspace root.")
+        try:
+            metadata = await self._filesystem().stat(existing_path)
+        except Exception as exc:
+            if _is_path_not_found_error(exc):
+                return
+            raise RuntimeError(
+                f"Failed to stat Microsandbox workspace file: {path}: {exc}"
+            ) from exc
+        kind = getattr(metadata, "kind", None)
+        if kind not in {"file", "regular"}:
+            raise IsADirectoryError(f"Workspace path is not a file: {path}")
+        result = await self.runner.exec(
+            ExecCommand.process("rm", "-f", "--", existing_path),
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Failed to delete Microsandbox workspace file: "
+                f"{path}: {result.stderr.strip() or result.stdout.strip()}"
+            )
 
     async def list(
         self,

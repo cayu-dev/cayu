@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 
-from cayu.runners import MicrosandboxRunner
+from cayu.runners import ExecResult, MicrosandboxRunner
 from cayu.workspaces import MicrosandboxWorkspace
 from cayu.workspaces.microsandbox import _is_path_not_found_error
 
@@ -77,7 +79,7 @@ class FakeMicrosandboxFs:
             raise RuntimeError("mkdir failed")
         self.dirs.add(path)
 
-    async def list(self, path: str) -> list[FakeFsEntry]:
+    async def list(self, path: str) -> Sequence[FakeFsEntry]:
         path = self.real_path(path)
         if path in self.fail_list_paths:
             raise RuntimeError("list failed")
@@ -174,6 +176,11 @@ def _workspace() -> tuple[MicrosandboxWorkspace, FakeMicrosandboxFs]:
     return MicrosandboxWorkspace(runner, workspace_id="sandbox-workspace"), fs
 
 
+def _replace_runner_exec(workspace: MicrosandboxWorkspace, func: Any) -> None:
+    runner = cast("Any", workspace.runner)
+    runner.exec = func
+
+
 def test_microsandbox_workspace_reads_writes_and_lists_native_fs() -> None:
     workspace, fs = _workspace()
 
@@ -190,6 +197,27 @@ def test_microsandbox_workspace_reads_writes_and_lists_native_fs() -> None:
     assert list_result.total_count == 2
     assert list_result.truncated is False
     assert "/workspace/notes" in fs.mkdir_calls
+
+
+def test_microsandbox_workspace_deletes_files_through_runner_exec() -> None:
+    workspace, fs = _workspace()
+    fs.files["/workspace/notes/a.txt"] = b"abcdef"
+    fs.dirs.add("/workspace/notes")
+    calls: list[tuple[list[str], str | None]] = []
+
+    async def fake_exec(command, *, cwd=None, **kwargs):
+        calls.append((list(command.argv or []), cwd))
+        assert command.argv == ["rm", "-f", "--", "/workspace/notes/a.txt"]
+        assert cwd is None
+        fs.files.pop("/workspace/notes/a.txt", None)
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    asyncio.run(workspace.delete("notes/a.txt"))
+
+    assert calls == [(["rm", "-f", "--", "/workspace/notes/a.txt"], None)]
+    assert "/workspace/notes/a.txt" not in fs.files
 
 
 def test_microsandbox_workspace_uses_default_bounds() -> None:
@@ -234,6 +262,107 @@ def test_microsandbox_workspace_rejects_realpath_escape() -> None:
 
     with pytest.raises(ValueError, match="escapes"):
         asyncio.run(workspace.read_bytes("link/passwd"))
+
+
+def test_microsandbox_workspace_rejects_deleting_through_realpath_escape() -> None:
+    workspace, fs = _workspace()
+    fs.symlinks["/workspace/link"] = "/etc"
+    fs.files["/etc/passwd"] = b"secret"
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("link/passwd"))
+
+    assert called is False
+
+
+def test_microsandbox_workspace_rejects_deleting_symlink_leaf_inside_workspace() -> None:
+    workspace, fs = _workspace()
+    fs.symlinks["/workspace/link"] = "/workspace/target.txt"
+    fs.files["/workspace/target.txt"] = b"keep"
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("link"))
+
+    assert called is False
+    assert fs.files["/workspace/target.txt"] == b"keep"
+
+
+def test_microsandbox_workspace_rejects_writing_symlink_leaf_inside_workspace() -> None:
+    workspace, fs = _workspace()
+    fs.symlinks["/workspace/link"] = "/workspace/target.txt"
+    fs.files["/workspace/target.txt"] = b"keep"
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link", b"overwrite"))
+
+    assert fs.files["/workspace/target.txt"] == b"keep"
+
+
+def test_microsandbox_workspace_rejects_deleting_through_symlink_parent_inside_workspace() -> None:
+    workspace, fs = _workspace()
+    fs.dirs.add("/workspace/target")
+    fs.files["/workspace/target/a.txt"] = b"keep"
+    fs.symlinks["/workspace/link"] = "/workspace/target"
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.delete("link/a.txt"))
+
+    assert called is False
+    assert fs.files["/workspace/target/a.txt"] == b"keep"
+
+
+def test_microsandbox_workspace_rejects_writing_through_symlink_parent_inside_workspace() -> None:
+    workspace, fs = _workspace()
+    fs.dirs.add("/workspace/target")
+    fs.files["/workspace/target/a.txt"] = b"keep"
+    fs.symlinks["/workspace/link"] = "/workspace/target"
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link/a.txt", b"overwrite"))
+
+    assert fs.files["/workspace/target/a.txt"] == b"keep"
+
+
+def test_microsandbox_workspace_rejects_deleting_directory_before_exec() -> None:
+    workspace, fs = _workspace()
+    fs.dirs.add("/workspace/notes")
+    called = False
+
+    async def fake_exec(command, **kwargs):
+        nonlocal called
+        called = True
+        return ExecResult(exit_code=0)
+
+    _replace_runner_exec(workspace, fake_exec)
+
+    with pytest.raises(IsADirectoryError, match="not a file"):
+        asyncio.run(workspace.delete("notes"))
+
+    assert called is False
 
 
 def test_microsandbox_workspace_surfaces_list_failure() -> None:

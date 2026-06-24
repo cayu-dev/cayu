@@ -6176,6 +6176,7 @@ def _binding_base_payload(
 
 def _bound_workspace_payload(bound: BoundWorkspace) -> dict[str, Any]:
     return {
+        "source_workspace_id": _workspace_object_id(bound.source_workspace),
         "bound_workspace_id": _workspace_object_id(bound.workspace),
         "bound_path": bound.path,
         "bound_metadata": copy_json_value(bound.metadata, "bound_metadata"),

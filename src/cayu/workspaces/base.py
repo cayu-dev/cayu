@@ -77,6 +77,10 @@ class Workspace(ABC):
         """Write a file into the workspace."""
 
     @abstractmethod
+    async def delete(self, path: str) -> None:
+        """Delete a file from the workspace if it exists."""
+
+    @abstractmethod
     async def list(
         self,
         pattern: str = "**/*",

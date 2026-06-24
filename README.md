@@ -169,6 +169,67 @@ Likewise, `E2BRunner.create(envs=...)` configures sandbox-level environment
 variables. Treat those values as visible to code running in the sandbox, and use
 them only for non-secret boot/config values.
 
+Use `SyncBinding` when a durable source workspace should be staged into a
+separate bound workspace for one session, then copied back after the run. This is
+useful when the active runner has its own filesystem, such as E2B or
+Microsandbox, while the app keeps the canonical workspace in local storage, S3,
+or another workspace implementation:
+
+```python
+from cayu import (
+    E2BRunner,
+    E2BWorkspace,
+    Environment,
+    EnvironmentSpec,
+    LocalWorkspace,
+    SyncBinding,
+)
+
+source = LocalWorkspace("./project", workspace_id="project")
+runner = await E2BRunner.create(close_action="kill")
+target = E2BWorkspace(runner, workspace_id="session-e2b")
+
+environment = Environment(
+    EnvironmentSpec(name="project-session"),
+    workspace=source,
+    runner=runner,
+    binding=SyncBinding(target_workspace=target, path="/home/user/workspace"),
+)
+```
+
+During the run, file tools and command tools operate on the bound workspace. On
+finalize, `SyncBinding` copies changed files back to the source workspace and can
+also propagate deletions. It does not commit to Git, push branches, or hide
+storage policy; applications decide how durable workspaces are backed and when
+agent-produced changes should be reviewed or published.
+The minimal snippet above uses one explicit target workspace and is suitable for
+one live session. For concurrent sessions or per-session sandboxes, use
+`target_workspace_factory` or an `EnvironmentFactory` so each session gets a
+dedicated bound workspace.
+`max_file_bytes=None` means `SyncBinding` does not add its own per-file cap, but
+the workspace being read may still enforce its default read limit. Configure the
+source and target workspace read limits, or `max_file_bytes`, explicitly for
+large files.
+
+Docker and Docker Sandboxes (`sbx`) do not have dedicated native workspace
+adapters. Use `RunnerWorkspace` as the bound target so workspace file operations
+execute through the runner:
+
+```python
+from cayu import DockerRunner, RunnerWorkspace, SyncBinding
+
+runner = await DockerRunner.create(
+    "session-123",
+    image="python:3.13-alpine",
+)
+target = RunnerWorkspace(runner, workspace_id="session-docker")
+binding = SyncBinding(target_workspace=target, path=runner.default_cwd)
+```
+
+`RunnerWorkspace` requires `python3` inside the guest because file operations run
+small Python scripts through the runner. Use a Python image, or install Python
+with the runner's setup commands.
+
 The OpenAI provider uses Responses API streaming by default. Tune the ordinary HTTP
 timeout and the no-provider-event stall timeout separately:
 

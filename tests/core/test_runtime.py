@@ -324,6 +324,9 @@ class MemoryWorkspace(Workspace):
     async def write_bytes(self, path: str, content: bytes) -> None:
         return None
 
+    async def delete(self, path: str) -> None:
+        return None
+
     async def list(
         self,
         pattern: str = "**/*",
@@ -433,6 +436,7 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
             raise RuntimeError("bind failed")
         return BoundWorkspace(
             workspace=self.bound_workspace if self.bound_workspace is not None else workspace,
+            source_workspace=workspace,
             runner=runner,
             path="/bound",
             metadata={"binding": "recording"},
@@ -1607,6 +1611,7 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         "binding_type": "RecordingWorkspaceBinding",
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
+        "source_workspace_id": configured_workspace.id,
         "bound_workspace_id": bound_workspace.id,
         "bound_path": "/bound",
         "bound_metadata": {"binding": "recording"},
@@ -1619,6 +1624,7 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         EventType.SESSION_COMPLETED,
     ]
     assert events[-3].payload["configured_workspace_id"] == configured_workspace.id
+    assert events[-3].payload["source_workspace_id"] == configured_workspace.id
     assert events[-3].payload["bound_workspace_id"] == bound_workspace.id
     assert events[-3].payload["outcome"] == "completed"
     assert events[-3].payload["bound_snapshot"] is None
@@ -1700,14 +1706,10 @@ def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
         event for event in events if event.type == EventType.ENVIRONMENT_BINDING_COMPLETED
     )
     finalize_started = next(
-        event
-        for event in events
-        if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
+        event for event in events if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
     )
     finalize_completed = next(
-        event
-        for event in events
-        if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+        event for event in events if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
     )
     assert binding_completed.payload["bound_snapshot"] == {
         "snapshot_id": bind_snapshot.snapshot_id,
@@ -1716,9 +1718,7 @@ def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
         "source": bind_snapshot.source,
         "metadata": bind_snapshot.metadata,
     }
-    assert finalize_started.payload["bound_snapshot"] == binding_completed.payload[
-        "bound_snapshot"
-    ]
+    assert finalize_started.payload["bound_snapshot"] == binding_completed.payload["bound_snapshot"]
     assert finalize_completed.payload["final_snapshot"] == {
         "snapshot_id": final_snapshot.snapshot_id,
         "workspace_id": final_snapshot.workspace_id,
@@ -2348,9 +2348,10 @@ def test_cayu_app_recovery_factory_failure_returns_to_interrupted_before_resume(
         EventType.SESSION_INTERRUPTED,
     ]
     assert recovery_events[-1].payload["error"] == "factory failed"
-    assert recovery_events[-1].payload["approval_id"] == recovery_events[-1].payload[
-        "approval"
-    ]["approval_id"]
+    assert (
+        recovery_events[-1].payload["approval_id"]
+        == recovery_events[-1].payload["approval"]["approval_id"]
+    )
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
 

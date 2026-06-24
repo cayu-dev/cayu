@@ -6,7 +6,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import DEFAULT_E2B_CWD, E2BRunner
+from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand
 from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
 
 DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
@@ -76,6 +76,32 @@ class E2BWorkspace(Workspace):
             user=self.user,
             request_timeout=self.request_timeout_s,
         )
+
+    async def delete(self, path: str) -> None:
+        guest_path = self.resolve(path)
+        await self._reject_symlink_path(posixpath.dirname(guest_path), allow_missing_suffix=True)
+        try:
+            metadata = await self._filesystem().get_info(
+                guest_path,
+                user=self.user,
+                request_timeout=self.request_timeout_s,
+            )
+        except Exception as exc:
+            if _is_path_not_found_error(exc):
+                return
+            raise RuntimeError(f"Failed to inspect E2B workspace path: {guest_path}") from exc
+        if _is_symlink(metadata):
+            raise ValueError("Workspace path escapes the workspace root.")
+        if _entry_type(metadata) != "file":
+            raise IsADirectoryError(f"Workspace path is not a file: {path}")
+        result = await self.runner.exec(
+            ExecCommand.process("rm", "-f", "--", guest_path),
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Failed to delete E2B workspace file: "
+                f"{path}: {result.stderr.strip() or result.stdout.strip()}"
+            )
 
     async def list(
         self,
