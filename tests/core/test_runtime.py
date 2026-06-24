@@ -30,6 +30,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
+from cayu.proxies import PassthroughProxy
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
     AllowlistRule,
@@ -104,6 +105,7 @@ from cayu.tools import (
     SubagentSpec,
     SubagentTool,
 )
+from cayu.vaults import StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -10961,6 +10963,68 @@ def test_cayu_app_tool_policy_receives_workspace_identity():
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].environment_name == "local"
     assert policy.requests[0].workspace_id == "workspace_1"
+
+
+def test_cayu_app_wires_environment_proxy_into_tool_context():
+    class ProxyProbeTool(Tool):
+        spec = ToolSpec(
+            name="probe_proxy",
+            description="Record proxy identity.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.proxies: list[object] = []
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            self.proxies.append(ctx.proxy)
+            return ToolResult(content="ok")
+
+    vault = StaticVault({"api_key": "sk-secret-123"})
+    proxy = PassthroughProxy(vault)
+    tool = ProxyProbeTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="probe_proxy",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=proxy,
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_context_proxy",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert tool.proxies == [proxy]
 
 
 def test_cayu_app_tool_policy_receives_run_request_metadata_copy():

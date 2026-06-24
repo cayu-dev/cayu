@@ -4419,6 +4419,7 @@ class CayuApp:
                 artifact_store=_artifact_store(registered_environment),
                 runner=_runner(registered_environment),
                 vault=_vault(registered_environment),
+                proxy=_proxy(registered_environment),
                 mcp_servers=_mcp_servers(registered_environment),
                 metadata=tool_execution.context_metadata(
                     tool_call_id=tool_call.id,
@@ -6916,6 +6917,12 @@ def _vault(registered_environment: runtime_records.RegisteredEnvironment | None)
     if registered_environment is None:
         return None
     return registered_environment.environment.vault
+
+
+def _proxy(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.proxy
 
 
 def _mcp_servers(

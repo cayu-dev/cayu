@@ -89,6 +89,7 @@ from cayu.providers import (
     ModelFinishReason,
     OpenAIProvider,
 )
+from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import (
     DEFAULT_DOCKER_CWD,
     DEFAULT_DOCKER_IMAGE,
@@ -381,6 +382,7 @@ __all__ = [
     "ContextPolicy",
     "ContextRequest",
     "CostLineItem",
+    "CredentialProxy",
     "DefaultContextPolicy",
     "DenyPatternRule",
     "DispatchHandle",
@@ -464,6 +466,7 @@ __all__ = [
     "OpenAIProvider",
     "ParameterConstrainedToolPolicy",
     "ParameterRule",
+    "PassthroughProxy",
     "PdfArtifactReader",
     "PendingToolApproval",
     "PendingToolCallApproval",
@@ -472,6 +475,7 @@ __all__ = [
     "PostgresTaskStore",
     "PricingCatalog",
     "ProviderStatePart",
+    "ProxyAuthorizationResult",
     "ReadFileOptions",
     "ReadFileTool",
     "RecentTurnsContextPolicy",

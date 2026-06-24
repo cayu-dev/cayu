@@ -10,6 +10,7 @@ from cayu._validation import copy_json_value, require_clean_nonblank, require_no
 from cayu.artifacts import ArtifactStore
 from cayu.environments.bindings import WorkspaceBinding
 from cayu.mcp import McpServerSpec
+from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
@@ -111,6 +112,7 @@ class Environment:
         artifact_store: ArtifactStore | None = None,
         runner: Runner | None = None,
         vault: Vault | None = None,
+        proxy: CredentialProxy | None = None,
         binding: WorkspaceBinding | None = None,
         mcp_servers: Iterable[McpServerSpec] | None = None,
         workspace_instructions: WorkspaceInstructionsInput | None = None,
@@ -127,6 +129,8 @@ class Environment:
             raise TypeError("runner must be a Runner.")
         if vault is not None and not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
+        if proxy is not None and not isinstance(proxy, CredentialProxy):
+            raise TypeError("proxy must be a CredentialProxy.")
         if binding is not None and not isinstance(binding, WorkspaceBinding):
             raise TypeError("binding must be a WorkspaceBinding.")
 
@@ -144,6 +148,7 @@ class Environment:
         self.artifact_store = artifact_store
         self.runner = runner
         self.vault = vault
+        self.proxy = proxy
         self.binding = binding
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
@@ -174,6 +179,7 @@ def copy_environment(environment: Environment) -> Environment:
         artifact_store=environment.artifact_store,
         runner=environment.runner,
         vault=environment.vault,
+        proxy=environment.proxy,
         binding=environment.binding,
         mcp_servers=environment.mcp_servers,
         workspace_instructions=environment.workspace_instructions,
