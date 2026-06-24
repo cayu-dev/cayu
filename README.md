@@ -23,7 +23,7 @@ Cayu treats payloads, metadata, tool arguments, tool results, model options, che
 
 Framework objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
 
 Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue.
 
@@ -41,6 +41,7 @@ src/cayu/
   providers/   model provider contracts
   mcp/         MCP client/server integration contracts
   vaults/      secrets access contracts
+  proxies/     credential proxy contracts
   cli/         developer/admin CLI
 ```
 
@@ -304,6 +305,31 @@ app = CayuApp(
     ],
 )
 ```
+
+`SecretRedactor` redacts resolved secret values, not secret reference names or
+keys. For example, a reference name such as `sendgrid_api_key` may remain in
+metadata, while the resolved value `SG.x...` is replaced with
+`[REDACTED_SECRET]` before events, transcripts, provider context, or logs are
+persisted/displayed through Cayu's redaction path.
+
+Tools can also use an environment credential proxy when the app wants a trusted
+tool to request a scoped credential through a controlled boundary:
+
+```python
+from cayu import Environment, EnvironmentSpec, LocalEnvVault, PassthroughProxy
+
+vault = LocalEnvVault({"sendgrid_api_key": "SENDGRID_API_KEY"})
+environment = Environment(
+    EnvironmentSpec(name="trusted-tools"),
+    vault=vault,
+    proxy=PassthroughProxy(vault),
+)
+```
+
+`ctx.proxy.resolve(...)` values are automatically added to the redactor for that
+tool result, so accidental leaks from the trusted tool result are redacted before
+they reach durable events, transcripts, or the next model request. This is
+defense in depth; it does not make generic shell execution safe for secrets.
 
 ## Usage And Cache Metrics
 
@@ -1354,6 +1380,42 @@ app.register_agent(
     tool_policy=StaticToolPolicy(allow=["read_file", "list_files"]),
 )
 ```
+
+Use parameter-constrained policies when a tool is allowed only for specific
+argument shapes:
+
+```python
+from cayu import (
+    AgentSpec,
+    AllowlistRule,
+    DenyPatternRule,
+    ParameterConstrainedToolPolicy,
+    RequiredFieldRule,
+    ToolPolicyDecision,
+)
+
+policy = ParameterConstrainedToolPolicy(
+    {
+        "send_email": [
+            RequiredFieldRule("to"),
+            AllowlistRule("template", values=["invoice_reminder", "receipt"]),
+            DenyPatternRule("to", patterns=[r"@example\.invalid$"]),
+        ],
+    },
+    decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+)
+
+app.register_agent(
+    AgentSpec(name="billing_assistant", model="gpt-5.5"),
+    tools=[send_email_tool],
+    tool_policy=policy,
+)
+```
+
+Here `send_email_tool` is an application-owned tool whose spec name is
+`send_email`. The policy runs before the tool implementation. Violations either
+block the call or request durable approval, depending on the configured
+decision.
 
 Custom policies can also require caller approval before a tool round runs. The runtime checkpoints the pending approval, emits `tool.call.approval_requested`, marks the session `interrupted`, and waits for `resolve_tool_approval(...)`:
 

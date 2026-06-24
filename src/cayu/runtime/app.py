@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -60,6 +60,7 @@ from cayu.providers import (
     copy_model_stream_event,
     normalize_model_completion,
 )
+from cayu.proxies import CredentialProxy, ProxyAuthorizationResult
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -228,7 +229,7 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_payload,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
@@ -4406,6 +4407,7 @@ class CayuApp:
                     f"Unsupported tool policy decision: {resolved_policy_result.decision}"
                 )
 
+        resolved_proxy_secrets: list[ResolvedSecret] = []
         result = await tool_execution.run_tool(
             tool=registered_tool.tool,
             ctx=ToolContext(
@@ -4419,7 +4421,10 @@ class CayuApp:
                 artifact_store=_artifact_store(registered_environment),
                 runner=_runner(registered_environment),
                 vault=_vault(registered_environment),
-                proxy=_proxy(registered_environment),
+                proxy=_proxy(
+                    registered_environment,
+                    on_resolve=resolved_proxy_secrets.append,
+                ),
                 mcp_servers=_mcp_servers(registered_environment),
                 metadata=tool_execution.context_metadata(
                     tool_call_id=tool_call.id,
@@ -4441,6 +4446,10 @@ class CayuApp:
             payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
+        redactor = _redactor_with_resolved_secrets(
+            self._secret_redactor,
+            resolved_proxy_secrets,
+        )
         async for event in self._emit_tool_call_result_with_hooks(
             event=Event(
                 type=event_type,
@@ -4456,6 +4465,7 @@ class CayuApp:
             tool_call=tool_call,
             result=result,
             task_id=task_id,
+            redactor=redactor,
         ):
             yield event
 
@@ -5586,11 +5596,13 @@ class CayuApp:
         tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
+        redactor: SecretRedactor | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        resolved_redactor = redactor if redactor is not None else self._secret_redactor
         event, result = _redact_tool_result_event(
             event=event,
             result=result,
-            redactor=self._secret_redactor,
+            redactor=resolved_redactor,
         )
         tool_event = await self._emit(event)
         outcome = runtime_records.ToolCallOutcome(call=tool_call, result=result)
@@ -6919,10 +6931,61 @@ def _vault(registered_environment: runtime_records.RegisteredEnvironment | None)
     return registered_environment.environment.vault
 
 
-def _proxy(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
+class _RedactingCredentialProxy(CredentialProxy):
+    def __init__(
+        self,
+        proxy: CredentialProxy,
+        on_resolve: Callable[[ResolvedSecret], None],
+    ) -> None:
+        if not isinstance(proxy, CredentialProxy):
+            raise TypeError("proxy must be a CredentialProxy.")
+        if not callable(on_resolve):
+            raise TypeError("on_resolve must be callable.")
+        self._proxy = proxy
+        self._on_resolve = on_resolve
+
+    async def resolve(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> ResolvedSecret:
+        secret = await self._proxy.resolve(ref, scope=scope)
+        if type(secret) is not ResolvedSecret:
+            raise TypeError("Proxy secret resolution must return ResolvedSecret.")
+        self._on_resolve(secret)
+        return secret
+
+    async def authorize_request(
+        self,
+        *,
+        destination: str,
+        credential: SecretRef | None = None,
+        action: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ProxyAuthorizationResult:
+        result = await self._proxy.authorize_request(
+            destination=destination,
+            credential=credential,
+            action=action,
+            metadata=metadata,
+        )
+        if type(result) is not ProxyAuthorizationResult:
+            raise TypeError("Proxy authorization must return ProxyAuthorizationResult.")
+        return result
+
+
+def _proxy(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    *,
+    on_resolve: Callable[[ResolvedSecret], None],
+) -> Any:
     if registered_environment is None:
         return None
-    return registered_environment.environment.proxy
+    proxy = registered_environment.environment.proxy
+    if proxy is None:
+        return None
+    return _RedactingCredentialProxy(proxy, on_resolve)
 
 
 def _mcp_servers(
@@ -7311,6 +7374,18 @@ def _redact_tool_call_outcome(
         call=outcome.call,
         result=tool_results.redact_tool_result(outcome.result, redactor),
     )
+
+
+def _redactor_with_resolved_secrets(
+    redactor: SecretRedactor,
+    secrets: list[ResolvedSecret],
+) -> SecretRedactor:
+    resolved_redactor = redactor
+    for secret in secrets:
+        if type(secret) is not ResolvedSecret:
+            raise TypeError("Resolved proxy secrets must be ResolvedSecret instances.")
+        resolved_redactor = resolved_redactor.with_secret(secret)
+    return resolved_redactor
 
 
 def _redact_structured_output_validation(

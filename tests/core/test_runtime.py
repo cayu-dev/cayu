@@ -30,7 +30,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
-from cayu.proxies import PassthroughProxy
+from cayu.proxies import CredentialProxy, PassthroughProxy
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
     AllowlistRule,
@@ -105,7 +105,7 @@ from cayu.tools import (
     SubagentSpec,
     SubagentTool,
 )
-from cayu.vaults import StaticVault
+from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -768,6 +768,105 @@ def test_cayu_app_redacts_tool_results_before_events_transcript_and_context() ->
     )
 
     transcript = asyncio.run(store.load_transcript("sess_tool_result_redaction"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    tool_part = tool_message.content[0]
+    assert isinstance(tool_part, ToolResultPart)
+    assert secret_value not in str(tool_part.model_dump(mode="json"))
+    assert tool_part.content == f"connected with {REDACTED_SECRET}"
+    assert tool_part.structured is not None
+    assert tool_part.structured["token"] == REDACTED_SECRET
+    assert tool_part.artifacts[0]["metadata"]["authorization"] == f"Bearer {REDACTED_SECRET}"
+
+    second_request = provider.requests[1]
+    assert secret_value not in str(
+        [message.model_dump(mode="json") for message in second_request.messages]
+    )
+
+
+def test_cayu_app_redacts_proxy_resolved_secrets_from_tool_results() -> None:
+    from cayu.vaults import REDACTED_SECRET
+
+    secret_value = "sk-proxy-resolved-secret"
+
+    class ProxyLeakingTool(Tool):
+        spec = ToolSpec(
+            name="proxy_leak",
+            description="Resolve a proxy secret and accidentally return it.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            resolved = await ctx.proxy.resolve(
+                SecretRef(name="api_key"),
+                scope={"session_id": ctx.session_id},
+            )
+            raw_secret = resolved.value.get_secret_value()
+            return ToolResult(
+                content=f"connected with {raw_secret}",
+                structured={
+                    "token": raw_secret,
+                    "nested": ["safe", f"prefix-{raw_secret}-suffix"],
+                },
+                artifacts=[
+                    {
+                        "type": "debug",
+                        "metadata": {"authorization": f"Bearer {raw_secret}"},
+                    }
+                ],
+            )
+
+    store = InMemorySessionStore()
+    vault = StaticVault({"api_key": secret_value})
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_proxy_leak", name="proxy_leak", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=PassthroughProxy(vault),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ProxyLeakingTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_secret_redaction",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_event = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    result_payload = tool_event.payload["result"]
+    assert secret_value not in str(result_payload)
+    assert result_payload["content"] == f"connected with {REDACTED_SECRET}"
+    assert result_payload["structured"]["token"] == REDACTED_SECRET
+    assert result_payload["structured"]["nested"][1] == f"prefix-{REDACTED_SECRET}-suffix"
+    assert result_payload["artifacts"][0]["metadata"]["authorization"] == (
+        f"Bearer {REDACTED_SECRET}"
+    )
+
+    transcript = asyncio.run(store.load_transcript("sess_proxy_secret_redaction"))
     tool_message = next(message for message in transcript if message.role == "tool")
     tool_part = tool_message.content[0]
     assert isinstance(tool_part, ToolResultPart)
@@ -11024,7 +11123,8 @@ def test_cayu_app_wires_environment_proxy_into_tool_context():
     )
 
     assert events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.proxies == [proxy]
+    assert len(tool.proxies) == 1
+    assert isinstance(tool.proxies[0], CredentialProxy)
 
 
 def test_cayu_app_tool_policy_receives_run_request_metadata_copy():

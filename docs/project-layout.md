@@ -19,6 +19,7 @@ src/cayu/
   storage/
   mcp/
   vaults/
+  proxies/
   cli/
   dashboard/
 ```

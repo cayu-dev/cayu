@@ -31,7 +31,7 @@ Compaction checkpoints store the summary and `compacted_transcript_cursor`, the 
 Cayu separates agent definition, execution environment, and session state:
 
 - `AgentSpec`: model, system prompt, tool declarations, and metadata.
-- `Environment`: workspace, artifact store, runner, vault, MCP servers, and execution metadata.
+- `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `RunRequest` / `ResumeRequest` / `Session`: one run of an agent, optionally in a named environment, with messages, status, events, and checkpoints.
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
@@ -57,7 +57,7 @@ Tool policy is Cayu's first scoped-authority primitive. It is separate from prov
 - tool policy decides whether a registered tool call may execute
 - tools and runners perform the work only after authorization
 
-`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
+`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include required fields, string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
 
 Denied tool calls are recoverable by default. The runtime emits `tool.call.started`, then `tool.call.blocked`, does not run the tool implementation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. Tool policy implementation errors are not recoverable tool failures; they fail the session because the authority layer itself is broken.
 
@@ -802,7 +802,7 @@ String-only tool results are not enough for the final framework.
 
 Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. Tool policy denials are recorded separately as `tool.call.blocked`, do not execute the tool, and are also returned to the model as structured error `tool_result` message parts. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
 
 The first built-in tools are:
 
@@ -1064,6 +1064,41 @@ Runner/MCP integrations should accept secret refs and resolve them through the
 active environment vault at the execution boundary. The model should not receive
 a general-purpose secret-reading tool. Application-owned tools can use secrets
 internally by resolving refs in trusted code and returning safe results.
+
+## Credential Proxy
+
+`Vault` resolves `SecretRef` values. `CredentialProxy` is the runtime boundary
+for trusted tools that need a controlled way to use those credentials. An
+environment can expose both:
+
+```python
+Environment(
+    EnvironmentSpec(name="trusted-tools"),
+    vault=vault,
+    proxy=PassthroughProxy(vault),
+)
+```
+
+Tools then receive `ctx.proxy`. `PassthroughProxy` is a local/trusted
+implementation that resolves through the active vault; production apps can
+provide stricter proxies that authorize only specific destinations, scopes, or
+actions.
+
+The proxy does not replace the vault. The vault is still the source of secret
+values; the proxy is the controlled use boundary exposed to trusted tools.
+Generic model-driven command execution should not receive vault secrets by
+default, because a command can print its own environment.
+
+When a tool resolves a `ResolvedSecret` through `ctx.proxy`, Cayu records that
+resolved value for the current tool result and extends the active redactor before
+emitting durable events, storing transcripts, or building the next provider
+request. Redaction matches resolved secret values, not `SecretRef` names or
+metadata keys. A name such as `sendgrid_api_key` can remain visible while the raw
+secret value is replaced with `[REDACTED_SECRET]`.
+
+This redaction is defense in depth. It does not intercept sandbox network calls,
+make arbitrary shell commands safe for secrets, or guarantee safety for secrets
+already present inside a workspace.
 
 MCP config separates plain and secret values:
 

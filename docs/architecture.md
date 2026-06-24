@@ -31,9 +31,10 @@ core
   workspaces -> core
   storage -> core
   vaults -> core
+  proxies -> vaults + core
   mcp -> core
-  environments -> artifacts + workspaces + runners + vaults + mcp
-  runtime -> core + providers + artifacts + runners + workspaces + storage + vaults + mcp
+  environments -> artifacts + workspaces + runners + vaults + proxies + mcp
+  runtime -> core + providers + artifacts + runners + workspaces + storage + vaults + proxies + mcp
   cli -> runtime + project scaffolding
   dashboard -> runtime API / event store
 ```
@@ -77,7 +78,7 @@ This requires both deterministic orchestration and LLM orchestrator agents.
 Cayu follows an agent/environment/session separation:
 
 - `Agent`: model, system prompt, tool declarations, and metadata.
-- `Environment`: workspace, artifact store, runner, vault, MCP servers, and execution metadata.
+- `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `Session`: one run of an agent in an environment, with messages, status, events, and checkpoints.
 
 - `Workspace`: active filesystem an agent can work with, such as a target repo or working directory.
