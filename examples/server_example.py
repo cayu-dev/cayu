@@ -5,6 +5,8 @@ Usage:
     OPENAI_API_KEY=... python examples/server_example.py
     # or:
     ANTHROPIC_API_KEY=... python examples/server_example.py
+    # or (Google Gemini via the OpenAI-compatible endpoint):
+    GEMINI_API_KEY=... python examples/server_example.py
 
     # Then:
     curl http://localhost:8000/api/health
@@ -94,8 +96,23 @@ def _register_provider(app: CayuApp) -> str:
         app.register_provider(AnthropicProvider(), default=True)
         return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+    if os.environ.get("GEMINI_API_KEY"):
+        from cayu import ChatCompletionsProvider
+
+        app.register_provider(
+            ChatCompletionsProvider(
+                name="gemini",
+                api_key_env="GEMINI_API_KEY",
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                document_encoding="image_url",
+            ),
+            default=True,
+        )
+        return os.environ.get("CAYU_GEMINI_MODEL", "gemini-2.5-flash")
+
     raise RuntimeError(
-        "Set OPENAI_API_KEY or ANTHROPIC_API_KEY before starting examples/server_example.py."
+        "Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY before starting "
+        "examples/server_example.py."
     )
 
 

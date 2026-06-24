@@ -242,6 +242,36 @@ provider = OpenAIProvider(
 )
 ```
 
+For OpenAI-compatible services that implement the older Chat Completions API
+(`/v1/chat/completions`) rather than the Responses API — Google Gemini (AI Studio), Azure
+OpenAI, Together, Fireworks, Mistral, and others — use `ChatCompletionsProvider`. `base_url`
+follows the OpenAI-SDK convention (it includes the version path; the provider appends only
+`/chat/completions`):
+
+```python
+from cayu import ChatCompletionsProvider
+
+provider = ChatCompletionsProvider(
+    name="gemini",
+    api_key_env="GEMINI_API_KEY",
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+    document_encoding="image_url",  # Gemini carries PDFs via the image_url part
+)
+```
+
+It streams text and tool calls, supports image and PDF/document attachments, and strips
+JSON-schema keys some vendors reject (e.g. Gemini's `additionalProperties`). PDF encoding is not
+portable across vendors, so it is selectable: `document_encoding="file"` (the default) uses the
+OpenAI/Azure Chat Completions `file` content part, while `document_encoding="image_url"` carries
+the PDF through the `image_url` part, which is what Google Gemini's compatible endpoint accepts.
+Native structured output is not supported on this path; structured output still works through the
+default tool strategy.
+
+Per-vendor knobs: `auth_header`/`auth_value_prefix` for non-Bearer auth (Azure uses
+`auth_header="api-key", auth_value_prefix=""`), `allow_http=True` for local servers such as
+Ollama/vLLM on `http://localhost`, `endpoint_url` to override the request URL outright, and
+`stream_include_usage=False` for servers that reject `stream_options`.
+
 `CayuApp` registers `LoggingEventSink` by default. It writes concise event
 summaries to `logging.getLogger("cayu")` without configuring global logging
 handlers, process-wide levels, or formatters. Applications control where those
@@ -866,6 +896,15 @@ Run the live OpenAI example with local tools:
 ```bash
 export OPENAI_API_KEY=...
 PYTHONPATH=src python examples/openai_local_tools.py
+```
+
+Run the live OpenAI-compatible Chat Completions example with local tools (shown with Google
+Gemini; point it at Azure/Together/Fireworks/Mistral by changing the provider's `base_url` and
+`api_key_env`):
+
+```bash
+export GEMINI_API_KEY=...
+PYTHONPATH=src python examples/chat_completions_local_tools.py
 ```
 
 Run the live artifact/file example with image or PDF attachments:

@@ -82,7 +82,13 @@ from cayu.mcp import (
     mcp_cayu_tool_name,
 )
 from cayu.observability import LoggingEventSink
-from cayu.providers import AnthropicProvider, ModelCompletion, ModelFinishReason, OpenAIProvider
+from cayu.providers import (
+    AnthropicProvider,
+    ChatCompletionsProvider,
+    ModelCompletion,
+    ModelFinishReason,
+    OpenAIProvider,
+)
 from cayu.runners import (
     DEFAULT_DOCKER_CWD,
     DEFAULT_DOCKER_IMAGE,
@@ -360,6 +366,7 @@ __all__ = [
     "CausalBudgetCostSummary",
     "CausalBudgetUsageSummary",
     "CayuApp",
+    "ChatCompletionsProvider",
     "CheckpointCompactionContextPolicy",
     "CompactionPromptBuilder",
     "CompactionRequest",
