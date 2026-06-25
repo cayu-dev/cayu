@@ -934,6 +934,25 @@ compact added/removed/changed tool diff. Comparison uses a stable
 `manifest_identity` for the exposed toolset, so distinct MCP toolsets with the
 same server name are audited separately.
 
+Apps that want to enforce MCP tool drift can configure `McpManifestPolicy`:
+
+```python
+app = CayuApp(
+    mcp_manifest_policy=McpManifestPolicy(
+        on_first_seen="allow",
+        on_unchanged="allow",
+        on_changed="block",
+        on_tools_added="block",
+        on_tools_removed="alert",
+    )
+)
+```
+
+`allow` continues normally, `alert` records the policy decision on
+`mcp.manifest.checked`, and `block` emits `mcp.manifest.blocked` then fails the
+session before the changed tools are sent to the provider. Without a configured
+policy, manifest checks remain audit-only.
+
 Run the live Anthropic example with local tools:
 
 ```bash

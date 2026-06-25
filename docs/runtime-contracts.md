@@ -1171,8 +1171,17 @@ The first MCP implementation supports stdio servers:
   not store full schemas or server instructions. The comparison key is a stable
   `manifest_identity` built from the server name and generated Cayu tool names,
   so distinct same-name MCP toolsets are audited independently. This is an audit
-  signal for dashboards, watchers, and deployment checks, not an authorization
-  decision.
+  signal for dashboards, watchers, and deployment checks. It becomes an
+  authorization decision only when `CayuApp(mcp_manifest_policy=...)` is
+  configured.
+- `McpManifestPolicy` maps manifest statuses and diffs to `allow`, `alert`, or
+  `block`. `alert` keeps the run moving and records the policy decision on
+  `mcp.manifest.checked`; `block` emits `mcp.manifest.blocked` and fails the
+  session before the provider receives the changed MCP tool definitions. Specific
+  diff actions such as `on_tools_added`, `on_tools_removed`, `on_tools_changed`,
+  and `on_server_changed` override the generic `on_changed` action when set. If
+  several changed aspects are present, Cayu applies the strictest resulting
+  action. Without a configured policy, manifest checks remain audit-only.
 - `McpToolAdapter` exposes one MCP tool as a normal Cayu `Tool`, so tool policies,
   approvals, events, transcript persistence, and provider adapters work through the
   same path as framework-native tools.
@@ -1184,8 +1193,8 @@ at the environment/vault boundary before the subprocess is started. Streamable H
 OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are future
 layers. MCP resources should remain explicit and policy-controlled instead of being
 dumped into model context automatically. MCP manifest hashes are audit/debug
-fingerprints, not signatures or authorization decisions; tool policy still controls
-whether a tool call may execute.
+fingerprints, not signatures; tool policy still controls whether an allowed MCP
+tool call may execute.
 
 ## KnowledgeStore
 

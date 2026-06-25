@@ -17,6 +17,8 @@ from cayu import (
     EventType,
     McpClient,
     McpInitializeResult,
+    McpManifestPolicy,
+    McpManifestPolicyAction,
     McpProtocolError,
     McpResourceDefinition,
     McpResourceResult,
@@ -461,6 +463,319 @@ def test_runtime_marks_mcp_manifest_changed_across_sessions() -> None:
         "removed_tools": [],
         "changed_tools": ["mcp__local-mcp__echo"],
     }
+
+
+def test_runtime_blocks_changed_mcp_manifest_before_model_request() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_blocked_1",
+            toolset=_fake_toolset(description="Echo text."),
+        )
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("should-not-run"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(on_changed=McpManifestPolicyAction.BLOCK),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=_fake_toolset(description="Echo changed text.").tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_blocked_2",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return events, provider.requests
+
+    events, requests = asyncio.run(run())
+
+    assert requests == []
+    checked = [event for event in events if event.type == EventType.MCP_MANIFEST_CHECKED]
+    blocked = [event for event in events if event.type == EventType.MCP_MANIFEST_BLOCKED]
+    failed = [event for event in events if event.type == EventType.SESSION_FAILED]
+    assert [event.type for event in events if event.type == EventType.MODEL_STARTED] == []
+    assert checked == []
+    assert len(blocked) == 1
+    assert len(failed) == 1
+    assert blocked[0].payload["status"] == "changed"
+    assert blocked[0].payload["policy"]["action"] == "block"
+    assert blocked[0].payload["policy"]["matched_changes"] == ["tools_changed"]
+    assert failed[0].payload["error_type"] == "McpManifestPolicyError"
+
+
+def test_runtime_alerts_changed_mcp_manifest_without_blocking() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_alert_1",
+            toolset=_fake_toolset(description="Echo text."),
+        )
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(on_changed=McpManifestPolicyAction.ALERT),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=_fake_toolset(description="Echo changed text.").tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_alert_2",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return events, provider.requests
+
+    events, requests = asyncio.run(run())
+
+    assert len(requests) == 1
+    checked = [event for event in events if event.type == EventType.MCP_MANIFEST_CHECKED]
+    assert len(checked) == 1
+    assert checked[0].payload["status"] == "changed"
+    assert checked[0].payload["policy"]["action"] == "alert"
+    assert [event for event in events if event.type == EventType.MCP_MANIFEST_BLOCKED] == []
+    assert [event.type for event in events if event.type == EventType.SESSION_COMPLETED] == [
+        EventType.SESSION_COMPLETED
+    ]
+
+
+def test_runtime_blocked_mcp_manifest_does_not_become_baseline() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_block_baseline_1",
+            toolset=_fake_toolset(description="Echo text."),
+        )
+        for session_id in [
+            "mcp_manifest_block_baseline_2",
+            "mcp_manifest_block_baseline_3",
+        ]:
+            provider = FakeProvider(
+                [[ModelStreamEvent.text_delta("should-not-run"), ModelStreamEvent.completed({})]]
+            )
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                mcp_manifest_policy=McpManifestPolicy(on_changed=McpManifestPolicyAction.BLOCK),
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=_fake_toolset(description="Echo changed text.").tools,
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "hello")],
+                    )
+                )
+            )
+        checked_records = await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+        blocked_records = await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_BLOCKED, limit=10)
+        )
+        return checked_records, blocked_records
+
+    checked_records, blocked_records = asyncio.run(run())
+
+    assert [record.event.payload["status"] for record in checked_records] == ["first_seen"]
+    assert [record.event.payload["status"] for record in blocked_records] == [
+        "changed",
+        "changed",
+    ]
+
+
+def test_runtime_blocked_mcp_manifest_does_not_partially_accept_other_toolsets() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        echo_toolset = _fake_toolset(definitions=_fake_tool_definitions("echo"))
+        summarize_toolset = _fake_toolset(
+            definitions=_fake_tool_definitions("summarize", description="Summarize text.")
+        )
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[*echo_toolset.tools, *summarize_toolset.tools],
+        )
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_partial_accept_1",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+
+        changed_summarize_toolset = _fake_toolset(
+            definitions=_fake_tool_definitions(
+                "summarize",
+                description="Summarize changed text.",
+            )
+        )
+        blocked_provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("should-not-run"), ModelStreamEvent.completed({})]]
+        )
+        blocked_app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(on_changed=McpManifestPolicyAction.BLOCK),
+        )
+        blocked_app.register_provider(blocked_provider, default=True)
+        blocked_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[*echo_toolset.tools, *changed_summarize_toolset.tools],
+        )
+        await _collect_events(
+            blocked_app.run(
+                RunRequest(
+                    session_id="mcp_manifest_partial_accept_2",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        checked_records = await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+        blocked_records = await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_BLOCKED, limit=10)
+        )
+        return checked_records, blocked_records, blocked_provider.requests
+
+    checked_records, blocked_records, requests = asyncio.run(run())
+
+    assert requests == []
+    assert len(checked_records) == 2
+    assert [record.event.session_id for record in checked_records] == [
+        "mcp_manifest_partial_accept_1",
+        "mcp_manifest_partial_accept_1",
+    ]
+    assert len(blocked_records) == 1
+    assert blocked_records[0].event.payload["diff"]["changed_tools"] == [
+        "mcp__local-mcp__summarize"
+    ]
+
+
+def test_runtime_mcp_manifest_policy_specific_change_overrides_generic_change() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_added_block_1",
+            toolset=_fake_toolset(definitions=_fake_tool_definitions("echo")),
+        )
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("should-not-run"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_changed=McpManifestPolicyAction.ALLOW,
+                on_tools_added=McpManifestPolicyAction.BLOCK,
+            ),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=_fake_toolset(definitions=_fake_tool_definitions("echo", "summarize")).tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_added_block_2",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return events, provider.requests
+
+    events, requests = asyncio.run(run())
+
+    assert requests == []
+    checked = [event for event in events if event.type == EventType.MCP_MANIFEST_CHECKED]
+    blocked = [event for event in events if event.type == EventType.MCP_MANIFEST_BLOCKED]
+    assert checked == []
+    assert len(blocked) == 1
+    assert blocked[0].payload["policy"]["action"] == "block"
+    assert blocked[0].payload["policy"]["matched_changes"] == ["tools_added"]
+    assert blocked[0].payload["diff"]["added_tools"] == ["mcp__local-mcp__summarize"]
+
+
+def test_runtime_mcp_manifest_policy_specific_override_can_be_less_strict() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_removed_alert_1",
+            toolset=_fake_toolset(definitions=_fake_tool_definitions("echo", "summarize")),
+        )
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_changed=McpManifestPolicyAction.BLOCK,
+                on_tools_removed=McpManifestPolicyAction.ALERT,
+            ),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=_fake_toolset(definitions=_fake_tool_definitions("echo")).tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_removed_alert_2",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return events, provider.requests
+
+    events, requests = asyncio.run(run())
+
+    assert len(requests) == 1
+    checked = [event for event in events if event.type == EventType.MCP_MANIFEST_CHECKED]
+    assert len(checked) == 1
+    assert checked[0].payload["policy"]["action"] == "alert"
+    assert checked[0].payload["policy"]["matched_changes"] == ["tools_removed"]
+    assert checked[0].payload["diff"]["removed_tools"] == ["mcp__local-mcp__summarize"]
+    assert [event for event in events if event.type == EventType.MCP_MANIFEST_BLOCKED] == []
 
 
 def test_runtime_marks_mcp_server_metadata_changed_across_sessions() -> None:

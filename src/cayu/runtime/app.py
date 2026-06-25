@@ -155,6 +155,14 @@ from cayu.runtime.loop_policies import (
     copy_before_stop_decision,
     validate_loop_policies,
 )
+from cayu.runtime.mcp_manifest_policy import (
+    McpManifestPolicy,
+    McpManifestPolicyAction,
+    McpManifestPolicyDecision,
+    McpManifestPolicyError,
+    copy_mcp_manifest_policy,
+    mcp_manifest_policy_payload,
+)
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassification,
@@ -364,6 +372,7 @@ class CayuApp:
         retry_policy: RetryPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
+        mcp_manifest_policy: McpManifestPolicy | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
@@ -392,6 +401,7 @@ class CayuApp:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         policies = validate_loop_policies(loop_policies, field_name="loop_policies")
+        manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
         )
@@ -438,6 +448,7 @@ class CayuApp:
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
+        self._mcp_manifest_policy = manifest_policy
         self._event_sinks = sinks
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
@@ -4581,6 +4592,7 @@ class CayuApp:
             prior_records,
             environment_name=environment_name,
         )
+        checks: list[tuple[dict[str, Any], McpManifestPolicyDecision | None]] = []
         for toolset in toolsets:
             toolset_key = id(toolset)
             if toolset_key in seen_toolsets:
@@ -4621,6 +4633,33 @@ class CayuApp:
                 "previous": previous_payload,
                 "diff": diff,
             }
+            policy = self._mcp_manifest_policy
+            decision = None
+            if policy is not None:
+                decision = policy.decide(status=status, diff=diff)
+                payload["policy"] = mcp_manifest_policy_payload(decision)
+            checks.append((payload, decision))
+
+        blocked_checks = [
+            (payload, decision)
+            for payload, decision in checks
+            if decision is not None and decision.action == McpManifestPolicyAction.BLOCK
+        ]
+        if blocked_checks:
+            for payload, _ in blocked_checks:
+                yield await self._emit(
+                    Event(
+                        type=EventType.MCP_MANIFEST_BLOCKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=copy_json_value(payload, "payload"),
+                    )
+                )
+            reasons = "; ".join(decision.reason for _, decision in blocked_checks)
+            raise McpManifestPolicyError(reasons)
+
+        for payload, _ in checks:
             yield await self._emit(
                 Event(
                     type=EventType.MCP_MANIFEST_CHECKED,

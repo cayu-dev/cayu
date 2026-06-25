@@ -89,6 +89,13 @@ from cayu.runtime.loop_policies import (
     BeforeStopDecision,
     LoopPolicy,
 )
+from cayu.runtime.mcp_manifest_policy import (
+    McpManifestPolicy,
+    McpManifestPolicyAction,
+    McpManifestPolicyDecision,
+    McpManifestPolicyError,
+    copy_mcp_manifest_policy,
+)
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -245,6 +252,10 @@ __all__ = [
     "LabelSelectorOperator",
     "LabelSelectorRequirement",
     "LoopPolicy",
+    "McpManifestPolicy",
+    "McpManifestPolicyAction",
+    "McpManifestPolicyDecision",
+    "McpManifestPolicyError",
     "MessageWindowContextPolicy",
     "ModelCompactor",
     "ModelPricing",
@@ -308,6 +319,7 @@ __all__ = [
     "classify_retryable_error",
     "copy_dispatch_handle",
     "copy_dispatch_request",
+    "copy_mcp_manifest_policy",
     "copy_pricing_catalog",
     "copy_retry_policy",
     "copy_run_limits",
