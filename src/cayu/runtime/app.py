@@ -1071,9 +1071,11 @@ class CayuApp:
                 continue
             if len(sessions) >= request.limit:
                 break
-            candidates = await self.session_store.list_sessions(
-                SessionQuery(status=status, limit=min(1000, request.limit - len(sessions)))
-            )
+            candidates = (
+                await self.session_store.list_sessions(
+                    SessionQuery(status=status, limit=min(1000, request.limit - len(sessions)))
+                )
+            ).sessions
             for candidate in candidates:
                 if candidate.id in seen_session_ids:
                     continue
@@ -1246,18 +1248,20 @@ class CayuApp:
         sessions: list[Session] = []
         offset = query.offset
         while True:
-            page = await self.session_store.list_sessions(
-                SessionQuery(
-                    status=query.status,
-                    agent_name=query.agent_name,
-                    environment_name=query.environment_name,
-                    parent_session_id=query.parent_session_id,
-                    causal_budget_id=query.causal_budget_id,
-                    limit=query.limit,
-                    offset=offset,
-                    order_by=query.order_by,
+            page = (
+                await self.session_store.list_sessions(
+                    SessionQuery(
+                        status=query.status,
+                        agent_name=query.agent_name,
+                        environment_name=query.environment_name,
+                        parent_session_id=query.parent_session_id,
+                        causal_budget_id=query.causal_budget_id,
+                        limit=query.limit,
+                        offset=offset,
+                        order_by=query.order_by,
+                    )
                 )
-            )
+            ).sessions
             if not page:
                 return sessions
             sessions.extend(page)
@@ -5381,9 +5385,11 @@ class CayuApp:
         reason: str | None,
         metadata: dict[str, Any],
     ) -> None:
-        children = await self.session_store.list_sessions(
-            SessionQuery(parent_session_id=parent_session_id, limit=1000)
-        )
+        children = (
+            await self.session_store.list_sessions(
+                SessionQuery(parent_session_id=parent_session_id, limit=1000)
+            )
+        ).sessions
         for child in children:
             if not _is_background_subagent_session(child):
                 continue

@@ -363,7 +363,7 @@ def test_server_run_accepts_budget_limits() -> None:
         assert response.status_code == 200
         list(response.iter_lines())
 
-    sessions = client.get("/api/sessions").json()
+    sessions = client.get("/api/sessions").json()["sessions"]
     assert len(sessions) == 1
     assert sessions[0]["status"] == "interrupted"
 
@@ -411,18 +411,18 @@ def test_server_lists_sessions_with_label_filters() -> None:
     missing_response = client.get("/api/sessions?label=organization=missing&limit=10")
 
     assert org_response.status_code == 200
-    assert {session["id"] for session in org_response.json()} == {
+    assert {session["id"] for session in org_response.json()["sessions"]} == {
         "sess_invoice",
         "sess_research",
     }
     assert exact_response.status_code == 200
-    assert [session["id"] for session in exact_response.json()] == ["sess_invoice"]
-    assert exact_response.json()[0]["labels"] == {
+    assert [session["id"] for session in exact_response.json()["sessions"]] == ["sess_invoice"]
+    assert exact_response.json()["sessions"][0]["labels"] == {
         "organization": "org_123",
         "project": "ap_q2",
     }
     assert missing_response.status_code == 200
-    assert missing_response.json() == []
+    assert missing_response.json()["sessions"] == []
 
 
 def test_server_lists_sessions_with_typed_filters() -> None:
@@ -471,16 +471,20 @@ def test_server_lists_sessions_with_typed_filters() -> None:
     causal_response = client.get("/api/sessions?causal_budget_id=budget_123&limit=10")
 
     assert builder_response.status_code == 200
-    assert [session["id"] for session in builder_response.json()] == [
+    assert [session["id"] for session in builder_response.json()["sessions"]] == [
         "sess_builder_local",
         "sess_builder_prod",
     ]
     assert completed_response.status_code == 200
-    assert [session["id"] for session in completed_response.json()] == ["sess_builder_prod"]
+    assert [session["id"] for session in completed_response.json()["sessions"]] == [
+        "sess_builder_prod"
+    ]
     assert env_response.status_code == 200
-    assert [session["id"] for session in env_response.json()] == ["sess_builder_prod"]
+    assert [session["id"] for session in env_response.json()["sessions"]] == ["sess_builder_prod"]
     assert causal_response.status_code == 200
-    assert [session["id"] for session in causal_response.json()] == ["sess_builder_prod"]
+    assert [session["id"] for session in causal_response.json()["sessions"]] == [
+        "sess_builder_prod"
+    ]
 
 
 def test_server_lists_sessions_with_typed_and_label_filters_together() -> None:
@@ -513,7 +517,7 @@ def test_server_lists_sessions_with_typed_and_label_filters_together() -> None:
     response = client.get("/api/sessions?agent_name=builder&label=organization=org_123")
 
     assert response.status_code == 200
-    assert [session["id"] for session in response.json()] == ["sess_builder_invoice"]
+    assert [session["id"] for session in response.json()["sessions"]] == ["sess_builder_invoice"]
 
 
 def test_server_lists_sessions_with_label_selectors() -> None:
@@ -577,22 +581,28 @@ def test_server_lists_sessions_with_label_selectors() -> None:
     )
 
     assert exists_response.status_code == 200
-    assert [session["id"] for session in exists_response.json()] == ["sess_selector_invoice"]
+    assert [session["id"] for session in exists_response.json()["sessions"]] == [
+        "sess_selector_invoice"
+    ]
     assert in_response.status_code == 200
-    assert {session["id"] for session in in_response.json()} == {
+    assert {session["id"] for session in in_response.json()["sessions"]} == {
         "sess_selector_invoice",
         "sess_selector_research",
         "sess_selector_unowned",
     }
     assert equals_response.status_code == 200
-    assert {session["id"] for session in equals_response.json()} == {
+    assert {session["id"] for session in equals_response.json()["sessions"]} == {
         "sess_selector_invoice",
         "sess_selector_unowned",
     }
     assert not_in_response.status_code == 200
-    assert [session["id"] for session in not_in_response.json()] == ["sess_selector_invoice"]
+    assert [session["id"] for session in not_in_response.json()["sessions"]] == [
+        "sess_selector_invoice"
+    ]
     assert not_exists_response.status_code == 200
-    assert [session["id"] for session in not_exists_response.json()] == ["sess_selector_unowned"]
+    assert [session["id"] for session in not_exists_response.json()["sessions"]] == [
+        "sess_selector_unowned"
+    ]
 
 
 def test_server_session_label_filters_allow_reserved_query_keys() -> None:
@@ -602,7 +612,7 @@ def test_server_session_label_filters_allow_reserved_query_keys() -> None:
     response = client.get("/api/sessions?label=cayu:agent=builder")
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json()["sessions"] == []
 
 
 def test_server_rejects_invalid_session_label_filters() -> None:
@@ -1989,3 +1999,135 @@ def test_interrupt_session_endpoint_is_idempotent_for_interrupted_session() -> N
     body = "\n".join(lines)
     assert "session.interrupted" in body
     assert "already interrupted" in body
+
+
+def _lifecycle_store_and_client(seed) -> tuple[InMemorySessionStore, TestClient]:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    client = TestClient(create_server(app))
+    asyncio.run(seed(store))
+    return store, client
+
+
+def _create_session(store: InMemorySessionStore, session_id: str, **kwargs):
+    return store.create(
+        RunRequest(
+            agent_name="builder",
+            session_id=session_id,
+            messages=[Message.text("user", "x")],
+            **kwargs,
+        ),
+        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+    )
+
+
+def test_server_deletes_session_and_is_idempotent() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_del")
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    assert client.delete("/api/sessions/sess_del").status_code == 204
+    assert client.get("/api/sessions/sess_del").status_code == 404
+    # Idempotent: deleting a missing session is still 204.
+    assert client.delete("/api/sessions/sess_del").status_code == 204
+
+
+def test_server_delete_running_session_conflicts() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_run")
+        await store.update_status("sess_run", SessionStatus.RUNNING)
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    response = client.delete("/api/sessions/sess_run")
+    assert response.status_code == 409
+
+
+def test_server_updates_session_labels() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_lab", labels={"team": "research"})
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    response = client.patch("/api/sessions/sess_lab/labels", json={"labels": {"stage": "review"}})
+    assert response.status_code == 200
+    # Full replacement: the old "team" label is gone.
+    assert response.json()["labels"] == {"stage": "review"}
+    missing = client.patch("/api/sessions/sess_missing/labels", json={"labels": {}})
+    assert missing.status_code == 404
+    # An invalid label (blank value) is a client error (422), not an unhandled 500.
+    invalid = client.patch("/api/sessions/sess_lab/labels", json={"labels": {"k": "   "}})
+    assert invalid.status_code == 422
+    # A typo'd key must 422 (extra="forbid"), NOT silently replace all labels with {}.
+    typo = client.patch("/api/sessions/sess_lab/labels", json={"lables": {"a": "b"}})
+    assert typo.status_code == 422
+    # A missing required field must 422, not default to an empty (wiping) replacement.
+    empty_body = client.patch("/api/sessions/sess_lab/labels", json={})
+    assert empty_body.status_code == 422
+    # The labels were not wiped by any of the rejected requests.
+    assert client.get("/api/sessions/sess_lab").json()["session"]["labels"] == {"stage": "review"}
+
+
+def test_server_updates_session_metadata() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_meta", metadata={"a": 1})
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    response = client.patch("/api/sessions/sess_meta/metadata", json={"metadata": {"b": [1, 2]}})
+    assert response.status_code == 200
+    assert response.json()["metadata"] == {"b": [1, 2]}
+    missing = client.patch("/api/sessions/sess_missing/metadata", json={"metadata": {}})
+    assert missing.status_code == 404
+    # Typo'd key / missing field must 422, never silently wipe metadata.
+    assert client.patch("/api/sessions/sess_meta/metadata", json={"metadat": {}}).status_code == 422
+    assert client.patch("/api/sessions/sess_meta/metadata", json={}).status_code == 422
+    assert client.get("/api/sessions/sess_meta").json()["session"]["metadata"] == {"b": [1, 2]}
+
+
+def test_server_lists_sessions_with_cursor_pagination() -> None:
+    async def seed(store):
+        for index in range(3):
+            await _create_session(store, f"sess_{index}")
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    page1 = client.get("/api/sessions?limit=2&order_by=created_at_asc").json()
+    assert [session["id"] for session in page1["sessions"]] == ["sess_0", "sess_1"]
+    assert page1["total_count"] == 3
+    assert page1["next_cursor"] is not None
+
+    page2 = client.get(
+        "/api/sessions",
+        params={"limit": 2, "order_by": "created_at_asc", "cursor": page1["next_cursor"]},
+    ).json()
+    assert [session["id"] for session in page2["sessions"]] == ["sess_2"]
+    assert page2["total_count"] == 3
+    assert page2["next_cursor"] is None
+
+
+def test_server_lists_sessions_rejects_invalid_cursor() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_only")
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    response = client.get("/api/sessions", params={"cursor": "!!!not-a-cursor"})
+    assert response.status_code == 422
+
+
+def test_server_list_omits_metadata_but_detail_includes_it() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_m", metadata={"secret": "value"})
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    # The list view omits the (unbounded) per-session metadata...
+    listed = client.get("/api/sessions").json()["sessions"]
+    assert [row["id"] for row in listed] == ["sess_m"]
+    assert "metadata" not in listed[0]
+    assert "labels" in listed[0]  # base fields still present
+    # ...but the single-session detail view includes it.
+    detail = client.get("/api/sessions/sess_m").json()
+    assert detail["session"]["metadata"] == {"secret": "value"}

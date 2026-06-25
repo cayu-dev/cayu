@@ -77,6 +77,7 @@ from cayu.runtime import (
     RuntimeHookContext,
     Session,
     SessionIdentity,
+    SessionListResult,
     SessionQuery,
     SessionStatus,
     StaticToolPolicy,
@@ -308,7 +309,7 @@ class RecordingListSessionsStore(InMemorySessionStore):
         super().__init__()
         self.session_queries: list[SessionQuery] = []
 
-    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+    async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         copied_query = SessionQuery() if query is None else query.model_copy(deep=True)
         self.session_queries.append(copied_query)
         return await super().list_sessions(query)
@@ -5684,7 +5685,7 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
                 parent_session_id="sess_subagent_parent",
             )
         )
-    )
+    ).sessions
     assert len(child_sessions) == 1
     child = child_sessions[0]
     assert child.agent_name == "reviewer"
@@ -5796,9 +5797,11 @@ def test_subagent_tool_background_starts_child_without_waiting_for_completion():
         assert parent_events[-1].type == EventType.SESSION_COMPLETED
         assert provider.parent_final_requested.is_set()
 
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_subagent_background_parent")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_subagent_background_parent")
+            )
+        ).sessions
         assert len(child_sessions) == 1
         child = child_sessions[0]
         assert child.causal_budget_id == "job_subagent_background"
@@ -5911,9 +5914,11 @@ def test_subagent_result_tool_waits_for_background_child_result():
         await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
         parent_events = await asyncio.wait_for(parent_task, timeout=2)
         parent_transcript = await store.load_transcript("sess_subagent_background_result_parent")
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_subagent_background_result_parent")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_subagent_background_result_parent")
+            )
+        ).sessions
         return parent_events, parent_transcript, child_sessions
 
     parent_events, parent_transcript, child_sessions = asyncio.run(run())
@@ -6011,9 +6016,11 @@ def test_subagent_result_tool_can_wait_for_all_background_children():
         await asyncio.wait_for(provider.child_model_started["task b"].wait(), timeout=1)
         parent_events = await asyncio.wait_for(parent_task, timeout=2)
         parent_transcript = await store.load_transcript("sess_subagent_background_all_parent")
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_subagent_background_all_parent")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_subagent_background_all_parent")
+            )
+        ).sessions
         return parent_events, parent_transcript, child_sessions
 
     parent_events, parent_transcript, child_sessions = asyncio.run(run())
@@ -6106,9 +6113,11 @@ def test_interrupting_parent_interrupts_running_background_subagents():
             )
         ]
         parent_events = await asyncio.wait_for(parent_task, timeout=2)
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_background_parent_interrupt")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_background_parent_interrupt")
+            )
+        ).sessions
         child_events = await store.load_events(child_sessions[0].id)
         return interrupt_events, parent_events, child_sessions, child_events
 
@@ -6186,7 +6195,7 @@ def test_subagent_tool_background_reports_start_failure_as_tool_error():
         store.list_sessions(
             SessionQuery(parent_session_id="sess_subagent_background_missing_child")
         )
-    )
+    ).sessions
     assert child_sessions == []
 
 
@@ -6249,7 +6258,7 @@ def test_subagent_tool_returns_child_failure_as_tool_error():
                 parent_session_id="sess_subagent_parent_failure",
             )
         )
-    )
+    ).sessions
     assert len(child_sessions) == 1
     assert child_sessions[0].status == SessionStatus.FAILED
     parent_transcript = asyncio.run(store.load_transcript("sess_subagent_parent_failure"))
@@ -6394,9 +6403,11 @@ def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
             )
         ]
         parent_events = await asyncio.wait_for(parent_task, timeout=1)
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_subagent_parent_interrupt")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_subagent_parent_interrupt")
+            )
+        ).sessions
         child_events = await store.load_events(child_sessions[0].id)
         return interrupt_events, parent_events, child_sessions, child_events
 
@@ -6523,9 +6534,11 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
             )
         ]
         parent_events = await asyncio.wait_for(parent_task, timeout=1)
-        child_sessions = await store.list_sessions(
-            SessionQuery(parent_session_id="sess_subagent_parent_startup_interrupt")
-        )
+        child_sessions = (
+            await store.list_sessions(
+                SessionQuery(parent_session_id="sess_subagent_parent_startup_interrupt")
+            )
+        ).sessions
         child_events = await store.load_events(child_sessions[0].id)
         return interrupt_events, parent_events, child_sessions, child_events
 

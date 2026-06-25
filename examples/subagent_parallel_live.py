@@ -122,7 +122,9 @@ async def main() -> None:
             event.payload,
         )
 
-    children = await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+    children = (
+        await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+    ).sessions
     print("child_sessions", [child.id for child in children])
     for child in children:
         events = await app.session_store.load_events(child.id)

@@ -7,7 +7,14 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from sse_starlette.sse import EventSourceResponse
 
 from cayu._validation import copy_label_map, require_clean_nonblank
@@ -102,6 +109,20 @@ class InterruptSessionBody(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class UpdateSessionLabelsBody(BaseModel):
+    # Required + extra="forbid": a missing/typo'd key must 422, never silently replace
+    # all labels with {} (these are full-replacement mutations).
+    model_config = ConfigDict(extra="forbid")
+
+    labels: dict[str, str]
+
+
+class UpdateSessionMetadataBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metadata: dict[str, Any]
+
+
 class SessionCostBody(BaseModel):
     pricing: PricingCatalog
     currency: NonBlankString = "USD"
@@ -191,7 +212,9 @@ def _serialize_session_outcome(outcome: SessionOutcome) -> dict[str, Any]:
     }
 
 
-def _serialize_session(session: Session) -> dict[str, Any]:
+def _serialize_session_base(session: Session) -> dict[str, Any]:
+    # Shared list-view fields. The list endpoint omits the (potentially large,
+    # unbounded) per-session metadata; callers fetch a single session to get it.
     return {
         "id": session.id,
         "status": session.status.value,
@@ -206,8 +229,11 @@ def _serialize_session(session: Session) -> dict[str, Any]:
         "created_at": session.created_at.isoformat(),
         "updated_at": session.updated_at.isoformat(),
         "labels": session.labels,
-        "metadata": session.metadata,
     }
+
+
+def _serialize_session(session: Session) -> dict[str, Any]:
+    return {**_serialize_session_base(session), "metadata": session.metadata}
 
 
 def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
@@ -572,6 +598,7 @@ def create_router(
     async def list_sessions(
         limit: Annotated[int, Query(ge=1, le=1000)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
+        cursor: Annotated[str | None, Query()] = None,
         status: SessionStatus | None = None,
         agent_name: str | None = None,
         environment_name: str | None = None,
@@ -583,46 +610,39 @@ def create_router(
     ):
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
-        sessions = await session_store.list_sessions(
-            SessionQuery(
-                status=status,
-                agent_name=_clean_optional_query_value(agent_name, "agent_name"),
-                environment_name=_clean_optional_query_value(
-                    environment_name,
-                    "environment_name",
-                ),
-                parent_session_id=_clean_optional_query_value(
-                    parent_session_id,
-                    "parent_session_id",
-                ),
-                causal_budget_id=_clean_optional_query_value(
-                    causal_budget_id,
-                    "causal_budget_id",
-                ),
-                labels=labels,
-                label_selectors=label_selectors,
-                limit=limit,
-                offset=offset,
-                order_by=order_by,
+        try:
+            result = await session_store.list_sessions(
+                SessionQuery(
+                    status=status,
+                    agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                    environment_name=_clean_optional_query_value(
+                        environment_name,
+                        "environment_name",
+                    ),
+                    parent_session_id=_clean_optional_query_value(
+                        parent_session_id,
+                        "parent_session_id",
+                    ),
+                    causal_budget_id=_clean_optional_query_value(
+                        causal_budget_id,
+                        "causal_budget_id",
+                    ),
+                    labels=labels,
+                    label_selectors=label_selectors,
+                    limit=limit,
+                    offset=offset,
+                    cursor=cursor,
+                    include_total_count=True,
+                    order_by=order_by,
+                )
             )
-        )
-        return [
-            {
-                "id": s.id,
-                "status": s.status.value,
-                "agent_name": s.agent_name,
-                "provider_name": s.provider_name,
-                "model": s.model,
-                "parent_session_id": s.parent_session_id,
-                "causal_budget_id": s.causal_budget_id,
-                "runtime_name": s.runtime_name,
-                "runtime_version": s.runtime_version,
-                "labels": s.labels,
-                "created_at": s.created_at.isoformat(),
-                "updated_at": s.updated_at.isoformat(),
-            }
-            for s in sessions
-        ]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "sessions": [_serialize_session_base(session) for session in result.sessions],
+            "next_cursor": result.next_cursor,
+            "total_count": result.total_count,
+        }
 
     @router.post("/sessions/summary")
     async def get_sessions_summary(
@@ -641,29 +661,31 @@ def create_router(
         body = body or SessionsSummaryBody()
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
-        sessions = await session_store.list_sessions(
-            SessionQuery(
-                status=status,
-                agent_name=_clean_optional_query_value(agent_name, "agent_name"),
-                environment_name=_clean_optional_query_value(
-                    environment_name,
-                    "environment_name",
-                ),
-                parent_session_id=_clean_optional_query_value(
-                    parent_session_id,
-                    "parent_session_id",
-                ),
-                causal_budget_id=_clean_optional_query_value(
-                    causal_budget_id,
-                    "causal_budget_id",
-                ),
-                labels=labels,
-                label_selectors=label_selectors,
-                limit=limit,
-                offset=offset,
-                order_by=order_by,
+        sessions = (
+            await session_store.list_sessions(
+                SessionQuery(
+                    status=status,
+                    agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                    environment_name=_clean_optional_query_value(
+                        environment_name,
+                        "environment_name",
+                    ),
+                    parent_session_id=_clean_optional_query_value(
+                        parent_session_id,
+                        "parent_session_id",
+                    ),
+                    causal_budget_id=_clean_optional_query_value(
+                        causal_budget_id,
+                        "causal_budget_id",
+                    ),
+                    labels=labels,
+                    label_selectors=label_selectors,
+                    limit=limit,
+                    offset=offset,
+                    order_by=order_by,
+                )
             )
-        )
+        ).sessions
         session_event_records_by_id: dict[str, list[EventRecord]] = {}
         session_ids = [session.id for session in sessions]
         all_event_records = await _query_all_session_event_records(session_ids)
@@ -902,14 +924,16 @@ def create_router(
         sessions: list[Session] = []
         offset = 0
         while True:
-            page = await session_store.list_sessions(
-                SessionQuery(
-                    causal_budget_id=causal_budget_id,
-                    limit=1000,
-                    offset=offset,
-                    order_by=SessionOrder.CREATED_AT_ASC,
+            page = (
+                await session_store.list_sessions(
+                    SessionQuery(
+                        causal_budget_id=causal_budget_id,
+                        limit=1000,
+                        offset=offset,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                    )
                 )
-            )
+            ).sessions
             if not page:
                 return sessions
             sessions.extend(page)
@@ -1076,6 +1100,40 @@ def create_router(
                 for m in transcript
             ],
         }
+
+    @router.delete("/sessions/{session_id}", status_code=204)
+    async def delete_session(session_id: NonBlankString):
+        try:
+            await session_store.delete_session(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return None
+
+    @router.patch("/sessions/{session_id}/labels")
+    async def update_session_labels(
+        session_id: NonBlankString,
+        body: UpdateSessionLabelsBody,
+    ):
+        try:
+            session = await session_store.update_labels(session_id, body.labels)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _serialize_session(session)
+
+    @router.patch("/sessions/{session_id}/metadata")
+    async def update_session_metadata(
+        session_id: NonBlankString,
+        body: UpdateSessionMetadataBody,
+    ):
+        try:
+            session = await session_store.update_metadata(session_id, body.metadata)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _serialize_session(session)
 
     @router.get("/tasks")
     async def list_tasks(

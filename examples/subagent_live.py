@@ -114,7 +114,9 @@ async def main() -> None:
             event.payload,
         )
 
-    children = await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+    children = (
+        await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+    ).sessions
     print("child_sessions", [child.id for child in children])
     for child in children:
         print(
@@ -134,13 +136,15 @@ async def main() -> None:
 
     if mode == SubagentExecutionMode.BACKGROUND:
         for _ in range(100):
-            children = await app.session_store.list_sessions(
-                SessionQuery(parent_session_id=session_id)
-            )
+            children = (
+                await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+            ).sessions
             if children and all(child.status != "running" for child in children):
                 break
             await asyncio.sleep(0.1)
-        children = await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+        children = (
+            await app.session_store.list_sessions(SessionQuery(parent_session_id=session_id))
+        ).sessions
         print(
             "background_child_statuses",
             [(child.id, str(child.status)) for child in children],

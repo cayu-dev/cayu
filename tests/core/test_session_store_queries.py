@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -23,6 +24,14 @@ StoreFactory = Callable[[object], SessionStore]
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
+
+
+def test_session_store_lifecycle_methods_are_not_abstract() -> None:
+    # delete/update_labels/update_metadata are concrete (NotImplementedError) defaults,
+    # not @abstractmethod, so existing out-of-tree SessionStore subclasses still instantiate.
+    assert {"delete_session", "update_labels", "update_metadata"}.isdisjoint(
+        SessionStore.__abstractmethods__
+    )
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -145,22 +154,32 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         await store.update_status("sess_builder_1", SessionStatus.RUNNING)
         await store.update_status("sess_builder_2", SessionStatus.COMPLETED)
 
-        builder_sessions = await store.list_sessions(
-            SessionQuery(
-                agent_name="builder",
-                order_by=SessionOrder.CREATED_AT_ASC,
+        builder_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    agent_name="builder",
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
-        hosted_sessions = await store.list_sessions(
-            SessionQuery(environment_name="hosted", order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        completed_sessions = await store.list_sessions(SessionQuery(status=SessionStatus.COMPLETED))
-        paged_sessions = await store.list_sessions(
-            SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        causal_sessions = await store.list_sessions(
-            SessionQuery(causal_budget_id="job_build", order_by=SessionOrder.CREATED_AT_ASC)
-        )
+        ).sessions
+        hosted_sessions = (
+            await store.list_sessions(
+                SessionQuery(environment_name="hosted", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        completed_sessions = (
+            await store.list_sessions(SessionQuery(status=SessionStatus.COMPLETED))
+        ).sessions
+        paged_sessions = (
+            await store.list_sessions(
+                SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        causal_sessions = (
+            await store.list_sessions(
+                SessionQuery(causal_budget_id="job_build", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
 
         assert [session.id for session in builder_sessions] == [
             "sess_builder_1",
@@ -232,19 +251,27 @@ def test_session_stores_preserve_and_filter_session_labels(
         assert loaded is not None
         assert loaded.labels == created.labels
 
-        owner_sessions = await store.list_sessions(
-            SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        project_sessions = await store.list_sessions(
-            SessionQuery(labels={"project": "ap_q2"}, order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        exact_sessions = await store.list_sessions(
-            SessionQuery(
-                labels={"owner": "org_123", "project": "ap_q2"},
-                order_by=SessionOrder.CREATED_AT_ASC,
+        owner_sessions = (
+            await store.list_sessions(
+                SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
             )
-        )
-        missing_sessions = await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+        ).sessions
+        project_sessions = (
+            await store.list_sessions(
+                SessionQuery(labels={"project": "ap_q2"}, order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        exact_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    labels={"owner": "org_123", "project": "ap_q2"},
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+        ).sessions
+        missing_sessions = (
+            await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+        ).sessions
 
         assert [session.id for session in owner_sessions] == [
             "sess_labels_invoice",
@@ -1000,6 +1027,350 @@ def test_session_stores_transition_status_atomically(
         await _close_store(store)
 
     asyncio.run(run_store_operations())
+
+
+def _lifecycle_request(
+    session_id: str,
+    *,
+    parent: str | None = None,
+    labels: dict[str, str] | None = None,
+    metadata: dict[str, object] | None = None,
+) -> RunRequest:
+    return RunRequest(
+        agent_name="assistant",
+        session_id=session_id,
+        parent_session_id=parent,
+        labels=labels or {},
+        metadata=metadata or {},
+        messages=[Message.text("user", "hi")],
+    )
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_delete_session_cascades_and_is_idempotent(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        await store.create(_lifecycle_request("sess_keep"), identity=_identity())
+        await store.create(
+            _lifecycle_request("sess_drop", labels={"team": "drop"}), identity=_identity()
+        )
+        await store.append_events(
+            "sess_drop",
+            [Event(type=EventType.SESSION_STARTED, session_id="sess_drop", agent_name="assistant")],
+        )
+        await store.append_transcript_messages("sess_drop", [Message.text("assistant", "bye")])
+        await store.checkpoint("sess_drop", {"cursor": 1})
+
+        await store.delete_session("sess_drop")
+
+        assert await store.load("sess_drop") is None
+        assert await store.query_events(EventQuery(session_id="sess_drop")) == []
+        assert await store.load_checkpoint("sess_drop") is None
+        # All related data is gone, including label rows.
+        assert (await store.list_sessions(SessionQuery(labels={"team": "drop"}))).sessions == []
+        # The kept session is untouched, and the id can be reused after a clean delete.
+        assert await store.load("sess_keep") is not None
+        await store.create(_lifecycle_request("sess_drop"), identity=_identity())
+        assert await store.load("sess_drop") is not None
+        # Idempotent: deleting a missing session is a no-op.
+        await store.delete_session("sess_never_existed")
+
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_delete_rejects_in_flight_sessions(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        for index, status in enumerate((SessionStatus.RUNNING, SessionStatus.INTERRUPTING)):
+            session_id = f"sess_inflight_{index}"
+            await store.create(_lifecycle_request(session_id), identity=_identity())
+            await store.update_status(session_id, status)
+            with pytest.raises(ValueError, match="interrupt it first"):
+                await store.delete_session(session_id)
+            assert await store.load(session_id) is not None
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_delete_parent_nulls_child_parent(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        await store.create(_lifecycle_request("sess_parent"), identity=_identity())
+        await store.create(
+            _lifecycle_request("sess_child", parent="sess_parent"), identity=_identity()
+        )
+        await store.delete_session("sess_parent")
+        child = await store.load("sess_child")
+        assert child is not None
+        assert child.parent_session_id is None
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_update_labels_replaces_and_filters(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        created = await store.create(
+            _lifecycle_request("sess_labeled", labels={"team": "research", "stage": "draft"}),
+            identity=_identity(),
+        )
+        await store.update_status("sess_labeled", SessionStatus.COMPLETED)
+        updated = await store.update_labels("sess_labeled", {"stage": "review"})
+        # Full replacement, not a merge: the old "team" label is gone.
+        assert updated.labels == {"stage": "review"}
+        assert updated.updated_at >= created.updated_at
+        # Updating labels must not change the session's status.
+        assert updated.status == SessionStatus.COMPLETED
+        reloaded = await store.load("sess_labeled")
+        assert reloaded is not None
+        assert reloaded.labels == {"stage": "review"}
+        assert reloaded.status == SessionStatus.COMPLETED
+        # The replacement is reflected in subsequent label queries.
+        matched = (await store.list_sessions(SessionQuery(labels={"stage": "review"}))).sessions
+        assert [session.id for session in matched] == ["sess_labeled"]
+        stale = (await store.list_sessions(SessionQuery(labels={"team": "research"}))).sessions
+        assert stale == []
+        # An empty dict clears every label.
+        cleared = await store.update_labels("sess_labeled", {})
+        assert cleared.labels == {}
+        assert (await store.list_sessions(SessionQuery(labels={"stage": "review"}))).sessions == []
+        # Reserved cayu: labels are rejected on update, same as on create.
+        with pytest.raises(ValueError, match="reserved"):
+            await store.update_labels("sess_labeled", {"cayu:internal": "x"})
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.update_labels("sess_missing", {"k": "v"})
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_update_metadata_replaces(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        await store.create(
+            _lifecycle_request("sess_meta", metadata={"a": 1, "keep": False}),
+            identity=_identity(),
+        )
+        await store.update_status("sess_meta", SessionStatus.COMPLETED)
+        updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
+        assert updated.metadata == {"b": [1, 2]}
+        # Updating metadata must not change the session's status.
+        assert updated.status == SessionStatus.COMPLETED
+        reloaded = await store.load("sess_meta")
+        assert reloaded is not None
+        assert reloaded.metadata == {"b": [1, 2]}
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.update_metadata("sess_missing", {"k": "v"})
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_cursor_pagination_is_stable_across_orders(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        for index in range(5):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        for order in SessionOrder:
+            full = (await store.list_sessions(SessionQuery(order_by=order, limit=100))).sessions
+            expected_ids = [session.id for session in full]
+            collected: list[str] = []
+            cursor: str | None = None
+            while True:
+                page = await store.list_sessions(
+                    SessionQuery(order_by=order, limit=2, cursor=cursor, include_total_count=True)
+                )
+                assert page.total_count == len(expected_ids)
+                collected.extend(session.id for session in page.sessions)
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+            # Same order, no duplicates, no skips.
+            assert collected == expected_ids, order
+        # total_count is opt-in: omitted by default.
+        assert (await store.list_sessions(SessionQuery(limit=1))).total_count is None
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_cursor_survives_concurrent_insert(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        for index in range(4):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        order = SessionOrder.CREATED_AT_ASC
+        first = await store.list_sessions(SessionQuery(order_by=order, limit=2))
+        seen = [session.id for session in first.sessions]
+        # A session inserted mid-pagination must not cause a duplicate or a skip of
+        # the rows we have not yet passed.
+        await store.create(_lifecycle_request("sess_inserted"), identity=_identity())
+        cursor = first.next_cursor
+        while cursor is not None:
+            page = await store.list_sessions(SessionQuery(order_by=order, limit=2, cursor=cursor))
+            seen.extend(session.id for session in page.sessions)
+            cursor = page.next_cursor
+        assert len(seen) == len(set(seen)), seen  # no duplicates
+        # Every original session appears exactly once.
+        assert {"sess_0", "sess_1", "sess_2", "sess_3"} <= set(seen)
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_reject_invalid_cursor(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        await store.create(_lifecycle_request("sess_only"), identity=_identity())
+        # Not valid base64/JSON.
+        with pytest.raises(ValueError, match="[Cc]ursor"):
+            await store.list_sessions(SessionQuery(cursor="!!!not-a-cursor"))
+        # Structurally valid but the encoded sort value is not a timestamp: every
+        # store must reject it rather than silently returning a wrong page.
+        forged = base64.urlsafe_b64encode(b'["not-a-timestamp","sess_only"]').decode("ascii")
+        with pytest.raises(ValueError, match="[Cc]ursor"):
+            await store.list_sessions(SessionQuery(cursor=forged))
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_cursor_pagination_empty_result(store_factory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        await store.create(_lifecycle_request("sess_only"), identity=_identity())
+        # A filter that matches nothing: empty first page, no next cursor, zero total.
+        page = await store.list_sessions(
+            SessionQuery(labels={"absent": "1"}, limit=2, include_total_count=True)
+        )
+        assert page.sessions == []
+        assert page.next_cursor is None
+        assert page.total_count == 0
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+def _force_timestamps(store: InMemorySessionStore, stamps: dict[str, datetime]) -> None:
+    for session_id, stamp in stamps.items():
+        store._sessions[session_id] = store._sessions[session_id].model_copy(
+            update={"created_at": stamp, "updated_at": stamp}
+        )
+
+
+def test_inmemory_cursor_pagination_with_tied_timestamps() -> None:
+    # Two tie-groups at distinct timestamps: paging across ties must not skip/duplicate,
+    # AND ASC vs DESC must produce DIFFERENT orders (so a reversed primary-sort comparison,
+    # not just a reversed tiebreak, would fail this test).
+    store = InMemorySessionStore()
+
+    async def run() -> None:
+        for index in range(5):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        early = datetime(2026, 1, 1, tzinfo=UTC)
+        late = datetime(2026, 6, 1, tzinfo=UTC)
+        _force_timestamps(
+            store,
+            {"sess_0": early, "sess_1": early, "sess_2": early, "sess_3": late, "sess_4": late},
+        )
+
+        async def page_through(order: SessionOrder) -> list[str]:
+            collected: list[str] = []
+            cursor: str | None = None
+            while True:
+                page = await store.list_sessions(
+                    SessionQuery(order_by=order, limit=2, cursor=cursor)
+                )
+                collected.extend(session.id for session in page.sessions)
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+            return collected
+
+        for order in SessionOrder:
+            full = (await store.list_sessions(SessionQuery(order_by=order, limit=100))).sessions
+            expected = [session.id for session in full]
+            assert await page_through(order) == expected, order
+            assert len(expected) == len(set(expected)) == 5
+
+        asc = [
+            s.id
+            for s in (
+                await store.list_sessions(
+                    SessionQuery(order_by=SessionOrder.CREATED_AT_ASC, limit=100)
+                )
+            ).sessions
+        ]
+        desc = [
+            s.id
+            for s in (
+                await store.list_sessions(
+                    SessionQuery(order_by=SessionOrder.CREATED_AT_DESC, limit=100)
+                )
+            ).sessions
+        ]
+        assert asc == ["sess_0", "sess_1", "sess_2", "sess_3", "sess_4"]
+        assert desc == ["sess_3", "sess_4", "sess_0", "sess_1", "sess_2"]
+        assert asc != desc
+
+    asyncio.run(run())
+
+
+def test_inmemory_cursor_survives_mid_stream_insert() -> None:
+    # A row inserted AFTER the cursor position (but before the end) must appear on a
+    # later page — not be skipped. Forces created_at so the insert lands mid-stream.
+    store = InMemorySessionStore()
+
+    async def run() -> None:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        for index in range(4):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        _force_timestamps(
+            store,
+            {f"sess_{i}": base.replace(minute=i * 2) for i in range(4)},  # minutes 0,2,4,6
+        )
+        order = SessionOrder.CREATED_AT_ASC
+        first = await store.list_sessions(SessionQuery(order_by=order, limit=2))
+        seen = [s.id for s in first.sessions]  # sess_0(0), sess_1(2)
+        # Insert a row at minute 3 — strictly after the cursor (sess_1@2), before sess_2@4.
+        await store.create(_lifecycle_request("sess_mid"), identity=_identity())
+        _force_timestamps(store, {"sess_mid": base.replace(minute=3)})
+        cursor = first.next_cursor
+        while cursor is not None:
+            page = await store.list_sessions(SessionQuery(order_by=order, limit=2, cursor=cursor))
+            seen.extend(s.id for s in page.sessions)
+            cursor = page.next_cursor
+        assert seen == ["sess_0", "sess_1", "sess_mid", "sess_2", "sess_3"]
+
+    asyncio.run(run())
+
+
+def test_session_query_rejects_cursor_with_offset() -> None:
+    SessionQuery(cursor="abc")  # cursor alone is fine
+    SessionQuery(offset=5)  # offset alone is fine
+    with pytest.raises(ValidationError, match="cursor and a non-zero offset"):
+        SessionQuery(cursor="abc", offset=5)
 
 
 def _make_store(store_factory: StoreFactory, tmp_path) -> SessionStore:

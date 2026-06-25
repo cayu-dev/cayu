@@ -631,14 +631,14 @@ async def _list_background_subagent_children(
     *,
     parent_session_id: str,
 ) -> list[Session]:
-    sessions = await session_store.list_sessions(
+    result = await session_store.list_sessions(
         SessionQuery(
             parent_session_id=parent_session_id,
             limit=1000,
             order_by=SessionOrder.CREATED_AT_ASC,
         )
     )
-    return [session for session in sessions if _is_background_subagent_session(session)]
+    return [session for session in result.sessions if _is_background_subagent_session(session)]
 
 
 def _is_background_subagent_session(session: Session) -> bool:

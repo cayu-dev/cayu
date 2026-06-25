@@ -9,6 +9,8 @@ from cayu.runtime.sessions import (
     Session,
     SessionOrder,
     SessionStatus,
+    session_order_is_descending,
+    session_sort_column,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
 
@@ -269,13 +271,10 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
 
 
 def session_order_sql(order_by: SessionOrder) -> str:
-    if order_by == SessionOrder.CREATED_AT_ASC:
-        return "created_at ASC"
-    if order_by == SessionOrder.CREATED_AT_DESC:
-        return "created_at DESC"
-    if order_by == SessionOrder.UPDATED_AT_ASC:
-        return "updated_at ASC"
-    return "updated_at DESC"
+    # Derived from the same helpers the keyset cursor uses, so the ORDER BY direction
+    # can never drift from the cursor comparison.
+    direction = "DESC" if session_order_is_descending(order_by) else "ASC"
+    return f"{session_sort_column(order_by)} {direction}"
 
 
 def task_order_sql(order_by: TaskOrder) -> str:

@@ -10,12 +10,14 @@ from typing import Any
 from cayu._validation import (
     copy_json_object,
     copy_json_value,
+    copy_label_map,
     require_clean_nonblank,
     require_nonblank,
 )
 from cayu.core.events import Event, copy_event
 from cayu.core.messages import Message
 from cayu.runtime.sessions import (
+    DELETE_BLOCKED_SESSION_STATUSES,
     CheckpointTransform,
     EventQuery,
     EventRecord,
@@ -24,6 +26,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionListResult,
     SessionOutcome,
     SessionQuery,
     SessionStatus,
@@ -39,7 +42,11 @@ from cayu.runtime.sessions import (
     copy_session_query,
     copy_transcript_messages,
     copy_transcript_query,
+    decode_session_cursor,
+    session_next_cursor,
+    session_order_is_descending,
     session_outcome,
+    session_sort_column,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -404,6 +411,81 @@ class SQLiteSessionStore(SessionStore):
             if cursor.rowcount != 1:
                 raise KeyError(f"Session not found: {session_id}")
 
+            loaded = self._load_unlocked(session_id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
+    async def delete_session(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT status FROM cayu_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return  # idempotent: deleting a missing session is a no-op
+            status = SessionStatus(row["status"])
+            if status in DELETE_BLOCKED_SESSION_STATUSES:
+                raise ValueError(
+                    f"Cannot delete a session while it is {status}; "
+                    f"interrupt it first: {session_id}"
+                )
+            with self._connection:
+                # ON DELETE CASCADE removes events/labels/checkpoint/transcript; the
+                # self-FK is ON DELETE SET NULL so children keep loading with no parent.
+                self._connection.execute(
+                    "DELETE FROM cayu_sessions WHERE id = ?",
+                    (session_id,),
+                )
+
+    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_labels = copy_label_map(labels, "labels", allow_reserved=False)
+        updated_at = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    "UPDATE cayu_sessions SET updated_at = ? WHERE id = ?",
+                    (sqlite_support.format_datetime(updated_at), session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                self._connection.execute(
+                    "DELETE FROM cayu_session_labels WHERE session_id = ?",
+                    (session_id,),
+                )
+                if new_labels:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO cayu_session_labels (session_id, key, value)
+                        VALUES (?, ?, ?)
+                        """,
+                        [(session_id, key, value) for key, value in new_labels.items()],
+                    )
+            loaded = self._load_unlocked(session_id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
+    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_metadata = copy_json_value(metadata, "metadata")
+        if type(new_metadata) is not dict:
+            raise TypeError("Session metadata must be an object.")
+        updated_at = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (
+                        sqlite_support.json_dumps(new_metadata),
+                        sqlite_support.format_datetime(updated_at),
+                        session_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
             loaded = self._load_unlocked(session_id)
             if loaded is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -808,7 +890,7 @@ class SQLiteSessionStore(SessionStore):
                 latest_retry_event=_event_record_from_row(retry_row),
             )
 
-    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+    async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
         clauses: list[str] = []
         params: list[object] = []
@@ -885,11 +967,38 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(f"Unsupported label selector operator: {selector.operator}")
                 params.extend([selector.key, *selector.values])
 
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where_filter = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = sqlite_support.session_order_sql(query.order_by)
-        params.extend([query.limit, query.offset])
+
+        # The paged query reuses the filters plus, when a cursor is given, a keyset
+        # predicate; the COUNT uses only the filters so total_count is page-stable.
+        page_clauses = list(clauses)
+        page_params = list(params)
+        sort_column = session_sort_column(query.order_by)
+        if query.cursor is not None:
+            cursor_dt, cursor_id = decode_session_cursor(query.cursor)
+            # SQLite compares timestamps as TEXT; format the cursor datetime with the
+            # same encoder used to store the column so the comparison is byte-exact.
+            cursor_value = sqlite_support.format_datetime(cursor_dt)
+            comparison = "<" if session_order_is_descending(query.order_by) else ">"
+            page_clauses.append(
+                f"(({sort_column} {comparison} ?) OR ({sort_column} = ? AND id > ?))"
+            )
+            page_params.extend([cursor_value, cursor_value, cursor_id])
+            page_params.append(query.limit + 1)
+            pagination_sql = "LIMIT ?"
+        else:
+            page_params.extend([query.limit + 1, query.offset])
+            pagination_sql = "LIMIT ? OFFSET ?"
+        where_page = f"WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
 
         async with self._lock:
+            total_count: int | None = None
+            if query.include_total_count:
+                total_count = self._connection.execute(
+                    f"SELECT COUNT(*) FROM cayu_sessions {where_filter}",
+                    params,
+                ).fetchone()[0]
             rows = self._connection.execute(
                 f"""
                 SELECT id, agent_name, provider_name, model, parent_session_id,
@@ -897,22 +1006,28 @@ class SQLiteSessionStore(SessionStore):
                        status, created_at,
                        updated_at, metadata_json
                 FROM cayu_sessions
-                {where_sql}
+                {where_page}
                 ORDER BY {order_sql}, id ASC
-                LIMIT ? OFFSET ?
+                {pagination_sql}
                 """,
-                params,
+                page_params,
             ).fetchall()
+            has_more = len(rows) > query.limit
+            rows = rows[: query.limit]
             labels_by_session_id = self._load_labels_for_sessions_unlocked(
                 [row["id"] for row in rows]
             )
-            return [
+            sessions = [
                 sqlite_support.session_from_row(
                     row,
                     labels=labels_by_session_id.get(row["id"], {}),
                 )
                 for row in rows
             ]
+        next_cursor = session_next_cursor(sessions, has_more, query.order_by)
+        return SessionListResult(
+            sessions=sessions, next_cursor=next_cursor, total_count=total_count
+        )
 
     async def append_transcript_messages(
         self,

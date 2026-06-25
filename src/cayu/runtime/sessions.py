@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
@@ -437,7 +439,24 @@ class SessionQuery(BaseModel):
     label_selectors: tuple[LabelSelectorRequirement, ...] = Field(default_factory=tuple)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0)
+    cursor: str | None = None
+    include_total_count: StrictBool = False
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "cursor")
+
+    @model_validator(mode="after")
+    def reject_cursor_with_offset(self) -> SessionQuery:
+        # A keyset cursor and offset are two different paging schemes; combining them
+        # would silently ignore the offset, so reject it explicitly.
+        if self.cursor is not None and self.offset:
+            raise ValueError("cursor and a non-zero offset cannot be combined.")
+        return self
 
     @field_validator("agent_name", "environment_name", "parent_session_id", "causal_budget_id")
     @classmethod
@@ -715,6 +734,17 @@ class TranscriptPage(BaseModel):
     total_records: StrictInt = Field(ge=0)
 
 
+class SessionListResult(BaseModel):
+    """One page of a session listing plus its keyset cursor and (optional) total count."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sessions: list[Session] = Field(default_factory=list)
+    next_cursor: str | None = None
+    # None unless the query opted in via include_total_count (COUNT is expensive at scale).
+    total_count: StrictInt | None = Field(default=None, ge=0)
+
+
 class TranscriptQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -818,8 +848,35 @@ class SessionStore(ABC):
         """Derive the current session outcome from durable events."""
 
     @abstractmethod
-    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
-        """List sessions for dashboard, replay, and orchestration views."""
+    async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        """List sessions (filtered/sorted/paginated) with a keyset cursor and total count."""
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and cascade to its events, transcript, and checkpoint.
+
+        Raises ``ValueError`` if the session is in-flight (``RUNNING`` or
+        ``INTERRUPTING`` — interrupt it first). Idempotent: deleting a session
+        that does not exist is a no-op.
+
+        Default raises ``NotImplementedError`` so out-of-tree stores keep working.
+        """
+        raise NotImplementedError("This SessionStore does not support delete_session.")
+
+    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+        """Replace a session's labels (full replacement, not a merge) and return it.
+
+        Raises ``KeyError`` if the session does not exist. Default raises
+        ``NotImplementedError`` so out-of-tree stores keep working.
+        """
+        raise NotImplementedError("This SessionStore does not support update_labels.")
+
+    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+        """Replace a session's metadata (full replacement, not a merge) and return it.
+
+        Raises ``KeyError`` if the session does not exist. Default raises
+        ``NotImplementedError`` so out-of-tree stores keep working.
+        """
+        raise NotImplementedError("This SessionStore does not support update_metadata.")
 
     @abstractmethod
     async def append_transcript_messages(
@@ -1018,6 +1075,58 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
+    async def delete_session(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return  # idempotent: deleting a missing session is a no-op
+            if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+                raise ValueError(
+                    f"Cannot delete a session while it is {session.status}; "
+                    f"interrupt it first: {session_id}"
+                )
+            self._sessions.pop(session_id, None)
+            self._events.pop(session_id, None)
+            self._event_ids.pop(session_id, None)
+            self._transcripts.pop(session_id, None)
+            self._checkpoints.pop(session_id, None)
+            self._event_records = [
+                record for record in self._event_records if record.event.session_id != session_id
+            ]
+            # Mirror the SQL FK's ON DELETE SET NULL: children keep loading, parent ref cleared.
+            for child_id, child in list(self._sessions.items()):
+                if child.parent_session_id == session_id:
+                    self._sessions[child_id] = child.model_copy(update={"parent_session_id": None})
+
+    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_labels = copy_label_map(labels, "labels", allow_reserved=False)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            updated = session.model_copy(
+                update={"labels": new_labels, "updated_at": datetime.now(UTC)}
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_metadata = copy_json_value(metadata, "metadata")
+        if type(new_metadata) is not dict:
+            raise TypeError("Session metadata must be an object.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            updated = session.model_copy(
+                update={"metadata": new_metadata, "updated_at": datetime.now(UTC)}
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
     async def transition_status(
         self,
         session_id: str,
@@ -1182,15 +1291,31 @@ class InMemorySessionStore(SessionStore):
             ]
             return session_outcome_from_records(session, records)
 
-    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+    async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
         async with self._lock:
-            sessions = [
+            matching = [
                 session for session in self._sessions.values() if _session_matches(session, query)
             ]
-            sessions = _sort_sessions(sessions, query.order_by)
-            page = sessions[query.offset : query.offset + query.limit]
-            return [session.model_copy(deep=True) for session in page]
+            total = len(matching) if query.include_total_count else None
+            ordered = _sort_sessions(matching, query.order_by)
+            if query.cursor is not None:
+                cursor_dt, cursor_id = decode_session_cursor(query.cursor)
+                ordered = [
+                    session
+                    for session in ordered
+                    if _session_after_cursor(session, query.order_by, cursor_dt, cursor_id)
+                ]
+                window = ordered[: query.limit + 1]
+            else:
+                window = ordered[query.offset : query.offset + query.limit + 1]
+            page = window[: query.limit]
+            next_cursor = session_next_cursor(page, len(window) > query.limit, query.order_by)
+            return SessionListResult(
+                sessions=[session.model_copy(deep=True) for session in page],
+                next_cursor=next_cursor,
+                total_count=total,
+            )
 
     async def append_transcript_messages(
         self,
@@ -1639,6 +1764,8 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         label_selectors=copy_label_selector_requirements(query.label_selectors),
         limit=query.limit,
         offset=query.offset,
+        cursor=query.cursor,
+        include_total_count=query.include_total_count,
         order_by=query.order_by,
     )
 
@@ -1727,6 +1854,74 @@ def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Sess
         key=lambda session: session.updated_at,
         reverse=True,
     )
+
+
+# Sessions that must be interrupted before they can be deleted (in-flight work).
+DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
+
+_DESCENDING_SESSION_ORDERS = frozenset({SessionOrder.CREATED_AT_DESC, SessionOrder.UPDATED_AT_DESC})
+_CREATED_AT_ORDERS = frozenset({SessionOrder.CREATED_AT_ASC, SessionOrder.CREATED_AT_DESC})
+
+
+def session_order_is_descending(order_by: SessionOrder) -> bool:
+    return order_by in _DESCENDING_SESSION_ORDERS
+
+
+def session_sort_column(order_by: SessionOrder) -> str:
+    """The session column an order sorts by — the keyset cursor's primary key."""
+    return "created_at" if order_by in _CREATED_AT_ORDERS else "updated_at"
+
+
+def _session_sort_value(session: Session, order_by: SessionOrder) -> datetime:
+    return session.created_at if order_by in _CREATED_AT_ORDERS else session.updated_at
+
+
+def encode_session_cursor(session: Session, order_by: SessionOrder) -> str:
+    """Opaque keyset cursor for the last row of a page: (sort value, session id)."""
+    sort_value = _session_sort_value(session, order_by).astimezone(UTC).isoformat()
+    raw = json.dumps([sort_value, session.id], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def decode_session_cursor(cursor: str) -> tuple[datetime, str]:
+    """Decode a cursor to (sort value, session id). Raises ValueError if malformed."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        decoded = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid session cursor.") from exc
+    if (
+        type(decoded) is not list
+        or len(decoded) != 2
+        or type(decoded[0]) is not str
+        or type(decoded[1]) is not str
+    ):
+        raise ValueError("Invalid session cursor.")
+    try:
+        sort_value = datetime.fromisoformat(decoded[0])
+    except ValueError as exc:
+        raise ValueError("Invalid session cursor.") from exc
+    return sort_value, decoded[1]
+
+
+def session_next_cursor(page: list[Session], has_more: bool, order_by: SessionOrder) -> str | None:
+    """The keyset cursor for the next page: the last row's cursor, or None if no more."""
+    return encode_session_cursor(page[-1], order_by) if has_more and page else None
+
+
+def _session_after_cursor(
+    session: Session,
+    order_by: SessionOrder,
+    cursor_value: datetime,
+    cursor_id: str,
+) -> bool:
+    """Whether ``session`` falls strictly after the cursor under ``order_by`` (id tiebreak ASC)."""
+    value = _session_sort_value(session, order_by)
+    if value != cursor_value:
+        if session_order_is_descending(order_by):
+            return value < cursor_value
+        return value > cursor_value
+    return session.id > cursor_id
 
 
 def _event_record_matches(

@@ -9,6 +9,7 @@ They skip automatically when Docker is unavailable (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import UTC, datetime
 
 import pytest
@@ -272,7 +273,7 @@ def test_postgres_session_store_transforms_current_checkpoint_during_fork(postgr
         assert await store.load_checkpoint("sess_fork_ck_child") == {"copied_version": 2}
         transcript = await store.load_transcript("sess_fork_ck_child")
         assert [m.content[0].text for m in transcript] == ["first request", "first answer"]
-        children = await store.list_sessions(SessionQuery(parent_session_id=source.id))
+        children = (await store.list_sessions(SessionQuery(parent_session_id=source.id))).sessions
         assert [s.id for s in children] == ["sess_fork_ck_child"]
 
     _run(postgres_dsn, ops)
@@ -304,7 +305,9 @@ def test_postgres_session_store_persists_run_request_parent_session_id(postgres_
         assert loaded is not None
         assert loaded.parent_session_id == "sess_pg_run_parent"
         assert loaded.causal_budget_id == "job_pg_run_parent"
-        children = await store.list_sessions(SessionQuery(parent_session_id="sess_pg_run_parent"))
+        children = (
+            await store.list_sessions(SessionQuery(parent_session_id="sess_pg_run_parent"))
+        ).sessions
         assert [session.id for session in children] == ["sess_pg_run_child"]
 
     _run(postgres_dsn, ops)
@@ -507,16 +510,24 @@ def test_postgres_session_store_lists_sessions_with_filters_and_pagination(postg
         await store.update_status("sess_builder_1", SessionStatus.RUNNING)
         await store.update_status("sess_builder_2", SessionStatus.COMPLETED)
 
-        builder_sessions = await store.list_sessions(
-            SessionQuery(agent_name="builder", order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        hosted_sessions = await store.list_sessions(
-            SessionQuery(environment_name="hosted", order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        completed_sessions = await store.list_sessions(SessionQuery(status=SessionStatus.COMPLETED))
-        paged_sessions = await store.list_sessions(
-            SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
-        )
+        builder_sessions = (
+            await store.list_sessions(
+                SessionQuery(agent_name="builder", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        hosted_sessions = (
+            await store.list_sessions(
+                SessionQuery(environment_name="hosted", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        completed_sessions = (
+            await store.list_sessions(SessionQuery(status=SessionStatus.COMPLETED))
+        ).sessions
+        paged_sessions = (
+            await store.list_sessions(
+                SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
 
         assert [s.id for s in builder_sessions] == ["sess_builder_1", "sess_builder_2"]
         assert [s.id for s in hosted_sessions] == ["sess_builder_2", "sess_reviewer"]
@@ -561,43 +572,59 @@ def test_postgres_session_store_preserves_and_filters_session_labels(postgres_ds
         )
 
         loaded = await store.load(created.id)
-        owner_sessions = await store.list_sessions(
-            SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
-        )
-        exact_sessions = await store.list_sessions(
-            SessionQuery(
-                labels={"owner": "org_123", "project": "ap_q2"},
-                order_by=SessionOrder.CREATED_AT_ASC,
+        owner_sessions = (
+            await store.list_sessions(
+                SessionQuery(labels={"owner": "org_123"}, order_by=SessionOrder.CREATED_AT_ASC)
             )
-        )
-        missing_sessions = await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
-        exists_sessions = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[{"key": "workflow", "operator": "exists"}],
-                order_by=SessionOrder.CREATED_AT_ASC,
+        ).sessions
+        exact_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    labels={"owner": "org_123", "project": "ap_q2"},
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
-        in_sessions = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[
-                    {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
-                ],
-                order_by=SessionOrder.CREATED_AT_ASC,
+        ).sessions
+        missing_sessions = (
+            await store.list_sessions(SessionQuery(labels={"owner": "missing"}))
+        ).sessions
+        exists_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[{"key": "workflow", "operator": "exists"}],
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
-        not_in_sessions = await store.list_sessions(
-            SessionQuery(
-                labels={"owner": "org_123"},
-                label_selectors=[{"key": "project", "operator": "not_in", "values": ["research"]}],
-                order_by=SessionOrder.CREATED_AT_ASC,
+        ).sessions
+        in_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[
+                        {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
+                    ],
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
-        not_exists_sessions = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[{"key": "owner", "operator": "not_exists"}],
-                order_by=SessionOrder.CREATED_AT_ASC,
+        ).sessions
+        not_in_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    labels={"owner": "org_123"},
+                    label_selectors=[
+                        {"key": "project", "operator": "not_in", "values": ["research"]}
+                    ],
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
+        ).sessions
+        not_exists_sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[{"key": "owner", "operator": "not_exists"}],
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+        ).sessions
 
         assert loaded is not None
         assert loaded.labels == {
@@ -1253,5 +1280,191 @@ def test_postgres_session_store_query_transcript_pagination_and_role_filter(post
 
         with pytest.raises(KeyError, match="Session not found"):
             await store.query_transcript(TranscriptQuery(session_id="missing_session"))
+
+    _run(postgres_dsn, ops)
+
+
+def _lifecycle_request(
+    session_id: str,
+    *,
+    parent: str | None = None,
+    labels: dict[str, str] | None = None,
+    metadata: dict[str, object] | None = None,
+) -> RunRequest:
+    return RunRequest(
+        agent_name="assistant",
+        session_id=session_id,
+        parent_session_id=parent,
+        labels=labels or {},
+        metadata=metadata or {},
+        messages=[Message.text("user", "hi")],
+    )
+
+
+def test_postgres_session_store_delete_session_cascades_and_is_idempotent(postgres_dsn):
+    async def ops(store):
+        await store.create(_lifecycle_request("sess_keep"), identity=_identity())
+        await store.create(
+            _lifecycle_request("sess_drop", labels={"team": "drop"}), identity=_identity()
+        )
+        await store.append_events(
+            "sess_drop",
+            [Event(type=EventType.SESSION_STARTED, session_id="sess_drop", agent_name="assistant")],
+        )
+        await store.append_transcript_messages("sess_drop", [Message.text("assistant", "bye")])
+        await store.checkpoint("sess_drop", {"cursor": 1})
+
+        await store.delete_session("sess_drop")
+
+        assert await store.load("sess_drop") is None
+        assert await store.query_events(EventQuery(session_id="sess_drop")) == []
+        assert await store.load_checkpoint("sess_drop") is None
+        assert (await store.list_sessions(SessionQuery(labels={"team": "drop"}))).sessions == []
+        assert await store.load("sess_keep") is not None
+        await store.create(_lifecycle_request("sess_drop"), identity=_identity())
+        assert await store.load("sess_drop") is not None
+        await store.delete_session("sess_never_existed")
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_delete_rejects_in_flight_sessions(postgres_dsn):
+    async def ops(store):
+        for index, status in enumerate((SessionStatus.RUNNING, SessionStatus.INTERRUPTING)):
+            session_id = f"sess_inflight_{index}"
+            await store.create(_lifecycle_request(session_id), identity=_identity())
+            await store.update_status(session_id, status)
+            with pytest.raises(ValueError, match="interrupt it first"):
+                await store.delete_session(session_id)
+            assert await store.load(session_id) is not None
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_delete_parent_nulls_child_parent(postgres_dsn):
+    async def ops(store):
+        await store.create(_lifecycle_request("sess_parent"), identity=_identity())
+        await store.create(
+            _lifecycle_request("sess_child", parent="sess_parent"), identity=_identity()
+        )
+        await store.delete_session("sess_parent")
+        child = await store.load("sess_child")
+        assert child is not None
+        assert child.parent_session_id is None
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_update_labels_replaces_and_filters(postgres_dsn):
+    async def ops(store):
+        created = await store.create(
+            _lifecycle_request("sess_labeled", labels={"team": "research", "stage": "draft"}),
+            identity=_identity(),
+        )
+        await store.update_status("sess_labeled", SessionStatus.COMPLETED)
+        updated = await store.update_labels("sess_labeled", {"stage": "review"})
+        assert updated.labels == {"stage": "review"}
+        assert updated.updated_at >= created.updated_at
+        assert updated.status == SessionStatus.COMPLETED
+        reloaded = await store.load("sess_labeled")
+        assert reloaded is not None
+        assert reloaded.labels == {"stage": "review"}
+        matched = (await store.list_sessions(SessionQuery(labels={"stage": "review"}))).sessions
+        assert [session.id for session in matched] == ["sess_labeled"]
+        stale = (await store.list_sessions(SessionQuery(labels={"team": "research"}))).sessions
+        assert stale == []
+        cleared = await store.update_labels("sess_labeled", {})
+        assert cleared.labels == {}
+        assert (await store.list_sessions(SessionQuery(labels={"stage": "review"}))).sessions == []
+        with pytest.raises(ValueError, match="reserved"):
+            await store.update_labels("sess_labeled", {"cayu:internal": "x"})
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.update_labels("sess_missing", {"k": "v"})
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_update_metadata_replaces(postgres_dsn):
+    async def ops(store):
+        await store.create(
+            _lifecycle_request("sess_meta", metadata={"a": 1, "keep": False}),
+            identity=_identity(),
+        )
+        await store.update_status("sess_meta", SessionStatus.COMPLETED)
+        updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
+        assert updated.metadata == {"b": [1, 2]}
+        assert updated.status == SessionStatus.COMPLETED
+        reloaded = await store.load("sess_meta")
+        assert reloaded is not None
+        assert reloaded.metadata == {"b": [1, 2]}
+        with pytest.raises(KeyError, match="Session not found"):
+            await store.update_metadata("sess_missing", {"k": "v"})
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_cursor_pagination_is_stable_across_orders(postgres_dsn):
+    async def ops(store):
+        for index in range(5):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        for order in SessionOrder:
+            full = (await store.list_sessions(SessionQuery(order_by=order, limit=100))).sessions
+            expected_ids = [session.id for session in full]
+            collected: list[str] = []
+            cursor: str | None = None
+            while True:
+                page = await store.list_sessions(
+                    SessionQuery(order_by=order, limit=2, cursor=cursor, include_total_count=True)
+                )
+                assert page.total_count == len(expected_ids)
+                collected.extend(session.id for session in page.sessions)
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+            assert collected == expected_ids, order
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_cursor_survives_concurrent_insert(postgres_dsn):
+    async def ops(store):
+        for index in range(4):
+            await store.create(_lifecycle_request(f"sess_{index}"), identity=_identity())
+        order = SessionOrder.CREATED_AT_ASC
+        first = await store.list_sessions(SessionQuery(order_by=order, limit=2))
+        seen = [session.id for session in first.sessions]
+        await store.create(_lifecycle_request("sess_inserted"), identity=_identity())
+        cursor = first.next_cursor
+        while cursor is not None:
+            page = await store.list_sessions(SessionQuery(order_by=order, limit=2, cursor=cursor))
+            seen.extend(session.id for session in page.sessions)
+            cursor = page.next_cursor
+        assert len(seen) == len(set(seen)), seen
+        assert {"sess_0", "sess_1", "sess_2", "sess_3"} <= set(seen)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_rejects_invalid_cursor(postgres_dsn):
+    async def ops(store):
+        await store.create(_lifecycle_request("sess_only"), identity=_identity())
+        with pytest.raises(ValueError, match="[Cc]ursor"):
+            await store.list_sessions(SessionQuery(cursor="!!!not-a-cursor"))
+        forged = base64.urlsafe_b64encode(b'["not-a-timestamp","sess_only"]').decode("ascii")
+        with pytest.raises(ValueError, match="[Cc]ursor"):
+            await store.list_sessions(SessionQuery(cursor=forged))
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_cursor_pagination_empty_result(postgres_dsn):
+    async def ops(store):
+        await store.create(_lifecycle_request("sess_only"), identity=_identity())
+        page = await store.list_sessions(
+            SessionQuery(labels={"absent": "1"}, limit=2, include_total_count=True)
+        )
+        assert page.sessions == []
+        assert page.next_cursor is None
+        assert page.total_count == 0
 
     _run(postgres_dsn, ops)

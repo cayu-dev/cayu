@@ -66,7 +66,9 @@ async function responseErrorMessage(response: Response): Promise<string> {
 }
 
 export async function fetchSessions(): Promise<Session[]> {
-  return fetchJson<Session[]>("/api/sessions")
+  // GET /api/sessions returns a paginated envelope; the dashboard shows the first page.
+  const page = await fetchJson<{ sessions: Session[] }>("/api/sessions")
+  return page.sessions
 }
 
 export async function fetchSession(id: string): Promise<SessionDetail> {

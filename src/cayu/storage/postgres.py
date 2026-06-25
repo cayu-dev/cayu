@@ -11,6 +11,7 @@ from psycopg_pool import AsyncConnectionPool
 from cayu._validation import (
     copy_json_object,
     copy_json_value,
+    copy_label_map,
     require_clean_nonblank,
     require_nonblank,
 )
@@ -24,6 +25,7 @@ from cayu.runtime.event_watchers import (
     EventWatcherStore,
 )
 from cayu.runtime.sessions import (
+    DELETE_BLOCKED_SESSION_STATUSES,
     CheckpointTransform,
     EventQuery,
     EventRecord,
@@ -32,6 +34,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionListResult,
     SessionOutcome,
     SessionQuery,
     SessionStatus,
@@ -47,7 +50,11 @@ from cayu.runtime.sessions import (
     copy_session_query,
     copy_transcript_messages,
     copy_transcript_query,
+    decode_session_cursor,
+    session_next_cursor,
+    session_order_is_descending,
     session_outcome,
+    session_sort_column,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -839,6 +846,81 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             return loaded
 
+    async def delete_session(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM cayu_sessions WHERE id = %s",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return  # idempotent: deleting a missing session is a no-op
+                status = SessionStatus(row[0])
+                if status in DELETE_BLOCKED_SESSION_STATUSES:
+                    raise ValueError(
+                        f"Cannot delete a session while it is {status}; "
+                        f"interrupt it first: {session_id}"
+                    )
+                # ON DELETE CASCADE removes events/labels/checkpoint/transcript; the
+                # self-FK is ON DELETE SET NULL so children keep loading with no parent.
+                await cur.execute("DELETE FROM cayu_sessions WHERE id = %s", (session_id,))
+            await conn.commit()
+
+    async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_labels = copy_label_map(labels, "labels", allow_reserved=False)
+        await self._ensure_ready()
+        updated_at = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET updated_at = %s WHERE id = %s",
+                    (updated_at, session_id),
+                )
+                if cur.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                await cur.execute(
+                    "DELETE FROM cayu_session_labels WHERE session_id = %s",
+                    (session_id,),
+                )
+                if new_labels:
+                    await cur.executemany(
+                        """
+                        INSERT INTO cayu_session_labels (session_id, key, value)
+                        VALUES (%s, %s, %s)
+                        """,
+                        [(session_id, key, value) for key, value in new_labels.items()],
+                    )
+                loaded = await self._load(cur, session_id)
+            await conn.commit()
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
+    async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        new_metadata = copy_json_value(metadata, "metadata")
+        if type(new_metadata) is not dict:
+            raise TypeError("Session metadata must be an object.")
+        await self._ensure_ready()
+        updated_at = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
+                    (_dumps(new_metadata), updated_at, session_id),
+                )
+                if cur.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                loaded = await self._load(cur, session_id)
+            await conn.commit()
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return loaded
+
     async def transition_status(
         self,
         session_id: str,
@@ -1233,7 +1315,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 latest_retry_event=_event_record_from_row(retry_row),
             )
 
-    async def list_sessions(self, query: SessionQuery | None = None) -> list[Session]:
+    async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
         clauses: list[str] = []
         params: list[object] = []
@@ -1310,39 +1392,70 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     raise ValueError(f"Unsupported label selector operator: {selector.operator}")
                 params.extend([selector.key, *selector.values])
 
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        where_filter = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_sql = pg_support.session_order_sql(query.order_by)
-        params.extend([query.limit, query.offset])
+
+        # The paged query reuses the filters plus, when a cursor is given, a keyset
+        # predicate; the COUNT uses only the filters so total_count is page-stable.
+        page_clauses = list(clauses)
+        page_params = list(params)
+        sort_column = session_sort_column(query.order_by)
+        if query.cursor is not None:
+            cursor_dt, cursor_id = decode_session_cursor(query.cursor)
+            comparison = "<" if session_order_is_descending(query.order_by) else ">"
+            page_clauses.append(
+                f"(({sort_column} {comparison} %s) OR ({sort_column} = %s AND id > %s))"
+            )
+            page_params.extend([cursor_dt, cursor_dt, cursor_id, query.limit + 1])
+            pagination_sql = "LIMIT %s"
+        else:
+            page_params.extend([query.limit + 1, query.offset])
+            pagination_sql = "LIMIT %s OFFSET %s"
+        where_page = f"WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
 
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             # Interpolations are trusted: SESSION_COLUMNS is a constant, order_sql is
-            # an enum-derived literal, where_sql is hard-coded clauses; values bind via %s.
+            # an enum-derived literal, the clauses are hard-coded; values bind via %s.
+            total_count: int | None = None
+            if query.include_total_count:
+                await cur.execute(
+                    cast("LiteralString", f"SELECT COUNT(*) FROM cayu_sessions {where_filter}"),
+                    params,
+                )
+                count_row = await cur.fetchone()
+                total_count = count_row[0] if count_row is not None else 0
             await cur.execute(
                 cast(
                     "LiteralString",
                     f"""
                     SELECT {pg_support.SESSION_COLUMNS}
                     FROM cayu_sessions
-                    {where_sql}
+                    {where_page}
                     ORDER BY {order_sql}, id ASC
-                    LIMIT %s OFFSET %s
+                    {pagination_sql}
                     """,
                 ),
-                params,
+                page_params,
             )
             rows = await cur.fetchall()
+            has_more = len(rows) > query.limit
+            rows = rows[: query.limit]
             labels_by_session_id = await self._load_labels_for_sessions(
                 cur,
                 [row[0] for row in rows],
             )
-            return [
+            sessions = [
                 pg_support.session_from_row(
                     row,
                     labels=labels_by_session_id.get(row[0], {}),
                 )
                 for row in rows
             ]
+        next_cursor = session_next_cursor(sessions, has_more, query.order_by)
+        return SessionListResult(
+            sessions=sessions, next_cursor=next_cursor, total_count=total_count
+        )
 
     async def append_transcript_messages(
         self,

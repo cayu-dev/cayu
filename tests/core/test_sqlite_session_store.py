@@ -419,9 +419,9 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
         ]
         checkpoint = await reopened.load_checkpoint("sess_sqlite_fork_child")
         assert checkpoint == {"context_compaction": {}}
-        children = await reopened.list_sessions(
-            SessionQuery(parent_session_id="sess_sqlite_fork_source")
-        )
+        children = (
+            await reopened.list_sessions(SessionQuery(parent_session_id="sess_sqlite_fork_source"))
+        ).sessions
         assert [session.id for session in children] == ["sess_sqlite_fork_child"]
         events = await reopened.load_events("sess_sqlite_fork_child")
         assert [event.type for event in events] == [EventType.SESSION_FORKED]
@@ -465,9 +465,9 @@ def test_sqlite_session_store_persists_run_request_parent_session_id(tmp_path):
         assert child is not None
         assert child.parent_session_id == "sess_sqlite_run_parent"
         assert child.causal_budget_id == "job_sqlite_run_parent"
-        children = await reopened.list_sessions(
-            SessionQuery(parent_session_id="sess_sqlite_run_parent")
-        )
+        children = (
+            await reopened.list_sessions(SessionQuery(parent_session_id="sess_sqlite_run_parent"))
+        ).sessions
         assert [session.id for session in children] == ["sess_sqlite_run_child"]
         await _close(reopened)
 
@@ -788,7 +788,7 @@ def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
     store = SQLiteSessionStore(db_path)
 
     async def assert_initialized() -> None:
-        assert await store.list_sessions() == []
+        assert (await store.list_sessions()).sessions == []
         await _close(store)
 
     asyncio.run(assert_initialized())
@@ -799,7 +799,7 @@ def test_sqlite_session_store_initializes_new_unversioned_database(tmp_path):
     store = SQLiteSessionStore(db_path)
 
     async def assert_initialized() -> None:
-        sessions = await store.list_sessions()
+        sessions = (await store.list_sessions()).sessions
         assert sessions == []
         await _close(store)
 
@@ -916,33 +916,43 @@ def test_sqlite_session_store_filters_session_label_selectors(tmp_path):
             identity=_identity(),
         )
 
-        exists = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[{"key": "workflow", "operator": "exists"}],
-                order_by="created_at_asc",
+        exists = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[{"key": "workflow", "operator": "exists"}],
+                    order_by="created_at_asc",
+                )
             )
-        )
-        in_selector = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[
-                    {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
-                ],
-                order_by="created_at_asc",
+        ).sessions
+        in_selector = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[
+                        {"key": "project", "operator": "in", "values": ["ap_q2", "research"]}
+                    ],
+                    order_by="created_at_asc",
+                )
             )
-        )
-        not_in = await store.list_sessions(
-            SessionQuery(
-                labels={"owner": "org_123"},
-                label_selectors=[{"key": "project", "operator": "not_in", "values": ["research"]}],
-                order_by="created_at_asc",
+        ).sessions
+        not_in = (
+            await store.list_sessions(
+                SessionQuery(
+                    labels={"owner": "org_123"},
+                    label_selectors=[
+                        {"key": "project", "operator": "not_in", "values": ["research"]}
+                    ],
+                    order_by="created_at_asc",
+                )
             )
-        )
-        not_exists = await store.list_sessions(
-            SessionQuery(
-                label_selectors=[{"key": "owner", "operator": "not_exists"}],
-                order_by="created_at_asc",
+        ).sessions
+        not_exists = (
+            await store.list_sessions(
+                SessionQuery(
+                    label_selectors=[{"key": "owner", "operator": "not_exists"}],
+                    order_by="created_at_asc",
+                )
             )
-        )
+        ).sessions
 
         assert [session.id for session in exists] == ["sess_sqlite_selector_invoice"]
         assert [session.id for session in in_selector] == [

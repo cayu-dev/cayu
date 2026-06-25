@@ -45,13 +45,15 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
     count = 0
     offset = 0
     while True:
-        page = await store.list_sessions(
-            SessionQuery(
-                limit=_EXPORT_PAGE_SIZE,
-                offset=offset,
-                order_by=SessionOrder.CREATED_AT_ASC,
+        page = (
+            await store.list_sessions(
+                SessionQuery(
+                    limit=_EXPORT_PAGE_SIZE,
+                    offset=offset,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
             )
-        )
+        ).sessions
         if not page:
             return count
         for session in page:
