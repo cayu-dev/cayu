@@ -81,6 +81,7 @@ from cayu.runtime import (
     SessionStatus,
     StaticToolPolicy,
     StructuredOutputSpec,
+    TaintAwareToolPolicy,
     TaskCreate,
     TaskStatus,
     ToolApprovalDecision,
@@ -11749,6 +11750,136 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
     assert session is not None
     assert session.metadata == {"tenant": {"id": "tenant_1"}}
+
+
+def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result():
+    store = InMemorySessionStore()
+    echo_tool = EchoTool()
+    side_effect_tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_read",
+                    name="echo",
+                    arguments={"text": "external email body"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("stored"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[echo_tool, side_effect_tool],
+        tool_policy=TaintAwareToolPolicy(
+            taint_sources={"echo": ["external_email"]},
+            protected_tools={"side_effect": ["external_email"]},
+        ),
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_taint_prior",
+                messages=[Message.text("user", "read external data")],
+            ),
+        )
+    )
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_taint_prior",
+                messages=[Message.text("user", "send outbound action")],
+            ),
+        )
+    )
+
+    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
+    approval_event = next(
+        event for event in resume_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    approval = approval_event.payload["approval"]
+    assert approval["tool_name"] == "side_effect"
+    assert approval["metadata"]["policy"] == "taint_aware"
+    assert approval["metadata"]["matched_taint_labels"] == ["external_email"]
+    assert side_effect_tool.calls == []
+
+
+def test_cayu_app_taint_policy_applies_within_same_tool_round():
+    echo_tool = EchoTool()
+    side_effect_tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_read",
+                    name="echo",
+                    arguments={"text": "external email body"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_send",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[echo_tool, side_effect_tool],
+        tool_policy=TaintAwareToolPolicy(
+            taint_sources={"echo": ["external_email"]},
+            protected_tools={"side_effect": ["external_email"]},
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_taint_same_round",
+                messages=[Message.text("user", "read then send")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    approval_event = next(
+        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    approval = approval_event.payload["approval"]
+    assert approval["tool_name"] == "side_effect"
+    assert approval["metadata"]["policy"] == "taint_aware"
+    assert approval["metadata"]["matched_taint_labels"] == ["external_email"]
+    assert side_effect_tool.calls == []
 
 
 def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():

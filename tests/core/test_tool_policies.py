@@ -5,13 +5,18 @@ import asyncio
 import pytest
 
 from cayu import (
+    ANY_TAINT_LABEL,
+    TAINT_LABELS_METADATA_KEY,
     AgentSpec,
     AllowlistRule,
     DenyPatternRule,
     ParameterConstrainedToolPolicy,
     RequiredFieldRule,
+    TaintAwareToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
+    metadata_with_taint_labels,
+    taint_labels_from_metadata,
 )
 from cayu.runtime import Session, SessionStatus
 
@@ -156,3 +161,107 @@ def test_parameter_constrained_policy_rejects_invalid_configuration() -> None:
 
     with pytest.raises(ValueError, match="cannot be blank"):
         RequiredFieldRule("payload..message")
+
+
+def test_taint_aware_policy_allows_before_untrusted_source() -> None:
+    policy = TaintAwareToolPolicy(
+        taint_sources={"read_email": ["external_email"]},
+        protected_tools={"send_email": ["external_email"]},
+    )
+
+    result = asyncio.run(policy.authorize(_request(tool_name="send_email")))
+
+    assert result.decision == ToolPolicyDecision.ALLOW
+
+
+def test_taint_aware_policy_requires_approval_after_matching_taint() -> None:
+    policy = TaintAwareToolPolicy(
+        taint_sources={"read_email": ["external_email"]},
+        protected_tools={"send_email": ["external_email"]},
+    )
+
+    result = asyncio.run(
+        policy.authorize(
+            _request(
+                tool_name="send_email",
+                arguments={},
+            ).model_copy(
+                update={
+                    "metadata": metadata_with_taint_labels(
+                        {},
+                        ["external_email", "artifact_pdf"],
+                    )
+                }
+            )
+        )
+    )
+
+    assert result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+    assert result.metadata == {
+        "policy": "taint_aware",
+        "tool_name": "send_email",
+        "taint_labels": ["artifact_pdf", "external_email"],
+        "matched_taint_labels": ["external_email"],
+        "protected_taint_labels": ["external_email"],
+    }
+
+
+def test_taint_aware_policy_does_not_count_current_source_before_result() -> None:
+    policy = TaintAwareToolPolicy(
+        taint_sources={"read_and_send": ["external_email"]},
+        protected_tools={"read_and_send": ["external_email"]},
+    )
+
+    result = asyncio.run(policy.authorize(_request(tool_name="read_and_send")))
+
+    assert result.decision == ToolPolicyDecision.ALLOW
+
+
+def test_taint_aware_policy_supports_any_taint_label() -> None:
+    policy = TaintAwareToolPolicy(
+        taint_sources={"read_pdf": ["artifact_pdf"]},
+        protected_tools={"send_email": [ANY_TAINT_LABEL]},
+        decision=ToolPolicyDecision.DENY,
+    )
+
+    result = asyncio.run(
+        policy.authorize(
+            _request(
+                tool_name="send_email",
+            ).model_copy(update={"metadata": metadata_with_taint_labels({}, ["artifact_pdf"])})
+        )
+    )
+
+    assert result.decision == ToolPolicyDecision.DENY
+    assert result.metadata["matched_taint_labels"] == ["artifact_pdf"]
+
+
+def test_taint_aware_policy_rejects_invalid_configuration() -> None:
+    with pytest.raises(ValueError, match="cannot be ALLOW"):
+        TaintAwareToolPolicy(
+            taint_sources={"read_email": ["external_email"]},
+            protected_tools={"send_email": ["external_email"]},
+            decision=ToolPolicyDecision.ALLOW,
+        )
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        TaintAwareToolPolicy(taint_sources={}, protected_tools={"send_email": ["external"]})
+
+    with pytest.raises(ValueError, match="cannot contain"):
+        TaintAwareToolPolicy(
+            taint_sources={"read_email": [ANY_TAINT_LABEL]},
+            protected_tools={"send_email": ["external_email"]},
+        )
+
+
+def test_taint_metadata_helpers_copy_and_validate_labels() -> None:
+    metadata = {"tenant": {"id": "acme"}}
+    copied = metadata_with_taint_labels(metadata, ["external_email"])
+
+    copied["tenant"]["id"] = "mutated"
+    assert metadata == {"tenant": {"id": "acme"}}
+    assert copied[TAINT_LABELS_METADATA_KEY] == ["external_email"]
+    assert taint_labels_from_metadata(copied) == frozenset({"external_email"})
+
+    with pytest.raises(ValueError, match="cannot contain"):
+        metadata_with_taint_labels({}, [ANY_TAINT_LABEL])

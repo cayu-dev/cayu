@@ -221,10 +221,12 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
+    TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    metadata_with_taint_labels,
 )
 from cayu.runtime.usage import (
     CausalBudgetUsageSummary,
@@ -4214,6 +4216,10 @@ class CayuApp:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
         approval_tool_call: runtime_records.ToolCallRequest | None = None
+        taint_labels = await self._prior_taint_labels_for_policy(
+            session_id=session.id,
+            policy=registered_agent.tool_policy,
+        )
         for tool_call in tool_calls:
             if tool_call.name not in registered_agent.tools:
                 policy_outcomes.append(
@@ -4227,6 +4233,7 @@ class CayuApp:
                 registered_environment=registered_environment,
                 tool_call=tool_call,
                 request_metadata=request_metadata,
+                taint_labels=taint_labels,
             )
             policy_outcomes.append(
                 runtime_records.ToolCallPolicyOutcome(call=tool_call, result=policy_result)
@@ -4237,6 +4244,13 @@ class CayuApp:
             ):
                 approval_policy_result = policy_result
                 approval_tool_call = tool_call
+            taint_labels.update(
+                _taint_labels_for_source_tool(
+                    registered_agent.tool_policy,
+                    tool_call.name,
+                    policy_result=policy_result,
+                )
+            )
 
         if approval_policy_result is None or approval_tool_call is None:
             return runtime_records.ToolRoundPolicyPlan(
@@ -4261,7 +4275,11 @@ class CayuApp:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
         request_metadata: dict[str, Any],
+        taint_labels: Iterable[str] | None = None,
     ) -> ToolPolicyResult:
+        policy_metadata = request_metadata
+        if taint_labels:
+            policy_metadata = metadata_with_taint_labels(request_metadata, taint_labels)
         policy_result = await registered_agent.tool_policy.authorize(
             ToolPolicyRequest(
                 session=session.model_copy(deep=True),
@@ -4271,10 +4289,33 @@ class CayuApp:
                 arguments=tool_call.arguments,
                 environment_name=_environment_name(registered_environment),
                 workspace_id=_workspace_id(registered_environment),
-                metadata=request_metadata,
+                metadata=policy_metadata,
             )
         )
         return tool_execution.validate_tool_policy_result(policy_result)
+
+    async def _prior_taint_labels_for_policy(
+        self,
+        *,
+        session_id: str,
+        policy: ToolPolicy,
+    ) -> set[str]:
+        if not isinstance(policy, TaintAwareToolPolicy):
+            return set()
+        labels: set[str] = set()
+        for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
+            records = await self._query_all_event_records(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=event_type,
+                    limit=5000,
+                )
+            )
+            for record in records:
+                if record.event.tool_name is None:
+                    continue
+                labels.update(policy.labels_for_source_tool(record.event.tool_name))
+        return labels
 
     async def _execute_tool_call(
         self,
@@ -7442,6 +7483,19 @@ def _has_structured_output_tool_call(
 
 def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> int:
     return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
+
+
+def _taint_labels_for_source_tool(
+    policy: ToolPolicy,
+    tool_name: str,
+    *,
+    policy_result: ToolPolicyResult | None,
+) -> set[str]:
+    if not isinstance(policy, TaintAwareToolPolicy):
+        return set()
+    if policy_result is not None and policy_result.decision != ToolPolicyDecision.ALLOW:
+        return set()
+    return set(policy.labels_for_source_tool(tool_name))
 
 
 def _validate_structured_output_tool_round(

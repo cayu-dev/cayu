@@ -148,6 +148,8 @@ from cayu.runtime.tasks import (
     TaskStore,
 )
 from cayu.runtime.tool_policy import (
+    ANY_TAINT_LABEL,
+    TAINT_LABELS_METADATA_KEY,
     AllowAllToolPolicy,
     AllowlistRule,
     DenyPatternRule,
@@ -155,10 +157,13 @@ from cayu.runtime.tool_policy import (
     ParameterRule,
     RequiredFieldRule,
     StaticToolPolicy,
+    TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    metadata_with_taint_labels,
+    taint_labels_from_metadata,
 )
 from cayu.runtime.usage import (
     CacheUsageMetrics,
@@ -172,6 +177,8 @@ from cayu.runtime.usage import (
 )
 
 __all__ = [
+    "ANY_TAINT_LABEL",
+    "TAINT_LABELS_METADATA_KEY",
     "AllowAllToolPolicy",
     "AllowlistRule",
     "BeforeStopAction",
@@ -276,6 +283,7 @@ __all__ = [
     "StructuredOutputSpec",
     "StructuredOutputStrategy",
     "StructuredOutputValidation",
+    "TaintAwareToolPolicy",
     "Task",
     "TaskCreate",
     "TaskOrder",
@@ -308,10 +316,12 @@ __all__ = [
     "estimate_session_cost",
     "first_reached_limit",
     "has_run_limits",
+    "metadata_with_taint_labels",
     "normalize_usage_metrics",
     "retry_decision",
     "session_usage_summary",
     "strip_old_file_attachments",
+    "taint_labels_from_metadata",
     "trim_context_messages",
     "trim_context_turns",
     "usage_metrics_from_event_payload",

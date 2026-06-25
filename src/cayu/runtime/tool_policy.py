@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -17,6 +18,10 @@ class ToolPolicyDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     REQUIRE_APPROVAL = "require_approval"
+
+
+ANY_TAINT_LABEL = "*"
+TAINT_LABELS_METADATA_KEY = "cayu:taint_labels"
 
 
 class ToolPolicyRequest(BaseModel):
@@ -264,6 +269,107 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class TaintAwareToolPolicy(ToolPolicy):
+    """Protect sensitive tools after untrusted tool output enters a session.
+
+    This policy does not scan content for prompt-injection strings. Instead,
+    apps classify tool boundaries:
+
+    - ``taint_sources`` maps inbound/untrusted tool names to taint labels.
+    - ``protected_tools`` maps sensitive outbound tools to labels that should
+      deny or require approval once present in the session.
+
+    Cayu's runtime supplies durable prior labels through
+    ``request.metadata["cayu:taint_labels"]`` and adds same-round labels while
+    planning a batch of tool calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        taint_sources: Mapping[str, Iterable[str]],
+        protected_tools: Mapping[str, Iterable[str]],
+        decision: ToolPolicyDecision = ToolPolicyDecision.REQUIRE_APPROVAL,
+    ) -> None:
+        if type(taint_sources) is not dict:
+            raise TypeError("TaintAwareToolPolicy taint_sources must be a dict.")
+        if type(protected_tools) is not dict:
+            raise TypeError("TaintAwareToolPolicy protected_tools must be a dict.")
+        copied_sources: dict[str, frozenset[str]] = {}
+        for tool_name, labels in taint_sources.items():
+            copied_sources[require_clean_nonblank(tool_name, "tool_name")] = _copy_taint_labels(
+                labels,
+                f"taint_sources[{tool_name!r}]",
+                allow_any=False,
+            )
+        copied_protected: dict[str, frozenset[str]] = {}
+        for tool_name, labels in protected_tools.items():
+            copied_protected[require_clean_nonblank(tool_name, "tool_name")] = _copy_taint_labels(
+                labels,
+                f"protected_tools[{tool_name!r}]",
+                allow_any=True,
+            )
+        if not copied_sources:
+            raise ValueError("TaintAwareToolPolicy taint_sources cannot be empty.")
+        if not copied_protected:
+            raise ValueError("TaintAwareToolPolicy protected_tools cannot be empty.")
+        decision = ToolPolicyDecision(decision)
+        if decision == ToolPolicyDecision.ALLOW:
+            raise ValueError("TaintAwareToolPolicy decision cannot be ALLOW.")
+        self.taint_sources = MappingProxyType(copied_sources)
+        self.protected_tools = MappingProxyType(copied_protected)
+        self.decision = decision
+
+    def labels_for_source_tool(self, tool_name: str) -> frozenset[str]:
+        """Return labels added when ``tool_name`` produces a terminal result."""
+        return self.taint_sources.get(require_clean_nonblank(tool_name, "tool_name"), frozenset())
+
+    def protected_labels_for_tool(self, tool_name: str) -> frozenset[str]:
+        """Return taint labels that protect ``tool_name``."""
+        return self.protected_tools.get(
+            require_clean_nonblank(tool_name, "tool_name"),
+            frozenset(),
+        )
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        active_labels = set(taint_labels_from_metadata(request.metadata))
+        protected_labels = self.protected_labels_for_tool(request.tool_name)
+        if not protected_labels:
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+        matched_labels = _matched_taint_labels(active_labels, protected_labels)
+        if not matched_labels:
+            return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+        return ToolPolicyResult(
+            decision=self.decision,
+            reason="Tool call is protected after untrusted data entered the session.",
+            metadata={
+                "policy": "taint_aware",
+                "tool_name": request.tool_name,
+                "taint_labels": sorted(active_labels),
+                "matched_taint_labels": sorted(matched_labels),
+                "protected_taint_labels": sorted(protected_labels),
+            },
+        )
+
+
+def taint_labels_from_metadata(metadata: Mapping[str, Any]) -> frozenset[str]:
+    labels = metadata.get(TAINT_LABELS_METADATA_KEY)
+    if labels is None:
+        return frozenset()
+    return _copy_taint_labels(labels, TAINT_LABELS_METADATA_KEY, allow_any=False)
+
+
+def metadata_with_taint_labels(
+    metadata: Mapping[str, Any],
+    labels: Iterable[str],
+) -> dict[str, Any]:
+    copied = copy_json_value(dict(metadata), "metadata")
+    copied[TAINT_LABELS_METADATA_KEY] = sorted(_copy_taint_labels(labels, "labels", allow_any=False))
+    return copied
+
+
 def _copy_tool_name_set(value: Iterable[str], field_name: str) -> frozenset[str]:
     if isinstance(value, str | bytes):
         raise TypeError(f"{field_name} must be an iterable of tool names.")
@@ -293,6 +399,29 @@ def _copy_nonempty_string_list(value: Iterable[str], field_name: str) -> list[st
 
 def _copy_nonempty_string_set(value: Iterable[str], field_name: str) -> frozenset[str]:
     return frozenset(_copy_nonempty_string_list(value, field_name))
+
+
+def _copy_taint_labels(
+    value: Iterable[str],
+    field_name: str,
+    *,
+    allow_any: bool,
+) -> frozenset[str]:
+    labels = _copy_nonempty_string_set(value, field_name)
+    if not labels:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if not allow_any and ANY_TAINT_LABEL in labels:
+        raise ValueError(f"{field_name} cannot contain {ANY_TAINT_LABEL!r}.")
+    return labels
+
+
+def _matched_taint_labels(
+    active_labels: set[str],
+    protected_labels: frozenset[str],
+) -> set[str]:
+    if ANY_TAINT_LABEL in protected_labels:
+        return set(active_labels)
+    return active_labels.intersection(protected_labels)
 
 
 def _copy_parameter_rules(

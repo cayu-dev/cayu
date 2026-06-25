@@ -1440,6 +1440,36 @@ Here `send_email_tool` is an application-owned tool whose spec name is
 block the call or request durable approval, depending on the configured
 decision.
 
+Use taint-aware policies when untrusted source content should not flow into
+sensitive outbound tools without a checkpoint:
+
+```python
+from cayu import AgentSpec, TaintAwareToolPolicy, ToolPolicyDecision
+
+policy = TaintAwareToolPolicy(
+    taint_sources={
+        "read_email": ["external_email"],
+        "read_pdf": ["artifact_pdf"],
+    },
+    protected_tools={
+        "send_email": ["external_email", "artifact_pdf"],
+        "make_payment": ["*"],
+    },
+    decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+)
+
+app.register_agent(
+    AgentSpec(name="billing_assistant", model="gpt-5.5"),
+    tools=[read_email_tool, read_pdf_tool, send_email_tool, make_payment_tool],
+    tool_policy=policy,
+)
+```
+
+This policy does not scan text for prompt-injection phrases. It treats output
+from configured source tools as untrusted by origin. Cayu derives prior taint
+from durable tool events and also handles a single model round such as
+`read_email` followed by `send_email` before either tool runs.
+
 Custom policies can also require caller approval before a tool round runs. The runtime checkpoints the pending approval, emits `tool.call.approval_requested`, marks the session `interrupted`, and waits for `resolve_tool_approval(...)`:
 
 ```python
