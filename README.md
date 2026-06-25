@@ -340,6 +340,7 @@ credential for an outbound action. Cayu emits a durable
 `credential.proxy.checked` event with the destination, credential reference name,
 action, metadata, and allow/deny result. This is an audit/enforcement hook for
 proxy-aware tools; it does not intercept arbitrary sandbox network traffic.
+See `examples/credential_proxy_tool.py` for a runnable trusted-tool example.
 
 ## Usage And Cache Metrics
 

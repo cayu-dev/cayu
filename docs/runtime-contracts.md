@@ -1105,6 +1105,10 @@ The event is redacted with any secrets resolved during the same tool call.
 Authorization checks are an audit/enforcement hook for trusted proxy-aware
 tools. Cayu records the decision; the proxy and tool implementation remain
 responsible for denying or avoiding the outbound action when `allowed=False`.
+`examples/credential_proxy_tool.py` shows a complete trusted-tool flow with a
+strict proxy wrapper, `ctx.proxy.authorize_request(...)`,
+`ctx.proxy.resolve(...)`, durable `credential.proxy.checked` events, and
+redaction of a proxy-resolved value before event/transcript persistence.
 
 This redaction is defense in depth. It does not intercept sandbox network calls,
 make arbitrary shell commands safe for secrets, or guarantee safety for secrets
