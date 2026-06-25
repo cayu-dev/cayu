@@ -291,6 +291,7 @@ from cayu.vaults import (
     StaticVault,
     Vault,
     VaultError,
+    copy_resolved_secret,
     copy_secret_env,
 )
 from cayu.workspaces import (
@@ -585,6 +586,7 @@ __all__ = [
     "copy_environment_factory_request",
     "copy_environment_factory_result",
     "copy_pricing_catalog",
+    "copy_resolved_secret",
     "copy_retry_policy",
     "copy_run_limits",
     "copy_secret_env",

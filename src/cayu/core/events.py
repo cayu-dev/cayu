@@ -30,6 +30,8 @@ class EventType(StrEnum):
     BUDGET_RESERVATION_FAILED = "budget.reservation_failed"
     BUDGET_RESERVATION_RELEASED = "budget.reservation_released"
 
+    CREDENTIAL_PROXY_CHECKED = "credential.proxy.checked"
+
     TASK_CREATED = "task.created"
     TASK_STARTED = "task.started"
     TASK_COMPLETED = "task.completed"

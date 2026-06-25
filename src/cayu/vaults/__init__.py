@@ -7,6 +7,7 @@ from cayu.vaults.base import (
     SecretRef,
     Vault,
     VaultError,
+    copy_resolved_secret,
     copy_secret_env,
     copy_secret_ref,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "StaticVault",
     "Vault",
     "VaultError",
+    "copy_resolved_secret",
     "copy_secret_env",
     "copy_secret_ref",
 ]

@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import (
+    copy_json_object,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -60,7 +61,11 @@ from cayu.providers import (
     copy_model_stream_event,
     normalize_model_completion,
 )
-from cayu.proxies import CredentialProxy, ProxyAuthorizationResult
+from cayu.proxies import (
+    CredentialProxy,
+    ProxyAuthorizationResult,
+    copy_proxy_authorization_result,
+)
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -229,7 +234,13 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_payload,
 )
-from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef
+from cayu.vaults import (
+    ResolvedSecret,
+    SecretRedactor,
+    SecretRef,
+    copy_resolved_secret,
+    copy_secret_ref,
+)
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
@@ -4408,31 +4419,68 @@ class CayuApp:
                 )
 
         resolved_proxy_secrets: list[ResolvedSecret] = []
-        result = await tool_execution.run_tool(
-            tool=registered_tool.tool,
-            ctx=ToolContext(
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                causal_budget_id=session.causal_budget_id,
-                workspace_id=_workspace_id(registered_environment),
-                artifact_store_id=_artifact_store_id(registered_environment),
-                workspace=_workspace(registered_environment),
-                artifact_store=_artifact_store(registered_environment),
-                runner=_runner(registered_environment),
-                vault=_vault(registered_environment),
-                proxy=_proxy(
-                    registered_environment,
-                    on_resolve=resolved_proxy_secrets.append,
+        proxy_authorizations: list[_ProxyAuthorizationRecord] = []
+        try:
+            result = await tool_execution.run_tool(
+                tool=registered_tool.tool,
+                ctx=ToolContext(
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    causal_budget_id=session.causal_budget_id,
+                    workspace_id=_workspace_id(registered_environment),
+                    artifact_store_id=_artifact_store_id(registered_environment),
+                    workspace=_workspace(registered_environment),
+                    artifact_store=_artifact_store(registered_environment),
+                    runner=_runner(registered_environment),
+                    vault=_vault(registered_environment),
+                    proxy=_proxy(
+                        registered_environment,
+                        on_resolve=resolved_proxy_secrets.append,
+                        on_authorize=proxy_authorizations.append,
+                    ),
+                    mcp_servers=_mcp_servers(registered_environment),
+                    metadata=tool_execution.context_metadata(
+                        tool_call_id=tool_call.id,
+                        approval_id=approval_id,
+                    ),
                 ),
-                mcp_servers=_mcp_servers(registered_environment),
-                metadata=tool_execution.context_metadata(
-                    tool_call_id=tool_call.id,
+                arguments=deepcopy(tool_call.arguments),
+            )
+        except asyncio.CancelledError:
+            if proxy_authorizations and await self._session_interrupt_requested(session.id):
+                _clear_current_task_cancellation()
+                redactor = _redactor_with_resolved_secrets(
+                    self._secret_redactor,
+                    resolved_proxy_secrets,
+                )
+                async for event in self._emit_proxy_authorization_events(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    records=proxy_authorizations,
+                    tool_round_id=tool_round_id,
                     approval_id=approval_id,
-                ),
-            ),
-            arguments=deepcopy(tool_call.arguments),
+                    redactor=redactor,
+                ):
+                    yield event, None
+            raise
+        redactor = _redactor_with_resolved_secrets(
+            self._secret_redactor,
+            resolved_proxy_secrets,
         )
+        async for event in self._emit_proxy_authorization_events(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            records=proxy_authorizations,
+            tool_round_id=tool_round_id,
+            approval_id=approval_id,
+            redactor=redactor,
+        ):
+            yield event, None
         if await self._session_is_interrupting(session.id):
             raise _SessionInterruptedByRequest(session.id)
         event_type = (
@@ -4446,10 +4494,6 @@ class CayuApp:
             payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
-        redactor = _redactor_with_resolved_secrets(
-            self._secret_redactor,
-            resolved_proxy_secrets,
-        )
         async for event in self._emit_tool_call_result_with_hooks(
             event=Event(
                 type=event_type,
@@ -4468,6 +4512,54 @@ class CayuApp:
             redactor=redactor,
         ):
             yield event
+
+    async def _emit_proxy_authorization_events(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        records: list[_ProxyAuthorizationRecord],
+        tool_round_id: str | None,
+        approval_id: str | None,
+        redactor: SecretRedactor,
+    ) -> AsyncIterator[Event]:
+        for record in records:
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call.id,
+                "destination": record.destination,
+                "credential": None if record.credential is None else record.credential.name,
+                "action": record.action,
+                "metadata": copy_json_value(record.metadata, "metadata"),
+                "allowed": record.result.allowed,
+                "reason": record.result.reason,
+                "result_metadata": copy_json_value(
+                    record.result.metadata,
+                    "result_metadata",
+                ),
+            }
+            if tool_round_id is not None:
+                payload["tool_round_id"] = tool_round_id
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
+            if redactor.has_values:
+                redacted_payload = redactor.redact_json(payload)
+                if type(redacted_payload) is not dict:
+                    raise AssertionError(
+                        "Proxy authorization redaction returned non-object payload."
+                    )
+                payload = redacted_payload
+            yield await self._emit(
+                Event(
+                    type=EventType.CREDENTIAL_PROXY_CHECKED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    tool_name=tool_call.name,
+                    payload=payload,
+                )
+            )
 
     async def _checkpoint_pending_tool_approval(
         self,
@@ -6931,18 +7023,31 @@ def _vault(registered_environment: runtime_records.RegisteredEnvironment | None)
     return registered_environment.environment.vault
 
 
+@dataclass(frozen=True)
+class _ProxyAuthorizationRecord:
+    destination: str
+    credential: SecretRef | None
+    action: str | None
+    metadata: dict[str, Any]
+    result: ProxyAuthorizationResult
+
+
 class _RedactingCredentialProxy(CredentialProxy):
     def __init__(
         self,
         proxy: CredentialProxy,
         on_resolve: Callable[[ResolvedSecret], None],
+        on_authorize: Callable[[_ProxyAuthorizationRecord], None],
     ) -> None:
         if not isinstance(proxy, CredentialProxy):
             raise TypeError("proxy must be a CredentialProxy.")
         if not callable(on_resolve):
             raise TypeError("on_resolve must be callable.")
+        if not callable(on_authorize):
+            raise TypeError("on_authorize must be callable.")
         self._proxy = proxy
         self._on_resolve = on_resolve
+        self._on_authorize = on_authorize
 
     async def resolve(
         self,
@@ -6950,11 +7055,16 @@ class _RedactingCredentialProxy(CredentialProxy):
         *,
         scope: dict[str, Any] | None = None,
     ) -> ResolvedSecret:
-        secret = await self._proxy.resolve(ref, scope=scope)
+        copied_ref = copy_secret_ref(ref)
+        copied_scope = None if scope is None else copy_json_object(scope, "scope")
+        secret = await self._proxy.resolve(
+            copied_ref,
+            scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
+        )
         if type(secret) is not ResolvedSecret:
             raise TypeError("Proxy secret resolution must return ResolvedSecret.")
-        self._on_resolve(secret)
-        return secret
+        self._on_resolve(copy_resolved_secret(secret))
+        return copy_resolved_secret(secret)
 
     async def authorize_request(
         self,
@@ -6964,28 +7074,43 @@ class _RedactingCredentialProxy(CredentialProxy):
         action: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ProxyAuthorizationResult:
+        copied_destination = require_clean_nonblank(destination, "destination")
+        copied_credential = None if credential is None else copy_secret_ref(credential)
+        copied_action = None if action is None else require_clean_nonblank(action, "action")
+        copied_metadata = {} if metadata is None else copy_json_object(metadata, "metadata")
         result = await self._proxy.authorize_request(
-            destination=destination,
-            credential=credential,
-            action=action,
-            metadata=metadata,
+            destination=copied_destination,
+            credential=copied_credential,
+            action=copied_action,
+            metadata=copy_json_object(copied_metadata, "metadata"),
         )
         if type(result) is not ProxyAuthorizationResult:
             raise TypeError("Proxy authorization must return ProxyAuthorizationResult.")
-        return result
+        copied_result = copy_proxy_authorization_result(result)
+        self._on_authorize(
+            _ProxyAuthorizationRecord(
+                destination=copied_destination,
+                credential=copied_credential,
+                action=copied_action,
+                metadata=copied_metadata,
+                result=copied_result,
+            )
+        )
+        return copied_result
 
 
 def _proxy(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     *,
     on_resolve: Callable[[ResolvedSecret], None],
+    on_authorize: Callable[[_ProxyAuthorizationRecord], None],
 ) -> Any:
     if registered_environment is None:
         return None
     proxy = registered_environment.environment.proxy
     if proxy is None:
         return None
-    return _RedactingCredentialProxy(proxy, on_resolve)
+    return _RedactingCredentialProxy(proxy, on_resolve, on_authorize)
 
 
 def _mcp_servers(

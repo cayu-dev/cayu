@@ -30,7 +30,7 @@ from cayu.providers import (
     ModelStreamEvent,
     ModelStreamEventType,
 )
-from cayu.proxies import CredentialProxy, PassthroughProxy
+from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
     AllowlistRule,
@@ -105,7 +105,7 @@ from cayu.tools import (
     SubagentSpec,
     SubagentTool,
 )
-from cayu.vaults import SecretRef, StaticVault
+from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -880,6 +880,575 @@ def test_cayu_app_redacts_proxy_resolved_secrets_from_tool_results() -> None:
     assert secret_value not in str(
         [message.model_dump(mode="json") for message in second_request.messages]
     )
+
+
+def test_cayu_app_emits_redacted_proxy_authorization_events() -> None:
+    from cayu.vaults import REDACTED_SECRET
+
+    secret_value = "sk-authorized-proxy-secret"
+
+    class AuditingProxy(CredentialProxy):
+        def __init__(self, vault: StaticVault) -> None:
+            self._passthrough = PassthroughProxy(vault)
+
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            return await self._passthrough.resolve(ref, scope=scope)
+
+        async def authorize_request(
+            self,
+            *,
+            destination: str,
+            credential: SecretRef | None = None,
+            action: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> ProxyAuthorizationResult:
+            if action == "deny_email":
+                return ProxyAuthorizationResult(
+                    allowed=False,
+                    reason="destination denied",
+                    metadata={"policy": "blocked", "debug": secret_value},
+                )
+            return ProxyAuthorizationResult(
+                allowed=True,
+                metadata={"policy": "allowlist", "debug": secret_value},
+            )
+
+    class ProxyAuthorizingTool(Tool):
+        spec = ToolSpec(
+            name="proxy_auth",
+            description="Resolve and authorize proxy use.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            await ctx.proxy.resolve(SecretRef(name="sendgrid_api_key"))
+            allowed = await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                credential=SecretRef(name="sendgrid_api_key"),
+                action="send_email",
+                metadata={"template": "invoice_reminder"},
+            )
+            denied = await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                credential=SecretRef(name="sendgrid_api_key"),
+                action="deny_email",
+                metadata={"template": "invoice_reminder"},
+            )
+            return ToolResult(
+                content="checked",
+                structured={
+                    "allowed": allowed.allowed,
+                    "denied": denied.allowed,
+                },
+            )
+
+    store = InMemorySessionStore()
+    vault = StaticVault({"sendgrid_api_key": secret_value})
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_proxy_auth", name="proxy_auth", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=AuditingProxy(vault),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ProxyAuthorizingTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_authorization_events",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    proxy_events = [event for event in events if event.type == EventType.CREDENTIAL_PROXY_CHECKED]
+    assert len(proxy_events) == 2
+    assert [event.type for event in events].index(EventType.CREDENTIAL_PROXY_CHECKED) < [
+        event.type for event in events
+    ].index(EventType.TOOL_CALL_COMPLETED)
+
+    allowed_event = proxy_events[0]
+    assert allowed_event.tool_name == "proxy_auth"
+    assert allowed_event.payload["tool_call_id"] == "call_proxy_auth"
+    assert allowed_event.payload["destination"] == "https://api.sendgrid.com/v3/mail/send"
+    assert allowed_event.payload["credential"] == "sendgrid_api_key"
+    assert allowed_event.payload["action"] == "send_email"
+    assert allowed_event.payload["metadata"] == {"template": "invoice_reminder"}
+    assert allowed_event.payload["allowed"] is True
+    assert allowed_event.payload["reason"] is None
+    assert allowed_event.payload["result_metadata"] == {
+        "policy": "allowlist",
+        "debug": REDACTED_SECRET,
+    }
+
+    denied_event = proxy_events[1]
+    assert denied_event.payload["allowed"] is False
+    assert denied_event.payload["reason"] == "destination denied"
+    assert denied_event.payload["result_metadata"] == {
+        "policy": "blocked",
+        "debug": REDACTED_SECRET,
+    }
+    assert secret_value not in str([event.model_dump(mode="json") for event in proxy_events])
+
+
+def test_cayu_app_records_original_proxy_authorization_metadata() -> None:
+    class MutatingProxy(CredentialProxy):
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            raise AssertionError("resolve should not be called")
+
+        async def authorize_request(
+            self,
+            *,
+            destination: str,
+            credential: SecretRef | None = None,
+            action: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> ProxyAuthorizationResult:
+            if metadata is None:
+                raise AssertionError("metadata should be copied before proxy delegation")
+            metadata["template"] = "mutated"
+            metadata["new_field"] = "proxy-added"
+            if credential is not None:
+                credential.metadata["scope"] = "mutated"
+            return ProxyAuthorizationResult(allowed=True)
+
+    class ProxyAuthorizingTool(Tool):
+        spec = ToolSpec(
+            name="proxy_auth",
+            description="Authorize proxy use.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                credential=SecretRef(
+                    name="sendgrid_api_key",
+                    metadata={"scope": "email"},
+                ),
+                action="send_email",
+                metadata={"template": "invoice_reminder"},
+            )
+            return ToolResult(content="checked")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_proxy_auth", name="proxy_auth", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            proxy=MutatingProxy(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ProxyAuthorizingTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_authorization_metadata_copy",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    proxy_events = [event for event in events if event.type == EventType.CREDENTIAL_PROXY_CHECKED]
+    assert len(proxy_events) == 1
+    assert proxy_events[0].payload["metadata"] == {"template": "invoice_reminder"}
+    assert proxy_events[0].payload["credential"] == "sendgrid_api_key"
+
+
+def test_cayu_app_redacts_proxy_secret_after_tool_mutates_resolved_secret() -> None:
+    from pydantic import SecretStr
+
+    from cayu.vaults import REDACTED_SECRET
+
+    secret_value = "sk-mutated-proxy-secret"
+
+    class MutatingSecretTool(Tool):
+        spec = ToolSpec(
+            name="mutate_secret",
+            description="Mutate returned proxy secret and leak original value.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            secret = await ctx.proxy.resolve(SecretRef(name="api_key"))
+            raw_value = secret.value.get_secret_value()
+            secret.value = SecretStr("changed-after-resolve")
+            secret.metadata["leak"] = "mutated"
+            return ToolResult(
+                content=f"using {raw_value}",
+                structured={"token": raw_value},
+                artifacts=[
+                    {
+                        "type": "test.secret",
+                        "value": raw_value,
+                    }
+                ],
+            )
+
+    vault = StaticVault({"api_key": secret_value})
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_mutate_secret",
+                    name="mutate_secret",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=PassthroughProxy(vault),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[MutatingSecretTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_resolved_secret_copy",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(tool_events) == 1
+    result = tool_events[0].payload["result"]
+    assert result["content"] == f"using {REDACTED_SECRET}"
+    assert result["structured"] == {"token": REDACTED_SECRET}
+    assert result["artifacts"] == [{"type": "test.secret", "value": REDACTED_SECRET}]
+    assert secret_value not in str([event.model_dump(mode="json") for event in events])
+
+
+def test_cayu_app_copies_proxy_resolve_inputs_before_delegation() -> None:
+    from pydantic import SecretStr
+
+    class MutatingResolveProxy(CredentialProxy):
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            ref.metadata["scope"] = "proxy-mutated"
+            if scope is not None:
+                scope["tenant"] = "proxy-mutated"
+            return ResolvedSecret(
+                name=ref.name,
+                value=SecretStr("resolved-secret"),
+                metadata={"source": "mutating-proxy"},
+            )
+
+        async def authorize_request(
+            self,
+            *,
+            destination: str,
+            credential: SecretRef | None = None,
+            action: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> ProxyAuthorizationResult:
+            raise AssertionError("authorize_request should not be called")
+
+    class ProxyResolvingTool(Tool):
+        spec = ToolSpec(
+            name="resolve_proxy",
+            description="Resolve proxy secret with mutable inputs.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            ref = SecretRef(name="api_key", metadata={"scope": "email"})
+            scope = {"tenant": "acme"}
+            await ctx.proxy.resolve(ref, scope=scope)
+            return ToolResult(
+                content="checked",
+                structured={
+                    "ref_metadata": ref.metadata,
+                    "scope": scope,
+                },
+            )
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_resolve_proxy",
+                    name="resolve_proxy",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            proxy=MutatingResolveProxy(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ProxyResolvingTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_resolve_input_copy",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(tool_events) == 1
+    assert tool_events[0].payload["result"]["structured"] == {
+        "ref_metadata": {"scope": "email"},
+        "scope": {"tenant": "acme"},
+    }
+
+
+def test_cayu_app_rejects_invalid_proxy_resolve_scope_before_delegation() -> None:
+    class FailingProxy(CredentialProxy):
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            raise AssertionError("invalid scope should fail before proxy delegation")
+
+        async def authorize_request(
+            self,
+            *,
+            destination: str,
+            credential: SecretRef | None = None,
+            action: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> ProxyAuthorizationResult:
+            raise AssertionError("authorize_request should not be called")
+
+    class InvalidScopeTool(Tool):
+        spec = ToolSpec(
+            name="invalid_scope",
+            description="Resolve proxy secret with invalid scope.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            await ctx.proxy.resolve(
+                SecretRef(name="api_key"),
+                scope=["not", "an", "object"],  # type: ignore[arg-type]
+            )
+            return ToolResult(content="unexpected")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_invalid_scope",
+                    name="invalid_scope",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            proxy=FailingProxy(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[InvalidScopeTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_invalid_scope",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
+    assert len(tool_events) == 1
+    assert "`scope` must be a JSON object" in tool_events[0].payload["result"]["content"]
+
+
+def test_cayu_app_rejects_invalid_proxy_authorization_metadata_before_delegation() -> None:
+    class FailingProxy(CredentialProxy):
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            raise AssertionError("resolve should not be called")
+
+        async def authorize_request(
+            self,
+            *,
+            destination: str,
+            credential: SecretRef | None = None,
+            action: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> ProxyAuthorizationResult:
+            raise AssertionError("invalid metadata should fail before proxy delegation")
+
+    class InvalidMetadataTool(Tool):
+        spec = ToolSpec(
+            name="invalid_metadata",
+            description="Authorize proxy use with invalid metadata.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            assert ctx.proxy is not None
+            await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                metadata=["not", "an", "object"],  # type: ignore[arg-type]
+            )
+            return ToolResult(content="unexpected")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_invalid_metadata",
+                    name="invalid_metadata",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            proxy=FailingProxy(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[InvalidMetadataTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_proxy_invalid_metadata",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    tool_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
+    assert len(tool_events) == 1
+    assert "`metadata` must be a JSON object" in tool_events[0].payload["result"]["content"]
+    assert EventType.CREDENTIAL_PROXY_CHECKED not in [event.type for event in events]
 
 
 def test_cayu_app_redacts_blocked_tool_result_event_payload() -> None:
@@ -17576,6 +18145,199 @@ def test_interrupt_session_stops_in_flight_tool_call():
     assert transcript[-1].role == "tool"
     assert transcript[-1].content[0].tool_call_id == "call_1"
     assert transcript[-1].content[0].is_error is True
+
+
+def test_interrupt_session_preserves_proxy_authorization_events() -> None:
+    class ProxyBlockingTool(Tool):
+        spec = ToolSpec(
+            name="proxy_blocking_tool",
+            description="Authorize proxy use and block until cancelled.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.authorized: asyncio.Event | None = None
+            self.cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.authorized is None or self.cancelled is None or self.never_complete is None:
+                raise AssertionError("ProxyBlockingTool test events were not initialized.")
+            assert ctx.proxy is not None
+            await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                credential=SecretRef(name="sendgrid_api_key"),
+                action="send_email",
+                metadata={"template": "invoice_reminder"},
+            )
+            self.authorized.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return ToolResult(content="unexpected")
+
+    tool = ProxyBlockingTool()
+    vault = StaticVault({"sendgrid_api_key": "sk-proxy-interrupt-secret"})
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_proxy_blocking",
+                name="proxy_blocking_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=PassthroughProxy(vault),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        tool.authorized = asyncio.Event()
+        tool.cancelled = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interrupt_proxy_authorization",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.authorized.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_proxy_authorization",
+                    reason="operator stop",
+                )
+            )
+        ]
+        await asyncio.wait_for(tool.cancelled.wait(), timeout=1)
+        run_events = await run_task
+        stored_events = await app.session_store.load_events("sess_interrupt_proxy_authorization")
+        return run_events, interrupt_events, stored_events
+
+    run_events, interrupt_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    proxy_events = [
+        event for event in stored_events if event.type == EventType.CREDENTIAL_PROXY_CHECKED
+    ]
+    assert len(proxy_events) == 1
+    assert proxy_events[0].payload["tool_call_id"] == "call_proxy_blocking"
+    assert proxy_events[0].payload["destination"] == "https://api.sendgrid.com/v3/mail/send"
+    assert proxy_events[0].payload["credential"] == "sendgrid_api_key"
+    assert proxy_events[0].payload["action"] == "send_email"
+    assert proxy_events[0].payload["allowed"] is True
+    stored_event_types = [event.type for event in stored_events]
+    assert stored_event_types.index(EventType.CREDENTIAL_PROXY_CHECKED) < stored_event_types.index(
+        EventType.TOOL_CALL_FAILED
+    )
+    assert stored_event_types.index(EventType.TOOL_CALL_FAILED) < stored_event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
+
+
+def test_generic_cancellation_does_not_emit_proxy_authorization_events() -> None:
+    class ProxyBlockingTool(Tool):
+        spec = ToolSpec(
+            name="proxy_blocking_tool",
+            description="Authorize proxy use and block until cancelled.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        def __init__(self) -> None:
+            self.authorized: asyncio.Event | None = None
+            self.cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            if self.authorized is None or self.cancelled is None or self.never_complete is None:
+                raise AssertionError("ProxyBlockingTool test events were not initialized.")
+            assert ctx.proxy is not None
+            await ctx.proxy.authorize_request(
+                destination="https://api.sendgrid.com/v3/mail/send",
+                credential=SecretRef(name="sendgrid_api_key"),
+                action="send_email",
+            )
+            self.authorized.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return ToolResult(content="unexpected")
+
+    tool = ProxyBlockingTool()
+    vault = StaticVault({"sendgrid_api_key": "sk-proxy-cancel-secret"})
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_proxy_blocking",
+                name="proxy_blocking_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            vault=vault,
+            proxy=PassthroughProxy(vault),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    async def run():
+        tool.authorized = asyncio.Event()
+        tool.cancelled = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_generic_cancel_proxy_authorization",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await tool.authorized.wait()
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        await asyncio.wait_for(tool.cancelled.wait(), timeout=1)
+        return await app.session_store.load_events("sess_generic_cancel_proxy_authorization")
+
+    stored_events = asyncio.run(run())
+
+    assert EventType.CREDENTIAL_PROXY_CHECKED not in [event.type for event in stored_events]
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in stored_events]
 
 
 def test_cancelled_runner_cleanup_diagnostics_are_preserved_in_tool_result():

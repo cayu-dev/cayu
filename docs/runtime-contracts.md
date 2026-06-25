@@ -1096,6 +1096,16 @@ request. Redaction matches resolved secret values, not `SecretRef` names or
 metadata keys. A name such as `sendgrid_api_key` can remain visible while the raw
 secret value is replaced with `[REDACTED_SECRET]`.
 
+Trusted tools can also call `ctx.proxy.authorize_request(...)` before using a
+credential for an outbound action. Cayu emits a durable
+`credential.proxy.checked` event for each check with the destination, credential
+reference name, action, metadata, allow/deny result, and proxy result metadata.
+The event is redacted with any secrets resolved during the same tool call.
+
+Authorization checks are an audit/enforcement hook for trusted proxy-aware
+tools. Cayu records the decision; the proxy and tool implementation remain
+responsible for denying or avoiding the outbound action when `allowed=False`.
+
 This redaction is defense in depth. It does not intercept sandbox network calls,
 make arbitrary shell commands safe for secrets, or guarantee safety for secrets
 already present inside a workspace.

@@ -115,6 +115,16 @@ class ResolvedSecret(BaseModel):
         return value
 
 
+def copy_resolved_secret(secret: ResolvedSecret) -> ResolvedSecret:
+    if type(secret) is not ResolvedSecret:
+        raise TypeError("Resolved secrets must be ResolvedSecret instances.")
+    return ResolvedSecret(
+        name=secret.name,
+        value=SecretStr(secret.value.get_secret_value()),
+        metadata=copy_json_value(secret.metadata, "metadata"),
+    )
+
+
 class VaultError(RuntimeError):
     """Base error for vault resolution failures."""
 

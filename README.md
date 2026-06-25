@@ -331,6 +331,12 @@ tool result, so accidental leaks from the trusted tool result are redacted befor
 they reach durable events, transcripts, or the next model request. This is
 defense in depth; it does not make generic shell execution safe for secrets.
 
+Trusted tools can also call `ctx.proxy.authorize_request(...)` before using a
+credential for an outbound action. Cayu emits a durable
+`credential.proxy.checked` event with the destination, credential reference name,
+action, metadata, and allow/deny result. This is an audit/enforcement hook for
+proxy-aware tools; it does not intercept arbitrary sandbox network traffic.
+
 ## Usage And Cache Metrics
 
 `model.completed` events keep the provider's raw `usage` payload and add a

@@ -17,6 +17,7 @@ from cayu import (
     SecretRef,
     StaticVault,
     VaultError,
+    copy_resolved_secret,
     copy_secret_env,
 )
 
@@ -72,6 +73,43 @@ def test_copy_secret_env_rejects_subclasses_before_attribute_access() -> None:
 
     with pytest.raises(TypeError, match="SecretEnv"):
         copy_secret_env(secret_env)
+
+
+def test_copy_resolved_secret_owns_value_and_metadata() -> None:
+    metadata = {"scope": {"project": "alpha"}}
+    secret = ResolvedSecret(
+        name="github_token",
+        value=SecretStr("ghp_secret"),
+        metadata=metadata,
+    )
+
+    copied = copy_resolved_secret(secret)
+    secret.value = SecretStr("mutated_secret")
+    secret.metadata["scope"]["project"] = "mutated"
+    metadata["scope"]["project"] = "external-mutated"
+
+    assert copied == ResolvedSecret(
+        name="github_token",
+        value=SecretStr("ghp_secret"),
+        metadata={"scope": {"project": "alpha"}},
+    )
+
+
+def test_copy_resolved_secret_rejects_subclasses_before_attribute_access() -> None:
+    class BadResolvedSecret(ResolvedSecret):
+        def __getattribute__(self, name):
+            if name == "name":
+                raise RuntimeError("secret name access should not run")
+            return super().__getattribute__(name)
+
+    secret = BadResolvedSecret.model_construct(
+        name="token",
+        value=SecretStr("secret"),
+        metadata={},
+    )
+
+    with pytest.raises(TypeError, match="ResolvedSecret"):
+        copy_resolved_secret(secret)
 
 
 def test_static_vault_gets_and_resolves_secret_refs() -> None:
