@@ -51,6 +51,10 @@ execution. `E2BRunner` and `E2BWorkspace` are available behind the optional
 `cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
 access.
 
+To run commands on your own platform, implement a custom `Runner`: see the
+[Build a Runner guide](docs/build-a-runner.md) and the worked
+`examples/modal_runner.py` example.
+
 ## Development
 
 ```bash
