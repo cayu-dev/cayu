@@ -3,11 +3,27 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Mapping
 from contextlib import suppress
-from typing import Any, cast
+from typing import Any
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu.mcp._jsonrpc import (
+    DEFAULT_MCP_CLIENT_NAME,
+    DEFAULT_MCP_CLIENT_VERSION,
+    DEFAULT_MCP_REQUEST_TIMEOUT_S,
+    JSONRPC_METHOD_NOT_FOUND,
+    MCP_PROTOCOL_VERSION,
+    McpProtocolError,
+    initialize_params,
+    initialize_result_from_payload,
+    jsonrpc_notification_payload,
+    jsonrpc_request_payload,
+    resource_definition_from_payload,
+    result_from_jsonrpc_response,
+    tool_definition_from_payload,
+    tool_result_from_payload,
+    validate_positive_number,
+)
 from cayu.mcp.base import (
     McpClient,
     McpInitializeResult,
@@ -19,18 +35,9 @@ from cayu.mcp.base import (
     McpToolResult,
 )
 
-MCP_PROTOCOL_VERSION = "2025-06-18"
-DEFAULT_MCP_REQUEST_TIMEOUT_S = 30.0
 DEFAULT_MCP_WRITE_TIMEOUT_S = 5.0
 DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S = 2.0
 DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S = 1.0
-DEFAULT_MCP_CLIENT_NAME = "cayu"
-DEFAULT_MCP_CLIENT_VERSION = "0.1.0"
-_JSONRPC_METHOD_NOT_FOUND = -32601
-
-
-class McpProtocolError(RuntimeError):
-    """Raised when an MCP server violates the expected JSON-RPC contract."""
 
 
 class StdioMcpClient(McpClient):
@@ -47,19 +54,19 @@ class StdioMcpClient(McpClient):
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
         inherit_env: bool = False,
     ) -> None:
-        self.request_timeout_s = _validate_positive_number(
+        self.request_timeout_s = validate_positive_number(
             request_timeout_s,
             "request_timeout_s",
         )
-        self.write_timeout_s = _validate_positive_number(
+        self.write_timeout_s = validate_positive_number(
             write_timeout_s,
             "write_timeout_s",
         )
-        self.graceful_shutdown_timeout_s = _validate_positive_number(
+        self.graceful_shutdown_timeout_s = validate_positive_number(
             graceful_shutdown_timeout_s,
             "graceful_shutdown_timeout_s",
         )
-        self.cancellation_notification_timeout_s = _validate_positive_number(
+        self.cancellation_notification_timeout_s = validate_positive_number(
             cancellation_notification_timeout_s,
             "cancellation_notification_timeout_s",
         )
@@ -152,18 +159,11 @@ class StdioMcpSession(McpSession):
     async def initialize(self) -> None:
         result = await self._request(
             "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": self.client_name,
-                    "version": self.client_version,
-                },
-            },
+            initialize_params(self.client_name, self.client_version),
         )
         if type(result) is not dict:
             raise McpProtocolError("MCP initialize result must be an object.")
-        self._initialize_result = _initialize_result(result)
+        self._initialize_result = initialize_result_from_payload(result)
         if self._initialize_result.protocol_version != MCP_PROTOCOL_VERSION:
             raise McpProtocolError(
                 "MCP server negotiated unsupported protocol version "
@@ -178,7 +178,7 @@ class StdioMcpSession(McpSession):
         tools = result.get("tools", [])
         if not isinstance(tools, list):
             raise McpProtocolError("MCP tools/list result tools must be a list.")
-        return tuple(_tool_definition(tool, self.server.name) for tool in tools)
+        return tuple(tool_definition_from_payload(tool, self.server.name) for tool in tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         tool_name = require_clean_nonblank(name, "tool name")
@@ -194,7 +194,7 @@ class StdioMcpSession(McpSession):
         )
         if type(result) is not dict:
             raise McpProtocolError("MCP tools/call result must be an object.")
-        return _tool_result(result)
+        return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
         result = await self._request("resources/list", {})
@@ -203,7 +203,9 @@ class StdioMcpSession(McpSession):
         resources = result.get("resources", [])
         if not isinstance(resources, list):
             raise McpProtocolError("MCP resources/list result resources must be a list.")
-        return tuple(_resource_definition(resource, self.server.name) for resource in resources)
+        return tuple(
+            resource_definition_from_payload(resource, self.server.name) for resource in resources
+        )
 
     async def read_resource(self, uri: str) -> McpResourceResult:
         resource_uri = require_clean_nonblank(uri, "resource uri")
@@ -263,12 +265,7 @@ class StdioMcpSession(McpSession):
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         request_written = False
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method_name,
-            "params": copy_json_value(params, "params"),
-        }
+        payload = jsonrpc_request_payload(request_id, method_name, params)
         try:
             await self._write_with_timeout(
                 payload,
@@ -307,24 +304,12 @@ class StdioMcpSession(McpSession):
                     reason="Cayu caller cancelled the request.",
                 )
             raise
-        if "error" in response:
-            error = response["error"]
-            if isinstance(error, Mapping):
-                message = error.get("message", "MCP request failed.")
-                raise McpProtocolError(f"MCP {method_name} failed: {message}")
-            raise McpProtocolError(f"MCP {method_name} failed.")
-        if "result" not in response:
-            raise McpProtocolError(f"MCP {method_name} response missing result.")
-        return copy_json_value(response["result"], "result")
+        return result_from_jsonrpc_response(response, method_name)
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         method_name = require_clean_nonblank(method, "method")
         await self._write_with_timeout(
-            {
-                "jsonrpc": "2.0",
-                "method": method_name,
-                "params": copy_json_value(params, "params"),
-            },
+            jsonrpc_notification_payload(method_name, params),
             timeout_message=f"MCP notification {method_name} write timed out.",
         )
 
@@ -437,7 +422,7 @@ class StdioMcpSession(McpSession):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {
-                    "code": _JSONRPC_METHOD_NOT_FOUND,
+                    "code": JSONRPC_METHOD_NOT_FOUND,
                     "message": f"Cayu does not support MCP server request: {method_name}",
                 },
             },
@@ -476,103 +461,6 @@ class StdioMcpSession(McpSession):
                 return
 
 
-def _tool_definition(payload: object, server_name: str) -> McpToolDefinition:
-    if type(payload) is not dict:
-        raise McpProtocolError("MCP tool definitions must be objects.")
-    payload = cast("dict[str, Any]", payload)
-    name = _mapping_string(payload, "name")
-    description = _optional_mapping_string(payload, "description") or ""
-    input_schema = payload.get("inputSchema", {})
-    if type(input_schema) is not dict:
-        raise McpProtocolError("MCP tool inputSchema must be an object.")
-    annotations = payload.get("annotations", {})
-    if type(annotations) is not dict:
-        raise McpProtocolError("MCP tool annotations must be an object.")
-    return McpToolDefinition(
-        name=name,
-        description=description,
-        input_schema=input_schema,
-        annotations={
-            **annotations,
-            "mcp_server": server_name,
-        },
-    )
-
-
-def _initialize_result(payload: dict[str, Any]) -> McpInitializeResult:
-    protocol_version = payload.get("protocolVersion")
-    if not isinstance(protocol_version, str):
-        raise McpProtocolError("MCP initialize protocolVersion must be a string.")
-    capabilities = payload.get("capabilities", {})
-    if type(capabilities) is not dict:
-        raise McpProtocolError("MCP initialize capabilities must be an object.")
-    server_info = payload.get("serverInfo", {})
-    if server_info is None:
-        server_info = {}
-    if type(server_info) is not dict:
-        raise McpProtocolError("MCP initialize serverInfo must be an object.")
-    instructions = payload.get("instructions")
-    if instructions is not None and type(instructions) is not str:
-        raise McpProtocolError("MCP initialize instructions must be a string.")
-    return McpInitializeResult(
-        protocol_version=protocol_version,
-        server_name=_optional_mapping_string(server_info, "name"),
-        server_version=_optional_mapping_string(server_info, "version"),
-        instructions=instructions,
-        capabilities=capabilities,
-    )
-
-
-def _tool_result(payload: dict[str, Any]) -> McpToolResult:
-    content = payload.get("content", [])
-    if not isinstance(content, list):
-        raise McpProtocolError("MCP tool result content must be a list.")
-    structured_content = payload.get("structuredContent")
-    if structured_content is not None and type(structured_content) is not dict:
-        raise McpProtocolError("MCP structuredContent must be an object.")
-    is_error = payload.get("isError", False)
-    if type(is_error) is not bool:
-        raise McpProtocolError("MCP tool result isError must be a bool.")
-    return McpToolResult(
-        content=content,
-        structured_content=structured_content,
-        is_error=is_error,
-    )
-
-
-def _resource_definition(payload: object, server_name: str) -> McpResourceDefinition:
-    if type(payload) is not dict:
-        raise McpProtocolError("MCP resource definitions must be objects.")
-    payload = cast("dict[str, Any]", payload)
-    uri = _mapping_string(payload, "uri")
-    metadata = {
-        "mcp_server": server_name,
-    }
-    return McpResourceDefinition(
-        uri=uri,
-        name=_optional_mapping_string(payload, "name"),
-        description=_optional_mapping_string(payload, "description"),
-        mime_type=_optional_mapping_string(payload, "mimeType"),
-        metadata=metadata,
-    )
-
-
-def _mapping_string(payload: Mapping[str, Any], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str):
-        raise McpProtocolError(f"MCP {key} must be a string.")
-    return require_clean_nonblank(value, key)
-
-
-def _optional_mapping_string(payload: Mapping[str, Any], key: str) -> str | None:
-    value = payload.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise McpProtocolError(f"MCP {key} must be a string.")
-    return require_nonblank(value, key)
-
-
 def _consume_task_result(task: asyncio.Task) -> None:
     with suppress(Exception, asyncio.CancelledError):
         task.result()
@@ -589,12 +477,3 @@ async def _close_session_after_failed_connect(session: McpSession) -> None:
         except asyncio.CancelledError:
             if close_task.done():
                 return
-
-
-def _validate_positive_number(value: float, field_name: str) -> float:
-    if type(value) not in {float, int}:
-        raise TypeError(f"{field_name} must be a number.")
-    numeric = float(value)
-    if numeric <= 0:
-        raise ValueError(f"{field_name} must be greater than zero.")
-    return numeric

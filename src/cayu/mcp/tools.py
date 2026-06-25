@@ -17,6 +17,7 @@ from cayu.mcp.base import (
     McpToolDefinition,
     McpToolResult,
 )
+from cayu.mcp.http import HttpMcpClient
 from cayu.mcp.stdio import StdioMcpClient
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -115,7 +116,7 @@ class McpToolset:
     ) -> McpToolset:
         if type(server) is not McpServerSpec:
             raise TypeError("server must be an McpServerSpec.")
-        mcp_client = client if client is not None else StdioMcpClient()
+        mcp_client = client if client is not None else _default_client_for(server)
         session = await mcp_client.connect(server)
         try:
             definitions = await session.list_tools()
@@ -146,6 +147,13 @@ async def connect_mcp_toolset(
     """Connect to one MCP server and return its initialized toolset."""
 
     return await McpToolset.connect(server, client=client)
+
+
+def _default_client_for(server: McpServerSpec) -> McpClient:
+    """Pick the transport from the spec: a URL server uses HTTP, a command server stdio."""
+    if server.url is not None:
+        return HttpMcpClient()
+    return StdioMcpClient()
 
 
 def mcp_cayu_tool_name(server_name: str, tool_name: str) -> str:
