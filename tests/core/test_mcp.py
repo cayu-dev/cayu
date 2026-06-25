@@ -11,6 +11,10 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
+    EventQuery,
+    EventType,
     McpClient,
     McpInitializeResult,
     McpProtocolError,
@@ -20,6 +24,7 @@ from cayu import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    McpToolset,
     Message,
     RunRequest,
     StdioMcpClient,
@@ -28,8 +33,11 @@ from cayu import (
     connect_mcp_toolset,
     mcp_cayu_tool_name,
     mcp_tool_manifest_hash,
+    mcp_tool_manifest_identity,
+    mcp_tool_manifest_tools,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import InMemorySessionStore
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "fixtures" / "fake_mcp_server.py"
 
@@ -52,17 +60,21 @@ class FakeMcpSession(McpSession):
         self,
         *,
         definitions: tuple[McpToolDefinition, ...] = (),
+        initialize_result: McpInitializeResult | None = None,
         list_tools_error: BaseException | None = None,
         close_error: BaseException | None = None,
     ) -> None:
         self.definitions = definitions
+        self._initialize_result = initialize_result or McpInitializeResult(
+            protocol_version="2025-06-18"
+        )
         self.list_tools_error = list_tools_error
         self.close_error = close_error
         self.closed = False
 
     @property
     def initialize_result(self) -> McpInitializeResult:
-        return McpInitializeResult(protocol_version="2025-06-18")
+        return self._initialize_result
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
         if self.list_tools_error is not None:
@@ -272,6 +284,379 @@ def test_mcp_tool_manifest_hash_changes_when_schema_changes() -> None:
         initialize_result=initialize_result,
         definitions=changed,
     )
+
+
+def test_mcp_tool_manifest_tools_are_compact_and_stable() -> None:
+    server = _fake_server_spec()
+    first = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo text.",
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+            },
+        ),
+    )
+    second = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo text.",
+            input_schema={
+                "properties": {"text": {"type": "string"}},
+                "type": "object",
+            },
+        ),
+    )
+
+    entries = mcp_tool_manifest_tools(server=server, definitions=first)
+
+    assert entries == mcp_tool_manifest_tools(server=server, definitions=second)
+    assert entries[0]["cayu_name"] == "mcp__local-mcp__echo"
+    assert entries[0]["mcp_name"] == "echo"
+    assert entries[0]["hash"].startswith("sha256:")
+    assert "input_schema" not in entries[0]
+
+
+def test_mcp_tool_manifest_identity_tracks_exposed_tool_names() -> None:
+    server = _fake_server_spec()
+    first = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo text.",
+            input_schema={"type": "object", "required": ["text"]},
+        ),
+    )
+    schema_changed = (
+        McpToolDefinition(
+            name="echo",
+            description="Echo changed text.",
+            input_schema={"type": "object", "required": ["message"]},
+        ),
+    )
+    tool_changed = (
+        McpToolDefinition(
+            name="summarize",
+            description="Summarize text.",
+            input_schema={"type": "object", "required": ["text"]},
+        ),
+    )
+
+    assert mcp_tool_manifest_identity(server=server, definitions=first) == (
+        mcp_tool_manifest_identity(server=server, definitions=schema_changed)
+    )
+    assert mcp_tool_manifest_identity(server=server, definitions=first) != (
+        mcp_tool_manifest_identity(server=server, definitions=tool_changed)
+    )
+
+
+def test_runtime_emits_first_seen_mcp_manifest_event() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        toolset = _fake_toolset()
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=toolset.tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_first_seen",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        records = await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+        return events, records, toolset
+
+    events, records, toolset = asyncio.run(run())
+
+    manifest_events = [event for event in events if event.type == EventType.MCP_MANIFEST_CHECKED]
+    assert len(manifest_events) == 1
+    payload = manifest_events[0].payload
+    assert payload["server_name"] == "local-mcp"
+    assert payload["manifest_hash"] == toolset.manifest_hash
+    assert payload["server_hash"] == toolset.manifest_server_hash
+    assert payload["status"] == "first_seen"
+    assert payload["previous"] is None
+    assert payload["diff"] == {
+        "server_changed": False,
+        "added_tools": [],
+        "removed_tools": [],
+        "changed_tools": [],
+    }
+    assert payload["tools"] == list(toolset.manifest_tools)
+    assert len(records) == 1
+
+
+def test_runtime_marks_mcp_manifest_unchanged_across_sessions() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_unchanged_1",
+            toolset=_fake_toolset(),
+        )
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_unchanged_2",
+            toolset=_fake_toolset(),
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "unchanged",
+    ]
+    assert records[1].event.payload["previous"]["event_id"] == records[0].event.id
+    assert records[1].event.payload["previous"]["session_id"] == "mcp_manifest_unchanged_1"
+    assert records[1].event.payload["diff"] == {
+        "server_changed": False,
+        "added_tools": [],
+        "removed_tools": [],
+        "changed_tools": [],
+    }
+
+
+def test_runtime_marks_mcp_manifest_changed_across_sessions() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_changed_1",
+            toolset=_fake_toolset(description="Echo text."),
+        )
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_changed_2",
+            toolset=_fake_toolset(description="Echo changed text."),
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "changed",
+    ]
+    changed_payload = records[1].event.payload
+    assert changed_payload["previous"]["manifest_hash"] == records[0].event.payload["manifest_hash"]
+    assert changed_payload["diff"] == {
+        "server_changed": False,
+        "added_tools": [],
+        "removed_tools": [],
+        "changed_tools": ["mcp__local-mcp__echo"],
+    }
+
+
+def test_runtime_marks_mcp_server_metadata_changed_across_sessions() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_server_changed_1",
+            toolset=_fake_toolset(
+                initialize_result=McpInitializeResult(
+                    protocol_version="2025-06-18",
+                    instructions="Use carefully.",
+                )
+            ),
+        )
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_server_changed_2",
+            toolset=_fake_toolset(
+                initialize_result=McpInitializeResult(
+                    protocol_version="2025-06-18",
+                    instructions="Use only after approval.",
+                )
+            ),
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "changed",
+    ]
+    assert records[1].event.payload["diff"] == {
+        "server_changed": True,
+        "added_tools": [],
+        "removed_tools": [],
+        "changed_tools": [],
+    }
+
+
+def test_runtime_marks_mcp_added_and_removed_tools_across_sessions() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_tools_changed_1",
+            toolset=_fake_toolset(definitions=_fake_tool_definitions("echo", "old")),
+        )
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_tools_changed_2",
+            toolset=_fake_toolset(definitions=_fake_tool_definitions("echo", "new")),
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "changed",
+    ]
+    assert records[1].event.payload["diff"] == {
+        "server_changed": False,
+        "added_tools": ["mcp__local-mcp__new"],
+        "removed_tools": ["mcp__local-mcp__old"],
+        "changed_tools": [],
+    }
+
+
+def test_runtime_audits_distinct_same_name_mcp_toolsets() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        echo_toolset = _fake_toolset(definitions=_fake_tool_definitions("echo"))
+        summarize_toolset = _fake_toolset(definitions=_fake_tool_definitions("summarize"))
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[*echo_toolset.tools, *summarize_toolset.tools],
+        )
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_same_server_two_toolsets",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert len(records) == 2
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "first_seen",
+    ]
+    assert [record.event.payload["server_name"] for record in records] == [
+        "local-mcp",
+        "local-mcp",
+    ]
+    assert [record.event.payload["tools"][0]["cayu_name"] for record in records] == [
+        "mcp__local-mcp__echo",
+        "mcp__local-mcp__summarize",
+    ]
+    assert (
+        records[0].event.payload["manifest_identity"]
+        != records[1].event.payload["manifest_identity"]
+    )
+
+
+def test_runtime_does_not_fallback_for_new_toolset_when_current_server_is_ambiguous() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        echo_toolset = _fake_toolset(definitions=_fake_tool_definitions("echo"))
+        summarize_toolset = _fake_toolset(definitions=_fake_tool_definitions("summarize"))
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_same_server_initial",
+            toolset=echo_toolset,
+        )
+
+        provider = FakeProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[*echo_toolset.tools, *summarize_toolset.tools],
+        )
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_manifest_same_server_added_second",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.payload["tools"][0]["cayu_name"] for record in records] == [
+        "mcp__local-mcp__echo",
+        "mcp__local-mcp__echo",
+        "mcp__local-mcp__summarize",
+    ]
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "unchanged",
+        "first_seen",
+    ]
+    assert records[2].event.payload["previous"] is None
+
+
+def test_runtime_scopes_mcp_manifest_comparison_by_environment() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_env_scoped_1",
+            toolset=_fake_toolset(),
+            environment_name="local",
+        )
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_manifest_env_scoped_2",
+            toolset=_fake_toolset(),
+            environment_name=None,
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert [record.event.environment_name for record in records] == ["local", None]
+    assert [record.event.payload["status"] for record in records] == [
+        "first_seen",
+        "first_seen",
+    ]
 
 
 def test_stdio_mcp_client_replies_to_unsupported_server_requests() -> None:
@@ -791,6 +1176,72 @@ def test_stdio_mcp_client_rejects_unresolved_secret_env() -> None:
 
 async def _collect_events(events):
     return [event async for event in events]
+
+
+async def _run_mcp_manifest_session(
+    *,
+    store: InMemorySessionStore,
+    session_id: str,
+    toolset,
+    environment_name: str | None = None,
+) -> None:
+    provider = FakeProvider([[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    if environment_name is not None:
+        app.register_environment(Environment(EnvironmentSpec(name=environment_name)), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=toolset.tools,
+    )
+    await _collect_events(
+        app.run(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                environment_name=environment_name,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    )
+
+
+def _fake_toolset(
+    *,
+    description: str = "Echo text.",
+    definitions: tuple[McpToolDefinition, ...] | None = None,
+    initialize_result: McpInitializeResult | None = None,
+):
+    tool_definitions = (
+        _fake_tool_definitions("echo", description=description)
+        if definitions is None
+        else definitions
+    )
+    return McpToolset(
+        server=_fake_server_spec(),
+        session=FakeMcpSession(
+            definitions=tool_definitions,
+            initialize_result=initialize_result,
+        ),
+        definitions=tool_definitions,
+    )
+
+
+def _fake_tool_definitions(
+    *names: str,
+    description: str = "Echo text.",
+) -> tuple[McpToolDefinition, ...]:
+    return tuple(
+        McpToolDefinition(
+            name=name,
+            description=description,
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+            },
+        )
+        for name in names
+    )
 
 
 def _fake_server_spec() -> McpServerSpec:

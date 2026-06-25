@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -52,6 +52,7 @@ from cayu.environments import (
     copy_workspace_snapshot,
     load_workspace_instructions,
 )
+from cayu.mcp import McpToolAdapter, McpToolset
 from cayu.providers import (
     ModelCompletion,
     ModelProvider,
@@ -2316,6 +2317,12 @@ class CayuApp:
                 yield event
             if binding_result.error is not None:
                 raise binding_result.error
+            async for event in self._emit_mcp_manifest_checks(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+            ):
+                yield event
             if start_event_type is not None:
                 yield await self._emit(
                     Event(
@@ -4512,6 +4519,76 @@ class CayuApp:
             redactor=redactor,
         ):
             yield event
+
+    async def _emit_mcp_manifest_checks(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> AsyncIterator[Event]:
+        seen_toolsets: set[int] = set()
+        prior_records = await self._query_all_event_records(
+            EventQuery(
+                event_type=EventType.MCP_MANIFEST_CHECKED,
+                environment_name=environment_name,
+            )
+        )
+        toolsets = _mcp_toolsets_for_agent(registered_agent)
+        current_server_counts = _mcp_current_server_counts(toolsets)
+        prior_server_counts = _mcp_prior_server_counts(
+            prior_records,
+            environment_name=environment_name,
+        )
+        for toolset in toolsets:
+            toolset_key = id(toolset)
+            if toolset_key in seen_toolsets:
+                continue
+            seen_toolsets.add(toolset_key)
+            previous = _latest_mcp_manifest_event(
+                prior_records,
+                manifest_identity=toolset.manifest_identity,
+                environment_name=environment_name,
+            )
+            if (
+                previous is None
+                and current_server_counts.get(toolset.server.name) == 1
+                and prior_server_counts.get(toolset.server.name) == 1
+            ):
+                previous = _latest_mcp_manifest_event_for_server(
+                    prior_records,
+                    server_name=toolset.server.name,
+                    environment_name=environment_name,
+                )
+            status, previous_payload, diff = _mcp_manifest_status(
+                toolset=toolset,
+                previous=previous,
+            )
+            payload: dict[str, Any] = {
+                "server_name": toolset.server.name,
+                "manifest_identity": toolset.manifest_identity,
+                "manifest_hash": toolset.manifest_hash,
+                "server_hash": toolset.manifest_server_hash,
+                "status": status,
+                "tool_count": len(toolset.definitions),
+                "tools": copy_json_value(list(toolset.manifest_tools), "tools"),
+                "server": {
+                    "protocol_version": toolset.initialize_result.protocol_version,
+                    "server_name": toolset.initialize_result.server_name,
+                    "server_version": toolset.initialize_result.server_version,
+                },
+                "previous": previous_payload,
+                "diff": diff,
+            }
+            yield await self._emit(
+                Event(
+                    type=EventType.MCP_MANIFEST_CHECKED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                )
+            )
 
     async def _emit_proxy_authorization_events(
         self,
@@ -7119,6 +7196,143 @@ def _mcp_servers(
     if registered_environment is None:
         return ()
     return registered_environment.environment.mcp_servers
+
+
+def _mcp_toolsets_for_agent(
+    registered_agent: runtime_records.RegisteredAgentState,
+) -> tuple[McpToolset, ...]:
+    toolsets: list[McpToolset] = []
+    for registered_tool in registered_agent.tools.values():
+        tool = registered_tool.tool
+        if isinstance(tool, McpToolAdapter):
+            toolsets.append(tool.toolset)
+    return tuple(toolsets)
+
+
+def _mcp_current_server_counts(toolsets: tuple[McpToolset, ...]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    seen_toolsets: set[int] = set()
+    for toolset in toolsets:
+        toolset_key = id(toolset)
+        if toolset_key in seen_toolsets:
+            continue
+        seen_toolsets.add(toolset_key)
+        counts[toolset.server.name] = counts.get(toolset.server.name, 0) + 1
+    return counts
+
+
+def _mcp_prior_server_counts(
+    records: list[EventRecord],
+    *,
+    environment_name: str | None,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    seen_identities: set[str] = set()
+    for record in records:
+        if record.event.environment_name != environment_name:
+            continue
+        server_name = record.event.payload.get("server_name")
+        manifest_identity = record.event.payload.get("manifest_identity")
+        if not isinstance(server_name, str) or not isinstance(manifest_identity, str):
+            continue
+        if manifest_identity in seen_identities:
+            continue
+        seen_identities.add(manifest_identity)
+        counts[server_name] = counts.get(server_name, 0) + 1
+    return counts
+
+
+def _latest_mcp_manifest_event(
+    records: list[EventRecord],
+    *,
+    manifest_identity: str,
+    environment_name: str | None,
+) -> EventRecord | None:
+    for record in reversed(records):
+        if (
+            record.event.environment_name == environment_name
+            and record.event.payload.get("manifest_identity") == manifest_identity
+        ):
+            return record
+    return None
+
+
+def _latest_mcp_manifest_event_for_server(
+    records: list[EventRecord],
+    *,
+    server_name: str,
+    environment_name: str | None,
+) -> EventRecord | None:
+    for record in reversed(records):
+        if (
+            record.event.environment_name == environment_name
+            and record.event.payload.get("server_name") == server_name
+        ):
+            return record
+    return None
+
+
+def _mcp_manifest_status(
+    *,
+    toolset: McpToolset,
+    previous: EventRecord | None,
+) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    current_tools = _mcp_manifest_tool_hashes(toolset.manifest_tools)
+    empty_diff = {
+        "server_changed": False,
+        "added_tools": [],
+        "removed_tools": [],
+        "changed_tools": [],
+    }
+    if previous is None:
+        return "first_seen", None, empty_diff
+
+    previous_payload = previous.event.payload
+    previous_summary = {
+        "event_id": previous.event.id,
+        "session_id": previous.event.session_id,
+        "sequence": previous.sequence,
+        "manifest_identity": previous_payload.get("manifest_identity"),
+        "manifest_hash": previous_payload.get("manifest_hash"),
+        "server_hash": previous_payload.get("server_hash"),
+        "status": previous_payload.get("status"),
+    }
+    if previous_payload.get("manifest_hash") == toolset.manifest_hash:
+        return "unchanged", previous_summary, empty_diff
+
+    previous_tools = _mcp_manifest_tool_hashes(previous_payload.get("tools"))
+    added = sorted(name for name in current_tools if name not in previous_tools)
+    removed = sorted(name for name in previous_tools if name not in current_tools)
+    changed = sorted(
+        name
+        for name, tool_hash in current_tools.items()
+        if name in previous_tools and previous_tools[name] != tool_hash
+    )
+    return (
+        "changed",
+        previous_summary,
+        {
+            "server_changed": previous_payload.get("server_hash") != toolset.manifest_server_hash,
+            "added_tools": added,
+            "removed_tools": removed,
+            "changed_tools": changed,
+        },
+    )
+
+
+def _mcp_manifest_tool_hashes(value: object) -> dict[str, str]:
+    if not isinstance(value, list | tuple):
+        return {}
+    result: dict[str, str] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        entry = cast("Mapping[str, object]", item)
+        cayu_name = entry.get("cayu_name")
+        tool_hash = entry.get("hash")
+        if isinstance(cayu_name, str) and isinstance(tool_hash, str):
+            result[cayu_name] = tool_hash
+    return result
 
 
 def _validate_stream_event(value: object) -> ModelStreamEvent:

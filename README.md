@@ -921,7 +921,13 @@ PYTHONPATH=src python examples/stdio_mcp_runtime.py
 `mcp_manifest_hash` and is included in structured MCP tool results for audit and
 debugging. A changed MCP input schema, tool description, annotations, server
 instructions, or generated Cayu tool name changes the hash; the hash is not an
-authorization decision.
+authorization decision. When an agent run exposes MCP tool adapters, Cayu also
+emits a durable `mcp.manifest.checked` event before the model step. The event
+records whether the server manifest is `first_seen`, `unchanged`, or `changed`
+against prior durable events for the same server/environment and includes a
+compact added/removed/changed tool diff. Comparison uses a stable
+`manifest_identity` for the exposed toolset, so distinct MCP toolsets with the
+same server name are audited separately.
 
 Run the live Anthropic example with local tools:
 

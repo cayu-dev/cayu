@@ -32,6 +32,8 @@ class EventType(StrEnum):
 
     CREDENTIAL_PROXY_CHECKED = "credential.proxy.checked"
 
+    MCP_MANIFEST_CHECKED = "mcp.manifest.checked"
+
     TASK_CREATED = "task.created"
     TASK_STARTED = "task.started"
     TASK_COMPLETED = "task.completed"

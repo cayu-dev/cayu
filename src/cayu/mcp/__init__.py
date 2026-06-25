@@ -36,6 +36,9 @@ from cayu.mcp.tools import (
     connect_mcp_toolset,
     mcp_cayu_tool_name,
     mcp_tool_manifest_hash,
+    mcp_tool_manifest_identity,
+    mcp_tool_manifest_server_hash,
+    mcp_tool_manifest_tools,
 )
 
 __all__ = [
@@ -66,4 +69,7 @@ __all__ = [
     "connect_mcp_toolset",
     "mcp_cayu_tool_name",
     "mcp_tool_manifest_hash",
+    "mcp_tool_manifest_identity",
+    "mcp_tool_manifest_server_hash",
+    "mcp_tool_manifest_tools",
 ]

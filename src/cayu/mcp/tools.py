@@ -102,6 +102,18 @@ class McpToolset:
             initialize_result=self.initialize_result,
             definitions=self.definitions,
         )
+        self.manifest_identity = mcp_tool_manifest_identity(
+            server=self.server,
+            definitions=self.definitions,
+        )
+        self.manifest_server_hash = mcp_tool_manifest_server_hash(
+            server=self.server,
+            initialize_result=self.initialize_result,
+        )
+        self.manifest_tools = mcp_tool_manifest_tools(
+            server=self.server,
+            definitions=self.definitions,
+        )
         self.tools = tuple(
             McpToolAdapter(toolset=self, definition=definition) for definition in self.definitions
         )
@@ -188,6 +200,102 @@ def mcp_tool_manifest_hash(
         initialize_result=initialize_result,
         definitions=definitions,
     )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def mcp_tool_manifest_identity(
+    *,
+    server: McpServerSpec,
+    definitions: tuple[McpToolDefinition, ...],
+) -> str:
+    """Return a stable identity for comparing one exposed MCP toolset over time."""
+
+    if type(server) is not McpServerSpec:
+        raise TypeError("server must be an McpServerSpec.")
+    if not isinstance(definitions, tuple):
+        raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+    cayu_names: list[str] = []
+    for definition in definitions:
+        if type(definition) is not McpToolDefinition:
+            raise TypeError("definitions must contain McpToolDefinition instances.")
+        cayu_names.append(mcp_cayu_tool_name(server.name, definition.name))
+    payload = {
+        "server_name": server.name,
+        "cayu_tool_names": sorted(cayu_names),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def mcp_tool_manifest_tools(
+    *,
+    server: McpServerSpec,
+    definitions: tuple[McpToolDefinition, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Return compact per-tool manifest entries for drift auditing."""
+
+    if type(server) is not McpServerSpec:
+        raise TypeError("server must be an McpServerSpec.")
+    if not isinstance(definitions, tuple):
+        raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+    entries: list[dict[str, Any]] = []
+    for definition in definitions:
+        if type(definition) is not McpToolDefinition:
+            raise TypeError("definitions must contain McpToolDefinition instances.")
+        cayu_name = mcp_cayu_tool_name(server.name, definition.name)
+        payload = {
+            "cayu_name": cayu_name,
+            "mcp_name": definition.name,
+            "description": definition.description,
+            "input_schema": definition.input_schema,
+            "annotations": definition.annotations,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        entries.append(
+            {
+                "cayu_name": cayu_name,
+                "mcp_name": definition.name,
+                "hash": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+            }
+        )
+    entries.sort(key=lambda entry: (entry["cayu_name"], entry["mcp_name"]))
+    return tuple(entries)
+
+
+def mcp_tool_manifest_server_hash(
+    *,
+    server: McpServerSpec,
+    initialize_result: McpInitializeResult,
+) -> str:
+    """Return a stable hash of MCP server metadata that affects the manifest."""
+
+    if type(server) is not McpServerSpec:
+        raise TypeError("server must be an McpServerSpec.")
+    if type(initialize_result) is not McpInitializeResult:
+        raise TypeError("initialize_result must be an McpInitializeResult.")
+    payload = {
+        "name": server.name,
+        "protocol_version": initialize_result.protocol_version,
+        "server_name": initialize_result.server_name,
+        "server_version": initialize_result.server_version,
+        "instructions": initialize_result.instructions,
+    }
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

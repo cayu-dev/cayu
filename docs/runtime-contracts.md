@@ -1158,6 +1158,17 @@ The first MCP implementation supports stdio servers:
   description, input schema, and annotations. `McpToolAdapter` exposes the same
   value as `mcp_manifest_hash` and includes it in structured tool results so
   events/transcripts can show which MCP contract produced a result.
+- Before a run or resume enters the model loop, Cayu emits a durable
+  `mcp.manifest.checked` event for each MCP toolset exposed through the agent's
+  registered tool adapters. The event compares the current manifest hash with
+  prior durable events for the same server/environment and marks it as
+  `first_seen`, `unchanged`, or `changed`. The payload stores the manifest hash,
+  compact per-tool hashes, and added/removed/changed Cayu tool names; it does
+  not store full schemas or server instructions. The comparison key is a stable
+  `manifest_identity` built from the server name and generated Cayu tool names,
+  so distinct same-name MCP toolsets are audited independently. This is an audit
+  signal for dashboards, watchers, and deployment checks, not an authorization
+  decision.
 - `McpToolAdapter` exposes one MCP tool as a normal Cayu `Tool`, so tool policies,
   approvals, events, transcript persistence, and provider adapters work through the
   same path as framework-native tools.

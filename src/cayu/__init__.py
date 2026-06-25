@@ -85,6 +85,9 @@ from cayu.mcp import (
     connect_mcp_toolset,
     mcp_cayu_tool_name,
     mcp_tool_manifest_hash,
+    mcp_tool_manifest_identity,
+    mcp_tool_manifest_server_hash,
+    mcp_tool_manifest_tools,
 )
 from cayu.observability import LoggingEventSink
 from cayu.providers import (
@@ -602,6 +605,9 @@ __all__ = [
     "has_run_limits",
     "mcp_cayu_tool_name",
     "mcp_tool_manifest_hash",
+    "mcp_tool_manifest_identity",
+    "mcp_tool_manifest_server_hash",
+    "mcp_tool_manifest_tools",
     "normalize_usage_metrics",
     "retry_decision",
     "session_usage_summary",
