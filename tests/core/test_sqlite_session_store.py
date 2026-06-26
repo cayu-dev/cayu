@@ -862,6 +862,13 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         watcher_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_event_watcher_state'"
         ).fetchone()
+        knowledge_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_knowledge_entries'"
+        ).fetchone()
+        knowledge_fts = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_knowledge_chunks_fts'"
+        ).fetchone()
         revisions = connection.execute(
             "SELECT revision, compatible_from FROM cayu_schema_migrations ORDER BY revision"
         ).fetchall()
@@ -874,13 +881,15 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
 
     assert label_table is not None
     assert watcher_table is not None
+    assert knowledge_table is not None
+    assert knowledge_fts is not None
     assert {
         "worker_id",
         "lease_expires_at",
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]
     assert version == schema_migrations.LATEST_REVISION
 
 

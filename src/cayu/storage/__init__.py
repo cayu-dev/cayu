@@ -2,6 +2,7 @@
 
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.event_watchers import SQLiteEventWatcherStore
+from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     BUILTIN_KNOWLEDGE_KINDS,
     DEFAULT_KNOWLEDGE_KIND,
@@ -44,6 +45,7 @@ __all__ = [
     "PostgresTaskStore",
     "SQLiteBudgetLedger",
     "SQLiteEventWatcherStore",
+    "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
 ]

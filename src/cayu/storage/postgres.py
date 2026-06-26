@@ -168,6 +168,85 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_tasks ADD COLUMN status_reason TEXT",
         "ALTER TABLE cayu_tasks ADD COLUMN status_payload JSONB",
     ),
+    6: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_entries (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            text TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_by_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            source_type TEXT,
+            source_uri TEXT,
+            source_id TEXT,
+            source_hash TEXT,
+            importance DOUBLE PRECISION,
+            importance_source TEXT,
+            confidence DOUBLE PRECISION,
+            last_used_at TIMESTAMPTZ,
+            expires_at TIMESTAMPTZ,
+            title TEXT,
+            metadata JSONB NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_labels (
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (entry_id, key)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_aspects (
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            aspect TEXT NOT NULL,
+            PRIMARY KEY (entry_id, aspect)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_impact_targets (
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            impact_target TEXT NOT NULL,
+            PRIMARY KEY (entry_id, impact_target)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_chunks (
+            id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            content_hash TEXT,
+            source_uri TEXT,
+            metadata JSONB NOT NULL,
+            UNIQUE (entry_id, chunk_index)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_namespace_status "
+        "ON cayu_knowledge_entries(namespace, status)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_kind "
+        "ON cayu_knowledge_entries(kind)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_visibility "
+        "ON cayu_knowledge_entries(visibility)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_source "
+        "ON cayu_knowledge_entries(source_type, source_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_expires_at "
+        "ON cayu_knowledge_entries(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_labels_key_value_entry "
+        "ON cayu_knowledge_labels(key, value, entry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_aspects_aspect_entry "
+        "ON cayu_knowledge_aspects(aspect, entry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_impact_targets_target_entry "
+        "ON cayu_knowledge_impact_targets(impact_target, entry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_entry_index "
+        "ON cayu_knowledge_chunks(entry_id, chunk_index)",
+    ),
 }
 
 

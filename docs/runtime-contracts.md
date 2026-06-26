@@ -1204,14 +1204,15 @@ tool call may execute.
 preferences, procedures, instructions, skills, documents, examples, warnings,
 decisions, events, summaries, and app-defined custom kinds.
 
-The first framework slice defines the data contract and an
-`InMemoryKnowledgeStore` for tests, demos, and single-process local apps. There
-is no legacy memory alias in the public surface; use the `Knowledge*` names and
-entry/chunk methods directly.
+The first framework slices define the data contract, an `InMemoryKnowledgeStore`
+for tests, demos, and single-process local apps, and a `SQLiteKnowledgeStore` for
+durable local knowledge. There is no legacy memory alias in the public surface;
+use the `Knowledge*` names and entry/chunk methods directly.
 
-`InMemoryKnowledgeStore` is a keyword backend. It supports `auto` and `keyword`
-query modes and rejects semantic, hybrid, and external modes so apps do not
-mistake the local test store for an embedding or external retrieval backend.
+`InMemoryKnowledgeStore` is a simple keyword backend. `SQLiteKnowledgeStore` uses
+SQLite FTS5/BM25 for durable keyword search. Both support `auto` and `keyword`
+query modes and reject semantic, hybrid, and external modes so apps do not
+mistake these local stores for embedding or external retrieval backends.
 
 - `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
@@ -1246,7 +1247,6 @@ result = await store.search(query)
 ```
 
 This slice does not add runtime context injection, model-facing memory tools,
-SQLite/Postgres FTS, embeddings, graph retrieval, or automatic indexing. Those
-layers should build on the same `KnowledgeEntry` / `KnowledgeChunk` /
-`KnowledgeQuery` contract rather than introducing separate memory, skill, or
-document-store APIs.
+Postgres search, embeddings, graph retrieval, or automatic indexing. Those layers
+should build on the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery`
+contract rather than introducing separate memory, skill, or document-store APIs.
