@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, LiteralString, cast
 
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
@@ -76,6 +78,23 @@ from cayu.runtime.tasks import (
 )
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import migrations as schema
+from cayu.storage.memory import (
+    DEFAULT_KNOWLEDGE_LIMIT,
+    DEFAULT_KNOWLEDGE_MAX_BYTES,
+    KnowledgeActorType,
+    KnowledgeChunk,
+    KnowledgeEntry,
+    KnowledgeHit,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+    KnowledgeSearchResult,
+    KnowledgeStatus,
+    KnowledgeStore,
+    KnowledgeVisibility,
+    copy_knowledge_chunk,
+    copy_knowledge_entry,
+    copy_knowledge_query,
+)
 
 # A fixed 63-bit advisory-lock key. Every Cayu store sharing a database takes this
 # lock before touching schema, so concurrent creators/migrators (the production
@@ -85,6 +104,8 @@ from cayu.storage import migrations as schema
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
+_KNOWLEDGE_SEARCH_PAGE_SIZE = 500
+_KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
     "task.parent_task_id, task.assigned_agent_name, task.worker_id, task.lease_expires_at, "
@@ -246,6 +267,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_knowledge_impact_targets(impact_target, entry_id)",
         "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_entry_index "
         "ON cayu_knowledge_chunks(entry_id, chunk_index)",
+    ),
+    7: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_title_fts "
+        "ON cayu_knowledge_entries USING GIN (to_tsvector('simple', COALESCE(title, '')))",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_text_fts "
+        "ON cayu_knowledge_chunks USING GIN (to_tsvector('simple', text))",
     ),
 }
 
@@ -688,6 +715,549 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
                 pg_support.to_utc(state.updated_at),
             ),
         )
+
+
+class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
+    """Postgres-backed durable knowledge store with full-text search."""
+
+    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        entry = copy_knowledge_entry(entry)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    existing_entry = await self._load_entry(cur, entry.id)
+                    existing_chunks = await self._load_chunks(cur, entry.id)
+                    await self._upsert_entry(cur, entry)
+                    if (
+                        existing_entry is None
+                        or not existing_chunks
+                        or _knowledge_has_only_default_chunk(existing_entry, existing_chunks)
+                    ):
+                        await self._replace_chunks(cur, entry.id, [_default_chunk_for_entry(entry)])
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return copy_knowledge_entry(entry)
+
+    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._load_entry(cur, entry_id)
+
+    async def update_entry_status(
+        self,
+        entry_id: str,
+        status: KnowledgeStatus,
+    ) -> KnowledgeEntry:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if not isinstance(status, KnowledgeStatus):
+            raise ValueError("status must be a KnowledgeStatus.")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    entry = await self._load_entry(cur, entry_id)
+                    if entry is None:
+                        raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                    updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
+                    await cur.execute(
+                        """
+                        UPDATE cayu_knowledge_entries
+                        SET status = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (str(status), pg_support.to_utc(updated_at), entry_id),
+                    )
+                    loaded = await self._load_entry(cur, entry_id)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        if loaded is None:
+            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+        return loaded
+
+    async def delete_entry(
+        self,
+        entry_id: str,
+        *,
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    entry = await self._load_entry(cur, entry_id)
+                    if entry is None:
+                        await conn.commit()
+                        return None
+                    if hard:
+                        await cur.execute(
+                            "DELETE FROM cayu_knowledge_entries WHERE id = %s",
+                            (entry_id,),
+                        )
+                        await conn.commit()
+                        return copy_knowledge_entry(entry)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return await self.update_entry_status(entry_id, KnowledgeStatus.DELETED)
+
+    async def replace_chunks(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> list[KnowledgeChunk]:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        copied_chunks = _copy_knowledge_entry_chunks(entry_id, chunks)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    if await self._load_entry(cur, entry_id) is None:
+                        raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                    await self._replace_chunks(cur, entry_id, copied_chunks)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
+
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        entry = copy_knowledge_entry(entry)
+        copied_chunks = _copy_knowledge_entry_chunks(entry.id, chunks)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await self._upsert_entry(cur, entry)
+                    await self._replace_chunks(cur, entry.id, copied_chunks)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return copy_knowledge_entry(entry)
+
+    async def read_chunks(
+        self,
+        entry_id: str,
+        *,
+        chunk_index: int | None = None,
+        around: int = 0,
+        max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> list[KnowledgeChunk]:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if chunk_index is not None:
+            _validate_knowledge_nonnegative_int(chunk_index, "chunk_index")
+        _validate_knowledge_nonnegative_int(around, "around")
+        if chunk_index is None and around != 0:
+            raise ValueError("`around` requires `chunk_index`.")
+        _validate_knowledge_positive_int(max_chunks, "max_chunks")
+        _validate_knowledge_positive_int(max_bytes, "max_bytes")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            if await self._load_entry(cur, entry_id) is None:
+                return []
+            chunks = await self._load_chunks(cur, entry_id)
+        if chunk_index is not None:
+            chunks = _center_knowledge_chunk_window(
+                chunks,
+                chunk_index=chunk_index,
+                max_chunks=max_chunks,
+            )
+        start_index = 0 if chunk_index is None else max(0, chunk_index - around)
+        end_index = None if chunk_index is None else chunk_index + around
+        return _bounded_knowledge_chunks(
+            chunks,
+            start_index=start_index,
+            end_index=end_index,
+            max_chunks=max_chunks,
+            max_bytes=max_bytes,
+        )
+
+    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+        query = copy_knowledge_query(query)
+        if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
+            raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
+        terms = _tokenize_knowledge_search_text(query.text)
+        if not terms:
+            return KnowledgeSearchResult(
+                query=query,
+                hits=[],
+                truncated=False,
+                limit=query.limit,
+                max_bytes=query.max_bytes,
+                total_hits_known=0,
+            )
+        ts_query = " | ".join(terms)
+        where_sql, params = _postgres_knowledge_filter_sql(query)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            total_hits_known = await self._count_search_hits(cur, ts_query, where_sql, params)
+            rows = await self._search_unique_rows(
+                cur,
+                ts_query=ts_query,
+                where_sql=where_sql,
+                params=params,
+                limit=query.limit,
+            )
+            hits, byte_truncated = await self._hits_from_search_rows(cur, rows, query, terms)
+        return KnowledgeSearchResult(
+            query=query,
+            hits=hits,
+            truncated=byte_truncated or len(hits) < total_hits_known,
+            limit=query.limit,
+            max_bytes=query.max_bytes,
+            total_hits_known=total_hits_known,
+        )
+
+    async def _upsert_entry(self, cur: Any, entry: KnowledgeEntry) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_entries (
+                id,
+                namespace,
+                text,
+                kind,
+                visibility,
+                status,
+                created_by_type,
+                created_by,
+                created_at,
+                updated_at,
+                source_type,
+                source_uri,
+                source_id,
+                source_hash,
+                importance,
+                importance_source,
+                confidence,
+                last_used_at,
+                expires_at,
+                title,
+                metadata
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                namespace = excluded.namespace,
+                text = excluded.text,
+                kind = excluded.kind,
+                visibility = excluded.visibility,
+                status = excluded.status,
+                created_by_type = excluded.created_by_type,
+                created_by = excluded.created_by,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                source_type = excluded.source_type,
+                source_uri = excluded.source_uri,
+                source_id = excluded.source_id,
+                source_hash = excluded.source_hash,
+                importance = excluded.importance,
+                importance_source = excluded.importance_source,
+                confidence = excluded.confidence,
+                last_used_at = excluded.last_used_at,
+                expires_at = excluded.expires_at,
+                title = excluded.title,
+                metadata = excluded.metadata
+            """,
+            _knowledge_entry_row_values(entry),
+        )
+        await self._replace_entry_lists(cur, entry)
+
+    async def _replace_entry_lists(self, cur: Any, entry: KnowledgeEntry) -> None:
+        for table in (
+            "cayu_knowledge_labels",
+            "cayu_knowledge_aspects",
+            "cayu_knowledge_impact_targets",
+        ):
+            await cur.execute(f"DELETE FROM {table} WHERE entry_id = %s", (entry.id,))
+        if entry.labels:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_labels (entry_id, key, value)
+                VALUES (%s, %s, %s)
+                """,
+                [(entry.id, key, value) for key, value in sorted(entry.labels.items())],
+            )
+        if entry.aspects:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_aspects (entry_id, aspect)
+                VALUES (%s, %s)
+                """,
+                [(entry.id, aspect) for aspect in entry.aspects],
+            )
+        if entry.impact_targets:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_impact_targets (entry_id, impact_target)
+                VALUES (%s, %s)
+                """,
+                [(entry.id, target) for target in entry.impact_targets],
+            )
+
+    async def _replace_chunks(
+        self,
+        cur: Any,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        await cur.execute("DELETE FROM cayu_knowledge_chunks WHERE entry_id = %s", (entry_id,))
+        await cur.executemany(
+            """
+            INSERT INTO cayu_knowledge_chunks (
+                id,
+                entry_id,
+                chunk_index,
+                text,
+                content_hash,
+                source_uri,
+                metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            [_knowledge_chunk_row_values(chunk) for chunk in chunks],
+        )
+
+    async def _load_entry(self, cur: Any, entry_id: str) -> KnowledgeEntry | None:
+        await cur.execute(
+            """
+            SELECT
+                id,
+                namespace,
+                text,
+                kind,
+                visibility,
+                status,
+                created_by_type,
+                created_by,
+                created_at,
+                updated_at,
+                source_type,
+                source_uri,
+                source_id,
+                source_hash,
+                importance,
+                importance_source,
+                confidence,
+                last_used_at,
+                expires_at,
+                title,
+                metadata
+            FROM cayu_knowledge_entries
+            WHERE id = %s
+            """,
+            (entry_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return _knowledge_entry_from_row(
+            row,
+            labels=await self._load_labels(cur, entry_id),
+            aspects=await self._load_aspects(cur, entry_id),
+            impact_targets=await self._load_impact_targets(cur, entry_id),
+        )
+
+    async def _load_chunk(self, cur: Any, chunk_id: str) -> KnowledgeChunk | None:
+        await cur.execute(
+            """
+            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            FROM cayu_knowledge_chunks
+            WHERE id = %s
+            """,
+            (chunk_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return _knowledge_chunk_from_row(row)
+
+    async def _load_chunks(self, cur: Any, entry_id: str) -> list[KnowledgeChunk]:
+        await cur.execute(
+            """
+            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            FROM cayu_knowledge_chunks
+            WHERE entry_id = %s
+            ORDER BY chunk_index ASC
+            """,
+            (entry_id,),
+        )
+        return [_knowledge_chunk_from_row(row) for row in await cur.fetchall()]
+
+    async def _load_labels(self, cur: Any, entry_id: str) -> dict[str, str]:
+        await cur.execute(
+            """
+            SELECT key, value
+            FROM cayu_knowledge_labels
+            WHERE entry_id = %s
+            ORDER BY key ASC
+            """,
+            (entry_id,),
+        )
+        return {row[0]: row[1] for row in await cur.fetchall()}
+
+    async def _load_aspects(self, cur: Any, entry_id: str) -> list[str]:
+        await cur.execute(
+            """
+            SELECT aspect
+            FROM cayu_knowledge_aspects
+            WHERE entry_id = %s
+            ORDER BY aspect ASC
+            """,
+            (entry_id,),
+        )
+        return [row[0] for row in await cur.fetchall()]
+
+    async def _load_impact_targets(self, cur: Any, entry_id: str) -> list[str]:
+        await cur.execute(
+            """
+            SELECT impact_target
+            FROM cayu_knowledge_impact_targets
+            WHERE entry_id = %s
+            ORDER BY impact_target ASC
+            """,
+            (entry_id,),
+        )
+        return [row[0] for row in await cur.fetchall()]
+
+    async def _count_search_hits(
+        self,
+        cur: Any,
+        ts_query: str,
+        where_sql: str,
+        params: list[object],
+    ) -> int:
+        await cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT e.id)
+            FROM cayu_knowledge_chunks AS c
+            JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+            WHERE (
+                to_tsvector('simple', c.text) @@ to_tsquery('simple', %s)
+                OR to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
+            )
+            {where_sql}
+            """,
+            [ts_query, ts_query, *params],
+        )
+        row = await cur.fetchone()
+        return 0 if row is None else int(row[0])
+
+    async def _search_unique_rows(
+        self,
+        cur: Any,
+        *,
+        ts_query: str,
+        where_sql: str,
+        params: list[object],
+        limit: int,
+    ) -> list[tuple[Any, ...]]:
+        unique_rows: list[tuple[Any, ...]] = []
+        seen_entry_ids: set[str] = set()
+        offset = 0
+        while len(unique_rows) < limit:
+            await cur.execute(
+                f"""
+                SELECT
+                    e.id AS entry_id,
+                    c.id AS chunk_id,
+                    ts_rank_cd(
+                        setweight(to_tsvector('simple', COALESCE(e.title, '')), 'A')
+                        || to_tsvector('simple', c.text),
+                        to_tsquery('simple', %s)
+                    ) AS score
+                FROM cayu_knowledge_chunks AS c
+                JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+                WHERE (
+                    to_tsvector('simple', c.text) @@ to_tsquery('simple', %s)
+                    OR to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
+                )
+                {where_sql}
+                ORDER BY score DESC,
+                         COALESCE(e.importance, 0.0) DESC,
+                         e.updated_at DESC,
+                         e.id ASC,
+                         c.chunk_index ASC
+                LIMIT %s OFFSET %s
+                """,
+                [
+                    ts_query,
+                    ts_query,
+                    ts_query,
+                    *params,
+                    _KNOWLEDGE_SEARCH_PAGE_SIZE,
+                    offset,
+                ],
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                break
+            for row in rows:
+                entry_id = str(row[0])
+                if entry_id in seen_entry_ids:
+                    continue
+                seen_entry_ids.add(entry_id)
+                unique_rows.append(row)
+                if len(unique_rows) >= limit:
+                    break
+            if len(rows) < _KNOWLEDGE_SEARCH_PAGE_SIZE:
+                break
+            offset += _KNOWLEDGE_SEARCH_PAGE_SIZE
+        return unique_rows
+
+    async def _hits_from_search_rows(
+        self,
+        cur: Any,
+        rows: list[tuple[Any, ...]],
+        query: KnowledgeQuery,
+        terms: list[str],
+    ) -> tuple[list[KnowledgeHit], bool]:
+        hits: list[KnowledgeHit] = []
+        remaining = query.max_bytes
+        truncated = False
+        for row in rows:
+            if remaining <= 0:
+                truncated = True
+                break
+            entry = await self._load_entry(cur, row[0])
+            chunk = await self._load_chunk(cur, row[1])
+            if entry is None or chunk is None:
+                continue
+            reason, preview_text = _knowledge_preview_for_match(entry, chunk, terms)
+            preview_bytes = len(preview_text.encode("utf-8"))
+            preview = _truncate_knowledge_text_to_bytes(preview_text, remaining)
+            if not preview:
+                truncated = True
+                break
+            returned_bytes = len(preview.encode("utf-8"))
+            if returned_bytes < preview_bytes:
+                truncated = True
+            remaining -= returned_bytes
+            hits.append(
+                KnowledgeHit(
+                    entry=entry,
+                    chunk=chunk,
+                    score=float(row[2]),
+                    score_kind="postgres_full_text",
+                    rank=len(hits) + 1,
+                    reason=reason,
+                    text_preview=preview,
+                )
+            )
+        return hits, truncated
 
 
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
@@ -2466,6 +3036,303 @@ def _json_obj(value: Any) -> dict[str, Any]:
     return value
 
 
+def _knowledge_entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
+    return (
+        entry.id,
+        entry.namespace,
+        entry.text,
+        entry.kind,
+        str(entry.visibility),
+        str(entry.status),
+        str(entry.created_by_type),
+        entry.created_by,
+        pg_support.to_utc(entry.created_at),
+        pg_support.to_utc(entry.updated_at),
+        entry.source_type,
+        entry.source_uri,
+        entry.source_id,
+        entry.source_hash,
+        entry.importance,
+        entry.importance_source,
+        entry.confidence,
+        pg_support.to_utc_optional(entry.last_used_at),
+        pg_support.to_utc_optional(entry.expires_at),
+        entry.title,
+        _dumps(entry.metadata),
+    )
+
+
+def _knowledge_entry_from_row(
+    row: tuple[Any, ...],
+    *,
+    labels: dict[str, str],
+    aspects: list[str],
+    impact_targets: list[str],
+) -> KnowledgeEntry:
+    return KnowledgeEntry(
+        id=row[0],
+        namespace=row[1],
+        text=row[2],
+        kind=row[3],
+        visibility=KnowledgeVisibility(row[4]),
+        status=KnowledgeStatus(row[5]),
+        created_by_type=KnowledgeActorType(row[6]),
+        created_by=row[7],
+        created_at=pg_support.to_utc(row[8]),
+        updated_at=pg_support.to_utc(row[9]),
+        source_type=row[10],
+        source_uri=row[11],
+        source_id=row[12],
+        source_hash=row[13],
+        importance=row[14],
+        importance_source=row[15],
+        confidence=row[16],
+        last_used_at=pg_support.to_utc_optional(row[17]),
+        expires_at=pg_support.to_utc_optional(row[18]),
+        title=row[19],
+        labels=labels,
+        aspects=aspects,
+        impact_targets=impact_targets,
+        metadata=_json_obj(row[20]),
+    )
+
+
+def _knowledge_chunk_row_values(chunk: KnowledgeChunk) -> tuple[object, ...]:
+    return (
+        chunk.id,
+        chunk.entry_id,
+        chunk.chunk_index,
+        chunk.text,
+        chunk.content_hash,
+        chunk.source_uri,
+        _dumps(chunk.metadata),
+    )
+
+
+def _knowledge_chunk_from_row(row: tuple[Any, ...]) -> KnowledgeChunk:
+    return KnowledgeChunk(
+        id=row[0],
+        entry_id=row[1],
+        chunk_index=row[2],
+        text=row[3],
+        content_hash=row[4],
+        source_uri=row[5],
+        metadata=_json_obj(row[6]),
+    )
+
+
+def _copy_knowledge_entry_chunks(
+    entry_id: str,
+    chunks: list[KnowledgeChunk],
+) -> list[KnowledgeChunk]:
+    if type(chunks) is not list:
+        raise ValueError("`chunks` must be a list.")
+    if not chunks:
+        raise ValueError("`chunks` cannot be empty.")
+    copied_chunks = [copy_knowledge_chunk(chunk) for chunk in chunks]
+    seen_ids: set[str] = set()
+    seen_indexes: set[int] = set()
+    for chunk in copied_chunks:
+        if chunk.entry_id != entry_id:
+            raise ValueError("Knowledge chunks must belong to the entry.")
+        if chunk.id in seen_ids:
+            raise ValueError("Knowledge chunk ids must be unique within an entry.")
+        if chunk.chunk_index in seen_indexes:
+            raise ValueError("Knowledge chunk indexes must be unique within an entry.")
+        seen_ids.add(chunk.id)
+        seen_indexes.add(chunk.chunk_index)
+    return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
+
+
+def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    clauses.append("e.namespace = %s")
+    params.append(query.namespace)
+    for key, value in query.labels.items():
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_labels AS label
+                WHERE label.entry_id = e.id
+                  AND label.key = %s
+                  AND label.value = %s
+            )
+            """
+        )
+        params.extend([key, value])
+    if query.kinds is not None:
+        if query.kinds:
+            clauses.append("e.kind = ANY(%s)")
+            params.append(query.kinds)
+        else:
+            clauses.append("FALSE")
+    if query.statuses:
+        clauses.append("e.status = ANY(%s)")
+        params.append([str(status) for status in query.statuses])
+    if query.visibilities is not None:
+        clauses.append("e.visibility = ANY(%s)")
+        params.append([str(visibility) for visibility in query.visibilities])
+    if query.source_type is not None:
+        clauses.append("e.source_type = %s")
+        params.append(query.source_type)
+    if query.source_id is not None:
+        clauses.append("e.source_id = %s")
+        params.append(query.source_id)
+    if query.aspects:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_aspects AS aspect
+                WHERE aspect.entry_id = e.id
+                  AND aspect.aspect = ANY(%s)
+            )
+            """
+        )
+        params.append(query.aspects)
+    if query.impact_targets:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_impact_targets AS target
+                WHERE target.entry_id = e.id
+                  AND target.impact_target = ANY(%s)
+            )
+            """
+        )
+        params.append(query.impact_targets)
+    if not query.include_expired:
+        clauses.append("(e.expires_at IS NULL OR e.expires_at > %s)")
+        params.append(datetime.now(UTC))
+    return " AND " + " AND ".join(clauses), params
+
+
+def _center_knowledge_chunk_window(
+    chunks: list[KnowledgeChunk],
+    *,
+    chunk_index: int,
+    max_chunks: int,
+) -> list[KnowledgeChunk]:
+    if len(chunks) <= max_chunks:
+        return chunks
+    closest = sorted(
+        chunks, key=lambda chunk: (abs(chunk.chunk_index - chunk_index), chunk.chunk_index)
+    )
+    return sorted(closest[:max_chunks], key=lambda chunk: chunk.chunk_index)
+
+
+def _bounded_knowledge_chunks(
+    chunks: list[KnowledgeChunk],
+    *,
+    start_index: int,
+    end_index: int | None,
+    max_chunks: int,
+    max_bytes: int,
+) -> list[KnowledgeChunk]:
+    selected: list[KnowledgeChunk] = []
+    remaining = max_bytes
+    for chunk in chunks:
+        if chunk.chunk_index < start_index:
+            continue
+        if end_index is not None and chunk.chunk_index > end_index:
+            continue
+        if len(selected) >= max_chunks or remaining <= 0:
+            break
+        copied = copy_knowledge_chunk(chunk)
+        chunk_bytes = len(copied.text.encode("utf-8"))
+        if chunk_bytes > remaining:
+            truncated_text = _truncate_knowledge_text_to_bytes(copied.text, remaining)
+            if not truncated_text:
+                break
+            selected.append(
+                KnowledgeChunk(
+                    id=copied.id,
+                    entry_id=copied.entry_id,
+                    text=truncated_text,
+                    chunk_index=copied.chunk_index,
+                    content_hash=None,
+                    source_uri=copied.source_uri,
+                    metadata=copied.metadata,
+                )
+            )
+            break
+        selected.append(copied)
+        remaining -= chunk_bytes
+    return selected
+
+
+def _knowledge_preview_for_match(
+    entry: KnowledgeEntry,
+    chunk: KnowledgeChunk,
+    terms: list[str],
+) -> tuple[str, str]:
+    if entry.title is not None:
+        title_terms = set(_tokenize_knowledge_search_text(entry.title))
+        if any(term in title_terms for term in terms):
+            return "title match", entry.title
+    return "chunk text match", chunk.text
+
+
+def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
+    return KnowledgeChunk(
+        id=f"{entry.id}:0",
+        entry_id=entry.id,
+        text=entry.text,
+        chunk_index=0,
+        content_hash=sha256(entry.text.encode("utf-8")).hexdigest(),
+        source_uri=entry.source_uri,
+    )
+
+
+def _knowledge_has_only_default_chunk(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+) -> bool:
+    if len(chunks) != 1:
+        return False
+    default_chunk = _default_chunk_for_entry(entry)
+    chunk = chunks[0]
+    return (
+        chunk.id == default_chunk.id
+        and chunk.entry_id == default_chunk.entry_id
+        and chunk.text == default_chunk.text
+        and chunk.chunk_index == default_chunk.chunk_index
+        and chunk.content_hash == default_chunk.content_hash
+        and chunk.source_uri == default_chunk.source_uri
+        and chunk.metadata == default_chunk.metadata
+    )
+
+
+def _tokenize_knowledge_search_text(text: str) -> list[str]:
+    return _KNOWLEDGE_SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _truncate_knowledge_text_to_bytes(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _validate_knowledge_nonnegative_int(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ValueError(f"`{field_name}` must be an integer.")
+    if value < 0:
+        raise ValueError(f"`{field_name}` must be greater than or equal to 0.")
+
+
+def _validate_knowledge_positive_int(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ValueError(f"`{field_name}` must be an integer.")
+    if value < 1:
+        raise ValueError(f"`{field_name}` must be greater than or equal to 1.")
+
+
 def _validate_task_positive_int(value: int, field_name: str) -> int:
     if type(value) is not int:
         raise TypeError(f"{field_name} must be an integer.")
@@ -2545,6 +3412,7 @@ _TERMINAL_EVENT_TYPES = [
 __all__ = [
     "AsyncConnectionPool",
     "PostgresEventWatcherStore",
+    "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
 ]

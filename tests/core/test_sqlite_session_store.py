@@ -889,7 +889,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]
+    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 6)]
     assert version == schema_migrations.LATEST_REVISION
 
 

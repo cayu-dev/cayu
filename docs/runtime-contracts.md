@@ -1205,14 +1205,16 @@ preferences, procedures, instructions, skills, documents, examples, warnings,
 decisions, events, summaries, and app-defined custom kinds.
 
 The first framework slices define the data contract, an `InMemoryKnowledgeStore`
-for tests, demos, and single-process local apps, and a `SQLiteKnowledgeStore` for
-durable local knowledge. There is no legacy memory alias in the public surface;
-use the `Knowledge*` names and entry/chunk methods directly.
+for tests, demos, and single-process local apps, a `SQLiteKnowledgeStore` for
+durable local knowledge, and a `PostgresKnowledgeStore` for production Postgres
+deployments. There is no legacy memory alias in the public surface; use the
+`Knowledge*` names and entry/chunk methods directly.
 
 `InMemoryKnowledgeStore` is a simple keyword backend. `SQLiteKnowledgeStore` uses
-SQLite FTS5/BM25 for durable keyword search. Both support `auto` and `keyword`
-query modes and reject semantic, hybrid, and external modes so apps do not
-mistake these local stores for embedding or external retrieval backends.
+SQLite FTS5/BM25 for durable keyword search. `PostgresKnowledgeStore` uses native
+Postgres full-text search with entry/chunk filters. These stores support `auto`
+and `keyword` query modes and reject semantic, hybrid, and external modes so apps
+do not mistake these local stores for embedding or external retrieval backends.
 
 - `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
@@ -1247,6 +1249,6 @@ result = await store.search(query)
 ```
 
 This slice does not add runtime context injection, model-facing memory tools,
-Postgres search, embeddings, graph retrieval, or automatic indexing. Those layers
-should build on the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery`
-contract rather than introducing separate memory, skill, or document-store APIs.
+embeddings, graph retrieval, or automatic indexing. Those layers should build on
+the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` contract rather
+than introducing separate memory, skill, or document-store APIs.

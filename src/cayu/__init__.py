@@ -536,6 +536,7 @@ __all__ = [
     "PendingToolApproval",
     "PendingToolCallApproval",
     "PostgresEventWatcherStore",
+    "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
     "PricingCatalog",
@@ -679,7 +680,12 @@ __all__ = [
 def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so ``import cayu`` does not depend on psycopg being installed.
-    if name in {"PostgresEventWatcherStore", "PostgresSessionStore", "PostgresTaskStore"}:
+    if name in {
+        "PostgresEventWatcherStore",
+        "PostgresKnowledgeStore",
+        "PostgresSessionStore",
+        "PostgresTaskStore",
+    }:
         from cayu.storage import postgres
 
         return getattr(postgres, name)
