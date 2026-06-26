@@ -12,6 +12,7 @@ from cayu.environments.base import (
 )
 from cayu.environments.bindings import (
     BoundWorkspace,
+    GitRepositoryBinding,
     NativeBinding,
     NoWorkspaceBinding,
     SyncBinding,
@@ -38,6 +39,7 @@ __all__ = [
     "EnvironmentFactoryRequest",
     "EnvironmentFactoryResult",
     "EnvironmentSpec",
+    "GitRepositoryBinding",
     "NativeBinding",
     "NoWorkspaceBinding",
     "SyncBinding",

@@ -7,11 +7,12 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.runners import Runner
-from cayu.workspaces import Workspace
+from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
+from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,8 @@ SyncTargetWorkspaceFactory = Callable[
 ]
 SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
+
+GIT_REPOSITORY_METADATA_KEY = "git_repository"
 
 
 @dataclass(frozen=True)
@@ -289,6 +292,188 @@ class NoWorkspaceBinding(WorkspaceBinding):
     ) -> WorkspaceSnapshot | None:
         _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
         return None
+
+
+class GitRepositoryBinding(WorkspaceBinding):
+    """Ensure a workspace contains a checked-out Git repository.
+
+    The binding creates or updates the repository before the model sees the
+    workspace. It records commit/dirty metadata, but it never commits, pushes,
+    or creates pull requests; those remain explicit app/tool workflows.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_url: str,
+        ref: str | None = None,
+        remote_name: str = "origin",
+        path: str | None = None,
+        git_executable: str = "git",
+        fetch: bool = True,
+        require_clean: bool = True,
+        verify_remote_url: bool = True,
+        timeout_s: int | None = 120,
+        output_limit_bytes: int = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        self.repo_url = _validate_git_repo_url(repo_url)
+        self.ref = _validate_git_value(ref, "ref") if ref is not None else None
+        self.remote_name = _validate_git_value(remote_name, "remote_name")
+        self.path = require_clean_nonblank(path, "path") if path is not None else None
+        self.git_executable = _validate_git_value(git_executable, "git_executable")
+        if type(fetch) is not bool:
+            raise TypeError("GitRepositoryBinding fetch must be a bool.")
+        if type(require_clean) is not bool:
+            raise TypeError("GitRepositoryBinding require_clean must be a bool.")
+        if type(verify_remote_url) is not bool:
+            raise TypeError("GitRepositoryBinding verify_remote_url must be a bool.")
+        self.fetch = fetch
+        self.require_clean = require_clean
+        self.verify_remote_url = verify_remote_url
+        self.timeout_s = _validate_optional_timeout(timeout_s, "timeout_s")
+        self.output_limit_bytes = _validate_positive_int(
+            output_limit_bytes,
+            "output_limit_bytes",
+            owner="GitRepositoryBinding",
+        )
+
+    async def bind(
+        self,
+        workspace: Workspace | None,
+        runner: Runner | None,
+        *,
+        session_id: str,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BoundWorkspace:
+        request_metadata = _validate_bind_request(
+            workspace,
+            runner,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=metadata,
+        )
+        if workspace is None:
+            raise ValueError("GitRepositoryBinding requires a workspace.")
+        _reject_reserved_metadata(request_metadata, GIT_REPOSITORY_METADATA_KEY)
+        executor = _git_executor_for_workspace(
+            workspace,
+            git_executable=self.git_executable,
+            timeout_s=self.timeout_s,
+            output_limit_bytes=self.output_limit_bytes,
+        )
+
+        inside_work_tree = await executor.is_work_tree()
+        if inside_work_tree:
+            await self._prepare_existing_repository(executor)
+        else:
+            await _require_empty_workspace_for_git_clone(
+                workspace,
+                timeout_s=self.timeout_s,
+                output_limit_bytes=self.output_limit_bytes,
+            )
+            await executor.run("clone", self.repo_url, ".")
+
+        if self.ref is not None:
+            await self._checkout_configured_ref(executor)
+        commit = await executor.stdout("rev-parse", "HEAD")
+        branch = await executor.stdout("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = await executor.is_dirty()
+        git_metadata = {
+            "repo_url": self.repo_url,
+            "remote_name": self.remote_name,
+            "ref": self.ref,
+            "commit": commit,
+            "branch": branch,
+            "dirty": dirty,
+            "fetch": self.fetch,
+            "require_clean": self.require_clean,
+            "verify_remote_url": self.verify_remote_url,
+        }
+        bound_metadata = {
+            **request_metadata,
+            GIT_REPOSITORY_METADATA_KEY: git_metadata,
+        }
+        return BoundWorkspace(
+            workspace=workspace,
+            source_workspace=workspace,
+            runner=runner,
+            path=self.path,
+            metadata=bound_metadata,
+            snapshot=WorkspaceSnapshot(
+                snapshot_id=f"git-bind:{session_id}:{commit[:12]}",
+                workspace_id=workspace.id,
+                version=commit,
+                source="git",
+                metadata=git_metadata,
+            ),
+        )
+
+    async def finalize(
+        self,
+        bound: BoundWorkspace,
+        *,
+        outcome: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> WorkspaceSnapshot | None:
+        finalize_metadata = _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
+        _reject_reserved_metadata(finalize_metadata, GIT_REPOSITORY_METADATA_KEY)
+        if bound.workspace is None:
+            raise ValueError("GitRepositoryBinding finalize requires a bound workspace.")
+        bind_metadata = bound.metadata.get(GIT_REPOSITORY_METADATA_KEY)
+        if type(bind_metadata) is not dict:
+            raise ValueError("GitRepositoryBinding bound metadata is missing git repository state.")
+        executor = _git_executor_for_workspace(
+            bound.workspace,
+            git_executable=self.git_executable,
+            timeout_s=self.timeout_s,
+            output_limit_bytes=self.output_limit_bytes,
+        )
+        if not await executor.is_work_tree():
+            raise ValueError("GitRepositoryBinding finalize requires a Git work tree.")
+        commit = await executor.stdout("rev-parse", "HEAD")
+        branch = await executor.stdout("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = await executor.is_dirty()
+        git_metadata = {
+            **copy_json_value(bind_metadata, GIT_REPOSITORY_METADATA_KEY),
+            "commit": commit,
+            "branch": branch,
+            "dirty": dirty,
+            "outcome": outcome,
+        }
+        return WorkspaceSnapshot(
+            snapshot_id=f"git-final:{bound.workspace.id}:{commit[:12]}:{outcome or 'unknown'}",
+            workspace_id=bound.workspace.id,
+            version=commit,
+            source="git",
+            metadata={
+                **finalize_metadata,
+                GIT_REPOSITORY_METADATA_KEY: git_metadata,
+            },
+        )
+
+    async def _prepare_existing_repository(self, executor: _GitWorkspaceExecutor) -> None:
+        if self.verify_remote_url:
+            current_url = await executor.stdout("remote", "get-url", self.remote_name)
+            if current_url != self.repo_url:
+                raise ValueError(
+                    "GitRepositoryBinding existing repository remote URL does not match "
+                    f"configured repo_url for {self.remote_name!r}."
+                )
+        if self.require_clean and await executor.is_dirty():
+            raise ValueError("GitRepositoryBinding refuses to bind a dirty repository.")
+        if self.fetch:
+            await executor.run("fetch", "--prune", self.remote_name)
+
+    async def _checkout_configured_ref(self, executor: _GitWorkspaceExecutor) -> None:
+        if self.ref is None:
+            return
+        await executor.run("checkout", self.ref)
+        fetched_ref = f"refs/remotes/{self.remote_name}/{self.ref}"
+        if self.fetch and await executor.ref_exists(fetched_ref):
+            await executor.run("merge", "--ff-only", fetched_ref)
 
 
 class SyncBinding(WorkspaceBinding):
@@ -638,11 +823,11 @@ def _runner_resource_key(runner: Any) -> tuple[Any, ...]:
     return (type(runner), "object", id(runner))
 
 
-def _validate_positive_int(value: int, field_name: str) -> int:
+def _validate_positive_int(value: int, field_name: str, *, owner: str = "SyncBinding") -> int:
     if type(value) is not int:
-        raise TypeError(f"SyncBinding {field_name} must be an integer.")
+        raise TypeError(f"{owner} {field_name} must be an integer.")
     if value <= 0:
-        raise ValueError(f"SyncBinding {field_name} must be greater than zero.")
+        raise ValueError(f"{owner} {field_name} must be greater than zero.")
     return value
 
 
@@ -650,6 +835,12 @@ def _validate_optional_positive_int(value: int | None, field_name: str) -> int |
     if value is None:
         return None
     return _validate_positive_int(value, field_name)
+
+
+def _validate_optional_timeout(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _validate_positive_int(value, field_name, owner="GitRepositoryBinding")
 
 
 def _validate_clean_policy(value: object) -> SyncTargetCleanPolicy:
@@ -745,3 +936,158 @@ def _final_sync_snapshot_id(bound: BoundWorkspace, outcome: str | None) -> str:
     source_id = bound.source_workspace.id if bound.source_workspace is not None else "unknown"
     suffix = outcome or "unknown"
     return f"sync-final:{source_id}:{suffix}"
+
+
+class _GitWorkspaceExecutor:
+    def __init__(
+        self,
+        *,
+        runner: Runner,
+        cwd: str | None,
+        git_executable: str,
+        timeout_s: int | None,
+        output_limit_bytes: int,
+    ) -> None:
+        self.runner = runner
+        self.cwd = cwd
+        self.git_executable = git_executable
+        self.timeout_s = timeout_s
+        self.output_limit_bytes = output_limit_bytes
+
+    async def run(self, *args: str) -> None:
+        result = await self._exec(*args)
+        if result.exit_code != 0:
+            _raise_git_error(args, result)
+
+    async def stdout(self, *args: str) -> str:
+        result = await self._exec(*args)
+        if result.exit_code != 0:
+            _raise_git_error(args, result)
+        if result.stdout_truncated:
+            raise RuntimeError(f"Git command output exceeded limit: {_git_command_label(args)}")
+        return result.stdout.strip()
+
+    async def is_work_tree(self) -> bool:
+        result = await self._exec("rev-parse", "--is-inside-work-tree")
+        return result.exit_code == 0 and result.stdout.strip() == "true"
+
+    async def is_dirty(self) -> bool:
+        result = await self._exec("status", "--porcelain")
+        if result.exit_code != 0:
+            _raise_git_error(("status", "--porcelain"), result)
+        if result.stdout_truncated:
+            raise RuntimeError("Git status output exceeded limit.")
+        return bool(result.stdout.strip())
+
+    async def ref_exists(self, ref: str) -> bool:
+        result = await self._exec("rev-parse", "--verify", "--quiet", ref)
+        return result.exit_code == 0
+
+    async def _exec(self, *args: str):
+        return await self.runner.exec(
+            ExecCommand.process(self.git_executable, *args),
+            cwd=self.cwd,
+            timeout_s=self.timeout_s,
+            output_limit_bytes=self.output_limit_bytes,
+        )
+
+
+def _git_executor_for_workspace(
+    workspace: Workspace,
+    *,
+    git_executable: str,
+    timeout_s: int | None,
+    output_limit_bytes: int,
+) -> _GitWorkspaceExecutor:
+    if isinstance(workspace, LocalWorkspace):
+        return _GitWorkspaceExecutor(
+            runner=LocalRunner(workspace.root),
+            cwd=None,
+            git_executable=git_executable,
+            timeout_s=timeout_s,
+            output_limit_bytes=output_limit_bytes,
+        )
+    if isinstance(workspace, RunnerWorkspace):
+        return _GitWorkspaceExecutor(
+            runner=workspace.runner,
+            cwd=workspace.cwd,
+            git_executable=git_executable,
+            timeout_s=timeout_s,
+            output_limit_bytes=output_limit_bytes,
+        )
+    raise TypeError(
+        "GitRepositoryBinding requires a LocalWorkspace or RunnerWorkspace. "
+        "For E2B, Microsandbox, Docker, or SBX runners, wrap the runner with RunnerWorkspace."
+    )
+
+
+async def _require_empty_workspace_for_git_clone(
+    workspace: Workspace,
+    *,
+    timeout_s: int | None,
+    output_limit_bytes: int,
+) -> None:
+    nonempty = False
+    if isinstance(workspace, LocalWorkspace):
+        nonempty = any(workspace.root.iterdir())
+    elif isinstance(workspace, RunnerWorkspace):
+        result = await workspace.runner.exec(
+            ExecCommand.process(
+                workspace.python_executable,
+                "-c",
+                (
+                    "import os, sys\n"
+                    "with os.scandir('.') as entries:\n"
+                    "    sys.exit(10 if any(entries) else 0)\n"
+                ),
+            ),
+            cwd=workspace.cwd,
+            timeout_s=timeout_s,
+            output_limit_bytes=output_limit_bytes,
+        )
+        if result.exit_code == 10:
+            nonempty = True
+        elif result.exit_code != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"GitRepositoryBinding could not inspect workspace: {detail}")
+    else:
+        existing = await workspace.list("**/*", limit=1)
+        nonempty = bool(existing.paths)
+    if nonempty:
+        raise ValueError(
+            "GitRepositoryBinding can only clone into an empty workspace or an existing Git work tree."
+        )
+
+
+def _validate_git_repo_url(value: str) -> str:
+    repo_url = _validate_git_value(value, "repo_url")
+    parsed = urlsplit(repo_url)
+    if parsed.scheme in {"http", "https"} and (parsed.username or parsed.password):
+        raise ValueError(
+            "GitRepositoryBinding repo_url must not contain embedded credentials because "
+            "the URL is stored in durable binding metadata."
+        )
+    return repo_url
+
+
+def _validate_git_value(value: str, field_name: str) -> str:
+    checked = require_clean_nonblank(value, field_name)
+    if checked.startswith("-"):
+        raise ValueError(f"GitRepositoryBinding {field_name} must not start with '-'.")
+    return checked
+
+
+def _raise_git_error(args: tuple[str, ...], result) -> None:
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+    raise RuntimeError(
+        f"Git command failed with exit code {result.exit_code}: {_git_command_label(args)}: {detail}"
+    )
+
+
+def _git_command_label(args: tuple[str, ...]) -> str:
+    return "git " + " ".join(args)
+
+
+def _reject_reserved_metadata(metadata: dict[str, Any], key: str) -> None:
+    if key in metadata:
+        raise ValueError(f"GitRepositoryBinding metadata key {key!r} is reserved.")

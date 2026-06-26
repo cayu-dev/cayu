@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from cayu.environments import (
     BoundWorkspace,
+    GitRepositoryBinding,
     NativeBinding,
     NoWorkspaceBinding,
     SyncBinding,
@@ -67,6 +71,43 @@ class StubRunner(Runner):
         return ExecResult(stdout="ok")
 
 
+def _require_git() -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required for GitRepositoryBinding tests")
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return result.stdout.strip()
+
+
+def _create_bare_origin(tmp_path: Path) -> tuple[Path, str]:
+    _require_git()
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    origin.mkdir(parents=True)
+    seed.mkdir(parents=True)
+    _git(origin, "init", "--bare")
+    _git(seed, "init")
+    _git(seed, "checkout", "-b", "main")
+    _git(seed, "config", "user.email", "tester@example.com")
+    _git(seed, "config", "user.name", "Test User")
+    (seed / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "initial")
+    commit = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "push", "origin", "main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    return origin, commit
+
+
 def test_native_binding_passes_configured_workspace_and_runner_through() -> None:
     workspace = StubWorkspace()
     runner = StubRunner()
@@ -111,6 +152,233 @@ def test_no_workspace_binding_hides_workspace() -> None:
     assert bound.runner is runner
     assert bound.path is None
     assert bound.metadata == {"reason": "api-only"}
+
+
+def test_git_repository_binding_clones_local_origin_and_reports_snapshots(tmp_path) -> None:
+    origin, commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    workspace = LocalWorkspace(target_root, workspace_id="repo-workspace")
+
+    async def run() -> tuple[BoundWorkspace, WorkspaceSnapshot | None]:
+        binding = GitRepositoryBinding(repo_url=str(origin), ref="main", path="/workspace")
+        bound = await binding.bind(
+            workspace,
+            None,
+            session_id="sess_git",
+            agent_name="assistant",
+            environment_name="env",
+            metadata={"request": "meta"},
+        )
+        (target_root / "README.md").write_text("changed\n", encoding="utf-8")
+        final_snapshot = await binding.finalize(bound, outcome="completed")
+        return bound, final_snapshot
+
+    bound, final_snapshot = asyncio.run(run())
+
+    assert (target_root / ".git").is_dir()
+    assert (target_root / "README.md").read_text(encoding="utf-8") == "changed\n"
+    assert bound.workspace is workspace
+    assert bound.source_workspace is workspace
+    assert bound.path == "/workspace"
+    assert bound.metadata["request"] == "meta"
+    assert bound.metadata["git_repository"]["repo_url"] == str(origin)
+    assert bound.metadata["git_repository"]["ref"] == "main"
+    assert bound.metadata["git_repository"]["commit"] == commit
+    assert bound.metadata["git_repository"]["dirty"] is False
+    assert bound.snapshot is not None
+    assert bound.snapshot.source == "git"
+    assert bound.snapshot.version == commit
+    assert final_snapshot is not None
+    assert final_snapshot.source == "git"
+    assert final_snapshot.version == commit
+    assert final_snapshot.metadata["git_repository"]["dirty"] is True
+    assert final_snapshot.metadata["git_repository"]["outcome"] == "completed"
+
+
+def test_git_repository_binding_uses_runner_workspace(tmp_path) -> None:
+    origin, commit = _create_bare_origin(tmp_path)
+    runner_root = tmp_path / "runner"
+    runner_root.mkdir()
+    runner = LocalRunner(runner_root)
+    workspace = RunnerWorkspace(runner, workspace_id="runner-repo")
+
+    async def run() -> BoundWorkspace:
+        return await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            runner,
+            session_id="sess_runner_git",
+        )
+
+    bound = asyncio.run(run())
+
+    assert (runner_root / ".git").is_dir()
+    assert (runner_root / "README.md").read_text(encoding="utf-8") == "hello\n"
+    assert bound.workspace is workspace
+    assert bound.runner is runner
+    assert bound.snapshot is not None
+    assert bound.snapshot.version == commit
+
+
+def test_git_repository_binding_updates_existing_checkout_to_fetched_ref(tmp_path) -> None:
+    origin, first_commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    _git(target_root, "clone", str(origin), ".")
+    assert _git(target_root, "rev-parse", "HEAD") == first_commit
+
+    seed = tmp_path / "second-seed"
+    _git(seed.parent, "clone", str(origin), seed.name)
+    _git(seed, "config", "user.email", "tester@example.com")
+    _git(seed, "config", "user.name", "Test User")
+    (seed / "README.md").write_text("second\n", encoding="utf-8")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "second")
+    second_commit = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "origin", "main")
+
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> BoundWorkspace:
+        return await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_stale_git",
+        )
+
+    bound = asyncio.run(run())
+
+    assert bound.snapshot is not None
+    assert bound.snapshot.version == second_commit
+    assert bound.metadata["git_repository"]["commit"] == second_commit
+    assert _git(target_root, "rev-parse", "HEAD") == second_commit
+    assert _git(target_root, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (target_root / "README.md").read_text(encoding="utf-8") == "second\n"
+
+
+def test_git_repository_binding_refuses_divergent_existing_branch(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    _git(target_root, "clone", str(origin), ".")
+    _git(target_root, "config", "user.email", "tester@example.com")
+    _git(target_root, "config", "user.name", "Test User")
+    (target_root / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(target_root, "add", "local.txt")
+    _git(target_root, "commit", "-m", "local")
+    local_commit = _git(target_root, "rev-parse", "HEAD")
+
+    seed = tmp_path / "second-seed"
+    _git(seed.parent, "clone", str(origin), seed.name)
+    _git(seed, "config", "user.email", "tester@example.com")
+    _git(seed, "config", "user.name", "Test User")
+    (seed / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(seed, "add", "remote.txt")
+    _git(seed, "commit", "-m", "remote")
+    _git(seed, "push", "origin", "main")
+
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> None:
+        await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_diverged_git",
+        )
+
+    with pytest.raises(RuntimeError, match="ff-only"):
+        asyncio.run(run())
+    assert _git(target_root, "rev-parse", "HEAD") == local_commit
+
+
+def test_git_repository_binding_refuses_non_empty_non_git_workspace(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    (target_root / "notes.txt").write_text("not git\n", encoding="utf-8")
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> None:
+        await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_non_empty_git",
+        )
+
+    with pytest.raises(ValueError, match="empty workspace"):
+        asyncio.run(run())
+
+
+def test_git_repository_binding_refuses_directory_only_non_git_workspace(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    (target_root / "nested").mkdir()
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> None:
+        await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_directory_only_git",
+        )
+
+    with pytest.raises(ValueError, match="empty workspace"):
+        asyncio.run(run())
+
+
+def test_git_repository_binding_refuses_dirty_existing_repo(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    _git(target_root, "clone", str(origin), ".")
+    (target_root / "README.md").write_text("dirty\n", encoding="utf-8")
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> None:
+        await GitRepositoryBinding(repo_url=str(origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_dirty_git",
+        )
+
+    with pytest.raises(ValueError, match="dirty repository"):
+        asyncio.run(run())
+
+
+def test_git_repository_binding_refuses_unexpected_remote(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+    other_origin, _other_commit = _create_bare_origin(tmp_path / "other")
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    _git(target_root, "clone", str(origin), ".")
+    workspace = LocalWorkspace(target_root)
+
+    async def run() -> None:
+        await GitRepositoryBinding(repo_url=str(other_origin), ref="main").bind(
+            workspace,
+            None,
+            session_id="sess_wrong_remote",
+        )
+
+    with pytest.raises(ValueError, match="remote URL"):
+        asyncio.run(run())
+
+
+def test_git_repository_binding_rejects_credential_bearing_https_url() -> None:
+    with pytest.raises(ValueError, match="embedded credentials"):
+        GitRepositoryBinding(repo_url="https://token:secret@example.com/acme/app.git")
+
+
+def test_git_repository_binding_rejects_option_like_git_inputs() -> None:
+    with pytest.raises(ValueError, match="repo_url"):
+        GitRepositoryBinding(repo_url="--upload-pack=bad")
+    with pytest.raises(ValueError, match="ref"):
+        GitRepositoryBinding(repo_url="https://example.com/acme/app.git", ref="--detach")
+    with pytest.raises(ValueError, match="remote_name"):
+        GitRepositoryBinding(repo_url="https://example.com/acme/app.git", remote_name="--tags")
+    with pytest.raises(ValueError, match="git_executable"):
+        GitRepositoryBinding(repo_url="https://example.com/acme/app.git", git_executable="-git")
 
 
 def test_bind_request_rejects_invalid_values() -> None:
@@ -636,6 +904,9 @@ def test_workspace_snapshot_rejects_invalid_values() -> None:
 
 def test_binding_constructors_validate_values() -> None:
     invalid_path: Any = 123
+    invalid_clean_target: Any = "sometimes"
+    invalid_sync_back: Any = "sometimes"
+    invalid_delete_missing: Any = "yes"
 
     with pytest.raises(TypeError, match="default_path"):
         NativeBinding(default_path=invalid_path)
@@ -654,11 +925,11 @@ def test_binding_constructors_validate_values() -> None:
     with pytest.raises(ValueError, match="max_files"):
         SyncBinding(max_files=0)
     with pytest.raises(ValueError, match="clean_target"):
-        SyncBinding(clean_target="sometimes")  # type: ignore[arg-type]
+        SyncBinding(clean_target=invalid_clean_target)
     with pytest.raises(ValueError, match="sync_back"):
-        SyncBinding(sync_back="sometimes")  # type: ignore[arg-type]
+        SyncBinding(sync_back=invalid_sync_back)
     with pytest.raises(TypeError, match="delete_missing"):
-        SyncBinding(delete_missing="yes")  # type: ignore[arg-type]
+        SyncBinding(delete_missing=invalid_delete_missing)
 
 
 def test_copy_bound_workspace_defensively_copies_metadata_and_snapshot() -> None:

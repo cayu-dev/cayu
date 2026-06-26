@@ -216,6 +216,36 @@ the workspace being read may still enforce its default read limit. Configure the
 source and target workspace read limits, or `max_file_bytes`, explicitly for
 large files.
 
+Use `GitRepositoryBinding` when a workspace should start as a checked-out Git
+repository:
+
+```python
+from cayu import Environment, EnvironmentSpec, GitRepositoryBinding, LocalWorkspace
+
+workspace = LocalWorkspace("./workspaces/project-123")
+environment = Environment(
+    EnvironmentSpec(name="project"),
+    workspace=workspace,
+    binding=GitRepositoryBinding(
+        repo_url="https://github.com/acme/app.git",
+        ref="main",
+        path="/workspace",
+    ),
+)
+app.register_environment(environment, default=True)
+```
+
+On bind, Cayu clones into an empty workspace or fetches/checks out an existing
+clean repository, fast-forwarding to the fetched remote branch when it can do so
+without merging or rewriting history. It then records repo/ref/commit metadata in
+the binding snapshot. On finalize, Cayu records the final commit and dirty state.
+It does not commit, push, create branches, rebase, merge divergent branches, or
+create pull requests; those remain explicit agent/tool or trusted app workflows.
+Do not put credentials in `repo_url`; the URL is stored in durable metadata, so
+HTTP(S) URLs with embedded credentials are rejected. For untrusted sandbox
+runners, avoid exposing long-lived Git credentials through generic shell access;
+use public repos, trusted host-side credentials, or a dedicated brokered Git tool.
+
 Docker and Docker Sandboxes (`sbx`) do not have dedicated native workspace
 adapters. Use `RunnerWorkspace` as the bound target so workspace file operations
 execute through the runner:
