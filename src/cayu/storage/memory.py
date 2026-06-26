@@ -1,24 +1,104 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
+from collections import Counter
+from datetime import UTC, datetime
+from enum import StrEnum
+from hashlib import sha256
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
     copy_json_value,
+    copy_label_map,
     require_clean_nonblank,
     require_finite,
     require_nonblank,
 )
 
+DEFAULT_KNOWLEDGE_NAMESPACE = "default"
+DEFAULT_KNOWLEDGE_KIND = "fact"
+DEFAULT_KNOWLEDGE_LIMIT = 10
+DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
+_SEARCH_TOKEN_RE = re.compile(r"\w+")
 
-class KnowledgeItem(BaseModel):
+BUILTIN_KNOWLEDGE_KINDS = (
+    "fact",
+    "preference",
+    "procedure",
+    "instruction",
+    "skill",
+    "document",
+    "example",
+    "warning",
+    "decision",
+    "event",
+    "summary",
+)
+
+
+class KnowledgeStatus(StrEnum):
+    ACTIVE = "active"
+    PENDING = "pending"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+
+
+class KnowledgeVisibility(StrEnum):
+    GLOBAL = "global"
+    ORGANIZATION = "organization"
+    PROJECT = "project"
+    WORKSPACE = "workspace"
+    USER = "user"
+    SESSION = "session"
+    TASK = "task"
+
+
+class KnowledgeActorType(StrEnum):
+    APP = "app"
+    USER = "user"
+    MODEL = "model"
+    SYSTEM = "system"
+
+
+class KnowledgeSearchMode(StrEnum):
+    AUTO = "auto"
+    KEYWORD = "keyword"
+    SEMANTIC = "semantic"
+    HYBRID = "hybrid"
+    EXTERNAL = "external"
+
+
+class KnowledgeEntry(BaseModel):
+    """Durable, source-attributed knowledge item."""
+
     model_config = ConfigDict(extra="forbid")
 
     id: str
     text: str
-    source: str | None = None
+    namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
+    labels: dict[str, str] = Field(default_factory=dict)
+    kind: str = DEFAULT_KNOWLEDGE_KIND
+    visibility: KnowledgeVisibility = KnowledgeVisibility.GLOBAL
+    status: KnowledgeStatus = KnowledgeStatus.ACTIVE
+    created_by_type: KnowledgeActorType = KnowledgeActorType.APP
+    created_by: str = "app"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    source_type: str | None = None
+    source_uri: str | None = None
+    source_id: str | None = None
+    source_hash: str | None = None
+    aspects: list[str] = Field(default_factory=list)
+    impact_targets: list[str] = Field(default_factory=list)
+    importance: float | None = None
+    importance_source: str | None = None
+    confidence: float | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+    title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata", mode="before")
@@ -26,9 +106,14 @@ class KnowledgeItem(BaseModel):
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
 
-    @field_validator("id")
+    @field_validator("labels", mode="before")
     @classmethod
-    def validate_clean_nonblank_id(cls, value: str, info) -> str:
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+    @field_validator("id", "namespace", "kind", "created_by")
+    @classmethod
+    def validate_clean_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("text")
@@ -36,60 +121,826 @@ class KnowledgeItem(BaseModel):
     def validate_nonblank_text(cls, value: str, info) -> str:
         return require_nonblank(value, info.field_name)
 
-    @field_validator("source")
+    @field_validator(
+        "source_type",
+        "source_uri",
+        "source_id",
+        "source_hash",
+        "importance_source",
+        "title",
+    )
     @classmethod
-    def validate_nonblank_source(cls, value: str | None, info) -> str | None:
+    def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("aspects", "impact_targets", mode="before")
+    @classmethod
+    def copy_string_list(cls, value, info) -> list[str]:
+        if value is None:
+            return []
+        copied = copy_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"`{info.field_name}` must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return _dedupe_strings(result)
+
+    @field_validator("importance", "confidence", mode="before")
+    @classmethod
+    def validate_optional_unit_interval(cls, value, info) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"`{info.field_name}` must be a number.")
+        value = require_finite(float(value), info.field_name)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"`{info.field_name}` must be between 0.0 and 1.0.")
+        return value
+
+    @field_validator("created_at", "updated_at", "last_used_at", "expires_at")
+    @classmethod
+    def validate_timezone_aware_datetime(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"`{info.field_name}` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_timestamp_order(self) -> KnowledgeEntry:
+        if self.updated_at < self.created_at:
+            raise ValueError("`updated_at` must be greater than or equal to `created_at`.")
+        return self
+
+
+class KnowledgeChunk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    entry_id: str
+    text: str
+    chunk_index: int
+    content_hash: str | None = None
+    source_uri: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "metadata")
+
+    @field_validator("id", "entry_id")
+    @classmethod
+    def validate_clean_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("text")
+    @classmethod
+    def validate_nonblank_text(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("content_hash", "source_uri")
+    @classmethod
+    def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("chunk_index")
+    @classmethod
+    def validate_chunk_index(cls, value: int, info) -> int:
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(f"`{info.field_name}` must be an integer.")
+        if value < 0:
+            raise ValueError(f"`{info.field_name}` must be greater than or equal to 0.")
+        return value
+
+
+class KnowledgeQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
+    labels: dict[str, str] = Field(default_factory=dict)
+    kinds: list[str] | None = None
+    statuses: list[KnowledgeStatus] = Field(default_factory=lambda: [KnowledgeStatus.ACTIVE])
+    visibilities: list[KnowledgeVisibility] | None = None
+    aspects: list[str] = Field(default_factory=list)
+    impact_targets: list[str] = Field(default_factory=list)
+    source_type: str | None = None
+    source_id: str | None = None
+    mode: KnowledgeSearchMode = KnowledgeSearchMode.AUTO
+    include_expired: bool = False
+    limit: int = DEFAULT_KNOWLEDGE_LIMIT
+    max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+    @field_validator("text")
+    @classmethod
+    def validate_nonblank_text(cls, value: str, info) -> str:
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("namespace")
+    @classmethod
+    def validate_clean_namespace(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("source_type", "source_id")
+    @classmethod
+    def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("kinds", "aspects", "impact_targets", mode="before")
+    @classmethod
+    def copy_optional_string_list(cls, value, info) -> list[str] | None:
+        if value is None and info.field_name == "kinds":
+            return None
+        if value is None:
+            return []
+        copied = copy_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"`{info.field_name}` must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return _dedupe_strings(result)
+
+    @field_validator("limit", "max_bytes")
+    @classmethod
+    def validate_positive_int(cls, value: int, info) -> int:
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(f"`{info.field_name}` must be an integer.")
+        if value <= 0:
+            raise ValueError(f"`{info.field_name}` must be greater than 0.")
+        return value
+
+    @field_validator("statuses")
+    @classmethod
+    def validate_statuses(cls, value: list[KnowledgeStatus], info) -> list[KnowledgeStatus]:
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return list(dict.fromkeys(value))
+
+    @field_validator("visibilities")
+    @classmethod
+    def validate_visibilities(
+        cls,
+        value: list[KnowledgeVisibility] | None,
+        info,
+    ) -> list[KnowledgeVisibility] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return list(dict.fromkeys(value))
 
 
 class KnowledgeHit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    item: KnowledgeItem
+    entry: KnowledgeEntry
+    chunk: KnowledgeChunk | None = None
     score: float | None = None
     reason: str | None = None
+    rank: int | None = None
+    score_kind: str | None = None
+    score_normalized: float | None = None
+    text_preview: str | None = None
 
-    @field_validator("item")
+    @field_validator("entry")
     @classmethod
-    def copy_item(cls, value):
-        return copy_knowledge_item(value)
+    def copy_entry(cls, value):
+        return copy_knowledge_entry(value)
 
-    @field_validator("score", mode="before")
+    @field_validator("chunk")
+    @classmethod
+    def copy_chunk(cls, value):
+        if value is None:
+            return None
+        return copy_knowledge_chunk(value)
+
+    @field_validator("score", "score_normalized", mode="before")
     @classmethod
     def validate_score(cls, value, info):
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"`{info.field_name}` must be a number.")
-        return require_finite(value, info.field_name)
+        value = require_finite(float(value), info.field_name)
+        if info.field_name == "score_normalized" and (value < 0.0 or value > 1.0):
+            raise ValueError("`score_normalized` must be between 0.0 and 1.0.")
+        return value
+
+    @field_validator("rank")
+    @classmethod
+    def validate_rank(cls, value: int | None, info) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(f"`{info.field_name}` must be an integer.")
+        if value <= 0:
+            raise ValueError(f"`{info.field_name}` must be greater than 0.")
+        return value
+
+    @field_validator("reason", "score_kind", "text_preview")
+    @classmethod
+    def validate_optional_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_chunk_belongs_to_entry(self) -> KnowledgeHit:
+        if self.chunk is not None and self.chunk.entry_id != self.entry.id:
+            raise ValueError("`chunk.entry_id` must match `entry.id`.")
+        return self
+
+
+class KnowledgeSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: KnowledgeQuery
+    hits: list[KnowledgeHit] = Field(default_factory=list)
+    truncated: bool = False
+    limit: int
+    max_bytes: int
+    total_hits_known: int | None = None
+
+    @field_validator("query")
+    @classmethod
+    def copy_query(cls, value):
+        return copy_knowledge_query(value)
+
+    @field_validator("hits")
+    @classmethod
+    def copy_hits(cls, value):
+        return [copy_knowledge_hit(hit) for hit in value]
+
+    @field_validator("limit", "max_bytes")
+    @classmethod
+    def validate_positive_int(cls, value: int, info) -> int:
+        _validate_positive_int(value, info.field_name)
+        return value
+
+    @field_validator("total_hits_known")
+    @classmethod
+    def validate_total_hits_known(cls, value: int | None, info) -> int | None:
+        if value is None:
+            return None
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @model_validator(mode="after")
+    def validate_total_hits_known_covers_hits(self) -> KnowledgeSearchResult:
+        if self.total_hits_known is not None and self.total_hits_known < len(self.hits):
+            raise ValueError("`total_hits_known` cannot be less than the number of hits.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_limits_match_query(self) -> KnowledgeSearchResult:
+        if self.limit != self.query.limit:
+            raise ValueError("`limit` must match `query.limit`.")
+        if self.max_bytes != self.query.max_bytes:
+            raise ValueError("`max_bytes` must match `query.max_bytes`.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_hit_count_and_ranks(self) -> KnowledgeSearchResult:
+        if len(self.hits) > self.limit:
+            raise ValueError("`hits` cannot contain more entries than `limit`.")
+        ranks = [hit.rank for hit in self.hits if hit.rank is not None]
+        if len(ranks) != len(set(ranks)):
+            raise ValueError("Knowledge hit ranks must be unique when present.")
+        return self
 
 
 class KnowledgeStore(ABC):
-    """Searchable memory/knowledge contract."""
+    """Searchable knowledge contract."""
 
     @abstractmethod
-    async def upsert(self, item: KnowledgeItem) -> None:
-        """Insert or update one knowledge item."""
+    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        """Insert or update one knowledge entry by id."""
 
     @abstractmethod
-    async def search(
+    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+        """Load one entry by id."""
+
+    @abstractmethod
+    async def update_entry_status(
         self,
-        query: str,
+        entry_id: str,
+        status: KnowledgeStatus,
+    ) -> KnowledgeEntry:
+        """Update one entry status and return the updated entry."""
+
+    @abstractmethod
+    async def delete_entry(
+        self,
+        entry_id: str,
         *,
-        filters: dict[str, Any] | None = None,
-        limit: int = 10,
-    ) -> list[KnowledgeHit]:
-        """Search memory/knowledge."""
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        """Soft-delete one entry by default, or hard-delete when requested."""
+
+    @abstractmethod
+    async def replace_chunks(
+        self, entry_id: str, chunks: list[KnowledgeChunk]
+    ) -> list[KnowledgeChunk]:
+        """Replace the complete chunk set for an existing entry."""
+
+    @abstractmethod
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        """Atomically write one entry and its complete chunk set."""
+
+    @abstractmethod
+    async def read_chunks(
+        self,
+        entry_id: str,
+        *,
+        chunk_index: int | None = None,
+        around: int = 0,
+        max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> list[KnowledgeChunk]:
+        """Read bounded chunks for one entry."""
+
+    @abstractmethod
+    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+        """Search knowledge and return a bounded result envelope."""
 
 
-def copy_knowledge_item(item: KnowledgeItem) -> KnowledgeItem:
-    if type(item) is not KnowledgeItem:
-        raise TypeError("Knowledge hits must contain KnowledgeItem instances.")
-    return KnowledgeItem(
-        id=item.id,
-        text=item.text,
-        source=item.source,
-        metadata=copy_json_value(item.metadata, "metadata"),
+class InMemoryKnowledgeStore(KnowledgeStore):
+    """In-memory knowledge store for tests, demos, and single-process apps."""
+
+    def __init__(self, entries: list[KnowledgeEntry] | None = None) -> None:
+        self._entries: dict[str, KnowledgeEntry] = {}
+        self._chunks: dict[str, list[KnowledgeChunk]] = {}
+        if entries:
+            for entry in entries:
+                copied = copy_knowledge_entry(entry)
+                if copied.id in self._entries:
+                    raise ValueError(f"Duplicate knowledge entry id {copied.id!r}.")
+                self._entries[copied.id] = copied
+                self._chunks[copied.id] = [_default_chunk_for_entry(copied)]
+
+    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        entry = copy_knowledge_entry(entry)
+        existing_entry = self._entries.get(entry.id)
+        existing_chunks = self._chunks.get(entry.id)
+        self._entries[entry.id] = entry
+        if (
+            existing_entry is None
+            or existing_chunks is None
+            or _has_only_default_chunk(existing_entry, existing_chunks)
+        ):
+            self._chunks[entry.id] = [_default_chunk_for_entry(entry)]
+        return copy_knowledge_entry(entry)
+
+    async def get_entry(self, entry_id: str) -> KnowledgeEntry | None:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        entry = self._entries.get(clean_id)
+        if entry is None:
+            return None
+        return copy_knowledge_entry(entry)
+
+    async def update_entry_status(
+        self,
+        entry_id: str,
+        status: KnowledgeStatus,
+    ) -> KnowledgeEntry:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        entry = self._entries.get(clean_id)
+        if entry is None:
+            raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        updated = entry.model_copy(update={"status": status, "updated_at": _next_updated_at(entry)})
+        updated = copy_knowledge_entry(updated)
+        self._entries[clean_id] = updated
+        return copy_knowledge_entry(updated)
+
+    async def delete_entry(
+        self,
+        entry_id: str,
+        *,
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        entry = self._entries.get(clean_id)
+        if entry is None:
+            return None
+        if hard:
+            self._entries.pop(clean_id, None)
+            self._chunks.pop(clean_id, None)
+            return copy_knowledge_entry(entry)
+        return await self.update_entry_status(clean_id, KnowledgeStatus.DELETED)
+
+    async def replace_chunks(
+        self, entry_id: str, chunks: list[KnowledgeChunk]
+    ) -> list[KnowledgeChunk]:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        if clean_id not in self._entries:
+            raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        copied_chunks = _copy_entry_chunks(clean_id, chunks)
+        self._chunks[clean_id] = copied_chunks
+        return [copy_knowledge_chunk(chunk) for chunk in copied_chunks]
+
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        copied_entry = copy_knowledge_entry(entry)
+        copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
+        self._entries[copied_entry.id] = copied_entry
+        self._chunks[copied_entry.id] = copied_chunks
+        return copy_knowledge_entry(copied_entry)
+
+    async def read_chunks(
+        self,
+        entry_id: str,
+        *,
+        chunk_index: int | None = None,
+        around: int = 0,
+        max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
+        max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
+    ) -> list[KnowledgeChunk]:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        if clean_id not in self._entries:
+            return []
+        if chunk_index is not None:
+            _validate_nonnegative_int(chunk_index, "chunk_index")
+        _validate_nonnegative_int(around, "around")
+        if chunk_index is None and around != 0:
+            raise ValueError("`around` requires `chunk_index`.")
+        _validate_positive_int(max_chunks, "max_chunks")
+        _validate_positive_int(max_bytes, "max_bytes")
+        start_index = 0 if chunk_index is None else max(0, chunk_index - around)
+        end_index = None if chunk_index is None else chunk_index + around
+        chunks = self._chunks.get(clean_id, [])
+        if chunk_index is not None:
+            chunks = _center_chunk_window(chunks, chunk_index=chunk_index, max_chunks=max_chunks)
+        return _bounded_chunks(
+            chunks,
+            start_index=start_index,
+            end_index=end_index,
+            max_chunks=max_chunks,
+            max_bytes=max_bytes,
+        )
+
+    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+        knowledge_query = copy_knowledge_query(query)
+        if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
+            raise ValueError("InMemoryKnowledgeStore supports only auto and keyword search modes.")
+        scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]] = []
+        for entry in self._entries.values():
+            if not _entry_matches_query(entry, knowledge_query):
+                continue
+            score, chunk, reason, preview_text = _score_entry(
+                entry, self._chunks.get(entry.id, []), knowledge_query
+            )
+            if score <= 0:
+                continue
+            scored.append((score, entry, chunk, reason, preview_text))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -(item[1].importance or 0.0),
+                -item[1].updated_at.timestamp(),
+                item[1].id,
+            )
+        )
+        hits: list[KnowledgeHit] = []
+        remaining = knowledge_query.max_bytes
+        truncated = False
+        for rank, (score, entry, chunk, reason, preview_text) in enumerate(
+            scored[: knowledge_query.limit], start=1
+        ):
+            if remaining <= 0:
+                truncated = True
+                break
+            source_bytes = len(preview_text.encode("utf-8"))
+            preview = _truncate_text_to_bytes(preview_text, remaining)
+            if not preview:
+                truncated = True
+                break
+            if len(preview.encode("utf-8")) < source_bytes:
+                truncated = True
+            remaining -= len(preview.encode("utf-8"))
+            hits.append(
+                KnowledgeHit(
+                    entry=entry,
+                    chunk=chunk,
+                    score=score,
+                    score_kind="inmemory_keyword",
+                    rank=rank,
+                    reason=reason,
+                    text_preview=preview,
+                )
+            )
+        return KnowledgeSearchResult(
+            query=knowledge_query,
+            hits=hits,
+            truncated=truncated or len(hits) < len(scored),
+            limit=knowledge_query.limit,
+            max_bytes=knowledge_query.max_bytes,
+            total_hits_known=len(scored),
+        )
+
+
+def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
+    if type(entry) is not KnowledgeEntry:
+        raise TypeError("KnowledgeEntry instances must not be subclasses.")
+    return KnowledgeEntry(
+        id=entry.id,
+        text=entry.text,
+        namespace=entry.namespace,
+        labels=copy_label_map(entry.labels, "labels"),
+        kind=entry.kind,
+        visibility=entry.visibility,
+        status=entry.status,
+        created_by_type=entry.created_by_type,
+        created_by=entry.created_by,
+        created_at=entry.created_at,
+        updated_at=entry.updated_at,
+        source_type=entry.source_type,
+        source_uri=entry.source_uri,
+        source_id=entry.source_id,
+        source_hash=entry.source_hash,
+        aspects=list(entry.aspects),
+        impact_targets=list(entry.impact_targets),
+        importance=entry.importance,
+        importance_source=entry.importance_source,
+        confidence=entry.confidence,
+        last_used_at=entry.last_used_at,
+        expires_at=entry.expires_at,
+        title=entry.title,
+        metadata=copy_json_value(entry.metadata, "metadata"),
     )
+
+
+def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
+    if type(chunk) is not KnowledgeChunk:
+        raise TypeError("KnowledgeChunk instances must not be subclasses.")
+    return KnowledgeChunk(
+        id=chunk.id,
+        entry_id=chunk.entry_id,
+        text=chunk.text,
+        chunk_index=chunk.chunk_index,
+        content_hash=chunk.content_hash,
+        source_uri=chunk.source_uri,
+        metadata=copy_json_value(chunk.metadata, "metadata"),
+    )
+
+
+def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
+    if type(query) is not KnowledgeQuery:
+        raise TypeError("KnowledgeQuery instances must not be subclasses.")
+    return KnowledgeQuery(
+        text=query.text,
+        namespace=query.namespace,
+        labels=copy_label_map(query.labels, "labels"),
+        kinds=list(query.kinds) if query.kinds is not None else None,
+        statuses=list(query.statuses),
+        visibilities=list(query.visibilities) if query.visibilities is not None else None,
+        aspects=list(query.aspects),
+        impact_targets=list(query.impact_targets),
+        source_type=query.source_type,
+        source_id=query.source_id,
+        mode=query.mode,
+        include_expired=query.include_expired,
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+    )
+
+
+def copy_knowledge_hit(hit: KnowledgeHit) -> KnowledgeHit:
+    if type(hit) is not KnowledgeHit:
+        raise TypeError("KnowledgeHit instances must not be subclasses.")
+    return KnowledgeHit(
+        entry=copy_knowledge_entry(hit.entry),
+        chunk=copy_knowledge_chunk(hit.chunk) if hit.chunk is not None else None,
+        score=hit.score,
+        reason=hit.reason,
+        rank=hit.rank,
+        score_kind=hit.score_kind,
+        score_normalized=hit.score_normalized,
+        text_preview=hit.text_preview,
+    )
+
+
+def _copy_entry_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> list[KnowledgeChunk]:
+    if type(chunks) is not list:
+        raise ValueError("`chunks` must be a list.")
+    if not chunks:
+        raise ValueError("`chunks` cannot be empty.")
+    copied_chunks = [copy_knowledge_chunk(chunk) for chunk in chunks]
+    seen_ids: set[str] = set()
+    seen_indexes: set[int] = set()
+    for chunk in copied_chunks:
+        if chunk.entry_id != entry_id:
+            raise ValueError("Knowledge chunks must belong to the entry.")
+        if chunk.id in seen_ids:
+            raise ValueError("Knowledge chunk ids must be unique within an entry.")
+        if chunk.chunk_index in seen_indexes:
+            raise ValueError("Knowledge chunk indexes must be unique within an entry.")
+        seen_ids.add(chunk.id)
+        seen_indexes.add(chunk.chunk_index)
+    return sorted(copied_chunks, key=lambda chunk: chunk.chunk_index)
+
+
+def _center_chunk_window(
+    chunks: list[KnowledgeChunk],
+    *,
+    chunk_index: int,
+    max_chunks: int,
+) -> list[KnowledgeChunk]:
+    if len(chunks) <= max_chunks:
+        return chunks
+    closest = sorted(
+        chunks, key=lambda chunk: (abs(chunk.chunk_index - chunk_index), chunk.chunk_index)
+    )
+    return sorted(closest[:max_chunks], key=lambda chunk: chunk.chunk_index)
+
+
+def _bounded_chunks(
+    chunks: list[KnowledgeChunk],
+    *,
+    start_index: int,
+    end_index: int | None,
+    max_chunks: int,
+    max_bytes: int,
+) -> list[KnowledgeChunk]:
+    _validate_positive_int(max_chunks, "max_chunks")
+    _validate_positive_int(max_bytes, "max_bytes")
+    selected: list[KnowledgeChunk] = []
+    remaining = max_bytes
+    for chunk in chunks:
+        if chunk.chunk_index < start_index:
+            continue
+        if end_index is not None and chunk.chunk_index > end_index:
+            continue
+        if len(selected) >= max_chunks or remaining <= 0:
+            break
+        copied = copy_knowledge_chunk(chunk)
+        chunk_bytes = len(copied.text.encode("utf-8"))
+        if chunk_bytes > remaining:
+            truncated_text = _truncate_text_to_bytes(copied.text, remaining)
+            if not truncated_text:
+                break
+            selected.append(
+                KnowledgeChunk(
+                    id=copied.id,
+                    entry_id=copied.entry_id,
+                    text=truncated_text,
+                    chunk_index=copied.chunk_index,
+                    content_hash=None,
+                    source_uri=copied.source_uri,
+                    metadata=copied.metadata,
+                )
+            )
+            break
+        selected.append(copied)
+        remaining -= chunk_bytes
+    return selected
+
+
+def _entry_matches_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
+    if entry.namespace != query.namespace:
+        return False
+    for key, value in query.labels.items():
+        if entry.labels.get(key) != value:
+            return False
+    if query.kinds is not None and entry.kind not in set(query.kinds):
+        return False
+    if entry.status not in set(query.statuses):
+        return False
+    if query.visibilities is not None and entry.visibility not in set(query.visibilities):
+        return False
+    if query.source_type is not None and entry.source_type != query.source_type:
+        return False
+    if query.source_id is not None and entry.source_id != query.source_id:
+        return False
+    if query.aspects and not set(query.aspects).intersection(entry.aspects):
+        return False
+    if query.impact_targets and not set(query.impact_targets).intersection(entry.impact_targets):
+        return False
+    return not _entry_is_expired_for_query(entry, query)
+
+
+def _entry_is_expired_for_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
+    return (
+        not query.include_expired
+        and entry.expires_at is not None
+        and entry.expires_at <= datetime.now(UTC)
+    )
+
+
+def _score_entry(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    query: KnowledgeQuery,
+) -> tuple[float, KnowledgeChunk | None, str, str]:
+    terms = _tokenize_search_text(query.text)
+    if not terms:
+        return 0.0, None, "empty query", entry.text
+    best_score = _score_text(entry.text, terms)
+    best_chunk: KnowledgeChunk | None = None
+    best_reason = "entry text match"
+    best_preview_text = entry.text
+    if entry.title is not None:
+        title_score = _score_text(entry.title, terms) * 1.2
+        if title_score > best_score:
+            best_score = title_score
+            best_reason = "title match"
+            best_preview_text = entry.title
+    for chunk in chunks:
+        chunk_score = _score_text(chunk.text, terms)
+        if chunk_score > best_score:
+            best_score = chunk_score
+            best_chunk = chunk
+            best_reason = "chunk text match"
+            best_preview_text = chunk.text
+    return best_score, best_chunk, best_reason, best_preview_text
+
+
+def _score_text(text: str, terms: list[str]) -> float:
+    token_counts = Counter(_tokenize_search_text(text))
+    return float(sum(token_counts[term] for term in terms))
+
+
+def _tokenize_search_text(text: str) -> list[str]:
+    return _SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
+    return KnowledgeChunk(
+        id=f"{entry.id}:0",
+        entry_id=entry.id,
+        text=entry.text,
+        chunk_index=0,
+        content_hash=sha256(entry.text.encode("utf-8")).hexdigest(),
+        source_uri=entry.source_uri,
+    )
+
+
+def _next_updated_at(entry: KnowledgeEntry) -> datetime:
+    return max(datetime.now(UTC), entry.created_at, entry.updated_at)
+
+
+def _has_only_default_chunk(entry: KnowledgeEntry, chunks: list[KnowledgeChunk]) -> bool:
+    if len(chunks) != 1:
+        return False
+    default_chunk = _default_chunk_for_entry(entry)
+    chunk = chunks[0]
+    return (
+        chunk.id == default_chunk.id
+        and chunk.entry_id == default_chunk.entry_id
+        and chunk.text == default_chunk.text
+        and chunk.chunk_index == default_chunk.chunk_index
+        and chunk.content_hash == default_chunk.content_hash
+        and chunk.source_uri == default_chunk.source_uri
+        and chunk.metadata == default_chunk.metadata
+    )
+
+
+def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _validate_positive_int(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ValueError(f"`{field_name}` must be an integer.")
+    if value <= 0:
+        raise ValueError(f"`{field_name}` must be greater than 0.")
+
+
+def _validate_nonnegative_int(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ValueError(f"`{field_name}` must be an integer.")
+    if value < 0:
+        raise ValueError(f"`{field_name}` must be greater than or equal to 0.")
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))

@@ -63,8 +63,8 @@ from cayu.runtime import (
     ToolPolicyResult,
     retry_decision,
 )
-from cayu.storage import KnowledgeHit, KnowledgeItem
-from cayu.storage.memory import copy_knowledge_item
+from cayu.storage import KnowledgeEntry, KnowledgeHit
+from cayu.storage.memory import copy_knowledge_entry
 from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -481,12 +481,12 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
     secret = SecretRef(name="github_token", metadata=secret_metadata)
 
     knowledge_metadata = {"nested": {"value": "original"}}
-    knowledge_item = KnowledgeItem(
+    knowledge_entry = KnowledgeEntry(
         id="item_1",
         text="memory",
         metadata=knowledge_metadata,
     )
-    knowledge_hit = KnowledgeHit(item=knowledge_item)
+    knowledge_hit = KnowledgeHit(entry=knowledge_entry)
 
     exec_artifacts = [{"nested": {"value": "original"}}]
     exec_result = ExecResult(artifacts=exec_artifacts)
@@ -497,7 +497,7 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
     stream_arguments["nested"]["value"] = "mutated"
     secret_metadata["nested"]["value"] = "mutated"
     knowledge_metadata["nested"]["value"] = "mutated"
-    knowledge_item.metadata["nested"]["value"] = "mutated again"
+    knowledge_entry.metadata["nested"]["value"] = "mutated again"
     exec_artifacts[0]["nested"]["value"] = "mutated"
 
     assert request.messages[0].content[0].text == "start"
@@ -505,7 +505,7 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
     assert request.options == {"nested": {"value": "original"}}
     assert stream_event.payload["arguments"] == {"nested": {"value": "original"}}
     assert secret.metadata == {"nested": {"value": "original"}}
-    assert knowledge_hit.item.metadata == {"nested": {"value": "original"}}
+    assert knowledge_hit.entry.metadata == {"nested": {"value": "original"}}
     assert exec_result.artifacts == [{"nested": {"value": "original"}}]
 
 
@@ -541,7 +541,7 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
             tools=[{"bad": value}],
         ),
         lambda value: ExecResult(artifacts=[{"bad": value}]),
-        lambda value: KnowledgeItem(id="item_1", text="memory", metadata={"bad": value}),
+        lambda value: KnowledgeEntry(id="item_1", text="memory", metadata={"bad": value}),
         lambda value: SecretRef(name="github_token", metadata={"bad": value}),
     ],
 )
@@ -707,7 +707,7 @@ def test_json_boundary_fields_reject_custom_container_subclasses():
         lambda value: Message(role="user", content=[value]),
         lambda value: RunRequest(agent_name="assistant", messages=[value]),
         lambda value: ModelRequest(model="fake-model", messages=[value]),
-        lambda value: KnowledgeHit(item=value),
+        lambda value: KnowledgeHit(entry=value),
         lambda value: McpServerSpec(
             name="local",
             command=["node"],
@@ -1270,10 +1270,10 @@ def test_framework_spec_models_reject_blank_names():
         ResolvedSecret(name=" ", value=SecretStr("secret"))
 
     with pytest.raises(ValidationError, match="cannot be blank"):
-        KnowledgeItem(id=" ", text="memory")
+        KnowledgeEntry(id=" ", text="memory")
 
     with pytest.raises(ValidationError, match="cannot be blank"):
-        KnowledgeItem(id="memory_1", text=" ")
+        KnowledgeEntry(id="memory_1", text=" ")
 
 
 def test_framework_spec_models_reject_edge_whitespace_identity_fields():
@@ -1296,11 +1296,11 @@ def test_framework_spec_models_reject_edge_whitespace_identity_fields():
         SecretRef(name=" OPENAI_API_KEY")
 
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
-        KnowledgeItem(id=" memory_1", text="memory")
+        KnowledgeEntry(id=" memory_1", text="memory")
 
-    item = KnowledgeItem(id="memory_1", text=" memory text ", source="project docs")
-    assert item.text == " memory text "
-    assert item.source == "project docs"
+    entry = KnowledgeEntry(id="memory_1", text=" memory text ", source_uri="project-docs")
+    assert entry.text == " memory text "
+    assert entry.source_uri == "project-docs"
 
 
 def test_mcp_server_rejects_blank_transport_values():
@@ -1374,23 +1374,23 @@ def test_mcp_server_rejects_invalid_config_maps_with_validation_error():
 
 
 def test_knowledge_hit_rejects_non_finite_scores():
-    item = KnowledgeItem(id="memory_1", text="memory")
+    entry = KnowledgeEntry(id="memory_1", text="memory")
 
     with pytest.raises(ValidationError, match="must be finite"):
-        KnowledgeHit(item=item, score=float("nan"))
+        KnowledgeHit(entry=entry, score=float("nan"))
 
     with pytest.raises(ValidationError, match="must be finite"):
-        KnowledgeHit(item=item, score=float("inf"))
+        KnowledgeHit(entry=entry, score=float("inf"))
 
 
 def test_knowledge_hit_rejects_non_numeric_scores():
-    item = KnowledgeItem(id="memory_1", text="memory")
+    entry = KnowledgeEntry(id="memory_1", text="memory")
 
     with pytest.raises(ValidationError, match="must be a number"):
-        KnowledgeHit(item=item, score="0.3")  # type: ignore[arg-type]
+        KnowledgeHit(entry=entry, score="0.3")  # type: ignore[arg-type]
 
     with pytest.raises(ValidationError, match="must be a number"):
-        KnowledgeHit(item=item, score=True)  # type: ignore[arg-type]
+        KnowledgeHit(entry=entry, score=True)  # type: ignore[arg-type]
 
 
 def test_knowledge_hit_revalidates_constructed_items():
@@ -1400,44 +1400,41 @@ def test_knowledge_hit_revalidates_constructed_items():
 
     with pytest.raises(ValueError, match="`id` cannot be blank"):
         KnowledgeHit(
-            item=KnowledgeItem.model_construct(
+            entry=KnowledgeEntry.model_construct(
                 id=" ",
                 text="memory",
-                source=None,
                 metadata={},
             )
         )
 
     with pytest.raises(ValueError, match="JSON-compatible"):
         KnowledgeHit(
-            item=KnowledgeItem.model_construct(
+            entry=KnowledgeEntry.model_construct(
                 id="memory_1",
                 text="memory",
-                source=None,
                 metadata=BadMetadata({"bad": "value"}),
             )
         )
 
 
-def test_knowledge_item_copy_boundaries_reject_subclasses_before_attribute_access():
-    class BadItem(KnowledgeItem):
+def test_knowledge_entry_copy_boundaries_reject_subclasses_before_attribute_access():
+    class BadEntry(KnowledgeEntry):
         def __getattribute__(self, name):
             if name == "id":
-                raise RuntimeError("knowledge item id access should not run")
+                raise RuntimeError("knowledge entry id access should not run")
             return super().__getattribute__(name)
 
-    item = BadItem.model_construct(
+    entry = BadEntry.model_construct(
         id="memory_1",
         text="memory",
-        source=None,
         metadata={},
     )
 
-    with pytest.raises(TypeError, match="KnowledgeItem"):
-        copy_knowledge_item(item)
+    with pytest.raises(TypeError, match="KnowledgeEntry"):
+        copy_knowledge_entry(entry)
 
-    with pytest.raises(TypeError, match="KnowledgeItem"):
-        KnowledgeHit(item=item)
+    with pytest.raises(TypeError, match="KnowledgeEntry"):
+        KnowledgeHit(entry=entry)
 
 
 def test_message_rejects_unknown_fields():

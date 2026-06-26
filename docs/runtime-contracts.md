@@ -1200,4 +1200,53 @@ tool call may execute.
 
 ## KnowledgeStore
 
-Searchable memory/knowledge interface. Default local implementation should eventually support file indexing plus SQLite FTS.
+`KnowledgeStore` is Cayu's contract for durable reusable context: facts,
+preferences, procedures, instructions, skills, documents, examples, warnings,
+decisions, events, summaries, and app-defined custom kinds.
+
+The first framework slice defines the data contract and an
+`InMemoryKnowledgeStore` for tests, demos, and single-process local apps. There
+is no legacy memory alias in the public surface; use the `Knowledge*` names and
+entry/chunk methods directly.
+
+`InMemoryKnowledgeStore` is a keyword backend. It supports `auto` and `keyword`
+query modes and rejects semantic, hybrid, and external modes so apps do not
+mistake the local test store for an embedding or external retrieval backend.
+
+- `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
+  extensible `kind`, visibility, status, source refs, audit timestamps,
+  importance/confidence hints, aspects, impact targets, and metadata.
+- `KnowledgeChunk`: bounded readable chunks for long entries. Stores may keep
+  one default chunk for short entries, or replace the complete chunk set after
+  indexing a larger source.
+- `KnowledgeQuery`: scoped retrieval request with namespace, labels, kinds,
+  status/visibility filters, aspects, impact targets, source filters, mode,
+  result limit, and preview byte cap.
+- `KnowledgeSearchResult`: result envelope containing copied hits, truncation
+  metadata, configured limits, and `total_hits_known` when the backend can count
+  candidates.
+
+`KnowledgeQuery.max_bytes` bounds returned `text_preview` payloads from
+`search(...)`. It does not rewrite the copied `KnowledgeEntry` or
+`KnowledgeChunk` objects inside each `KnowledgeHit`; model-facing memory tools
+and automatic injection layers must build their own bounded provider context
+from previews or explicitly read bounded chunks.
+
+The store contract is intentionally entry/chunk oriented:
+
+```python
+await store.put_entry(entry)
+await store.get_entry(entry_id)
+await store.update_entry_status(entry_id, KnowledgeStatus.ARCHIVED)
+await store.delete_entry(entry_id, hard=False)
+await store.replace_chunks(entry_id, chunks)
+await store.put_entry_with_chunks(entry, chunks)
+await store.read_chunks(entry_id, chunk_index=3, around=1)
+result = await store.search(query)
+```
+
+This slice does not add runtime context injection, model-facing memory tools,
+SQLite/Postgres FTS, embeddings, graph retrieval, or automatic indexing. Those
+layers should build on the same `KnowledgeEntry` / `KnowledgeChunk` /
+`KnowledgeQuery` contract rather than introducing separate memory, skill, or
+document-store APIs.
