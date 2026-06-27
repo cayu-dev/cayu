@@ -1248,7 +1248,34 @@ await store.read_chunks(entry_id, chunk_index=3, around=1)
 result = await store.search(query)
 ```
 
+`KnowledgeIndexer` is the deterministic local indexing helper for app-owned text.
+It is not an agent and does not connect to remote memory systems. It converts one
+text body into a `KnowledgeEntry` plus bounded `KnowledgeChunk` records, computes
+source/chunk hashes, preserves heading context for Markdown-like text, and can
+write atomically through any `KnowledgeStore`.
+
+```python
+indexer = KnowledgeIndexer(store)
+result = await indexer.index_text(
+    KnowledgeIndexRequest(
+        text=markdown,
+        entry_id="repo-rules",
+        title="Repo rules",
+        kind="procedure",
+        labels={"project": "cayu"},
+        source_type="file",
+        source_uri="workspace://AGENTS.md",
+    )
+)
+```
+
+Small overlap is enabled by default so important text is less likely to be split
+across chunk boundaries. `max_chunks` and byte limits keep indexing bounded.
+`skip_unchanged=True` avoids rewriting only when the stored source hash, derived
+entry metadata, and derived chunks all match the newly indexed output.
+
 This slice does not add runtime context injection, model-facing memory tools,
-embeddings, graph retrieval, or automatic indexing. Those layers should build on
-the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` contract rather
-than introducing separate memory, skill, or document-store APIs.
+embeddings, graph retrieval, remote source connectors, or agent-authored memory.
+Those layers should build on the same `KnowledgeEntry` / `KnowledgeChunk` /
+`KnowledgeQuery` / `KnowledgeIndexer` contracts rather than introducing separate
+memory, skill, or document-store APIs.

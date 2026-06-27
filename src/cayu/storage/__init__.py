@@ -2,6 +2,14 @@
 
 from cayu.storage.budget_ledger import SQLiteBudgetLedger
 from cayu.storage.event_watchers import SQLiteEventWatcherStore
+from cayu.storage.knowledge_indexer import (
+    DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
+    DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES,
+    DEFAULT_KNOWLEDGE_INDEX_MAX_CHUNKS,
+    KnowledgeIndexer,
+    KnowledgeIndexRequest,
+    KnowledgeIndexResult,
+)
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     BUILTIN_KNOWLEDGE_KINDS,
@@ -25,6 +33,9 @@ from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 __all__ = [
     "BUILTIN_KNOWLEDGE_KINDS",
+    "DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES",
+    "DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES",
+    "DEFAULT_KNOWLEDGE_INDEX_MAX_CHUNKS",
     "DEFAULT_KNOWLEDGE_KIND",
     "DEFAULT_KNOWLEDGE_LIMIT",
     "DEFAULT_KNOWLEDGE_MAX_BYTES",
@@ -34,6 +45,9 @@ __all__ = [
     "KnowledgeChunk",
     "KnowledgeEntry",
     "KnowledgeHit",
+    "KnowledgeIndexRequest",
+    "KnowledgeIndexResult",
+    "KnowledgeIndexer",
     "KnowledgeQuery",
     "KnowledgeSearchMode",
     "KnowledgeSearchResult",
