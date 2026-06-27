@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Status
 
-Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu is in early development. The current codebase is a framework foundation/runtime slice: it includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, initial Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
 It does not yet include hosted deployment adapters, vector search, or higher-level task orchestration.
 
@@ -23,7 +23,7 @@ Cayu treats payloads, metadata, tool arguments, tool results, model options, che
 
 Framework objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
 
 Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue.
 
@@ -126,6 +126,38 @@ output = await copy_workspace_file_to_artifact(
 
 These copy helpers are explicit one-way operations. There is no hidden sync between
 artifact storage and the active workspace.
+
+Attach a knowledge store and register the recall tools when an agent should
+explicitly search durable facts, procedures, documents, skills, warnings, or other
+reusable context:
+
+```python
+from cayu import (
+    AgentSpec,
+    Environment,
+    EnvironmentSpec,
+    ReadKnowledgeTool,
+    SQLiteKnowledgeStore,
+    SearchKnowledgeTool,
+)
+
+knowledge_store = SQLiteKnowledgeStore("knowledge.sqlite")
+environment = Environment(
+    EnvironmentSpec(name="local"),
+    knowledge_store=knowledge_store,
+)
+
+app.register_environment(environment, default=True)
+app.register_agent(
+    AgentSpec(name="assistant", model="gpt-5.5"),
+    tools=[SearchKnowledgeTool(), ReadKnowledgeTool()],
+)
+```
+
+`search_knowledge` returns bounded previews and entry/chunk ids for active
+knowledge. `read_knowledge` expands bounded chunks from a returned entry. Filters
+such as namespace, labels, kinds, aspects, and source ids are retrieval hints;
+tenant/user/project isolation should be enforced by the app or store wrapper.
 
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:

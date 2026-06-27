@@ -14,6 +14,7 @@ from cayu.tools.files import (
     WriteFileTool,
     default_artifact_readers,
 )
+from cayu.tools.knowledge import ReadKnowledgeTool, SearchKnowledgeTool
 from cayu.tools.subagents import (
     SubagentContextMode,
     SubagentExecutionMode,
@@ -32,6 +33,8 @@ __all__ = [
     "PdfArtifactReader",
     "ReadFileOptions",
     "ReadFileTool",
+    "ReadKnowledgeTool",
+    "SearchKnowledgeTool",
     "SubagentContextMode",
     "SubagentExecutionMode",
     "SubagentResultTool",

@@ -4502,6 +4502,7 @@ class CayuApp:
                         on_resolve=resolved_proxy_secrets.append,
                         on_authorize=proxy_authorizations.append,
                     ),
+                    knowledge_store=_knowledge_store(registered_environment),
                     mcp_servers=_mcp_servers(registered_environment),
                     metadata=tool_execution.context_metadata(
                         tool_call_id=tool_call.id,
@@ -7184,6 +7185,14 @@ def _vault(registered_environment: runtime_records.RegisteredEnvironment | None)
     if registered_environment is None:
         return None
     return registered_environment.environment.vault
+
+
+def _knowledge_store(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> Any:
+    if registered_environment is None:
+        return None
+    return registered_environment.environment.knowledge_store
 
 
 @dataclass(frozen=True)

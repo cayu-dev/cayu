@@ -172,6 +172,7 @@ class ToolContext(BaseModel):
     runner: Any = Field(default=None, exclude=True)
     vault: Any = Field(default=None, exclude=True)
     proxy: Any = Field(default=None, exclude=True)
+    knowledge_store: Any = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

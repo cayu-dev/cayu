@@ -804,7 +804,7 @@ String-only tool results are not enough for the final framework.
 
 Tool failures are recoverable by default. They are recorded as `tool.call.failed` events and returned to the model as structured `tool_result` message parts with `is_error=true`. Tool policy denials are recorded separately as `tool.call.blocked`, do not execute the tool, and are also returned to the model as structured error `tool_result` message parts. The session itself should fail for provider errors, runtime contract violations, max-step exhaustion, storage failures, or unrecoverable infrastructure problems.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
 
 The first built-in tools are:
 
@@ -815,6 +815,8 @@ The first built-in tools are:
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, while background mode returns the child session id after startup
 - `subagent_result`: fetch one background subagent result by `child_session_id`, or wait for all background subagents started by the current parent session
+- `search_knowledge`: search the active knowledge store with bounded previews and optional filters
+- `read_knowledge`: expand bounded chunks from a returned knowledge entry
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 
@@ -827,6 +829,8 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `list_files`: 500 paths by default, 10,000 maximum per call
 - `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
 - `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
+- `search_knowledge`: 10 hits by default, 25 maximum per call; 20 KB preview text by default, 128 KB maximum per call
+- `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
 
 ## Workflow
 
@@ -1274,8 +1278,41 @@ across chunk boundaries. `max_chunks` and byte limits keep indexing bounded.
 `skip_unchanged=True` avoids rewriting only when the stored source hash, derived
 entry metadata, and derived chunks all match the newly indexed output.
 
-This slice does not add runtime context injection, model-facing memory tools,
-embeddings, graph retrieval, remote source connectors, or agent-authored memory.
-Those layers should build on the same `KnowledgeEntry` / `KnowledgeChunk` /
-`KnowledgeQuery` / `KnowledgeIndexer` contracts rather than introducing separate
-memory, skill, or document-store APIs.
+Apps can expose explicit agent recall by attaching a knowledge store to the
+environment and registering the built-in tools:
+
+```python
+store = SQLiteKnowledgeStore("knowledge.sqlite")
+environment = Environment(
+    EnvironmentSpec(name="local"),
+    knowledge_store=store,
+)
+
+app.register_environment(environment, default=True)
+app.register_agent(
+    AgentSpec(name="assistant", model="gpt-5.5"),
+    tools=[SearchKnowledgeTool(), ReadKnowledgeTool()],
+)
+```
+
+`search_knowledge` builds a bounded active-only `KnowledgeQuery` from
+model-provided query text and filters. It returns ranked previews plus entry/chunk
+ids. `read_knowledge` then expands one returned entry by `entry_id`, optional
+`chunk_index`, neighboring `around` window, chunk cap, and byte cap. Both tools
+fail as normal tool errors when the active environment has no `knowledge_store`,
+so apps explicitly choose which agents can recall durable knowledge.
+
+Filters are retrieval hints, not an authorization boundary. Production apps
+should attach a store already scoped to the active tenant/user/project, or
+provide a wrapper store/tool that enforces those constraints before calling the
+underlying store. The model does not need to know every namespace, label, kind,
+aspect, impact target, or source value to use `search_knowledge`; it can search
+with only `query`, then use returned hit metadata to refine later searches. Apps
+that rely on non-default namespaces or strict project/user labels should make
+that scope part of the registered agent/tool configuration or instructions.
+
+This slice does not add runtime context injection, embeddings, graph retrieval,
+remote source connectors, or agent-authored memory. Those layers should build on
+the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` /
+`KnowledgeIndexer` contracts rather than introducing separate memory, skill, or
+document-store APIs.

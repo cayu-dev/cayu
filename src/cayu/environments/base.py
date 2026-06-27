@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -15,8 +15,23 @@ from cayu.runners import Runner
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
 from cayu.workspaces import Workspace
 
+if TYPE_CHECKING:
+    from cayu.storage.memory import KnowledgeStore
+else:
+    KnowledgeStore = Any
+
 DEFAULT_WORKSPACE_INSTRUCTION_PATHS = ("AGENTS.md", ".cayu/AGENTS.md")
 DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES = 32 * 1024
+_KNOWLEDGE_STORE_METHODS = (
+    "put_entry",
+    "get_entry",
+    "update_entry_status",
+    "delete_entry",
+    "replace_chunks",
+    "put_entry_with_chunks",
+    "read_chunks",
+    "search",
+)
 
 
 class EnvironmentSpec(BaseModel):
@@ -113,6 +128,7 @@ class Environment:
         runner: Runner | None = None,
         vault: Vault | None = None,
         proxy: CredentialProxy | None = None,
+        knowledge_store: KnowledgeStore | None = None,
         binding: WorkspaceBinding | None = None,
         mcp_servers: Iterable[McpServerSpec] | None = None,
         workspace_instructions: WorkspaceInstructionsInput | None = None,
@@ -131,6 +147,8 @@ class Environment:
             raise TypeError("vault must be a Vault.")
         if proxy is not None and not isinstance(proxy, CredentialProxy):
             raise TypeError("proxy must be a CredentialProxy.")
+        if knowledge_store is not None:
+            _validate_knowledge_store(knowledge_store)
         if binding is not None and not isinstance(binding, WorkspaceBinding):
             raise TypeError("binding must be a WorkspaceBinding.")
 
@@ -149,6 +167,7 @@ class Environment:
         self.runner = runner
         self.vault = vault
         self.proxy = proxy
+        self.knowledge_store = knowledge_store
         self.binding = binding
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
@@ -180,10 +199,17 @@ def copy_environment(environment: Environment) -> Environment:
         runner=environment.runner,
         vault=environment.vault,
         proxy=environment.proxy,
+        knowledge_store=environment.knowledge_store,
         binding=environment.binding,
         mcp_servers=environment.mcp_servers,
         workspace_instructions=environment.workspace_instructions,
     )
+
+
+def _validate_knowledge_store(value: Any) -> None:
+    for method_name in _KNOWLEDGE_STORE_METHODS:
+        if not callable(getattr(value, method_name, None)):
+            raise TypeError("knowledge_store must implement KnowledgeStore.")
 
 
 def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:

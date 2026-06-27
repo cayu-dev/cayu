@@ -101,6 +101,7 @@ from cayu.runtime import (
 )
 from cayu.runtime.context import validate_context_messages
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry
 from cayu.tools import (
     SubagentExecutionMode,
     SubagentResultTool,
@@ -698,6 +699,80 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+def test_cayu_app_passes_environment_knowledge_store_to_tools() -> None:
+    class KnowledgeStoreCheckTool(Tool):
+        spec = ToolSpec(
+            name="check_knowledge_store",
+            description="Check whether the tool context has a knowledge store.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            entry = await ctx.knowledge_store.get_entry("entry_1")
+            return ToolResult(
+                content="knowledge store available",
+                structured={
+                    "has_knowledge_store": ctx.knowledge_store is not None,
+                    "entry_text": entry.text if entry is not None else None,
+                },
+            )
+
+    knowledge_store = InMemoryKnowledgeStore(
+        [KnowledgeEntry(id="entry_1", text="Runtime knowledge is available.")]
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_knowledge",
+                    name="check_knowledge_store",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[KnowledgeStoreCheckTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_store_context",
+                messages=[Message.text("user", "check knowledge")],
+            ),
+        )
+    )
+
+    tool_event = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    result_payload = tool_event.payload["result"]
+    assert result_payload["structured"] == {
+        "has_knowledge_store": True,
+        "entry_text": "Runtime knowledge is available.",
+    }
 
 
 def test_cayu_app_redacts_tool_results_before_events_transcript_and_context() -> None:
