@@ -136,6 +136,7 @@ from cayu import (
     AgentSpec,
     Environment,
     EnvironmentSpec,
+    ListKnowledgeTool,
     ReadKnowledgeTool,
     SQLiteKnowledgeStore,
     SearchKnowledgeTool,
@@ -150,14 +151,26 @@ environment = Environment(
 app.register_environment(environment, default=True)
 app.register_agent(
     AgentSpec(name="assistant", model="gpt-5.5"),
-    tools=[SearchKnowledgeTool(), ReadKnowledgeTool()],
+    tools=[ListKnowledgeTool(), SearchKnowledgeTool(), ReadKnowledgeTool()],
 )
 ```
 
-`search_knowledge` returns bounded previews and entry/chunk ids for active
-knowledge. `read_knowledge` expands bounded chunks from a returned entry. Filters
-such as namespace, labels, kinds, aspects, and source ids are retrieval hints;
-tenant/user/project isolation should be enforced by the app or store wrapper.
+`list_knowledge` lets the agent discover active entries and facets such as kinds,
+labels, aspects, namespaces, and source types before it knows the right search
+terms. `search_knowledge` returns bounded previews and entry/chunk ids for active
+knowledge; it accepts simple query text plus structured keyword fields
+(`any`/`all`/`none`/`phrases`) without exposing backend query syntax.
+For large stores, prefer `list_knowledge(group_by=["kind"])` for discovery, then
+targeted `search_knowledge`, then `read_knowledge` to expand the selected entry.
+The model-facing tool schema uses a list such as `["kind", "aspect", "label"]`;
+direct runtime calls may also pass a single facet field string.
+Grouped discovery omits entry previews by default; pass `include_entries=true`
+only when a small entry sample is useful. `limit` also caps facets per group, and
+`facets_truncated=true` means more buckets matched than were returned.
+`preview_bytes` controls per-result snippet size; `max_bytes` caps the total tool
+payload. Filters such as namespace, labels, kinds, aspects, and source ids are
+retrieval hints; tenant/user/project isolation should be enforced by the app or
+store wrapper.
 
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:

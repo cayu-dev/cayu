@@ -12,7 +12,12 @@ from cayu.storage import (
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeFacet,
     KnowledgeHit,
+    KnowledgeListGroup,
+    KnowledgeListItem,
+    KnowledgeListQuery,
+    KnowledgeListResult,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
@@ -432,6 +437,267 @@ def test_in_memory_knowledge_store_uses_importance_as_ranking_tiebreaker() -> No
     result = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["high_importance", "low_importance"]
+
+
+def test_in_memory_knowledge_store_structured_keyword_search() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry(
+            KnowledgeEntry(id="github_secret", text="GitHub push requires a credential broker.")
+        )
+        await store.put_entry(
+            KnowledgeEntry(id="sendgrid_secret", text="SendGrid email uses a secret proxy.")
+        )
+        await store.put_entry(
+            KnowledgeEntry(id="github_test", text="GitHub test credentials are fixture-only.")
+        )
+        return await store.search(
+            KnowledgeQuery(
+                any_terms=["credential", "secret"],
+                all_terms=["github push"],
+                none_terms=["fixture only"],
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+def test_in_memory_knowledge_store_searches_entry_text_with_custom_chunks() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(
+                id="broker_summary",
+                text="Remote sandbox Git operations need a brokered credential boundary.",
+            ),
+            [
+                KnowledgeChunk(
+                    id="broker_summary:0",
+                    entry_id="broker_summary",
+                    chunk_index=0,
+                    text="Implementation details live in the separate chunk body.",
+                )
+            ],
+        )
+        return await store.search(KnowledgeQuery(text="brokered credential"))
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["broker_summary"]
+    assert result.hits[0].reason == "entry text match"
+    assert "brokered credential" in result.hits[0].text_preview
+
+
+def test_in_memory_knowledge_store_matches_singular_plural_token_variants() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry(
+            KnowledgeEntry(
+                id="remote_git",
+                title="Remote sandbox Git credential boundary",
+                text=(
+                    "GitHub clone or push from a remote sandbox should use a brokered "
+                    "proxy. The trusted side injects the credential outside the sandbox."
+                ),
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="fixture",
+                text="Fixture credentials in local tests are not production guidance.",
+            )
+        )
+        return await store.search(
+            KnowledgeQuery(
+                all_terms=["GitHub", "credentials"],
+                any_terms=["sandbox", "push", "token"],
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["remote_git"]
+
+
+def test_in_memory_knowledge_store_matches_y_plural_token_variants() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
+        await store.put_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
+        key_result = await store.search(KnowledgeQuery(text="key"))
+        policy_result = await store.search(KnowledgeQuery(text="policy"))
+        return key_result, policy_result
+
+    key_result, policy_result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in key_result.hits] == ["keys"]
+    assert [hit.entry.id for hit in policy_result.hits] == ["policies"]
+
+
+def test_in_memory_knowledge_store_all_terms_match_across_entry_document() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(
+                id="split_match",
+                title="GitHub credential policy",
+                text="Remote sandbox operations use a trusted boundary.",
+            ),
+            [
+                KnowledgeChunk(
+                    id="split_match:0",
+                    entry_id="split_match",
+                    chunk_index=0,
+                    text="Use a brokered proxy for push operations.",
+                )
+            ],
+        )
+        return await store.search(KnowledgeQuery(all_terms=["github", "proxy"]))
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["split_match"]
+
+
+def test_in_memory_knowledge_store_all_terms_do_not_match_across_unrelated_chunks() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="split_chunks", text="General operations note."),
+            [
+                KnowledgeChunk(
+                    id="split_chunks:0",
+                    entry_id="split_chunks",
+                    chunk_index=0,
+                    text="GitHub push requires special handling.",
+                ),
+                KnowledgeChunk(
+                    id="split_chunks:1",
+                    entry_id="split_chunks",
+                    chunk_index=1,
+                    text="Use a brokered proxy for remote credentials.",
+                ),
+            ],
+        )
+        return await store.search(KnowledgeQuery(all_terms=["github", "proxy"]))
+
+    result = asyncio.run(run())
+
+    assert result.hits == []
+
+
+def test_in_memory_knowledge_store_lists_entries_and_facets() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry(
+            KnowledgeEntry(
+                id="runbook",
+                namespace="ops",
+                kind="procedure",
+                labels={"project": "billing"},
+                aspects=["payments"],
+                text="Payment reminder runbook.",
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="warning",
+                namespace="ops",
+                kind="warning",
+                labels={"project": "billing"},
+                aspects=["payments"],
+                text="Do not send reminders without approval.",
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="archived",
+                namespace="ops",
+                kind="warning",
+                status=KnowledgeStatus.ARCHIVED,
+                text="Old warning.",
+            )
+        )
+        return await store.list_entries(
+            KnowledgeListQuery(
+                namespace="ops",
+                labels={"project": "billing"},
+                group_by=KnowledgeListGroup.KIND,
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert result.total_entries_known == 2
+    assert [item.entry.id for item in result.entries] == ["warning", "runbook"]
+    assert [(facet.value, facet.count) for facet in result.facets] == [
+        ("procedure", 1),
+        ("warning", 1),
+    ]
+
+
+def test_in_memory_knowledge_store_caps_facets() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        for index in range(5):
+            await store.put_entry(
+                KnowledgeEntry(
+                    id=f"entry_{index}",
+                    labels={"area": f"area_{index}"},
+                    text=f"Knowledge entry {index}.",
+                )
+            )
+        return await store.list_entries(
+            KnowledgeListQuery(
+                group_by=KnowledgeListGroup.LABEL,
+                limit=3,
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert len(result.facets) == 3
+    assert result.facets_truncated is True
+    assert result.truncated is True
+
+
+def test_knowledge_list_result_validates_result_envelope() -> None:
+    query = KnowledgeListQuery(group_by=KnowledgeListGroup.KIND, limit=1)
+    entry = KnowledgeEntry(id="entry_1", text="Knowledge entry.")
+    facet = KnowledgeFacet(field=KnowledgeListGroup.KIND, value="fact", count=1)
+
+    result = KnowledgeListResult(
+        query=query,
+        entries=[KnowledgeListItem(entry=entry)],
+        facets=[facet],
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        total_entries_known=1,
+    )
+
+    assert result.entries[0].entry.id == "entry_1"
+    assert result.facets[0].field == KnowledgeListGroup.KIND
+
+    with pytest.raises(ValidationError, match="entries"):
+        KnowledgeListResult(
+            query=query,
+            entries=[
+                KnowledgeListItem(entry=KnowledgeEntry(id="entry_1", text="One.")),
+                KnowledgeListItem(entry=KnowledgeEntry(id="entry_2", text="Two.")),
+            ],
+            limit=query.limit,
+            max_bytes=query.max_bytes,
+        )
+
+    with pytest.raises(ValidationError, match="query.group_by"):
+        KnowledgeListResult(
+            query=query,
+            facets=[KnowledgeFacet(field=KnowledgeListGroup.LABEL, value="cayu", count=1)],
+            limit=query.limit,
+            max_bytes=query.max_bytes,
+        )
 
 
 def test_in_memory_knowledge_store_entry_and_chunk_lifecycle() -> None:

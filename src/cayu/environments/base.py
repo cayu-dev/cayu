@@ -31,6 +31,7 @@ _KNOWLEDGE_STORE_METHODS = (
     "put_entry_with_chunks",
     "read_chunks",
     "search",
+    "list_entries",
 )
 
 

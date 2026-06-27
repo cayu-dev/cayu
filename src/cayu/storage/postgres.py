@@ -84,7 +84,12 @@ from cayu.storage.memory import (
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeFacet,
     KnowledgeHit,
+    KnowledgeListGroup,
+    KnowledgeListItem,
+    KnowledgeListQuery,
+    KnowledgeListResult,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
@@ -93,6 +98,7 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
     copy_knowledge_chunk,
     copy_knowledge_entry,
+    copy_knowledge_list_query,
     copy_knowledge_query,
 )
 
@@ -271,6 +277,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     7: (
         "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_title_fts "
         "ON cayu_knowledge_entries USING GIN (to_tsvector('simple', COALESCE(title, '')))",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_entries_text_fts "
+        "ON cayu_knowledge_entries USING GIN (to_tsvector('simple', text))",
         "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_text_fts "
         "ON cayu_knowledge_chunks USING GIN (to_tsvector('simple', text))",
     ),
@@ -889,29 +897,31 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         query = copy_knowledge_query(query)
         if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
-        terms = _tokenize_knowledge_search_text(query.text)
-        if not terms:
-            return KnowledgeSearchResult(
-                query=query,
-                hits=[],
-                truncated=False,
-                limit=query.limit,
-                max_bytes=query.max_bytes,
-                total_hits_known=0,
-            )
-        ts_query = " | ".join(terms)
+        ts_query, preview_terms = _postgres_knowledge_ts_query(query)
+        search_filter_sql, search_filter_params = _postgres_knowledge_search_filter_sql(query)
         where_sql, params = _postgres_knowledge_filter_sql(query)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            total_hits_known = await self._count_search_hits(cur, ts_query, where_sql, params)
+            total_hits_known = await self._count_search_hits(
+                cur,
+                search_filter_sql,
+                [*search_filter_params, *params],
+                where_sql,
+            )
             rows = await self._search_unique_rows(
                 cur,
                 ts_query=ts_query,
+                search_filter_sql=search_filter_sql,
                 where_sql=where_sql,
-                params=params,
+                params=[*search_filter_params, *params],
                 limit=query.limit,
             )
-            hits, byte_truncated = await self._hits_from_search_rows(cur, rows, query, terms)
+            hits, byte_truncated = await self._hits_from_search_rows(
+                cur,
+                rows,
+                query,
+                preview_terms,
+            )
         return KnowledgeSearchResult(
             query=query,
             hits=hits,
@@ -919,6 +929,47 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             limit=query.limit,
             max_bytes=query.max_bytes,
             total_hits_known=total_hits_known,
+        )
+
+    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+        query = copy_knowledge_list_query(query)
+        where_sql, params = _postgres_knowledge_list_filter_sql(query)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            total_entries_known = await self._count_list_entries(cur, where_sql, params)
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT e.id
+                    FROM cayu_knowledge_entries AS e
+                    WHERE TRUE
+                    {where_sql}
+                    ORDER BY COALESCE(e.importance, 0.0) DESC,
+                             e.updated_at DESC,
+                             e.id ASC
+                    LIMIT %s
+                    """,
+                ),
+                [*params, query.limit],
+            )
+            rows = await cur.fetchall()
+            entries = [
+                entry
+                for row in rows
+                if (entry := await self._load_entry(cur, str(row[0]))) is not None
+            ]
+            facets, facets_truncated = await self._list_facets(cur, query, where_sql, params)
+            items, byte_truncated = await self._list_items(cur, entries, query)
+        return KnowledgeListResult(
+            query=query,
+            entries=items,
+            facets=facets,
+            facets_truncated=facets_truncated,
+            truncated=byte_truncated or len(items) < total_entries_known or facets_truncated,
+            limit=query.limit,
+            max_bytes=query.max_bytes,
+            total_entries_known=total_entries_known,
         )
 
     async def _upsert_entry(self, cur: Any, entry: KnowledgeEntry) -> None:
@@ -1136,22 +1187,19 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     async def _count_search_hits(
         self,
         cur: Any,
-        ts_query: str,
-        where_sql: str,
+        search_filter_sql: str,
         params: list[object],
+        where_sql: str,
     ) -> int:
         await cur.execute(
             f"""
             SELECT COUNT(DISTINCT e.id)
             FROM cayu_knowledge_chunks AS c
             JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
-            WHERE (
-                to_tsvector('simple', c.text) @@ to_tsquery('simple', %s)
-                OR to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
-            )
+            WHERE {search_filter_sql}
             {where_sql}
             """,
-            [ts_query, ts_query, *params],
+            params,
         )
         row = await cur.fetchone()
         return 0 if row is None else int(row[0])
@@ -1161,6 +1209,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         cur: Any,
         *,
         ts_query: str,
+        search_filter_sql: str,
         where_sql: str,
         params: list[object],
         limit: int,
@@ -1175,16 +1224,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     e.id AS entry_id,
                     c.id AS chunk_id,
                     ts_rank_cd(
-                        setweight(to_tsvector('simple', COALESCE(e.title, '')), 'A')
-                        || to_tsvector('simple', c.text),
+                        {_postgres_entry_search_vector_sql()},
                         to_tsquery('simple', %s)
                     ) AS score
                 FROM cayu_knowledge_chunks AS c
                 JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
-                WHERE (
-                    to_tsvector('simple', c.text) @@ to_tsquery('simple', %s)
-                    OR to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
-                )
+                WHERE {search_filter_sql}
                 {where_sql}
                 ORDER BY score DESC,
                          COALESCE(e.importance, 0.0) DESC,
@@ -1194,8 +1239,6 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 LIMIT %s OFFSET %s
                 """,
                 [
-                    ts_query,
-                    ts_query,
                     ts_query,
                     *params,
                     _KNOWLEDGE_SEARCH_PAGE_SIZE,
@@ -1258,6 +1301,83 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 )
             )
         return hits, truncated
+
+    async def _count_list_entries(
+        self,
+        cur: Any,
+        where_sql: str,
+        params: list[object],
+    ) -> int:
+        await cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM cayu_knowledge_entries AS e
+            WHERE TRUE
+            {where_sql}
+            """,
+            params,
+        )
+        row = await cur.fetchone()
+        return 0 if row is None else int(row[0])
+
+    async def _list_items(
+        self,
+        cur: Any,
+        entries: list[KnowledgeEntry],
+        query: KnowledgeListQuery,
+    ) -> tuple[list[KnowledgeListItem], bool]:
+        items: list[KnowledgeListItem] = []
+        remaining = query.max_bytes
+        truncated = False
+        for entry in entries:
+            if remaining <= 0:
+                truncated = True
+                break
+            preview_source = entry.title or entry.text
+            preview_bytes = len(preview_source.encode("utf-8"))
+            preview = _truncate_knowledge_text_to_bytes(preview_source, remaining)
+            if not preview:
+                truncated = True
+                break
+            returned_bytes = len(preview.encode("utf-8"))
+            if returned_bytes < preview_bytes:
+                truncated = True
+            remaining -= returned_bytes
+            items.append(
+                KnowledgeListItem(
+                    entry=entry,
+                    chunk_count=len(await self._load_chunks(cur, entry.id)),
+                    text_preview=preview,
+                )
+            )
+        return items, truncated
+
+    async def _list_facets(
+        self,
+        cur: Any,
+        query: KnowledgeListQuery,
+        where_sql: str,
+        params: list[object],
+    ) -> tuple[list[KnowledgeFacet], bool]:
+        if query.group_by is None:
+            return [], False
+        sql, facet_params = _postgres_list_facet_sql(
+            query.group_by,
+            where_sql,
+            params,
+            limit=query.limit + 1,
+        )
+        await cur.execute(sql, facet_params)
+        rows = await cur.fetchall()
+        return [
+            KnowledgeFacet(
+                field=query.group_by,
+                key=str(row[0]) if row[0] is not None else None,
+                value=str(row[1]),
+                count=int(row[2]),
+            )
+            for row in rows[: query.limit]
+        ], len(rows) > query.limit
 
 
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
@@ -3145,11 +3265,56 @@ def _copy_knowledge_entry_chunks(
 
 
 def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
+    return _postgres_knowledge_metadata_filter_sql(
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _postgres_knowledge_list_filter_sql(
+    query: KnowledgeListQuery,
+) -> tuple[str, list[object]]:
+    return _postgres_knowledge_metadata_filter_sql(
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _postgres_knowledge_metadata_filter_sql(
+    *,
+    namespace: str | None,
+    labels: dict[str, str],
+    kinds: list[str] | None,
+    statuses: list[KnowledgeStatus],
+    visibilities: list[KnowledgeVisibility] | None,
+    aspects: list[str],
+    impact_targets: list[str],
+    source_type: str | None,
+    source_id: str | None,
+    include_expired: bool,
+) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
-    clauses.append("e.namespace = %s")
-    params.append(query.namespace)
-    for key, value in query.labels.items():
+    if namespace is not None:
+        clauses.append("e.namespace = %s")
+        params.append(namespace)
+    for key, value in labels.items():
         clauses.append(
             """
             EXISTS (
@@ -3162,25 +3327,25 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
             """
         )
         params.extend([key, value])
-    if query.kinds is not None:
-        if query.kinds:
+    if kinds is not None:
+        if kinds:
             clauses.append("e.kind = ANY(%s)")
-            params.append(query.kinds)
+            params.append(kinds)
         else:
             clauses.append("FALSE")
-    if query.statuses:
+    if statuses:
         clauses.append("e.status = ANY(%s)")
-        params.append([str(status) for status in query.statuses])
-    if query.visibilities is not None:
+        params.append([str(status) for status in statuses])
+    if visibilities is not None:
         clauses.append("e.visibility = ANY(%s)")
-        params.append([str(visibility) for visibility in query.visibilities])
-    if query.source_type is not None:
+        params.append([str(visibility) for visibility in visibilities])
+    if source_type is not None:
         clauses.append("e.source_type = %s")
-        params.append(query.source_type)
-    if query.source_id is not None:
+        params.append(source_type)
+    if source_id is not None:
         clauses.append("e.source_id = %s")
-        params.append(query.source_id)
-    if query.aspects:
+        params.append(source_id)
+    if aspects:
         clauses.append(
             """
             EXISTS (
@@ -3191,8 +3356,8 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
             )
             """
         )
-        params.append(query.aspects)
-    if query.impact_targets:
+        params.append(aspects)
+    if impact_targets:
         clauses.append(
             """
             EXISTS (
@@ -3203,11 +3368,300 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
             )
             """
         )
-        params.append(query.impact_targets)
-    if not query.include_expired:
+        params.append(impact_targets)
+    if not include_expired:
         clauses.append("(e.expires_at IS NULL OR e.expires_at > %s)")
         params.append(datetime.now(UTC))
+    if not clauses:
+        return "", params
     return " AND " + " AND ".join(clauses), params
+
+
+def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
+    any_terms = _dedupe_knowledge_search_tokens(
+        [
+            *_expand_knowledge_search_tokens(_tokenize_knowledge_search_text(query.text or "")),
+            *(
+                token
+                for term in query.any_terms
+                for group in _structured_knowledge_search_token_groups(term)
+                for token in group
+            ),
+        ]
+    )
+    all_groups = _dedupe_knowledge_search_token_groups(
+        [group for term in query.all_terms for group in _structured_knowledge_search_token_groups(term)]
+    )
+    none_terms = _dedupe_knowledge_search_tokens(
+        [
+            token
+            for term in query.none_terms
+            for group in _structured_knowledge_search_token_groups(term)
+            for token in group
+        ]
+    )
+    phrase_queries = [_postgres_phrase_query(phrase) for phrase in query.phrases]
+    phrase_terms = _dedupe_knowledge_search_tokens(
+        [term for phrase in query.phrases for term in _tokenize_knowledge_search_text(phrase)]
+    )
+    positive_parts: list[str] = []
+    if any_terms:
+        positive_parts.append("(" + " | ".join(any_terms) + ")")
+    if all_groups:
+        positive_parts.append(
+            " & ".join("(" + " | ".join(group) + ")" for group in all_groups)
+        )
+    if phrase_queries:
+        positive_parts.append("(" + " | ".join(phrase_queries) + ")")
+    if not positive_parts:
+        raise ValueError("Knowledge query requires positive search terms.")
+    ts_query = " & ".join(positive_parts)
+    for term in none_terms:
+        ts_query += f" & !{term}"
+    preview_terms = _dedupe_knowledge_search_tokens(
+        [*any_terms, *(term for group in all_groups for term in group), *phrase_terms]
+    )
+    return ts_query, preview_terms
+
+
+def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
+    any_terms = _dedupe_knowledge_search_tokens(
+        [
+            *_expand_knowledge_search_tokens(_tokenize_knowledge_search_text(query.text or "")),
+            *(
+                token
+                for term in query.any_terms
+                for group in _structured_knowledge_search_token_groups(term)
+                for token in group
+            ),
+        ]
+    )
+    all_groups = _dedupe_knowledge_search_token_groups(
+        [group for term in query.all_terms for group in _structured_knowledge_search_token_groups(term)]
+    )
+    none_terms = _dedupe_knowledge_search_tokens(
+        [
+            token
+            for term in query.none_terms
+            for group in _structured_knowledge_search_token_groups(term)
+            for token in group
+        ]
+    )
+    phrase_queries = [_postgres_phrase_query(phrase) for phrase in query.phrases]
+    clauses: list[str] = []
+    params: list[object] = []
+    if any_terms:
+        clause, clause_params = _postgres_document_match_clause(
+            "(" + " | ".join(any_terms) + ")"
+        )
+        clauses.append(clause)
+        params.extend(clause_params)
+    for group in all_groups:
+        clause, clause_params = _postgres_document_match_clause(
+            "(" + " | ".join(group) + ")"
+        )
+        clauses.append(clause)
+        params.extend(clause_params)
+    if phrase_queries:
+        phrase_clauses: list[str] = []
+        for phrase_query in phrase_queries:
+            clause, clause_params = _postgres_document_match_clause(phrase_query)
+            phrase_clauses.append(clause)
+            params.extend(clause_params)
+        clauses.append("(" + " OR ".join(phrase_clauses) + ")")
+    for term in none_terms:
+        clause, clause_params = _postgres_document_match_clause(term)
+        clauses.append(f"NOT {clause}")
+        params.extend(clause_params)
+    if not any_terms and not all_groups and not phrase_queries:
+        raise ValueError("Knowledge query requires positive search terms.")
+    return cast("LiteralString", " AND ".join(clauses)), params
+
+
+def _postgres_document_match_clause(ts_query: str) -> tuple[LiteralString, list[object]]:
+    return (
+        cast(
+            "LiteralString",
+            """
+            (
+                to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
+                OR to_tsvector('simple', e.text) @@ to_tsquery('simple', %s)
+                OR (
+                    c.text <> e.text
+                    AND to_tsvector('simple', c.text) @@ to_tsquery('simple', %s)
+                )
+            )
+            """,
+        ),
+        [ts_query, ts_query, ts_query],
+    )
+
+
+def _postgres_list_facet_sql(
+    group_by: KnowledgeListGroup,
+    where_sql: str,
+    params: list[object],
+    *,
+    limit: int,
+) -> tuple[LiteralString, list[object]]:
+    limited_params = [*params, limit]
+    if group_by is KnowledgeListGroup.KIND:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT NULL AS key, e.kind AS value, COUNT(*) AS count
+                FROM cayu_knowledge_entries AS e
+                WHERE TRUE
+                {where_sql}
+                GROUP BY e.kind
+                ORDER BY count DESC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.NAMESPACE:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT NULL AS key, e.namespace AS value, COUNT(*) AS count
+                FROM cayu_knowledge_entries AS e
+                WHERE TRUE
+                {where_sql}
+                GROUP BY e.namespace
+                ORDER BY count DESC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.LABEL:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT label.key AS key, label.value AS value, COUNT(DISTINCT e.id) AS count
+                FROM cayu_knowledge_entries AS e
+                JOIN cayu_knowledge_labels AS label ON label.entry_id = e.id
+                WHERE TRUE
+                {where_sql}
+                GROUP BY label.key, label.value
+                ORDER BY count DESC, key ASC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.ASPECT:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT NULL AS key, aspect.aspect AS value, COUNT(DISTINCT e.id) AS count
+                FROM cayu_knowledge_entries AS e
+                JOIN cayu_knowledge_aspects AS aspect ON aspect.entry_id = e.id
+                WHERE TRUE
+                {where_sql}
+                GROUP BY aspect.aspect
+                ORDER BY count DESC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.IMPACT_TARGET:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT NULL AS key, target.impact_target AS value, COUNT(DISTINCT e.id) AS count
+                FROM cayu_knowledge_entries AS e
+                JOIN cayu_knowledge_impact_targets AS target ON target.entry_id = e.id
+                WHERE TRUE
+                {where_sql}
+                GROUP BY target.impact_target
+                ORDER BY count DESC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.VISIBILITY:
+        return (
+            cast(
+                "LiteralString",
+                f"""
+                SELECT NULL AS key, e.visibility AS value, COUNT(*) AS count
+                FROM cayu_knowledge_entries AS e
+                WHERE TRUE
+                {where_sql}
+                GROUP BY e.visibility
+                ORDER BY count DESC, value ASC
+                LIMIT %s
+                """,
+            ),
+            limited_params,
+        )
+    return (
+        cast(
+            "LiteralString",
+            f"""
+            SELECT NULL AS key, e.source_type AS value, COUNT(*) AS count
+            FROM cayu_knowledge_entries AS e
+            WHERE e.source_type IS NOT NULL
+            {where_sql}
+            GROUP BY e.source_type
+            ORDER BY count DESC, value ASC
+            LIMIT %s
+            """,
+        ),
+        limited_params,
+    )
+
+
+def _structured_knowledge_search_token_groups(value: str) -> list[list[str]]:
+    tokens = _tokenize_knowledge_search_text(value)
+    if not tokens:
+        raise ValueError("Structured knowledge search terms must contain at least one token.")
+    return [_knowledge_search_token_variants(token) for token in tokens]
+
+
+def _postgres_phrase_query(value: str) -> str:
+    tokens = _tokenize_knowledge_search_text(value)
+    if not tokens:
+        raise ValueError("Structured knowledge search phrases must contain at least one token.")
+    return " <-> ".join(tokens)
+
+
+def _dedupe_knowledge_search_tokens(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _dedupe_knowledge_search_token_groups(groups: list[list[str]]) -> list[list[str]]:
+    result: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for group in groups:
+        key = tuple(group)
+        if key not in seen:
+            result.append(group)
+            seen.add(key)
+    return result
+
+
+def _postgres_entry_search_vector_sql() -> LiteralString:
+    return cast(
+        "LiteralString",
+        """
+        setweight(to_tsvector('simple', COALESCE(e.title, '')), 'A')
+        || setweight(to_tsvector('simple', e.text), 'B')
+        || to_tsvector(
+               'simple',
+               CASE WHEN c.text = e.text THEN '' ELSE c.text END
+           )
+        """,
+    )
 
 
 def _center_knowledge_chunk_window(
@@ -3273,6 +3727,9 @@ def _knowledge_preview_for_match(
         title_terms = set(_tokenize_knowledge_search_text(entry.title))
         if any(term in title_terms for term in terms):
             return "title match", entry.title
+    entry_terms = set(_tokenize_knowledge_search_text(entry.text))
+    if any(term in entry_terms for term in terms):
+        return "entry text match", entry.text
     return "chunk text match", chunk.text
 
 
@@ -3308,6 +3765,29 @@ def _knowledge_has_only_default_chunk(
 
 def _tokenize_knowledge_search_text(text: str) -> list[str]:
     return _KNOWLEDGE_SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _expand_knowledge_search_tokens(tokens: list[str]) -> list[str]:
+    return [variant for token in tokens for variant in _knowledge_search_token_variants(token)]
+
+
+def _knowledge_search_token_variants(token: str) -> list[str]:
+    variants = [token]
+    if len(token) < 3 or not token.isalpha():
+        return variants
+    if token.endswith("ies") and len(token) > 4:
+        variants.append(token[:-3] + "y")
+    elif token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        variants.append(token[:-1])
+    else:
+        variants.append(_plural_knowledge_search_token(token))
+    return _dedupe_knowledge_search_tokens(variants)
+
+
+def _plural_knowledge_search_token(token: str) -> str:
+    if token.endswith("y") and len(token) > 1 and token[-2] not in "aeiou":
+        return token[:-1] + "ies"
+    return token + "s"
 
 
 def _truncate_knowledge_text_to_bytes(text: str, max_bytes: int) -> str:

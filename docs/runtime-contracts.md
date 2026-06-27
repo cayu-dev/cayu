@@ -815,6 +815,7 @@ The first built-in tools are:
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, while background mode returns the child session id after startup
 - `subagent_result`: fetch one background subagent result by `child_session_id`, or wait for all background subagents started by the current parent session
+- `list_knowledge`: discover active knowledge entries and facets without requiring a lexical search term
 - `search_knowledge`: search the active knowledge store with bounded previews and optional filters
 - `read_knowledge`: expand bounded chunks from a returned knowledge entry
 
@@ -829,7 +830,8 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `list_files`: 500 paths by default, 10,000 maximum per call
 - `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
 - `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
-- `search_knowledge`: 10 hits by default, 25 maximum per call; 20 KB preview text by default, 128 KB maximum per call
+- `list_knowledge`: 10 entries or facets per group by default, 25 maximum per call/group; 240 bytes of preview text per entry by default, 4 KB maximum per entry, and 20 KB total preview text by default, 128 KB maximum per call
+- `search_knowledge`: 10 hits by default, 25 maximum per call; 320 bytes of preview text per hit by default, 4 KB maximum per hit, and 20 KB total preview text by default, 128 KB maximum per call
 - `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
 
 ## Workflow
@@ -1226,16 +1228,22 @@ do not mistake these local stores for embedding or external retrieval backends.
 - `KnowledgeChunk`: bounded readable chunks for long entries. Stores may keep
   one default chunk for short entries, or replace the complete chunk set after
   indexing a larger source.
-- `KnowledgeQuery`: scoped retrieval request with namespace, labels, kinds,
-  status/visibility filters, aspects, impact targets, source filters, mode,
-  result limit, and preview byte cap.
+- `KnowledgeQuery`: scoped retrieval request with simple query text, structured
+  keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
+  labels, kinds, status/visibility filters, aspects, impact targets, source
+  filters, mode, result limit, and preview byte cap.
 - `KnowledgeSearchResult`: result envelope containing copied hits, truncation
   metadata, configured limits, and `total_hits_known` when the backend can count
   candidates.
+- `KnowledgeListQuery`: filter-only discovery request that can list entries or
+  group matching entries by kind, label, aspect, impact target, visibility,
+  source type, or namespace.
+- `KnowledgeListResult`: copied entry previews plus optional facets/counts for
+  agent navigation before targeted search.
 
 `KnowledgeQuery.max_bytes` bounds returned `text_preview` payloads from
 `search(...)`. It does not rewrite the copied `KnowledgeEntry` or
-`KnowledgeChunk` objects inside each `KnowledgeHit`; model-facing memory tools
+`KnowledgeChunk` objects inside each `KnowledgeHit`; model-facing knowledge tools
 and automatic injection layers must build their own bounded provider context
 from previews or explicitly read bounded chunks.
 
@@ -1250,6 +1258,7 @@ await store.replace_chunks(entry_id, chunks)
 await store.put_entry_with_chunks(entry, chunks)
 await store.read_chunks(entry_id, chunk_index=3, around=1)
 result = await store.search(query)
+listing = await store.list_entries(list_query)
 ```
 
 `KnowledgeIndexer` is the deterministic local indexing helper for app-owned text.
@@ -1291,14 +1300,28 @@ environment = Environment(
 app.register_environment(environment, default=True)
 app.register_agent(
     AgentSpec(name="assistant", model="gpt-5.5"),
-    tools=[SearchKnowledgeTool(), ReadKnowledgeTool()],
+    tools=[ListKnowledgeTool(), SearchKnowledgeTool(), ReadKnowledgeTool()],
 )
 ```
 
+`list_knowledge` builds a bounded active-only `KnowledgeListQuery` from filters
+and optional `group_by`, returning compact entry previews and facets/counts so
+the agent can discover what kinds of knowledge exist before guessing search
+terms. The model-facing tool schema uses a list of facet fields, for example
+`group_by=["kind"]` or `group_by=["kind", "aspect", "label"]`; direct runtime
+calls may also pass a single facet field string. For large stores, agents should
+usually call it with `group_by` first instead of listing many entries.
+When `group_by` is set, the model-facing tool omits entry previews by default;
+pass `include_entries=true` only when a small entry sample is useful. `limit`
+also caps returned facets per group; `facets_truncated=true` means more facet
+buckets matched than were returned.
 `search_knowledge` builds a bounded active-only `KnowledgeQuery` from
-model-provided query text and filters. It returns ranked previews plus entry/chunk
-ids. `read_knowledge` then expands one returned entry by `entry_id`, optional
-`chunk_index`, neighboring `around` window, chunk cap, and byte cap. Both tools
+model-provided query text, structured keyword fields (`any`/`all`/`none`/
+`phrases`), and filters. It returns ranked compact previews plus entry/chunk ids;
+`preview_bytes` controls per-hit snippet size, while `max_bytes` caps the total
+tool payload.
+`read_knowledge` then expands one returned entry by `entry_id`, optional
+`chunk_index`, neighboring `around` window, chunk cap, and byte cap. These tools
 fail as normal tool errors when the active environment has no `knowledge_store`,
 so apps explicitly choose which agents can recall durable knowledge.
 

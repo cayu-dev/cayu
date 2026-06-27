@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -39,6 +39,13 @@ BUILTIN_KNOWLEDGE_KINDS = (
 )
 
 
+class _SearchTerms(TypedDict):
+    any: list[str]
+    all: list[list[str]]
+    none: list[str]
+    phrases: list[str]
+
+
 class KnowledgeStatus(StrEnum):
     ACTIVE = "active"
     PENDING = "pending"
@@ -69,6 +76,16 @@ class KnowledgeSearchMode(StrEnum):
     SEMANTIC = "semantic"
     HYBRID = "hybrid"
     EXTERNAL = "external"
+
+
+class KnowledgeListGroup(StrEnum):
+    KIND = "kind"
+    LABEL = "label"
+    ASPECT = "aspect"
+    IMPACT_TARGET = "impact_target"
+    VISIBILITY = "visibility"
+    SOURCE_TYPE = "source_type"
+    NAMESPACE = "namespace"
 
 
 class KnowledgeEntry(BaseModel):
@@ -224,7 +241,11 @@ class KnowledgeChunk(BaseModel):
 class KnowledgeQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    text: str
+    text: str | None = None
+    any_terms: list[str] = Field(default_factory=list)
+    all_terms: list[str] = Field(default_factory=list)
+    none_terms: list[str] = Field(default_factory=list)
+    phrases: list[str] = Field(default_factory=list)
     namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
     labels: dict[str, str] = Field(default_factory=dict)
     kinds: list[str] | None = None
@@ -246,7 +267,9 @@ class KnowledgeQuery(BaseModel):
 
     @field_validator("text")
     @classmethod
-    def validate_nonblank_text(cls, value: str, info) -> str:
+    def validate_optional_nonblank_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return require_nonblank(value, info.field_name)
 
     @field_validator("namespace")
@@ -255,6 +278,97 @@ class KnowledgeQuery(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("source_type", "source_id")
+    @classmethod
+    def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "any_terms",
+        "all_terms",
+        "none_terms",
+        "phrases",
+        "kinds",
+        "aspects",
+        "impact_targets",
+        mode="before",
+    )
+    @classmethod
+    def copy_optional_string_list(cls, value, info) -> list[str] | None:
+        if value is None and info.field_name == "kinds":
+            return None
+        if value is None:
+            return []
+        copied = copy_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"`{info.field_name}` must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return _dedupe_strings(result)
+
+    @field_validator("limit", "max_bytes")
+    @classmethod
+    def validate_positive_int(cls, value: int, info) -> int:
+        if isinstance(value, bool) or type(value) is not int:
+            raise ValueError(f"`{info.field_name}` must be an integer.")
+        if value <= 0:
+            raise ValueError(f"`{info.field_name}` must be greater than 0.")
+        return value
+
+    @field_validator("statuses")
+    @classmethod
+    def validate_statuses(cls, value: list[KnowledgeStatus], info) -> list[KnowledgeStatus]:
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return list(dict.fromkeys(value))
+
+    @field_validator("visibilities")
+    @classmethod
+    def validate_visibilities(
+        cls,
+        value: list[KnowledgeVisibility] | None,
+        info,
+    ) -> list[KnowledgeVisibility] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def validate_has_positive_search_terms(self) -> KnowledgeQuery:
+        if _knowledge_query_has_positive_terms(self):
+            return self
+        raise ValueError("Knowledge query requires `text`, `any_terms`, `all_terms`, or `phrases`.")
+
+
+class KnowledgeListQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    namespace: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    kinds: list[str] | None = None
+    statuses: list[KnowledgeStatus] = Field(default_factory=lambda: [KnowledgeStatus.ACTIVE])
+    visibilities: list[KnowledgeVisibility] | None = None
+    aspects: list[str] = Field(default_factory=list)
+    impact_targets: list[str] = Field(default_factory=list)
+    source_type: str | None = None
+    source_id: str | None = None
+    include_expired: bool = False
+    group_by: KnowledgeListGroup | None = None
+    limit: int = DEFAULT_KNOWLEDGE_LIMIT
+    max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+    @field_validator("namespace", "source_type", "source_id")
     @classmethod
     def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -281,10 +395,7 @@ class KnowledgeQuery(BaseModel):
     @field_validator("limit", "max_bytes")
     @classmethod
     def validate_positive_int(cls, value: int, info) -> int:
-        if isinstance(value, bool) or type(value) is not int:
-            raise ValueError(f"`{info.field_name}` must be an integer.")
-        if value <= 0:
-            raise ValueError(f"`{info.field_name}` must be greater than 0.")
+        _validate_positive_int(value, info.field_name)
         return value
 
     @field_validator("statuses")
@@ -427,6 +538,128 @@ class KnowledgeSearchResult(BaseModel):
         return self
 
 
+class KnowledgeListItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entry: KnowledgeEntry
+    chunk_count: int = 0
+    text_preview: str | None = None
+
+    @field_validator("entry")
+    @classmethod
+    def copy_entry(cls, value):
+        return copy_knowledge_entry(value)
+
+    @field_validator("chunk_count")
+    @classmethod
+    def validate_chunk_count(cls, value: int, info) -> int:
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @field_validator("text_preview")
+    @classmethod
+    def validate_optional_nonblank_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+
+class KnowledgeFacet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: KnowledgeListGroup
+    value: str
+    count: int
+    key: str | None = None
+
+    @field_validator("value", "key")
+    @classmethod
+    def validate_optional_clean_nonblank(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("count")
+    @classmethod
+    def validate_count(cls, value: int, info) -> int:
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+
+class KnowledgeListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: KnowledgeListQuery
+    entries: list[KnowledgeListItem] = Field(default_factory=list)
+    facets: list[KnowledgeFacet] = Field(default_factory=list)
+    facets_truncated: bool = False
+    truncated: bool = False
+    limit: int
+    max_bytes: int
+    total_entries_known: int | None = None
+
+    @field_validator("query")
+    @classmethod
+    def copy_query(cls, value):
+        return copy_knowledge_list_query(value)
+
+    @field_validator("entries")
+    @classmethod
+    def copy_entries(cls, value):
+        return [copy_knowledge_list_item(item) for item in value]
+
+    @field_validator("facets")
+    @classmethod
+    def copy_facets(cls, value):
+        return [copy_knowledge_facet(facet) for facet in value]
+
+    @field_validator("limit", "max_bytes")
+    @classmethod
+    def validate_positive_int(cls, value: int, info) -> int:
+        _validate_positive_int(value, info.field_name)
+        return value
+
+    @field_validator("total_entries_known")
+    @classmethod
+    def validate_total_entries_known(cls, value: int | None, info) -> int | None:
+        if value is None:
+            return None
+        _validate_nonnegative_int(value, info.field_name)
+        return value
+
+    @model_validator(mode="after")
+    def validate_total_entries_known_covers_entries(self) -> KnowledgeListResult:
+        if self.total_entries_known is not None and self.total_entries_known < len(self.entries):
+            raise ValueError("`total_entries_known` cannot be less than the number of entries.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_limits_match_query(self) -> KnowledgeListResult:
+        if self.limit != self.query.limit:
+            raise ValueError("`limit` must match `query.limit`.")
+        if self.max_bytes != self.query.max_bytes:
+            raise ValueError("`max_bytes` must match `query.max_bytes`.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_entry_and_facet_count(self) -> KnowledgeListResult:
+        if len(self.entries) > self.limit:
+            raise ValueError("`entries` cannot contain more entries than `limit`.")
+        if len(self.facets) > self.limit:
+            raise ValueError("`facets` cannot contain more buckets than `limit`.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_facet_group(self) -> KnowledgeListResult:
+        if self.query.group_by is None and self.facets:
+            raise ValueError("`facets` require `query.group_by`.")
+        if self.query.group_by is not None:
+            for facet in self.facets:
+                if facet.field != self.query.group_by:
+                    raise ValueError("Knowledge facets must match `query.group_by`.")
+        return self
+
+
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
@@ -484,6 +717,10 @@ class KnowledgeStore(ABC):
     @abstractmethod
     async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
         """Search knowledge and return a bounded result envelope."""
+
+    @abstractmethod
+    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+        """List entries/facets for discovery without requiring a lexical search term."""
 
 
 class InMemoryKnowledgeStore(KnowledgeStore):
@@ -662,6 +899,58 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             total_hits_known=len(scored),
         )
 
+    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+        knowledge_query = copy_knowledge_list_query(query)
+        entries = [
+            entry
+            for entry in self._entries.values()
+            if _entry_matches_list_query(entry, knowledge_query)
+        ]
+        entries.sort(
+            key=lambda entry: (
+                -(entry.importance or 0.0),
+                -entry.updated_at.timestamp(),
+                entry.id,
+            )
+        )
+        facets, facets_truncated = _knowledge_facets(
+            entries,
+            knowledge_query.group_by,
+            limit=knowledge_query.limit,
+        )
+        items: list[KnowledgeListItem] = []
+        remaining = knowledge_query.max_bytes
+        truncated = False
+        for entry in entries[: knowledge_query.limit]:
+            if remaining <= 0:
+                truncated = True
+                break
+            preview_source = entry.title or entry.text
+            preview = _truncate_text_to_bytes(preview_source, remaining)
+            if not preview:
+                truncated = True
+                break
+            if len(preview.encode("utf-8")) < len(preview_source.encode("utf-8")):
+                truncated = True
+            remaining -= len(preview.encode("utf-8"))
+            items.append(
+                KnowledgeListItem(
+                    entry=entry,
+                    chunk_count=len(self._chunks.get(entry.id, [])),
+                    text_preview=preview,
+                )
+            )
+        return KnowledgeListResult(
+            query=knowledge_query,
+            entries=items,
+            facets=facets,
+            facets_truncated=facets_truncated,
+            truncated=truncated or len(items) < len(entries) or facets_truncated,
+            limit=knowledge_query.limit,
+            max_bytes=knowledge_query.max_bytes,
+            total_entries_known=len(entries),
+        )
+
 
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
     if type(entry) is not KnowledgeEntry:
@@ -713,6 +1002,10 @@ def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
         raise TypeError("KnowledgeQuery instances must not be subclasses.")
     return KnowledgeQuery(
         text=query.text,
+        any_terms=list(query.any_terms),
+        all_terms=list(query.all_terms),
+        none_terms=list(query.none_terms),
+        phrases=list(query.phrases),
         namespace=query.namespace,
         labels=copy_label_map(query.labels, "labels"),
         kinds=list(query.kinds) if query.kinds is not None else None,
@@ -724,6 +1017,26 @@ def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
         source_id=query.source_id,
         mode=query.mode,
         include_expired=query.include_expired,
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+    )
+
+
+def copy_knowledge_list_query(query: KnowledgeListQuery) -> KnowledgeListQuery:
+    if type(query) is not KnowledgeListQuery:
+        raise TypeError("KnowledgeListQuery instances must not be subclasses.")
+    return KnowledgeListQuery(
+        namespace=query.namespace,
+        labels=copy_label_map(query.labels, "labels"),
+        kinds=list(query.kinds) if query.kinds is not None else None,
+        statuses=list(query.statuses),
+        visibilities=list(query.visibilities) if query.visibilities is not None else None,
+        aspects=list(query.aspects),
+        impact_targets=list(query.impact_targets),
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+        group_by=query.group_by,
         limit=query.limit,
         max_bytes=query.max_bytes,
     )
@@ -741,6 +1054,27 @@ def copy_knowledge_hit(hit: KnowledgeHit) -> KnowledgeHit:
         score_kind=hit.score_kind,
         score_normalized=hit.score_normalized,
         text_preview=hit.text_preview,
+    )
+
+
+def copy_knowledge_list_item(item: KnowledgeListItem) -> KnowledgeListItem:
+    if type(item) is not KnowledgeListItem:
+        raise TypeError("KnowledgeListItem instances must not be subclasses.")
+    return KnowledgeListItem(
+        entry=copy_knowledge_entry(item.entry),
+        chunk_count=item.chunk_count,
+        text_preview=item.text_preview,
+    )
+
+
+def copy_knowledge_facet(facet: KnowledgeFacet) -> KnowledgeFacet:
+    if type(facet) is not KnowledgeFacet:
+        raise TypeError("KnowledgeFacet instances must not be subclasses.")
+    return KnowledgeFacet(
+        field=facet.field,
+        key=facet.key,
+        value=facet.value,
+        count=facet.count,
     )
 
 
@@ -821,31 +1155,76 @@ def _bounded_chunks(
 
 
 def _entry_matches_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
-    if entry.namespace != query.namespace:
+    return _entry_matches_metadata(
+        entry,
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _entry_matches_list_query(entry: KnowledgeEntry, query: KnowledgeListQuery) -> bool:
+    return _entry_matches_metadata(
+        entry,
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _entry_matches_metadata(
+    entry: KnowledgeEntry,
+    *,
+    namespace: str | None,
+    labels: dict[str, str],
+    kinds: list[str] | None,
+    statuses: list[KnowledgeStatus],
+    visibilities: list[KnowledgeVisibility] | None,
+    aspects: list[str],
+    impact_targets: list[str],
+    source_type: str | None,
+    source_id: str | None,
+    include_expired: bool,
+) -> bool:
+    if namespace is not None and entry.namespace != namespace:
         return False
-    for key, value in query.labels.items():
+    for key, value in labels.items():
         if entry.labels.get(key) != value:
             return False
-    if query.kinds is not None and entry.kind not in set(query.kinds):
+    if kinds is not None and entry.kind not in set(kinds):
         return False
-    if entry.status not in set(query.statuses):
+    if entry.status not in set(statuses):
         return False
-    if query.visibilities is not None and entry.visibility not in set(query.visibilities):
+    if visibilities is not None and entry.visibility not in set(visibilities):
         return False
-    if query.source_type is not None and entry.source_type != query.source_type:
+    if source_type is not None and entry.source_type != source_type:
         return False
-    if query.source_id is not None and entry.source_id != query.source_id:
+    if source_id is not None and entry.source_id != source_id:
         return False
-    if query.aspects and not set(query.aspects).intersection(entry.aspects):
+    if aspects and not set(aspects).intersection(entry.aspects):
         return False
-    if query.impact_targets and not set(query.impact_targets).intersection(entry.impact_targets):
+    if impact_targets and not set(impact_targets).intersection(entry.impact_targets):
         return False
-    return not _entry_is_expired_for_query(entry, query)
+    return not _entry_is_expired(entry, include_expired=include_expired)
 
 
-def _entry_is_expired_for_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
+def _entry_is_expired(entry: KnowledgeEntry, *, include_expired: bool) -> bool:
     return (
-        not query.include_expired
+        not include_expired
         and entry.expires_at is not None
         and entry.expires_at <= datetime.now(UTC)
     )
@@ -856,21 +1235,22 @@ def _score_entry(
     chunks: list[KnowledgeChunk],
     query: KnowledgeQuery,
 ) -> tuple[float, KnowledgeChunk | None, str, str]:
-    terms = _tokenize_search_text(query.text)
-    if not terms:
+    terms = _knowledge_query_terms(query)
+    if not _query_terms_have_positive_terms(terms):
         return 0.0, None, "empty query", entry.text
-    best_score = _score_text(entry.text, terms)
+    best_score = _score_candidate(entry.text, terms)
     best_chunk: KnowledgeChunk | None = None
     best_reason = "entry text match"
     best_preview_text = entry.text
     if entry.title is not None:
-        title_score = _score_text(entry.title, terms) * 1.2
+        title_score = _score_candidate(entry.title, terms) * 1.2
         if title_score > best_score:
             best_score = title_score
             best_reason = "title match"
             best_preview_text = entry.title
     for chunk in chunks:
-        chunk_score = _score_text(chunk.text, terms)
+        chunk_search_text = _entry_chunk_searchable_text(entry, chunk)
+        chunk_score = _score_candidate(chunk_search_text, terms)
         if chunk_score > best_score:
             best_score = chunk_score
             best_chunk = chunk
@@ -879,13 +1259,162 @@ def _score_entry(
     return best_score, best_chunk, best_reason, best_preview_text
 
 
-def _score_text(text: str, terms: list[str]) -> float:
+def _score_candidate(text: str, terms: _SearchTerms) -> float:
+    if not _text_matches_structured_terms(text, terms):
+        return 0.0
     token_counts = Counter(_tokenize_search_text(text))
-    return float(sum(token_counts[term] for term in terms))
+    score = float(sum(token_counts[term] for term in terms["any"]))
+    score += float(sum(max(token_counts[term] for term in group) for group in terms["all"]))
+    folded = text.casefold()
+    score += float(sum(2 for phrase in terms["phrases"] if phrase in folded))
+    return score
+
+
+def _text_matches_structured_terms(text: str, terms: _SearchTerms) -> bool:
+    tokens = set(_tokenize_search_text(text))
+    folded = text.casefold()
+    if any(term in tokens for term in terms["none"]):
+        return False
+    if not all(any(term in tokens for term in group) for group in terms["all"]):
+        return False
+    positives = terms["any"] or terms["phrases"]
+    return not positives or (
+        any(term in tokens for term in terms["any"])
+        or any(phrase in folded for phrase in terms["phrases"])
+    )
+
+
+def _entry_chunk_searchable_text(entry: KnowledgeEntry, chunk: KnowledgeChunk) -> str:
+    parts: list[str] = []
+    if entry.title is not None:
+        parts.append(entry.title)
+    parts.append(entry.text)
+    if chunk.text == entry.text:
+        return "\n".join(parts)
+    parts.append(chunk.text)
+    return "\n".join(parts)
+
+
+def _knowledge_query_terms(query: KnowledgeQuery) -> _SearchTerms:
+    text_terms = _expand_search_tokens(_tokenize_search_text(query.text or ""))
+    return {
+        "any": _dedupe_strings(
+            [
+                *text_terms,
+                *(
+                    token
+                    for term in query.any_terms
+                    for group in _normalize_search_term_groups(term)
+                    for token in group
+                ),
+            ]
+        ),
+        "all": _dedupe_search_term_groups(
+            [group for value in query.all_terms for group in _normalize_search_term_groups(value)]
+        ),
+        "none": _dedupe_strings(
+            [
+                token
+                for value in query.none_terms
+                for group in _normalize_search_term_groups(value)
+                for token in group
+            ]
+        ),
+        "phrases": _dedupe_strings([_normalize_search_phrase(phrase) for phrase in query.phrases]),
+    }
+
+
+def _knowledge_query_has_positive_terms(query: KnowledgeQuery) -> bool:
+    if _tokenize_search_text(query.text or ""):
+        return True
+    return bool(query.any_terms or query.all_terms or query.phrases)
+
+
+def _query_terms_have_positive_terms(terms: _SearchTerms) -> bool:
+    return bool(terms["any"] or terms["all"] or terms["phrases"])
+
+
+def _normalize_search_term_groups(value: str) -> list[list[str]]:
+    terms = _tokenize_search_text(value)
+    if not terms:
+        raise ValueError("Structured knowledge search terms must contain at least one token.")
+    return [_search_token_variants(term) for term in terms]
+
+
+def _dedupe_search_term_groups(groups: list[list[str]]) -> list[list[str]]:
+    result: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for group in groups:
+        key = tuple(group)
+        if key not in seen:
+            result.append(group)
+            seen.add(key)
+    return result
+
+
+def _normalize_search_phrase(value: str) -> str:
+    return require_nonblank(value, "phrase").casefold()
+
+
+def _knowledge_facets(
+    entries: list[KnowledgeEntry],
+    group_by: KnowledgeListGroup | None,
+    *,
+    limit: int,
+) -> tuple[list[KnowledgeFacet], bool]:
+    if group_by is None:
+        return [], False
+    counter: Counter[tuple[str | None, str]] = Counter()
+    for entry in entries:
+        if group_by is KnowledgeListGroup.KIND:
+            counter[(None, entry.kind)] += 1
+        elif group_by is KnowledgeListGroup.LABEL:
+            for key, value in entry.labels.items():
+                counter[(key, value)] += 1
+        elif group_by is KnowledgeListGroup.ASPECT:
+            for aspect in entry.aspects:
+                counter[(None, aspect)] += 1
+        elif group_by is KnowledgeListGroup.IMPACT_TARGET:
+            for target in entry.impact_targets:
+                counter[(None, target)] += 1
+        elif group_by is KnowledgeListGroup.VISIBILITY:
+            counter[(None, entry.visibility.value)] += 1
+        elif group_by is KnowledgeListGroup.SOURCE_TYPE and entry.source_type is not None:
+            counter[(None, entry.source_type)] += 1
+        elif group_by is KnowledgeListGroup.NAMESPACE:
+            counter[(None, entry.namespace)] += 1
+    facets = [
+        KnowledgeFacet(field=group_by, key=key, value=value, count=count)
+        for (key, value), count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    return facets[:limit], len(facets) > limit
 
 
 def _tokenize_search_text(text: str) -> list[str]:
     return _SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _expand_search_tokens(tokens: list[str]) -> list[str]:
+    return [variant for token in tokens for variant in _search_token_variants(token)]
+
+
+def _search_token_variants(token: str) -> list[str]:
+    variants = [token]
+    if len(token) < 3 or not token.isalpha():
+        return variants
+    if token.endswith("ies") and len(token) > 4:
+        variants.append(token[:-3] + "y")
+    elif token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        variants.append(token[:-1])
+    else:
+        variants.append(_plural_search_token(token))
+    return _dedupe_strings(variants)
+
+
+def _plural_search_token(token: str) -> str:
+    if token.endswith("y") and len(token) > 1 and token[-2] not in "aeiou":
+        return token[:-1] + "ies"
+    return token + "s"
 
 
 def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:

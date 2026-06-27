@@ -17,7 +17,12 @@ from cayu.storage.memory import (
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeFacet,
     KnowledgeHit,
+    KnowledgeListGroup,
+    KnowledgeListItem,
+    KnowledgeListQuery,
+    KnowledgeListResult,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
@@ -26,6 +31,7 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
     copy_knowledge_chunk,
     copy_knowledge_entry,
+    copy_knowledge_list_query,
     copy_knowledge_query,
 )
 
@@ -203,17 +209,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         knowledge_query = copy_knowledge_query(query)
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("SQLiteKnowledgeStore supports only auto and keyword search modes.")
-        terms = _tokenize_search_text(knowledge_query.text)
-        if not terms:
-            return KnowledgeSearchResult(
-                query=knowledge_query,
-                hits=[],
-                truncated=False,
-                limit=knowledge_query.limit,
-                max_bytes=knowledge_query.max_bytes,
-                total_hits_known=0,
-            )
-        fts_query = " OR ".join(f'"{term}"' for term in terms)
+        fts_query, preview_terms = _sqlite_knowledge_fts_query(knowledge_query)
         where_sql, params = _knowledge_filter_sql(knowledge_query)
         async with self._lock:
             total_hits_known = self._count_search_hits_unlocked(fts_query, where_sql, params)
@@ -226,7 +222,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             hits, byte_truncated = self._hits_from_search_rows_unlocked(
                 unique_rows,
                 knowledge_query,
-                terms,
+                preview_terms,
             )
         return KnowledgeSearchResult(
             query=knowledge_query,
@@ -235,6 +231,46 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             limit=knowledge_query.limit,
             max_bytes=knowledge_query.max_bytes,
             total_hits_known=total_hits_known,
+        )
+
+    async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
+        knowledge_query = copy_knowledge_list_query(query)
+        where_sql, params = _knowledge_list_filter_sql(knowledge_query)
+        async with self._lock:
+            total_entries_known = self._count_list_entries_unlocked(where_sql, params)
+            rows = self._connection.execute(
+                f"""
+                SELECT e.id
+                FROM cayu_knowledge_entries AS e
+                WHERE 1 = 1
+                {where_sql}
+                ORDER BY COALESCE(e.importance, 0.0) DESC,
+                         e.updated_at DESC,
+                         e.id ASC
+                LIMIT ?
+                """,
+                [*params, knowledge_query.limit],
+            ).fetchall()
+            entries = [
+                entry
+                for row in rows
+                if (entry := self._load_entry_unlocked(str(row["id"]))) is not None
+            ]
+            facets, facets_truncated = self._list_facets_unlocked(
+                knowledge_query,
+                where_sql,
+                params,
+            )
+            items, byte_truncated = self._list_items_unlocked(entries, knowledge_query)
+        return KnowledgeListResult(
+            query=knowledge_query,
+            entries=items,
+            facets=facets,
+            facets_truncated=facets_truncated,
+            truncated=byte_truncated or len(items) < total_entries_known or facets_truncated,
+            limit=knowledge_query.limit,
+            max_bytes=knowledge_query.max_bytes,
+            total_entries_known=total_entries_known,
         )
 
     async def close(self) -> None:
@@ -350,6 +386,76 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 )
             )
         return hits, truncated
+
+    def _count_list_entries_unlocked(self, where_sql: str, params: list[object]) -> int:
+        row = self._connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM cayu_knowledge_entries AS e
+            WHERE 1 = 1
+            {where_sql}
+            """,
+            params,
+        ).fetchone()
+        return 0 if row is None else int(row[0])
+
+    def _list_items_unlocked(
+        self,
+        entries: list[KnowledgeEntry],
+        query: KnowledgeListQuery,
+    ) -> tuple[list[KnowledgeListItem], bool]:
+        items: list[KnowledgeListItem] = []
+        remaining = query.max_bytes
+        truncated = False
+        for entry in entries:
+            if remaining <= 0:
+                truncated = True
+                break
+            preview_source = entry.title or entry.text
+            preview_bytes = len(preview_source.encode("utf-8"))
+            preview = _truncate_text_to_bytes(preview_source, remaining)
+            if not preview:
+                truncated = True
+                break
+            returned_bytes = len(preview.encode("utf-8"))
+            if returned_bytes < preview_bytes:
+                truncated = True
+            remaining -= returned_bytes
+            items.append(
+                KnowledgeListItem(
+                    entry=entry,
+                    chunk_count=len(self._load_chunks_unlocked(entry.id)),
+                    text_preview=preview,
+                )
+            )
+        return items, truncated
+
+    def _list_facets_unlocked(
+        self,
+        query: KnowledgeListQuery,
+        where_sql: str,
+        params: list[object],
+    ) -> tuple[list[KnowledgeFacet], bool]:
+        if query.group_by is None:
+            return [], False
+        rows = self._connection.execute(
+            *_sqlite_list_facet_sql(
+                query.group_by,
+                where_sql,
+                params,
+                limit=query.limit + 1,
+            )
+        ).fetchall()
+        facets = [
+            KnowledgeFacet(
+                field=query.group_by,
+                key=str(row["key"]) if row["key"] is not None else None,
+                value=str(row["value"]),
+                count=int(row["count"]),
+            )
+            for row in rows[: query.limit]
+        ]
+        return facets, len(rows) > query.limit
 
     def _upsert_entry_unlocked(self, entry: KnowledgeEntry) -> None:
         self._connection.execute(
@@ -482,7 +588,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             INSERT INTO cayu_knowledge_chunks_fts (entry_id, chunk_id, title, text)
             VALUES (?, ?, ?, ?)
             """,
-            [(entry.id, chunk.id, entry.title or "", chunk.text) for chunk in chunks],
+            [
+                (entry.id, chunk.id, entry.title or "", _fts_text_for_entry_chunk(entry, chunk))
+                for chunk in chunks
+            ],
         )
 
     def _load_entry_unlocked(self, entry_id: str) -> KnowledgeEntry | None:
@@ -558,11 +667,54 @@ class SQLiteKnowledgeStore(KnowledgeStore):
 
 
 def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
+    return _knowledge_metadata_filter_sql(
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[object]]:
+    return _knowledge_metadata_filter_sql(
+        namespace=query.namespace,
+        labels=query.labels,
+        kinds=query.kinds,
+        statuses=query.statuses,
+        visibilities=query.visibilities,
+        aspects=query.aspects,
+        impact_targets=query.impact_targets,
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
+def _knowledge_metadata_filter_sql(
+    *,
+    namespace: str | None,
+    labels: dict[str, str],
+    kinds: list[str] | None,
+    statuses: list[KnowledgeStatus],
+    visibilities: list[KnowledgeVisibility] | None,
+    aspects: list[str],
+    impact_targets: list[str],
+    source_type: str | None,
+    source_id: str | None,
+    include_expired: bool,
+) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
-    clauses.append("e.namespace = ?")
-    params.append(query.namespace)
-    for key, value in query.labels.items():
+    if namespace is not None:
+        clauses.append("e.namespace = ?")
+        params.append(namespace)
+    for key, value in labels.items():
         clauses.append(
             """
             EXISTS (
@@ -575,29 +727,29 @@ def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
             """
         )
         params.extend([key, value])
-    if query.kinds is not None:
-        if query.kinds:
-            placeholders = ", ".join("?" for _ in query.kinds)
+    if kinds is not None:
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
             clauses.append(f"e.kind IN ({placeholders})")
-            params.extend(query.kinds)
+            params.extend(kinds)
         else:
             clauses.append("0")
-    if query.statuses:
-        placeholders = ", ".join("?" for _ in query.statuses)
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
         clauses.append(f"e.status IN ({placeholders})")
-        params.extend(str(status) for status in query.statuses)
-    if query.visibilities is not None:
-        placeholders = ", ".join("?" for _ in query.visibilities)
+        params.extend(str(status) for status in statuses)
+    if visibilities is not None:
+        placeholders = ", ".join("?" for _ in visibilities)
         clauses.append(f"e.visibility IN ({placeholders})")
-        params.extend(str(visibility) for visibility in query.visibilities)
-    if query.source_type is not None:
+        params.extend(str(visibility) for visibility in visibilities)
+    if source_type is not None:
         clauses.append("e.source_type = ?")
-        params.append(query.source_type)
-    if query.source_id is not None:
+        params.append(source_type)
+    if source_id is not None:
         clauses.append("e.source_id = ?")
-        params.append(query.source_id)
-    if query.aspects:
-        placeholders = ", ".join("?" for _ in query.aspects)
+        params.append(source_id)
+    if aspects:
+        placeholders = ", ".join("?" for _ in aspects)
         clauses.append(
             f"""
             EXISTS (
@@ -608,9 +760,9 @@ def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
             )
             """
         )
-        params.extend(query.aspects)
-    if query.impact_targets:
-        placeholders = ", ".join("?" for _ in query.impact_targets)
+        params.extend(aspects)
+    if impact_targets:
+        placeholders = ", ".join("?" for _ in impact_targets)
         clauses.append(
             f"""
             EXISTS (
@@ -621,11 +773,194 @@ def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
             )
             """
         )
-        params.extend(query.impact_targets)
-    if not query.include_expired:
+        params.extend(impact_targets)
+    if not include_expired:
         clauses.append("(e.expires_at IS NULL OR e.expires_at > ?)")
         params.append(sqlite_support.format_datetime(datetime.now(UTC)))
+    if not clauses:
+        return "", params
     return " AND " + " AND ".join(clauses), params
+
+
+def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
+    any_terms = _dedupe_search_tokens(
+        [
+            *_expand_search_tokens(_tokenize_search_text(query.text or "")),
+            *(
+                token
+                for term in query.any_terms
+                for group in _structured_search_token_groups(term)
+                for token in group
+            ),
+        ]
+    )
+    all_groups = _dedupe_search_token_groups(
+        [group for term in query.all_terms for group in _structured_search_token_groups(term)]
+    )
+    none_terms = _dedupe_search_tokens(
+        [
+            token
+            for term in query.none_terms
+            for group in _structured_search_token_groups(term)
+            for token in group
+        ]
+    )
+    phrases = [phrase.casefold() for phrase in query.phrases]
+    positive_parts: list[str] = []
+    if any_terms:
+        positive_parts.append(
+            "(" + " OR ".join(_sqlite_fts_quote(term) for term in any_terms) + ")"
+        )
+    positive_parts.extend(
+        "(" + " OR ".join(_sqlite_fts_quote(term) for term in group) + ")"
+        for group in all_groups
+    )
+    if phrases:
+        positive_parts.append(
+            "(" + " OR ".join(_sqlite_fts_quote(phrase) for phrase in phrases) + ")"
+        )
+    if not positive_parts:
+        raise ValueError("Knowledge query requires positive search terms.")
+    fts_query = " AND ".join(positive_parts)
+    for term in none_terms:
+        fts_query += f" NOT {_sqlite_fts_quote(term)}"
+    preview_terms = _dedupe_search_tokens(
+        [
+            *any_terms,
+            *(term for group in all_groups for term in group),
+            *_tokenize_search_text(" ".join(phrases)),
+        ]
+    )
+    return fts_query, preview_terms
+
+
+def _sqlite_list_facet_sql(
+    group_by: KnowledgeListGroup,
+    where_sql: str,
+    params: list[object],
+    *,
+    limit: int,
+) -> tuple[str, list[object]]:
+    limited_params = [*params, limit]
+    if group_by is KnowledgeListGroup.KIND:
+        return (
+            f"""
+            SELECT NULL AS key, e.kind AS value, COUNT(*) AS count
+            FROM cayu_knowledge_entries AS e
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY e.kind
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.NAMESPACE:
+        return (
+            f"""
+            SELECT NULL AS key, e.namespace AS value, COUNT(*) AS count
+            FROM cayu_knowledge_entries AS e
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY e.namespace
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.LABEL:
+        return (
+            f"""
+            SELECT label.key AS key, label.value AS value, COUNT(DISTINCT e.id) AS count
+            FROM cayu_knowledge_entries AS e
+            JOIN cayu_knowledge_labels AS label ON label.entry_id = e.id
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY label.key, label.value
+            ORDER BY count DESC, key ASC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.ASPECT:
+        return (
+            f"""
+            SELECT NULL AS key, aspect.aspect AS value, COUNT(DISTINCT e.id) AS count
+            FROM cayu_knowledge_entries AS e
+            JOIN cayu_knowledge_aspects AS aspect ON aspect.entry_id = e.id
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY aspect.aspect
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.IMPACT_TARGET:
+        return (
+            f"""
+            SELECT NULL AS key, target.impact_target AS value, COUNT(DISTINCT e.id) AS count
+            FROM cayu_knowledge_entries AS e
+            JOIN cayu_knowledge_impact_targets AS target ON target.entry_id = e.id
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY target.impact_target
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    if group_by is KnowledgeListGroup.VISIBILITY:
+        return (
+            f"""
+            SELECT NULL AS key, e.visibility AS value, COUNT(*) AS count
+            FROM cayu_knowledge_entries AS e
+            WHERE 1 = 1
+            {where_sql}
+            GROUP BY e.visibility
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            limited_params,
+        )
+    return (
+        f"""
+        SELECT NULL AS key, e.source_type AS value, COUNT(*) AS count
+        FROM cayu_knowledge_entries AS e
+        WHERE e.source_type IS NOT NULL
+        {where_sql}
+        GROUP BY e.source_type
+        ORDER BY count DESC, value ASC
+        LIMIT ?
+        """,
+        limited_params,
+    )
+
+
+def _structured_search_token_groups(value: str) -> list[list[str]]:
+    tokens = _tokenize_search_text(value)
+    if not tokens:
+        raise ValueError("Structured knowledge search terms must contain at least one token.")
+    return [_search_token_variants(token) for token in tokens]
+
+
+def _sqlite_fts_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _dedupe_search_tokens(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _dedupe_search_token_groups(groups: list[list[str]]) -> list[list[str]]:
+    result: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for group in groups:
+        key = tuple(group)
+        if key not in seen:
+            result.append(group)
+            seen.add(key)
+    return result
 
 
 def _entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
@@ -796,7 +1131,16 @@ def _preview_for_match(
         title_terms = set(_tokenize_search_text(entry.title))
         if any(term in title_terms for term in terms):
             return "title match", entry.title
+    entry_terms = set(_tokenize_search_text(entry.text))
+    if any(term in entry_terms for term in terms):
+        return "entry text match", entry.text
     return "chunk text match", chunk.text
+
+
+def _fts_text_for_entry_chunk(entry: KnowledgeEntry, chunk: KnowledgeChunk) -> str:
+    if chunk.text == entry.text:
+        return chunk.text
+    return f"{entry.text}\n{chunk.text}"
 
 
 def _default_chunk_for_entry(entry: KnowledgeEntry) -> KnowledgeChunk:
@@ -828,6 +1172,29 @@ def _has_only_default_chunk(entry: KnowledgeEntry, chunks: list[KnowledgeChunk])
 
 def _tokenize_search_text(text: str) -> list[str]:
     return _SEARCH_TOKEN_RE.findall(text.casefold())
+
+
+def _expand_search_tokens(tokens: list[str]) -> list[str]:
+    return [variant for token in tokens for variant in _search_token_variants(token)]
+
+
+def _search_token_variants(token: str) -> list[str]:
+    variants = [token]
+    if len(token) < 3 or not token.isalpha():
+        return variants
+    if token.endswith("ies") and len(token) > 4:
+        variants.append(token[:-3] + "y")
+    elif token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        variants.append(token[:-1])
+    else:
+        variants.append(_plural_search_token(token))
+    return _dedupe_search_tokens(variants)
+
+
+def _plural_search_token(token: str) -> str:
+    if token.endswith("y") and len(token) > 1 and token[-2] not in "aeiou":
+        return token[:-1] + "ies"
+    return token + "s"
 
 
 def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:

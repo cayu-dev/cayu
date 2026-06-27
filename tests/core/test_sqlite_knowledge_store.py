@@ -9,6 +9,8 @@ import pytest
 from cayu.storage import (
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeListGroup,
+    KnowledgeListQuery,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeStatus,
@@ -234,6 +236,253 @@ def test_sqlite_knowledge_store_search_dedupes_across_large_chunk_matches(tmp_pa
     assert {hit.entry.id for hit in result.hits} == {"large", "small"}
     assert result.total_hits_known == 2
     assert result.truncated is False
+
+
+def test_sqlite_knowledge_store_structured_keyword_search(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(
+            KnowledgeEntry(id="github_secret", text="GitHub push requires a credential broker.")
+        )
+        await store.put_entry(
+            KnowledgeEntry(id="sendgrid_secret", text="SendGrid email uses a secret proxy.")
+        )
+        await store.put_entry(
+            KnowledgeEntry(id="github_test", text="GitHub test credentials are fixture-only.")
+        )
+        result = await store.search(
+            KnowledgeQuery(
+                any_terms=["credential", "secret"],
+                all_terms=["github push"],
+                none_terms=["fixture only"],
+            )
+        )
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+def test_sqlite_knowledge_store_searches_entry_text_with_custom_chunks(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(
+                id="broker_summary",
+                text="Remote sandbox Git operations need a brokered credential boundary.",
+            ),
+            [
+                KnowledgeChunk(
+                    id="broker_summary:0",
+                    entry_id="broker_summary",
+                    chunk_index=0,
+                    text="Implementation details live in the separate chunk body.",
+                )
+            ],
+        )
+        result = await store.search(KnowledgeQuery(text="brokered credential"))
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["broker_summary"]
+    assert result.hits[0].reason == "entry text match"
+    assert "brokered credential" in result.hits[0].text_preview
+
+
+def test_sqlite_knowledge_store_matches_singular_plural_token_variants(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(
+            KnowledgeEntry(
+                id="remote_git",
+                title="Remote sandbox Git credential boundary",
+                text=(
+                    "GitHub clone or push from a remote sandbox should use a brokered "
+                    "proxy. The trusted side injects the credential outside the sandbox."
+                ),
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="fixture",
+                text="Fixture credentials in local tests are not production guidance.",
+            )
+        )
+        result = await store.search(
+            KnowledgeQuery(
+                all_terms=["GitHub", "credentials"],
+                any_terms=["sandbox", "push", "token"],
+            )
+        )
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["remote_git"]
+
+
+def test_sqlite_knowledge_store_matches_y_plural_token_variants(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(KnowledgeEntry(id="keys", text="Store API keys securely."))
+        await store.put_entry(KnowledgeEntry(id="policies", text="Security policies apply."))
+        key_result = await store.search(KnowledgeQuery(text="key"))
+        policy_result = await store.search(KnowledgeQuery(text="policy"))
+        await _close(store)
+        return key_result, policy_result
+
+    key_result, policy_result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in key_result.hits] == ["keys"]
+    assert [hit.entry.id for hit in policy_result.hits] == ["policies"]
+
+
+def test_sqlite_knowledge_store_all_terms_match_across_entry_document(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(
+                id="split_match",
+                title="GitHub credential policy",
+                text="Remote sandbox operations use a trusted boundary.",
+            ),
+            [
+                KnowledgeChunk(
+                    id="split_match:0",
+                    entry_id="split_match",
+                    chunk_index=0,
+                    text="Use a brokered proxy for push operations.",
+                )
+            ],
+        )
+        result = await store.search(KnowledgeQuery(all_terms=["github", "proxy"]))
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["split_match"]
+
+
+def test_sqlite_knowledge_store_all_terms_do_not_match_across_unrelated_chunks(
+    tmp_path,
+) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="split_chunks", text="General operations note."),
+            [
+                KnowledgeChunk(
+                    id="split_chunks:0",
+                    entry_id="split_chunks",
+                    chunk_index=0,
+                    text="GitHub push requires special handling.",
+                ),
+                KnowledgeChunk(
+                    id="split_chunks:1",
+                    entry_id="split_chunks",
+                    chunk_index=1,
+                    text="Use a brokered proxy for remote credentials.",
+                ),
+            ],
+        )
+        result = await store.search(KnowledgeQuery(all_terms=["github", "proxy"]))
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert result.hits == []
+
+
+def test_sqlite_knowledge_store_lists_entries_and_facets(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(
+            KnowledgeEntry(
+                id="runbook",
+                namespace="ops",
+                kind="procedure",
+                labels={"project": "billing"},
+                text="Payment reminder runbook.",
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="warning",
+                namespace="ops",
+                kind="warning",
+                labels={"project": "billing"},
+                text="Do not send reminders without approval.",
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="archived",
+                namespace="ops",
+                kind="warning",
+                status=KnowledgeStatus.ARCHIVED,
+                text="Old warning.",
+            )
+        )
+        result = await store.list_entries(
+            KnowledgeListQuery(
+                namespace="ops",
+                labels={"project": "billing"},
+                group_by=KnowledgeListGroup.KIND,
+            )
+        )
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert result.total_entries_known == 2
+    assert {item.entry.id for item in result.entries} == {"runbook", "warning"}
+    assert [(facet.value, facet.count) for facet in result.facets] == [
+        ("procedure", 1),
+        ("warning", 1),
+    ]
+
+
+def test_sqlite_knowledge_store_caps_facets(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        for index in range(5):
+            await store.put_entry(
+                KnowledgeEntry(
+                    id=f"entry_{index}",
+                    labels={"area": f"area_{index}"},
+                    text=f"Knowledge entry {index}.",
+                )
+            )
+        result = await store.list_entries(
+            KnowledgeListQuery(
+                group_by=KnowledgeListGroup.LABEL,
+                limit=3,
+            )
+        )
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    assert len(result.facets) == 3
+    assert result.facets_truncated is True
+    assert result.truncated is True
 
 
 def test_sqlite_knowledge_store_chunk_windows_and_truncation(tmp_path) -> None:
