@@ -9,6 +9,8 @@ import pytest
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
+    CacheBreakpoint,
+    CachePolicy,
     CayuApp,
     FileAttachmentKind,
     Message,
@@ -27,6 +29,7 @@ from cayu.providers import (
     anthropic_response_events,
     build_anthropic_payload,
 )
+from cayu.providers.cache import resolve_cache_policy
 
 
 class RecordingTransport:
@@ -653,3 +656,200 @@ async def test_anthropic_provider_emits_nonblank_error_for_blank_exception() -> 
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
     assert events[0].payload == {"error": "RuntimeError: Anthropic provider failed"}
+
+
+_ALL_BREAKPOINTS = (
+    CacheBreakpoint.SYSTEM_PROMPT,
+    CacheBreakpoint.TOOL_DEFINITIONS,
+    CacheBreakpoint.CONVERSATION_PREFIX,
+)
+
+
+def _cache_request() -> ModelRequest:
+    return ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("system", "You are helpful."),
+            Message.text("user", "hi"),
+            Message.text("assistant", "hello"),
+            Message.text("user", "thanks"),
+        ],
+        tools=[{"name": "lookup", "description": "d", "input_schema": {"type": "object"}}],
+    )
+
+
+def test_cache_policy_marks_system_and_tools_by_default() -> None:
+    payload = build_anthropic_payload(_cache_request(), cache_policy=CachePolicy())
+    assert payload["system"] == [
+        {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    # default policy has no CONVERSATION_PREFIX breakpoint
+    assert not any(
+        "cache_control" in block for message in payload["messages"] for block in message["content"]
+    )
+
+
+def test_cache_policy_none_is_byte_identical_to_no_caching() -> None:
+    request = _cache_request()
+    assert build_anthropic_payload(request) == build_anthropic_payload(request, cache_policy=None)
+    payload = build_anthropic_payload(request)
+    assert isinstance(payload["system"], str)
+    assert "cache_control" not in payload["tools"][-1]
+
+
+def test_cache_policy_conversation_prefix_marks_second_to_last_message() -> None:
+    policy = CachePolicy(breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,))
+    payload = build_anthropic_payload(_cache_request(), cache_policy=policy)
+    # messages (system stripped): [user, assistant, user]; all_but_last marks index 1.
+    marked = [i for i, m in enumerate(payload["messages"]) if "cache_control" in m["content"][-1]]
+    assert marked == [1]
+    # system/tools untouched (not in breakpoints)
+    assert isinstance(payload["system"], str)
+    assert "cache_control" not in payload["tools"][-1]
+
+
+def test_cache_policy_conversation_prefix_all_but_last_n() -> None:
+    policy = CachePolicy(
+        breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,),
+        conversation_prefix_strategy="all_but_last_n",
+        conversation_prefix_n=2,
+    )
+    payload = build_anthropic_payload(_cache_request(), cache_policy=policy)
+    # 3 messages, skip last 2 -> mark index 0
+    marked = [i for i, m in enumerate(payload["messages"]) if "cache_control" in m["content"][-1]]
+    assert marked == [0]
+
+
+def test_cache_policy_conversation_prefix_too_few_messages_is_safe() -> None:
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hi")])
+    policy = CachePolicy(breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,))
+    payload = build_anthropic_payload(request, cache_policy=policy)
+    assert not any(
+        "cache_control" in block for message in payload["messages"] for block in message["content"]
+    )
+
+
+def test_cache_policy_empty_tools_and_system_do_not_crash() -> None:
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hi")])
+    payload = build_anthropic_payload(
+        request, cache_policy=CachePolicy(breakpoints=_ALL_BREAKPOINTS)
+    )
+    assert "system" not in payload
+    assert "tools" not in payload
+
+
+@pytest.mark.anyio
+async def test_cache_policy_extended_ttl_sets_1h_marker_without_beta_header() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_1",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            }
+        ]
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=transport,
+        cache_policy=CachePolicy(ttl="extended"),
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("system", "You are helpful."), Message.text("user", "hi")],
+    )
+
+    _ = [event async for event in provider.stream(request)]
+
+    # The ttl:"1h" marker alone enables 1-hour caching; it is GA and needs no beta header.
+    payload = transport.calls[0]["payload"]
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "anthropic-beta" not in transport.calls[0]["headers"]
+
+
+@pytest.mark.anyio
+async def test_cache_policy_per_request_override_beats_provider_default() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_1",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            }
+        ]
+    )
+    # Provider default caches nothing relevant; the request overrides with system caching.
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=transport,
+        cache_policy=CachePolicy(breakpoints=()),
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("system", "You are helpful."), Message.text("user", "hi")],
+        options={"cache_policy": {"breakpoints": ["system_prompt"]}},
+    )
+
+    _ = [event async for event in provider.stream(request)]
+
+    system = transport.calls[0]["payload"]["system"]
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_cache_policy_conversation_prefix_none_strategy_marks_nothing() -> None:
+    policy = CachePolicy(
+        breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,),
+        conversation_prefix_strategy="none",
+    )
+    payload = build_anthropic_payload(_cache_request(), cache_policy=policy)
+    assert not any(
+        "cache_control" in block for message in payload["messages"] for block in message["content"]
+    )
+
+
+def test_resolve_cache_policy_merges_partial_override_onto_default() -> None:
+    default = CachePolicy(breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,), ttl="extended")
+    # Overriding only ttl keeps the provider's breakpoints (no silent reset).
+    merged = resolve_cache_policy(default, {"cache_policy": {"ttl": "standard"}})
+    assert merged is not None
+    assert merged.breakpoints == (CacheBreakpoint.CONVERSATION_PREFIX,)
+    assert merged.ttl == "standard"
+    # No override returns the default unchanged; no default lets the override stand alone.
+    assert resolve_cache_policy(default, {}) is default
+    solo = resolve_cache_policy(None, {"cache_policy": {"breakpoints": ["system_prompt"]}})
+    assert solo is not None
+    assert solo.breakpoints == (CacheBreakpoint.SYSTEM_PROMPT,)
+
+
+@pytest.mark.anyio
+async def test_cache_policy_standard_ttl_has_no_beta_header() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_1",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            }
+        ]
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=transport,
+        cache_policy=CachePolicy(ttl="standard"),
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("system", "You are helpful."), Message.text("user", "hi")],
+    )
+
+    _ = [event async for event in provider.stream(request)]
+
+    assert "anthropic-beta" not in transport.calls[0]["headers"]
+    assert transport.calls[0]["payload"]["system"][0]["cache_control"] == {"type": "ephemeral"}

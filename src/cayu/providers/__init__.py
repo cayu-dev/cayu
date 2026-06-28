@@ -20,6 +20,7 @@ from cayu.providers.base import (
     copy_model_stream_event,
     normalize_model_completion,
 )
+from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.chat_completions import (
     ChatCompletionsAPIError,
     ChatCompletionsError,
@@ -47,6 +48,8 @@ __all__ = [
     "AnthropicProtocolError",
     "AnthropicProvider",
     "AnthropicTransport",
+    "CacheBreakpoint",
+    "CachePolicy",
     "ChatCompletionsAPIError",
     "ChatCompletionsError",
     "ChatCompletionsProtocolError",

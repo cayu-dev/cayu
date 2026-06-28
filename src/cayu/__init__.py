@@ -93,6 +93,8 @@ from cayu.mcp import (
 from cayu.observability import LoggingEventSink
 from cayu.providers import (
     AnthropicProvider,
+    CacheBreakpoint,
+    CachePolicy,
     ChatCompletionsProvider,
     ModelCompletion,
     ModelFinishReason,
@@ -433,6 +435,8 @@ __all__ = [
     "BudgetScope",
     "BudgetStore",
     "BudgetWindow",
+    "CacheBreakpoint",
+    "CachePolicy",
     "CacheUsageMetrics",
     "CausalBudgetCostSummary",
     "CausalBudgetUsageSummary",

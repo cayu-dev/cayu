@@ -29,6 +29,11 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
 )
+from cayu.providers.cache import (
+    CacheBreakpoint,
+    CachePolicy,
+    resolve_cache_policy,
+)
 
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
@@ -132,6 +137,7 @@ class AnthropicProvider(ModelProvider):
         timeout_s: float = DEFAULT_ANTHROPIC_TIMEOUT_SECONDS,
         transport: AnthropicTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key = require_nonblank(
@@ -155,15 +161,20 @@ class AnthropicProvider(ModelProvider):
         self.timeout_s = float(timeout_s)
         self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
+        if cache_policy is not None and type(cache_policy) is not CachePolicy:
+            raise TypeError("cache_policy must be a CachePolicy.")
+        self.cache_policy = cache_policy
 
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
+            policy = resolve_cache_policy(self.cache_policy, request.options)
             payload = build_anthropic_payload(
                 request,
                 default_max_tokens=self.max_tokens,
+                cache_policy=policy,
             )
             response = await self.transport.create_message(
                 url=f"{self.base_url}/v1/messages",
@@ -190,6 +201,7 @@ def build_anthropic_payload(
     request: ModelRequest,
     *,
     default_max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
+    cache_policy: CachePolicy | None = None,
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
@@ -220,7 +232,43 @@ def build_anthropic_payload(
     if tools:
         payload["tools"] = tools
     payload.update(options)
+    if cache_policy is not None:
+        _apply_cache_breakpoints(payload, cache_policy)
     return copy_json_value(payload, "anthropic_payload")
+
+
+def _apply_cache_breakpoints(payload: dict[str, Any], policy: CachePolicy) -> None:
+    if CacheBreakpoint.SYSTEM_PROMPT in policy.breakpoints:
+        # `_system_text` emits a flat string today; if a future structured-system-prompt
+        # feature makes it a block list, this guard skips it (no marker) rather than crash.
+        system = payload.get("system")
+        if isinstance(system, str) and system:
+            payload["system"] = [{"type": "text", "text": system, "cache_control": policy.marker()}]
+    if CacheBreakpoint.TOOL_DEFINITIONS in policy.breakpoints:
+        tools = payload.get("tools")
+        if tools:
+            tools[-1]["cache_control"] = policy.marker()
+    if CacheBreakpoint.CONVERSATION_PREFIX in policy.breakpoints:
+        _mark_conversation_prefix(payload, policy)
+
+
+def _mark_conversation_prefix(payload: dict[str, Any], policy: CachePolicy) -> None:
+    if policy.conversation_prefix_strategy == "none":
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    skip = (
+        policy.conversation_prefix_n
+        if policy.conversation_prefix_strategy == "all_but_last_n"
+        else 1
+    )
+    boundary = len(messages) - 1 - skip
+    if boundary < 0:
+        return  # too few messages for a stable cacheable prefix
+    content = messages[boundary].get("content")
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1]["cache_control"] = policy.marker()
 
 
 def anthropic_response_events(
