@@ -6,7 +6,8 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.observability import LoggingEventSink
+from cayu.observability import TRACE_LEVEL, LoggingEventSink
+from cayu.observability.logging import _level_for, _register_trace_level
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import CayuApp, EventSink, RunRequest
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -58,19 +59,66 @@ def test_logging_event_sink_summarizes_lifecycle_events(caplog: pytest.LogCaptur
     assert "step=2" in record.message
 
 
-def test_logging_event_sink_keeps_token_deltas_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+def test_logging_event_sink_routes_token_deltas_to_trace(caplog: pytest.LogCaptureFixture) -> None:
     logger = logging.getLogger("cayu.test.delta")
     sink = LoggingEventSink(logger=logger)
     event = Event(
         type=EventType.MODEL_TEXT_DELTA,
         session_id="sess_delta",
-        payload={"delta": "secret text that should not be logged at info"},
+        payload={"delta": "streamed token chunk"},
     )
 
-    caplog.set_level(logging.INFO, logger=logger.name)
+    # DEBUG is now clean — token deltas live below it, at TRACE.
+    caplog.set_level(logging.DEBUG, logger=logger.name)
     asyncio.run(sink.emit(event))
-
     assert caplog.records == []
+
+    # They surface only when the logger opts into TRACE.
+    caplog.clear()
+    caplog.set_level(TRACE_LEVEL, logger=logger.name)
+    asyncio.run(sink.emit(event))
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == TRACE_LEVEL
+    assert "model.text.delta" in caplog.records[0].message
+
+
+def test_level_for_routes_events_to_expected_levels() -> None:
+    assert _level_for(EventType.MODEL_TEXT_DELTA) == TRACE_LEVEL
+    assert _level_for(EventType.HOOK_STARTED) == logging.DEBUG
+    assert _level_for(EventType.MODEL_STARTED) == logging.INFO
+    assert _level_for(EventType.SESSION_INTERRUPTED) == logging.WARNING
+    assert _level_for(EventType.SESSION_FAILED) == logging.ERROR
+
+
+def test_trace_level_name_is_registered() -> None:
+    assert TRACE_LEVEL == 5
+    assert logging.getLevelName(TRACE_LEVEL) == "TRACE"
+
+
+def test_register_trace_level_skips_when_name_already_taken(monkeypatch) -> None:
+    # Another library already owns the "TRACE" name at a different level — don't clobber it.
+    added: list[tuple[int, str]] = []
+    monkeypatch.setattr(logging, "getLevelNamesMapping", lambda: {"TRACE": 15, "DEBUG": 10})
+    monkeypatch.setattr(logging, "addLevelName", lambda level, name: added.append((level, name)))
+    _register_trace_level()
+    assert added == []
+
+
+def test_register_trace_level_skips_when_level_number_already_taken(monkeypatch) -> None:
+    # Another library already named level 5 — don't overwrite that name.
+    added: list[tuple[int, str]] = []
+    monkeypatch.setattr(logging, "getLevelNamesMapping", lambda: {"VERBOSE": TRACE_LEVEL})
+    monkeypatch.setattr(logging, "addLevelName", lambda level, name: added.append((level, name)))
+    _register_trace_level()
+    assert added == []
+
+
+def test_register_trace_level_registers_when_free(monkeypatch) -> None:
+    added: list[tuple[int, str]] = []
+    monkeypatch.setattr(logging, "getLevelNamesMapping", lambda: {"DEBUG": 10, "INFO": 20})
+    monkeypatch.setattr(logging, "addLevelName", lambda level, name: added.append((level, name)))
+    _register_trace_level()
+    assert added == [(TRACE_LEVEL, "TRACE")]
 
 
 def test_logging_event_sink_summarizes_normalized_usage_metrics(

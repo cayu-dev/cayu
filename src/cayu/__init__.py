@@ -90,7 +90,7 @@ from cayu.mcp import (
     mcp_tool_manifest_server_hash,
     mcp_tool_manifest_tools,
 )
-from cayu.observability import LoggingEventSink
+from cayu.observability import TRACE_LEVEL, LoggingEventSink
 from cayu.providers import (
     AnthropicProvider,
     CacheBreakpoint,
@@ -405,6 +405,7 @@ __all__ = [
     "REDACTED_SECRET",
     "RESOLVED_FILE_ATTACHMENTS_OPTION",
     "TAINT_LABELS_METADATA_KEY",
+    "TRACE_LEVEL",
     "Agent",
     "AgentSpec",
     "AllowAllToolPolicy",

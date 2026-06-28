@@ -10,8 +10,26 @@ from cayu.vaults import SecretRedactor
 DEFAULT_CAYU_LOGGER_NAME = "cayu"
 DEFAULT_ERROR_SUMMARY_LIMIT = 200
 
-_DEBUG_EVENTS = {
+# A level below DEBUG (10) for very high-frequency streaming events (one per token
+# chunk) so DEBUG stays readable. Apps opt in with `logger.setLevel(TRACE_LEVEL)`.
+TRACE_LEVEL = 5
+
+
+def _register_trace_level() -> None:
+    # Logging level names AND numbers are process-global. Register "TRACE" only when
+    # both the number and the name are free, so importing cayu never overwrites another
+    # library's registration (e.g. a "TRACE" name already bound to a different level).
+    mapping = logging.getLevelNamesMapping()
+    if "TRACE" not in mapping and TRACE_LEVEL not in mapping.values():
+        logging.addLevelName(TRACE_LEVEL, "TRACE")
+
+
+_register_trace_level()
+
+_TRACE_EVENTS = {
     EventType.MODEL_TEXT_DELTA,
+}
+_DEBUG_EVENTS = {
     EventType.HOOK_STARTED,
     EventType.HOOK_COMPLETED,
 }
@@ -36,8 +54,14 @@ _ERROR_EVENTS = {
 class LoggingEventSink(EventSink):
     """Emit concise runtime event summaries through Python logging.
 
+    High-frequency streaming events (``model.text.delta``) log at ``TRACE_LEVEL``
+    (5) so ``DEBUG`` stays readable; set the logger to ``TRACE_LEVEL`` to see them.
+
     The sink does not configure global handlers, process logging levels, or
-    formatter state. Applications stay responsible for logging configuration.
+    formatter state — the one exception being the non-clobbering, idempotent
+    registration of the ``"TRACE"`` level name at import (skipped if the name or the
+    level number is already taken). Applications stay responsible for logging
+    configuration.
     """
 
     def __init__(
@@ -81,6 +105,8 @@ class LoggingEventSink(EventSink):
 
 
 def _level_for(event_type: EventType | str) -> int:
+    if event_type in _TRACE_EVENTS:
+        return TRACE_LEVEL
     if event_type in _DEBUG_EVENTS:
         return logging.DEBUG
     if event_type in _ERROR_EVENTS:
