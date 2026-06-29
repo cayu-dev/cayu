@@ -54,6 +54,9 @@ class EventType(StrEnum):
     CONTEXT_COMPACTION_STARTED = "context.compaction.started"
     CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"
     CONTEXT_COMPACTION_FAILED = "context.compaction.failed"
+    CONTEXT_COUNTED = "context.counted"
+    CONTEXT_COUNT_FAILED = "context.count.failed"
+    CONTEXT_COUNT_RECONCILED = "context.count.reconciled"
 
     KNOWLEDGE_SEARCH_STARTED = "knowledge.search.started"
     KNOWLEDGE_SEARCH_COMPLETED = "knowledge.search.completed"

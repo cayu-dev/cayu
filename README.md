@@ -438,6 +438,22 @@ The optional server exposes the same summary at
 budget and stop policies should build on them instead of parsing raw provider
 responses.
 
+Cayu can also observe pre-call input token counts when a provider implements
+`count_input_tokens(...)`. This is disabled by default and does not enforce
+context budgets or mutate model-facing context:
+
+```python
+from cayu import CayuApp, ContextCountingConfig
+
+app = CayuApp(context_counting=ContextCountingConfig(mode="observe"))
+```
+
+In observe mode, the runtime emits `context.counted` before `model.started`.
+When the provider later reports usage, it emits `context.count.reconciled` with
+the pre-call count, actual input tokens, and delta. If a provider does not
+support counting, the count is reported as unavailable; if counting fails, Cayu
+emits `context.count.failed` and still runs the model call.
+
 For work-item views that span forks or task-linked sessions, use the causal
 budget summaries:
 

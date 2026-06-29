@@ -47,6 +47,11 @@ from cayu.runtime.context import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime.context_counting import (
+    ContextCountingConfig,
+    ContextCountingMode,
+    copy_context_counting_config,
+)
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     CostLineItem,
@@ -217,6 +222,8 @@ __all__ = [
     "CompactionRequest",
     "CompactionResult",
     "ContextCompactor",
+    "ContextCountingConfig",
+    "ContextCountingMode",
     "ContextKnowledgeTelemetry",
     "ContextPolicy",
     "ContextRequest",
@@ -323,6 +330,7 @@ __all__ = [
     "UsageMetrics",
     "causal_budget_usage_summary",
     "classify_retryable_error",
+    "copy_context_counting_config",
     "copy_dispatch_handle",
     "copy_dispatch_request",
     "copy_mcp_manifest_policy",

@@ -26,6 +26,16 @@ Compaction checkpoints store the summary and `compacted_transcript_cursor`, the 
 
 `TranscriptDigestCompactor` is the deterministic fallback. It converts older messages into a clipped text digest and does not perform semantic summarization. `ModelCompactor` is the provider-backed implementation for production semantic summaries: it sends a text-only compaction request with no tools to a configured `ModelProvider`, rejects tool calls from the compaction model, and stores the returned text as the checkpoint summary. Model compaction bounds the serialized compaction input with `max_input_chars` by default so very large transcripts cannot create unbounded provider requests; the default prompt preserves compaction instructions and existing summary while clipping only the newly compacted transcript digest. Callers can tune or disable that bound explicitly. Callers can provide `system_prompt` to change compaction-model behavior and `prompt_builder` to replace the user prompt body.
 
+## Context Counting
+
+Context counting observes the final provider request after context policy output, knowledge injection, structured-output tool wiring, and file attachment resolution. It is disabled by default. `CayuApp(context_counting=ContextCountingConfig(mode="observe"))` asks the active `ModelProvider` to run `count_input_tokens(ModelRequest)` before each provider attempt.
+
+`count_input_tokens(...)` is optional provider behavior. Providers that support an official remote counter should return `InputTokenCountResult(method="official", confidence="high")`. Local tokenizers and heuristics may return lower-confidence results for observability, but they are not hard provider-limit guarantees. The runtime passes a copied `ModelRequest` into the counter so provider counting code cannot mutate the actual request sent to `stream(...)`. Providers that do not implement counting return `None`; the runtime records that as unavailable. If a counter raises, Cayu emits `context.count.failed` and still performs the model call because observe mode is not an enforcement boundary.
+
+Successful observation emits `context.counted` before `model.started`. The event payload includes model/provider identity, step/attempt, message count and roles, tool count, provider-option keys, an opaque observation id, and the provider's count result. It does not include prompt text, tool schemas, attachment contents, or a deterministic request-derived fingerprint. When the model later emits `model.completed` with normalized `usage_metrics.input_tokens`, Cayu emits `context.count.reconciled` with the same observation id, pre-call count, actual input tokens, delta, and relative error. Reconciliation is telemetry only; it does not rewrite budgets, transcripts, checkpoints, or context.
+
+This contract is the first slice for future context-budget enforcement. Later reducers or hard budget policies should consume the same final request boundary and count result, but enforcement must be explicit and should prefer official provider counters near hard context limits.
+
 ## Agent, Environment, Session
 
 Cayu separates agent definition, execution environment, and session state:

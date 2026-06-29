@@ -27,6 +27,84 @@ class ModelFinishReason(StrEnum):
     UNKNOWN = "unknown"
 
 
+class InputTokenCountMethod(StrEnum):
+    """How a provider counted one model request before submission."""
+
+    OFFICIAL = "official"
+    LOCAL_TOKENIZER = "local_tokenizer"
+    HEURISTIC = "heuristic"
+    UNAVAILABLE = "unavailable"
+
+
+class InputTokenCountConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    UNAVAILABLE = "unavailable"
+
+
+class InputTokenCountResult(BaseModel):
+    """Provider-neutral input token count for a model request.
+
+    Official provider counters should use `method="official"` and
+    `confidence="high"`. Local tokenizers and heuristics are useful for
+    observability, but callers should not treat them as hard provider-limit
+    guarantees.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int | None = Field(default=None, ge=0)
+    method: InputTokenCountMethod
+    confidence: InputTokenCountConfidence
+    components: dict[str, int] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def validate_method(cls, value: object) -> InputTokenCountMethod:
+        if isinstance(value, InputTokenCountMethod):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("`method` must be a string.")
+        return InputTokenCountMethod(require_clean_nonblank(value, "method"))
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def validate_confidence(cls, value: object) -> InputTokenCountConfidence:
+        if isinstance(value, InputTokenCountConfidence):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("`confidence` must be a string.")
+        return InputTokenCountConfidence(require_clean_nonblank(value, "confidence"))
+
+    @field_validator("components", mode="before")
+    @classmethod
+    def copy_components(cls, value: dict[str, Any]) -> dict[str, int]:
+        copied = copy_json_value(value, "components")
+        if type(copied) is not dict:
+            raise ValueError("`components` must be a dictionary.")
+        result: dict[str, int] = {}
+        for key, component_value in copied.items():
+            if type(key) is not str:
+                raise ValueError("Input token count component keys must be strings.")
+            clean_key = require_clean_nonblank(key, "component key")
+            if type(component_value) is not int:
+                raise ValueError("Input token count component values must be integers.")
+            if component_value < 0:
+                raise ValueError("Input token count component values must be non-negative.")
+            result[clean_key] = component_value
+        return result
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_json_value(value, "metadata")
+        if type(copied) is not dict:
+            raise ValueError("`metadata` must be a dictionary.")
+        return copied
+
+
 class ModelCompletion(BaseModel):
     """Provider-neutral completion metadata for a model step."""
 
@@ -184,6 +262,22 @@ def copy_model_completion(completion: ModelCompletion | None) -> ModelCompletion
     )
 
 
+def copy_input_token_count_result(
+    result: InputTokenCountResult | None,
+) -> InputTokenCountResult | None:
+    if result is None:
+        return None
+    if type(result) is not InputTokenCountResult:
+        raise TypeError("Input token count result must be an InputTokenCountResult instance.")
+    return InputTokenCountResult(
+        input_tokens=result.input_tokens,
+        method=result.method,
+        confidence=result.confidence,
+        components=copy_json_value(result.components, "components"),
+        metadata=copy_json_value(result.metadata, "metadata"),
+    )
+
+
 def normalize_model_completion(payload: dict[str, Any]) -> ModelCompletion:
     """Normalize known provider completion payloads without discarding raw fields."""
 
@@ -265,6 +359,19 @@ class ModelProvider(ABC):
     """Normalizes provider-specific model streams."""
 
     name: str
+
+    async def count_input_tokens(
+        self,
+        request: ModelRequest,
+    ) -> InputTokenCountResult | None:
+        """Optionally count the input tokens for one request before submission.
+
+        Providers that need to call a remote counting endpoint should do so here.
+        The default implementation is intentionally unavailable so existing
+        providers remain source-compatible.
+        """
+
+        return None
 
     @abstractmethod
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:

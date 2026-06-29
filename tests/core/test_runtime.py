@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -25,6 +26,9 @@ from cayu.environments import (
     WorkspaceSnapshot,
 )
 from cayu.providers import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -45,6 +49,8 @@ from cayu.runtime import (
     CompactionRequest,
     CompactionResult,
     ContextCompactor,
+    ContextCountingConfig,
+    ContextCountingMode,
     ContextPolicy,
     ContextRequest,
     Dispatcher,
@@ -133,6 +139,29 @@ class FakeProvider(ModelProvider):
             raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
             yield event
+
+
+class CountingProvider(FakeProvider):
+    def __init__(
+        self,
+        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
+        *,
+        count_result: InputTokenCountResult | None = None,
+        count_error: Exception | None = None,
+    ) -> None:
+        super().__init__(events)
+        self.count_result = count_result
+        self.count_error = count_error
+        self.count_requests: list[ModelRequest] = []
+
+    async def count_input_tokens(
+        self,
+        request: ModelRequest,
+    ) -> InputTokenCountResult | None:
+        self.count_requests.append(request)
+        if self.count_error is not None:
+            raise self.count_error
+        return self.count_result
 
 
 class OtherProvider(FakeProvider):
@@ -700,6 +729,205 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+def test_context_counting_is_off_by_default() -> None:
+    provider = CountingProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        count_result=InputTokenCountResult(
+            input_tokens=12,
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+        ),
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_context_counting_default_off",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.count_requests == []
+    assert EventType.CONTEXT_COUNTED not in {event.type for event in events}
+    assert EventType.CONTEXT_COUNT_RECONCILED not in {event.type for event in events}
+
+
+def test_context_counting_observe_emits_count_and_reconciliation_events() -> None:
+    user_text = "secret phrase should not be in context count event payload"
+    provider = CountingProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 15,
+                        "output_tokens": 2,
+                        "total_tokens": 17,
+                    },
+                }
+            ),
+        ],
+        count_result=InputTokenCountResult(
+            input_tokens=12,
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+            components={"messages": 10, "tools": 2},
+        ),
+    )
+    app = CayuApp(
+        context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_context_counting_observe",
+                messages=[Message.text("user", user_text)],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    counted_index = event_types.index(EventType.CONTEXT_COUNTED)
+    started_index = event_types.index(EventType.MODEL_STARTED)
+    completed_index = event_types.index(EventType.MODEL_COMPLETED)
+    reconciled_index = event_types.index(EventType.CONTEXT_COUNT_RECONCILED)
+    assert counted_index < started_index < completed_index < reconciled_index
+    assert len(provider.count_requests) == 1
+
+    counted = events[counted_index]
+    assert counted.payload["provider"] == "fake"
+    assert counted.payload["model"] == "fake-model"
+    assert isinstance(counted.payload["observation_id"], str)
+    assert counted.payload["observation_id"]
+    assert counted.payload["messages"] == {"count": 1, "roles": ["user"]}
+    assert counted.payload["tools"] == {"count": 0}
+    assert counted.payload["count"] == {
+        "input_tokens": 12,
+        "method": "official",
+        "confidence": "high",
+        "components": {"messages": 10, "tools": 2},
+        "metadata": {},
+    }
+    assert user_text not in json.dumps(counted.payload, sort_keys=True)
+
+    reconciled = events[reconciled_index]
+    assert reconciled.payload["observation_id"] == counted.payload["observation_id"]
+    assert reconciled.payload["pre_call_count"]["input_tokens"] == 12
+    assert reconciled.payload["actual_input_tokens"] == 15
+    assert reconciled.payload["delta_tokens"] == 3
+    assert reconciled.payload["relative_error"] == 0.2
+    assert reconciled.payload["reconciled"] is True
+
+
+def test_context_counting_uses_defensive_request_copy_for_provider_counter() -> None:
+    class MutatingCountingProvider(CountingProvider):
+        async def count_input_tokens(
+            self,
+            request: ModelRequest,
+        ) -> InputTokenCountResult | None:
+            result = await super().count_input_tokens(request)
+            part = request.messages[0].content[0]
+            assert isinstance(part, TextPart)
+            part.text = "mutated by counter"
+            request.tools.append({"name": "mutated_tool"})
+            request.options["temperature"] = 1
+            return result
+
+    provider = MutatingCountingProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        count_result=InputTokenCountResult(
+            input_tokens=12,
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+        ),
+    )
+    app = CayuApp(
+        context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_context_counting_copy",
+                messages=[Message.text("user", "original prompt")],
+            ),
+        )
+    )
+
+    count_part = provider.count_requests[0].messages[0].content[0]
+    stream_part = provider.requests[0].messages[0].content[0]
+    assert isinstance(count_part, TextPart)
+    assert isinstance(stream_part, TextPart)
+    assert count_part.text == "mutated by counter"
+    assert stream_part.text == "original prompt"
+    assert provider.count_requests[0].tools == [{"name": "mutated_tool"}]
+    assert provider.requests[0].tools == []
+    assert provider.count_requests[0].options["temperature"] == 1
+    assert "temperature" not in provider.requests[0].options
+
+
+def test_context_counting_failure_is_observable_and_does_not_block_model_call() -> None:
+    provider = CountingProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        count_error=RuntimeError("counter endpoint unavailable"),
+    )
+    app = CayuApp(
+        context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_context_counting_failure",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    assert EventType.CONTEXT_COUNT_FAILED in event_types
+    assert EventType.MODEL_COMPLETED in event_types
+    assert EventType.CONTEXT_COUNTED not in event_types
+    assert EventType.CONTEXT_COUNT_RECONCILED not in event_types
+
+    failed = next(event for event in events if event.type == EventType.CONTEXT_COUNT_FAILED)
+    assert failed.payload["error"] == "counter endpoint unavailable"
+    assert failed.payload["error_type"] == "RuntimeError"
 
 
 def test_cayu_app_passes_environment_knowledge_store_to_tools() -> None:

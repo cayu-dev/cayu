@@ -54,11 +54,15 @@ from cayu.environments import (
 )
 from cayu.mcp import McpToolAdapter, McpToolset
 from cayu.providers import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelCompletion,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    copy_input_token_count_result,
     copy_model_stream_event,
     normalize_model_completion,
 )
@@ -113,6 +117,11 @@ from cayu.runtime.context import (
     DefaultContextPolicy,
     RuntimeManagedContextPolicy,
     copy_context_messages,
+)
+from cayu.runtime.context_counting import (
+    ContextCountingConfig,
+    ContextCountingMode,
+    copy_context_counting_config,
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
@@ -295,6 +304,12 @@ class _ActiveSessionRun:
 
 
 @dataclass(frozen=True)
+class _ContextCountObservation:
+    result: InputTokenCountResult
+    observation_id: str
+
+
+@dataclass(frozen=True)
 class _BudgetStepReservation:
     limit: BudgetLimit
     record: BudgetReservationRecord
@@ -374,6 +389,7 @@ class CayuApp:
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
+        context_counting: ContextCountingConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
@@ -403,6 +419,7 @@ class CayuApp:
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         policies = validate_loop_policies(loop_policies, field_name="loop_policies")
         manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
+        context_counting_config = copy_context_counting_config(context_counting)
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
         )
@@ -450,6 +467,7 @@ class CayuApp:
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
         self._mcp_manifest_policy = manifest_policy
+        self._context_counting = context_counting_config
         self._event_sinks = sinks
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
@@ -3433,6 +3451,22 @@ class CayuApp:
         retry_policy = copy_retry_policy(retry_policy)
         attempt = 1
         while True:
+            (
+                context_count_observation,
+                context_count_event,
+            ) = await self._observe_model_request_context_count(
+                provider=provider,
+                model_request=model_request,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=retry_policy.max_attempts,
+            )
+            if context_count_event is not None:
+                yield context_count_event, None
             yield (
                 await self._emit(
                     Event(
@@ -3466,6 +3500,26 @@ class CayuApp:
                 ):
                     if event is not None:
                         yield event, None
+                        if (
+                            event.type == EventType.MODEL_COMPLETED
+                            and context_count_observation is not None
+                        ):
+                            yield (
+                                await self._emit(
+                                    _context_count_reconciled_event(
+                                        event,
+                                        observation=context_count_observation,
+                                        session=session,
+                                        registered_agent=registered_agent,
+                                        registered_provider=registered_provider,
+                                        environment_name=environment_name,
+                                        step=step,
+                                        attempt=attempt,
+                                        max_attempts=retry_policy.max_attempts,
+                                    )
+                                ),
+                                None,
+                            )
                     if step_result is not None:
                         result = step_result
                 if result is None:
@@ -3516,6 +3570,78 @@ class CayuApp:
                 )
                 await self._sleep_before_retry(session.id, decision)
                 attempt += 1
+
+    async def _observe_model_request_context_count(
+        self,
+        *,
+        provider: ModelProvider,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+    ) -> tuple[_ContextCountObservation | None, Event | None]:
+        if self._context_counting.mode == ContextCountingMode.OFF:
+            return None, None
+        observation_id = str(uuid4())
+        base_payload = _context_count_base_payload(
+            model_request=model_request,
+            provider_name=registered_provider.name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            observation_id=observation_id,
+        )
+        try:
+            provider_result = await provider.count_input_tokens(
+                _copy_model_request_for_counting(model_request)
+            )
+            provider_result = copy_input_token_count_result(provider_result)
+            result = (
+                provider_result
+                if provider_result is not None
+                else InputTokenCountResult(
+                    input_tokens=None,
+                    method=InputTokenCountMethod.UNAVAILABLE,
+                    confidence=InputTokenCountConfidence.UNAVAILABLE,
+                )
+            )
+        except Exception as exc:
+            event = await self._emit(
+                Event(
+                    type=EventType.CONTEXT_COUNT_FAILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **base_payload,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            )
+            return None, event
+
+        observation = _ContextCountObservation(
+            result=result,
+            observation_id=observation_id,
+        )
+        event = await self._emit(
+            Event(
+                type=EventType.CONTEXT_COUNTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    **base_payload,
+                    "count": result.model_dump(mode="json"),
+                },
+            )
+        )
+        return observation, event
 
     async def _run_model_step_once(
         self,
@@ -7495,6 +7621,104 @@ def _validate_stream_event(value: object) -> ModelStreamEvent:
     if type(value) is not ModelStreamEvent:
         raise TypeError("Model providers must yield ModelStreamEvent instances.")
     return copy_model_stream_event(value)
+
+
+def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    return ModelRequest(
+        model=request.model,
+        messages=request.messages,
+        tools=request.tools,
+        options=request.options,
+    )
+
+
+def _context_count_base_payload(
+    *,
+    model_request: ModelRequest,
+    provider_name: str,
+    step: int,
+    attempt: int,
+    max_attempts: int,
+    observation_id: str,
+) -> dict[str, Any]:
+    roles: list[str] = []
+    for message in model_request.messages:
+        role = message.role
+        roles.append(role.value if isinstance(role, MessageRole) else str(role))
+    return {
+        "model": model_request.model,
+        "provider": provider_name,
+        "step": step,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "observation_id": observation_id,
+        "messages": {
+            "count": len(model_request.messages),
+            "roles": roles,
+        },
+        "tools": {
+            "count": len(model_request.tools),
+        },
+        "options": {
+            "keys": sorted(model_request.options.keys()),
+        },
+    }
+
+
+def _context_count_reconciled_event(
+    model_completed_event: Event,
+    *,
+    observation: _ContextCountObservation,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_provider: runtime_records.RegisteredProvider,
+    environment_name: str | None,
+    step: int,
+    attempt: int,
+    max_attempts: int,
+) -> Event:
+    if model_completed_event.type != EventType.MODEL_COMPLETED:
+        raise ValueError("Context count reconciliation requires a model.completed event.")
+    actual_input_tokens = _actual_input_tokens_from_completed_event(model_completed_event)
+    estimated_input_tokens = observation.result.input_tokens
+    delta_tokens: int | None = None
+    relative_error: float | None = None
+    if actual_input_tokens is not None and estimated_input_tokens is not None:
+        delta_tokens = actual_input_tokens - estimated_input_tokens
+        if actual_input_tokens > 0:
+            relative_error = delta_tokens / actual_input_tokens
+    return Event(
+        type=EventType.CONTEXT_COUNT_RECONCILED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "model": session.model,
+            "provider": registered_provider.name,
+            "step": step,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "observation_id": observation.observation_id,
+            "pre_call_count": observation.result.model_dump(mode="json"),
+            "actual_input_tokens": actual_input_tokens,
+            "delta_tokens": delta_tokens,
+            "relative_error": relative_error,
+            "reconciled": actual_input_tokens is not None
+            and estimated_input_tokens is not None,
+        },
+    )
+
+
+def _actual_input_tokens_from_completed_event(event: Event) -> int | None:
+    usage_metrics = event.payload.get("usage_metrics")
+    if type(usage_metrics) is not dict:
+        return None
+    input_tokens = usage_metrics.get("input_tokens")
+    if type(input_tokens) is not int or input_tokens < 0:
+        return None
+    return input_tokens
 
 
 def _model_stream_event_to_runtime_event(
