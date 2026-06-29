@@ -6,7 +6,7 @@ import contextlib
 from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -371,6 +371,23 @@ def _clean_optional_query_value(value: str | None, field_name: str) -> str | Non
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _trace_context_metadata(http_request: Request) -> dict[str, Any]:
+    # Carry an inbound W3C trace context into the session metadata so an
+    # OpenTelemetryEventSink can root the session span under the caller's trace.
+    # Used as a shared dependency by every route that starts a traced session.
+    metadata: dict[str, Any] = {}
+    traceparent = http_request.headers.get("traceparent")
+    if traceparent:
+        metadata["traceparent"] = traceparent
+        tracestate = http_request.headers.get("tracestate")
+        if tracestate:
+            metadata["tracestate"] = tracestate
+    return metadata
+
+
+TraceContextMetadata = Annotated[dict[str, Any], Depends(_trace_context_metadata)]
+
+
 def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any]:
     return {
         "index": index,
@@ -421,7 +438,7 @@ def create_router(
     router = APIRouter(prefix="/api")
 
     @router.post("/run")
-    async def run_agent(body: RunBody):
+    async def run_agent(body: RunBody, trace_metadata: TraceContextMetadata):
         session_id = f"session-{uuid4().hex[:8]}"
 
         if task_store is not None:
@@ -449,6 +466,7 @@ def create_router(
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
+            metadata=trace_metadata,
         )
 
         async def generate():
@@ -458,7 +476,7 @@ def create_router(
         return EventSourceResponse(generate())
 
     @router.post("/resume")
-    async def resume_agent(body: ResumeBody):
+    async def resume_agent(body: ResumeBody, trace_metadata: TraceContextMetadata):
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -474,6 +492,7 @@ def create_router(
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
+            metadata=trace_metadata,
         )
 
         async def generate():

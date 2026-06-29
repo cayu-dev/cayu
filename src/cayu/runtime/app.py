@@ -2366,7 +2366,10 @@ class CayuApp:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
-                        payload=start_event_payload,
+                        payload={
+                            **start_event_payload,
+                            **_session_trace_event_fields(session, request_metadata),
+                        },
                     )
                 )
             async for event in self._recover_pending_tool_round(
@@ -6641,6 +6644,25 @@ def _environment_name(
     if registered_environment is None:
         return None
     return registered_environment.spec.name
+
+
+def _session_trace_event_fields(
+    session: Session,
+    request_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    # Surface the parent linkage and any inbound W3C trace context on the session
+    # start event so an OpenTelemetryEventSink can parent the root span. Additive:
+    # other sinks ignore these keys.
+    fields: dict[str, Any] = {}
+    if session.parent_session_id:
+        fields["parent_session_id"] = session.parent_session_id
+    traceparent = request_metadata.get("traceparent")
+    if isinstance(traceparent, str) and traceparent:
+        fields["traceparent"] = traceparent
+        tracestate = request_metadata.get("tracestate")
+        if isinstance(tracestate, str) and tracestate:
+            fields["tracestate"] = tracestate
+    return fields
 
 
 def _binding_base_payload(

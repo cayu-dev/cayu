@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 import pytest
@@ -73,6 +74,66 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["status"] == "completed"
     assert tasks[0]["worker_id"] is None
     assert tasks[0]["lease_expires_at"] is None
+
+
+def test_run_threads_inbound_traceparent_into_session_metadata() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    traceparent = "00-11111111111111111111111111111111-2222222222222222-01"
+    started = None
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello"},
+        headers={"traceparent": traceparent},
+    ) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            event = json.loads(line[len("data:") :].strip())
+            if event["type"] == "session.started":
+                started = event
+
+    assert started is not None
+    assert started["payload"]["traceparent"] == traceparent
+
+
+def _session_started_event(client: TestClient, path: str, body: dict, headers: dict) -> dict:
+    started = None
+    with client.stream("POST", path, json=body, headers=headers) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            event = json.loads(line[len("data:") :].strip())
+            if event["type"] in ("session.started", "session.resumed"):
+                started = event
+    assert started is not None
+    return started
+
+
+def test_resume_threads_inbound_traceparent_into_session_metadata() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
+    session_id = started["session_id"]
+
+    traceparent = "00-44444444444444444444444444444444-5555555555555555-01"
+    resumed = _session_started_event(
+        client,
+        "/api/resume",
+        {"session_id": session_id, "prompt": "again"},
+        {"traceparent": traceparent},
+    )
+    assert resumed["type"] == "session.resumed"
+    assert resumed["payload"]["traceparent"] == traceparent
 
 
 def test_server_task_list_exposes_worker_lease_state() -> None:

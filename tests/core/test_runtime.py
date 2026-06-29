@@ -7573,6 +7573,7 @@ def test_cayu_app_dispatches_forked_session_with_task_linkage():
         "appended_messages": 1,
         "dispatch_id": "dispatch_fork_1",
         "task_id": task.id,
+        "parent_session_id": "sess_dispatch_fork_source",
     }
     completed_task = asyncio.run(tasks.load_task(task.id))
     assert completed_task is not None

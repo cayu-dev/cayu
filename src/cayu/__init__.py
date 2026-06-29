@@ -90,7 +90,7 @@ from cayu.mcp import (
     mcp_tool_manifest_server_hash,
     mcp_tool_manifest_tools,
 )
-from cayu.observability import TRACE_LEVEL, LoggingEventSink
+from cayu.observability import TRACE_LEVEL, LoggingEventSink, OpenTelemetryEventSink
 from cayu.providers import (
     AnthropicProvider,
     CacheBreakpoint,
@@ -573,6 +573,7 @@ __all__ = [
     "NativeBinding",
     "NoWorkspaceBinding",
     "OpenAIProvider",
+    "OpenTelemetryEventSink",
     "ParameterConstrainedToolPolicy",
     "ParameterRule",
     "PassthroughProxy",
