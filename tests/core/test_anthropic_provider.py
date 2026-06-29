@@ -21,11 +21,13 @@ from cayu.core.messages import TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     AnthropicAPIError,
+    AnthropicContextOverflowError,
     AnthropicProtocolError,
     AnthropicProvider,
     HttpxAnthropicTransport,
     InputTokenCountConfidence,
     InputTokenCountMethod,
+    ModelContextOverflowError,
     ModelRequest,
     ModelStreamEventType,
     anthropic_response_events,
@@ -722,6 +724,126 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
     )
     assert "debug" not in message
     assert "not persisted" not in message
+
+
+@pytest.mark.anyio
+async def test_httpx_anthropic_transport_classifies_request_too_large(monkeypatch) -> None:
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            request = httpx.Request("POST", url)
+            response = httpx.Response(
+                413,
+                request=request,
+                headers={"content-type": "application/json"},
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "request_too_large",
+                        "message": "Request exceeds the maximum allowed number of bytes.",
+                    },
+                    "request_id": "req_context",
+                },
+            )
+            raise httpx.HTTPStatusError(
+                "request too large",
+                request=request,
+                response=response,
+            )
+
+    monkeypatch.setattr(
+        "cayu.providers.anthropic.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    with pytest.raises(AnthropicContextOverflowError) as exc_info:
+        await HttpxAnthropicTransport().create_message(
+            url="https://api.anthropic.com/v1/messages",
+            headers={},
+            payload={},
+            timeout_s=1,
+        )
+
+    assert exc_info.value.provider == "anthropic"
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert isinstance(exc_info.value, AnthropicAPIError)
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.error_type == "request_too_large"
+    assert exc_info.value.request_id == "req_context"
+    assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+
+@pytest.mark.anyio
+async def test_httpx_anthropic_transport_classifies_prompt_too_long(monkeypatch) -> None:
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            request = httpx.Request("POST", url)
+            response = httpx.Response(
+                400,
+                request=request,
+                headers={"content-type": "application/json"},
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Prompt is too long for this model's context window.",
+                    },
+                },
+            )
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=request,
+                response=response,
+            )
+
+    monkeypatch.setattr(
+        "cayu.providers.anthropic.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    with pytest.raises(AnthropicContextOverflowError) as exc_info:
+        await HttpxAnthropicTransport().create_message(
+            url="https://api.anthropic.com/v1/messages",
+            headers={},
+            payload={},
+            timeout_s=1,
+        )
+
+    assert exc_info.value.provider == "anthropic"
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert isinstance(exc_info.value, AnthropicAPIError)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
 
 
 @pytest.mark.anyio

@@ -28,6 +28,7 @@ from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
+    ModelContextOverflowError,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -65,6 +66,31 @@ class AnthropicError(RuntimeError):
 
 class AnthropicAPIError(AnthropicError):
     """Raised when the Anthropic HTTP API returns an error response."""
+
+
+class AnthropicContextOverflowError(AnthropicAPIError, ModelContextOverflowError):
+    """Raised when Anthropic reports that the request exceeds context limits."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelContextOverflowError.__init__(
+            self,
+            message,
+            provider="anthropic",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            response_body=response_body,
+        )
 
 
 class AnthropicProtocolError(AnthropicError):
@@ -147,6 +173,10 @@ class HttpxAnthropicTransport:
                 )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            try:
+                _raise_anthropic_context_overflow_if_applicable(exc.response)
+            except ModelContextOverflowError as overflow:
+                raise overflow from exc
             raise AnthropicAPIError(
                 "Anthropic API request failed with HTTP "
                 f"{exc.response.status_code}: "
@@ -660,6 +690,69 @@ def _safe_error_response_text(response: httpx.Response) -> str:
         if isinstance(decoded, Mapping):
             return _safe_error_json(decoded)
     return _truncate_error_text(response.text)
+
+
+def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) -> None:
+    decoded = _response_json_object(response)
+    if decoded is None:
+        return
+    error = decoded.get("error")
+    request_id = decoded.get("request_id")
+    if not isinstance(error, Mapping):
+        return
+    error_type = _optional_error_string(error.get("type"))
+    message = _optional_error_string(error.get("message"))
+    if not _is_anthropic_context_overflow(
+        status_code=response.status_code,
+        error_type=error_type,
+        message=message,
+    ):
+        return
+    raise AnthropicContextOverflowError(
+        "Anthropic model context overflow",
+        status_code=response.status_code,
+        error_type=error_type,
+        request_id=request_id if isinstance(request_id, str) else None,
+        response_body=_safe_error_response_text(response),
+    )
+
+
+def _is_anthropic_context_overflow(
+    *,
+    status_code: int,
+    error_type: str | None,
+    message: str | None,
+) -> bool:
+    if status_code == 413 and error_type == "request_too_large":
+        return True
+    if status_code != 400 or error_type != "invalid_request_error" or message is None:
+        return False
+    normalized = message.lower()
+    return (
+        "prompt is too long" in normalized
+        or "context window" in normalized
+        or "maximum context" in normalized
+        or ("token" in normalized and ("too long" in normalized or "exceed" in normalized))
+    )
+
+
+def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return None
+    try:
+        decoded = response.json()
+    except ValueError:
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    return decoded
+
+
+def _optional_error_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:

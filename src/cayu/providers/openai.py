@@ -30,6 +30,7 @@ from cayu.providers.base import (
     InputTokenCountMethod,
     InputTokenCountResult,
     ModelCompletion,
+    ModelContextOverflowError,
     ModelFinishReason,
     ModelProvider,
     ModelRequest,
@@ -80,6 +81,31 @@ class OpenAIError(RuntimeError):
 
 class OpenAIAPIError(OpenAIError):
     """Raised when the OpenAI HTTP API returns an error response."""
+
+
+class OpenAIContextOverflowError(OpenAIAPIError, ModelContextOverflowError):
+    """Raised when OpenAI reports that the request exceeds context limits."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelContextOverflowError.__init__(
+            self,
+            message,
+            provider="openai",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            response_body=response_body,
+        )
 
 
 class OpenAIProtocolError(OpenAIError):
@@ -133,6 +159,10 @@ class HttpxOpenAITransport:
                 )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            try:
+                _raise_openai_context_overflow_if_applicable(exc.response)
+            except ModelContextOverflowError as overflow:
+                raise overflow from exc
             raise OpenAIAPIError(
                 "OpenAI API request failed with HTTP "
                 f"{exc.response.status_code}: "
@@ -179,6 +209,7 @@ class HttpxOpenAITransport:
                     # body and raises httpx.ResponseNotRead, masking the real API
                     # error (e.g. HTTP 404 "item not found").
                     await response.aread()
+                    _raise_openai_context_overflow_if_applicable(response)
                     raise OpenAIAPIError(
                         "OpenAI API request failed with HTTP "
                         f"{response.status_code}: "
@@ -495,6 +526,7 @@ async def openai_stream_events(
             completed = True
             continue
         if event_type in {"response.failed", "error"}:
+            _raise_openai_stream_context_overflow_if_applicable(event)
             raise OpenAIAPIError(f"OpenAI streaming error: {_stream_error_message(event)}")
 
     if not completed:
@@ -853,6 +885,30 @@ def _stream_error_message(event: Mapping[str, Any]) -> str:
     if event_type == "error":
         return _safe_error_json(event)
     return _safe_error_value(event)
+
+
+def _raise_openai_stream_context_overflow_if_applicable(event: Mapping[str, Any]) -> None:
+    event_type = event.get("type")
+    error: Mapping[str, Any] | None = None
+    request_id = None
+    if event_type == "response.failed":
+        response = _stream_response_object(event)
+        response_error = response.get("error")
+        if isinstance(response_error, Mapping):
+            error = response_error
+        request_id_value = response.get("request_id")
+        if isinstance(request_id_value, str):
+            request_id = request_id_value
+    elif event_type == "error":
+        error = event
+    if error is None:
+        return
+    _raise_openai_context_overflow_from_error(
+        status_code=None,
+        error=error,
+        request_id=request_id,
+        response_body=_stream_error_message(event),
+    )
 
 
 def _stream_output_index(event: Mapping[str, Any]) -> int:
@@ -1296,6 +1352,77 @@ def _safe_error_response_text(response: httpx.Response) -> str:
         if isinstance(decoded, Mapping):
             return _safe_error_json(decoded)
     return _truncate_error_text(response.text)
+
+
+def _raise_openai_context_overflow_if_applicable(response: httpx.Response) -> None:
+    decoded = _response_json_object(response)
+    if decoded is None:
+        return
+    error = decoded.get("error")
+    request_id = decoded.get("request_id")
+    if not isinstance(error, Mapping):
+        error = decoded
+    _raise_openai_context_overflow_from_error(
+        status_code=response.status_code,
+        error=error,
+        request_id=request_id if isinstance(request_id, str) else None,
+        response_body=_safe_error_response_text(response),
+    )
+
+
+def _raise_openai_context_overflow_from_error(
+    *,
+    status_code: int | None,
+    error: Mapping[str, Any],
+    request_id: str | None,
+    response_body: str,
+) -> None:
+    code = _optional_error_string(error.get("code"))
+    error_type = _optional_error_string(error.get("type"))
+    message = _optional_error_string(error.get("message"))
+    if not _is_openai_context_overflow(code=code, message=message):
+        return
+    raise OpenAIContextOverflowError(
+        "OpenAI model context overflow",
+        status_code=status_code,
+        error_type=error_type,
+        error_code=code,
+        request_id=request_id,
+        response_body=response_body,
+    )
+
+
+def _is_openai_context_overflow(*, code: str | None, message: str | None) -> bool:
+    if code == "context_length_exceeded":
+        return True
+    if message is None:
+        return False
+    normalized = message.lower()
+    return (
+        "context_length_exceeded" in normalized
+        or "context length exceeded" in normalized
+        or "maximum context length" in normalized
+        or "exceeds the context window" in normalized
+    )
+
+
+def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return None
+    try:
+        decoded = response.json()
+    except ValueError:
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    return decoded
+
+
+def _optional_error_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:

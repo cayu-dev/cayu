@@ -43,6 +43,42 @@ class InputTokenCountConfidence(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class ModelContextOverflowError(RuntimeError):
+    """Provider-neutral signal that a model request was too large for context.
+
+    Provider adapters should raise this only for clear context-window or request-size
+    overflow responses. Runtime recovery can then shrink model-facing context and
+    retry without depending on provider-specific exception classes.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        super().__init__(require_nonblank(message, "message"))
+        self.provider = require_clean_nonblank(provider, "provider")
+        if status_code is not None and (type(status_code) is not int or status_code < 100):
+            raise ValueError("status_code must be a valid HTTP status code.")
+        self.status_code = status_code
+        self.error_type = _optional_clean_error_field(error_type, "error_type")
+        self.error_code = _optional_clean_error_field(error_code, "error_code")
+        self.request_id = _optional_clean_error_field(request_id, "request_id")
+        self.response_body = response_body
+
+
+def _optional_clean_error_field(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return require_clean_nonblank(value, field_name)
+
+
 class InputTokenCountResult(BaseModel):
     """Provider-neutral input token count for a model request.
 

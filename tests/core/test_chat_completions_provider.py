@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any
 
+import httpx
 import pytest
 
 from cayu import (
@@ -19,8 +20,11 @@ from cayu import (
 from cayu.core.messages import MessageRole, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
+    ChatCompletionsAPIError,
+    ChatCompletionsContextOverflowError,
     ChatCompletionsProtocolError,
     HttpxChatCompletionsTransport,
+    ModelContextOverflowError,
     ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
@@ -897,6 +901,130 @@ async def test_transport_rejects_http_unless_opted_in() -> None:
     # With allow_http the scheme check passes (the URL is accepted before any
     # network call), so an http endpoint is permitted.
     assert HttpxChatCompletionsTransport(allow_http=True).allow_http is True
+
+
+@pytest.mark.anyio
+async def test_chat_completions_transport_classifies_gemini_context_too_long(
+    monkeypatch,
+) -> None:
+    class ResponseContext:
+        async def __aenter__(self) -> httpx.Response:
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                500,
+                request=request,
+                headers={"content-type": "application/json"},
+                json={
+                    "error": {
+                        "code": 500,
+                        "status": "INTERNAL",
+                        "message": "The input context is too long.",
+                    }
+                },
+            )
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> ResponseContext:
+            return ResponseContext()
+
+    monkeypatch.setattr(
+        "cayu.providers.chat_completions.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    stream = HttpxChatCompletionsTransport().stream_chat_completions(
+        url="https://example.test/v1/chat/completions",
+        headers={},
+        payload={},
+        timeout_s=1,
+        stream_idle_timeout_s=1,
+    )
+    with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
+        await stream.__anext__()
+
+    assert exc_info.value.provider == "chat_completions"
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert isinstance(exc_info.value, ChatCompletionsAPIError)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.error_type == "INTERNAL"
+
+
+@pytest.mark.anyio
+async def test_chat_completions_transport_does_not_classify_quota_exhausted(
+    monkeypatch,
+) -> None:
+    class ResponseContext:
+        async def __aenter__(self) -> httpx.Response:
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"content-type": "application/json"},
+                json={
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "You exceeded your current quota.",
+                    }
+                },
+            )
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> ResponseContext:
+            return ResponseContext()
+
+    monkeypatch.setattr(
+        "cayu.providers.chat_completions.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    stream = HttpxChatCompletionsTransport().stream_chat_completions(
+        url="https://example.test/v1/chat/completions",
+        headers={},
+        payload={},
+        timeout_s=1,
+        stream_idle_timeout_s=1,
+    )
+    with pytest.raises(ChatCompletionsAPIError):
+        await stream.__anext__()
 
 
 def test_stream_options_is_configurable() -> None:

@@ -109,7 +109,11 @@ from cayu.runtime import (
     trim_context_messages,
     trim_context_turns,
 )
-from cayu.runtime.context import validate_context_messages
+from cayu.runtime.context import (
+    ContextBuildResult,
+    RuntimeManagedContextPolicy,
+    validate_context_messages,
+)
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry
 from cayu.tools import (
@@ -13384,7 +13388,7 @@ def test_context_usage_state_uses_latest_completed_event_query():
     assert tracking_store.event_queries[0].order_by.value == "sequence_desc"
 
 
-def test_usage_triggered_context_policy_switches_after_previous_actual_usage():
+def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_usage():
     provider = FakeProvider(
         [
             [
@@ -13423,7 +13427,7 @@ def test_usage_triggered_context_policy_switches_after_previous_actual_usage():
             ),
         )
     )
-    asyncio.run(
+    second_events = asyncio.run(
         collect_resume_events(
             app,
             ResumeRequest(
@@ -13445,8 +13449,196 @@ def test_usage_triggered_context_policy_switches_after_previous_actual_usage():
     assert len(provider.requests[0].messages) == 1
     assert len(provider.requests[1].messages) == 1
     assert provider.requests[1].messages[0].content[0].text == "second request"
+    assert len(provider.requests[2].messages) == 1
+    assert provider.requests[2].messages[0].content[0].text == "third request"
+    checkpoint_events = [
+        event for event in second_events if event.type == EventType.SESSION_CHECKPOINTED
+    ]
+    assert len(checkpoint_events) == 1
+    assert checkpoint_events[0].payload == {
+        "checkpoint": "usage_triggered_context",
+        "min_input_tokens": 50,
+        "min_total_tokens": None,
+        "last_input_tokens": 100,
+        "last_total_tokens": 104,
+    }
+    checkpoint = asyncio.run(app.session_store.load_checkpoint("usage_triggered_policy"))
+    assert checkpoint == {
+        "usage_triggered_context": {
+            "version": 1,
+            "min_input_tokens": 50,
+            "min_total_tokens": None,
+            "last_input_tokens": 100,
+            "last_total_tokens": 104,
+        }
+    }
+
+
+def test_usage_triggered_context_policy_preserves_marker_with_checkpoint_policy():
+    class ReplacingCheckpointPolicy(RuntimeManagedContextPolicy):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def build_with_checkpoint(
+            self,
+            request: ContextRequest,
+            *,
+            checkpoint: dict[str, Any] | None,
+        ) -> ContextBuildResult:
+            self.calls += 1
+            return ContextBuildResult(
+                messages=[request.messages[-1]],
+                checkpoint={"triggered_policy": {"calls": self.calls}},
+                checkpoint_event_payload={
+                    "checkpoint": "triggered_policy",
+                    "calls": self.calls,
+                },
+            )
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 100, "output_tokens": 4}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 2}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("third answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 1}}),
+            ],
+        ]
+    )
+    triggered_policy = ReplacingCheckpointPolicy()
+    policy = UsageTriggeredContextPolicy(
+        base_policy=DefaultContextPolicy(),
+        triggered_policy=triggered_policy,
+        min_input_tokens=50,
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_triggered_policy_checkpoint_merge",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy_checkpoint_merge",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy_checkpoint_merge",
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert triggered_policy.calls == 2
+    assert len(provider.requests[1].messages) == 1
+    assert len(provider.requests[2].messages) == 1
+    checkpoint = asyncio.run(
+        app.session_store.load_checkpoint("usage_triggered_policy_checkpoint_merge")
+    )
+    assert checkpoint == {
+        "triggered_policy": {"calls": 2},
+        "usage_triggered_context": {
+            "version": 1,
+            "min_input_tokens": 50,
+            "min_total_tokens": None,
+            "last_input_tokens": 100,
+            "last_total_tokens": 104,
+        },
+    }
+
+
+def test_usage_triggered_context_policy_can_be_last_call_only():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 100, "output_tokens": 4}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 2}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("third answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 1}}),
+            ],
+        ]
+    )
+    policy = UsageTriggeredContextPolicy(
+        base_policy=DefaultContextPolicy(),
+        triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        min_input_tokens=50,
+        sticky=False,
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_triggered_policy_last_call_only",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy_last_call_only",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy_last_call_only",
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert len(provider.requests[0].messages) == 1
+    assert len(provider.requests[1].messages) == 1
+    assert provider.requests[1].messages[0].content[0].text == "second request"
     assert len(provider.requests[2].messages) > 1
     assert provider.requests[2].messages[-1].content[0].text == "third request"
+    checkpoint = asyncio.run(
+        app.session_store.load_checkpoint("usage_triggered_policy_last_call_only")
+    )
+    assert checkpoint is None
 
 
 def test_usage_triggered_context_policy_supports_total_token_threshold():
@@ -13483,6 +13675,15 @@ def test_usage_triggered_context_policy_requires_a_threshold():
     with pytest.raises(ValueError, match="At least one usage threshold"):
         UsageTriggeredContextPolicy(
             triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        )
+
+
+def test_usage_triggered_context_policy_requires_bool_sticky():
+    with pytest.raises(TypeError, match="sticky must be a bool"):
+        UsageTriggeredContextPolicy(
+            triggered_policy=MessageWindowContextPolicy(max_messages=1),
+            min_input_tokens=1,
+            sticky=1,
         )
 
 

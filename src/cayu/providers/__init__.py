@@ -2,6 +2,7 @@
 
 from cayu.providers.anthropic import (
     AnthropicAPIError,
+    AnthropicContextOverflowError,
     AnthropicError,
     AnthropicProtocolError,
     AnthropicProvider,
@@ -15,6 +16,7 @@ from cayu.providers.base import (
     InputTokenCountMethod,
     InputTokenCountResult,
     ModelCompletion,
+    ModelContextOverflowError,
     ModelFinishReason,
     ModelProvider,
     ModelRequest,
@@ -27,6 +29,7 @@ from cayu.providers.base import (
 from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.chat_completions import (
     ChatCompletionsAPIError,
+    ChatCompletionsContextOverflowError,
     ChatCompletionsError,
     ChatCompletionsProtocolError,
     ChatCompletionsProvider,
@@ -38,6 +41,7 @@ from cayu.providers.chat_completions import (
 from cayu.providers.openai import (
     HttpxOpenAITransport,
     OpenAIAPIError,
+    OpenAIContextOverflowError,
     OpenAIError,
     OpenAIProtocolError,
     OpenAIProvider,
@@ -48,6 +52,7 @@ from cayu.providers.openai import (
 
 __all__ = [
     "AnthropicAPIError",
+    "AnthropicContextOverflowError",
     "AnthropicError",
     "AnthropicProtocolError",
     "AnthropicProvider",
@@ -55,6 +60,7 @@ __all__ = [
     "CacheBreakpoint",
     "CachePolicy",
     "ChatCompletionsAPIError",
+    "ChatCompletionsContextOverflowError",
     "ChatCompletionsError",
     "ChatCompletionsProtocolError",
     "ChatCompletionsProvider",
@@ -66,12 +72,14 @@ __all__ = [
     "InputTokenCountMethod",
     "InputTokenCountResult",
     "ModelCompletion",
+    "ModelContextOverflowError",
     "ModelFinishReason",
     "ModelProvider",
     "ModelRequest",
     "ModelStreamEvent",
     "ModelStreamEventType",
     "OpenAIAPIError",
+    "OpenAIContextOverflowError",
     "OpenAIError",
     "OpenAIProtocolError",
     "OpenAIProvider",

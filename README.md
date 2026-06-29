@@ -1521,7 +1521,10 @@ app.register_agent(
 Use `UsageTriggeredContextPolicy` to react to actual provider usage from the
 previous completed model call in the same session. This is post-call state, not
 a pre-call estimator: the next request can switch to a smaller projection after
-the prior call reported high `usage_metrics.input_tokens` or total tokens.
+the prior call reported high `usage_metrics.input_tokens` or total tokens. The
+trigger is sticky by default: once a threshold is crossed, Cayu stores a session
+checkpoint marker and keeps using `triggered_policy` for later requests in that
+session. Set `sticky=False` only when you explicitly want last-call-only routing.
 
 ```python
 from cayu import (

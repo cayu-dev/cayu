@@ -26,6 +26,7 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers.base import (
+    ModelContextOverflowError,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -73,6 +74,34 @@ class ChatCompletionsError(RuntimeError):
 
 class ChatCompletionsAPIError(ChatCompletionsError):
     """Raised when the Chat Completions HTTP API returns an error response."""
+
+
+class ChatCompletionsContextOverflowError(
+    ChatCompletionsAPIError,
+    ModelContextOverflowError,
+):
+    """Raised when a Chat Completions provider reports context overflow."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelContextOverflowError.__init__(
+            self,
+            message,
+            provider="chat_completions",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            response_body=response_body,
+        )
 
 
 class ChatCompletionsProtocolError(ChatCompletionsError):
@@ -130,6 +159,7 @@ class HttpxChatCompletionsTransport:
                     # body and raises httpx.ResponseNotRead, masking the real API
                     # error (e.g. HTTP 404 from a wrong endpoint).
                     await response.aread()
+                    _raise_chat_context_overflow_if_applicable(response)
                     raise ChatCompletionsAPIError(
                         "Chat Completions API request failed with HTTP "
                         f"{response.status_code}: "
@@ -866,6 +896,88 @@ def _safe_error_response_text(response: httpx.Response) -> str:
         if isinstance(decoded, Mapping):
             return _safe_error_json(decoded)
     return _truncate_error_text(response.text)
+
+
+def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None:
+    decoded = _response_json_object(response)
+    if decoded is None:
+        return
+    error = decoded.get("error")
+    if not isinstance(error, Mapping):
+        error = decoded
+    error_type = _optional_error_string(error.get("type")) or _optional_error_string(
+        error.get("status")
+    )
+    code = _optional_error_string(error.get("code"))
+    message = _optional_error_string(error.get("message"))
+    if not _is_chat_context_overflow(
+        status_code=response.status_code,
+        error_type=error_type,
+        code=code,
+        message=message,
+    ):
+        return
+    raise ChatCompletionsContextOverflowError(
+        "Chat Completions model context overflow",
+        status_code=response.status_code,
+        error_type=error_type,
+        error_code=code,
+        response_body=_safe_error_response_text(response),
+    )
+
+
+def _is_chat_context_overflow(
+    *,
+    status_code: int,
+    error_type: str | None,
+    code: str | None,
+    message: str | None,
+) -> bool:
+    if code == "context_length_exceeded":
+        return True
+    if error_type == "context_length_exceeded":
+        return True
+    if message is None:
+        return False
+    normalized = message.lower()
+    if any(
+        phrase in normalized
+        for phrase in (
+            "context_length_exceeded",
+            "context length exceeded",
+            "maximum context length",
+            "input context is too long",
+            "context is too long",
+            "context too large",
+            "prompt too large",
+            "exceeds the context window",
+        )
+    ):
+        return True
+    return (
+        status_code in {400, 500, 504}
+        and "context" in normalized
+        and "too large" in normalized
+    )
+
+
+def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return None
+    try:
+        decoded = response.json()
+    except ValueError:
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    return decoded
+
+
+def _optional_error_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:

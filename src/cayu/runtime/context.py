@@ -42,6 +42,8 @@ from cayu.storage.memory import (
 
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 1
+_USAGE_TRIGGERED_CHECKPOINT_KEY = "usage_triggered_context"
+_USAGE_TRIGGERED_CHECKPOINT_VERSION = 1
 _DEFAULT_KNOWLEDGE_INJECTION_MAX_HITS = 3
 _DEFAULT_KNOWLEDGE_INJECTION_MAX_BYTES = 4000
 _DEFAULT_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 2000
@@ -554,7 +556,8 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
     The runtime populates ``ContextRequest.context_usage`` from the previous completed
     model call in the same session. This wrapper keeps normal context behavior below the
     configured thresholds and delegates to ``triggered_policy`` on the next call once a
-    threshold is reached.
+    threshold is reached. By default the trigger is sticky and stored in the session
+    checkpoint so later low-usage calls continue using ``triggered_policy``.
     """
 
     def __init__(
@@ -564,6 +567,7 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         base_policy: ContextPolicy | None = None,
         min_input_tokens: int | None = None,
         min_total_tokens: int | None = None,
+        sticky: bool = True,
     ) -> None:
         if base_policy is None:
             self.base_policy = DefaultContextPolicy()
@@ -584,6 +588,9 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         )
         if self.min_input_tokens is None and self.min_total_tokens is None:
             raise ValueError("At least one usage threshold must be configured.")
+        if type(sticky) is not bool:
+            raise TypeError("sticky must be a bool.")
+        self.sticky = sticky
 
     async def build_with_checkpoint(
         self,
@@ -591,8 +598,50 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         *,
         checkpoint: dict[str, Any] | None,
     ) -> ContextBuildResult:
-        selected = self.triggered_policy if self._is_triggered(request) else self.base_policy
-        return await _build_policy_context(selected, request, checkpoint=checkpoint)
+        checkpoint_state = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        previous = _usage_triggered_checkpoint(checkpoint_state)
+        already_triggered = self.sticky and previous is not None
+        threshold_triggered = self._is_triggered(request)
+        use_triggered = already_triggered or threshold_triggered
+        selected = self.triggered_policy if use_triggered else self.base_policy
+        result = await _build_policy_context(
+            selected,
+            request,
+            checkpoint=checkpoint_state,
+        )
+        if not self.sticky or not use_triggered:
+            return result
+        if result.checkpoint is None and result.checkpoint_event_payload is not None:
+            return result
+
+        marker = (
+            previous
+            if previous is not None
+            else _usage_triggered_checkpoint_marker(
+                policy=self,
+                request=request,
+            )
+        )
+        if result.checkpoint is None and previous is not None:
+            return result
+
+        checkpoint_update = (
+            copy_json_value(result.checkpoint, "checkpoint")
+            if result.checkpoint is not None
+            else copy_json_value(checkpoint_state, "checkpoint")
+        )
+        checkpoint_update[_USAGE_TRIGGERED_CHECKPOINT_KEY] = marker
+        checkpoint_event_payload = result.checkpoint_event_payload
+        if checkpoint_event_payload is None and previous is None:
+            checkpoint_event_payload = _usage_triggered_checkpoint_event_payload(marker)
+        if checkpoint_event_payload is None:
+            return result.model_copy(update={"checkpoint": checkpoint_update})
+        return result.model_copy(
+            update={
+                "checkpoint": checkpoint_update,
+                "checkpoint_event_payload": checkpoint_event_payload,
+            }
+        )
 
     def _is_triggered(self, request: ContextRequest) -> bool:
         usage = request.context_usage
@@ -607,6 +656,30 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             and usage.last_total_tokens is not None
             and usage.last_total_tokens >= self.min_total_tokens
         )
+
+
+def _usage_triggered_checkpoint_marker(
+    *,
+    policy: UsageTriggeredContextPolicy,
+    request: ContextRequest,
+) -> dict[str, Any]:
+    return {
+        "version": _USAGE_TRIGGERED_CHECKPOINT_VERSION,
+        "min_input_tokens": policy.min_input_tokens,
+        "min_total_tokens": policy.min_total_tokens,
+        "last_input_tokens": request.context_usage.last_input_tokens,
+        "last_total_tokens": request.context_usage.last_total_tokens,
+    }
+
+
+def _usage_triggered_checkpoint_event_payload(marker: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "checkpoint": _USAGE_TRIGGERED_CHECKPOINT_KEY,
+        "min_input_tokens": marker.get("min_input_tokens"),
+        "min_total_tokens": marker.get("min_total_tokens"),
+        "last_input_tokens": marker.get("last_input_tokens"),
+        "last_total_tokens": marker.get("last_total_tokens"),
+    }
 
 
 class CompactionRequest(BaseModel):
@@ -1440,6 +1513,15 @@ def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
     if value.get("version") != _COMPACTION_CHECKPOINT_VERSION:
         return None
     return copy_json_value(value, _COMPACTION_CHECKPOINT_KEY)
+
+
+def _usage_triggered_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
+    value = checkpoint.get(_USAGE_TRIGGERED_CHECKPOINT_KEY)
+    if type(value) is not dict:
+        return None
+    if value.get("version") != _USAGE_TRIGGERED_CHECKPOINT_VERSION:
+        return None
+    return copy_json_value(value, _USAGE_TRIGGERED_CHECKPOINT_KEY)
 
 
 def _compaction_telemetry(

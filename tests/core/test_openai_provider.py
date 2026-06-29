@@ -24,10 +24,12 @@ from cayu.providers import (
     HttpxOpenAITransport,
     InputTokenCountConfidence,
     InputTokenCountMethod,
+    ModelContextOverflowError,
     ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
     OpenAIAPIError,
+    OpenAIContextOverflowError,
     OpenAIProtocolError,
     OpenAIProvider,
     build_openai_payload,
@@ -1578,6 +1580,94 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
     )
     assert "debug" not in message
     assert "not persisted" not in message
+
+
+@pytest.mark.anyio
+async def test_httpx_openai_transport_classifies_context_overflow(monkeypatch) -> None:
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            request = httpx.Request("POST", url)
+            response = httpx.Response(
+                400,
+                request=request,
+                headers={"content-type": "application/json"},
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "This model's maximum context length was exceeded.",
+                    },
+                    "request_id": "req_context",
+                },
+            )
+            raise httpx.HTTPStatusError(
+                "bad request",
+                request=request,
+                response=response,
+            )
+
+    monkeypatch.setattr(
+        "cayu.providers.openai.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    with pytest.raises(OpenAIContextOverflowError) as exc_info:
+        await HttpxOpenAITransport().create_response(
+            url="https://api.openai.com/v1/responses",
+            headers={},
+            payload={},
+            timeout_s=1,
+        )
+
+    assert exc_info.value.provider == "openai"
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert isinstance(exc_info.value, OpenAIAPIError)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert exc_info.value.error_code == "context_length_exceeded"
+    assert exc_info.value.request_id == "req_context"
+    assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_classifies_context_overflow() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "id": "resp_1",
+                "status": "failed",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Context length exceeded.",
+                },
+            },
+            "sequence_number": 1,
+        }
+
+    with pytest.raises(OpenAIContextOverflowError) as exc_info:
+        [event async for event in openai_module.openai_stream_events(raw_events())]
+
+    assert exc_info.value.provider == "openai"
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert isinstance(exc_info.value, OpenAIAPIError)
+    assert exc_info.value.error_code == "context_length_exceeded"
 
 
 @pytest.mark.anyio
