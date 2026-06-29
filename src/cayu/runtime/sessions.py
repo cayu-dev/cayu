@@ -354,6 +354,11 @@ class SessionOrder(StrEnum):
     UPDATED_AT_DESC = "updated_at_desc"
 
 
+class EventOrder(StrEnum):
+    SEQUENCE_ASC = "sequence_asc"
+    SEQUENCE_DESC = "sequence_desc"
+
+
 class LabelSelectorOperator(StrEnum):
     EXISTS = "exists"
     NOT_EXISTS = "not_exists"
@@ -653,6 +658,7 @@ class EventQuery(BaseModel):
     until: datetime | None = None
     after_sequence: StrictInt | None = Field(default=None, ge=0)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
+    order_by: EventOrder = EventOrder.SEQUENCE_ASC
 
     @field_validator(
         "session_id",
@@ -1260,6 +1266,8 @@ class InMemorySessionStore(SessionStore):
                 if _event_record_matches(record, query, event_type)
                 and _event_record_matches_session(record, query, self._sessions)
             ]
+            if query.order_by == EventOrder.SEQUENCE_DESC:
+                records = list(reversed(records))
             return [
                 EventRecord(
                     sequence=record.sequence,
@@ -1788,6 +1796,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         until=query.until,
         after_sequence=query.after_sequence,
         limit=query.limit,
+        order_by=query.order_by,
     )
 
 

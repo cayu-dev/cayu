@@ -114,6 +114,7 @@ from cayu.runtime.context import (
     ContextKnowledgeTelemetry,
     ContextPolicy,
     ContextRequest,
+    ContextUsageState,
     DefaultContextPolicy,
     RuntimeManagedContextPolicy,
     copy_context_messages,
@@ -188,6 +189,7 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.sessions import (
+    EventOrder,
     EventQuery,
     EventRecord,
     ForkSessionRequest,
@@ -253,6 +255,7 @@ from cayu.runtime.usage import (
     causal_budget_usage_summary,
     normalize_usage_metrics,
     session_usage_summary,
+    usage_metrics_from_event_payload,
     usage_metrics_payload,
 )
 from cayu.vaults import (
@@ -6589,6 +6592,10 @@ async def _build_context(
     list[ContextCompactionTelemetry],
     list[ContextKnowledgeTelemetry],
 ]:
+    context_usage = await _context_usage_state_for_session(
+        session_store=session_store,
+        session_id=session.id,
+    )
     request = ContextRequest(
         session=session.model_copy(deep=True),
         agent=agent_spec.model_copy(deep=True),
@@ -6597,6 +6604,7 @@ async def _build_context(
         environment_name=environment_name,
         knowledge_store=knowledge_store,
         metadata=copy_json_value(request_metadata, "metadata"),
+        context_usage=context_usage,
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
@@ -6615,6 +6623,41 @@ async def _build_context(
 
     result = await context_policy.build(request)
     return copy_context_messages(result), None, None, [], []
+
+
+async def _context_usage_state_for_session(
+    *,
+    session_store: SessionStore,
+    session_id: str,
+) -> ContextUsageState:
+    records = await session_store.query_events(
+        EventQuery(
+            session_id=session_id,
+            event_type=EventType.MODEL_COMPLETED,
+            limit=1,
+            order_by=EventOrder.SEQUENCE_DESC,
+        )
+    )
+    if not records:
+        return ContextUsageState()
+    return _context_usage_state_from_model_completed_event(records[0].event)
+
+
+def _context_usage_state_from_model_completed_event(
+    event: Event,
+) -> ContextUsageState:
+    if event.type != EventType.MODEL_COMPLETED:
+        return ContextUsageState()
+    metrics = usage_metrics_from_event_payload(event.payload)
+    if metrics is None:
+        return ContextUsageState()
+    return ContextUsageState(
+        last_input_tokens=metrics.input_tokens,
+        last_output_tokens=metrics.output_tokens,
+        last_total_tokens=metrics.total_tokens,
+        last_provider_name=metrics.provider_name,
+        last_model=metrics.model,
+    )
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:

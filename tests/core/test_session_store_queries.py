@@ -8,7 +8,14 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from cayu import EventQuery, SessionOrder, SessionQuery, SQLiteSessionStore, TranscriptQuery
+from cayu import (
+    EventOrder,
+    EventQuery,
+    SessionOrder,
+    SessionQuery,
+    SQLiteSessionStore,
+    TranscriptQuery,
+)
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     InMemorySessionStore,
@@ -387,6 +394,9 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         )
 
         all_records = await store.query_events(EventQuery(limit=10))
+        desc_records = await store.query_events(
+            EventQuery(order_by=EventOrder.SEQUENCE_DESC, limit=2)
+        )
         since_records = await store.query_events(
             EventQuery(since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC), limit=10)
         )
@@ -413,6 +423,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         event_summary = await store.summarize_events("sess_builder")
 
         assert [record.sequence for record in all_records] == [1, 2, 3, 4]
+        assert [record.sequence for record in desc_records] == [4, 3]
         assert [record.event.id for record in since_records] == [
             "event_2",
             "event_3",

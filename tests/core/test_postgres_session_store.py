@@ -16,6 +16,7 @@ import pytest
 
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
+    EventOrder,
     EventQuery,
     RunRequest,
     Session,
@@ -719,6 +720,9 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         )
 
         all_records = await store.query_events(EventQuery(limit=10))
+        desc_records = await store.query_events(
+            EventQuery(order_by=EventOrder.SEQUENCE_DESC, limit=2)
+        )
         since_records = await store.query_events(
             EventQuery(since=datetime(2026, 1, 1, 12, 5, tzinfo=UTC), limit=10)
         )
@@ -743,6 +747,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         )
 
         assert [r.sequence for r in all_records] == [1, 2, 3, 4]
+        assert [r.sequence for r in desc_records] == [4, 3]
         assert [r.event.id for r in since_records] == ["event_2", "event_3", "event_4"]
         assert [r.event.id for r in until_records] == ["event_1", "event_2"]
         assert [r.event.id for r in window_records] == ["event_2", "event_3"]

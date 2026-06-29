@@ -13245,6 +13245,148 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
     }
 
 
+def test_context_policy_receives_previous_actual_context_usage_on_next_call():
+    class UsageAwarePolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ContextRequest] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.requests.append(request)
+            if (
+                request.context_usage.last_input_tokens is not None
+                and request.context_usage.last_input_tokens >= 50
+            ):
+                return [request.messages[-1]]
+            return request.messages
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {"usage": {"input_tokens": 100, "output_tokens": 4}}
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed(
+                    {"usage": {"input_tokens": 20, "output_tokens": 2}}
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("third answer"),
+                ModelStreamEvent.completed(
+                    {"usage": {"input_tokens": 10, "output_tokens": 1}}
+                ),
+            ],
+        ]
+    )
+    policy = UsageAwarePolicy()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_context_policy",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_context_policy",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_context_policy",
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert len(policy.requests) == 3
+    assert policy.requests[0].context_usage.last_input_tokens is None
+    assert policy.requests[1].context_usage.last_input_tokens == 100
+    assert policy.requests[1].context_usage.last_output_tokens == 4
+    assert policy.requests[1].context_usage.last_total_tokens == 104
+    assert policy.requests[1].context_usage.last_provider_name == "fake"
+    assert policy.requests[1].context_usage.last_model == "fake-model"
+    assert policy.requests[2].context_usage.last_input_tokens == 20
+    assert len(provider.requests[0].messages) == 1
+    assert len(provider.requests[1].messages) == 1
+    assert provider.requests[1].messages[0].content[0].text == "second request"
+    assert len(provider.requests[2].messages) > 1
+    assert provider.requests[2].messages[-1].content[0].text == "third request"
+
+
+def test_context_usage_state_uses_latest_completed_event_query():
+    class TrackingStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.event_queries: list[EventQuery] = []
+
+        async def query_events(self, query: EventQuery | None = None):
+            if query is not None:
+                self.event_queries.append(query)
+            return await super().query_events(query)
+
+    tracking_store = TrackingStore()
+    session_id = "usage_context_policy_latest_event"
+
+    async def run():
+        await tracking_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await tracking_store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "model": "fake-model",
+                        "usage": {"input_tokens": index, "output_tokens": 1},
+                    },
+                )
+                for index in range(1, 106)
+            ],
+        )
+        return await runtime_app_module._context_usage_state_for_session(
+            session_store=tracking_store,
+            session_id=session_id,
+        )
+
+    context_usage = asyncio.run(run())
+
+    assert context_usage.last_input_tokens == 105
+    assert context_usage.last_output_tokens == 1
+    assert context_usage.last_total_tokens == 106
+    assert context_usage.last_provider_name is None
+    assert context_usage.last_model == "fake-model"
+    assert len(tracking_store.event_queries) == 1
+    assert tracking_store.event_queries[0].limit == 1
+    assert tracking_store.event_queries[0].order_by.value == "sequence_desc"
+
+
 def test_runtime_keeps_raw_model_completed_usage_when_it_cannot_normalize_usage_metrics():
     provider = FakeProvider(
         [

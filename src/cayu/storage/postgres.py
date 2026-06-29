@@ -146,6 +146,7 @@ def _event_query_with_session_ids(
         until=query.until,
         after_sequence=query.after_sequence,
         limit=query.limit,
+        order_by=query.order_by,
     )
 
 
@@ -1943,6 +1944,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             params.append(query.tool_name)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_direction = "DESC" if query.order_by.value == "sequence_desc" else "ASC"
         params.append(query.limit)
 
         await self._ensure_ready()
@@ -1957,7 +1959,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     FROM cayu_events
                     JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                     {where_sql}
-                    ORDER BY cayu_events.sequence ASC
+                    ORDER BY cayu_events.sequence {order_direction}
                     LIMIT %s
                     """,
                 ),
@@ -1974,7 +1976,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     _event_query_with_session_ids(query, session_ids=batch),
                 )
             )
-        records.sort(key=lambda record: record.sequence)
+        records.sort(
+            key=lambda record: record.sequence,
+            reverse=query.order_by.value == "sequence_desc",
+        )
         return records[: query.limit]
 
     async def summarize_events(self, session_id: str) -> EventSummary:

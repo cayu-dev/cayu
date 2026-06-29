@@ -1518,6 +1518,12 @@ app.register_agent(
 )
 ```
 
+Custom policies can read `request.context_usage` to react to actual provider
+usage from the previous completed model call in the same session. For example,
+a policy can switch to a smaller rolling window on the next call after the
+prior call reported high `usage_metrics.input_tokens`. This is post-call state,
+not a pre-call estimator.
+
 Use `strip_old_file_attachments(...)` inside custom context policies when you build your
 own transcript projection and want the same bounded native-file behavior.
 

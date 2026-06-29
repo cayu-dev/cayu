@@ -49,6 +49,31 @@ _MIN_KNOWLEDGE_INJECTION_MAX_BYTES = 200
 _MIN_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 50
 
 
+class ContextUsageState(BaseModel):
+    """Actual provider usage from the previous completed model request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    last_input_tokens: StrictInt | None = Field(default=None, ge=0)
+    last_output_tokens: StrictInt | None = Field(default=None, ge=0)
+    last_total_tokens: StrictInt | None = Field(default=None, ge=0)
+    last_provider_name: str | None = None
+    last_model: str | None = None
+
+    @field_validator("last_provider_name", "last_model")
+    @classmethod
+    def validate_optional_nonblank(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+
+def copy_context_usage_state(state: ContextUsageState) -> ContextUsageState:
+    if type(state) is not ContextUsageState:
+        raise TypeError("Context usage state must be a ContextUsageState instance.")
+    return ContextUsageState(**state.model_dump())
+
+
 class ContextRequest(BaseModel):
     """Input passed to an agent context policy before each model request."""
 
@@ -61,6 +86,7 @@ class ContextRequest(BaseModel):
     environment_name: str | None = None
     knowledge_store: Any = Field(default=None, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    context_usage: ContextUsageState = Field(default_factory=ContextUsageState)
 
     @field_validator("messages")
     @classmethod
@@ -71,6 +97,11 @@ class ContextRequest(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("context_usage")
+    @classmethod
+    def copy_context_usage(cls, value: ContextUsageState) -> ContextUsageState:
+        return copy_context_usage_state(value)
 
     @field_validator("environment_name")
     @classmethod
