@@ -17,6 +17,8 @@ class ContextCountingConfig(BaseModel):
 
     `observe` records provider counts and reconciles them against completed
     model usage when available. It does not enforce budgets or mutate context.
+    Provider-backed counters may make an extra provider request, so this is
+    observability/debugging infrastructure rather than a default overflow guard.
     """
 
     model_config = ConfigDict(extra="forbid")

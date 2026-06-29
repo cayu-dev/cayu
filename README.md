@@ -454,6 +454,24 @@ the pre-call count, actual input tokens, and delta. If a provider does not
 support counting, the count is reported as unavailable; if counting fails, Cayu
 emits `context.count.failed` and still runs the model call.
 
+The built-in OpenAI Responses and Anthropic Messages providers use their
+official input-token count endpoints. OpenAI-compatible Chat Completions
+providers report unavailable by default because those vendors do not share one
+portable count endpoint.
+
+Remote provider counters are an explicit observability tool, not the default
+overflow guard. They send the request payload to the provider before the model
+call, so applications should treat them as extra provider API calls. Anthropic
+documents Messages token counting as free with separate RPM limits. OpenAI
+documents Responses input-token counting, but does not document whether that
+counting request is free or billed. Cayu records that provider-specific status
+in the count result metadata and does not fold count requests into generation
+usage or cost totals. Use remote counters for debugging, calibration, live
+verification, or explicit near-limit checks where exactness is worth the extra
+provider request. Production context management should rely first on local
+budget policy estimates, compaction, rolling windows, or truncation, then treat
+provider context-limit errors as a recovery path.
+
 For work-item views that span forks or task-linked sessions, use the causal
 budget summaries:
 

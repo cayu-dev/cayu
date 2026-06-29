@@ -24,6 +24,8 @@ from cayu.providers import (
     AnthropicProtocolError,
     AnthropicProvider,
     HttpxAnthropicTransport,
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
     ModelRequest,
     ModelStreamEventType,
     anthropic_response_events,
@@ -33,9 +35,35 @@ from cayu.providers.cache import resolve_cache_policy
 
 
 class RecordingTransport:
-    def __init__(self, responses: list[Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        responses: list[Mapping[str, Any]],
+        count_responses: list[Mapping[str, Any]] | None = None,
+    ) -> None:
         self.responses = list(responses)
+        self.count_responses = list(count_responses or [])
         self.calls: list[dict[str, Any]] = []
+        self.count_calls: list[dict[str, Any]] = []
+
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        self.count_calls.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "payload": dict(payload),
+                "timeout_s": timeout_s,
+            }
+        )
+        if not self.count_responses:
+            raise AssertionError("No fake Anthropic count response queued.")
+        return self.count_responses.pop(0)
 
     async def create_message(
         self,
@@ -59,6 +87,16 @@ class RecordingTransport:
 
 
 class BlankFailingTransport:
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        raise RuntimeError()
+
     async def create_message(
         self,
         *,
@@ -324,6 +362,48 @@ async def test_anthropic_provider_emits_text_and_completed_events() -> None:
     assert events[1].payload["stop_reason"] == "end_turn"
     assert transport.calls[0]["url"] == "https://api.anthropic.com/v1/messages"
     assert transport.calls[0]["headers"]["x-api-key"] == "test-key"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_counts_input_tokens_with_official_endpoint() -> None:
+    transport = RecordingTransport([], count_responses=[{"input_tokens": 37}])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("user", "Count this.")],
+        options={"anthropic": {"max_tokens": 100}},
+    )
+
+    result = await provider.count_input_tokens(request)
+
+    assert result is not None
+    assert result.input_tokens == 37
+    assert result.method == InputTokenCountMethod.OFFICIAL
+    assert result.confidence == InputTokenCountConfidence.HIGH
+    assert result.metadata == {
+        "endpoint": "messages/count_tokens",
+        "provider_billing_status": "documented_free",
+        "provider_rate_limit": "separate_rpm_limit",
+    }
+    assert transport.count_calls[0]["url"] == (
+        "https://api.anthropic.com/v1/messages/count_tokens"
+    )
+    assert transport.count_calls[0]["headers"]["x-api-key"] == "test-key"
+    assert transport.count_calls[0]["payload"] == {
+        "model": "claude-test",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Count this."}]}],
+    }
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_rejects_invalid_token_count_response() -> None:
+    transport = RecordingTransport([], count_responses=[{"input_tokens": "37"}])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+
+    with pytest.raises(AnthropicProtocolError, match="input_tokens"):
+        await provider.count_input_tokens(
+            ModelRequest(model="claude-test", messages=[Message.text("user", "Count this.")])
+        )
 
 
 @pytest.mark.anyio

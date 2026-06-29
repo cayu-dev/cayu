@@ -25,6 +25,9 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers.base import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -69,6 +72,16 @@ class AnthropicProtocolError(AnthropicError):
 
 
 class AnthropicTransport(Protocol):
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        """POST a Messages token-count payload and return decoded JSON."""
+
     async def create_message(
         self,
         *,
@@ -83,7 +96,37 @@ class AnthropicTransport(Protocol):
 class HttpxAnthropicTransport:
     """HTTP transport with explicit certifi-backed TLS verification."""
 
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+
     async def create_message(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+
+    async def _post_json(
         self,
         *,
         url: str,
@@ -187,6 +230,33 @@ class AnthropicProvider(ModelProvider):
         except Exception as exc:
             yield ModelStreamEvent.error(_exception_message(exc))
 
+    async def count_input_tokens(
+        self,
+        request: ModelRequest,
+    ) -> InputTokenCountResult | None:
+        policy = resolve_cache_policy(self.cache_policy, request.options)
+        payload = build_anthropic_token_count_payload(
+            request,
+            default_max_tokens=self.max_tokens,
+            cache_policy=policy,
+        )
+        response = await self.transport.count_message_tokens(
+            url=f"{self.base_url}/v1/messages/count_tokens",
+            headers=self._headers(),
+            payload=payload,
+            timeout_s=self.timeout_s,
+        )
+        return InputTokenCountResult(
+            input_tokens=_anthropic_input_tokens_from_count_response(response),
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+            metadata={
+                "endpoint": "messages/count_tokens",
+                "provider_billing_status": "documented_free",
+                "provider_rate_limit": "separate_rpm_limit",
+            },
+        )
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "content-type": "application/json",
@@ -235,6 +305,21 @@ def build_anthropic_payload(
     if cache_policy is not None:
         _apply_cache_breakpoints(payload, cache_policy)
     return copy_json_value(payload, "anthropic_payload")
+
+
+def build_anthropic_token_count_payload(
+    request: ModelRequest,
+    *,
+    default_max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
+    cache_policy: CachePolicy | None = None,
+) -> dict[str, Any]:
+    payload = build_anthropic_payload(
+        request,
+        default_max_tokens=default_max_tokens,
+        cache_policy=cache_policy,
+    )
+    payload.pop("max_tokens", None)
+    return payload
 
 
 def _apply_cache_breakpoints(payload: dict[str, Any], policy: CachePolicy) -> None:
@@ -332,6 +417,15 @@ def anthropic_response_events(
         )
     )
     return events
+
+
+def _anthropic_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
+    if not isinstance(response, Mapping):
+        raise AnthropicProtocolError("Anthropic token count response must be a JSON object.")
+    input_tokens = response.get("input_tokens")
+    if type(input_tokens) is not int or input_tokens < 0:
+        raise AnthropicProtocolError("Anthropic token count response requires input_tokens.")
+    return input_tokens
 
 
 def _anthropic_options(options: Mapping[str, Any]) -> dict[str, Any]:

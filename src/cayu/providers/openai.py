@@ -26,6 +26,9 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers.base import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelCompletion,
     ModelFinishReason,
     ModelProvider,
@@ -48,6 +51,21 @@ _RESERVED_OPENAI_OPTIONS = {
     "tools",
     "stream",
 }
+_OPENAI_TOKEN_COUNT_FIELDS = frozenset(
+    {
+        "model",
+        "input",
+        "previous_response_id",
+        "tools",
+        "text",
+        "reasoning",
+        "truncation",
+        "instructions",
+        "conversation",
+        "tool_choice",
+        "parallel_tool_calls",
+    }
+)
 _PROTECTED_HEADER_NAMES = {
     "authorization",
     "content-type",
@@ -69,6 +87,16 @@ class OpenAIProtocolError(OpenAIError):
 
 
 class OpenAITransport(Protocol):
+    async def create_response(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        """POST a non-streaming Responses API payload and return decoded JSON."""
+
     def stream_response_events(
         self,
         *,
@@ -234,6 +262,30 @@ class OpenAIProvider(ModelProvider):
         except Exception as exc:
             yield ModelStreamEvent.error(_exception_message(exc))
 
+    async def count_input_tokens(
+        self,
+        request: ModelRequest,
+    ) -> InputTokenCountResult | None:
+        payload = build_openai_token_count_payload(
+            request,
+            reasoning_state=self.reasoning_state,
+        )
+        response = await self.transport.create_response(
+            url=f"{self.base_url}/v1/responses/input_tokens",
+            headers=self._headers(),
+            payload=payload,
+            timeout_s=self.timeout_s,
+        )
+        return InputTokenCountResult(
+            input_tokens=_openai_input_tokens_from_count_response(response),
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+            metadata={
+                "endpoint": "responses/input_tokens",
+                "provider_billing_status": "not_documented",
+            },
+        )
+
     async def _consume(self, payload: dict[str, Any]) -> AsyncIterator[ModelStreamEvent]:
         raw_events = self.transport.stream_response_events(
             url=f"{self.base_url}/v1/responses",
@@ -324,6 +376,24 @@ def build_openai_payload(
     return copy_json_value(payload, "openai_payload")
 
 
+def build_openai_token_count_payload(
+    request: ModelRequest,
+    *,
+    reasoning_state: str = "inline",
+    chain: bool = True,
+) -> dict[str, Any]:
+    payload = build_openai_payload(
+        request,
+        stream=False,
+        reasoning_state=reasoning_state,
+        chain=chain,
+    )
+    count_payload = {
+        key: value for key, value in payload.items() if key in _OPENAI_TOKEN_COUNT_FIELDS
+    }
+    return copy_json_value(count_payload, "openai_token_count_payload")
+
+
 def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent]:
     if not isinstance(response, Mapping):
         raise OpenAIProtocolError("OpenAI response must be a JSON object.")
@@ -363,6 +433,18 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
 
     events.append(_completed_event_from_response(response, provider_state_items))
     return events
+
+
+def _openai_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
+    if not isinstance(response, Mapping):
+        raise OpenAIProtocolError("OpenAI input token count response must be a JSON object.")
+    object_type = response.get("object")
+    if object_type != "response.input_tokens":
+        raise OpenAIProtocolError("OpenAI input token count response has unexpected object.")
+    input_tokens = response.get("input_tokens")
+    if type(input_tokens) is not int or input_tokens < 0:
+        raise OpenAIProtocolError("OpenAI input token count response requires input_tokens.")
+    return input_tokens
 
 
 async def openai_stream_events(

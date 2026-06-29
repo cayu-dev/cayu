@@ -22,6 +22,8 @@ from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, ToolCal
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     HttpxOpenAITransport,
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
     ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
@@ -38,9 +40,32 @@ class RecordingTransport:
     def __init__(
         self,
         stream_events: list[list[Mapping[str, Any]]] | None = None,
+        count_responses: list[Mapping[str, Any]] | None = None,
     ) -> None:
         self.stream_event_batches = list(stream_events or [])
+        self.count_responses = list(count_responses or [])
         self.calls: list[dict[str, Any]] = []
+        self.count_calls: list[dict[str, Any]] = []
+
+    async def create_response(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        self.count_calls.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "payload": dict(payload),
+                "timeout_s": timeout_s,
+            }
+        )
+        if not self.count_responses:
+            raise AssertionError("No fake OpenAI count response queued.")
+        return self.count_responses.pop(0)
 
     async def stream_response_events(
         self,
@@ -67,6 +92,16 @@ class RecordingTransport:
 
 
 class BlankFailingTransport:
+    async def create_response(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        raise RuntimeError()
+
     async def stream_response_events(
         self,
         *,
@@ -393,6 +428,92 @@ async def test_openai_provider_emits_text_and_completed_events() -> None:
     assert transport.calls[0]["headers"]["authorization"] == "Bearer test-key"
     assert transport.calls[0]["payload"]["store"] is False
     assert transport.calls[0]["payload"]["stream"] is True
+
+
+@pytest.mark.anyio
+async def test_openai_provider_counts_input_tokens_with_official_endpoint() -> None:
+    transport = RecordingTransport(
+        count_responses=[{"object": "response.input_tokens", "input_tokens": 42}]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Count this.")],
+    )
+
+    result = await provider.count_input_tokens(request)
+
+    assert result is not None
+    assert result.input_tokens == 42
+    assert result.method == InputTokenCountMethod.OFFICIAL
+    assert result.confidence == InputTokenCountConfidence.HIGH
+    assert result.metadata == {
+        "endpoint": "responses/input_tokens",
+        "provider_billing_status": "not_documented",
+    }
+    assert transport.count_calls[0]["url"] == "https://api.openai.com/v1/responses/input_tokens"
+    assert transport.count_calls[0]["headers"]["authorization"] == "Bearer test-key"
+    assert transport.count_calls[0]["payload"]["model"] == "gpt-test"
+    assert transport.count_calls[0]["payload"]["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "Count this."}]}
+    ]
+    assert "store" not in transport.count_calls[0]["payload"]
+    assert "stream" not in transport.count_calls[0]["payload"]
+    assert "include" not in transport.count_calls[0]["payload"]
+
+
+def test_build_openai_token_count_payload_keeps_only_count_supported_fields() -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Count this.")],
+        tools=[EchoTool.spec.model_dump()],
+        options={
+            "openai": {
+                "parallel_tool_calls": False,
+                "reasoning": {"effort": "low"},
+                "temperature": 0.2,
+                "tool_choice": "auto",
+                "truncation": "auto",
+            }
+        },
+    )
+
+    payload = openai_module.build_openai_token_count_payload(request)
+
+    assert payload == {
+        "model": "gpt-test",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Count this."}]}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "echo",
+                "description": "Echo text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                "strict": False,
+            }
+        ],
+        "reasoning": {"effort": "low"},
+        "truncation": "auto",
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_openai_provider_rejects_invalid_token_count_response() -> None:
+    transport = RecordingTransport(
+        count_responses=[{"object": "response.input_tokens", "input_tokens": "42"}]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+
+    with pytest.raises(OpenAIProtocolError, match="input_tokens"):
+        await provider.count_input_tokens(
+            ModelRequest(model="gpt-test", messages=[Message.text("user", "Count this.")])
+        )
 
 
 @pytest.mark.anyio

@@ -47,9 +47,11 @@ class InputTokenCountResult(BaseModel):
     """Provider-neutral input token count for a model request.
 
     Official provider counters should use `method="official"` and
-    `confidence="high"`. Local tokenizers and heuristics are useful for
-    observability, but callers should not treat them as hard provider-limit
-    guarantees.
+    `confidence="high"`. Official remote counters can add latency and consume
+    provider rate limits. Their billing behavior is provider-specific and
+    should be documented in `metadata` when known. Local tokenizers and
+    heuristics are useful for observability, but callers should not treat them
+    as hard provider-limit guarantees.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -367,8 +369,9 @@ class ModelProvider(ABC):
         """Optionally count the input tokens for one request before submission.
 
         Providers that need to call a remote counting endpoint should do so here.
-        The default implementation is intentionally unavailable so existing
-        providers remain source-compatible.
+        Remote counters are opt-in observability/calibration hooks, not default
+        context-overflow enforcement. The default implementation is intentionally
+        unavailable so existing providers remain source-compatible.
         """
 
         return None
