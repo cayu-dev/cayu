@@ -548,6 +548,67 @@ class RecentTurnsContextPolicy(ContextPolicy):
         )
 
 
+class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
+    """Switch context policy after previous actual provider usage crosses a threshold.
+
+    The runtime populates ``ContextRequest.context_usage`` from the previous completed
+    model call in the same session. This wrapper keeps normal context behavior below the
+    configured thresholds and delegates to ``triggered_policy`` on the next call once a
+    threshold is reached.
+    """
+
+    def __init__(
+        self,
+        *,
+        triggered_policy: ContextPolicy,
+        base_policy: ContextPolicy | None = None,
+        min_input_tokens: int | None = None,
+        min_total_tokens: int | None = None,
+    ) -> None:
+        if base_policy is None:
+            self.base_policy = DefaultContextPolicy()
+        elif isinstance(base_policy, ContextPolicy):
+            self.base_policy = base_policy
+        else:
+            raise TypeError("base_policy must be a ContextPolicy.")
+        if not isinstance(triggered_policy, ContextPolicy):
+            raise TypeError("triggered_policy must be a ContextPolicy.")
+        self.triggered_policy = triggered_policy
+        self.min_input_tokens = _validate_optional_positive_int(
+            min_input_tokens,
+            "min_input_tokens",
+        )
+        self.min_total_tokens = _validate_optional_positive_int(
+            min_total_tokens,
+            "min_total_tokens",
+        )
+        if self.min_input_tokens is None and self.min_total_tokens is None:
+            raise ValueError("At least one usage threshold must be configured.")
+
+    async def build_with_checkpoint(
+        self,
+        request: ContextRequest,
+        *,
+        checkpoint: dict[str, Any] | None,
+    ) -> ContextBuildResult:
+        selected = self.triggered_policy if self._is_triggered(request) else self.base_policy
+        return await _build_policy_context(selected, request, checkpoint=checkpoint)
+
+    def _is_triggered(self, request: ContextRequest) -> bool:
+        usage = request.context_usage
+        if (
+            self.min_input_tokens is not None
+            and usage.last_input_tokens is not None
+            and usage.last_input_tokens >= self.min_input_tokens
+        ):
+            return True
+        return (
+            self.min_total_tokens is not None
+            and usage.last_total_tokens is not None
+            and usage.last_total_tokens >= self.min_total_tokens
+        )
+
+
 class CompactionRequest(BaseModel):
     """Input passed to a compactor when older context needs summarizing."""
 
@@ -1309,6 +1370,28 @@ def _knowledge_source_payload(hit: KnowledgeHit) -> dict[str, Any]:
         "score_kind": hit.score_kind,
         "reason": hit.reason,
     }
+
+
+async def _build_policy_context(
+    policy: ContextPolicy,
+    request: ContextRequest,
+    *,
+    checkpoint: dict[str, Any] | None,
+) -> ContextBuildResult:
+    if isinstance(policy, RuntimeManagedContextPolicy):
+        return await policy.build_with_checkpoint(request, checkpoint=checkpoint)
+    messages = await policy.build(request)
+    return ContextBuildResult(messages=messages)
+
+
+def _validate_optional_positive_int(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer or None.")
+    if value < 1:
+        raise ValueError(f"{name} must be greater than zero.")
+    return value
 
 
 def _validate_max_attachment_results(value: int) -> int:

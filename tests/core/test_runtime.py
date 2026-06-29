@@ -53,6 +53,8 @@ from cayu.runtime import (
     ContextCountingMode,
     ContextPolicy,
     ContextRequest,
+    ContextUsageState,
+    DefaultContextPolicy,
     Dispatcher,
     DispatchHandle,
     DispatchRequest,
@@ -101,6 +103,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    UsageTriggeredContextPolicy,
     default_compaction_prompt,
     strip_old_file_attachments,
     trim_context_messages,
@@ -13263,21 +13266,15 @@ def test_context_policy_receives_previous_actual_context_usage_on_next_call():
         [
             [
                 ModelStreamEvent.text_delta("first answer"),
-                ModelStreamEvent.completed(
-                    {"usage": {"input_tokens": 100, "output_tokens": 4}}
-                ),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 100, "output_tokens": 4}}),
             ],
             [
                 ModelStreamEvent.text_delta("second answer"),
-                ModelStreamEvent.completed(
-                    {"usage": {"input_tokens": 20, "output_tokens": 2}}
-                ),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 2}}),
             ],
             [
                 ModelStreamEvent.text_delta("third answer"),
-                ModelStreamEvent.completed(
-                    {"usage": {"input_tokens": 10, "output_tokens": 1}}
-                ),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 1}}),
             ],
         ]
     )
@@ -13385,6 +13382,108 @@ def test_context_usage_state_uses_latest_completed_event_query():
     assert len(tracking_store.event_queries) == 1
     assert tracking_store.event_queries[0].limit == 1
     assert tracking_store.event_queries[0].order_by.value == "sequence_desc"
+
+
+def test_usage_triggered_context_policy_switches_after_previous_actual_usage():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 100, "output_tokens": 4}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 2}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("third answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 1}}),
+            ],
+        ]
+    )
+    policy = UsageTriggeredContextPolicy(
+        base_policy=DefaultContextPolicy(),
+        triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        min_input_tokens=50,
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_triggered_policy",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+    asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="usage_triggered_policy",
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert len(provider.requests[0].messages) == 1
+    assert len(provider.requests[1].messages) == 1
+    assert provider.requests[1].messages[0].content[0].text == "second request"
+    assert len(provider.requests[2].messages) > 1
+    assert provider.requests[2].messages[-1].content[0].text == "third request"
+
+
+def test_usage_triggered_context_policy_supports_total_token_threshold():
+    policy = UsageTriggeredContextPolicy(
+        base_policy=MessageWindowContextPolicy(max_messages=3),
+        triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        min_total_tokens=100,
+    )
+    messages = [
+        Message.text("system", "You are careful."),
+        Message.text("user", "old"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current"),
+    ]
+
+    async def build_context() -> list[Message]:
+        return await policy.build(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=2,
+                context_usage=ContextUsageState(last_total_tokens=100),
+            )
+        )
+
+    context = asyncio.run(build_context())
+
+    assert [message.role for message in context] == ["system", "user"]
+    assert [message.content[0].text for message in context] == ["You are careful.", "current"]
+
+
+def test_usage_triggered_context_policy_requires_a_threshold():
+    with pytest.raises(ValueError, match="At least one usage threshold"):
+        UsageTriggeredContextPolicy(
+            triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        )
 
 
 def test_runtime_keeps_raw_model_completed_usage_when_it_cannot_normalize_usage_metrics():

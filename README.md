@@ -1518,11 +1518,27 @@ app.register_agent(
 )
 ```
 
-Custom policies can read `request.context_usage` to react to actual provider
-usage from the previous completed model call in the same session. For example,
-a policy can switch to a smaller rolling window on the next call after the
-prior call reported high `usage_metrics.input_tokens`. This is post-call state,
-not a pre-call estimator.
+Use `UsageTriggeredContextPolicy` to react to actual provider usage from the
+previous completed model call in the same session. This is post-call state, not
+a pre-call estimator: the next request can switch to a smaller projection after
+the prior call reported high `usage_metrics.input_tokens` or total tokens.
+
+```python
+from cayu import (
+    AgentSpec,
+    RecentTurnsContextPolicy,
+    UsageTriggeredContextPolicy,
+)
+
+app.register_agent(
+    AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+    context_policy=UsageTriggeredContextPolicy(
+        base_policy=RecentTurnsContextPolicy(max_user_turns=20),
+        triggered_policy=RecentTurnsContextPolicy(max_user_turns=6),
+        min_input_tokens=120_000,
+    ),
+)
+```
 
 Use `strip_old_file_attachments(...)` inside custom context policies when you build your
 own transcript projection and want the same bounded native-file behavior.
