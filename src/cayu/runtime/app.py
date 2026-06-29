@@ -107,6 +107,7 @@ from cayu.runtime.budgets import (
 from cayu.runtime.context import (
     ContextBuildError,
     ContextCompactionTelemetry,
+    ContextKnowledgeTelemetry,
     ContextPolicy,
     ContextRequest,
     DefaultContextPolicy,
@@ -2451,6 +2452,7 @@ class CayuApp:
                         checkpoint_update,
                         checkpoint_event_payload,
                         context_compaction_telemetry,
+                        context_knowledge_telemetry,
                     ) = await _build_context(
                         context_policy=registered_agent.context_policy,
                         session_store=self.session_store,
@@ -2462,6 +2464,7 @@ class CayuApp:
                         messages=messages,
                         step=step,
                         environment_name=environment_name,
+                        knowledge_store=_knowledge_store(registered_environment),
                         request_metadata=request_metadata,
                     )
                 except ContextBuildError as exc:
@@ -2474,10 +2477,46 @@ class CayuApp:
                                 environment_name=environment_name,
                             )
                         )
+                    for telemetry in exc.knowledge_telemetry:
+                        yield await self._emit(
+                            _context_knowledge_telemetry_event(
+                                telemetry=telemetry,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                            )
+                        )
+                    if exc.checkpoint_event_payload is not None:
+                        if exc.checkpoint is None:
+                            raise RuntimeError(
+                                "Context checkpoint event payload requires checkpoint state."
+                            ) from exc
+                        await self._checkpoint_preserving_runtime_state(
+                            session_id=session.id,
+                            checkpoint=exc.checkpoint,
+                        )
+                        yield await self._emit(
+                            Event(
+                                type=EventType.SESSION_CHECKPOINTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload=exc.checkpoint_event_payload,
+                            )
+                        )
                     raise exc.cause from exc
                 for telemetry in context_compaction_telemetry:
                     yield await self._emit(
                         _context_compaction_telemetry_event(
+                            telemetry=telemetry,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                        )
+                    )
+                for telemetry in context_knowledge_telemetry:
+                    yield await self._emit(
+                        _context_knowledge_telemetry_event(
                             telemetry=telemetry,
                             session=session,
                             registered_agent=registered_agent,
@@ -6412,12 +6451,14 @@ async def _build_context(
     messages: list[Message],
     step: int,
     environment_name: str | None,
+    knowledge_store: Any,
     request_metadata: dict[str, Any],
 ) -> tuple[
     list[Message],
     dict[str, Any] | None,
     dict[str, Any] | None,
     list[ContextCompactionTelemetry],
+    list[ContextKnowledgeTelemetry],
 ]:
     request = ContextRequest(
         session=session.model_copy(deep=True),
@@ -6425,6 +6466,7 @@ async def _build_context(
         messages=[message.model_copy(deep=True) for message in messages],
         step=step,
         environment_name=environment_name,
+        knowledge_store=knowledge_store,
         metadata=copy_json_value(request_metadata, "metadata"),
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
@@ -6439,10 +6481,11 @@ async def _build_context(
             copy_json_value(result.checkpoint, "checkpoint"),
             result.checkpoint_event_payload,
             [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
+            [telemetry.model_copy(deep=True) for telemetry in result.knowledge_telemetry],
         )
 
     result = await context_policy.build(request)
-    return copy_context_messages(result), None, None, []
+    return copy_context_messages(result), None, None, [], []
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
@@ -6540,6 +6583,24 @@ def _context_compaction_telemetry_event(
         raise TypeError(
             "Context compaction telemetry must be ContextCompactionTelemetry instances."
         )
+    return Event(
+        type=telemetry.event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=copy_json_value(telemetry.payload, "payload"),
+    )
+
+
+def _context_knowledge_telemetry_event(
+    *,
+    telemetry: ContextKnowledgeTelemetry,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+) -> Event:
+    if type(telemetry) is not ContextKnowledgeTelemetry:
+        raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
     return Event(
         type=telemetry.event_type,
         session_id=session.id,

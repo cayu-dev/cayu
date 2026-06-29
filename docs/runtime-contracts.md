@@ -20,7 +20,7 @@ The durable transcript is the source record of what happened in the session. A c
 
 Context output must preserve complete tool rounds: assistant tool calls must be followed by matching tool results, and tool results cannot appear without their preceding assistant tool calls. Policies that trim recent history should use `trim_context_turns(...)` for user-turn based history or `trim_context_messages(...)` for message-count based history instead of slicing blindly. Both helpers preserve leading system messages by default.
 
-Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, and `CheckpointCompactionContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
+Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `CheckpointCompactionContextPolicy`, and `KnowledgeInjectionPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
@@ -1334,8 +1334,19 @@ with only `query`, then use returned hit metadata to refine later searches. Apps
 that rely on non-default namespaces or strict project/user labels should make
 that scope part of the registered agent/tool configuration or instructions.
 
-This slice does not add runtime context injection, embeddings, graph retrieval,
-remote source connectors, or agent-authored memory. Those layers should build on
-the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` /
-`KnowledgeIndexer` contracts rather than introducing separate memory, skill, or
-document-store APIs.
+Apps can also use `KnowledgeInjectionPolicy` when knowledge should be recalled
+automatically before a model call instead of only through explicit tools. The
+policy wraps another context policy, searches the active environment's
+`knowledge_store` with the latest user message and configured filters, then
+injects bounded snippets as model-facing synthetic user context before the latest
+real user message. It does not append those snippets to the durable transcript.
+It emits `knowledge.search.started`, `knowledge.search.completed`,
+`knowledge.search.failed`, and `knowledge.injected` events for audit/debugging.
+Search failures are fail-open by default; configure `fail_open=False` when a
+missing knowledge lookup should fail the session before the provider request.
+
+This slice does not add embeddings, graph retrieval, remote source connectors,
+or agent-authored memory. Those layers should build on the same
+`KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` / `KnowledgeIndexer`
+contracts rather than introducing separate memory, skill, or document-store
+APIs.

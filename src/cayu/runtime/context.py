@@ -6,7 +6,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.artifacts import FileAttachment, file_attachment_from_payload
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
@@ -27,9 +32,21 @@ from cayu.providers.base import (
     copy_model_stream_event,
 )
 from cayu.runtime.sessions import Session
+from cayu.storage.memory import (
+    DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeHit,
+    KnowledgeQuery,
+    KnowledgeSearchMode,
+    KnowledgeVisibility,
+)
 
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 1
+_DEFAULT_KNOWLEDGE_INJECTION_MAX_HITS = 3
+_DEFAULT_KNOWLEDGE_INJECTION_MAX_BYTES = 4000
+_DEFAULT_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 2000
+_MIN_KNOWLEDGE_INJECTION_MAX_BYTES = 200
+_MIN_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 50
 
 
 class ContextRequest(BaseModel):
@@ -42,6 +59,7 @@ class ContextRequest(BaseModel):
     messages: list[Message]
     step: StrictInt = Field(ge=1)
     environment_name: str | None = None
+    knowledge_store: Any = Field(default=None, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("messages")
@@ -102,6 +120,32 @@ class ContextCompactionTelemetry(BaseModel):
         return copy_json_value(value, "payload")
 
 
+class ContextKnowledgeTelemetry(BaseModel):
+    """Knowledge retrieval telemetry that the runtime converts into events."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: EventType
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_context_event_type(cls, value: EventType) -> EventType:
+        if value not in {
+            EventType.KNOWLEDGE_SEARCH_STARTED,
+            EventType.KNOWLEDGE_SEARCH_COMPLETED,
+            EventType.KNOWLEDGE_SEARCH_FAILED,
+            EventType.KNOWLEDGE_INJECTED,
+        }:
+            raise ValueError("Context knowledge telemetry event_type is not supported.")
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "payload")
+
+
 def copy_context_compaction_telemetry(
     telemetry: ContextCompactionTelemetry,
 ) -> ContextCompactionTelemetry:
@@ -110,6 +154,17 @@ def copy_context_compaction_telemetry(
             "Context compaction telemetry must be ContextCompactionTelemetry instances."
         )
     return ContextCompactionTelemetry(
+        event_type=telemetry.event_type,
+        payload=copy_json_value(telemetry.payload, "payload"),
+    )
+
+
+def copy_context_knowledge_telemetry(
+    telemetry: ContextKnowledgeTelemetry,
+) -> ContextKnowledgeTelemetry:
+    if type(telemetry) is not ContextKnowledgeTelemetry:
+        raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
+    return ContextKnowledgeTelemetry(
         event_type=telemetry.event_type,
         payload=copy_json_value(telemetry.payload, "payload"),
     )
@@ -124,6 +179,7 @@ class ContextBuildResult(BaseModel):
     checkpoint: dict[str, Any] | None = None
     checkpoint_event_payload: dict[str, Any] | None = None
     compaction_telemetry: list[ContextCompactionTelemetry] = Field(default_factory=list)
+    knowledge_telemetry: list[ContextKnowledgeTelemetry] = Field(default_factory=list)
 
     @field_validator("messages")
     @classmethod
@@ -134,6 +190,11 @@ class ContextBuildResult(BaseModel):
     @classmethod
     def copy_compaction_telemetry(cls, value):
         return [copy_context_compaction_telemetry(item) for item in value]
+
+    @field_validator("knowledge_telemetry")
+    @classmethod
+    def copy_knowledge_telemetry(cls, value):
+        return [copy_context_knowledge_telemetry(item) for item in value]
 
     @field_validator("checkpoint", "checkpoint_event_payload", mode="before")
     @classmethod
@@ -151,11 +212,24 @@ class ContextBuildError(RuntimeError):
         message: str,
         *,
         compaction_telemetry: list[ContextCompactionTelemetry],
+        knowledge_telemetry: list[ContextKnowledgeTelemetry] | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        checkpoint_event_payload: dict[str, Any] | None = None,
         cause: Exception,
     ) -> None:
         super().__init__(message)
         self.compaction_telemetry = tuple(
             copy_context_compaction_telemetry(item) for item in compaction_telemetry
+        )
+        self.knowledge_telemetry = tuple(
+            copy_context_knowledge_telemetry(item)
+            for item in ([] if knowledge_telemetry is None else knowledge_telemetry)
+        )
+        self.checkpoint = None if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        self.checkpoint_event_payload = (
+            None
+            if checkpoint_event_payload is None
+            else copy_json_value(checkpoint_event_payload, "checkpoint_event_payload")
         )
         self.cause = cause
 
@@ -188,6 +262,195 @@ class DefaultContextPolicy(ContextPolicy):
             request.messages,
             max_attachment_results=self.max_attachment_results,
         )
+
+
+class KnowledgeInjectionPolicy(RuntimeManagedContextPolicy):
+    """Context policy wrapper that injects bounded retrieved knowledge.
+
+    The injected message is model-facing context only. It is not written to the
+    durable transcript.
+    """
+
+    def __init__(
+        self,
+        base_policy: ContextPolicy | None = None,
+        *,
+        enabled: bool = True,
+        namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE,
+        labels: dict[str, str] | None = None,
+        kinds: list[str] | None = None,
+        visibilities: list[KnowledgeVisibility] | None = None,
+        aspects: list[str] | None = None,
+        impact_targets: list[str] | None = None,
+        source_type: str | None = None,
+        source_id: str | None = None,
+        mode: KnowledgeSearchMode = KnowledgeSearchMode.AUTO,
+        include_expired: bool = False,
+        max_hits: int = _DEFAULT_KNOWLEDGE_INJECTION_MAX_HITS,
+        max_bytes: int = _DEFAULT_KNOWLEDGE_INJECTION_MAX_BYTES,
+        query_max_chars: int = _DEFAULT_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS,
+        prefix: str = "Relevant knowledge retrieved for this request:",
+        fail_open: bool = True,
+    ) -> None:
+        if base_policy is None:
+            self.base_policy = DefaultContextPolicy()
+        elif isinstance(base_policy, ContextPolicy):
+            self.base_policy = base_policy
+        else:
+            raise TypeError("base_policy must be a ContextPolicy.")
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a bool.")
+        if type(include_expired) is not bool:
+            raise TypeError("include_expired must be a bool.")
+        if type(fail_open) is not bool:
+            raise TypeError("fail_open must be a bool.")
+        self.enabled = enabled
+        self.namespace = require_clean_nonblank(namespace, "namespace")
+        self.labels = _copy_optional_label_map(labels)
+        self.kinds = _copy_optional_clean_string_list(kinds, "kinds")
+        self.visibilities = None if visibilities is None else list(dict.fromkeys(visibilities))
+        self.aspects = _copy_clean_string_list(aspects, "aspects")
+        self.impact_targets = _copy_clean_string_list(impact_targets, "impact_targets")
+        self.source_type = _optional_clean_nonblank(source_type, "source_type")
+        self.source_id = _optional_clean_nonblank(source_id, "source_id")
+        self.mode = KnowledgeSearchMode(mode)
+        self.include_expired = include_expired
+        self.max_hits = _validate_positive_int(max_hits, "max_hits")
+        self.max_bytes = _validate_minimum_int(
+            max_bytes,
+            "max_bytes",
+            minimum=_MIN_KNOWLEDGE_INJECTION_MAX_BYTES,
+        )
+        self.query_max_chars = _validate_minimum_int(
+            query_max_chars,
+            "query_max_chars",
+            minimum=_MIN_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS,
+        )
+        self.prefix = require_nonblank(prefix, "prefix")
+        self.fail_open = fail_open
+
+    async def build_with_checkpoint(
+        self,
+        request: ContextRequest,
+        *,
+        checkpoint: dict[str, Any] | None,
+    ) -> ContextBuildResult:
+        base_result = await self._build_base_context(request, checkpoint=checkpoint)
+        if not self.enabled or request.knowledge_store is None:
+            return base_result
+        if not callable(getattr(request.knowledge_store, "search", None)):
+            raise TypeError("ContextRequest.knowledge_store must implement KnowledgeStore.")
+
+        query_text = _latest_user_text(base_result.messages, max_chars=self.query_max_chars)
+        if query_text is None:
+            return base_result
+
+        query = KnowledgeQuery(
+            text=query_text,
+            namespace=self.namespace,
+            labels=self.labels,
+            kinds=self.kinds,
+            visibilities=self.visibilities,
+            aspects=self.aspects,
+            impact_targets=self.impact_targets,
+            source_type=self.source_type,
+            source_id=self.source_id,
+            mode=self.mode,
+            include_expired=self.include_expired,
+            limit=self.max_hits,
+            max_bytes=self.max_bytes,
+        )
+        telemetry = list(base_result.knowledge_telemetry)
+        telemetry.append(
+            _knowledge_search_telemetry(
+                event_type=EventType.KNOWLEDGE_SEARCH_STARTED,
+                policy=self,
+                query=query,
+                payload={
+                    "query_chars": len(query_text),
+                },
+            )
+        )
+        try:
+            search_result = await request.knowledge_store.search(query)
+        except Exception as exc:
+            telemetry.append(
+                _knowledge_search_telemetry(
+                    event_type=EventType.KNOWLEDGE_SEARCH_FAILED,
+                    policy=self,
+                    query=query,
+                    payload={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            )
+            if not self.fail_open:
+                raise ContextBuildError(
+                    str(exc),
+                    compaction_telemetry=list(base_result.compaction_telemetry),
+                    knowledge_telemetry=telemetry,
+                    checkpoint=base_result.checkpoint,
+                    checkpoint_event_payload=base_result.checkpoint_event_payload,
+                    cause=exc,
+                ) from exc
+            return base_result.model_copy(update={"knowledge_telemetry": telemetry})
+
+        telemetry.append(
+            _knowledge_search_telemetry(
+                event_type=EventType.KNOWLEDGE_SEARCH_COMPLETED,
+                policy=self,
+                query=query,
+                payload={
+                    "hit_count": len(search_result.hits),
+                    "total_hits_known": search_result.total_hits_known,
+                    "truncated": search_result.truncated,
+                },
+            )
+        )
+        if not search_result.hits:
+            return base_result.model_copy(update={"knowledge_telemetry": telemetry})
+
+        injection_text, injected_bytes = _format_knowledge_injection(
+            search_result.hits,
+            prefix=self.prefix,
+            max_bytes=self.max_bytes,
+        )
+        injected_messages = _insert_before_latest_user_message(
+            base_result.messages,
+            Message.text(MessageRole.USER, injection_text),
+        )
+        telemetry.append(
+            ContextKnowledgeTelemetry(
+                event_type=EventType.KNOWLEDGE_INJECTED,
+                payload={
+                    "policy": type(self).__name__,
+                    "hit_count": len(search_result.hits),
+                    "injected_bytes": injected_bytes,
+                    "sources": [_knowledge_source_payload(hit) for hit in search_result.hits],
+                },
+            )
+        )
+        return base_result.model_copy(
+            update={
+                "messages": injected_messages,
+                "knowledge_telemetry": telemetry,
+            }
+        )
+
+    async def _build_base_context(
+        self,
+        request: ContextRequest,
+        *,
+        checkpoint: dict[str, Any] | None,
+    ) -> ContextBuildResult:
+        if isinstance(self.base_policy, RuntimeManagedContextPolicy):
+            return await self.base_policy.build_with_checkpoint(
+                request,
+                checkpoint=checkpoint,
+            )
+        messages = await self.base_policy.build(request)
+        return ContextBuildResult(messages=messages)
 
 
 class MessageWindowContextPolicy(ContextPolicy):
@@ -852,6 +1115,169 @@ def _file_attachments_in_part(part: ToolResultPart) -> tuple[FileAttachment, ...
         if attachment is not None:
             attachments.append(attachment)
     return tuple(attachments)
+
+
+def _validate_positive_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+    return value
+
+
+def _validate_minimum_int(value: int, field_name: str, *, minimum: int) -> int:
+    _validate_positive_int(value, field_name)
+    if value < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return value
+
+
+def _copy_optional_label_map(value: dict[str, str] | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    return copy_label_map(value, "labels")
+
+
+def _optional_clean_nonblank(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return require_clean_nonblank(value, field_name)
+
+
+def _copy_clean_string_list(value: list[str] | None, field_name: str) -> list[str]:
+    copied = _copy_optional_clean_string_list(value, field_name)
+    return [] if copied is None else copied
+
+
+def _copy_optional_clean_string_list(
+    value: list[str] | None,
+    field_name: str,
+) -> list[str] | None:
+    if value is None:
+        return None
+    if type(value) is not list:
+        raise TypeError(f"{field_name} must be a list.")
+    result = [
+        require_clean_nonblank(item, f"{field_name}[{index}]") for index, item in enumerate(value)
+    ]
+    return list(dict.fromkeys(result))
+
+
+def _latest_user_text(messages: list[Message], *, max_chars: int) -> str | None:
+    for message in reversed(messages):
+        if message.role != MessageRole.USER:
+            continue
+        text = "\n".join(part.text for part in message.content if type(part) is TextPart).strip()
+        if not text:
+            return None
+        if len(text) <= max_chars:
+            return text
+        marker = "[query clipped to latest content]\n"
+        keep_chars = max_chars - len(marker)
+        if keep_chars <= 0:
+            return text[-max_chars:]
+        return marker + text[-keep_chars:]
+    return None
+
+
+def _insert_before_latest_user_message(
+    messages: list[Message],
+    injection: Message,
+) -> list[Message]:
+    copied = [copy_message(message) for message in messages]
+    for index in range(len(copied) - 1, -1, -1):
+        if copied[index].role == MessageRole.USER:
+            return [*copied[:index], copy_message(injection), *copied[index:]]
+    return [*copied, copy_message(injection)]
+
+
+def _format_knowledge_injection(
+    hits: list[KnowledgeHit],
+    *,
+    prefix: str,
+    max_bytes: int,
+) -> tuple[str, int]:
+    lines = [
+        prefix,
+        "Use these snippets as background context. They may be incomplete; cite entry ids when relying on them.",
+    ]
+    for index, hit in enumerate(hits, start=1):
+        entry = hit.entry
+        title = f" title={entry.title!r}" if entry.title else ""
+        chunk = f" chunk_index={hit.chunk.chunk_index}" if hit.chunk is not None else ""
+        score = f" score={hit.score:.4f}" if hit.score is not None else ""
+        text = hit.text_preview or (hit.chunk.text if hit.chunk is not None else entry.text)
+        lines.append(
+            f"{index}. entry_id={entry.id!r} kind={entry.kind!r}{title}{chunk}{score}\n{text}"
+        )
+    injected = _truncate_text_to_bytes("\n\n".join(lines), max_bytes)
+    if not injected:
+        injected = prefix
+    return injected, len(injected.encode("utf-8"))
+
+
+def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    marker = "\n[knowledge context truncated]"
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker[:max_bytes]
+    clipped = encoded[: max_bytes - len(marker_bytes)]
+    return clipped.decode("utf-8", errors="ignore").rstrip() + marker
+
+
+def _knowledge_search_telemetry(
+    *,
+    event_type: EventType,
+    policy: KnowledgeInjectionPolicy,
+    query: KnowledgeQuery,
+    payload: dict[str, Any] | None = None,
+) -> ContextKnowledgeTelemetry:
+    event_payload = {
+        "policy": type(policy).__name__,
+        "query": _knowledge_query_payload(query),
+    }
+    if payload is not None:
+        event_payload.update(copy_json_value(payload, "payload"))
+    return ContextKnowledgeTelemetry(event_type=event_type, payload=event_payload)
+
+
+def _knowledge_query_payload(query: KnowledgeQuery) -> dict[str, Any]:
+    return {
+        "namespace": query.namespace,
+        "labels": dict(query.labels),
+        "kinds": None if query.kinds is None else list(query.kinds),
+        "visibilities": (
+            None
+            if query.visibilities is None
+            else [visibility.value for visibility in query.visibilities]
+        ),
+        "aspects": list(query.aspects),
+        "impact_targets": list(query.impact_targets),
+        "source_type": query.source_type,
+        "source_id": query.source_id,
+        "mode": query.mode.value,
+        "include_expired": query.include_expired,
+        "limit": query.limit,
+        "max_bytes": query.max_bytes,
+    }
+
+
+def _knowledge_source_payload(hit: KnowledgeHit) -> dict[str, Any]:
+    entry = hit.entry
+    return {
+        "entry_id": entry.id,
+        "namespace": entry.namespace,
+        "kind": entry.kind,
+        "title": entry.title,
+        "chunk_id": hit.chunk.id if hit.chunk is not None else None,
+        "chunk_index": hit.chunk.chunk_index if hit.chunk is not None else None,
+        "score": hit.score,
+        "score_kind": hit.score_kind,
+        "reason": hit.reason,
+    }
 
 
 def _validate_max_attachment_results(value: int) -> int:

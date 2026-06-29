@@ -62,6 +62,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     InMemoryTaskStore,
     InterruptSessionRequest,
+    KnowledgeInjectionPolicy,
     LoopPolicy,
     MessageWindowContextPolicy,
     ModelCompactor,
@@ -772,6 +773,479 @@ def test_cayu_app_passes_environment_knowledge_store_to_tools() -> None:
     assert result_payload["structured"] == {
         "has_knowledge_store": True,
         "entry_text": "Runtime knowledge is available.",
+    }
+
+
+def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_transcript() -> None:
+    store = InMemorySessionStore()
+    knowledge_store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="git_policy",
+                text=(
+                    "For GitHub push from a remote sandbox, use a brokered Git HTTP "
+                    "proxy so credentials stay outside the sandbox."
+                ),
+                namespace="project:cayu",
+                labels={"project": "cayu"},
+                kind="procedure",
+                title="Remote sandbox Git credential boundary",
+            ),
+            KnowledgeEntry(
+                id="email_policy",
+                text="SendGrid requests should use the email credential proxy.",
+                namespace="project:cayu",
+                labels={"project": "cayu"},
+                kind="procedure",
+            ),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("use the git proxy"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(
+            namespace="project:cayu",
+            labels={"project": "cayu"},
+            max_hits=1,
+            max_bytes=800,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection",
+                messages=[Message.text("user", "How should I push to GitHub from a sandbox?")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[:5]] == [
+        EventType.SESSION_STARTED,
+        EventType.KNOWLEDGE_SEARCH_STARTED,
+        EventType.KNOWLEDGE_SEARCH_COMPLETED,
+        EventType.KNOWLEDGE_INJECTED,
+        EventType.MODEL_STARTED,
+    ]
+    provider_context = provider.requests[0].messages
+    assert [message.role for message in provider_context] == ["user", "user"]
+    injected_text = provider_context[0].content[0].text
+    assert "entry_id='git_policy'" in injected_text
+    assert "brokered Git HTTP proxy" in injected_text
+    assert provider_context[1].content[0].text == "How should I push to GitHub from a sandbox?"
+
+    injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
+    assert injected_event.payload["hit_count"] == 1
+    source = injected_event.payload["sources"][0]
+    assert source["entry_id"] == "git_policy"
+    assert source["namespace"] == "project:cayu"
+    assert source["kind"] == "procedure"
+    assert source["title"] == "Remote sandbox Git credential boundary"
+    assert source["chunk_id"] == "git_policy:0"
+    assert source["chunk_index"] == 0
+    assert source["score"] > 0
+    assert source["score_kind"] == "inmemory_keyword"
+    assert source["reason"] == "chunk text match"
+    assert "brokered Git HTTP proxy" not in str(injected_event.payload)
+    search_started = next(
+        event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_STARTED
+    )
+    assert search_started.payload["query"] == {
+        "namespace": "project:cayu",
+        "labels": {"project": "cayu"},
+        "kinds": None,
+        "visibilities": None,
+        "aspects": [],
+        "impact_targets": [],
+        "source_type": None,
+        "source_id": None,
+        "mode": "auto",
+        "include_expired": False,
+        "limit": 1,
+        "max_bytes": 800,
+    }
+
+    transcript = asyncio.run(store.load_transcript("sess_knowledge_injection"))
+    assert [message.content[0].text for message in transcript] == [
+        "How should I push to GitHub from a sandbox?",
+        "use the git proxy",
+    ]
+
+
+def test_cayu_app_knowledge_injection_can_be_disabled() -> None:
+    knowledge_store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="git_policy",
+                text="GitHub push should use a brokered proxy.",
+            )
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("plain answer"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(enabled=False),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection_disabled",
+                messages=[Message.text("user", "GitHub push?")],
+            ),
+        )
+    )
+
+    assert not any(str(event.type).startswith("knowledge.") for event in events)
+    assert [message.content[0].text for message in provider.requests[0].messages] == [
+        "GitHub push?"
+    ]
+
+
+def test_cayu_app_knowledge_injection_caps_inserted_context_bytes() -> None:
+    knowledge_store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="large_policy",
+                text="alpha " + ("large knowledge body " * 80),
+            )
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("bounded"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(max_hits=1, max_bytes=220),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection_cap",
+                messages=[Message.text("user", "alpha")],
+            ),
+        )
+    )
+
+    injected_text = provider.requests[0].messages[0].content[0].text
+    assert len(injected_text.encode("utf-8")) <= 220
+    assert "[knowledge context truncated]" in injected_text
+    injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
+    assert injected_event.payload["injected_bytes"] <= 220
+
+
+def test_cayu_app_knowledge_injection_search_failure_is_fail_open_by_default() -> None:
+    class FailingKnowledgeStore(InMemoryKnowledgeStore):
+        async def search(self, query):
+            raise RuntimeError("knowledge search unavailable")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("answered without injected knowledge"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=FailingKnowledgeStore(
+                [KnowledgeEntry(id="git_policy", text="GitHub push uses a proxy.")]
+            ),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection_fail_open",
+                messages=[Message.text("user", "GitHub push?")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[:4]] == [
+        EventType.SESSION_STARTED,
+        EventType.KNOWLEDGE_SEARCH_STARTED,
+        EventType.KNOWLEDGE_SEARCH_FAILED,
+        EventType.MODEL_STARTED,
+    ]
+    failed_event = next(
+        event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_FAILED
+    )
+    assert failed_event.payload["error"] == "knowledge search unavailable"
+    assert [message.content[0].text for message in provider.requests[0].messages] == [
+        "GitHub push?"
+    ]
+
+
+def test_cayu_app_knowledge_injection_fail_closed_emits_failure_before_session_failure() -> None:
+    class FailingKnowledgeStore(InMemoryKnowledgeStore):
+        async def search(self, query):
+            raise RuntimeError("knowledge search unavailable")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("unused"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=FailingKnowledgeStore(
+                [KnowledgeEntry(id="git_policy", text="GitHub push uses a proxy.")]
+            ),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(fail_open=False),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection_fail_closed",
+                messages=[Message.text("user", "GitHub push?")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.KNOWLEDGE_SEARCH_STARTED,
+        EventType.KNOWLEDGE_SEARCH_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    failed_event = next(
+        event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_FAILED
+    )
+    assert failed_event.payload["error"] == "knowledge search unavailable"
+    assert events[-1].payload == {
+        "error": "knowledge search unavailable",
+        "error_type": "RuntimeError",
+    }
+    assert provider.requests == []
+
+
+def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoint() -> None:
+    class FailingKnowledgeStore(InMemoryKnowledgeStore):
+        async def search(self, query):
+            raise RuntimeError("knowledge search unavailable")
+
+    store = InMemorySessionStore()
+    compactor = RecordingCompactor()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("unused"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=FailingKnowledgeStore(
+                [KnowledgeEntry(id="current_policy", text="Current deployment policy.")]
+            ),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(
+            CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+            fail_open=False,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_fail_closed_after_compaction",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current deployment"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.KNOWLEDGE_SEARCH_STARTED,
+        EventType.KNOWLEDGE_SEARCH_FAILED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[5].payload == {
+        "checkpoint": "context_compaction",
+        "compacted_transcript_cursor": 2,
+        "previous_compacted_transcript_cursor": 0,
+        "newly_compacted_message_count": 2,
+        "recent_message_count": 1,
+    }
+    checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
+    assert checkpoint == {
+        "context_compaction": {
+            "version": 1,
+            "summary": "old|old answer",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"request_count": 1},
+        }
+    }
+    assert provider.requests == []
+
+
+def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> None:
+    store = InMemorySessionStore()
+    compactor = RecordingCompactor()
+    knowledge_store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="current_policy",
+                text="Current deployment requests should check the rollout policy.",
+            )
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(
+            CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+            max_hits=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_injection_compaction",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current deployment"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events[:7]] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.KNOWLEDGE_SEARCH_STARTED,
+        EventType.KNOWLEDGE_SEARCH_COMPLETED,
+        EventType.KNOWLEDGE_INJECTED,
+        EventType.SESSION_CHECKPOINTED,
+    ]
+    provider_context = provider.requests[0].messages
+    assert [message.role for message in provider_context] == ["user", "user", "user"]
+    assert (
+        provider_context[0].content[0].text == "Previous session context summary:\nold|old answer"
+    )
+    assert "entry_id='current_policy'" in provider_context[1].content[0].text
+    assert provider_context[2].content[0].text == "current deployment"
+
+    checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
+    assert checkpoint == {
+        "context_compaction": {
+            "version": 1,
+            "summary": "old|old answer",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"request_count": 1},
+        }
     }
 
 

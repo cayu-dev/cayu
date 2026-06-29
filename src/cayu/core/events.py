@@ -55,6 +55,11 @@ class EventType(StrEnum):
     CONTEXT_COMPACTION_COMPLETED = "context.compaction.completed"
     CONTEXT_COMPACTION_FAILED = "context.compaction.failed"
 
+    KNOWLEDGE_SEARCH_STARTED = "knowledge.search.started"
+    KNOWLEDGE_SEARCH_COMPLETED = "knowledge.search.completed"
+    KNOWLEDGE_SEARCH_FAILED = "knowledge.search.failed"
+    KNOWLEDGE_INJECTED = "knowledge.injected"
+
     ENVIRONMENT_BINDING_STARTED = "environment.binding.started"
     ENVIRONMENT_BINDING_COMPLETED = "environment.binding.completed"
     ENVIRONMENT_BINDING_FAILED = "environment.binding.failed"

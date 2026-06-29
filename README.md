@@ -1487,6 +1487,29 @@ app.register_agent(
 Use `strip_old_file_attachments(...)` inside custom context policies when you build your
 own transcript projection and want the same bounded native-file behavior.
 
+Automatically inject relevant durable knowledge before each model call:
+
+```python
+from cayu import AgentSpec, KnowledgeInjectionPolicy, RecentTurnsContextPolicy
+
+app.register_agent(
+    AgentSpec(name="assistant", model="gpt-5.5"),
+    context_policy=KnowledgeInjectionPolicy(
+        RecentTurnsContextPolicy(max_user_turns=10),
+        namespace="project:cayu",
+        labels={"project": "cayu"},
+        max_hits=3,
+        max_bytes=4000,
+    ),
+)
+```
+
+`KnowledgeInjectionPolicy` searches the active environment's `knowledge_store`
+with the latest user message, injects bounded snippets only into the
+model-facing context, and leaves the durable transcript unchanged. Keep the
+explicit `ListKnowledgeTool`, `SearchKnowledgeTool`, and `ReadKnowledgeTool`
+available when the agent should actively explore or expand knowledge on demand.
+
 Scope tool authority per agent:
 
 ```python
