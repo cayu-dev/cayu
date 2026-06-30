@@ -5,6 +5,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
 from cayu.storage import (
     KnowledgeChunk,
     KnowledgeEntry,
@@ -20,6 +26,7 @@ from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, Sch
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_knowledge_embeddings",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
@@ -36,6 +43,36 @@ _TABLES = (
 )
 
 
+class KeywordEmbeddingProvider(TextEmbeddingProvider):
+    name = "keyword-test"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        self.calls.append(list(request.texts))
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def _test_embedding_vector(text: str) -> list[float]:
+    folded = text.casefold()
+    return [
+        1.0
+        if any(
+            term in folded for term in ("auth", "broker", "credential", "github", "proxy", "token")
+        )
+        else 0.0,
+        1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
+        1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
+    ]
+
+
 async def _drop_all(dsn: str) -> None:
     import psycopg
 
@@ -50,6 +87,33 @@ def _new_store(dsn: str):
     from cayu import PostgresKnowledgeStore
 
     return PostgresKnowledgeStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+
+
+def _new_embedding_store(dsn: str, provider: KeywordEmbeddingProvider):
+    from cayu import PostgresEmbeddingKnowledgeStore
+
+    return PostgresEmbeddingKnowledgeStore(
+        dsn,
+        min_size=1,
+        max_size=4,
+        schema_mode=SchemaMode.CREATE,
+        embedding_provider=provider,
+        embedding_model="test-embedding",
+        embedding_dimensions=3,
+        semantic_min_score=0.70,
+    )
+
+
+async def _skip_if_pgvector_unavailable(dsn: str) -> None:
+    import psycopg
+
+    try:
+        async with await psycopg.AsyncConnection.connect(dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            await conn.commit()
+    except Exception as exc:
+        pytest.skip(f"pgvector extension is not available: {exc}")
 
 
 def _run(dsn: str, coro_factory):
@@ -138,6 +202,281 @@ def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_d
     assert result.hits[0].score_kind == "postgres_full_text"
     assert result.total_hits_known == 1
     assert denied.hits == []
+
+
+def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_dsn: str) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            await store.put_entry(
+                KnowledgeEntry(
+                    id="git_policy",
+                    text="Use a credential broker for GitHub auth from remote sandboxes.",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    kind="procedure",
+                    aspects=["credentials", "git"],
+                )
+            )
+            await store.put_entry(
+                KnowledgeEntry(
+                    id="invoice_policy",
+                    text="Invoice refunds require payment approval.",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    kind="procedure",
+                    aspects=["invoices"],
+                )
+            )
+            result = await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+        finally:
+            await store.close()
+
+        reopened_provider = KeywordEmbeddingProvider()
+        reopened = _new_embedding_store(postgres_dsn, reopened_provider)
+        try:
+            reopened_result = await reopened.search(
+                KnowledgeQuery(
+                    text="github credential proxy",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+        finally:
+            await reopened.close()
+        return result, reopened_result, provider.calls, reopened_provider.calls
+
+    result, reopened_result, calls, reopened_calls = asyncio.run(ops())
+
+    assert [hit.entry.id for hit in result.hits] == ["git_policy"]
+    assert result.hits[0].score_kind == "postgres_semantic"
+    assert result.hits[0].chunk is not None
+    assert [hit.entry.id for hit in reopened_result.hits] == ["git_policy"]
+    assert reopened_calls == [["github credential proxy"]]
+    assert calls[:2] == [
+        ["Use a credential broker for GitHub auth from remote sandboxes."],
+        ["Invoice refunds require payment approval."],
+    ]
+
+
+def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="large-test-embedding",
+            embedding_dimensions=3072,
+        )
+        try:
+            await store._ensure_ready()
+        finally:
+            await store.close()
+
+        import psycopg
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT to_regclass('idx_cayu_knowledge_embeddings_embedding_hnsw')")
+            row = await cur.fetchone()
+        return None if row is None else row[0]
+
+    index_name = asyncio.run(ops())
+
+    assert index_name is None
+
+
+def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_indexing(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        first = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="large-test-embedding",
+            embedding_dimensions=3072,
+        )
+        try:
+            await first._ensure_ready()
+        finally:
+            await first.close()
+
+        second = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="small-test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="dimension mismatch"):
+                await second._ensure_ready()
+        finally:
+            await second.close()
+
+    asyncio.run(ops())
+
+
+def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        base = _new_store(postgres_dsn)
+        try:
+            await base.put_entry(
+                KnowledgeEntry(
+                    id="git_policy",
+                    text="Use a credential broker for GitHub auth from remote sandboxes.",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    kind="procedure",
+                )
+            )
+            await base.put_entry(
+                KnowledgeEntry(
+                    id="invoice_policy",
+                    text="GitHub token pushes should use the broker.",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    kind="procedure",
+                )
+            )
+            await base.put_entry(
+                KnowledgeEntry(
+                    id="other_policy",
+                    text="Invoice refunds require payment approval.",
+                    namespace="ops",
+                    labels={"project": "other"},
+                    kind="procedure",
+                )
+            )
+        finally:
+            await base.close()
+
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            before = await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+            first_backfill = await store.backfill_embeddings(
+                KnowledgeListQuery(
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                ),
+                limit=1,
+            )
+            after = await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+            second_backfill = await store.backfill_embeddings(
+                KnowledgeListQuery(
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                ),
+                limit=1,
+            )
+            third_backfill = await store.backfill_embeddings(
+                KnowledgeListQuery(
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                ),
+                limit=10,
+            )
+            refresh = await store.backfill_embeddings(
+                KnowledgeListQuery(
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                ),
+                limit=10,
+                refresh_existing=True,
+            )
+        finally:
+            await store.close()
+        return (
+            before,
+            first_backfill,
+            after,
+            second_backfill,
+            third_backfill,
+            refresh,
+            provider.calls,
+        )
+
+    before, first_backfill, after, second_backfill, third_backfill, refresh, calls = asyncio.run(
+        ops()
+    )
+
+    assert before.hits == []
+    assert first_backfill.scanned_chunks == 1
+    assert first_backfill.embedded_chunks == 1
+    assert first_backfill.skipped_current_chunks == 0
+    assert len(after.hits) == 1
+    assert after.hits[0].entry.id in {"git_policy", "invoice_policy"}
+    assert second_backfill.scanned_chunks == 1
+    assert second_backfill.embedded_chunks == 1
+    assert second_backfill.skipped_current_chunks == 0
+    assert third_backfill.scanned_chunks == 0
+    assert third_backfill.embedded_chunks == 0
+    assert third_backfill.skipped_current_chunks == 0
+    assert refresh.scanned_chunks == 2
+    assert refresh.embedded_chunks == 2
+    embed_calls = [call for call in calls if call != ["auth broker"]]
+    assert len(embed_calls) == 3
+    assert sorted(embed_calls[:2]) == sorted(
+        [
+            ["GitHub token pushes should use the broker."],
+            ["Use a credential broker for GitHub auth from remote sandboxes."],
+        ]
+    )
+    assert sorted(embed_calls[2]) == sorted(
+        [
+            "GitHub token pushes should use the broker.",
+            "Use a credential broker for GitHub auth from remote sandboxes.",
+        ]
+    )
 
 
 def test_postgres_knowledge_store_defaults_hide_inactive_and_expired(

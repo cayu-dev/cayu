@@ -1247,6 +1247,19 @@ tests, demos, and small single-process apps. It uses a configured
 `semantic` mode with cosine similarity, reports `score_normalized` as `(cosine +
 1) / 2`, compares `semantic_min_score` against that normalized score, and uses a
 bounded keyword boost for `hybrid` and `auto` mode. It does not persist vectors.
+`PostgresEmbeddingKnowledgeStore` is the durable Postgres semantic backend. It
+requires the pgvector `vector` extension, a configured `TextEmbeddingProvider`,
+and explicit `embedding_dimensions` because the pgvector column type includes the
+dimension. It keeps embeddings in a derived `cayu_knowledge_embeddings` table,
+updates vectors on entry/chunk writes, reuses persisted vectors across process
+restarts, and leaves plain `PostgresKnowledgeStore` usable without pgvector.
+Semantic search uses chunks that already have vectors, with pgvector HNSW
+indexing when `embedding_dimensions <= 2000`; larger dimensions use exact
+pgvector search. Bulk backfill for existing knowledge is explicit via
+`backfill_embeddings(..., limit=N)`, which embeds a bounded batch of matching
+chunks. By default backfill only embeds missing or stale vectors; pass
+`refresh_existing=True` to re-embed chunks whose current vector already matches
+the configured model and dimensions.
 
 - `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,

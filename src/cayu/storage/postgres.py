@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, LiteralString, cast
@@ -19,6 +20,7 @@ from cayu._validation import (
 )
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message
+from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
     EventWatcherDelivery,
@@ -97,6 +99,13 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _knowledge_chunk_content_hash,
+    _score_entry,
+    _search_result_from_scored_embeddings,
+    _semantic_query_text,
+    _validate_nonnegative_float,
+    _validate_positive_int,
+    _validate_unit_float,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
@@ -113,12 +122,26 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _KNOWLEDGE_SEARCH_PAGE_SIZE = 500
 _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
+_PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS = 2000
+_PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER = 8
+_PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7665_6374 & 0x7FFF_FFFF_FFFF_FFFF
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
     "task.parent_task_id, task.assigned_agent_name, task.worker_id, task.lease_expires_at, "
     "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
     "task.created_at, task.updated_at, task.started_at, task.completed_at"
 )
+
+
+@dataclass(frozen=True)
+class PostgresEmbeddingBackfillResult:
+    """Result of a bounded Postgres knowledge embedding backfill."""
+
+    scanned_chunks: int
+    embedded_chunks: int
+    skipped_current_chunks: int
+    limit: int
+    refresh_existing: bool
 
 
 def _event_query_session_id_batches(
@@ -1380,6 +1403,641 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
             for row in rows[: query.limit]
         ], len(rows) > query.limit
+
+
+class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
+    """Postgres knowledge store with pgvector-backed semantic chunk search."""
+
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        embedding_provider: TextEmbeddingProvider,
+        embedding_model: str,
+        embedding_dimensions: int,
+        hybrid_keyword_weight: float = 0.35,
+        semantic_min_score: float = 0.55,
+    ) -> None:
+        if not isinstance(embedding_provider, TextEmbeddingProvider):
+            raise TypeError("embedding_provider must implement TextEmbeddingProvider.")
+        _validate_positive_int(embedding_dimensions, "embedding_dimensions")
+        self.embedding_provider = embedding_provider
+        self.embedding_model = require_clean_nonblank(embedding_model, "embedding_model")
+        self.embedding_dimensions = embedding_dimensions
+        self.hybrid_keyword_weight = _validate_nonnegative_float(
+            hybrid_keyword_weight,
+            "hybrid_keyword_weight",
+        )
+        self.semantic_min_score = _validate_unit_float(
+            semantic_min_score,
+            "semantic_min_score",
+        )
+        self._embedding_schema_ready = False
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+        )
+
+    async def _ensure_ready(self) -> None:
+        await super()._ensure_ready()
+        if self._embedding_schema_ready:
+            return
+        async with self._open_lock:
+            if self._embedding_schema_ready:
+                return
+            await self._reconcile_embedding_schema()
+            self._embedding_schema_ready = True
+
+    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        stored = await super().put_entry(entry)
+        await self._embed_entry_chunks(stored.id)
+        return stored
+
+    async def delete_entry(
+        self,
+        entry_id: str,
+        *,
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        deleted = await super().delete_entry(entry_id, hard=hard)
+        if hard and deleted is not None:
+            await self._delete_entry_embeddings(deleted.id)
+        return deleted
+
+    async def replace_chunks(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> list[KnowledgeChunk]:
+        stored_chunks = await super().replace_chunks(entry_id, chunks)
+        await self._embed_chunks(stored_chunks)
+        await self._drop_stale_entry_embeddings(entry_id, stored_chunks)
+        return stored_chunks
+
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        stored = await super().put_entry_with_chunks(entry, chunks)
+        await self._embed_entry_chunks(stored.id)
+        return stored
+
+    async def backfill_embeddings(
+        self,
+        query: KnowledgeListQuery | None = None,
+        *,
+        limit: int = 500,
+        refresh_existing: bool = False,
+    ) -> PostgresEmbeddingBackfillResult:
+        """Embed a bounded batch of existing chunks matching knowledge filters.
+
+        By default this only fills missing or stale embedding rows. Set
+        ``refresh_existing=True`` to re-embed current rows for the configured
+        model and dimensions.
+        """
+
+        _validate_positive_int(limit, "limit")
+        if type(refresh_existing) is not bool:
+            raise ValueError("`refresh_existing` must be a boolean.")
+        query = copy_knowledge_list_query(query or KnowledgeListQuery())
+        await self._ensure_ready()
+        chunks = await self._backfill_candidate_chunks(
+            query,
+            limit,
+            refresh_existing=refresh_existing,
+        )
+        embedded_chunks = await self._embed_chunks(
+            chunks,
+            refresh_existing=refresh_existing,
+        )
+        return PostgresEmbeddingBackfillResult(
+            scanned_chunks=len(chunks),
+            embedded_chunks=embedded_chunks,
+            skipped_current_chunks=len(chunks) - embedded_chunks,
+            limit=limit,
+            refresh_existing=refresh_existing,
+        )
+
+    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+        query = copy_knowledge_query(query)
+        if query.mode is KnowledgeSearchMode.KEYWORD:
+            return await super().search(query)
+        if query.mode not in {
+            KnowledgeSearchMode.AUTO,
+            KnowledgeSearchMode.SEMANTIC,
+            KnowledgeSearchMode.HYBRID,
+        }:
+            raise ValueError(
+                "PostgresEmbeddingKnowledgeStore supports auto, keyword, semantic, "
+                "and hybrid search modes."
+            )
+        await self._ensure_ready()
+        semantic_query_text = _semantic_query_text(query)
+        query_vector = await self._embed_query(query, semantic_query_text)
+        rows, candidate_limit_reached = await self._semantic_search_rows(query, query_vector)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            scored, byte_truncated = await self._scored_semantic_rows(
+                cur,
+                rows,
+                query,
+            )
+        total_hits_known_floor = len(scored)
+        if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
+            keyword_query = query.model_copy(update={"mode": KnowledgeSearchMode.KEYWORD})
+            try:
+                keyword_result = await super().search(keyword_query)
+            except ValueError:
+                keyword_result = None
+            if keyword_result is not None:
+                scored = self._merge_keyword_hits(scored, keyword_result)
+                byte_truncated = byte_truncated or keyword_result.truncated
+                total_hits_known_floor = max(
+                    total_hits_known_floor,
+                    keyword_result.total_hits_known,
+                )
+        score_kind = (
+            "postgres_semantic" if query.mode is KnowledgeSearchMode.SEMANTIC else "postgres_hybrid"
+        )
+        result = _search_result_from_scored_embeddings(
+            scored,
+            query,
+            score_kind=score_kind,
+        )
+        return KnowledgeSearchResult(
+            query=result.query,
+            hits=result.hits,
+            truncated=byte_truncated or result.truncated or candidate_limit_reached,
+            limit=result.limit,
+            max_bytes=result.max_bytes,
+            total_hits_known=max(result.total_hits_known, total_hits_known_floor),
+        )
+
+    async def _reconcile_embedding_schema(self) -> None:
+        mode = self._schema_mode
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (_PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY,)
+                )
+                if mode in {schema.SchemaMode.CREATE, schema.SchemaMode.MIGRATE}:
+                    await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            CREATE TABLE IF NOT EXISTS cayu_knowledge_embeddings (
+                                chunk_id TEXT PRIMARY KEY REFERENCES cayu_knowledge_chunks(id) ON DELETE CASCADE,
+                                entry_id TEXT NOT NULL REFERENCES cayu_knowledge_entries(id) ON DELETE CASCADE,
+                                content_hash TEXT NOT NULL,
+                                model TEXT NOT NULL,
+                                dimensions INTEGER NOT NULL,
+                                embedding vector({self.embedding_dimensions}) NOT NULL,
+                                created_at TIMESTAMPTZ NOT NULL,
+                                updated_at TIMESTAMPTZ NOT NULL
+                            )
+                            """,
+                        )
+                    )
+                    await self._validate_embedding_schema(cur)
+                    await cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_embeddings_entry
+                        ON cayu_knowledge_embeddings(entry_id)
+                        """
+                    )
+                    await cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_embeddings_model_dims
+                        ON cayu_knowledge_embeddings(model, dimensions)
+                        """
+                    )
+                    if self.embedding_dimensions <= _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS:
+                        await cur.execute(
+                            """
+                            CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_embeddings_embedding_hnsw
+                            ON cayu_knowledge_embeddings USING hnsw (embedding vector_cosine_ops)
+                            """
+                        )
+                elif mode is schema.SchemaMode.VALIDATE:
+                    await cur.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+                    )
+                    row = await cur.fetchone()
+                    if row is None or not bool(row[0]):
+                        raise RuntimeError(
+                            "PostgresEmbeddingKnowledgeStore requires the pgvector extension. "
+                            "Use schema_mode=CREATE/MIGRATE or create extension vector manually."
+                        )
+                    await cur.execute("SELECT to_regclass('cayu_knowledge_embeddings')")
+                    row = await cur.fetchone()
+                    if row is None or row[0] is None:
+                        raise RuntimeError(
+                            "Missing Postgres knowledge embedding schema. "
+                            "Run with schema_mode=CREATE or MIGRATE first."
+                        )
+                await self._validate_embedding_schema(cur)
+            await conn.commit()
+
+    async def _validate_embedding_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute AS a
+            WHERE a.attrelid = 'cayu_knowledge_embeddings'::regclass
+              AND a.attname = 'embedding'
+              AND NOT a.attisdropped
+            """
+        )
+        row = await cur.fetchone()
+        expected = f"vector({self.embedding_dimensions})"
+        actual = None if row is None else str(row[0])
+        if actual != expected:
+            raise RuntimeError(
+                "Postgres knowledge embedding dimension mismatch: "
+                f"expected {expected}, found {actual or 'missing embedding column'}."
+            )
+
+    async def _semantic_search_rows(
+        self,
+        query: KnowledgeQuery,
+        query_vector: list[float],
+    ) -> tuple[list[tuple[str, str, float]], bool]:
+        where_sql, params = _postgres_knowledge_filter_sql(query)
+        none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+        vector_literal = _postgres_vector_literal(query_vector)
+        candidate_limit = max(
+            query.limit,
+            query.limit * _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
+        )
+        min_score_sql = (
+            ""
+            if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}
+            else "WHERE normalized_score >= %s"
+        )
+        min_score_params: list[object] = (
+            []
+            if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}
+            else [self.semantic_min_score]
+        )
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    WITH nearest_chunks AS (
+                        SELECT
+                            e.id AS entry_id,
+                            c.id AS chunk_id,
+                            c.chunk_index AS chunk_index,
+                            emb.embedding <=> %s::vector AS distance,
+                            (1.0 + (1.0 - (emb.embedding <=> %s::vector))) / 2.0 AS normalized_score,
+                            COALESCE(e.importance, 0.0) AS importance,
+                            e.updated_at AS updated_at
+                        FROM cayu_knowledge_embeddings AS emb
+                        JOIN cayu_knowledge_chunks AS c ON c.id = emb.chunk_id
+                        JOIN cayu_knowledge_entries AS e ON e.id = emb.entry_id
+                        WHERE emb.model = %s
+                          AND emb.dimensions = %s
+                          AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
+                        {where_sql}
+                        {none_sql}
+                        ORDER BY emb.embedding <=> %s::vector
+                        LIMIT %s
+                    ),
+                    best_entries AS (
+                        SELECT DISTINCT ON (entry_id)
+                            entry_id,
+                            chunk_id,
+                            normalized_score,
+                            importance,
+                            updated_at
+                        FROM nearest_chunks
+                        ORDER BY entry_id, distance ASC, chunk_index ASC
+                    ),
+                    filtered_entries AS (
+                        SELECT *
+                        FROM best_entries
+                        {min_score_sql}
+                    )
+                    SELECT
+                        entry_id,
+                        chunk_id,
+                        normalized_score,
+                        (SELECT COUNT(*) FROM nearest_chunks) AS candidate_count
+                    FROM filtered_entries
+                    ORDER BY normalized_score DESC,
+                             importance DESC,
+                             updated_at DESC,
+                             entry_id ASC
+                    LIMIT %s
+                    """,
+                ),
+                [
+                    vector_literal,
+                    vector_literal,
+                    self.embedding_model,
+                    self.embedding_dimensions,
+                    *params,
+                    *none_params,
+                    vector_literal,
+                    candidate_limit,
+                    *min_score_params,
+                    query.limit,
+                ],
+            )
+            rows = await cur.fetchall()
+        candidate_count = 0 if not rows else int(rows[0][3])
+        candidate_limit_reached = candidate_count >= candidate_limit
+        return [(str(row[0]), str(row[1]), float(row[2])) for row in rows], candidate_limit_reached
+
+    async def _backfill_candidate_chunks(
+        self,
+        query: KnowledgeListQuery,
+        limit: int,
+        *,
+        refresh_existing: bool,
+    ) -> list[KnowledgeChunk]:
+        where_sql, params = _postgres_knowledge_list_filter_sql(query)
+        current_embedding_join_sql = ""
+        missing_embedding_filter_sql = ""
+        current_embedding_params: list[object] = []
+        if not refresh_existing:
+            current_embedding_join_sql = """
+                    LEFT JOIN cayu_knowledge_embeddings AS emb
+                      ON emb.chunk_id = c.id
+                     AND emb.entry_id = c.entry_id
+                     AND emb.model = %s
+                     AND emb.dimensions = %s
+                     AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
+                    """
+            missing_embedding_filter_sql = "AND emb.chunk_id IS NULL"
+            current_embedding_params = [self.embedding_model, self.embedding_dimensions]
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT c.id, c.entry_id, c.chunk_index, c.text, c.content_hash, c.source_uri, c.metadata
+                    FROM cayu_knowledge_chunks AS c
+                    JOIN cayu_knowledge_entries AS e ON e.id = c.entry_id
+                    {current_embedding_join_sql}
+                    WHERE TRUE
+                    {where_sql}
+                    {missing_embedding_filter_sql}
+                    ORDER BY COALESCE(e.importance, 0.0) DESC,
+                             e.updated_at DESC,
+                             e.id ASC,
+                             c.chunk_index ASC
+                    LIMIT %s
+                    """,
+                ),
+                [*current_embedding_params, *params, limit],
+            )
+            return [_knowledge_chunk_from_row(row) for row in await cur.fetchall()]
+
+    async def _scored_semantic_rows(
+        self,
+        cur: Any,
+        rows: list[tuple[str, str, float]],
+        query: KnowledgeQuery,
+    ) -> tuple[
+        list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]], bool
+    ]:
+        scored: list[
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
+        ] = []
+        byte_truncated = False
+        for entry_id, chunk_id, normalized_score in rows:
+            entry = await self._load_entry(cur, entry_id)
+            chunk = await self._load_chunk(cur, chunk_id)
+            if entry is None or chunk is None:
+                continue
+            semantic_matched = normalized_score >= self.semantic_min_score
+            score = normalized_score if semantic_matched else 0.0
+            reason = "semantic chunk match"
+            preview_text = chunk.text
+            score_normalized = normalized_score if semantic_matched else None
+            if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
+                chunks = await self._load_chunks(cur, entry.id)
+                keyword_score, keyword_chunk, keyword_reason, keyword_preview = _score_entry(
+                    entry,
+                    chunks,
+                    query,
+                )
+                if keyword_score > 0:
+                    keyword_boost = min(keyword_score, 10.0) / 10.0
+                    score += self.hybrid_keyword_weight * keyword_boost
+                    if keyword_chunk is not None:
+                        chunk = keyword_chunk
+                    reason = (
+                        f"hybrid semantic chunk match; {keyword_reason}"
+                        if semantic_matched
+                        else f"hybrid keyword match; {keyword_reason}"
+                    )
+                    preview_text = keyword_preview
+            elif not semantic_matched:
+                continue
+            if score <= 0:
+                continue
+            scored.append((score, entry, chunk, reason, preview_text, score_normalized))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -(item[1].importance or 0.0),
+                -item[1].updated_at.timestamp(),
+                item[1].id,
+            )
+        )
+        return scored, byte_truncated
+
+    def _merge_keyword_hits(
+        self,
+        scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]],
+        keyword_result: KnowledgeSearchResult,
+    ) -> list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]]:
+        merged = list(scored)
+        seen_entry_ids = {entry.id for _, entry, _, _, _, _ in merged}
+        for hit in keyword_result.hits:
+            if hit.entry.id in seen_entry_ids:
+                continue
+            keyword_boost = min(hit.score, 10.0) / 10.0
+            score = self.hybrid_keyword_weight * keyword_boost
+            if score <= 0:
+                continue
+            seen_entry_ids.add(hit.entry.id)
+            merged.append(
+                (
+                    score,
+                    hit.entry,
+                    hit.chunk,
+                    f"hybrid keyword match; {hit.reason}",
+                    hit.text_preview,
+                    None,
+                )
+            )
+        merged.sort(
+            key=lambda item: (
+                -item[0],
+                -(item[1].importance or 0.0),
+                -item[1].updated_at.timestamp(),
+                item[1].id,
+            )
+        )
+        return merged
+
+    async def _embed_entry_chunks(self, entry_id: str) -> None:
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            chunks = await self._load_chunks(cur, entry_id)
+        await self._embed_chunks(chunks)
+        await self._drop_stale_entry_embeddings(entry_id, chunks)
+
+    async def _embed_chunks(
+        self,
+        chunks: list[KnowledgeChunk],
+        *,
+        refresh_existing: bool = False,
+    ) -> int:
+        if not chunks:
+            return 0
+        missing = list(chunks) if refresh_existing else await self._missing_embedding_chunks(chunks)
+        if not missing:
+            return 0
+        result = await self.embedding_provider.embed_texts(
+            TextEmbeddingRequest(
+                model=self.embedding_model,
+                texts=[chunk.text for chunk in missing],
+                dimensions=self.embedding_dimensions,
+            )
+        )
+        if len(result.embeddings) != len(missing):
+            raise ValueError("Embedding provider returned a different number of embeddings.")
+        by_index = {embedding.index: embedding for embedding in result.embeddings}
+        now = datetime.now(UTC)
+        rows: list[tuple[object, ...]] = []
+        for index, chunk in enumerate(missing):
+            embedding = by_index.get(index)
+            if embedding is None:
+                raise ValueError("Embedding provider did not return every requested index.")
+            self._validate_embedding_dimension(embedding.vector)
+            rows.append(
+                (
+                    chunk.id,
+                    chunk.entry_id,
+                    _knowledge_chunk_content_hash(chunk),
+                    self.embedding_model,
+                    self.embedding_dimensions,
+                    _postgres_vector_literal(embedding.vector),
+                    now,
+                    now,
+                )
+            )
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.executemany(
+                """
+                INSERT INTO cayu_knowledge_embeddings (
+                    chunk_id,
+                    entry_id,
+                    content_hash,
+                    model,
+                    dimensions,
+                    embedding,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s::vector, %s, %s)
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    entry_id = excluded.entry_id,
+                    content_hash = excluded.content_hash,
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    embedding = excluded.embedding,
+                    updated_at = excluded.updated_at
+                """,
+                rows,
+            )
+            await conn.commit()
+        return len(rows)
+
+    async def _missing_embedding_chunks(
+        self,
+        chunks: list[KnowledgeChunk],
+    ) -> list[KnowledgeChunk]:
+        chunk_ids = [chunk.id for chunk in chunks]
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT chunk_id, entry_id, content_hash, model, dimensions
+                FROM cayu_knowledge_embeddings
+                WHERE chunk_id = ANY(%s)
+                """,
+                (chunk_ids,),
+            )
+            existing = {str(row[0]): row for row in await cur.fetchall()}
+        missing: list[KnowledgeChunk] = []
+        for chunk in chunks:
+            row = existing.get(chunk.id)
+            if (
+                row is None
+                or str(row[1]) != chunk.entry_id
+                or str(row[2]) != _knowledge_chunk_content_hash(chunk)
+                or str(row[3]) != self.embedding_model
+                or int(row[4]) != self.embedding_dimensions
+            ):
+                missing.append(chunk)
+        return missing
+
+    async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
+        result = await self.embedding_provider.embed_texts(
+            TextEmbeddingRequest(
+                model=self.embedding_model,
+                texts=[text],
+                dimensions=self.embedding_dimensions,
+            )
+        )
+        embedding = next((item for item in result.embeddings if item.index == 0), None)
+        if embedding is None:
+            raise ValueError("Embedding provider did not return query embedding index 0.")
+        self._validate_embedding_dimension(embedding.vector)
+        return list(embedding.vector)
+
+    def _validate_embedding_dimension(self, vector: list[float]) -> None:
+        if len(vector) != self.embedding_dimensions:
+            raise ValueError("Embedding provider returned a vector with unexpected dimension.")
+
+    async def _delete_entry_embeddings(self, entry_id: str) -> None:
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM cayu_knowledge_embeddings WHERE entry_id = %s",
+                (entry_id,),
+            )
+            await conn.commit()
+
+    async def _drop_stale_entry_embeddings(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        current_ids = [chunk.id for chunk in chunks]
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM cayu_knowledge_embeddings
+                WHERE entry_id = %s
+                  AND NOT (chunk_id = ANY(%s))
+                """,
+                (entry_id, current_ids),
+            )
+            await conn.commit()
 
 
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
@@ -3396,7 +4054,11 @@ def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]
         ]
     )
     all_groups = _dedupe_knowledge_search_token_groups(
-        [group for term in query.all_terms for group in _structured_knowledge_search_token_groups(term)]
+        [
+            group
+            for term in query.all_terms
+            for group in _structured_knowledge_search_token_groups(term)
+        ]
     )
     none_terms = _dedupe_knowledge_search_tokens(
         [
@@ -3414,9 +4076,7 @@ def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]
     if any_terms:
         positive_parts.append("(" + " | ".join(any_terms) + ")")
     if all_groups:
-        positive_parts.append(
-            " & ".join("(" + " | ".join(group) + ")" for group in all_groups)
-        )
+        positive_parts.append(" & ".join("(" + " | ".join(group) + ")" for group in all_groups))
     if phrase_queries:
         positive_parts.append("(" + " | ".join(phrase_queries) + ")")
     if not positive_parts:
@@ -3443,7 +4103,11 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
         ]
     )
     all_groups = _dedupe_knowledge_search_token_groups(
-        [group for term in query.all_terms for group in _structured_knowledge_search_token_groups(term)]
+        [
+            group
+            for term in query.all_terms
+            for group in _structured_knowledge_search_token_groups(term)
+        ]
     )
     none_terms = _dedupe_knowledge_search_tokens(
         [
@@ -3457,15 +4121,11 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
     clauses: list[str] = []
     params: list[object] = []
     if any_terms:
-        clause, clause_params = _postgres_document_match_clause(
-            "(" + " | ".join(any_terms) + ")"
-        )
+        clause, clause_params = _postgres_document_match_clause("(" + " | ".join(any_terms) + ")")
         clauses.append(clause)
         params.extend(clause_params)
     for group in all_groups:
-        clause, clause_params = _postgres_document_match_clause(
-            "(" + " | ".join(group) + ")"
-        )
+        clause, clause_params = _postgres_document_match_clause("(" + " | ".join(group) + ")")
         clauses.append(clause)
         params.extend(clause_params)
     if phrase_queries:
@@ -3482,6 +4142,26 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
     if not any_terms and not all_groups and not phrase_queries:
         raise ValueError("Knowledge query requires positive search terms.")
     return cast("LiteralString", " AND ".join(clauses)), params
+
+
+def _postgres_knowledge_none_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
+    none_terms = _dedupe_knowledge_search_tokens(
+        [
+            token
+            for term in query.none_terms
+            for group in _structured_knowledge_search_token_groups(term)
+            for token in group
+        ]
+    )
+    clauses: list[str] = []
+    params: list[object] = []
+    for term in none_terms:
+        clause, clause_params = _postgres_document_match_clause(term)
+        clauses.append(f"NOT {clause}")
+        params.extend(clause_params)
+    if not clauses:
+        return "", params
+    return cast("LiteralString", " AND " + " AND ".join(clauses)), params
 
 
 def _postgres_document_match_clause(ts_query: str) -> tuple[LiteralString, list[object]]:
@@ -3501,6 +4181,20 @@ def _postgres_document_match_clause(ts_query: str) -> tuple[LiteralString, list[
         ),
         [ts_query, ts_query, ts_query],
     )
+
+
+def _postgres_vector_literal(vector: list[float]) -> str:
+    values: list[str] = []
+    for index, item in enumerate(vector):
+        if isinstance(item, bool) or not isinstance(item, int | float):
+            raise ValueError(f"embedding vector item {index} must be a number.")
+        number = float(item)
+        if number != number or number in {float("inf"), float("-inf")}:
+            raise ValueError(f"embedding vector item {index} must be finite.")
+        values.append(repr(number))
+    if not values:
+        raise ValueError("embedding vector cannot be empty.")
+    return "[" + ",".join(values) + "]"
 
 
 def _postgres_list_facet_sql(
@@ -3897,6 +4591,8 @@ _TERMINAL_EVENT_TYPES = [
 # Re-exported so callers can construct a pool explicitly when desired.
 __all__ = [
     "AsyncConnectionPool",
+    "PostgresEmbeddingBackfillResult",
+    "PostgresEmbeddingKnowledgeStore",
     "PostgresEventWatcherStore",
     "PostgresKnowledgeStore",
     "PostgresSessionStore",

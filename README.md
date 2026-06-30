@@ -176,8 +176,13 @@ For semantic recall, Cayu exposes a provider-neutral `TextEmbeddingProvider`
 contract. `OpenAIProvider.embed_texts(...)` implements that contract against
 OpenAI embeddings, and `InMemoryEmbeddingKnowledgeStore` can use any embedding
 provider for opt-in `semantic`, `hybrid`, or `auto` search in tests, demos, and
-small single-process apps. SQLite and Postgres knowledge stores remain durable
-keyword stores until a backend-specific vector index is added.
+small single-process apps. `PostgresEmbeddingKnowledgeStore` adds durable
+pgvector-backed semantic search for Postgres deployments that install the
+`vector` extension and opt into explicit embedding dimensions. Plain
+`PostgresKnowledgeStore` and SQLite remain durable keyword stores. Existing
+Postgres knowledge can be indexed deliberately with bounded
+`backfill_embeddings(..., limit=N)` batches. Pgvector HNSW indexing is created
+for dimensions up to 2000; larger vectors still work with exact pgvector search.
 
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:

@@ -596,7 +596,9 @@ __all__ = [
     "PdfArtifactReader",
     "PendingToolApproval",
     "PendingToolCallApproval",
+    "PostgresEmbeddingBackfillResult",
     "PostgresEventWatcherStore",
+    "PostgresEmbeddingKnowledgeStore",
     "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
@@ -753,6 +755,8 @@ def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so ``import cayu`` does not depend on psycopg being installed.
     if name in {
+        "PostgresEmbeddingBackfillResult",
+        "PostgresEmbeddingKnowledgeStore",
         "PostgresEventWatcherStore",
         "PostgresKnowledgeStore",
         "PostgresSessionStore",
