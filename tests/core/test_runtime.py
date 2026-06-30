@@ -29,6 +29,7 @@ from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
+    ModelContextOverflowError,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -169,6 +170,35 @@ class CountingProvider(FakeProvider):
         if self.count_error is not None:
             raise self.count_error
         return self.count_result
+
+
+class ContextOverflowProvider(ModelProvider):
+    name = "overflow"
+
+    def __init__(
+        self,
+        *,
+        overflow_requests: int = 1,
+        success_events: list[ModelStreamEvent] | None = None,
+    ) -> None:
+        self.overflow_requests = overflow_requests
+        self.success_events = success_events or [
+            ModelStreamEvent.text_delta("recovered"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) <= self.overflow_requests:
+            raise ModelContextOverflowError(
+                "context too large",
+                provider=self.name,
+                status_code=400,
+                error_code="context_length_exceeded",
+            )
+        for event in self.success_events:
+            yield event
 
 
 class OtherProvider(FakeProvider):
@@ -13710,6 +13740,216 @@ def test_usage_triggered_context_policy_requires_bool_sticky():
             triggered_policy=MessageWindowContextPolicy(max_messages=1),
             min_input_tokens=1,
             sticky=1,
+        )
+
+
+def test_context_overflow_policy_rebuilds_context_and_retries_once():
+    provider = ContextOverflowProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_recovery",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    assert [request.messages[0].content[0].text for request in provider.requests] == [
+        "old request",
+        "new request",
+    ]
+    assert len(provider.requests[0].messages) == 2
+    assert len(provider.requests[1].messages) == 1
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_OVERFLOW_RECOVERING,
+            EventType.CONTEXT_OVERFLOW_FAILED,
+            EventType.SESSION_COMPLETED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.SESSION_COMPLETED,
+    ]
+    detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
+    assert detected.payload == {
+        "step": 1,
+        "phase": "initial",
+        "error": "context too large",
+        "error_type": "ModelContextOverflowError",
+        "provider": "overflow",
+        "original_message_count": 2,
+        "status_code": 400,
+        "provider_error_code": "context_length_exceeded",
+    }
+    recovering = next(
+        event for event in events if event.type == EventType.CONTEXT_OVERFLOW_RECOVERING
+    )
+    assert recovering.payload == {
+        "step": 1,
+        "original_message_count": 2,
+        "recovery_message_count": 1,
+        "policy": "RecentTurnsContextPolicy",
+    }
+    transcript = asyncio.run(app.session_store.load_transcript("context_overflow_recovery"))
+    assert [message.content[0].text for message in transcript if message.role == "user"] == [
+        "old request",
+        "new request",
+    ]
+
+
+def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
+    provider = ContextOverflowProvider()
+    compactor = RecordingCompactor()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_compaction_recovery",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor.requests) == 1
+    assert [message.content[0].text for message in compactor.requests[0].messages] == [
+        "old request"
+    ]
+    assert len(provider.requests) == 2
+    assert len(provider.requests[1].messages) == 2
+    assert provider.requests[1].messages[0].content[0].text.startswith(
+        "Previous session context summary:"
+    )
+    assert provider.requests[1].messages[1].content[0].text == "new request"
+    assert EventType.SESSION_CHECKPOINTED in [event.type for event in events]
+    checkpoint = asyncio.run(
+        app.session_store.load_checkpoint("context_overflow_compaction_recovery")
+    )
+    assert checkpoint == {
+        "context_compaction": {
+            "version": 1,
+            "summary": "old request",
+            "compacted_transcript_cursor": 1,
+            "metadata": {"request_count": 1},
+        }
+    }
+
+
+def test_context_overflow_without_policy_fails_without_retry():
+    provider = ContextOverflowProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_no_policy",
+                messages=[Message.text("user", "too much")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    assert EventType.CONTEXT_OVERFLOW_DETECTED not in [event.type for event in events]
+    failed = events[-1]
+    assert failed.type == EventType.SESSION_FAILED
+    assert failed.payload["error"] == "context too large"
+    assert failed.payload["error_type"] == "ModelContextOverflowError"
+
+
+def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
+    provider = ContextOverflowProvider(overflow_requests=2)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=MessageWindowContextPolicy(max_messages=1),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_recovery_failed",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_OVERFLOW_RECOVERING,
+            EventType.CONTEXT_OVERFLOW_FAILED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.CONTEXT_OVERFLOW_FAILED,
+    ]
+    failed = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_FAILED)
+    assert failed.payload == {
+        "step": 1,
+        "phase": "recovery",
+        "error": "context too large",
+        "error_type": "ModelContextOverflowError",
+        "provider": "overflow",
+        "original_message_count": 2,
+        "status_code": 400,
+        "provider_error_code": "context_length_exceeded",
+        "recovery_message_count": 1,
+    }
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_register_agent_rejects_invalid_context_overflow_policy():
+    app = CayuApp()
+    with pytest.raises(TypeError, match="context_overflow_policy must be a ContextPolicy"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_overflow_policy=object(),  # type: ignore[arg-type]
         )
 
 

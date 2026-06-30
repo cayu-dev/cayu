@@ -27,6 +27,7 @@ class RegisteredAgentState:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
     context_policy: ContextPolicy
+    context_overflow_policy: ContextPolicy | None
     tool_policy: ToolPolicy
     runtime_hooks: tuple[RuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]

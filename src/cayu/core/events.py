@@ -58,6 +58,9 @@ class EventType(StrEnum):
     CONTEXT_COUNTED = "context.counted"
     CONTEXT_COUNT_FAILED = "context.count.failed"
     CONTEXT_COUNT_RECONCILED = "context.count.reconciled"
+    CONTEXT_OVERFLOW_DETECTED = "context.overflow.detected"
+    CONTEXT_OVERFLOW_RECOVERING = "context.overflow.recovering"
+    CONTEXT_OVERFLOW_FAILED = "context.overflow.failed"
 
     KNOWLEDGE_SEARCH_STARTED = "knowledge.search.started"
     KNOWLEDGE_SEARCH_COMPLETED = "knowledge.search.completed"

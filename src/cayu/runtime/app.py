@@ -59,6 +59,7 @@ from cayu.providers import (
     InputTokenCountMethod,
     InputTokenCountResult,
     ModelCompletion,
+    ModelContextOverflowError,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -489,6 +490,7 @@ class CayuApp:
         *,
         tools: Iterable[Tool] | None = None,
         context_policy: ContextPolicy | None = None,
+        context_overflow_policy: ContextPolicy | None = None,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -504,6 +506,12 @@ class CayuApp:
             stored_context_policy = context_policy
         else:
             raise TypeError("context_policy must be a ContextPolicy.")
+        if context_overflow_policy is None:
+            stored_context_overflow_policy = None
+        elif isinstance(context_overflow_policy, ContextPolicy):
+            stored_context_overflow_policy = context_overflow_policy
+        else:
+            raise TypeError("context_overflow_policy must be a ContextPolicy.")
         if tool_policy is None:
             stored_tool_policy = AllowAllToolPolicy()
         elif isinstance(tool_policy, ToolPolicy):
@@ -542,6 +550,7 @@ class CayuApp:
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
             context_policy=stored_context_policy,
+            context_overflow_policy=stored_context_overflow_policy,
             tool_policy=stored_tool_policy,
             runtime_hooks=stored_runtime_hooks,
             loop_policies=stored_loop_policies,
@@ -2584,58 +2593,14 @@ class CayuApp:
                     )
                 await self._raise_if_session_interrupted(session.id)
 
-                model_tools = [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": deepcopy(tool.schema),
-                    }
-                    for tool in registered_agent.tools.values()
-                ]
-                model_messages = context_messages
-                if (
-                    structured_output is not None
-                    and structured_output.strategy == StructuredOutputStrategy.TOOL
-                ):
-                    model_tools.append(structured_output_tool_spec(structured_output))
-                    model_messages = _with_structured_output_tool_instruction(
-                        context_messages,
-                        structured_output,
-                    )
-
-                request_options: dict[str, Any] = {
-                    **copy_json_value(
-                        registered_agent.spec.provider_options,
-                        "provider_options",
-                    ),
-                    "agent_metadata": deepcopy(registered_agent.spec.metadata),
-                    "environment_metadata": (
-                        deepcopy(registered_environment.spec.metadata)
-                        if registered_environment is not None
-                        else {}
-                    ),
-                    "step": step,
-                    "structured_output": (
-                        structured_output_spec_payload(structured_output)
-                        if structured_output is not None
-                        else None
-                    ),
-                    RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
-                        messages=context_messages,
-                        session=session,
-                        registered_environment=registered_environment,
-                        max_file_attachment_bytes=self._max_file_attachment_bytes,
-                        max_total_file_attachment_bytes=(self._max_total_file_attachment_bytes),
-                        max_file_attachments_per_request=(self._max_file_attachments_per_request),
-                    ),
-                }
-                if effective_thinking is not None:
-                    request_options["thinking"] = thinking_config_payload(effective_thinking)
-                model_request = ModelRequest(
-                    model=session.model,
-                    messages=model_messages,
-                    tools=model_tools,
-                    options=request_options,
+                model_request = await self._build_model_request(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    context_messages=context_messages,
+                    structured_output=structured_output,
+                    thinking=effective_thinking,
+                    step=step,
                 )
 
                 (
@@ -2667,16 +2632,23 @@ class CayuApp:
                 tool_calls: list[runtime_records.ToolCallRequest] = []
                 model_completed_event: Event | None = None
                 try:
-                    async for event, result in self._run_model_step_with_retries(
+                    model_step_events = self._run_model_step_with_context_overflow_recovery(
                         provider=provider,
                         model_request=model_request,
                         session=session,
                         registered_agent=registered_agent,
                         registered_provider=registered_provider,
+                        registered_environment=registered_environment,
                         environment_name=environment_name,
+                        messages=messages,
+                        structured_output=structured_output,
+                        thinking=effective_thinking,
+                        knowledge_store=_knowledge_store(registered_environment),
+                        request_metadata=request_metadata,
                         step=step,
                         retry_policy=retry_policy,
-                    ):
+                    )
+                    async for event, result in model_step_events:
                         if event is not None:
                             if event.type == EventType.MODEL_COMPLETED:
                                 model_completed_event = event
@@ -3461,6 +3433,314 @@ class CayuApp:
             },
         )
 
+    async def _build_model_request(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        context_messages: list[Message],
+        structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+        step: int,
+    ) -> ModelRequest:
+        model_tools = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": deepcopy(tool.schema),
+            }
+            for tool in registered_agent.tools.values()
+        ]
+        model_messages = context_messages
+        if (
+            structured_output is not None
+            and structured_output.strategy == StructuredOutputStrategy.TOOL
+        ):
+            model_tools.append(structured_output_tool_spec(structured_output))
+            model_messages = _with_structured_output_tool_instruction(
+                context_messages,
+                structured_output,
+            )
+
+        request_options: dict[str, Any] = {
+            **copy_json_value(
+                registered_agent.spec.provider_options,
+                "provider_options",
+            ),
+            "agent_metadata": deepcopy(registered_agent.spec.metadata),
+            "environment_metadata": (
+                deepcopy(registered_environment.spec.metadata)
+                if registered_environment is not None
+                else {}
+            ),
+            "step": step,
+            "structured_output": (
+                structured_output_spec_payload(structured_output)
+                if structured_output is not None
+                else None
+            ),
+            RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
+                messages=context_messages,
+                session=session,
+                registered_environment=registered_environment,
+                max_file_attachment_bytes=self._max_file_attachment_bytes,
+                max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
+                max_file_attachments_per_request=self._max_file_attachments_per_request,
+            ),
+        }
+        if thinking is not None:
+            request_options["thinking"] = thinking_config_payload(thinking)
+        return ModelRequest(
+            model=session.model,
+            messages=model_messages,
+            tools=model_tools,
+            options=request_options,
+        )
+
+    async def _run_model_step_with_context_overflow_recovery(
+        self,
+        *,
+        provider: ModelProvider,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        messages: list[Message],
+        structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+        knowledge_store: Any,
+        request_metadata: dict[str, Any],
+        step: int,
+        retry_policy: RetryPolicy,
+    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        overflow_policy = registered_agent.context_overflow_policy
+        try:
+            async for event, result in self._run_model_step_with_retries(
+                provider=provider,
+                model_request=model_request,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                retry_policy=retry_policy,
+            ):
+                yield event, result
+            return
+        except ModelContextOverflowError as exc:
+            if overflow_policy is None:
+                raise
+
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.CONTEXT_OVERFLOW_DETECTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=_context_overflow_event_payload(
+                            exc,
+                            step=step,
+                            phase="initial",
+                            original_message_count=len(model_request.messages),
+                        ),
+                    )
+                ),
+                None,
+            )
+
+        try:
+            (
+                recovery_context_messages,
+                checkpoint_update,
+                checkpoint_event_payload,
+                context_compaction_telemetry,
+                context_knowledge_telemetry,
+            ) = await _build_context(
+                context_policy=overflow_policy,
+                session_store=self.session_store,
+                session=session,
+                agent_spec=_session_agent_spec(
+                    registered_agent=registered_agent,
+                    session=session,
+                ),
+                messages=messages,
+                step=step,
+                environment_name=environment_name,
+                knowledge_store=knowledge_store,
+                request_metadata=request_metadata,
+            )
+        except ContextBuildError as build_exc:
+            for telemetry in build_exc.compaction_telemetry:
+                yield (
+                    await self._emit(
+                        _context_compaction_telemetry_event(
+                            telemetry=telemetry,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                        )
+                    ),
+                    None,
+                )
+            for telemetry in build_exc.knowledge_telemetry:
+                yield (
+                    await self._emit(
+                        _context_knowledge_telemetry_event(
+                            telemetry=telemetry,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                        )
+                    ),
+                    None,
+                )
+            if build_exc.checkpoint_event_payload is not None:
+                if build_exc.checkpoint is None:
+                    raise RuntimeError(
+                        "Context checkpoint event payload requires checkpoint state."
+                    ) from build_exc
+                await self._checkpoint_preserving_runtime_state(
+                    session_id=session.id,
+                    checkpoint=build_exc.checkpoint,
+                )
+                yield (
+                    await self._emit(
+                        Event(
+                            type=EventType.SESSION_CHECKPOINTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=build_exc.checkpoint_event_payload,
+                        )
+                    ),
+                    None,
+                )
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.CONTEXT_OVERFLOW_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "step": step,
+                            "phase": "context_build",
+                            "error": str(build_exc.cause),
+                            "error_type": type(build_exc.cause).__name__,
+                            "policy": type(overflow_policy).__name__,
+                        },
+                    )
+                ),
+                None,
+            )
+            raise build_exc.cause from build_exc
+        for telemetry in context_compaction_telemetry:
+            yield (
+                await self._emit(
+                    _context_compaction_telemetry_event(
+                        telemetry=telemetry,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    )
+                ),
+                None,
+            )
+        for telemetry in context_knowledge_telemetry:
+            yield (
+                await self._emit(
+                    _context_knowledge_telemetry_event(
+                        telemetry=telemetry,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    )
+                ),
+                None,
+            )
+        if checkpoint_event_payload is not None:
+            if checkpoint_update is None:
+                raise RuntimeError("Context checkpoint event payload requires checkpoint state.")
+            await self._checkpoint_preserving_runtime_state(
+                session_id=session.id,
+                checkpoint=checkpoint_update,
+            )
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.SESSION_CHECKPOINTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=checkpoint_event_payload,
+                    )
+                ),
+                None,
+            )
+
+        recovery_request = await self._build_model_request(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            context_messages=recovery_context_messages,
+            structured_output=structured_output,
+            thinking=thinking,
+            step=step,
+        )
+        yield (
+            await self._emit(
+                Event(
+                    type=EventType.CONTEXT_OVERFLOW_RECOVERING,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "step": step,
+                        "original_message_count": len(model_request.messages),
+                        "recovery_message_count": len(recovery_request.messages),
+                        "policy": type(overflow_policy).__name__,
+                    },
+                )
+            ),
+            None,
+        )
+        try:
+            async for event, result in self._run_model_step_with_retries(
+                provider=provider,
+                model_request=recovery_request,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                retry_policy=retry_policy,
+            ):
+                yield event, result
+        except ModelContextOverflowError as exc:
+            yield (
+                await self._emit(
+                    Event(
+                        type=EventType.CONTEXT_OVERFLOW_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=_context_overflow_event_payload(
+                            exc,
+                            step=step,
+                            phase="recovery",
+                            original_message_count=len(model_request.messages),
+                            recovery_message_count=len(recovery_request.messages),
+                        ),
+                    )
+                ),
+                None,
+            )
+            raise
+
     async def _run_model_step_with_retries(
         self,
         *,
@@ -3798,6 +4078,8 @@ class CayuApp:
         except asyncio.CancelledError:
             raise
         except _ModelAttemptFailed:
+            raise
+        except ModelContextOverflowError:
             raise
         except Exception as exc:
             raise _ModelAttemptFailed(
@@ -7830,8 +8112,7 @@ def _context_count_reconciled_event(
             "actual_input_tokens": actual_input_tokens,
             "delta_tokens": delta_tokens,
             "relative_error": relative_error,
-            "reconciled": actual_input_tokens is not None
-            and estimated_input_tokens is not None,
+            "reconciled": actual_input_tokens is not None and estimated_input_tokens is not None,
         },
     )
 
@@ -8133,6 +8414,35 @@ def _assistant_step_result(
         provider_state_count=provider_state_count(assistant_message),
         thinking_count=thinking_count(assistant_message),
     )
+
+
+def _context_overflow_event_payload(
+    error: ModelContextOverflowError,
+    *,
+    step: int,
+    phase: str,
+    original_message_count: int,
+    recovery_message_count: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "step": step,
+        "phase": require_clean_nonblank(phase, "phase"),
+        "error": str(error),
+        "error_type": type(error).__name__,
+        "provider": error.provider,
+        "original_message_count": original_message_count,
+    }
+    if error.status_code is not None:
+        payload["status_code"] = error.status_code
+    if error.error_type is not None:
+        payload["provider_error_type"] = error.error_type
+    if error.error_code is not None:
+        payload["provider_error_code"] = error.error_code
+    if error.request_id is not None:
+        payload["request_id"] = error.request_id
+    if recovery_message_count is not None:
+        payload["recovery_message_count"] = recovery_message_count
+    return payload
 
 
 def _retry_attempt_payload(

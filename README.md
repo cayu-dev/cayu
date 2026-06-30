@@ -1602,6 +1602,25 @@ app.register_agent(
 )
 ```
 
+Register `context_overflow_policy` when a session should recover once after a
+provider rejects a request as too large for the model context. The policy is
+opt-in and only handles classified `ModelContextOverflowError` responses from
+the provider. Cayu emits `context.overflow.detected`, rebuilds the provider
+request with the overflow policy, emits `context.overflow.recovering`, and
+runs the rebuilt request through the normal model-step retry policy. Cayu only
+performs one overflow rebuild for a model step; if the rebuilt request also
+overflows, Cayu emits `context.overflow.failed` and fails the session.
+
+```python
+from cayu import AgentSpec, CheckpointCompactionContextPolicy, RecentTurnsContextPolicy
+
+app.register_agent(
+    AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+    context_policy=RecentTurnsContextPolicy(max_user_turns=20),
+    context_overflow_policy=CheckpointCompactionContextPolicy(max_user_turns=8),
+)
+```
+
 Use `strip_old_file_attachments(...)` inside custom context policies when you build your
 own transcript projection and want the same bounded native-file behavior.
 
