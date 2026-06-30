@@ -20,6 +20,7 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
     copy_message,
@@ -834,6 +835,8 @@ class ModelCompactor(ContextCompactor):
                 )
             if event.type == ModelStreamEventType.TEXT_DELTA:
                 text_parts.append(event.delta)
+            elif event.type == ModelStreamEventType.THINKING:
+                continue  # reasoning is internal; the compaction summary uses only text
             elif event.type == ModelStreamEventType.TOOL_CALL:
                 raise RuntimeError("Compaction model must not call tools.")
             elif event.type == ModelStreamEventType.ERROR:
@@ -1150,7 +1153,9 @@ def strip_old_file_attachments(
             projected_messages.append(copy_message(message))
             continue
 
-        projected_parts: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = []
+        projected_parts: list[
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart
+        ] = []
         for part_index, part in enumerate(message.content):
             if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
                 projected_parts.append(copy_message_part(part))
@@ -1556,7 +1561,7 @@ def _messages_digest(messages: list[Message]) -> str:
 
 
 def _message_part_digest(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> str:
     if type(part) is TextPart:
         return part.text
@@ -1572,6 +1577,10 @@ def _message_part_digest(
         )
     if type(part) is ProviderStatePart:
         return f"[provider_state provider={part.provider}]"
+    if type(part) is ThinkingPart:
+        # Marker only: reasoning text is provider-internal and must not leak into the
+        # compaction digest shown to the model.
+        return "[thinking]"
     raise TypeError("Unsupported message part.")
 
 

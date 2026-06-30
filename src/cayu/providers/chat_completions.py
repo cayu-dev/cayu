@@ -22,6 +22,7 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
 )
@@ -365,7 +366,34 @@ def build_chat_completions_payload(
         if include_usage:
             payload["stream_options"] = {"include_usage": True}
     payload.update(options)
+    _apply_thinking_options(payload, request.options.get("thinking"))
     return copy_json_value(payload, "chat_completions_payload")
+
+
+def _chat_completions_reasoning_options(neutral: Mapping[str, Any]) -> dict[str, Any]:
+    """Map the neutral ``options["thinking"]`` payload to Chat Completions request keys.
+
+    The portable knob is ``reasoning_effort`` (low/medium/high), which OpenAI-compatible
+    reasoning providers accept. There is no portable way to *disable* reasoning here (the
+    ``reasoning_effort="none"`` value is backend-specific — Gemini/DeepSeek accept it,
+    OpenAI/Azure reject it), and this generic adapter can't know the backend, so
+    ``enabled=False`` is a no-op; pass a raw ``reasoning_effort`` via provider_options to
+    target a backend that supports it. There is no portable token budget, so ``max_tokens``
+    is not mapped.
+    """
+    if not neutral.get("enabled", True):
+        return {}
+    effort = neutral.get("effort")
+    if effort is not None:
+        return {"reasoning_effort": effort}
+    return {}
+
+
+def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:
+    """Merge the mapped reasoning config into the payload (typed config wins)."""
+    if not isinstance(neutral, Mapping):
+        return
+    payload.update(_chat_completions_reasoning_options(neutral))
 
 
 async def chat_completions_stream_events(
@@ -400,6 +428,15 @@ async def chat_completions_stream_events(
             if delta is not None:
                 if not isinstance(delta, Mapping):
                     raise ChatCompletionsProtocolError("Chat Completions delta must be an object.")
+                reasoning = delta.get("reasoning_content")
+                if not (isinstance(reasoning, str) and reasoning):
+                    # Fall back to `reasoning` unless reasoning_content is a non-empty
+                    # string, so an empty/absent reasoning_content can't shadow it.
+                    reasoning = delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    # Display-only reasoning surfaced by OpenAI-compatible reasoning
+                    # providers (DeepSeek/OpenRouter); no round-trip state.
+                    yield ModelStreamEvent.thinking(reasoning)
                 content = delta.get("content")
                 if content is not None:
                     if not isinstance(content, str):
@@ -621,9 +658,10 @@ def _assistant_message(message: Message) -> dict[str, Any]:
                     },
                 }
             )
-        elif type(part) is not ProviderStatePart:
+        elif type(part) not in {ProviderStatePart, ThinkingPart}:
             raise ChatCompletionsProtocolError(
-                "Assistant messages can only contain text, tool_call, and provider_state parts."
+                "Assistant messages can only contain text, tool_call, provider_state, "
+                "and thinking parts."
             )
     assistant: dict[str, Any] = {"role": "assistant"}
     # Chat Completions requires a content key; tool-call-only turns use null.
@@ -634,7 +672,7 @@ def _assistant_message(message: Message) -> dict[str, Any]:
 
 
 def _joined_text(
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart],
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
 ) -> str:
     text_parts: list[str] = []
     for part in content:

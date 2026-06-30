@@ -12,7 +12,17 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import AgentSpec, CayuApp, InMemoryTaskStore, Message, TaskCreate, TaskStatus
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    InMemoryTaskStore,
+    Message,
+    MessageRole,
+    TaskCreate,
+    TaskStatus,
+    TextPart,
+    ThinkingPart,
+)
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -2192,3 +2202,57 @@ def test_server_list_omits_metadata_but_detail_includes_it() -> None:
     # ...but the single-session detail view includes it.
     detail = client.get("/api/sessions/sess_m").json()
     assert detail["session"]["metadata"] == {"secret": "value"}
+
+
+def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
+    # Regression: with include_thinking=false the store drops thinking-only records from a
+    # page, so the route must advance next_offset by the window size (not the returned
+    # record count) or pagination stalls on an empty page (reviewer's repro: thinking-only
+    # first record + limit=1).
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    client = TestClient(create_server(app))
+
+    async def seed() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="a",
+                session_id="sess_think",
+                messages=[Message.text("user", "q")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            session.id,
+            [
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content=[ThinkingPart(text="reasoning", provider_state={"signature": "S"})],
+                ),
+                Message(role=MessageRole.ASSISTANT, content=[TextPart(text="answer")]),
+            ],
+        )
+
+    asyncio.run(seed())
+
+    offset = 0
+    seen_offsets: list[int] = []
+    collected: list[dict] = []
+    for _ in range(10):  # cap guards against the infinite loop the bug caused
+        assert offset not in seen_offsets, "pagination revisited an offset (loop)"
+        seen_offsets.append(offset)
+        body = client.get(
+            "/api/sessions/sess_think/transcript",
+            params={"include_thinking": "false", "limit": 1, "offset": offset},
+        ).json()
+        collected.extend(body["messages"])
+        if not body["has_more"]:
+            break
+        assert body["next_offset"] > offset  # must advance even on an empty (filtered) page
+        offset = body["next_offset"]
+    else:
+        raise AssertionError("pagination did not terminate")
+
+    parts = [part for message in collected for part in message["content"]]
+    assert any(part["type"] == "text" for part in parts)  # the answer survives
+    assert all(part["type"] != "thinking" for part in parts)  # thinking excluded

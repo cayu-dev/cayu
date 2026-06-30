@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -39,6 +40,7 @@ class ToolApprovalRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -99,6 +101,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -202,6 +205,7 @@ class PendingToolApproval(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[PendingToolCallApproval]
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
@@ -260,6 +264,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
@@ -284,6 +289,7 @@ def copy_tool_approval_recovery_request(
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
@@ -304,6 +310,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         metadata=copy_json_value(approval.metadata, "metadata"),
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
         structured_output=copy_structured_output_spec(approval.structured_output),
+        thinking=approval.thinking,
     )
 
 

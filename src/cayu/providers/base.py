@@ -13,6 +13,7 @@ from cayu.core.messages import Message, copy_message
 
 class ModelStreamEventType(StrEnum):
     TEXT_DELTA = "text_delta"
+    THINKING = "thinking"
     TOOL_CALL = "tool_call"
     COMPLETED = "completed"
     ERROR = "error"
@@ -235,6 +236,29 @@ class ModelStreamEvent(BaseModel):
     @classmethod
     def text_delta(cls, delta: str) -> ModelStreamEvent:
         return cls(type=ModelStreamEventType.TEXT_DELTA, delta=delta)
+
+    @classmethod
+    def thinking(
+        cls,
+        delta: str = "",
+        *,
+        provider_state: dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
+        """A reasoning/thinking event.
+
+        `delta` is the (possibly empty) reasoning text. `provider_state` carries the
+        opaque round-trip payload of a *complete* block — the Anthropic ``signature``
+        or ``redacted_thinking`` data. When present, the runtime materializes a
+        standalone `ThinkingPart`; events without it accumulate as streamed text.
+        """
+        if type(delta) is not str:
+            raise ValueError("`delta` must be a string.")
+        payload: dict[str, Any] = {}
+        if provider_state is not None:
+            if not isinstance(provider_state, dict):
+                raise ValueError("`provider_state` must be a dictionary.")
+            payload["provider_state"] = copy_json_value(provider_state, "provider_state")
+        return cls(type=ModelStreamEventType.THINKING, delta=delta, payload=payload)
 
     @classmethod
     def tool_call(

@@ -24,7 +24,8 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
-from cayu.core.messages import Message, MessageRole, copy_message
+from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message
+from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -62,6 +63,7 @@ class RunRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -142,6 +144,7 @@ class ResumeRequest(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
@@ -758,6 +761,11 @@ class TranscriptQuery(BaseModel):
     role: MessageRole | str | None = None
     offset: StrictInt = Field(default=0, ge=0)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
+    # When False, ThinkingPart content is stripped from the returned messages. This is a
+    # content view, not a record filter: `total_records` stays the role-matched total, a
+    # page may hold fewer than `limit` records when thinking-only turns drop out, and each
+    # record keeps its true transcript `index` (so offset pagination is unaffected).
+    include_thinking: StrictBool = True
 
     @field_validator("session_id")
     @classmethod
@@ -770,6 +778,31 @@ class TranscriptQuery(BaseModel):
         if value is None:
             return None
         return MessageRole(value)
+
+
+def _without_thinking_parts(message: Message) -> Message | None:
+    kept = [part for part in message.content if type(part) is not ThinkingPart]
+    if not kept:
+        return None
+    return Message(role=message.role, content=kept)
+
+
+def filter_transcript_records(
+    records: list[TranscriptRecord], *, include_thinking: bool
+) -> list[TranscriptRecord]:
+    """Apply a `TranscriptQuery.include_thinking` filter to a page of records.
+
+    When ``include_thinking`` is False, ThinkingParts are stripped from each message and
+    records whose message is left empty (a thinking-only turn) are dropped.
+    """
+    if include_thinking:
+        return records
+    filtered: list[TranscriptRecord] = []
+    for record in records:
+        message = _without_thinking_parts(record.message)
+        if message is not None:
+            filtered.append(TranscriptRecord(index=record.index, message=message))
+    return filtered
 
 
 class SessionStore(ABC):
@@ -1379,8 +1412,9 @@ class InMemorySessionStore(SessionStore):
                 ]
 
             page = indexed_messages[query.offset : query.offset + query.limit]
+            records = [TranscriptRecord(index=index, message=message) for index, message in page]
             return TranscriptPage(
-                records=[TranscriptRecord(index=index, message=message) for index, message in page],
+                records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=len(indexed_messages),
             )
 
@@ -1635,6 +1669,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
@@ -1655,6 +1690,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
@@ -1808,6 +1844,7 @@ def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:
         role=query.role,
         offset=query.offset,
         limit=query.limit,
+        include_thinking=query.include_thinking,
     )
 
 

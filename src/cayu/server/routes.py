@@ -20,6 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from cayu._validation import copy_label_map, require_clean_nonblank
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
@@ -78,6 +79,7 @@ class RunBody(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -97,6 +99,7 @@ class ResumeBody(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -148,6 +151,7 @@ class ToolApprovalBody(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -169,6 +173,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -388,11 +393,19 @@ def _trace_context_metadata(http_request: Request) -> dict[str, Any]:
 TraceContextMetadata = Annotated[dict[str, Any], Depends(_trace_context_metadata)]
 
 
+def _serialize_message_part(part: Any) -> dict[str, Any]:
+    if part.type == "thinking":
+        # The opaque round-trip state (Anthropic signatures / redacted blobs) is
+        # provider-internal and must not be exposed to transcript API consumers.
+        return part.model_dump(mode="json", exclude={"provider_state"})
+    return part.model_dump(mode="json")
+
+
 def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any]:
     return {
         "index": index,
         "role": str(message.role),
-        "content": [part.model_dump(mode="json") for part in message.content],
+        "content": [_serialize_message_part(part) for part in message.content],
     }
 
 
@@ -467,6 +480,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             metadata=trace_metadata,
+            thinking=body.thinking,
         )
 
         async def generate():
@@ -493,6 +507,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             metadata=trace_metadata,
+            thinking=body.thinking,
         )
 
         async def generate():
@@ -573,6 +588,7 @@ def create_router(
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
+            thinking=body.thinking,
         )
 
         async def generate():
@@ -605,6 +621,7 @@ def create_router(
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
+            thinking=body.thinking,
         )
 
         async def generate():
@@ -1048,6 +1065,7 @@ def create_router(
         role: MessageRole | None = None,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
+        include_thinking: bool = Query(default=True),
     ):
         session = await session_store.load(session_id)
         if session is None:
@@ -1059,9 +1077,14 @@ def create_router(
                 role=role,
                 offset=offset,
                 limit=limit,
+                include_thinking=include_thinking,
             )
         )
-        next_offset = offset + len(transcript_page.records)
+        # Advance by the queried window size, not the returned record count: the
+        # include_thinking filter can drop thinking-only records from a page, so
+        # len(records) under-counts the messages consumed and would stall pagination.
+        consumed = min(limit, max(0, transcript_page.total_records - offset))
+        next_offset = offset + consumed
 
         return {
             "session_id": session_id,
@@ -1114,7 +1137,7 @@ def create_router(
             "transcript": [
                 {
                     "role": str(m.role),
-                    "content": [p.model_dump(mode="json") for p in m.content],
+                    "content": [_serialize_message_part(p) for p in m.content],
                 }
                 for m in transcript
             ],

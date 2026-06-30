@@ -43,6 +43,7 @@ from cayu.runtime.sessions import (
     copy_transcript_messages,
     copy_transcript_query,
     decode_session_cursor,
+    filter_transcript_records,
     session_next_cursor,
     session_order_is_descending,
     session_outcome,
@@ -1185,14 +1186,15 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 page_params,
             ).fetchall()
+            records = [
+                TranscriptRecord(
+                    index=row["transcript_index"],
+                    message=Message(**json.loads(row["message_json"])),
+                )
+                for row in rows
+            ]
             return TranscriptPage(
-                records=[
-                    TranscriptRecord(
-                        index=row["transcript_index"],
-                        message=Message(**json.loads(row["message_json"])),
-                    )
-                    for row in rows
-                ],
+                records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=total_records,
             )
 

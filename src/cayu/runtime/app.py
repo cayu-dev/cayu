@@ -38,6 +38,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
@@ -180,6 +181,7 @@ from cayu.runtime.model_steps import (
     assistant_text_content,
     classify_assistant_step,
     provider_state_count,
+    thinking_count,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -848,6 +850,7 @@ class CayuApp:
                 budget_limits=request.budget_limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 structured_output=request.structured_output,
+                thinking=request.thinking,
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 task_id=request.task_id,
@@ -1141,6 +1144,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
+            thinking=request.thinking,
             loop_policies=request.loop_policies,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
@@ -1546,6 +1550,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
+            thinking=request.thinking,
             request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
             task_id=task_id,
@@ -1990,6 +1995,12 @@ class CayuApp:
                     structured_output=request.structured_output,
                     pending_approval=pending_approval,
                 ),
+                # Restore the original run's thinking config across the approval pause
+                # (an override on the approval request itself wins).
+                thinking=_effective_approval_thinking(
+                    thinking=request.thinking,
+                    pending_approval=pending_approval,
+                ),
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 task_id=pending_approval.task_id,
@@ -2256,6 +2267,7 @@ class CayuApp:
             budget_limits=request.budget_limits,
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
+            thinking=request.thinking,
             loop_policies=request.loop_policies,
         )
         async for event in self._continue_tool_approval_resolution(
@@ -2283,6 +2295,7 @@ class CayuApp:
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
         request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         task_id: str | None,
@@ -2292,6 +2305,10 @@ class CayuApp:
         start_task_on_enter: bool = True,
     ) -> AsyncIterator[Event]:
         provider = registered_provider.provider
+        # Per-run thinking override (RunRequest/ResumeRequest) wins over the agent's
+        # default (AgentSpec.thinking); the agent default applies on every path,
+        # including continuations that pass no override.
+        effective_thinking = thinking if thinking is not None else registered_agent.spec.thinking
         environment_name = _environment_name(registered_environment)
         task_started = task_id is not None and not start_task_on_enter
         task_finished = False
@@ -2586,38 +2603,39 @@ class CayuApp:
                         structured_output,
                     )
 
+                request_options: dict[str, Any] = {
+                    **copy_json_value(
+                        registered_agent.spec.provider_options,
+                        "provider_options",
+                    ),
+                    "agent_metadata": deepcopy(registered_agent.spec.metadata),
+                    "environment_metadata": (
+                        deepcopy(registered_environment.spec.metadata)
+                        if registered_environment is not None
+                        else {}
+                    ),
+                    "step": step,
+                    "structured_output": (
+                        structured_output_spec_payload(structured_output)
+                        if structured_output is not None
+                        else None
+                    ),
+                    RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
+                        messages=context_messages,
+                        session=session,
+                        registered_environment=registered_environment,
+                        max_file_attachment_bytes=self._max_file_attachment_bytes,
+                        max_total_file_attachment_bytes=(self._max_total_file_attachment_bytes),
+                        max_file_attachments_per_request=(self._max_file_attachments_per_request),
+                    ),
+                }
+                if effective_thinking is not None:
+                    request_options["thinking"] = thinking_config_payload(effective_thinking)
                 model_request = ModelRequest(
                     model=session.model,
                     messages=model_messages,
                     tools=model_tools,
-                    options={
-                        **copy_json_value(
-                            registered_agent.spec.provider_options,
-                            "provider_options",
-                        ),
-                        "agent_metadata": deepcopy(registered_agent.spec.metadata),
-                        "environment_metadata": (
-                            deepcopy(registered_environment.spec.metadata)
-                            if registered_environment is not None
-                            else {}
-                        ),
-                        "step": step,
-                        "structured_output": (
-                            structured_output_spec_payload(structured_output)
-                            if structured_output is not None
-                            else None
-                        ),
-                        RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
-                            messages=context_messages,
-                            session=session,
-                            registered_environment=registered_environment,
-                            max_file_attachment_bytes=self._max_file_attachment_bytes,
-                            max_total_file_attachment_bytes=(self._max_total_file_attachment_bytes),
-                            max_file_attachments_per_request=(
-                                self._max_file_attachments_per_request
-                            ),
-                        ),
-                    },
+                    options=request_options,
                 )
 
                 (
@@ -3123,6 +3141,7 @@ class CayuApp:
                             task_id=task_id,
                             policy_result=approval_plan.policy_result,
                             structured_output=structured_output,
+                            thinking=effective_thinking,
                         )
                         yield await self._emit(checkpoint_event)
                         yield await self._emit(
@@ -3662,7 +3681,17 @@ class CayuApp:
         attempt: int,
         max_attempts: int,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
-        assistant_parts: list[transcript_helpers.AssistantTextPart | ToolCallPart] = []
+        assistant_parts: list[
+            transcript_helpers.AssistantTextPart
+            | transcript_helpers.AssistantThinkingPart
+            | ToolCallPart
+        ] = []
+        thinking_options = model_request.options.get("thinking")
+        include_thinking_in_transcript = (
+            thinking_options.get("include_in_transcript", True)
+            if isinstance(thinking_options, dict)
+            else True
+        )
         tool_calls: list[runtime_records.ToolCallRequest] = []
         provider_state_parts: list[ProviderStatePart] = []
         completed_stream_event: ModelStreamEvent | None = None
@@ -3699,6 +3728,17 @@ class CayuApp:
                     transcript_helpers.append_assistant_text_delta(
                         assistant_parts, stream_event.delta
                     )
+                elif stream_event.type == ModelStreamEventType.THINKING:
+                    transcript_helpers.append_assistant_thinking_delta(
+                        assistant_parts,
+                        stream_event.delta,
+                        provider_state=stream_event.payload.get("provider_state"),
+                        include=include_thinking_in_transcript,
+                    )
+                    if not stream_event.delta:
+                        # Redacted thinking carries only opaque state; don't emit an
+                        # empty delta event (the text path suppresses empties too).
+                        continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
                     model_completed = True
                     completed_stream_event = stream_event
@@ -4629,6 +4669,7 @@ class CayuApp:
                     task_id=task_id,
                     policy_result=resolved_policy_result,
                     structured_output=None,
+                    thinking=None,
                 )
                 yield (await self._emit(checkpoint_event), None)
                 yield (
@@ -4906,6 +4947,7 @@ class CayuApp:
         task_id: str | None,
         policy_result: ToolPolicyResult,
         structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
     ) -> tuple[PendingToolApproval, Event]:
         checkpoint = await self.session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
@@ -4929,6 +4971,7 @@ class CayuApp:
                 policy_outcomes=policy_outcomes,
             ),
             structured_output=copy_structured_output_spec(structured_output),
+            thinking=thinking,
         )
         checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
             mode="json"
@@ -6449,6 +6492,7 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
         system_prompt=spec.system_prompt,
         metadata=copy_json_value(spec.metadata, "metadata"),
         provider_options=copy_json_value(spec.provider_options, "provider_options"),
+        thinking=spec.thinking,
     )
 
 
@@ -6479,6 +6523,21 @@ def _validate_tool_approval_recovery_request(
     request: ToolApprovalRecoveryRequest,
 ) -> ToolApprovalRecoveryRequest:
     return copy_tool_approval_recovery_request(request)
+
+
+def _effective_approval_thinking(
+    *,
+    thinking: ThinkingConfig | None,
+    pending_approval: PendingToolApproval,
+) -> ThinkingConfig | None:
+    # Restore the original run's thinking config on an approval continuation; a thinking
+    # override on the approval request itself takes precedence. (ThinkingConfig is frozen,
+    # so the reference is safe to reuse.)
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if thinking is not None:
+        return thinking
+    return pending_approval.thinking
 
 
 def _effective_approval_structured_output(
@@ -6677,6 +6736,7 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
+        thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
 
@@ -7813,6 +7873,21 @@ def _model_stream_event_to_runtime_event(
                 max_attempts=max_attempts,
             ),
         )
+    if stream_event.type == ModelStreamEventType.THINKING:
+        # The live event surfaces only the readable reasoning text; the opaque
+        # round-trip signature stays in the transcript ThinkingPart, not the stream.
+        return Event(
+            type=EventType.MODEL_THINKING_DELTA,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=_retry_attempt_payload(
+                {"delta": stream_event.delta},
+                step=step,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ),
+        )
     if stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
         completion = _stream_event_completion(stream_event)
@@ -8056,6 +8131,7 @@ def _assistant_step_result(
         text_content=text_content,
         has_user_visible_content=bool(text_content.strip()),
         provider_state_count=provider_state_count(assistant_message),
+        thinking_count=thinking_count(assistant_message),
     )
 
 

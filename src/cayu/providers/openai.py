@@ -22,6 +22,7 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
 )
@@ -404,6 +405,7 @@ def build_openai_payload(
     if stream:
         payload["stream"] = True
     payload.update(options)
+    _apply_thinking_options(payload, request.options.get("thinking"))
     return copy_json_value(payload, "openai_payload")
 
 
@@ -423,6 +425,26 @@ def build_openai_token_count_payload(
         key: value for key, value in payload.items() if key in _OPENAI_TOKEN_COUNT_FIELDS
     }
     return copy_json_value(count_payload, "openai_token_count_payload")
+
+
+def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:
+    """Map the neutral ``options["thinking"]`` payload onto OpenAI ``reasoning`` keys.
+
+    OpenAI reasoning models cannot disable reasoning and expose no token budget, so only
+    ``effort`` maps (authoritative — overwrites a raw value). ``summary="auto"`` is added
+    as a default to surface readable reasoning, so a caller's raw ``reasoning.summary``
+    (and any other raw ``reasoning`` sibling) is preserved. ``enabled=False`` is a no-op
+    (the model reasons at its default).
+    """
+    if not isinstance(neutral, Mapping) or not neutral.get("enabled", True):
+        return
+    existing = payload.get("reasoning")
+    reasoning = dict(existing) if isinstance(existing, dict) else {}
+    reasoning.setdefault("summary", "auto")
+    effort = neutral.get("effort")
+    if effort is not None:
+        reasoning["effort"] = effort
+    payload["reasoning"] = reasoning
 
 
 def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent]:
@@ -455,6 +477,10 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
         elif item_type == "reasoning":
+            # Surface the readable reasoning summary as display-only thinking, but keep
+            # capturing the full reasoning item (incl. encrypted_content) as provider
+            # state so the multi-turn round-trip is unaffected.
+            events.extend(_reasoning_thinking_events(item))
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
@@ -476,6 +502,31 @@ def _openai_input_tokens_from_count_response(response: Mapping[str, Any]) -> int
     if type(input_tokens) is not int or input_tokens < 0:
         raise OpenAIProtocolError("OpenAI input token count response requires input_tokens.")
     return input_tokens
+
+
+def _reasoning_thinking_events(item: Mapping[str, Any]) -> list[ModelStreamEvent]:
+    """Extract readable reasoning summary text from a non-stream reasoning item.
+
+    Emits one display-only thinking event per ``summary_text`` part; the opaque
+    encrypted reasoning is preserved separately as provider state for round-tripping.
+    """
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return []
+    texts: list[str] = []
+    for part in summary:
+        if not isinstance(part, Mapping):
+            continue
+        if part.get("type") != "summary_text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+    if not texts:
+        return []
+    # Join distinct summary parts with a blank line so they don't run together when the
+    # transcript accumulator concatenates consecutive thinking deltas.
+    return [ModelStreamEvent.thinking("\n\n".join(texts))]
 
 
 async def openai_stream_events(
@@ -501,6 +552,18 @@ async def openai_stream_events(
                 raise OpenAIProtocolError("OpenAI refusal delta must be a string.")
             if delta:
                 yield ModelStreamEvent.text_delta(delta)
+            continue
+        if event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
+            # Display-only readable reasoning; the encrypted reasoning item still
+            # round-trips via response.output_item.done -> provider state.
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                raise OpenAIProtocolError("OpenAI reasoning delta must be a string.")
+            if delta:
+                yield ModelStreamEvent.thinking(delta)
             continue
         if event_type == "response.output_item.added":
             _record_stream_output_item_added(event, pending_function_calls)
@@ -1044,10 +1107,13 @@ def _openai_input_items(
         for part in message.content:
             if type(part) is ToolCallPart:
                 items.append(_function_call_input_item(part))
-            elif type(part) not in {TextPart, ProviderStatePart}:
+            elif type(part) not in {TextPart, ProviderStatePart, ThinkingPart}:
                 raise OpenAIProtocolError(
-                    "Assistant messages can only contain text, tool_call, and provider_state parts."
+                    "Assistant messages can only contain text, tool_call, provider_state, "
+                    "and thinking parts."
                 )
+        # ThinkingPart is display-only here: OpenAI reasoning round-trips through the
+        # encrypted reasoning ProviderStatePart, so the readable summary is not re-sent.
         return items
     if message.role == MessageRole.TOOL:
         items: list[dict[str, Any]] = []
@@ -1132,7 +1198,7 @@ def _openai_provider_state_items(
 
 
 def _input_text_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> dict[str, str]:
     if type(part) is not TextPart:
         raise OpenAIProtocolError("User messages can only contain text parts.")
@@ -1140,7 +1206,7 @@ def _input_text_part(
 
 
 def _output_text_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> dict[str, str]:
     if type(part) is not TextPart:
         raise OpenAIProtocolError("Assistant text output requires a text part.")
@@ -1158,7 +1224,7 @@ def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
 
 
 def _function_call_output_item(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise OpenAIProtocolError("Tool messages can only contain tool_result parts.")

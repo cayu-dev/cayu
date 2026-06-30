@@ -604,6 +604,65 @@ and still validates the final JSON in the runtime before emitting
 output reject `strategy="native"` before making a model request. The portable
 `tool` strategy remains the default.
 
+## Thinking And Reasoning
+
+Model reasoning ("thinking") is a first-class, provider-neutral concept. Configure
+it with `ThinkingConfig` on an `AgentSpec` (the default for every run) and/or on a
+`RunRequest`/`ResumeRequest` (a per-run override that wins over the agent default):
+
+```python
+from cayu import AgentSpec, Message, RunRequest, ThinkingConfig
+
+app.register_agent(
+    AgentSpec(name="assistant", model="claude-opus-4-8", thinking=ThinkingConfig(effort="high"))
+)
+
+# Override the agent default for one run:
+request = RunRequest(
+    agent_name="assistant",
+    messages=[Message.text("user", "Plan the migration.")],
+    thinking=ThinkingConfig(effort="low"),
+)
+```
+
+The mapping to each provider is **field-driven**, so no per-model table is needed
+(the request shape differs by model generation):
+
+- `effort` (`"low" | "medium" | "high"`) → Anthropic adaptive thinking
+  (`thinking={"type": "adaptive"}` + `output_config={"effort": ...}`) and OpenAI
+  `reasoning={"effort": ...}`. This is the path the current Claude and OpenAI
+  reasoning models use.
+- `max_tokens` (≥ 1024, no `effort`) → Anthropic legacy budgeted thinking
+  (`thinking={"type": "enabled", "budget_tokens": ...}`). Only older Claude models
+  accept a token budget; OpenAI has no budget knob and ignores it.
+- `enabled=False` is best-effort and provider-dependent: Anthropic disables
+  (`thinking={"type": "disabled"}`); OpenAI reasoning models cannot be disabled, so it is
+  a no-op; the generic Chat Completions adapter also no-ops (disabling isn't portable —
+  pass a raw `reasoning_effort` via `provider_options` to target a backend like Gemini
+  that accepts `"none"`).
+
+Pick the field appropriate to your model; a mismatch surfaces as a clear provider
+`400` rather than being silently corrected. You can still pass raw provider keys via
+`AgentSpec.provider_options`; a typed `ThinkingConfig` wins over conflicting raw
+thinking/reasoning keys but leaves unrelated keys untouched.
+
+For OpenAI-compatible Chat Completions backends, `effort` maps to `reasoning_effort` and
+reasoning is surfaced where the provider emits `reasoning_content` deltas (e.g. DeepSeek,
+OpenRouter); Gemini's compatible endpoint accepts the request param but returns reasoning
+inlined in the answer, so no separate `ThinkingPart` appears there.
+
+Reasoning content streams as `model.thinking.delta` events and is persisted in the
+assistant transcript as a `ThinkingPart`. For Anthropic, the part keeps the opaque
+`signature`/`redacted_thinking` data needed to echo the block back verbatim during a
+tool-use loop. For OpenAI, the readable reasoning summary is surfaced as a
+display-only `ThinkingPart` while the encrypted reasoning still round-trips through
+the existing provider-state item. `ThinkingConfig(include_in_transcript=False)` keeps
+newly-produced readable reasoning (the OpenAI/Chat Completions display-only summary) out
+of the persisted transcript; it does not suppress the live `model.thinking.delta` events,
+and an Anthropic signed block is retained verbatim (its signature is needed to continue a
+tool-use loop, so that block stays in the transcript). Thinking tokens are billed inside
+`output_tokens` and surfaced for visibility as `usage_metrics.reasoning_output_tokens`.
+
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
 `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,

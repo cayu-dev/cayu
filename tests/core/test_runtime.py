@@ -13150,6 +13150,32 @@ def test_builtin_context_policies_trim_recent_history_safely():
     ]
 
 
+def test_model_compactor_ignores_thinking_events():
+    # A reasoning-capable compaction provider may emit THINKING events; compaction must
+    # ignore them (the summary is built from text) rather than crash on an unknown type.
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.thinking("internal reasoning", provider_state={"signature": "S"}),
+            ModelStreamEvent.text_delta("summary "),
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"usage": {"output_tokens": 2}}),
+        ]
+    )
+    compactor = ModelCompactor(provider=provider, model="summary-model")
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert result.summary == "summary done"
+
+
 def test_model_compactor_summarizes_context_with_provider():
     provider = FakeProvider(
         [

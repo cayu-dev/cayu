@@ -93,12 +93,33 @@ class ProviderStatePart(BaseModel):
         return copy_json_value(value, "state")
 
 
+class ThinkingPart(BaseModel):
+    """Model reasoning/thinking content from a single reasoning block.
+
+    `text` may be empty (the provider returned the reasoning in an omitted/redacted
+    form). `provider_state` carries the opaque round-trip payload — the Anthropic
+    `signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob —
+    needed to send the block back to the provider on a later turn.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["thinking"] = "thinking"
+    text: str = ""
+    provider_state: dict[str, Any] | None = None
+
+    @field_validator("provider_state", mode="before")
+    @classmethod
+    def copy_provider_state(cls, value):
+        return copy_json_value(value, "provider_state")
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: MessageRole
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = Field(
-        default_factory=list
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart] = (
+        Field(default_factory=list)
     )
 
     @field_validator("content")
@@ -119,6 +140,7 @@ class Message(BaseModel):
                 TextPart,
                 ToolCallPart,
                 ProviderStatePart,
+                ThinkingPart,
             )
         elif self.role == MessageRole.TOOL:
             _require_parts(self.role, self.content, ToolResultPart)
@@ -137,7 +159,7 @@ class Message(BaseModel):
         arguments: dict[str, Any] | None = None,
         calls: list[ToolCallPart] | None = None,
     ) -> Message:
-        content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart]
+        content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart]
         if calls is not None:
             if tool_call_id is not None or tool_name is not None or arguments is not None:
                 raise ValueError(
@@ -171,7 +193,9 @@ class Message(BaseModel):
         is_error: bool = False,
         results: list[ToolResultPart] | None = None,
     ) -> Message:
-        result_parts: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart]
+        result_parts: list[
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart
+        ]
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
         if not isinstance(is_error, bool):
@@ -208,9 +232,13 @@ class Message(BaseModel):
 
 def _require_parts(
     role: MessageRole,
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart],
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
     *allowed_types: (
-        type[TextPart] | type[ToolCallPart] | type[ToolResultPart] | type[ProviderStatePart]
+        type[TextPart]
+        | type[ToolCallPart]
+        | type[ToolResultPart]
+        | type[ProviderStatePart]
+        | type[ThinkingPart]
     ),
 ) -> None:
     invalid_parts = [part.type for part in content if not isinstance(part, allowed_types)]
@@ -239,8 +267,8 @@ def copy_message(message: Message) -> Message:
 
 
 def copy_message_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
-) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart:
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart:
     if type(part) is TextPart:
         return TextPart(text=part.text)
     if type(part) is ToolCallPart:
@@ -262,6 +290,11 @@ def copy_message_part(
         return ProviderStatePart(
             provider=part.provider,
             state=copy_json_value(part.state, "state"),
+        )
+    if type(part) is ThinkingPart:
+        return ThinkingPart(
+            text=part.text,
+            provider_state=copy_json_value(part.provider_state, "provider_state"),
         )
     raise TypeError("Message content must contain supported message parts.")
 

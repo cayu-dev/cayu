@@ -28,6 +28,7 @@ _register_trace_level()
 
 _TRACE_EVENTS = {
     EventType.MODEL_TEXT_DELTA,
+    EventType.MODEL_THINKING_DELTA,
 }
 _DEBUG_EVENTS = {
     EventType.HOOK_STARTED,

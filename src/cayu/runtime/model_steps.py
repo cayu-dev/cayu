@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from cayu.core.messages import Message, MessageRole, ProviderStatePart, TextPart
+from cayu.core.messages import Message, MessageRole, ProviderStatePart, TextPart, ThinkingPart
 from cayu.providers import ModelCompletion, ModelFinishReason
 from cayu.runtime._runtime_records import ToolCallRequest
 
@@ -28,6 +28,7 @@ class AssistantStepResult:
     text_content: str
     has_user_visible_content: bool
     provider_state_count: int
+    thinking_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,10 +73,10 @@ def classify_assistant_step(result: AssistantStepResult) -> StepClassification:
             type=StepClassificationType.FINAL,
             reason="assistant produced user-visible content",
         )
-    if result.provider_state_count > 0:
+    if result.provider_state_count > 0 or result.thinking_count > 0:
         return StepClassification(
             type=StepClassificationType.THINK_ONLY,
-            reason="assistant produced provider state but no user-visible content",
+            reason="assistant produced reasoning or provider state but no user-visible content",
         )
     return StepClassification(
         type=StepClassificationType.INVALID,
@@ -95,7 +96,15 @@ def assistant_text_content(message: Message | None) -> str:
     return "".join(text_parts)
 
 
-def provider_state_count(message: Message | None) -> int:
+def _count_parts(message: Message | None, part_type: type) -> int:
     if message is None:
         return 0
-    return sum(1 for part in message.content if type(part) is ProviderStatePart)
+    return sum(1 for part in message.content if type(part) is part_type)
+
+
+def provider_state_count(message: Message | None) -> int:
+    return _count_parts(message, ProviderStatePart)
+
+
+def thinking_count(message: Message | None) -> int:
+    return _count_parts(message, ThinkingPart)

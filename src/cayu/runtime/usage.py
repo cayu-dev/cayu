@@ -140,6 +140,10 @@ def normalize_usage_metrics(
         output_details = raw_usage.get("completion_tokens_details")
     if type(output_details) is dict:
         reasoning_output_tokens = _nonnegative_int(output_details.get("reasoning_tokens"))
+        if reasoning_output_tokens == 0:
+            # Anthropic reports extended-thinking tokens as `thinking_tokens` (already
+            # billed inside output_tokens); surface them in the same neutral field.
+            reasoning_output_tokens = _nonnegative_int(output_details.get("thinking_tokens"))
 
     cache_read_tokens = _nonnegative_int(raw_usage.get("cache_read_input_tokens"))
     cache_write_tokens = _nonnegative_int(raw_usage.get("cache_creation_input_tokens"))

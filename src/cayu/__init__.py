@@ -30,9 +30,11 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.environments import (
@@ -657,6 +659,8 @@ __all__ = [
     "TaskStore",
     "TextArtifactReader",
     "TextPart",
+    "ThinkingConfig",
+    "ThinkingPart",
     "Tool",
     "ToolApprovalDecision",
     "ToolApprovalRecoveryOutcome",

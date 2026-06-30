@@ -11,6 +11,7 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
     copy_message_part,
@@ -21,6 +22,13 @@ from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
 @dataclass
 class AssistantTextPart:
     text: str
+
+
+@dataclass
+class AssistantThinkingPart:
+    text: str
+    provider_state: dict[str, Any] | None = None
+    include: bool = True
 
 
 def initial_messages(
@@ -37,27 +45,43 @@ def initial_messages(
 
 def assistant_message(
     *,
-    content_parts: list[AssistantTextPart | ToolCallPart],
+    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
     provider_state_parts: list[ProviderStatePart],
 ) -> Message | None:
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart] = []
+    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart] = []
     for part in content_parts:
         if type(part) is AssistantTextPart:
             if part.text.strip():
                 content.append(TextPart(text=part.text))
             continue
+        if type(part) is AssistantThinkingPart:
+            thinking = _materialize_thinking(part)
+            if thinking is not None:
+                content.append(thinking)
+            continue
         if type(part) is ToolCallPart:
             content.append(copy_message_part(part))
             continue
-        raise TypeError("Assistant content must contain text buffers or tool calls.")
+        raise TypeError("Assistant content must contain text buffers, thinking, or tool calls.")
     content.extend(provider_state_parts)
     if not content:
         return None
     return Message(role=MessageRole.ASSISTANT, content=content)
 
 
+def _materialize_thinking(part: AssistantThinkingPart) -> ThinkingPart | None:
+    # include_in_transcript=False drops reasoning that round-trips out of band (no
+    # provider_state — e.g. an OpenAI display-only summary). A signed/redacted Anthropic
+    # block is kept INTACT: its signature is computed over the original text, so blanking
+    # the text would make it a modified block and break tool-use continuation. So opting
+    # out only redacts providers whose reasoning round-trips separately, not Anthropic.
+    if part.provider_state is None and (not part.include or not part.text):
+        return None
+    return ThinkingPart(text=part.text, provider_state=part.provider_state)
+
+
 def append_assistant_text_delta(
-    content_parts: list[AssistantTextPart | ToolCallPart],
+    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
     delta: str,
 ) -> None:
     if not delta:
@@ -67,6 +91,34 @@ def append_assistant_text_delta(
         previous.text = f"{previous.text}{delta}"
         return
     content_parts.append(AssistantTextPart(text=delta))
+
+
+def append_assistant_thinking_delta(
+    content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
+    delta: str,
+    *,
+    provider_state: dict[str, Any] | None = None,
+    include: bool = True,
+) -> None:
+    # A delta carrying provider_state is a complete, self-contained block (Anthropic
+    # emits one event per thinking/redacted block) -> always its own part so each
+    # signature round-trips independently. Stateless deltas (OpenAI streamed summary
+    # text) accumulate onto a trailing stateless thinking buffer.
+    if provider_state is not None:
+        content_parts.append(
+            AssistantThinkingPart(text=delta, provider_state=provider_state, include=include)
+        )
+        return
+    if not delta:
+        return
+    if (
+        content_parts
+        and type(content_parts[-1]) is AssistantThinkingPart
+        and content_parts[-1].provider_state is None
+    ):
+        content_parts[-1].text = f"{content_parts[-1].text}{delta}"
+        return
+    content_parts.append(AssistantThinkingPart(text=delta, include=include))
 
 
 def tool_call_part(tool_call: ToolCallRequest) -> ToolCallPart:

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event
 from cayu.core.messages import Message
+from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool
 
 
@@ -20,6 +21,7 @@ class AgentSpec(BaseModel):
     system_prompt: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     provider_options: dict[str, Any] = Field(default_factory=dict)
+    thinking: ThinkingConfig | None = None
 
     @field_validator("metadata", "provider_options", mode="before")
     @classmethod

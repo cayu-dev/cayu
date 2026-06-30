@@ -21,6 +21,7 @@ from cayu.core.messages import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
 )
@@ -332,6 +333,8 @@ def build_anthropic_payload(
     if tools:
         payload["tools"] = tools
     payload.update(options)
+    _apply_thinking_options(payload, request.options.get("thinking"))
+    _reconcile_thinking_budget(payload, default_max_tokens=default_max_tokens)
     if cache_policy is not None:
         _apply_cache_breakpoints(payload, cache_policy)
     return copy_json_value(payload, "anthropic_payload")
@@ -350,6 +353,65 @@ def build_anthropic_token_count_payload(
     )
     payload.pop("max_tokens", None)
     return payload
+
+
+def _anthropic_thinking_options(neutral: Mapping[str, Any]) -> dict[str, Any]:
+    """Map the neutral ``options["thinking"]`` payload to Anthropic request keys.
+
+    Field-driven so no model lookup is needed (the request shape differs by model
+    generation): ``effort`` -> adaptive thinking + ``output_config.effort``;
+    ``max_tokens`` -> legacy ``thinking.budget_tokens``; otherwise adaptive.
+    ``display="summarized"`` is requested whenever thinking is enabled so the newest
+    models (where the default is ``omitted``) still return readable reasoning text.
+    """
+    if not neutral.get("enabled", True):
+        return {"thinking": {"type": "disabled"}}
+    adaptive = {"thinking": {"type": "adaptive", "display": "summarized"}}
+    effort = neutral.get("effort")
+    if effort is not None:
+        return {**adaptive, "output_config": {"effort": effort}}
+    max_tokens = neutral.get("max_tokens")
+    if max_tokens is not None:
+        return {
+            "thinking": {"type": "enabled", "budget_tokens": max_tokens, "display": "summarized"}
+        }
+    return adaptive
+
+
+def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:
+    """Merge the mapped thinking config into the payload (typed config wins).
+
+    ``thinking`` is a mode-exclusive unit, so it replaces any raw value; ``output_config``
+    is merged so a caller's unrelated sibling keys (e.g. a raw ``output_config.format``)
+    survive.
+    """
+    if not isinstance(neutral, Mapping):
+        return
+    mapped = _anthropic_thinking_options(neutral)
+    payload["thinking"] = mapped["thinking"]
+    output_config = mapped.get("output_config")
+    if output_config:
+        existing = payload.get("output_config")
+        payload["output_config"] = (
+            {**existing, **output_config} if isinstance(existing, dict) else output_config
+        )
+
+
+def _reconcile_thinking_budget(payload: dict[str, Any], *, default_max_tokens: int) -> None:
+    """Ensure `max_tokens` exceeds a legacy thinking `budget_tokens`.
+
+    Anthropic requires `max_tokens > thinking.budget_tokens` (the budget is part of the
+    output allowance). A caller who only set a thinking budget would otherwise leave
+    `max_tokens` at the default and get a 400, so raise it to leave response headroom
+    above the budget.
+    """
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict):
+        return
+    budget = thinking.get("budget_tokens")
+    max_tokens = payload.get("max_tokens")
+    if isinstance(budget, int) and isinstance(max_tokens, int) and budget >= max_tokens:
+        payload["max_tokens"] = budget + default_max_tokens
 
 
 def _apply_cache_breakpoints(payload: dict[str, Any], policy: CachePolicy) -> None:
@@ -383,6 +445,10 @@ def _mark_conversation_prefix(payload: dict[str, Any], policy: CachePolicy) -> N
         return  # too few messages for a stable cacheable prefix
     content = messages[boundary].get("content")
     if isinstance(content, list) and content and isinstance(content[-1], dict):
+        # Anthropic rejects cache_control on thinking/redacted_thinking blocks, so a
+        # boundary turn ending in reasoning (e.g. a think-only turn) cannot be marked.
+        if content[-1].get("type") in {"thinking", "redacted_thinking"}:
+            return
         content[-1]["cache_control"] = policy.marker()
 
 
@@ -407,6 +473,28 @@ def anthropic_response_events(
                 raise AnthropicProtocolError(f"Anthropic text block {index} requires string text.")
             if text:
                 events.append(ModelStreamEvent.text_delta(text))
+        elif block_type == "thinking":
+            thinking_text = block.get("thinking", "")
+            if not isinstance(thinking_text, str):
+                raise AnthropicProtocolError(
+                    f"Anthropic thinking block {index} requires string thinking."
+                )
+            provider_state: dict[str, Any] = {"type": "thinking"}
+            signature = block.get("signature")
+            if isinstance(signature, str) and signature:
+                provider_state["signature"] = signature
+            events.append(ModelStreamEvent.thinking(thinking_text, provider_state=provider_state))
+        elif block_type == "redacted_thinking":
+            data = block.get("data")
+            if not isinstance(data, str) or not data:
+                raise AnthropicProtocolError(
+                    f"Anthropic redacted_thinking block {index} requires string data."
+                )
+            events.append(
+                ModelStreamEvent.thinking(
+                    provider_state={"type": "redacted_thinking", "data": data}
+                )
+            )
         elif block_type == "tool_use":
             tool_id = block.get("id")
             name = block.get("name")
@@ -495,11 +583,19 @@ def _anthropic_message(
             "content": [_text_block(part) for part in message.content],
         }
     if message.role == MessageRole.ASSISTANT:
-        content = [
-            _assistant_block(part)
-            for part in message.content
-            if type(part) is not ProviderStatePart
-        ]
+        # Thinking blocks must lead the assistant content and round-trip verbatim with
+        # their signature/data (Anthropic rejects modified blocks during tool use); the
+        # runtime assembles them first, so preserving content order keeps that ordering.
+        content: list[dict[str, Any]] = []
+        for part in message.content:
+            if type(part) is ProviderStatePart:
+                continue
+            if type(part) is ThinkingPart:
+                thinking_block = _assistant_thinking_block(part)
+                if thinking_block is not None:
+                    content.append(thinking_block)
+                continue
+            content.append(_assistant_block(part))
         if not content:
             return None
         return {
@@ -518,7 +614,7 @@ def _anthropic_message(
 
 
 def _text_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> dict[str, str]:
     if type(part) is not TextPart:
         raise AnthropicProtocolError("User messages can only contain text blocks.")
@@ -526,7 +622,7 @@ def _text_block(
 
 
 def _assistant_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> dict[str, Any]:
     if type(part) is TextPart:
         return {"type": "text", "text": part.text}
@@ -540,8 +636,28 @@ def _assistant_block(
     raise AnthropicProtocolError("Assistant messages can only contain text and tool_call blocks.")
 
 
+def _assistant_thinking_block(part: ThinkingPart) -> dict[str, Any] | None:
+    """Round-trip a thinking block back to Anthropic, or drop it when not echoable.
+
+    Anthropic requires a tool-use loop's prior thinking/redacted_thinking blocks to be
+    echoed verbatim with their ``signature``/``data``. A `ThinkingPart` lacking that
+    opaque state (another provider's reasoning, or a cross-model switch) cannot be
+    echoed, so it is dropped rather than triggering a 400.
+    """
+    state = part.provider_state or {}
+    if state.get("type") == "redacted_thinking":
+        data = state.get("data")
+        if isinstance(data, str) and data:
+            return {"type": "redacted_thinking", "data": data}
+        return None
+    signature = state.get("signature")
+    if isinstance(signature, str) and signature:
+        return {"type": "thinking", "thinking": part.text, "signature": signature}
+    return None
+
+
 def _tool_result_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
