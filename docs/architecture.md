@@ -1,6 +1,6 @@
 # Cayu Architecture
 
-This is a design/maintainer document for the current framework foundation. It records architecture decisions and intended direction; it is not a complete end-user guide.
+This is a design/maintainer document for Cayu's runtime framework. It records architecture decisions and intended direction; it is not a complete end-user guide.
 
 Cayu is a backend/runtime-first Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
 

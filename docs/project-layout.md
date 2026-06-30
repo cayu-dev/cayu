@@ -1,6 +1,6 @@
 # Project Layout
 
-This is a design/maintainer document for the current framework foundation. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
+This is a design/maintainer document for Cayu's runtime framework. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
 
 The framework repo and user-created agent projects should use different structures.
 

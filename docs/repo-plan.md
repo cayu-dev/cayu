@@ -1,6 +1,6 @@
 # Repo Plan
 
-This is a design/maintainer document for the current framework foundation. It records near-term implementation direction; it is not a public roadmap or complete end-user guide.
+This is a design/maintainer document for Cayu's runtime framework. It records implementation direction; it is not a public roadmap or complete end-user guide.
 
 ## Naming
 
@@ -13,7 +13,7 @@ CLI: cayu
 
 ## Framework Direction
 
-The repository should grow from stable contracts into a usable runtime through small vertical slices. Avoid preserving accidental APIs before the runtime shape is proven.
+The repository should preserve stable contracts while expanding runtime capabilities through small vertical slices. Avoid preserving accidental APIs before each public runtime shape is deliberate.
 
 Important framework capabilities:
 
@@ -23,7 +23,7 @@ Important framework capabilities:
 - tool protocol
 - path-safe framework-native file tools
 - framework-native command execution tool
-- initial Anthropic Messages API and OpenAI Responses API providers
+- Anthropic Messages API and OpenAI Responses API providers
 - LocalRunner implementation
 - LocalWorkspace implementation
 - CLI scaffold ideas
@@ -39,7 +39,7 @@ Areas that need deliberate design:
 - sandbox lifecycle
 - memory/search
 
-## Initial Implementation Rule
+## Implementation Rule
 
 Implement contracts first, then one tiny vertical demo:
 

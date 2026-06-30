@@ -1,6 +1,6 @@
 # Runtime Contracts
 
-This is a design/maintainer document for the current framework foundation. It names the first contracts that must stabilize before the framework grows higher-level features.
+This is a design/maintainer document for Cayu's runtime framework. It names contracts that must stay stable as the framework grows higher-level features.
 
 ## Boundary Data
 
