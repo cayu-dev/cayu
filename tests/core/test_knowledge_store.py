@@ -6,8 +6,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
 from cayu.storage import (
     BUILTIN_KNOWLEDGE_KINDS,
+    InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeActorType,
     KnowledgeChunk,
@@ -25,6 +32,34 @@ from cayu.storage import (
     KnowledgeVisibility,
 )
 from cayu.storage.memory import copy_knowledge_entry
+
+
+class KeywordEmbeddingProvider(TextEmbeddingProvider):
+    name = "keyword-test"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        self.calls.append(list(request.texts))
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def _test_embedding_vector(text: str) -> list[float]:
+    folded = text.casefold()
+    return [
+        1.0
+        if any(term in folded for term in ("auth", "broker", "credential", "github", "proxy", "token"))
+        else 0.0,
+        1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
+        1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
+    ]
 
 
 def test_knowledge_entry_accepts_extensible_kind_and_core_fields() -> None:
@@ -376,6 +411,277 @@ def test_in_memory_knowledge_store_rejects_unsupported_search_modes() -> None:
             await store.search(KnowledgeQuery(text="billing", mode=KnowledgeSearchMode.SEMANTIC))
 
     asyncio.run(run())
+
+
+def test_in_memory_embedding_knowledge_store_semantic_search() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="git_policy",
+                text="GitHub pushes should use a trusted proxy for the secret token.",
+                kind="procedure",
+            )
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="invoice_policy",
+                text="Invoice refunds require payment approval.",
+                kind="procedure",
+            )
+        )
+        result = await store.search(
+            KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        return result, provider.calls
+
+    result, calls = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["git_policy"]
+    assert result.hits[0].score_kind == "inmemory_semantic"
+    assert result.hits[0].chunk is not None
+    assert result.hits[0].reason == "semantic chunk match"
+    assert len(calls) == 3
+
+
+def test_in_memory_embedding_knowledge_store_auto_uses_hybrid_search() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(KnowledgeEntry(id="credential_policy", text="Use a credential proxy."))
+        await store.put_entry(KnowledgeEntry(id="email_policy", text="SendGrid email guide."))
+        result = await store.search(KnowledgeQuery(text="credential"))
+        return result
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["credential_policy"]
+    assert result.hits[0].score_kind == "inmemory_hybrid"
+    assert "entry text match" in result.hits[0].reason
+
+
+def test_in_memory_embedding_knowledge_store_hybrid_labels_keyword_only_hits() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            semantic_min_score=1.0,
+        )
+        await store.put_entry(KnowledgeEntry(id="deploy", text="Deployment checklist."))
+        return await store.search(KnowledgeQuery(text="deployment"))
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["deploy"]
+    assert result.hits[0].reason == "hybrid keyword match; entry text match"
+    assert result.hits[0].score_normalized is None
+
+
+def test_in_memory_embedding_knowledge_store_min_score_uses_normalized_score() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            semantic_min_score=0.70,
+        )
+        await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+        await store.put_entry(KnowledgeEntry(id="unrelated", text="Deployment checklist."))
+        return await store.search(
+            KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["matching"]
+    assert result.hits[0].score_normalized == 1.0
+
+
+def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(KnowledgeEntry(id="policy", text="GitHub token policy."))
+        first = await store.search(
+            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        await store.put_entry(KnowledgeEntry(id="policy", text="Invoice payment policy."))
+        second = await store.search(
+            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        third = await store.search(
+            KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        return first, second, third
+
+    first, second, third = asyncio.run(run())
+
+    assert [hit.entry.id for hit in first.hits] == ["policy"]
+    assert second.hits == []
+    assert [hit.entry.id for hit in third.hits] == ["policy"]
+
+
+def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="policy", text="Policy summary."),
+            [KnowledgeChunk(id="custom-old", entry_id="policy", chunk_index=0, text="GitHub token.")],
+        )
+        first = await store.search(
+            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        await store.replace_chunks(
+            "policy",
+            [
+                KnowledgeChunk(
+                    id="custom-new",
+                    entry_id="policy",
+                    chunk_index=0,
+                    text="Invoice refund.",
+                )
+            ],
+        )
+        second = await store.search(
+            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        third = await store.search(
+            KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC)
+        )
+        return first, second, third
+
+    first, second, third = asyncio.run(run())
+
+    assert [hit.chunk.id for hit in first.hits if hit.chunk is not None] == ["custom-old"]
+    assert second.hits == []
+    assert [hit.chunk.id for hit in third.hits if hit.chunk is not None] == ["custom-new"]
+
+
+def test_in_memory_embedding_knowledge_store_honors_none_terms() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
+        await store.put_entry(
+            KnowledgeEntry(id="excluded", text="GitHub credential proxy deprecated.")
+        )
+        return await store.search(
+            KnowledgeQuery(
+                text="auth broker",
+                none_terms=["deprecated"],
+                mode=KnowledgeSearchMode.SEMANTIC,
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["safe"]
+
+
+def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(KnowledgeEntry(id="safe", text="GitHub credential proxy."))
+        await store.put_entry(
+            KnowledgeEntry(id="excluded", text="GitHub credential proxy deprecated.")
+        )
+        await store.replace_chunks(
+            "safe",
+            [KnowledgeChunk(id="safe:0", entry_id="safe", chunk_index=0, text="GitHub auth proxy.")],
+        )
+        provider.calls.clear()
+        store._chunk_embeddings.clear()
+        result = await store.search(
+            KnowledgeQuery(
+                text="auth broker",
+                none_terms=["deprecated"],
+                mode=KnowledgeSearchMode.SEMANTIC,
+            )
+        )
+        return result, provider.calls
+
+    result, calls = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["safe"]
+    assert ["GitHub auth proxy."] in calls
+    assert ["GitHub credential proxy deprecated."] not in calls
+    assert ["auth broker"] in calls
+
+
+def test_in_memory_embedding_knowledge_store_empty_candidates_do_not_embed_query() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="policy",
+                text="GitHub credential proxy.",
+                labels={"project": "cayu"},
+            )
+        )
+        provider.calls.clear()
+        result = await store.search(
+            KnowledgeQuery(
+                text="auth broker",
+                labels={"project": "other"},
+                mode=KnowledgeSearchMode.SEMANTIC,
+            )
+        )
+        return result, provider.calls
+
+    result, calls = asyncio.run(run())
+
+    assert result.hits == []
+    assert result.total_hits_known == 0
+    assert calls == []
+
+
+def test_in_memory_embedding_knowledge_store_rejects_wrong_dimensions() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=2,
+        )
+        with pytest.raises(ValueError, match="unexpected dimension"):
+            await store.put_entry(KnowledgeEntry(id="policy", text="GitHub credential proxy."))
+
+    asyncio.run(run())
+
+
+def test_text_embedding_usage_rejects_bool_token_counts() -> None:
+    with pytest.raises(ValidationError, match="input_tokens"):
+        TextEmbeddingResult(
+            model="test-embedding",
+            embeddings=[TextEmbedding(index=0, vector=[1.0])],
+            usage={"input_tokens": True},
+        )
 
 
 def test_in_memory_knowledge_store_keyword_search_does_not_match_substrings() -> None:

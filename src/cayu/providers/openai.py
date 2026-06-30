@@ -26,6 +26,14 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+    TextEmbeddingUsage,
+    copy_text_embedding_request,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -225,7 +233,7 @@ class HttpxOpenAITransport:
             raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
 
 
-class OpenAIProvider(ModelProvider):
+class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     """OpenAI Responses API adapter for Cayu's provider-neutral runtime."""
 
     name = "openai"
@@ -317,6 +325,17 @@ class OpenAIProvider(ModelProvider):
                 "provider_billing_status": "not_documented",
             },
         )
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        embedding_request = copy_text_embedding_request(request)
+        payload = build_openai_embedding_payload(embedding_request)
+        response = await self.transport.create_response(
+            url=f"{self.base_url}/v1/embeddings",
+            headers=self._headers(),
+            payload=payload,
+            timeout_s=self.timeout_s,
+        )
+        return openai_embedding_result(response, requested_count=len(embedding_request.texts))
 
     async def _consume(self, payload: dict[str, Any]) -> AsyncIterator[ModelStreamEvent]:
         raw_events = self.transport.stream_response_events(
@@ -425,6 +444,100 @@ def build_openai_token_count_payload(
         key: value for key, value in payload.items() if key in _OPENAI_TOKEN_COUNT_FIELDS
     }
     return copy_json_value(count_payload, "openai_token_count_payload")
+
+
+def build_openai_embedding_payload(request: TextEmbeddingRequest) -> dict[str, Any]:
+    if type(request) is not TextEmbeddingRequest:
+        raise TypeError("request must be a TextEmbeddingRequest.")
+    options = _openai_embedding_options(request.options)
+    payload: dict[str, Any] = {
+        "model": request.model,
+        "input": list(request.texts),
+        "encoding_format": "float",
+    }
+    if request.dimensions is not None:
+        payload["dimensions"] = request.dimensions
+    payload.update(options)
+    return copy_json_value(payload, "openai_embedding_payload")
+
+
+def openai_embedding_result(
+    response: Mapping[str, Any],
+    *,
+    requested_count: int,
+) -> TextEmbeddingResult:
+    if not isinstance(response, Mapping):
+        raise OpenAIProtocolError("OpenAI embedding response must be a JSON object.")
+    object_type = response.get("object")
+    if object_type != "list":
+        raise OpenAIProtocolError("OpenAI embedding response has unexpected object.")
+    model = response.get("model")
+    if type(model) is not str:
+        raise OpenAIProtocolError("OpenAI embedding response requires model.")
+    data = response.get("data")
+    if not isinstance(data, list):
+        raise OpenAIProtocolError("OpenAI embedding response data must be a list.")
+    if len(data) != requested_count:
+        raise OpenAIProtocolError("OpenAI embedding response count did not match request.")
+    embeddings: list[TextEmbedding] = []
+    for position, item in enumerate(data):
+        if not isinstance(item, Mapping):
+            raise OpenAIProtocolError(f"OpenAI embedding item {position} must be an object.")
+        index = item.get("index")
+        vector = item.get("embedding")
+        if type(index) is not int:
+            raise OpenAIProtocolError(f"OpenAI embedding item {position} requires index.")
+        if not isinstance(vector, list):
+            raise OpenAIProtocolError(f"OpenAI embedding item {position} requires vector.")
+        embeddings.append(TextEmbedding(index=index, vector=vector))
+    embeddings.sort(key=lambda embedding: embedding.index)
+    if [embedding.index for embedding in embeddings] != list(range(requested_count)):
+        raise OpenAIProtocolError("OpenAI embedding response indexes did not match request.")
+    usage = _openai_embedding_usage(response.get("usage"))
+    return TextEmbeddingResult(
+        model=model,
+        embeddings=embeddings,
+        usage=usage,
+        metadata={"provider": "openai", "endpoint": "embeddings"},
+    )
+
+
+def _openai_embedding_usage(value: object) -> TextEmbeddingUsage | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise OpenAIProtocolError("OpenAI embedding usage must be an object.")
+    prompt_tokens = _optional_openai_embedding_token_count(value, "prompt_tokens")
+    total_tokens = _optional_openai_embedding_token_count(value, "total_tokens")
+    return TextEmbeddingUsage(
+        input_tokens=prompt_tokens,
+        total_tokens=total_tokens,
+        metadata={"provider_billing_status": "usage_reported"},
+    )
+
+
+def _optional_openai_embedding_token_count(
+    value: Mapping[str, Any],
+    key: str,
+) -> int | None:
+    raw = value.get(key)
+    if raw is None:
+        return None
+    if type(raw) is not int or raw < 0:
+        raise OpenAIProtocolError(f"OpenAI embedding usage requires nonnegative {key}.")
+    return raw
+
+
+def _openai_embedding_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    copied = copy_json_value(dict(options), "openai_embedding_options")
+    if type(copied) is not dict:
+        raise ValueError("OpenAI embedding options must be a dictionary.")
+    reserved = {"dimensions", "encoding_format", "input", "model"}
+    conflict = reserved.intersection(copied)
+    if conflict:
+        names = ", ".join(sorted(conflict))
+        raise ValueError(f"OpenAI embedding options cannot override reserved keys: {names}.")
+    return copied
 
 
 def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:

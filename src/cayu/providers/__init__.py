@@ -46,7 +46,9 @@ from cayu.providers.openai import (
     OpenAIProtocolError,
     OpenAIProvider,
     OpenAITransport,
+    build_openai_embedding_payload,
     build_openai_payload,
+    openai_embedding_result,
     openai_response_events,
 )
 
@@ -87,10 +89,12 @@ __all__ = [
     "anthropic_response_events",
     "build_anthropic_payload",
     "build_chat_completions_payload",
+    "build_openai_embedding_payload",
     "build_openai_payload",
     "chat_completions_stream_events",
     "copy_input_token_count_result",
     "copy_model_stream_event",
     "normalize_model_completion",
+    "openai_embedding_result",
     "openai_response_events",
 ]

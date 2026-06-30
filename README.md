@@ -15,7 +15,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
 
-The current public scope is the runtime and integration layer. Hosted deployment adapters, vector search, and higher-level task orchestration are expected to live in companion packages or application code.
+The current public scope is the runtime and integration layer. Hosted deployment adapters, durable production vector indexes, and higher-level task orchestration are expected to live in companion packages or application code.
 
 ## Contract Rules
 
@@ -171,6 +171,13 @@ only when a small entry sample is useful. `limit` also caps facets per group, an
 payload. Filters such as namespace, labels, kinds, aspects, and source ids are
 retrieval hints; tenant/user/project isolation should be enforced by the app or
 store wrapper.
+
+For semantic recall, Cayu exposes a provider-neutral `TextEmbeddingProvider`
+contract. `OpenAIProvider.embed_texts(...)` implements that contract against
+OpenAI embeddings, and `InMemoryEmbeddingKnowledgeStore` can use any embedding
+provider for opt-in `semantic`, `hybrid`, or `auto` search in tests, demos, and
+small single-process apps. SQLite and Postgres knowledge stores remain durable
+keyword stores until a backend-specific vector index is added.
 
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:

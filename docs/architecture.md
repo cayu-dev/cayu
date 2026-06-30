@@ -113,7 +113,8 @@ Default local strategy:
 files for human-readable source
 SQLite for sessions, append-only events, transcripts, checkpoints, and indexes
 SQLite FTS/BM25 for default keyword retrieval
-optional vector search later
+provider-neutral embeddings plus in-memory semantic retrieval for demos/tests
+backend-specific durable vector indexes later
 ```
 
 The local durable session store is `SQLiteSessionStore`. It keeps the event log append-only, but stores indexed identity columns beside the JSON event payload so dashboards and replay tools do not have to scan transcript files. Session records also persist provider, active model, runtime, agent, and environment identity so resume does not silently follow changed application defaults. New sessions start from the agent's default model; resume can durably update the session's active model within the stored provider. The store also keeps the provider-neutral transcript messages used by explicit session resume and checkpoint-backed context compaction. Storage APIs support filtered session listing, filtered event queries with durable sequence cursors, transcript loading, atomic status transitions, active model updates, and atomic batched event appends. JSONL is better treated as an export/debug format than as Cayu's primary runtime store.

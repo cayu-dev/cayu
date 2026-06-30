@@ -20,6 +20,7 @@ from cayu import (
 )
 from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.embeddings import TextEmbeddingRequest
 from cayu.providers import (
     HttpxOpenAITransport,
     InputTokenCountConfidence,
@@ -32,7 +33,9 @@ from cayu.providers import (
     OpenAIContextOverflowError,
     OpenAIProtocolError,
     OpenAIProvider,
+    build_openai_embedding_payload,
     build_openai_payload,
+    openai_embedding_result,
     openai_response_events,
 )
 from cayu.providers.openai import openai_stream_events
@@ -503,6 +506,108 @@ def test_build_openai_token_count_payload_keeps_only_count_supported_fields() ->
         "tool_choice": "auto",
         "parallel_tool_calls": False,
     }
+
+
+def test_build_openai_embedding_payload() -> None:
+    request = TextEmbeddingRequest(
+        model="text-embedding-test",
+        texts=["first", "second"],
+        dimensions=256,
+        options={"user": "user_123"},
+    )
+
+    payload = build_openai_embedding_payload(request)
+
+    assert payload == {
+        "model": "text-embedding-test",
+        "input": ["first", "second"],
+        "encoding_format": "float",
+        "dimensions": 256,
+        "user": "user_123",
+    }
+
+
+def test_build_openai_embedding_payload_rejects_reserved_overrides() -> None:
+    request = TextEmbeddingRequest(
+        model="text-embedding-test",
+        texts=["first"],
+        options={"input": "override"},
+    )
+
+    with pytest.raises(ValueError, match="reserved keys"):
+        build_openai_embedding_payload(request)
+
+
+@pytest.mark.anyio
+async def test_openai_provider_embeds_texts() -> None:
+    transport = RecordingTransport(
+        count_responses=[
+            {
+                "object": "list",
+                "model": "text-embedding-test",
+                "data": [
+                    {"object": "embedding", "index": 0, "embedding": [1.0, 0.0]},
+                    {"object": "embedding", "index": 1, "embedding": [0.0, 1.0]},
+                ],
+                "usage": {"prompt_tokens": 7, "total_tokens": 7},
+            }
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+
+    result = await provider.embed_texts(
+        TextEmbeddingRequest(model="text-embedding-test", texts=["first", "second"])
+    )
+
+    assert result.model == "text-embedding-test"
+    assert [embedding.vector for embedding in result.embeddings] == [[1.0, 0.0], [0.0, 1.0]]
+    assert result.usage is not None
+    assert result.usage.input_tokens == 7
+    assert result.usage.total_tokens == 7
+    assert result.metadata == {"provider": "openai", "endpoint": "embeddings"}
+    assert transport.count_calls[0]["url"] == "https://api.openai.com/v1/embeddings"
+    assert transport.count_calls[0]["payload"] == {
+        "model": "text-embedding-test",
+        "input": ["first", "second"],
+        "encoding_format": "float",
+    }
+
+
+def test_openai_embedding_result_rejects_count_mismatch() -> None:
+    with pytest.raises(OpenAIProtocolError, match="count"):
+        openai_embedding_result(
+            {
+                "object": "list",
+                "model": "text-embedding-test",
+                "data": [],
+            },
+            requested_count=1,
+        )
+
+
+def test_openai_embedding_result_rejects_wrong_indexes() -> None:
+    with pytest.raises(OpenAIProtocolError, match="indexes"):
+        openai_embedding_result(
+            {
+                "object": "list",
+                "model": "text-embedding-test",
+                "data": [{"object": "embedding", "index": 1, "embedding": [1.0]}],
+            },
+            requested_count=1,
+        )
+
+
+def test_openai_embedding_result_rejects_invalid_usage() -> None:
+    with pytest.raises(OpenAIProtocolError, match="prompt_tokens"):
+        openai_embedding_result(
+            {
+                "object": "list",
+                "model": "text-embedding-test",
+                "data": [{"object": "embedding", "index": 0, "embedding": [1.0]}],
+                "usage": {"prompt_tokens": True, "total_tokens": 1},
+            },
+            requested_count=1,
+        )
 
 
 @pytest.mark.anyio

@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
+from math import sqrt
 from typing import Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +18,7 @@ from cayu._validation import (
     require_finite,
     require_nonblank,
 )
+from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
 
 DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
@@ -44,6 +46,14 @@ class _SearchTerms(TypedDict):
     all: list[list[str]]
     none: list[str]
     phrases: list[str]
+
+
+class _StoredChunkEmbedding(TypedDict):
+    entry_id: str
+    content_hash: str
+    model: str
+    dimensions: int | None
+    vector: list[float]
 
 
 class KnowledgeStatus(StrEnum):
@@ -952,6 +962,271 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
 
 
+class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
+    """In-memory knowledge store with opt-in embedding search.
+
+    This backend is intended for tests, demos, and small single-process apps. It
+    keeps vectors in memory and does not persist them. Durable production vector
+    search should use a store with a real vector index.
+    """
+
+    def __init__(
+        self,
+        *,
+        embedding_provider: TextEmbeddingProvider,
+        embedding_model: str,
+        embedding_dimensions: int | None = None,
+        entries: list[KnowledgeEntry] | None = None,
+        hybrid_keyword_weight: float = 0.35,
+        semantic_min_score: float = 0.55,
+    ) -> None:
+        if not isinstance(embedding_provider, TextEmbeddingProvider):
+            raise TypeError("embedding_provider must implement TextEmbeddingProvider.")
+        self.embedding_provider = embedding_provider
+        self.embedding_model = require_clean_nonblank(embedding_model, "embedding_model")
+        if embedding_dimensions is not None:
+            _validate_positive_int(embedding_dimensions, "embedding_dimensions")
+        self.embedding_dimensions = embedding_dimensions
+        self.hybrid_keyword_weight = _validate_nonnegative_float(
+            hybrid_keyword_weight,
+            "hybrid_keyword_weight",
+        )
+        self.semantic_min_score = _validate_unit_float(
+            semantic_min_score,
+            "semantic_min_score",
+        )
+        self._chunk_embeddings: dict[str, _StoredChunkEmbedding] = {}
+        super().__init__(entries)
+
+    async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        stored = await super().put_entry(entry)
+        await self._embed_entry_chunks(stored.id)
+        return stored
+
+    async def delete_entry(
+        self,
+        entry_id: str,
+        *,
+        hard: bool = False,
+    ) -> KnowledgeEntry | None:
+        deleted = await super().delete_entry(entry_id, hard=hard)
+        if hard and deleted is not None:
+            self._drop_entry_embeddings(deleted.id)
+        return deleted
+
+    async def replace_chunks(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> list[KnowledgeChunk]:
+        stored_chunks = await super().replace_chunks(entry_id, chunks)
+        await self._embed_chunks(stored_chunks)
+        self._drop_stale_entry_embeddings(entry_id, stored_chunks)
+        return stored_chunks
+
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        stored = await super().put_entry_with_chunks(entry, chunks)
+        stored_chunks = self._chunks.get(stored.id, [])
+        await self._embed_chunks(stored_chunks)
+        self._drop_stale_entry_embeddings(stored.id, stored_chunks)
+        return stored
+
+    async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
+        knowledge_query = copy_knowledge_query(query)
+        if knowledge_query.mode is KnowledgeSearchMode.KEYWORD:
+            return await super().search(knowledge_query)
+        if knowledge_query.mode not in {
+            KnowledgeSearchMode.AUTO,
+            KnowledgeSearchMode.SEMANTIC,
+            KnowledgeSearchMode.HYBRID,
+        }:
+            raise ValueError(
+                "InMemoryEmbeddingKnowledgeStore supports auto, keyword, semantic, and "
+                "hybrid search modes."
+            )
+        terms = _knowledge_query_terms(knowledge_query)
+        candidates = [
+            entry
+            for entry in self._entries.values()
+            if _entry_matches_query(entry, knowledge_query)
+            and not _entry_matches_none_terms(entry, self._chunks.get(entry.id, []), terms)
+        ]
+        if not candidates:
+            return KnowledgeSearchResult(
+                query=knowledge_query,
+                hits=[],
+                truncated=False,
+                limit=knowledge_query.limit,
+                max_bytes=knowledge_query.max_bytes,
+                total_hits_known=0,
+            )
+        semantic_query_text = _semantic_query_text(knowledge_query)
+        await self._embed_entries(candidates)
+        query_vector = await self._embed_query(knowledge_query, semantic_query_text)
+        scored: list[
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
+        ] = []
+        for entry in candidates:
+            semantic_score, chunk = self._best_semantic_score(entry, query_vector)
+            if semantic_score is None:
+                continue
+            normalized_semantic = _normalize_cosine_similarity(semantic_score)
+            semantic_matched = normalized_semantic >= self.semantic_min_score
+            score = normalized_semantic if semantic_matched else 0.0
+            semantic_reason = "semantic chunk match" if chunk is not None else "semantic entry match"
+            reason = semantic_reason
+            preview_text = chunk.text if chunk is not None else entry.text
+            score_normalized = normalized_semantic if semantic_matched else None
+            if knowledge_query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
+                keyword_score, keyword_chunk, keyword_reason, keyword_preview = _score_entry(
+                    entry,
+                    self._chunks.get(entry.id, []),
+                    knowledge_query,
+                )
+                if keyword_score > 0:
+                    keyword_boost = min(keyword_score, 10.0) / 10.0
+                    score += self.hybrid_keyword_weight * keyword_boost
+                    if keyword_chunk is not None:
+                        chunk = keyword_chunk
+                    reason = (
+                        f"hybrid {semantic_reason}; {keyword_reason}"
+                        if semantic_matched
+                        else f"hybrid keyword match; {keyword_reason}"
+                    )
+                    preview_text = keyword_preview
+            elif not semantic_matched:
+                continue
+            if score <= 0:
+                continue
+            scored.append((score, entry, chunk, reason, preview_text, score_normalized))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -(item[1].importance or 0.0),
+                -item[1].updated_at.timestamp(),
+                item[1].id,
+            )
+        )
+        score_kind = (
+            "inmemory_semantic"
+            if knowledge_query.mode is KnowledgeSearchMode.SEMANTIC
+            else "inmemory_hybrid"
+        )
+        return _search_result_from_scored_embeddings(scored, knowledge_query, score_kind=score_kind)
+
+    async def _embed_entries(self, entries: list[KnowledgeEntry]) -> None:
+        chunks: list[KnowledgeChunk] = []
+        for entry in entries:
+            chunks.extend(self._chunks.get(entry.id, []))
+        await self._embed_chunks(chunks)
+
+    async def _embed_entry_chunks(self, entry_id: str) -> None:
+        await self._embed_chunks(self._chunks.get(entry_id, []))
+
+    async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> None:
+        missing = [
+            chunk
+            for chunk in chunks
+            if not self._has_current_embedding(chunk)
+        ]
+        if not missing:
+            return
+        result = await self.embedding_provider.embed_texts(
+            TextEmbeddingRequest(
+                model=self.embedding_model,
+                texts=[chunk.text for chunk in missing],
+                dimensions=self.embedding_dimensions,
+            )
+        )
+        if len(result.embeddings) != len(missing):
+            raise ValueError("Embedding provider returned a different number of embeddings.")
+        by_index = {embedding.index: embedding for embedding in result.embeddings}
+        for index, chunk in enumerate(missing):
+            embedding = by_index.get(index)
+            if embedding is None:
+                raise ValueError("Embedding provider did not return every requested index.")
+            self._validate_embedding_dimension(embedding.vector)
+            self._chunk_embeddings[chunk.id] = {
+                "entry_id": chunk.entry_id,
+                "content_hash": _knowledge_chunk_content_hash(chunk),
+                "model": self.embedding_model,
+                "dimensions": self.embedding_dimensions,
+                "vector": list(embedding.vector),
+            }
+
+    async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
+        result = await self.embedding_provider.embed_texts(
+            TextEmbeddingRequest(
+                model=self.embedding_model,
+                texts=[text],
+                dimensions=self.embedding_dimensions,
+            )
+        )
+        embedding = next((item for item in result.embeddings if item.index == 0), None)
+        if embedding is None:
+            raise ValueError("Embedding provider did not return query embedding index 0.")
+        self._validate_embedding_dimension(embedding.vector)
+        return list(embedding.vector)
+
+    def _validate_embedding_dimension(self, vector: list[float]) -> None:
+        if self.embedding_dimensions is not None and len(vector) != self.embedding_dimensions:
+            raise ValueError("Embedding provider returned a vector with unexpected dimension.")
+
+    def _best_semantic_score(
+        self,
+        entry: KnowledgeEntry,
+        query_vector: list[float],
+    ) -> tuple[float | None, KnowledgeChunk | None]:
+        best_score: float | None = None
+        best_chunk: KnowledgeChunk | None = None
+        for chunk in self._chunks.get(entry.id, []):
+            stored = self._chunk_embeddings.get(chunk.id)
+            if stored is None or stored["content_hash"] != _knowledge_chunk_content_hash(chunk):
+                continue
+            score = _cosine_similarity(query_vector, stored["vector"])
+            if best_score is None or score > best_score:
+                best_score = score
+                best_chunk = chunk
+        return best_score, best_chunk
+
+    def _has_current_embedding(self, chunk: KnowledgeChunk) -> bool:
+        stored = self._chunk_embeddings.get(chunk.id)
+        return (
+            stored is not None
+            and stored["entry_id"] == chunk.entry_id
+            and stored["content_hash"] == _knowledge_chunk_content_hash(chunk)
+            and stored["model"] == self.embedding_model
+            and stored["dimensions"] == self.embedding_dimensions
+        )
+
+    def _drop_entry_embeddings(self, entry_id: str) -> None:
+        stale_ids = [
+            chunk_id
+            for chunk_id, embedding in self._chunk_embeddings.items()
+            if embedding["entry_id"] == entry_id
+        ]
+        for chunk_id in stale_ids:
+            self._chunk_embeddings.pop(chunk_id, None)
+
+    def _drop_stale_entry_embeddings(
+        self,
+        entry_id: str,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        current_ids = {chunk.id for chunk in chunks}
+        stale_ids = [
+            chunk_id
+            for chunk_id, embedding in self._chunk_embeddings.items()
+            if embedding["entry_id"] == entry_id and chunk_id not in current_ids
+        ]
+        for chunk_id in stale_ids:
+            self._chunk_embeddings.pop(chunk_id, None)
+
+
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
     if type(entry) is not KnowledgeEntry:
         raise TypeError("KnowledgeEntry instances must not be subclasses.")
@@ -1295,6 +1570,104 @@ def _entry_chunk_searchable_text(entry: KnowledgeEntry, chunk: KnowledgeChunk) -
     return "\n".join(parts)
 
 
+def _entry_matches_none_terms(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    terms: _SearchTerms,
+) -> bool:
+    if not terms["none"]:
+        return False
+    texts = [entry.text]
+    if entry.title is not None:
+        texts.append(entry.title)
+    texts.extend(chunk.text for chunk in chunks)
+    tokens = {
+        token
+        for text in texts
+        for token in _tokenize_search_text(text)
+    }
+    return any(term in tokens for term in terms["none"])
+
+
+def _search_result_from_scored_embeddings(
+    scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]],
+    query: KnowledgeQuery,
+    *,
+    score_kind: str,
+) -> KnowledgeSearchResult:
+    hits: list[KnowledgeHit] = []
+    remaining = query.max_bytes
+    truncated = False
+    for rank, (score, entry, chunk, reason, preview_text, normalized_score) in enumerate(
+        scored[: query.limit],
+        start=1,
+    ):
+        if remaining <= 0:
+            truncated = True
+            break
+        source_bytes = len(preview_text.encode("utf-8"))
+        preview = _truncate_text_to_bytes(preview_text, remaining)
+        if not preview:
+            truncated = True
+            break
+        if len(preview.encode("utf-8")) < source_bytes:
+            truncated = True
+        remaining -= len(preview.encode("utf-8"))
+        hits.append(
+            KnowledgeHit(
+                entry=entry,
+                chunk=chunk,
+                score=score,
+                score_kind=score_kind,
+                score_normalized=normalized_score,
+                rank=rank,
+                reason=reason,
+                text_preview=preview,
+            )
+        )
+    return KnowledgeSearchResult(
+        query=query,
+        hits=hits,
+        truncated=truncated or len(hits) < len(scored),
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        total_hits_known=len(scored),
+    )
+
+
+def _semantic_query_text(query: KnowledgeQuery) -> str:
+    parts: list[str] = []
+    if query.text is not None:
+        parts.append(query.text)
+    parts.extend(query.any_terms)
+    parts.extend(query.all_terms)
+    parts.extend(query.phrases)
+    return require_nonblank(" ".join(parts), "semantic query text")
+
+
+def _knowledge_chunk_content_hash(chunk: KnowledgeChunk) -> str:
+    if chunk.content_hash is not None:
+        return chunk.content_hash
+    return f"sha256:{sha256(chunk.text.encode('utf-8')).hexdigest()}"
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError("Embedding vectors must have the same dimension.")
+    left_norm = sqrt(sum(value * value for value in left))
+    right_norm = sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    dot_product = sum(
+        left_item * right_item for left_item, right_item in zip(left, right, strict=True)
+    )
+    return dot_product / (left_norm * right_norm)
+
+
+def _normalize_cosine_similarity(value: float) -> float:
+    return max(0.0, min(1.0, (value + 1.0) / 2.0))
+
+
 def _knowledge_query_terms(query: KnowledgeQuery) -> _SearchTerms:
     text_terms = _expand_search_tokens(_tokenize_search_text(query.text or ""))
     return {
@@ -1462,6 +1835,22 @@ def _validate_positive_int(value: int, field_name: str) -> None:
         raise ValueError(f"`{field_name}` must be an integer.")
     if value <= 0:
         raise ValueError(f"`{field_name}` must be greater than 0.")
+
+
+def _validate_nonnegative_float(value: float, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"`{field_name}` must be a number.")
+    value = require_finite(float(value), field_name)
+    if value < 0.0:
+        raise ValueError(f"`{field_name}` must be greater than or equal to 0.")
+    return value
+
+
+def _validate_unit_float(value: float, field_name: str) -> float:
+    value = _validate_nonnegative_float(value, field_name)
+    if value > 1.0:
+        raise ValueError(f"`{field_name}` must be between 0.0 and 1.0.")
+    return value
 
 
 def _validate_nonnegative_int(value: int, field_name: str) -> None:

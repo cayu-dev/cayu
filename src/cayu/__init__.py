@@ -37,6 +37,13 @@ from cayu.core.messages import (
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+    TextEmbeddingUsage,
+)
 from cayu.environments import (
     DEFAULT_WORKSPACE_INSTRUCTION_PATHS,
     DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES,
@@ -293,6 +300,7 @@ from cayu.storage import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeActorType,
     KnowledgeChunk,
@@ -510,6 +518,7 @@ __all__ = [
     "ImageArtifactReader",
     "InMemoryBudgetLedger",
     "InMemoryBudgetStore",
+    "InMemoryEmbeddingKnowledgeStore",
     "InMemoryEventWatcherStore",
     "InMemoryKnowledgeStore",
     "InMemoryTaskStore",
@@ -658,6 +667,11 @@ __all__ = [
     "TaskStatus",
     "TaskStore",
     "TextArtifactReader",
+    "TextEmbedding",
+    "TextEmbeddingProvider",
+    "TextEmbeddingRequest",
+    "TextEmbeddingResult",
+    "TextEmbeddingUsage",
     "TextPart",
     "ThinkingConfig",
     "ThinkingPart",

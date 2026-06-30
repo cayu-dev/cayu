@@ -1240,7 +1240,13 @@ deployments. There is no legacy memory alias in the public surface; use the
 SQLite FTS5/BM25 for durable keyword search. `PostgresKnowledgeStore` uses native
 Postgres full-text search with entry/chunk filters. These stores support `auto`
 and `keyword` query modes and reject semantic, hybrid, and external modes so apps
-do not mistake these local stores for embedding or external retrieval backends.
+do not mistake keyword stores for embedding or external retrieval backends.
+`InMemoryEmbeddingKnowledgeStore` is an opt-in in-memory semantic backend for
+tests, demos, and small single-process apps. It uses a configured
+`TextEmbeddingProvider`, keeps vectors outside chunk metadata, supports
+`semantic` mode with cosine similarity, reports `score_normalized` as `(cosine +
+1) / 2`, compares `semantic_min_score` against that normalized score, and uses a
+bounded keyword boost for `hybrid` and `auto` mode. It does not persist vectors.
 
 - `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
@@ -1280,6 +1286,25 @@ await store.read_chunks(entry_id, chunk_index=3, around=1)
 result = await store.search(query)
 listing = await store.list_entries(list_query)
 ```
+
+Embeddings use a separate provider contract so model providers and vector stores
+do not need to share implementation details:
+
+```python
+embedding_result = await embedding_provider.embed_texts(
+    TextEmbeddingRequest(
+        model="text-embedding-3-small",
+        texts=["GitHub pushes should use the credential proxy."],
+        dimensions=512,
+    )
+)
+```
+
+`OpenAIProvider` implements `TextEmbeddingProvider` with the OpenAI embeddings
+endpoint. The returned `TextEmbeddingResult` contains copied float vectors and
+provider-reported usage when the provider returns it. Embedding calls are normal
+provider API calls: apps should treat their latency, rate limits, retention, and
+billing as provider-specific behavior.
 
 `KnowledgeIndexer` is the deterministic local indexing helper for app-owned text.
 It is not an agent and does not connect to remote memory systems. It converts one
@@ -1365,8 +1390,8 @@ It emits `knowledge.search.started`, `knowledge.search.completed`,
 Search failures are fail-open by default; configure `fail_open=False` when a
 missing knowledge lookup should fail the session before the provider request.
 
-This slice does not add embeddings, graph retrieval, remote source connectors,
-or agent-authored memory. Those layers should build on the same
-`KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` / `KnowledgeIndexer`
-contracts rather than introducing separate memory, skill, or document-store
-APIs.
+This slice does not add durable SQLite/Postgres vector indexes, graph retrieval,
+remote source connectors, or agent-authored memory. Those layers should build on
+the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` /
+`KnowledgeIndexer` / `TextEmbeddingProvider` contracts rather than introducing
+separate memory, skill, or document-store APIs.
