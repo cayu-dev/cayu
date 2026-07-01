@@ -1559,9 +1559,15 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             if keyword_result is not None:
                 scored = self._merge_keyword_hits(scored, keyword_result)
                 byte_truncated = byte_truncated or keyword_result.truncated
+                keyword_total_hits_known = keyword_result.total_hits_known
+                keyword_hits_floor = (
+                    keyword_total_hits_known
+                    if keyword_total_hits_known is not None
+                    else len(keyword_result.hits)
+                )
                 total_hits_known_floor = max(
                     total_hits_known_floor,
-                    keyword_result.total_hits_known,
+                    keyword_hits_floor,
                 )
         score_kind = (
             "postgres_semantic" if query.mode is KnowledgeSearchMode.SEMANTIC else "postgres_hybrid"
@@ -1577,7 +1583,12 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             truncated=byte_truncated or result.truncated or candidate_limit_reached,
             limit=result.limit,
             max_bytes=result.max_bytes,
-            total_hits_known=max(result.total_hits_known, total_hits_known_floor),
+            total_hits_known=max(
+                result.total_hits_known
+                if result.total_hits_known is not None
+                else len(result.hits),
+                total_hits_known_floor,
+            ),
         )
 
     async def _reconcile_embedding_schema(self) -> None:
@@ -1868,7 +1879,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         for hit in keyword_result.hits:
             if hit.entry.id in seen_entry_ids:
                 continue
-            keyword_boost = min(hit.score, 10.0) / 10.0
+            if hit.score is None:
+                continue
+            keyword_boost = min(float(hit.score), 10.0) / 10.0
             score = self.hybrid_keyword_weight * keyword_boost
             if score <= 0:
                 continue
@@ -1878,8 +1891,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     score,
                     hit.entry,
                     hit.chunk,
-                    f"hybrid keyword match; {hit.reason}",
-                    hit.text_preview,
+                    f"hybrid keyword match; {hit.reason or 'keyword match'}",
+                    hit.text_preview or hit.entry.title or hit.entry.id,
                     None,
                 )
             )

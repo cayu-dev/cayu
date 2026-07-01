@@ -105,6 +105,11 @@ class CausalBudgetUsageSummary(BaseModel):
         return result
 
 
+# Providers whose raw usage payload follows the Anthropic shape (cache tokens in
+# separate fields, excluded from input_tokens). Claude on Vertex AI is one of them.
+_ANTHROPIC_SHAPED_PROVIDERS = frozenset({"anthropic", "vertex"})
+
+
 def normalize_usage_metrics(
     *,
     provider_name: str | None,
@@ -154,17 +159,18 @@ def normalize_usage_metrics(
             cache_write_tokens = cache_creation_tokens
 
     provider = provider_name.strip().lower() if type(provider_name) is str else None
+    anthropic_shaped = provider in _ANTHROPIC_SHAPED_PROVIDERS
     if provider == "openai":
         cache_read_tokens = max(cache_read_tokens, cached_input_tokens)
-    elif provider == "anthropic":
+    elif anthropic_shaped:
         cached_input_tokens = max(cached_input_tokens, cache_read_tokens)
         input_tokens = input_tokens + cache_read_tokens + cache_write_tokens
 
-    if total_tokens == 0 or provider == "anthropic":
+    if total_tokens == 0 or anthropic_shaped:
         total_tokens = input_tokens + output_tokens
 
     uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
-    if provider == "anthropic":
+    if anthropic_shaped:
         uncached_input_tokens = _first_nonnegative_int(raw_usage, ("input_tokens",))
 
     return UsageMetrics(

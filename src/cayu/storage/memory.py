@@ -1077,7 +1077,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             normalized_semantic = _normalize_cosine_similarity(semantic_score)
             semantic_matched = normalized_semantic >= self.semantic_min_score
             score = normalized_semantic if semantic_matched else 0.0
-            semantic_reason = "semantic chunk match" if chunk is not None else "semantic entry match"
+            semantic_reason = (
+                "semantic chunk match" if chunk is not None else "semantic entry match"
+            )
             reason = semantic_reason
             preview_text = chunk.text if chunk is not None else entry.text
             score_normalized = normalized_semantic if semantic_matched else None
@@ -1128,11 +1130,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         await self._embed_chunks(self._chunks.get(entry_id, []))
 
     async def _embed_chunks(self, chunks: list[KnowledgeChunk]) -> None:
-        missing = [
-            chunk
-            for chunk in chunks
-            if not self._has_current_embedding(chunk)
-        ]
+        missing = [chunk for chunk in chunks if not self._has_current_embedding(chunk)]
         if not missing:
             return
         result = await self.embedding_provider.embed_texts(
@@ -1581,11 +1579,7 @@ def _entry_matches_none_terms(
     if entry.title is not None:
         texts.append(entry.title)
     texts.extend(chunk.text for chunk in chunks)
-    tokens = {
-        token
-        for text in texts
-        for token in _tokenize_search_text(text)
-    }
+    tokens = {token for text in texts for token in _tokenize_search_text(text)}
     return any(term in tokens for term in terms["none"])
 
 

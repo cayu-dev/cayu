@@ -55,7 +55,9 @@ def _test_embedding_vector(text: str) -> list[float]:
     folded = text.casefold()
     return [
         1.0
-        if any(term in folded for term in ("auth", "broker", "credential", "github", "proxy", "token"))
+        if any(
+            term in folded for term in ("auth", "broker", "credential", "github", "proxy", "token")
+        )
         else 0.0,
         1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
         1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
@@ -455,7 +457,9 @@ def test_in_memory_embedding_knowledge_store_auto_uses_hybrid_search() -> None:
             embedding_provider=provider,
             embedding_model="test-embedding",
         )
-        await store.put_entry(KnowledgeEntry(id="credential_policy", text="Use a credential proxy."))
+        await store.put_entry(
+            KnowledgeEntry(id="credential_policy", text="Use a credential proxy.")
+        )
         await store.put_entry(KnowledgeEntry(id="email_policy", text="SendGrid email guide."))
         result = await store.search(KnowledgeQuery(text="credential"))
         return result
@@ -513,16 +517,10 @@ def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
             embedding_model="test-embedding",
         )
         await store.put_entry(KnowledgeEntry(id="policy", text="GitHub token policy."))
-        first = await store.search(
-            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
-        )
+        first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         await store.put_entry(KnowledgeEntry(id="policy", text="Invoice payment policy."))
-        second = await store.search(
-            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
-        )
-        third = await store.search(
-            KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC)
-        )
+        second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
+        third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
         return first, second, third
 
     first, second, third = asyncio.run(run())
@@ -541,11 +539,13 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
         )
         await store.put_entry_with_chunks(
             KnowledgeEntry(id="policy", text="Policy summary."),
-            [KnowledgeChunk(id="custom-old", entry_id="policy", chunk_index=0, text="GitHub token.")],
+            [
+                KnowledgeChunk(
+                    id="custom-old", entry_id="policy", chunk_index=0, text="GitHub token."
+                )
+            ],
         )
-        first = await store.search(
-            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
-        )
+        first = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
         await store.replace_chunks(
             "policy",
             [
@@ -557,12 +557,8 @@ def test_in_memory_embedding_knowledge_store_drops_replaced_custom_chunk_ids() -
                 )
             ],
         )
-        second = await store.search(
-            KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC)
-        )
-        third = await store.search(
-            KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC)
-        )
+        second = await store.search(KnowledgeQuery(text="auth", mode=KnowledgeSearchMode.SEMANTIC))
+        third = await store.search(KnowledgeQuery(text="refund", mode=KnowledgeSearchMode.SEMANTIC))
         return first, second, third
 
     first, second, third = asyncio.run(run())
@@ -609,7 +605,11 @@ def test_in_memory_embedding_knowledge_store_does_not_embed_none_term_candidates
         )
         await store.replace_chunks(
             "safe",
-            [KnowledgeChunk(id="safe:0", entry_id="safe", chunk_index=0, text="GitHub auth proxy.")],
+            [
+                KnowledgeChunk(
+                    id="safe:0", entry_id="safe", chunk_index=0, text="GitHub auth proxy."
+                )
+            ],
         )
         provider.calls.clear()
         store._chunk_embeddings.clear()

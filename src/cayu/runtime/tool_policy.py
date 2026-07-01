@@ -366,7 +366,9 @@ def metadata_with_taint_labels(
     labels: Iterable[str],
 ) -> dict[str, Any]:
     copied = copy_json_value(dict(metadata), "metadata")
-    copied[TAINT_LABELS_METADATA_KEY] = sorted(_copy_taint_labels(labels, "labels", allow_any=False))
+    copied[TAINT_LABELS_METADATA_KEY] = sorted(
+        _copy_taint_labels(labels, "labels", allow_any=False)
+    )
     return copied
 
 

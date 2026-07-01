@@ -377,6 +377,28 @@ Per-vendor knobs: `auth_header`/`auth_value_prefix` for non-Bearer auth (Azure u
 Ollama/vLLM on `http://localhost`, `endpoint_url` to override the request URL outright, and
 `stream_include_usage=False` for servers that reject `stream_options`.
 
+To run Anthropic Claude models hosted on **Google Cloud Vertex AI** (enterprises mandated to
+GCP), use `VertexProvider` (install the optional `cayu[vertex]` extra). It sends the Anthropic
+Messages body to the regional `:rawPredict` endpoint with an OAuth bearer token, so tool calls
+and tool-strategy structured output work like the direct Anthropic provider:
+
+```python
+from cayu import VertexProvider
+
+provider = VertexProvider(
+    project_id="my-gcp-project",
+    region="global",  # also accepts regional locations such as "us-east5"
+)
+```
+
+Authentication uses `google-auth`: pass explicit `credentials=`, a service account via
+`service_account_info=`/`service_account_file=`, or (the default) Application Default Credentials
+(`gcloud auth application-default login`, a service-account key, or the GCE metadata server). The
+model id rides in the URL, so use Vertex ids such as `claude-sonnet-4-6`. The selected model must
+also be enabled or requested for the GCP project in Vertex Model Garden. For budget enforcement,
+register pricing rows under provider name `"vertex"` (Vertex rates differ from the direct
+Anthropic API).
+
 `CayuApp` registers `LoggingEventSink` by default. It writes concise event
 summaries to `logging.getLogger("cayu")` without configuring global logging
 handlers, process-wide levels, or formatters. Applications control where those
@@ -1167,6 +1189,14 @@ Gemini; point it at Azure/Together/Fireworks/Mistral by changing the provider's 
 ```bash
 export GEMINI_API_KEY=...
 PYTHONPATH=src python examples/chat_completions_local_tools.py
+```
+
+Run the live Vertex AI (Claude on Google Cloud) example with local tools (needs
+`pip install cayu[vertex]` and `gcloud auth application-default login`):
+
+```bash
+export GOOGLE_CLOUD_PROJECT=my-gcp-project
+PYTHONPATH=src python examples/vertex_local_tools.py
 ```
 
 Run the live artifact/file example with image or PDF attachments:

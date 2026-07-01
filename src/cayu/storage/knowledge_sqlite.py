@@ -812,8 +812,7 @@ def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
             "(" + " OR ".join(_sqlite_fts_quote(term) for term in any_terms) + ")"
         )
     positive_parts.extend(
-        "(" + " OR ".join(_sqlite_fts_quote(term) for term in group) + ")"
-        for group in all_groups
+        "(" + " OR ".join(_sqlite_fts_quote(term) for term in group) + ")" for group in all_groups
     )
     if phrases:
         positive_parts.append(

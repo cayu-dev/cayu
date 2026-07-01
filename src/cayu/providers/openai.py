@@ -483,13 +483,21 @@ def openai_embedding_result(
     for position, item in enumerate(data):
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(f"OpenAI embedding item {position} must be an object.")
-        index = item.get("index")
-        vector = item.get("embedding")
+        item_data = cast("Mapping[str, Any]", item)
+        index = item_data.get("index")
+        vector = item_data.get("embedding")
         if type(index) is not int:
             raise OpenAIProtocolError(f"OpenAI embedding item {position} requires index.")
         if not isinstance(vector, list):
             raise OpenAIProtocolError(f"OpenAI embedding item {position} requires vector.")
-        embeddings.append(TextEmbedding(index=index, vector=vector))
+        vector_numbers: list[float] = []
+        for vector_index, vector_item in enumerate(vector):
+            if isinstance(vector_item, bool) or not isinstance(vector_item, int | float):
+                raise OpenAIProtocolError(
+                    f"OpenAI embedding item {position} vector[{vector_index}] must be a number."
+                )
+            vector_numbers.append(float(vector_item))
+        embeddings.append(TextEmbedding(index=index, vector=vector_numbers))
     embeddings.sort(key=lambda embedding: embedding.index)
     if [embedding.index for embedding in embeddings] != list(range(requested_count)):
         raise OpenAIProtocolError("OpenAI embedding response indexes did not match request.")
@@ -507,8 +515,9 @@ def _openai_embedding_usage(value: object) -> TextEmbeddingUsage | None:
         return None
     if not isinstance(value, Mapping):
         raise OpenAIProtocolError("OpenAI embedding usage must be an object.")
-    prompt_tokens = _optional_openai_embedding_token_count(value, "prompt_tokens")
-    total_tokens = _optional_openai_embedding_token_count(value, "total_tokens")
+    usage_data = cast("Mapping[str, Any]", value)
+    prompt_tokens = _optional_openai_embedding_token_count(usage_data, "prompt_tokens")
+    total_tokens = _optional_openai_embedding_token_count(usage_data, "total_tokens")
     return TextEmbeddingUsage(
         input_tokens=prompt_tokens,
         total_tokens=total_tokens,

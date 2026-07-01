@@ -992,11 +992,7 @@ def _is_chat_context_overflow(
         )
     ):
         return True
-    return (
-        status_code in {400, 500, 504}
-        and "context" in normalized
-        and "too large" in normalized
-    )
+    return status_code in {400, 500, 504} and "context" in normalized and "too large" in normalized
 
 
 def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:

@@ -29,7 +29,10 @@ class TextEmbeddingRequest(BaseModel):
     def validate_texts(cls, value: list[str], info) -> list[str]:
         if not value:
             raise ValueError(f"`{info.field_name}` cannot be empty.")
-        return [require_nonblank(text, f"{info.field_name}[{index}]") for index, text in enumerate(value)]
+        return [
+            require_nonblank(text, f"{info.field_name}[{index}]")
+            for index, text in enumerate(value)
+        ]
 
     @field_validator("dimensions")
     @classmethod

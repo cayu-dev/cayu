@@ -111,6 +111,7 @@ from cayu.providers import (
     ModelCompletion,
     ModelFinishReason,
     OpenAIProvider,
+    VertexProvider,
 )
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import (
@@ -597,8 +598,8 @@ __all__ = [
     "PendingToolApproval",
     "PendingToolCallApproval",
     "PostgresEmbeddingBackfillResult",
-    "PostgresEventWatcherStore",
     "PostgresEmbeddingKnowledgeStore",
+    "PostgresEventWatcherStore",
     "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
@@ -700,6 +701,7 @@ __all__ = [
     "UsageTriggeredContextPolicy",
     "Vault",
     "VaultError",
+    "VertexProvider",
     "Workflow",
     "WorkflowSpec",
     "WorkspaceBinding",

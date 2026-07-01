@@ -387,9 +387,7 @@ async def test_anthropic_provider_counts_input_tokens_with_official_endpoint() -
         "provider_billing_status": "documented_free",
         "provider_rate_limit": "separate_rpm_limit",
     }
-    assert transport.count_calls[0]["url"] == (
-        "https://api.anthropic.com/v1/messages/count_tokens"
-    )
+    assert transport.count_calls[0]["url"] == ("https://api.anthropic.com/v1/messages/count_tokens")
     assert transport.count_calls[0]["headers"]["x-api-key"] == "test-key"
     assert transport.count_calls[0]["payload"] == {
         "model": "claude-test",

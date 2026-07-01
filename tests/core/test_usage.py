@@ -1316,6 +1316,32 @@ def test_normalize_anthropic_usage_metrics() -> None:
     assert metrics.cache.uncached_input_tokens == 100
 
 
+def test_normalize_vertex_usage_metrics_matches_anthropic() -> None:
+    # Claude on Vertex returns the Anthropic-shaped usage payload, so the "vertex"
+    # provider must fold cache tokens into input exactly like "anthropic".
+    raw_usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 70,
+        "cache_creation_input_tokens": 0,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 2,
+            "ephemeral_1h_input_tokens": 3,
+        },
+    }
+    metrics = normalize_usage_metrics(
+        provider_name="vertex", model="claude-sonnet-4-6", raw_usage=dict(raw_usage)
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 175
+    assert metrics.total_tokens == 195
+    assert metrics.cache.read_tokens == 70
+    assert metrics.cache.write_tokens == 5
+    assert metrics.cache.cached_input_tokens == 70
+    assert metrics.cache.uncached_input_tokens == 100
+
+
 def test_normalize_anthropic_top_level_cache_write_counter() -> None:
     metrics = normalize_usage_metrics(
         provider_name="anthropic",

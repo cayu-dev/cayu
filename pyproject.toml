@@ -55,6 +55,9 @@ otel = [
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
 ]
+vertex = [
+  "google-auth[requests]>=2,<3",
+]
 server = [
   "fastapi>=0.115",
   "uvicorn>=0.30",
@@ -63,6 +66,7 @@ server = [
 all = [
   "e2b>=2.28,<3",
   "fastapi>=0.115",
+  "google-auth[requests]>=2,<3",
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
   "pillow>=10",

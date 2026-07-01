@@ -51,6 +51,14 @@ from cayu.providers.openai import (
     openai_embedding_result,
     openai_response_events,
 )
+from cayu.providers.vertex import (
+    HttpxVertexTransport,
+    VertexAPIError,
+    VertexError,
+    VertexProtocolError,
+    VertexProvider,
+    VertexTransport,
+)
 
 __all__ = [
     "AnthropicAPIError",
@@ -70,6 +78,7 @@ __all__ = [
     "HttpxAnthropicTransport",
     "HttpxChatCompletionsTransport",
     "HttpxOpenAITransport",
+    "HttpxVertexTransport",
     "InputTokenCountConfidence",
     "InputTokenCountMethod",
     "InputTokenCountResult",
@@ -86,6 +95,11 @@ __all__ = [
     "OpenAIProtocolError",
     "OpenAIProvider",
     "OpenAITransport",
+    "VertexAPIError",
+    "VertexError",
+    "VertexProtocolError",
+    "VertexProvider",
+    "VertexTransport",
     "anthropic_response_events",
     "build_anthropic_payload",
     "build_chat_completions_payload",

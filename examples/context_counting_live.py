@@ -34,10 +34,7 @@ from cayu.providers import (
     OpenAIProvider,
 )
 
-PROMPT = (
-    "Reply with exactly this sentence and no extra text: "
-    "token counting live check"
-)
+PROMPT = "Reply with exactly this sentence and no extra text: token counting live check"
 
 
 async def main() -> None:

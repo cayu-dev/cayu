@@ -13848,8 +13848,11 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
     ]
     assert len(provider.requests) == 2
     assert len(provider.requests[1].messages) == 2
-    assert provider.requests[1].messages[0].content[0].text.startswith(
-        "Previous session context summary:"
+    assert (
+        provider.requests[1]
+        .messages[0]
+        .content[0]
+        .text.startswith("Previous session context summary:")
     )
     assert provider.requests[1].messages[1].content[0].text == "new request"
     assert EventType.SESSION_CHECKPOINTED in [event.type for event in events]
