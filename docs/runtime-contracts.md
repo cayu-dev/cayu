@@ -1261,6 +1261,34 @@ chunks. By default backfill only embeds missing or stale vectors; pass
 `refresh_existing=True` to re-embed chunks whose current vector already matches
 the configured model and dimensions.
 
+Postgres embedding operational contract:
+
+- pgvector must be installed in the target database. `schema_mode=CREATE` or
+  `MIGRATE` runs `CREATE EXTENSION IF NOT EXISTS vector`; otherwise create the
+  extension before starting the store.
+- `embedding_dimensions` is required because pgvector stores the dimension in the
+  column type (`vector(N)`). A store configured with a different dimension than
+  the existing embedding table fails at startup with a dimension mismatch instead
+  of silently mixing vector sizes. Changing dimensions requires rebuilding the
+  derived embedding table before starting a store with the new dimensions.
+- The embedding table is derived data. Rebuilding it is safe when source
+  knowledge remains in `cayu_knowledge_entries` and `cayu_knowledge_chunks`.
+- Existing keyword knowledge is not embedded implicitly at search time. Use
+  bounded `backfill_embeddings(KnowledgeListQuery(...), limit=N)` jobs to index
+  it deliberately. Repeated default backfills advance through missing/stale
+  chunks; use `refresh_existing=True` only when intentionally re-embedding
+  current rows for the configured model and dimensions. Switching to another
+  embedding model with the same dimensions is a bounded re-indexing job; switching
+  dimensions is a schema rebuild.
+- Search embeds the query text, then searches persisted chunk vectors matching
+  the configured model, dimensions, and current chunk content hash. Updating an
+  entry or replacing chunks updates the affected vectors.
+- HNSW is created for `vector(N)` when `N <= 2000`, matching pgvector's HNSW
+  limit for the `vector` type. Larger dimensions are valid for exact pgvector
+  search, but do not get the HNSW index in this store.
+- Embedding calls are provider calls. Apps should account for provider latency,
+  rate limits, retention, and billing when writing entries or running backfill.
+
 - `KnowledgeEntry`: one reusable knowledge record with `namespace`, `labels`,
   extensible `kind`, visibility, status, source refs, audit timestamps,
   importance/confidence hints, aspects, impact targets, and metadata.

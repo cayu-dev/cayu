@@ -183,6 +183,19 @@ pgvector-backed semantic search for Postgres deployments that install the
 Postgres knowledge can be indexed deliberately with bounded
 `backfill_embeddings(..., limit=N)` batches. Pgvector HNSW indexing is created
 for dimensions up to 2000; larger vectors still work with exact pgvector search.
+Use `examples/postgres_knowledge_embedding.py` for the durable Postgres path:
+seed normal Postgres knowledge, create the pgvector-backed store, backfill
+existing chunks in a bounded batch, then run semantic or hybrid search. In
+production, install pgvector once per database with `CREATE EXTENSION vector`
+or run the embedding store with `schema_mode=CREATE` using a role that can create
+extensions. Choose `embedding_dimensions` deliberately and keep it stable for a
+given embedding table. The example auto-selects dimensions only for OpenAI v3
+embedding models; set `CAYU_EMBEDDING_DIMENSIONS` for other OpenAI embedding
+models.
+Changing model with the same dimensions should be treated as a new indexing run
+and handled with bounded `backfill_embeddings(...)` batches. Changing dimensions
+requires rebuilding the derived embedding table, because pgvector stores the
+dimension in the column type.
 
 For Microsandbox execution, use `MicrosandboxWorkspace` so file tools
 read/write/list inside the same sandbox boundary as `exec_command`:
