@@ -52,6 +52,30 @@ def _test_embedding_vector(text: str) -> list[float]:
     ]
 
 
+class WeightedEmbeddingProvider(TextEmbeddingProvider):
+    name = "weighted-test"
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_weighted_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def _weighted_embedding_vector(text: str) -> list[float]:
+    folded = text.casefold()
+    if "sendgrid" in folded:
+        return [0.2, 0.98]
+    if "runbook" in folded:
+        return [0.4, 0.9165]
+    if "remote" in folded or "github" in folded or "auth" in folded:
+        return [1.0, 0.0]
+    return [0.0, 1.0]
+
+
 def test_environment_accepts_and_copies_knowledge_store() -> None:
     store = InMemoryKnowledgeStore()
     environment = Environment(
@@ -187,6 +211,7 @@ def test_search_knowledge_schema_keeps_portable_validation_hints() -> None:
     assert "broad keyword query" in SearchKnowledgeTool.spec.description
     assert "truncated facet value" in SearchKnowledgeTool.spec.description
     assert "semantic or hybrid" in schema["properties"]["mode"]["description"]
+    assert "min_score" not in schema["properties"]
     assert "anyOf" not in schema
     assert "oneOf" not in schema
     assert schema["properties"]["query"]["minLength"] == 1
@@ -200,6 +225,20 @@ def test_search_knowledge_schema_keeps_portable_validation_hints() -> None:
     assert "propertyNames" not in schema["properties"]["labels"]
     assert schema["properties"]["labels"]["additionalProperties"]["pattern"] == "\\S"
     assert "untruncated discovery result" in schema["properties"]["aspects"]["description"]
+
+
+def test_search_knowledge_score_override_is_opt_in() -> None:
+    default_schema = SearchKnowledgeTool.spec.input_schema
+    opt_in_schema = SearchKnowledgeTool(allow_score_override=True).spec.input_schema
+
+    assert "min_score" not in default_schema["properties"]
+    assert opt_in_schema["properties"]["min_score"]["minimum"] == 0.0
+    assert opt_in_schema["properties"]["min_score"]["maximum"] == 1.0
+    assert (
+        "application-owned retrieval policy"
+        in opt_in_schema["properties"]["min_score"]["description"]
+    )
+    assert "min_score" not in SearchKnowledgeTool.spec.input_schema["properties"]
 
 
 def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
@@ -244,6 +283,189 @@ def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
     assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
     assert result.structured["hits"][0]["score_kind"] == "inmemory_semantic"
     assert "chunk_index=0" in result.content
+
+
+def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=WeightedEmbeddingProvider(),
+            embedding_model="test-embedding",
+            semantic_min_score=0.0,
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text=(
+                    "Use a brokered Git HTTP proxy for GitHub pushes from a remote "
+                    "sandbox. Keep credentials outside the sandbox."
+                ),
+            )
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="sendgrid_proxy",
+                namespace="ops",
+                text="For SendGrid, prefer a trusted credential proxy outside the sandbox.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "query": "remote sandbox auth",
+                "namespace": "ops",
+                "limit": 5,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["query"]["mode"] == "auto"
+    assert result.structured["min_score"] == 0.75
+    assert result.structured["filtered_hits"] == 1
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
+    assert result.structured["hits"][0]["score_kind"] == "inmemory_hybrid"
+
+
+def test_search_knowledge_auto_min_score_zero_keeps_weak_semantic_neighbors() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=WeightedEmbeddingProvider(),
+            embedding_model="test-embedding",
+            semantic_min_score=0.0,
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text="GitHub remote sandbox auth should use a credential broker.",
+            )
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="sendgrid_proxy",
+                namespace="ops",
+                text="For SendGrid, prefer a trusted credential proxy outside the sandbox.",
+            )
+        )
+        return await SearchKnowledgeTool(allow_score_override=True).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "query": "remote sandbox auth",
+                "namespace": "ops",
+                "min_score": 0,
+                "limit": 5,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["min_score"] == 0.0
+    assert result.structured["filtered_hits"] == 0
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == [
+        "remote_git_credentials",
+        "sendgrid_proxy",
+    ]
+
+
+def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=WeightedEmbeddingProvider(),
+            embedding_model="test-embedding",
+            semantic_min_score=0.75,
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text="GitHub remote sandbox auth should use a credential broker.",
+            )
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="runbook_keyword_hit",
+                namespace="ops",
+                text="Remote sandbox auth runbook uses a documented fallback procedure.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "query": "remote sandbox auth",
+                "namespace": "ops",
+                "limit": 5,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["min_score"] == 0.75
+    hit_by_id = {hit["entry_id"]: hit for hit in result.structured["hits"]}
+    assert set(hit_by_id) == {"remote_git_credentials", "runbook_keyword_hit"}
+    assert hit_by_id["remote_git_credentials"]["score_normalized"] == 1.0
+    assert hit_by_id["runbook_keyword_hit"]["score_normalized"] is None
+    assert "hybrid keyword match" in hit_by_id["runbook_keyword_hit"]["reason"]
+
+
+def test_search_knowledge_default_rejects_score_override_argument() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=WeightedEmbeddingProvider(),
+            embedding_model="test-embedding",
+            semantic_min_score=0.0,
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text="GitHub remote sandbox auth should use a credential broker.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "query": "remote sandbox auth",
+                "namespace": "ops",
+                "min_score": 0,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "not enabled" in result.content
+
+
+def test_search_knowledge_keyword_store_auto_does_not_apply_min_score() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="github",
+                text="GitHub push needs a credential broker.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"query": "github credential"},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["search_modes"] == ["auto", "keyword"]
+    assert result.structured["min_score"] is None
+    assert result.structured["filtered_hits"] == 0
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == ["github"]
 
 
 def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:

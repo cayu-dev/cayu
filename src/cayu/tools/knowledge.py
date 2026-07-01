@@ -27,6 +27,17 @@ MAX_KNOWLEDGE_TOOL_MAX_BYTES = 128 * 1024
 DEFAULT_SEARCH_KNOWLEDGE_PREVIEW_BYTES = 320
 DEFAULT_LIST_KNOWLEDGE_PREVIEW_BYTES = 240
 MAX_KNOWLEDGE_TOOL_PREVIEW_BYTES = 4 * 1024
+DEFAULT_AUTO_SEMANTIC_MIN_SCORE = 0.75
+_MIN_SCORE_INPUT_SCHEMA = {
+    "type": "number",
+    "minimum": 0.0,
+    "maximum": 1.0,
+    "description": (
+        "Optional normalized relevance threshold for scored semantic hits. "
+        "This is an application-owned retrieval policy override; set 0 to "
+        "inspect all returned hits."
+    ),
+}
 DEFAULT_READ_KNOWLEDGE_MAX_CHUNKS = 5
 MAX_READ_KNOWLEDGE_MAX_CHUNKS = 50
 DEFAULT_READ_KNOWLEDGE_AROUND = 0
@@ -156,11 +167,11 @@ class SearchKnowledgeTool(Tool):
                     "type": "string",
                     "enum": [mode.value for mode in KnowledgeSearchMode],
                     "description": (
-                        "Search mode. Use auto by default. Use semantic or hybrid "
-                        "only when app instructions or prior tool results indicate "
-                        "the active knowledge store supports semantic search, "
-                        "especially for conceptual recall where exact keywords or "
-                        "facets may miss relevant knowledge."
+                        "Search mode. Use auto by default. If the active store "
+                        "supports semantic search, auto may use embedding-backed hybrid "
+                        "recall. Use semantic or hybrid, or keyword, only when app "
+                        "instructions or prior tool results indicate the active store "
+                        "supports that mode or a specific mode is required."
                     ),
                 },
                 "limit": {
@@ -188,11 +199,34 @@ class SearchKnowledgeTool(Tool):
         },
     )
 
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        allow_score_override: bool = False,
+        auto_min_score: float | None = DEFAULT_AUTO_SEMANTIC_MIN_SCORE,
+    ) -> None:
+        super().__init__(spec=spec)
+        self._allow_score_override = allow_score_override
+        self._auto_min_score = _validate_optional_unit_float(
+            auto_min_score,
+            "auto_min_score",
+        )
+        if allow_score_override:
+            schema = self.spec.input_schema
+            schema.setdefault("properties", {})["min_score"] = dict(_MIN_SCORE_INPUT_SCHEMA)
+            self.spec = self.spec.model_copy(update={"input_schema": schema})
+            self._validate_spec()
+
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(ctx)
         if store is None:
             return _missing_knowledge_store_result()
         try:
+            if "min_score" in args and not self._allow_score_override:
+                raise ValueError(
+                    "Tool argument `min_score` is not enabled for this search_knowledge tool."
+                )
             query = KnowledgeQuery(
                 text=_optional_nonblank_string(args, "query"),
                 any_terms=_optional_string_list(args, "any") or [],
@@ -228,15 +262,26 @@ class SearchKnowledgeTool(Tool):
                 default=DEFAULT_SEARCH_KNOWLEDGE_PREVIEW_BYTES,
                 maximum=MAX_KNOWLEDGE_TOOL_PREVIEW_BYTES,
             )
+            min_score = (
+                _optional_unit_float(args, "min_score") if self._allow_score_override else None
+            )
         except (ValidationError, ValueError) as exc:
             return _invalid_knowledge_arguments_result(exc)
         result = await store.search(query)
-        hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in result.hits]
         search_modes = _knowledge_search_modes_payload(store)
+        effective_min_score = _effective_search_min_score(
+            query=query,
+            search_modes=search_modes,
+            min_score=min_score,
+            auto_min_score=self._auto_min_score,
+        )
+        filtered_hits = _filter_search_hits(result.hits, min_score=effective_min_score)
+        hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in filtered_hits]
+        filtered_count = len(result.hits) - len(filtered_hits)
         content = (
             "No knowledge results found."
             if not hits
-            else _format_search_hits(result.hits, preview_bytes=preview_bytes)
+            else _format_search_hits(filtered_hits, preview_bytes=preview_bytes)
         )
         return ToolResult(
             content=content,
@@ -249,6 +294,8 @@ class SearchKnowledgeTool(Tool):
                 "preview_bytes": preview_bytes,
                 "total_hits_known": result.total_hits_known,
                 "search_modes": search_modes,
+                "min_score": effective_min_score,
+                "filtered_hits": filtered_count,
             },
         )
 
@@ -728,6 +775,24 @@ def _optional_positive_int(
     return value
 
 
+def _optional_unit_float(args: dict, key: str) -> float | None:
+    value = args.get(key)
+    if value is None:
+        return None
+    return _validate_optional_unit_float(value, key)
+
+
+def _validate_optional_unit_float(value: float | None, key: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"`{key}` must be a number.")
+    value = float(value)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"`{key}` must be between 0.0 and 1.0.")
+    return value
+
+
 def _optional_nonnegative_int(
     args: dict,
     key: str,
@@ -830,6 +895,38 @@ def _knowledge_search_modes_payload(store: Any) -> list[str]:
     else:
         modes = (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
     return [KnowledgeSearchMode(mode).value for mode in modes]
+
+
+def _effective_search_min_score(
+    *,
+    query: KnowledgeQuery,
+    search_modes: list[str],
+    min_score: float | None,
+    auto_min_score: float | None,
+) -> float | None:
+    if min_score is not None:
+        return min_score
+    if auto_min_score is None:
+        return None
+    if query.mode is not KnowledgeSearchMode.AUTO:
+        return None
+    if (
+        KnowledgeSearchMode.SEMANTIC.value not in search_modes
+        and KnowledgeSearchMode.HYBRID.value not in search_modes
+    ):
+        return None
+    return auto_min_score
+
+
+def _filter_search_hits(hits: list[KnowledgeHit], *, min_score: float | None) -> list[KnowledgeHit]:
+    if min_score is None or min_score <= 0:
+        return list(hits)
+    semantic_scored_hits = [hit for hit in hits if hit.score_normalized is not None]
+    if not semantic_scored_hits:
+        return list(hits)
+    return [
+        hit for hit in hits if hit.score_normalized is None or hit.score_normalized >= min_score
+    ]
 
 
 def _knowledge_chunk_payload(chunk: KnowledgeChunk) -> dict[str, Any]:
