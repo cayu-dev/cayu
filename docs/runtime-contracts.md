@@ -1322,6 +1322,11 @@ The store contract is intentionally entry/chunk oriented:
 await store.put_entry(entry)
 await store.get_entry(entry_id)
 await store.update_entry_status(entry_id, KnowledgeStatus.ARCHIVED)
+await store.transition_entry_status(
+    entry_id,
+    from_status=KnowledgeStatus.PENDING,
+    to_status=KnowledgeStatus.ACTIVE,
+)
 await store.delete_entry(entry_id, hard=False)
 await store.replace_chunks(entry_id, chunks)
 await store.put_entry_with_chunks(entry, chunks)
@@ -1426,9 +1431,18 @@ runtime. Model-facing inputs are deliberately limited to `text`, optional
 status, visibility, impact targets, importance, and confidence are app-owned for
 this tool. The default policy stores model-authored entries as `pending`; normal
 search/list queries exclude pending entries, while reviewer/app code can query
-pending entries through the store API. Active writes require
-`allow_active_writes=True`. The accepted text size is configured when the app
-registers the tool and is not exposed as a model-controlled argument. If
+pending entries through the store API. `KnowledgeReviewWorkflow` is the built-in
+app-side helper for this path: it lists pending entries inside a configured
+namespace/label scope, approves pending entries by moving them to `active`, and
+rejects pending entries by moving them to `archived`. It is not a model-facing
+tool. The packaged server/dashboard uses the same workflow when `CayuApp` is
+constructed with `knowledge_store=...`; `knowledge_review_namespace` and
+`knowledge_review_labels` limit which pending entries the dashboard can list or
+approve/reject. The server exposes `GET /api/knowledge/pending` plus
+`POST /api/knowledge/{entry_id}/approve` and `/reject` for that dashboard flow.
+Active writes require `allow_active_writes=True`. The accepted text size is
+configured when the app registers the tool and is not exposed as a
+model-controlled argument. If
 persistence fails after the tool has generated an entry id but the complete
 durable entry and chunks match the intended write, including an embedding hook
 failure in an embedding-backed store, the tool preserves the knowledge and

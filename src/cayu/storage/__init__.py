@@ -10,6 +10,7 @@ from cayu.storage.knowledge_indexer import (
     KnowledgeIndexRequest,
     KnowledgeIndexResult,
 )
+from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
 from cayu.storage.memory import (
     BUILTIN_KNOWLEDGE_KINDS,
@@ -61,6 +62,7 @@ __all__ = [
     "KnowledgeListQuery",
     "KnowledgeListResult",
     "KnowledgeQuery",
+    "KnowledgeReviewWorkflow",
     "KnowledgeSearchMode",
     "KnowledgeSearchResult",
     "KnowledgeStatus",

@@ -67,6 +67,7 @@ _KNOWLEDGE_STORE_METHODS = (
     "put_entry",
     "get_entry",
     "update_entry_status",
+    "transition_entry_status",
     "delete_entry",
     "replace_chunks",
     "put_entry_with_chunks",

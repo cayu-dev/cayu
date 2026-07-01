@@ -261,6 +261,7 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
     usage_metrics_payload,
 )
+from cayu.storage.memory import KnowledgeStore
 from cayu.vaults import (
     ResolvedSecret,
     SecretRedactor,
@@ -386,6 +387,9 @@ class CayuApp:
         *,
         session_store: SessionStore | None = None,
         task_store: TaskStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_review_namespace: str | None = None,
+        knowledge_review_labels: dict[str, str] | None = None,
         dispatcher: Dispatcher | None = None,
         budget_policy: BudgetPolicy | None = None,
         budget_store: BudgetStore | None = None,
@@ -407,6 +411,8 @@ class CayuApp:
             raise TypeError("session_store must be a SessionStore.")
         if task_store is not None and not isinstance(task_store, TaskStore):
             raise TypeError("task_store must be a TaskStore.")
+        if knowledge_store is not None and not isinstance(knowledge_store, KnowledgeStore):
+            raise TypeError("knowledge_store must be a KnowledgeStore.")
         if dispatcher is not None and not isinstance(dispatcher, Dispatcher):
             raise TypeError("dispatcher must be a Dispatcher.")
         if budget_store is not None and not isinstance(budget_store, BudgetStore):
@@ -459,6 +465,16 @@ class CayuApp:
         )
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
+        self.knowledge_store = knowledge_store
+        self.knowledge_review_namespace = (
+            require_clean_nonblank(knowledge_review_namespace, "knowledge_review_namespace")
+            if knowledge_review_namespace is not None
+            else None
+        )
+        self.knowledge_review_labels = copy_label_map(
+            knowledge_review_labels or {},
+            "knowledge_review_labels",
+        )
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
         self.budget_policy = copy_budget_policy(budget_policy)
         self.budget_store = (

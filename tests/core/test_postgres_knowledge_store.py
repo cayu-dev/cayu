@@ -871,6 +871,53 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
     postgres_dsn: str,
 ) -> None:
     async def ops(store):
+        await store.put_entry(
+            KnowledgeEntry(
+                id="pending_runbook",
+                text="deployment rollback procedure",
+                namespace="project:cayu",
+                labels={"project": "cayu"},
+                status=KnowledgeStatus.PENDING,
+            )
+        )
+        active = await store.transition_entry_status(
+            "pending_runbook",
+            from_status=KnowledgeStatus.PENDING,
+            to_status=KnowledgeStatus.ACTIVE,
+            expected_namespace="project:cayu",
+            expected_labels={"project": "cayu"},
+        )
+        with pytest.raises(ValueError, match="not 'pending'"):
+            await store.transition_entry_status(
+                "pending_runbook",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ARCHIVED,
+                expected_namespace="project:cayu",
+                expected_labels={"project": "cayu"},
+            )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="pending_other",
+                text="other project procedure",
+                namespace="project:other",
+                labels={"project": "other"},
+                status=KnowledgeStatus.PENDING,
+            )
+        )
+        with pytest.raises(ValueError, match="expected namespace"):
+            await store.transition_entry_status(
+                "pending_other",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ACTIVE,
+                expected_namespace="project:cayu",
+            )
+        with pytest.raises(ValueError, match="expected labels"):
+            await store.transition_entry_status(
+                "pending_other",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ACTIVE,
+                expected_labels={"project": "cayu"},
+            )
         await store.put_entry(KnowledgeEntry(id="runbook", text="deployment rollback procedure"))
         archived = await store.update_entry_status("runbook", KnowledgeStatus.ARCHIVED)
         archived_search = await store.search(
@@ -884,6 +931,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         missing = await store.get_entry("runbook")
         missing_delete = await store.delete_entry("runbook", hard=True)
         return (
+            active,
             archived,
             archived_search,
             soft_deleted,
@@ -894,6 +942,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         )
 
     (
+        active,
         archived,
         archived_search,
         soft_deleted,
@@ -903,6 +952,7 @@ def test_postgres_knowledge_store_updates_status_and_deletes_entries(
         missing_delete,
     ) = _run(postgres_dsn, ops)
 
+    assert active.status is KnowledgeStatus.ACTIVE
     assert archived.status is KnowledgeStatus.ARCHIVED
     assert [hit.entry.id for hit in archived_search.hits] == ["runbook"]
     assert soft_deleted is not None

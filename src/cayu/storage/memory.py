@@ -695,6 +695,18 @@ class KnowledgeStore(ABC):
         """Update one entry status and return the updated entry."""
 
     @abstractmethod
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        """Conditionally update one entry status and return the updated entry."""
+
+    @abstractmethod
     async def delete_entry(
         self,
         entry_id: str,
@@ -782,6 +794,46 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if entry is None:
             raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
         updated = entry.model_copy(update={"status": status, "updated_at": _next_updated_at(entry)})
+        updated = copy_knowledge_entry(updated)
+        self._entries[clean_id] = updated
+        return copy_knowledge_entry(updated)
+
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        if not isinstance(from_status, KnowledgeStatus):
+            raise ValueError("from_status must be a KnowledgeStatus.")
+        if not isinstance(to_status, KnowledgeStatus):
+            raise ValueError("to_status must be a KnowledgeStatus.")
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        entry = self._entries.get(clean_id)
+        if entry is None:
+            raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+        if entry.status is not from_status:
+            raise ValueError(
+                f"Knowledge entry {clean_id!r} is {entry.status.value!r}, "
+                f"not {from_status.value!r}."
+            )
+        if expected_namespace is not None and entry.namespace != expected_namespace:
+            raise ValueError(f"Knowledge entry {clean_id!r} does not match expected namespace.")
+        for key, value in expected_labels.items():
+            if entry.labels.get(key) != value:
+                raise ValueError(f"Knowledge entry {clean_id!r} does not match expected labels.")
+        updated = entry.model_copy(
+            update={"status": to_status, "updated_at": _next_updated_at(entry)}
+        )
         updated = copy_knowledge_entry(updated)
         self._entries[clean_id] = updated
         return copy_knowledge_entry(updated)

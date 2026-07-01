@@ -15,7 +15,10 @@ from fastapi.testclient import TestClient
 from cayu import (
     AgentSpec,
     CayuApp,
+    InMemoryKnowledgeStore,
     InMemoryTaskStore,
+    KnowledgeEntry,
+    KnowledgeStatus,
     Message,
     MessageRole,
     TaskCreate,
@@ -84,6 +87,109 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["status"] == "completed"
     assert tasks[0]["worker_id"] is None
     assert tasks[0]["lease_expires_at"] is None
+
+
+def test_server_exposes_pending_knowledge_review_endpoints() -> None:
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="pending_git",
+                text="Remote sandbox Git pushes should use a brokered credential proxy.",
+                namespace="project:cayu",
+                labels={"project": "cayu", "tenant": "trusted"},
+                kind="procedure",
+                status=KnowledgeStatus.PENDING,
+                aspects=["git", "credentials"],
+                title="Remote sandbox Git credentials",
+            ),
+            KnowledgeEntry(
+                id="active_git",
+                text="Active knowledge should not appear in pending review.",
+                namespace="project:cayu",
+                labels={"project": "cayu", "tenant": "trusted"},
+                status=KnowledgeStatus.ACTIVE,
+            ),
+        ]
+    )
+    app = CayuApp(
+        knowledge_store=store,
+        knowledge_review_namespace="project:cayu",
+        knowledge_review_labels={"project": "cayu", "tenant": "trusted"},
+    )
+    client = TestClient(create_server(app))
+
+    pending = client.get("/api/knowledge/pending")
+    assert pending.status_code == 200
+    body = pending.json()
+    assert [entry["entry_id"] for entry in body["entries"]] == ["pending_git"]
+    assert body["entries"][0]["title"] == "Remote sandbox Git credentials"
+    assert body["entries"][0]["text_preview"] == "Remote sandbox Git credentials"
+    assert body["total_entries_known"] == 1
+
+    approved = client.post("/api/knowledge/pending_git/approve")
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "active"
+
+    empty = client.get("/api/knowledge/pending")
+    assert empty.status_code == 200
+    assert empty.json()["entries"] == []
+
+    conflict = client.post("/api/knowledge/pending_git/reject")
+    assert conflict.status_code == 409
+    assert "not 'pending'" in conflict.json()["detail"]
+
+
+def test_server_rejects_pending_knowledge_with_archived_status() -> None:
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="pending_bad",
+                text="Do not retain this model-authored knowledge.",
+                namespace="project:cayu",
+                status=KnowledgeStatus.PENDING,
+            )
+        ]
+    )
+    client = TestClient(create_server(CayuApp(knowledge_store=store)))
+
+    rejected = client.post("/api/knowledge/pending_bad/reject")
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "archived"
+
+    pending = client.get("/api/knowledge/pending")
+    assert pending.status_code == 200
+    assert pending.json()["entries"] == []
+
+
+def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> None:
+    missing_store = TestClient(create_server(CayuApp()))
+    assert missing_store.get("/api/knowledge/pending").status_code == 404
+
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="pending_other",
+                text="Other project knowledge.",
+                namespace="project:other",
+                labels={"project": "other"},
+                status=KnowledgeStatus.PENDING,
+            )
+        ]
+    )
+    app = CayuApp(
+        knowledge_store=store,
+        knowledge_review_namespace="project:cayu",
+        knowledge_review_labels={"project": "cayu"},
+    )
+    client = TestClient(create_server(app))
+
+    scoped_list = client.get("/api/knowledge/pending")
+    assert scoped_list.status_code == 200
+    assert scoped_list.json()["entries"] == []
+
+    scoped_approve = client.post("/api/knowledge/pending_other/approve")
+    assert scoped_approve.status_code == 403
+    assert "outside review namespace" in scoped_approve.json()["detail"]
 
 
 def test_run_threads_inbound_traceparent_into_session_metadata() -> None:

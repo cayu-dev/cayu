@@ -5,7 +5,7 @@ Usage::
     from cayu import CayuApp
     from cayu.server import create_server
 
-    app = CayuApp(session_store=..., task_store=...)
+    app = CayuApp(session_store=..., task_store=..., knowledge_store=...)
     app.register_agent(...)
 
     server = create_server(app)
@@ -64,11 +64,15 @@ def create_server(
 
     session_store = app.session_store
     task_store = app.task_store
+    knowledge_store = app.knowledge_store
 
     router = create_router(
         cayu_app=app,
         session_store=session_store,
         task_store=task_store,
+        knowledge_store=knowledge_store,
+        knowledge_review_namespace=app.knowledge_review_namespace,
+        knowledge_review_labels=app.knowledge_review_labels,
     )
     server.include_router(router)
 

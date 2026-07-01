@@ -58,10 +58,17 @@ from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
 from cayu.server.sse import event_to_sse_data
+from cayu.storage import (
+    KnowledgeEntry,
+    KnowledgeListItem,
+    KnowledgeReviewWorkflow,
+    KnowledgeVisibility,
+)
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
+_KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
 _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
@@ -440,11 +447,96 @@ def _serialize_task_detail(task: Task) -> dict[str, Any]:
     }
 
 
+def _serialize_knowledge_entry_base(entry: KnowledgeEntry) -> dict[str, Any]:
+    return {
+        "entry_id": entry.id,
+        "namespace": entry.namespace,
+        "kind": entry.kind,
+        "visibility": entry.visibility.value,
+        "status": entry.status.value,
+        "title": entry.title,
+        "labels": dict(entry.labels),
+        "aspects": list(entry.aspects),
+        "impact_targets": list(entry.impact_targets),
+        "source_type": entry.source_type,
+        "source_uri": entry.source_uri,
+        "source_id": entry.source_id,
+        "created_by_type": entry.created_by_type.value,
+        "created_by": entry.created_by,
+        "created_at": entry.created_at.isoformat(),
+        "updated_at": entry.updated_at.isoformat(),
+        "importance": entry.importance,
+        "importance_source": entry.importance_source,
+        "confidence": entry.confidence,
+    }
+
+
+def _serialize_knowledge_list_item(item: KnowledgeListItem) -> dict[str, Any]:
+    return {
+        **_serialize_knowledge_entry_base(item.entry),
+        "chunk_count": item.chunk_count,
+        "text_preview": item.text_preview,
+    }
+
+
+def _serialize_reviewed_knowledge_entry(entry: KnowledgeEntry) -> dict[str, Any]:
+    return {
+        **_serialize_knowledge_entry_base(entry),
+        "text_preview": _knowledge_text_preview(entry.text),
+    }
+
+
+def _knowledge_text_preview(text: str) -> str:
+    if len(text) <= _KNOWLEDGE_REVIEW_PREVIEW_CHARS:
+        return text
+    return f"{text[:_KNOWLEDGE_REVIEW_PREVIEW_CHARS]}..."
+
+
+def _parse_knowledge_label_filters(values: list[str] | None) -> dict[str, str]:
+    if values is None:
+        return {}
+    labels: dict[str, str] = {}
+    for raw in values:
+        if type(raw) is not str or "=" not in raw:
+            raise HTTPException(
+                status_code=422,
+                detail="Knowledge label filters must use `key=value`.",
+            )
+        key, value = raw.split("=", 1)
+        try:
+            parsed = copy_label_map({key: value}, "label")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        parsed_key, parsed_value = next(iter(parsed.items()))
+        if parsed_key in labels:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Duplicate knowledge label filter: {parsed_key}",
+            )
+        labels[parsed_key] = parsed_value
+    return labels
+
+
+def _parse_knowledge_string_filters(values: list[str] | None, field_name: str) -> list[str]:
+    if values is None:
+        return []
+    result: list[str] = []
+    for value in values:
+        try:
+            result.append(require_clean_nonblank(value, field_name))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return list(dict.fromkeys(result))
+
+
 def create_router(
     *,
     cayu_app,
     session_store,
     task_store,
+    knowledge_store=None,
+    knowledge_review_namespace: str | None = None,
+    knowledge_review_labels: dict[str, str] | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints."""
 
@@ -1264,6 +1356,72 @@ def create_router(
     async def resume_task(task_id: NonBlankString):
         store = await _require_task_store()
         return await _apply_task_action(store.resume_task, task_id)
+
+    def _knowledge_review_workflow() -> KnowledgeReviewWorkflow:
+        if knowledge_store is None:
+            raise HTTPException(status_code=404, detail="Knowledge store is not configured.")
+        return KnowledgeReviewWorkflow(
+            knowledge_store,
+            namespace=knowledge_review_namespace,
+            labels=knowledge_review_labels,
+            default_limit=50,
+        )
+
+    async def _apply_knowledge_review_action(action, entry_id: str):
+        try:
+            entry = await action(entry_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _serialize_reviewed_knowledge_entry(entry)
+
+    @router.get("/knowledge/pending")
+    async def list_pending_knowledge(
+        namespace: str | None = None,
+        label: Annotated[list[str] | None, Query()] = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+        aspect: Annotated[list[str] | None, Query()] = None,
+        visibility: Annotated[list[KnowledgeVisibility] | None, Query()] = None,
+        source_type: str | None = None,
+        source_id: str | None = None,
+        limit: int = 50,
+        max_bytes: int = 20_000,
+    ):
+        workflow = _knowledge_review_workflow()
+        try:
+            result = await workflow.list_pending(
+                namespace=_clean_optional_query_value(namespace, "namespace"),
+                labels=_parse_knowledge_label_filters(label),
+                kinds=_parse_knowledge_string_filters(kind, "kind") if kind is not None else None,
+                visibilities=visibility,
+                aspects=_parse_knowledge_string_filters(aspect, "aspect"),
+                source_type=_clean_optional_query_value(source_type, "source_type"),
+                source_id=_clean_optional_query_value(source_id, "source_id"),
+                limit=limit,
+                max_bytes=max_bytes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "entries": [_serialize_knowledge_list_item(item) for item in result.entries],
+            "truncated": result.truncated,
+            "limit": result.limit,
+            "max_bytes": result.max_bytes,
+            "total_entries_known": result.total_entries_known,
+        }
+
+    @router.post("/knowledge/{entry_id}/approve")
+    async def approve_knowledge(entry_id: NonBlankString):
+        workflow = _knowledge_review_workflow()
+        return await _apply_knowledge_review_action(workflow.approve, entry_id)
+
+    @router.post("/knowledge/{entry_id}/reject")
+    async def reject_knowledge(entry_id: NonBlankString):
+        workflow = _knowledge_review_workflow()
+        return await _apply_knowledge_review_action(workflow.reject, entry_id)
 
     @router.get("/health")
     async def health():

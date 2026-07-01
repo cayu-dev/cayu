@@ -814,6 +814,88 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
         return loaded
 
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        if not isinstance(from_status, KnowledgeStatus):
+            raise ValueError("from_status must be a KnowledgeStatus.")
+        if not isinstance(to_status, KnowledgeStatus):
+            raise ValueError("to_status must be a KnowledgeStatus.")
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    scope_clauses: list[str] = []
+                    scope_params: list[object] = []
+                    if expected_namespace is not None:
+                        scope_clauses.append("e.namespace = %s")
+                        scope_params.append(expected_namespace)
+                    for key, value in expected_labels.items():
+                        scope_clauses.append(
+                            """
+                            EXISTS (
+                                SELECT 1
+                                FROM cayu_knowledge_labels AS label
+                                WHERE label.entry_id = e.id
+                                  AND label.key = %s
+                                  AND label.value = %s
+                            )
+                            """
+                        )
+                        scope_params.extend([key, value])
+                    scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
+                    update_sql = cast(
+                        "LiteralString",
+                        f"""
+                        UPDATE cayu_knowledge_entries AS e
+                        SET status = %s, updated_at = GREATEST(NOW(), created_at, updated_at)
+                        WHERE e.id = %s AND e.status = %s
+                        {scope_sql}
+                        """,
+                    )
+                    await cur.execute(
+                        update_sql,
+                        (str(to_status), entry_id, str(from_status), *scope_params),
+                    )
+                    if cur.rowcount != 1:
+                        entry = await self._load_entry(cur, entry_id)
+                        if entry is None:
+                            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+                        if expected_namespace is not None and entry.namespace != expected_namespace:
+                            raise ValueError(
+                                f"Knowledge entry {entry_id!r} does not match expected namespace."
+                            )
+                        for key, value in expected_labels.items():
+                            if entry.labels.get(key) != value:
+                                raise ValueError(
+                                    f"Knowledge entry {entry_id!r} does not match expected labels."
+                                )
+                        raise ValueError(
+                            f"Knowledge entry {entry_id!r} is {entry.status.value!r}, "
+                            f"not {from_status.value!r}."
+                        )
+                    loaded = await self._load_entry(cur, entry_id)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        if loaded is None:
+            raise KeyError(f"Knowledge entry {entry_id!r} does not exist.")
+        return loaded
+
     async def delete_entry(
         self,
         entry_id: str,

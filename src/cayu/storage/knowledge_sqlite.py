@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import copy_label_map, require_clean_nonblank, require_nonblank
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.memory import (
@@ -113,6 +113,88 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         sqlite_support.format_datetime(updated_at),
                         clean_id,
                     ),
+                )
+            loaded = self._load_entry_unlocked(clean_id)
+            if loaded is None:
+                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+            return loaded
+
+    async def transition_entry_status(
+        self,
+        entry_id: str,
+        *,
+        from_status: KnowledgeStatus,
+        to_status: KnowledgeStatus,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeEntry:
+        clean_id = require_clean_nonblank(entry_id, "entry_id")
+        if not isinstance(from_status, KnowledgeStatus):
+            raise ValueError("from_status must be a KnowledgeStatus.")
+        if not isinstance(to_status, KnowledgeStatus):
+            raise ValueError("to_status must be a KnowledgeStatus.")
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        async with self._lock:
+            entry = self._load_entry_unlocked(clean_id)
+            if entry is None:
+                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+            updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
+            scope_clauses: list[str] = []
+            scope_params: list[object] = []
+            if expected_namespace is not None:
+                scope_clauses.append("namespace = ?")
+                scope_params.append(expected_namespace)
+            for key, value in expected_labels.items():
+                scope_clauses.append(
+                    """
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_labels AS label
+                        WHERE label.entry_id = cayu_knowledge_entries.id
+                          AND label.key = ?
+                          AND label.value = ?
+                    )
+                    """
+                )
+                scope_params.extend([key, value])
+            scope_sql = "".join(f" AND {clause}" for clause in scope_clauses)
+            with self._connection:
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE cayu_knowledge_entries
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    {scope_sql}
+                    """,
+                    (
+                        str(to_status),
+                        sqlite_support.format_datetime(updated_at),
+                        clean_id,
+                        str(from_status),
+                        *scope_params,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                current = self._load_entry_unlocked(clean_id)
+                if current is None:
+                    raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
+                if expected_namespace is not None and current.namespace != expected_namespace:
+                    raise ValueError(
+                        f"Knowledge entry {clean_id!r} does not match expected namespace."
+                    )
+                for key, value in expected_labels.items():
+                    if current.labels.get(key) != value:
+                        raise ValueError(
+                            f"Knowledge entry {clean_id!r} does not match expected labels."
+                        )
+                raise ValueError(
+                    f"Knowledge entry {clean_id!r} is {current.status.value!r}, "
+                    f"not {from_status.value!r}."
                 )
             loaded = self._load_entry_unlocked(clean_id)
             if loaded is None:

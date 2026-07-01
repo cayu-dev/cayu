@@ -1,10 +1,11 @@
 import { Link, Outlet, useRouterState } from "@tanstack/react-router"
-import { LayoutDashboard, List, Play } from "lucide-react"
+import { BookOpenCheck, LayoutDashboard, List, Play } from "lucide-react"
 import { cn } from "./lib/utils"
 
 const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/sessions", label: "Sessions", icon: List },
+  { to: "/knowledge", label: "Knowledge", icon: BookOpenCheck },
   { to: "/run", label: "New Run", icon: Play },
 ] as const
 

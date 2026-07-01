@@ -36,6 +36,38 @@ export type Task = {
   completed_at: string | null
 }
 
+export type KnowledgeEntry = {
+  entry_id: string
+  namespace: string
+  kind: string
+  visibility: string
+  status: string
+  title: string | null
+  labels: Record<string, string>
+  aspects: string[]
+  impact_targets: string[]
+  source_type: string | null
+  source_uri: string | null
+  source_id: string | null
+  created_by_type: string
+  created_by: string
+  created_at: string
+  updated_at: string
+  importance: number | null
+  importance_source: string | null
+  confidence: number | null
+  chunk_count?: number
+  text_preview: string | null
+}
+
+export type KnowledgePendingPage = {
+  entries: KnowledgeEntry[]
+  truncated: boolean
+  limit: number
+  max_bytes: number
+  total_entries_known: number | null
+}
+
 export type SSEEvent = {
   id: string
   type: string
@@ -48,6 +80,14 @@ export type SSEEvent = {
 
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(await responseErrorMessage(res))
+  }
+  return res.json() as Promise<T>
+}
+
+async function postJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { method: "POST" })
   if (!res.ok) {
     throw new Error(await responseErrorMessage(res))
   }
@@ -77,6 +117,18 @@ export async function fetchSession(id: string): Promise<SessionDetail> {
 
 export async function fetchTasks(): Promise<Task[]> {
   return fetchJson<Task[]>("/api/tasks")
+}
+
+export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
+  return fetchJson<KnowledgePendingPage>("/api/knowledge/pending")
+}
+
+export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry> {
+  return postJson<KnowledgeEntry>(`/api/knowledge/${encodeURIComponent(entryId)}/approve`)
+}
+
+export async function rejectKnowledge(entryId: string): Promise<KnowledgeEntry> {
+  return postJson<KnowledgeEntry>(`/api/knowledge/${encodeURIComponent(entryId)}/reject`)
 }
 
 export async function streamRun(

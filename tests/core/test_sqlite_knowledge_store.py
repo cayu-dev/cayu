@@ -147,6 +147,65 @@ def test_sqlite_knowledge_store_defaults_hide_inactive_and_expired(tmp_path) -> 
     assert [hit.entry.id for hit in expired.hits] == ["expired", "active"]
 
 
+def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(
+            KnowledgeEntry(
+                id="pending",
+                text="Remote sandbox Git pushes should use a brokered credential proxy.",
+                namespace="project:cayu",
+                labels={"project": "cayu"},
+                status=KnowledgeStatus.PENDING,
+            )
+        )
+        active = await store.transition_entry_status(
+            "pending",
+            from_status=KnowledgeStatus.PENDING,
+            to_status=KnowledgeStatus.ACTIVE,
+            expected_namespace="project:cayu",
+            expected_labels={"project": "cayu"},
+        )
+        with pytest.raises(ValueError, match="not 'pending'"):
+            await store.transition_entry_status(
+                "pending",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ARCHIVED,
+                expected_namespace="project:cayu",
+                expected_labels={"project": "cayu"},
+            )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="pending_other",
+                text="Other project knowledge.",
+                namespace="project:other",
+                labels={"project": "other"},
+                status=KnowledgeStatus.PENDING,
+            )
+        )
+        with pytest.raises(ValueError, match="expected namespace"):
+            await store.transition_entry_status(
+                "pending_other",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ACTIVE,
+                expected_namespace="project:cayu",
+            )
+        with pytest.raises(ValueError, match="expected labels"):
+            await store.transition_entry_status(
+                "pending_other",
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ACTIVE,
+                expected_labels={"project": "cayu"},
+            )
+        await _close(store)
+        return active
+
+    active = asyncio.run(run())
+
+    assert active.status is KnowledgeStatus.ACTIVE
+
+
 def test_sqlite_knowledge_store_preserves_custom_chunks_on_entry_update(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
 

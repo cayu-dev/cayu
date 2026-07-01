@@ -13,7 +13,7 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 
 ## Scope
 
-Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, and events.
+Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
 
 The current public scope is the runtime and integration layer. Hosted deployment adapters, durable production vector indexes, and higher-level task orchestration are expected to live in companion packages or application code.
 
@@ -180,6 +180,12 @@ active writes. The policy owns the default namespace and required labels; model
 inputs are limited to the knowledge text plus optional title, kind, and aspects.
 If the app configures `allowed_kinds`, the registered tool schema exposes those
 values as the `kind` enum so the model can choose one instead of guessing.
+Use `KnowledgeReviewWorkflow` from app/operator code to list pending entries in
+an app-owned namespace/label scope, approve them into normal recall, or reject
+them as archived. The packaged server/dashboard exposes the same review flow
+when the app is constructed with `knowledge_store=...`; configure
+`knowledge_review_namespace` and `knowledge_review_labels` on `CayuApp` to limit
+which pending entries the dashboard can review.
 The tool creates new entries only and enforces an app-configured text-size cap;
 edits, archival, deletion, and dedupe/rewrite workflows belong in stricter
 app-owned or future tools. See
@@ -746,6 +752,12 @@ event for the latest session invocation, and compact details such as `limit`,
 exist in durable events. Estimated cost remains a separate
 `POST /api/sessions/{session_id}/cost` call because pricing is supplied by the
 application.
+
+When `CayuApp` is constructed with a `knowledge_store`, the optional server also
+exposes pending knowledge review for the dashboard: `GET /api/knowledge/pending`
+lists pending entries in the configured review scope, and
+`POST /api/knowledge/{entry_id}/approve` or `/reject` moves one pending entry to
+`active` or `archived`.
 
 For a work item that may fork into several sessions, use
 `GET /api/causal-budgets/{causal_budget_id}/usage` and

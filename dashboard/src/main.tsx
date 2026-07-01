@@ -5,6 +5,7 @@ import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
 import { DashboardPage } from "./routes/dashboard"
+import { KnowledgePage } from "./routes/knowledge"
 import { RunPage } from "./routes/run"
 import { SessionDetailPage } from "./routes/session-detail"
 import { SessionsPage } from "./routes/sessions"
@@ -33,6 +34,12 @@ const sessionDetailRoute = createRoute({
   component: SessionDetailPage,
 })
 
+const knowledgeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/knowledge",
+  component: KnowledgePage,
+})
+
 const runRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/run",
@@ -43,6 +50,7 @@ const routeTree = rootRoute.addChildren([
   dashboardRoute,
   sessionsRoute,
   sessionDetailRoute,
+  knowledgeRoute,
   runRoute,
 ])
 

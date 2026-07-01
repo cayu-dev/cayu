@@ -5,7 +5,7 @@ import json
 
 from cayu import (
     InMemoryKnowledgeStore,
-    KnowledgeQuery,
+    KnowledgeReviewWorkflow,
     KnowledgeStatus,
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
@@ -51,16 +51,27 @@ async def main() -> None:
     )
     print_json("normal_tool_search", _tool_hit_ids(normal_search.structured))
 
-    reviewer_search = await store.search(
-        KnowledgeQuery(
-            text="brokered credential proxy",
-            namespace="project:cayu",
-            labels={"project": "cayu"},
-            statuses=[KnowledgeStatus.PENDING],
-            limit=5,
-        )
+    reviewer = KnowledgeReviewWorkflow(
+        store,
+        namespace="project:cayu",
+        labels={"project": "cayu", "tenant": "trusted"},
     )
-    print_json("reviewer_pending_search", [hit.entry.id for hit in reviewer_search.hits])
+    pending_review = await reviewer.list_pending(source_type="tool", limit=5)
+    print_json("reviewer_pending_entries", [item.entry.id for item in pending_review.entries])
+
+    approved = await reviewer.approve(pending_review.entries[0].entry.id)
+    print_json("approved_pending_entry", {"entry_id": approved.id, "status": approved.status.value})
+
+    approved_search = await SearchKnowledgeTool().run(
+        ctx,
+        {
+            "query": "brokered credential proxy",
+            "namespace": "project:cayu",
+            "labels": {"project": "cayu"},
+            "limit": 5,
+        },
+    )
+    print_json("normal_tool_search_after_review", _tool_hit_ids(approved_search.structured))
 
     active_write = await RememberKnowledgeTool(
         policy=RememberKnowledgePolicy(
