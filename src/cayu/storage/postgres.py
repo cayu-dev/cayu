@@ -1445,6 +1445,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             schema_mode=schema_mode,
         )
 
+    def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
+        return (
+            KnowledgeSearchMode.AUTO,
+            KnowledgeSearchMode.KEYWORD,
+            KnowledgeSearchMode.SEMANTIC,
+            KnowledgeSearchMode.HYBRID,
+        )
+
     async def _ensure_ready(self) -> None:
         await super()._ensure_ready()
         if self._embedding_schema_ready:

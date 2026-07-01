@@ -673,6 +673,11 @@ class KnowledgeListResult(BaseModel):
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
+    def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
+        """Return search modes this store can execute directly."""
+
+        return (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
+
     @abstractmethod
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         """Insert or update one knowledge entry by id."""
@@ -997,6 +1002,14 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         )
         self._chunk_embeddings: dict[str, _StoredChunkEmbedding] = {}
         super().__init__(entries)
+
+    def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
+        return (
+            KnowledgeSearchMode.AUTO,
+            KnowledgeSearchMode.KEYWORD,
+            KnowledgeSearchMode.SEMANTIC,
+            KnowledgeSearchMode.HYBRID,
+        )
 
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         stored = await super().put_entry(entry)

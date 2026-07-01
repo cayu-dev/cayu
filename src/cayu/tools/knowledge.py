@@ -156,9 +156,11 @@ class SearchKnowledgeTool(Tool):
                     "type": "string",
                     "enum": [mode.value for mode in KnowledgeSearchMode],
                     "description": (
-                        "Search mode. Prefer auto unless app instructions say the "
-                        "active knowledge store supports semantic, hybrid, or external "
-                        "search."
+                        "Search mode. Use auto by default. Use semantic or hybrid "
+                        "only when app instructions or prior tool results indicate "
+                        "the active knowledge store supports semantic search, "
+                        "especially for conceptual recall where exact keywords or "
+                        "facets may miss relevant knowledge."
                     ),
                 },
                 "limit": {
@@ -230,6 +232,7 @@ class SearchKnowledgeTool(Tool):
             return _invalid_knowledge_arguments_result(exc)
         result = await store.search(query)
         hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in result.hits]
+        search_modes = _knowledge_search_modes_payload(store)
         content = (
             "No knowledge results found."
             if not hits
@@ -245,6 +248,7 @@ class SearchKnowledgeTool(Tool):
                 "max_bytes": result.max_bytes,
                 "preview_bytes": preview_bytes,
                 "total_hits_known": result.total_hits_known,
+                "search_modes": search_modes,
             },
         )
 
@@ -435,6 +439,7 @@ class ListKnowledgeTool(Tool):
             for item in exposed_entries
         ]
         facets = [_knowledge_facet_payload(facet) for facet in all_facets]
+        search_modes = _knowledge_search_modes_payload(store)
         content = _format_knowledge_list(
             exposed_entries,
             all_facets,
@@ -442,6 +447,7 @@ class ListKnowledgeTool(Tool):
             include_entries=include_entries,
             preview_bytes=preview_bytes,
             facets_truncated=facets_truncated,
+            search_modes=search_modes,
         )
         return ToolResult(
             content=content,
@@ -457,6 +463,7 @@ class ListKnowledgeTool(Tool):
                 "preview_bytes": preview_bytes,
                 "include_entries": include_entries,
                 "total_entries_known": result.total_entries_known,
+                "search_modes": search_modes,
             },
         )
 
@@ -816,6 +823,15 @@ def _knowledge_facet_groups_payload(
     return groups
 
 
+def _knowledge_search_modes_payload(store: Any) -> list[str]:
+    supported = getattr(store, "supported_search_modes", None)
+    if callable(supported):
+        modes = supported()
+    else:
+        modes = (KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD)
+    return [KnowledgeSearchMode(mode).value for mode in modes]
+
+
 def _knowledge_chunk_payload(chunk: KnowledgeChunk) -> dict[str, Any]:
     return {
         "chunk_id": chunk.id,
@@ -925,16 +941,26 @@ def _format_knowledge_list(
     include_entries: bool,
     preview_bytes: int,
     facets_truncated: bool,
+    search_modes: list[str],
 ) -> str:
+    header = [
+        "Knowledge discovery:",
+        "Search modes: " + ", ".join(search_modes),
+    ]
     if not entries and not facets:
         if not include_entries and total_entries_known:
-            return (
-                "Knowledge discovery found matching entries, but no entry previews were "
-                "requested and no facets matched the selected group. Use include_entries=true "
-                "for a bounded entry sample, or choose a different group_by field."
+            return "\n".join(
+                [
+                    *header,
+                    (
+                        "Knowledge discovery found matching entries, but no entry previews were "
+                        "requested and no facets matched the selected group. Use include_entries=true "
+                        "for a bounded entry sample, or choose a different group_by field."
+                    ),
+                ]
             )
-        return "No knowledge entries found."
-    lines = ["Knowledge discovery:"]
+        return "\n".join([*header, "No knowledge entries found."])
+    lines = list(header)
     if facets:
         lines.append("Facets:")
         for facet in facets:

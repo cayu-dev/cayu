@@ -8,6 +8,7 @@ import pytest
 from cayu import (
     Environment,
     EnvironmentSpec,
+    InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
@@ -16,7 +17,39 @@ from cayu import (
     SearchKnowledgeTool,
     ToolContext,
 )
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
 from cayu.environments import copy_environment
+
+
+class KeywordEmbeddingProvider(TextEmbeddingProvider):
+    name = "keyword-test"
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def _test_embedding_vector(text: str) -> list[float]:
+    folded = text.casefold()
+    return [
+        1.0
+        if any(
+            term in folded for term in ("auth", "broker", "credential", "github", "proxy", "token")
+        )
+        else 0.0,
+        1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
+        1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
+    ]
 
 
 def test_environment_accepts_and_copies_knowledge_store() -> None:
@@ -153,6 +186,7 @@ def test_search_knowledge_schema_keeps_portable_validation_hints() -> None:
 
     assert "broad keyword query" in SearchKnowledgeTool.spec.description
     assert "truncated facet value" in SearchKnowledgeTool.spec.description
+    assert "semantic or hybrid" in schema["properties"]["mode"]["description"]
     assert "anyOf" not in schema
     assert "oneOf" not in schema
     assert schema["properties"]["query"]["minLength"] == 1
@@ -166,6 +200,50 @@ def test_search_knowledge_schema_keeps_portable_validation_hints() -> None:
     assert "propertyNames" not in schema["properties"]["labels"]
     assert schema["properties"]["labels"]["additionalProperties"]["pattern"] == "\\S"
     assert "untruncated discovery result" in schema["properties"]["aspects"]["description"]
+
+
+def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text=(
+                    "Use a brokered Git HTTP proxy for GitHub pushes from a remote "
+                    "sandbox. Keep credentials outside the sandbox."
+                ),
+            )
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="invoice_approval",
+                namespace="ops",
+                text="Invoice refunds require approval before payment.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "query": "remote sandbox auth",
+                "namespace": "ops",
+                "mode": "semantic",
+                "limit": 5,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["query"]["mode"] == "semantic"
+    assert result.structured["search_modes"] == ["auto", "keyword", "semantic", "hybrid"]
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
+    assert result.structured["hits"][0]["score_kind"] == "inmemory_semantic"
+    assert "chunk_index=0" in result.content
 
 
 def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:
@@ -250,10 +328,12 @@ def test_list_knowledge_discovers_entries_and_facets() -> None:
     assert result.structured is not None
     assert "statuses" not in result.structured["query"]
     assert result.structured["query"]["group_by"] == ["kind"]
+    assert result.structured["search_modes"] == ["auto", "keyword"]
     assert result.structured["include_entries"] is False
     assert result.structured["truncated"] is False
     assert result.structured["entries"] == []
     assert "entry_id=" not in result.content
+    assert "Search modes: auto, keyword" in result.content
     assert [(facet["value"], facet["count"]) for facet in result.structured["facets"]] == [
         ("procedure", 1),
         ("warning", 1),
@@ -287,6 +367,36 @@ def test_list_knowledge_can_include_entries_with_facets() -> None:
     assert result.structured["include_entries"] is True
     assert [entry["entry_id"] for entry in result.structured["entries"]] == ["runbook"]
     assert "entry_id='runbook'" in result.content
+
+
+def test_list_knowledge_advertises_embedding_search_modes() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="runbook",
+                namespace="ops",
+                kind="procedure",
+                text="Remote sandbox credential proxy runbook.",
+            )
+        )
+        return await ListKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "namespace": "ops",
+                "group_by": "kind",
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["search_modes"] == ["auto", "keyword", "semantic", "hybrid"]
+    assert "Search modes: auto, keyword, semantic, hybrid" in result.content
 
 
 def test_list_knowledge_can_return_multiple_facet_groups() -> None:
