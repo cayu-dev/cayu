@@ -17,6 +17,7 @@ from cayu import (
     CayuApp,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
+    KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
     Message,
@@ -101,6 +102,7 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
                 status=KnowledgeStatus.PENDING,
                 aspects=["git", "credentials"],
                 title="Remote sandbox Git credentials",
+                metadata={"review_note": "inspect before approving"},
             ),
             KnowledgeEntry(
                 id="active_git",
@@ -116,6 +118,19 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
         knowledge_review_namespace="project:cayu",
         knowledge_review_labels={"project": "cayu", "tenant": "trusted"},
     )
+    asyncio.run(
+        store.replace_chunks(
+            "pending_git",
+            [
+                KnowledgeChunk(
+                    id="pending_git:0",
+                    entry_id="pending_git",
+                    chunk_index=0,
+                    text="Remote sandbox Git pushes should use a brokered credential proxy.",
+                )
+            ],
+        )
+    )
     client = TestClient(create_server(app))
 
     pending = client.get("/api/knowledge/pending")
@@ -125,6 +140,16 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     assert body["entries"][0]["title"] == "Remote sandbox Git credentials"
     assert body["entries"][0]["text_preview"] == "Remote sandbox Git credentials"
     assert body["total_entries_known"] == 1
+
+    detail = client.get("/api/knowledge/pending/pending_git")
+    assert detail.status_code == 200
+    detail_body = detail.json()
+    assert (
+        detail_body["text"] == "Remote sandbox Git pushes should use a brokered credential proxy."
+    )
+    assert detail_body["metadata"] == {"review_note": "inspect before approving"}
+    assert [chunk["chunk_id"] for chunk in detail_body["chunks"]] == ["pending_git:0"]
+    assert detail_body["chunks"][0]["text"] == detail_body["text"]
 
     approved = client.post("/api/knowledge/pending_git/approve")
     assert approved.status_code == 200
@@ -137,6 +162,10 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     conflict = client.post("/api/knowledge/pending_git/reject")
     assert conflict.status_code == 409
     assert "not 'pending'" in conflict.json()["detail"]
+
+    stale_detail = client.get("/api/knowledge/pending/pending_git")
+    assert stale_detail.status_code == 409
+    assert "not 'pending'" in stale_detail.json()["detail"]
 
 
 def test_server_rejects_pending_knowledge_with_archived_status() -> None:
@@ -190,6 +219,35 @@ def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> Non
     scoped_approve = client.post("/api/knowledge/pending_other/approve")
     assert scoped_approve.status_code == 403
     assert "outside review namespace" in scoped_approve.json()["detail"]
+
+    scoped_detail = client.get("/api/knowledge/pending/pending_other")
+    assert scoped_detail.status_code == 403
+    assert "outside review namespace" in scoped_detail.json()["detail"]
+
+
+def test_server_pending_knowledge_detail_validates_chunk_limits() -> None:
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="pending_git",
+                text="Remote sandbox Git pushes should use a brokered credential proxy.",
+                status=KnowledgeStatus.PENDING,
+            )
+        ]
+    )
+    client = TestClient(create_server(CayuApp(knowledge_store=store)))
+
+    response = client.get("/api/knowledge/pending/pending_git?max_chunks=0")
+    assert response.status_code == 422
+    assert "max_chunks" in str(response.json()["detail"])
+
+    too_many_chunks = client.get("/api/knowledge/pending/pending_git?max_chunks=51")
+    assert too_many_chunks.status_code == 422
+    assert "max_chunks" in str(too_many_chunks.json()["detail"])
+
+    too_many_bytes = client.get("/api/knowledge/pending/pending_git?max_bytes=128001")
+    assert too_many_bytes.status_code == 422
+    assert "max_bytes" in str(too_many_bytes.json()["detail"])
 
 
 def test_run_threads_inbound_traceparent_into_session_metadata() -> None:

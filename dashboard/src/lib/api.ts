@@ -60,6 +60,25 @@ export type KnowledgeEntry = {
   text_preview: string | null
 }
 
+export type KnowledgeEntryDetail = KnowledgeEntry & {
+  text: string
+  metadata: Record<string, unknown>
+  expires_at: string | null
+  chunks: KnowledgeChunk[]
+  chunk_limit: number
+  chunk_max_bytes: number
+}
+
+export type KnowledgeChunk = {
+  chunk_id: string
+  entry_id: string
+  chunk_index: number
+  text: string
+  content_hash: string | null
+  source_uri: string | null
+  metadata: Record<string, unknown>
+}
+
 export type KnowledgePendingPage = {
   entries: KnowledgeEntry[]
   truncated: boolean
@@ -121,6 +140,10 @@ export async function fetchTasks(): Promise<Task[]> {
 
 export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
   return fetchJson<KnowledgePendingPage>("/api/knowledge/pending")
+}
+
+export async function fetchPendingKnowledgeEntry(entryId: string): Promise<KnowledgeEntryDetail> {
+  return fetchJson<KnowledgeEntryDetail>(`/api/knowledge/pending/${encodeURIComponent(entryId)}`)
 }
 
 export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry> {

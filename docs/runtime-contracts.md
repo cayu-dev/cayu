@@ -1439,6 +1439,7 @@ tool. The packaged server/dashboard uses the same workflow when `CayuApp` is
 constructed with `knowledge_store=...`; `knowledge_review_namespace` and
 `knowledge_review_labels` limit which pending entries the dashboard can list or
 approve/reject. The server exposes `GET /api/knowledge/pending` plus
+`GET /api/knowledge/pending/{entry_id}` for scoped detail inspection and
 `POST /api/knowledge/{entry_id}/approve` and `/reject` for that dashboard flow.
 Active writes require `allow_active_writes=True`. The accepted text size is
 configured when the app registers the tool and is not exposed as a

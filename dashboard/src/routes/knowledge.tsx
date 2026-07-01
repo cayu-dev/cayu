@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Check, X } from "lucide-react"
+import { type ReactNode, useEffect, useState } from "react"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
 import { Card, CardContent } from "../components/ui/card"
@@ -14,7 +15,9 @@ import {
 import {
   approveKnowledge,
   fetchPendingKnowledge,
+  fetchPendingKnowledgeEntry,
   type KnowledgeEntry,
+  type KnowledgeEntryDetail,
   rejectKnowledge,
 } from "../lib/api"
 
@@ -84,21 +87,151 @@ function EntryActions({
   )
 }
 
+function MetadataBlock({ metadata }: { metadata: Record<string, unknown> }) {
+  if (Object.keys(metadata).length === 0) {
+    return <span className="text-muted-foreground">-</span>
+  }
+  return (
+    <pre className="max-h-56 overflow-auto rounded-md border bg-muted/30 p-3 text-xs">
+      {JSON.stringify(metadata, null, 2)}
+    </pre>
+  )
+}
+
+function DetailRow({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[7rem_1fr] gap-3 text-sm">
+      <div className="text-muted-foreground">{label}</div>
+      <div className="min-w-0">{value}</div>
+    </div>
+  )
+}
+
+function KnowledgeDetail({
+  entry,
+  isLoading,
+  error,
+  disabled,
+  onApprove,
+  onReject,
+}: {
+  entry: KnowledgeEntryDetail | null
+  isLoading: boolean
+  error: string | null
+  disabled: boolean
+  onApprove: (entryId: string) => void
+  onReject: (entryId: string) => void
+}) {
+  if (isLoading) {
+    return <div className="p-6 text-sm text-muted-foreground">Loading...</div>
+  }
+  if (error !== null) {
+    return <div className="p-6 text-sm text-destructive">{error}</div>
+  }
+  if (entry === null) {
+    return <div className="p-6 text-sm text-muted-foreground">Select a pending entry</div>
+  }
+  return (
+    <div className="space-y-5 p-6">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h2 className="break-words text-lg font-semibold">{entry.title || entry.entry_id}</h2>
+          <div className="mt-1 break-all font-mono text-xs text-muted-foreground">
+            {entry.entry_id}
+          </div>
+        </div>
+        <EntryActions entry={entry} disabled={disabled} onApprove={onApprove} onReject={onReject} />
+      </div>
+
+      <div className="space-y-3">
+        <DetailRow label="Kind" value={<Badge variant="outline">{entry.kind}</Badge>} />
+        <DetailRow label="Namespace" value={<span className="font-mono">{entry.namespace}</span>} />
+        <DetailRow label="Labels" value={<Labels labels={entry.labels} />} />
+        <DetailRow label="Aspects" value={<Aspects aspects={entry.aspects} />} />
+        <DetailRow label="Source" value={entry.source_type || "-"} />
+        <DetailRow label="Source ID" value={entry.source_id || "-"} />
+        <DetailRow label="Created" value={new Date(entry.created_at).toLocaleString()} />
+      </div>
+
+      <div>
+        <div className="mb-2 text-sm font-medium">Text</div>
+        <div className="max-h-[24rem] overflow-auto whitespace-pre-wrap rounded-md border bg-background p-4 text-sm">
+          {entry.text}
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-2 text-sm font-medium">Chunks</div>
+        <div className="space-y-3">
+          {entry.chunks.length === 0 ? (
+            <div className="text-sm text-muted-foreground">No chunks available</div>
+          ) : (
+            entry.chunks.map((chunk) => (
+              <div key={chunk.chunk_id} className="rounded-md border bg-background p-3">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <Badge variant="outline">#{chunk.chunk_index}</Badge>
+                  <span className="truncate font-mono text-xs text-muted-foreground">
+                    {chunk.chunk_id}
+                  </span>
+                </div>
+                <div className="max-h-44 overflow-auto whitespace-pre-wrap text-sm">
+                  {chunk.text}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-2 text-sm font-medium">Metadata</div>
+        <MetadataBlock metadata={entry.metadata} />
+      </div>
+    </div>
+  )
+}
+
 export function KnowledgePage() {
   const queryClient = useQueryClient()
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null)
   const pending = useQuery({
     queryKey: ["knowledge", "pending"],
     queryFn: fetchPendingKnowledge,
   })
+  const detail = useQuery({
+    queryKey: ["knowledge", "pending", selectedEntryId],
+    queryFn: () => fetchPendingKnowledgeEntry(selectedEntryId!),
+    enabled: selectedEntryId !== null,
+  })
 
   const approve = useMutation({
     mutationFn: approveKnowledge,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge", "pending"] }),
+    onSuccess: (_entry, entryId) => {
+      if (selectedEntryId === entryId) {
+        setSelectedEntryId(null)
+      }
+      void queryClient.invalidateQueries({ queryKey: ["knowledge", "pending"] })
+    },
   })
   const reject = useMutation({
     mutationFn: rejectKnowledge,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["knowledge", "pending"] }),
+    onSuccess: (_entry, entryId) => {
+      if (selectedEntryId === entryId) {
+        setSelectedEntryId(null)
+      }
+      void queryClient.invalidateQueries({ queryKey: ["knowledge", "pending"] })
+    },
   })
+
+  const entries = pending.data?.entries ?? []
+  useEffect(() => {
+    if (selectedEntryId === null || pending.isLoading) {
+      return
+    }
+    if (!entries.some((entry) => entry.entry_id === selectedEntryId)) {
+      setSelectedEntryId(null)
+    }
+  }, [entries, pending.isLoading, selectedEntryId])
 
   const error =
     pending.error instanceof Error
@@ -108,7 +241,7 @@ export function KnowledgePage() {
         : reject.error instanceof Error
           ? reject.error.message
           : null
-  const entries = pending.data?.entries ?? []
+  const detailError = detail.error instanceof Error ? detail.error.message : null
   const mutating = approve.isPending || reject.isPending
 
   return (
@@ -122,80 +255,101 @@ export function KnowledgePage() {
         </div>
       </div>
 
-      <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Entry</TableHead>
-                <TableHead>Kind</TableHead>
-                <TableHead>Scope</TableHead>
-                <TableHead>Aspects</TableHead>
-                <TableHead>Created</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {pending.isLoading ? (
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_28rem]">
+        <Card>
+          <CardContent className="p-0">
+            <Table>
+              <TableHeader>
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
-                    Loading...
-                  </TableCell>
+                  <TableHead>Entry</TableHead>
+                  <TableHead>Kind</TableHead>
+                  <TableHead>Scope</TableHead>
+                  <TableHead>Aspects</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
-              ) : error ? (
-                <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-destructive">
-                    {error}
-                  </TableCell>
-                </TableRow>
-              ) : entries.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
-                    No pending knowledge entries
-                  </TableCell>
-                </TableRow>
-              ) : (
-                entries.map((entry) => (
-                  <TableRow key={entry.entry_id}>
-                    <TableCell className="max-w-xl whitespace-normal">
-                      <div className="font-medium">{entry.title || entry.entry_id}</div>
-                      <div className="mt-1 text-sm text-muted-foreground">
-                        {entry.text_preview || "No preview available"}
-                      </div>
-                      <div className="mt-2 font-mono text-xs text-muted-foreground">
-                        {entry.entry_id}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="outline">{entry.kind}</Badge>
-                    </TableCell>
-                    <TableCell className="max-w-xs whitespace-normal">
-                      <div className="mb-2 font-mono text-xs text-muted-foreground">
-                        {entry.namespace}
-                      </div>
-                      <Labels labels={entry.labels} />
-                    </TableCell>
-                    <TableCell className="max-w-xs whitespace-normal">
-                      <Aspects aspects={entry.aspects} />
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {new Date(entry.created_at).toLocaleString()}
-                    </TableCell>
-                    <TableCell>
-                      <EntryActions
-                        entry={entry}
-                        disabled={mutating}
-                        onApprove={approve.mutate}
-                        onReject={reject.mutate}
-                      />
+              </TableHeader>
+              <TableBody>
+                {pending.isLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                      Loading...
                     </TableCell>
                   </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+                ) : error ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-destructive">
+                      {error}
+                    </TableCell>
+                  </TableRow>
+                ) : entries.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                      No pending knowledge entries
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  entries.map((entry) => (
+                    <TableRow
+                      key={entry.entry_id}
+                      className={
+                        selectedEntryId === entry.entry_id ? "bg-muted/50" : "cursor-pointer"
+                      }
+                      onClick={() => setSelectedEntryId(entry.entry_id)}
+                    >
+                      <TableCell className="max-w-xl whitespace-normal">
+                        <div className="font-medium">{entry.title || entry.entry_id}</div>
+                        <div className="mt-1 text-sm text-muted-foreground">
+                          {entry.text_preview || "No preview available"}
+                        </div>
+                        <div className="mt-2 font-mono text-xs text-muted-foreground">
+                          {entry.entry_id}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline">{entry.kind}</Badge>
+                      </TableCell>
+                      <TableCell className="max-w-xs whitespace-normal">
+                        <div className="mb-2 font-mono text-xs text-muted-foreground">
+                          {entry.namespace}
+                        </div>
+                        <Labels labels={entry.labels} />
+                      </TableCell>
+                      <TableCell className="max-w-xs whitespace-normal">
+                        <Aspects aspects={entry.aspects} />
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {new Date(entry.created_at).toLocaleString()}
+                      </TableCell>
+                      <TableCell onClick={(event) => event.stopPropagation()}>
+                        <EntryActions
+                          entry={entry}
+                          disabled={mutating}
+                          onApprove={approve.mutate}
+                          onReject={reject.mutate}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-0">
+            <KnowledgeDetail
+              entry={detail.data ?? null}
+              isLoading={detail.isLoading}
+              error={detailError}
+              disabled={mutating}
+              onApprove={approve.mutate}
+              onReject={reject.mutate}
+            />
+          </CardContent>
+        </Card>
+      </div>
     </div>
   )
 }

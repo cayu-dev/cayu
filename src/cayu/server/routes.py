@@ -59,6 +59,7 @@ from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
 from cayu.server.sse import event_to_sse_data
 from cayu.storage import (
+    KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListItem,
     KnowledgeReviewWorkflow,
@@ -69,6 +70,8 @@ NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_len
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
+_KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
+_KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
 _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
@@ -483,6 +486,27 @@ def _serialize_reviewed_knowledge_entry(entry: KnowledgeEntry) -> dict[str, Any]
     return {
         **_serialize_knowledge_entry_base(entry),
         "text_preview": _knowledge_text_preview(entry.text),
+    }
+
+
+def _serialize_knowledge_detail(entry: KnowledgeEntry) -> dict[str, Any]:
+    return {
+        **_serialize_knowledge_entry_base(entry),
+        "text": entry.text,
+        "metadata": entry.metadata,
+        "expires_at": entry.expires_at.isoformat() if entry.expires_at else None,
+    }
+
+
+def _serialize_knowledge_chunk(chunk: KnowledgeChunk) -> dict[str, Any]:
+    return {
+        "chunk_id": chunk.id,
+        "entry_id": chunk.entry_id,
+        "chunk_index": chunk.chunk_index,
+        "text": chunk.text,
+        "content_hash": chunk.content_hash,
+        "source_uri": chunk.source_uri,
+        "metadata": dict(chunk.metadata),
     }
 
 
@@ -1411,6 +1435,43 @@ def create_router(
             "limit": result.limit,
             "max_bytes": result.max_bytes,
             "total_entries_known": result.total_entries_known,
+        }
+
+    @router.get("/knowledge/pending/{entry_id}")
+    async def get_pending_knowledge(
+        entry_id: NonBlankString,
+        max_chunks: Annotated[
+            int,
+            Query(ge=1, le=_KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS),
+        ] = _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS,
+        max_bytes: Annotated[
+            int,
+            Query(ge=1, le=_KNOWLEDGE_PENDING_DETAIL_MAX_BYTES),
+        ] = _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES,
+    ):
+        workflow = _knowledge_review_workflow()
+        assert knowledge_store is not None
+        try:
+            entry = await workflow.get_pending(entry_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            chunks = await knowledge_store.read_chunks(
+                entry.id,
+                max_chunks=max_chunks,
+                max_bytes=max_bytes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            **_serialize_knowledge_detail(entry),
+            "chunks": [_serialize_knowledge_chunk(chunk) for chunk in chunks],
+            "chunk_limit": max_chunks,
+            "chunk_max_bytes": max_bytes,
         }
 
     @router.post("/knowledge/{entry_id}/approve")

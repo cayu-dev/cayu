@@ -755,9 +755,10 @@ application.
 
 When `CayuApp` is constructed with a `knowledge_store`, the optional server also
 exposes pending knowledge review for the dashboard: `GET /api/knowledge/pending`
-lists pending entries in the configured review scope, and
-`POST /api/knowledge/{entry_id}/approve` or `/reject` moves one pending entry to
-`active` or `archived`.
+lists pending entries in the configured review scope,
+`GET /api/knowledge/pending/{entry_id}` loads one scoped pending entry with its
+text and bounded chunks for inspection, and `POST /api/knowledge/{entry_id}/approve`
+or `/reject` moves one pending entry to `active` or `archived`.
 
 For a work item that may fork into several sessions, use
 `GET /api/causal-budgets/{causal_budget_id}/usage` and
