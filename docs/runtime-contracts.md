@@ -838,6 +838,7 @@ The first built-in tools are:
 - `list_knowledge`: discover active knowledge entries and facets without requiring a lexical search term
 - `search_knowledge`: search the active knowledge store with bounded previews and optional filters
 - `read_knowledge`: expand bounded chunks from a returned knowledge entry
+- `remember_knowledge`: propose a new knowledge entry through the active knowledge store, subject to application write policy
 
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 
@@ -853,6 +854,7 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `list_knowledge`: 10 entries or facets per group by default, 25 maximum per call/group; 240 bytes of preview text per entry by default, 4 KB maximum per entry, and 20 KB total preview text by default, 128 KB maximum per call
 - `search_knowledge`: 10 hits by default, 25 maximum per call; 320 bytes of preview text per hit by default, 4 KB maximum per hit, and 20 KB total preview text by default, 128 KB maximum per call
 - `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
+- `remember_knowledge`: 64 KB app-configured accepted text by default, 512 KB maximum for a registered tool instance; internal indexing defaults to 4 KB target chunks and 100 chunks maximum for the built-in tool instance; writes that would exceed the configured text or chunk capacity are rejected before persistence
 
 ## Workflow
 
@@ -1411,6 +1413,31 @@ tool payload.
 fail as normal tool errors when the active environment has no `knowledge_store`,
 so apps explicitly choose which agents can recall durable knowledge.
 
+Apps may also register `RememberKnowledgeTool` when an agent should be allowed
+to propose new durable knowledge. The tool is create-only: it does not accept an
+`entry_id` and cannot edit, archive, or delete existing entries. It writes
+through `KnowledgeIndexer` / `put_entry_with_chunks` so entry text, chunks, and
+source hashes stay consistent across stores. `RememberKnowledgePolicy` controls
+the actual stored status, namespace, visibility, required labels, and allowed
+kinds. When `allowed_kinds` is configured, the registered tool instance exposes
+those values as the model-facing `kind` enum while still enforcing them at
+runtime. Model-facing inputs are deliberately limited to `text`, optional
+`title`, optional `kind`, and optional topical `aspects`; namespace, labels,
+status, visibility, impact targets, importance, and confidence are app-owned for
+this tool. The default policy stores model-authored entries as `pending`; normal
+search/list queries exclude pending entries, while reviewer/app code can query
+pending entries through the store API. Active writes require
+`allow_active_writes=True`. The accepted text size is configured when the app
+registers the tool and is not exposed as a model-controlled argument. If
+persistence fails after the tool has generated an entry id but the complete
+durable entry and chunks match the intended write, including an embedding hook
+failure in an embedding-backed store, the tool preserves the knowledge and
+returns success with a structured `post_write_error` warning for app/event
+consumers; the model-facing tool content still reports only that the knowledge
+was stored. If the durable entry/chunks are not present or do not match the
+intended write, the tool returns an error and attempts to hard-delete the
+generated entry id.
+
 Filters are retrieval hints, not an authorization boundary. Production apps
 should attach a store already scoped to the active tenant/user/project, or
 provide a wrapper store/tool that enforces those constraints before calling the
@@ -1431,8 +1458,8 @@ It emits `knowledge.search.started`, `knowledge.search.completed`,
 Search failures are fail-open by default; configure `fail_open=False` when a
 missing knowledge lookup should fail the session before the provider request.
 
-This slice does not add durable SQLite/Postgres vector indexes, graph retrieval,
-remote source connectors, or agent-authored memory. Those layers should build on
-the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery` /
-`KnowledgeIndexer` / `TextEmbeddingProvider` contracts rather than introducing
-separate memory, skill, or document-store APIs.
+This slice does not add graph retrieval, remote source connectors, background
+remembering workers, or agent-led mutation of existing knowledge. Those layers
+should build on the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery`
+/ `KnowledgeIndexer` / `TextEmbeddingProvider` contracts rather than
+introducing separate memory, skill, or document-store APIs.

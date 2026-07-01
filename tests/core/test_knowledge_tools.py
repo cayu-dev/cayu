@@ -10,12 +10,19 @@ from cayu import (
     EnvironmentSpec,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
+    KnowledgeChunk,
+    KnowledgeEntry,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
+    KnowledgeQuery,
+    KnowledgeStatus,
     ListKnowledgeTool,
     ReadKnowledgeTool,
+    RememberKnowledgePolicy,
+    RememberKnowledgeTool,
     SearchKnowledgeTool,
     ToolContext,
+    ToolSpec,
 )
 from cayu.embeddings import (
     TextEmbedding,
@@ -63,6 +70,35 @@ class WeightedEmbeddingProvider(TextEmbeddingProvider):
                 for index, text in enumerate(request.texts)
             ],
         )
+
+
+class FailingEmbeddingProvider(TextEmbeddingProvider):
+    name = "failing-test"
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        raise RuntimeError("embedding service unavailable")
+
+
+class PartialWriteKnowledgeStore(InMemoryKnowledgeStore):
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        if not chunks:
+            raise AssertionError("test requires chunks")
+        await super().put_entry_with_chunks(entry, chunks[:1])
+        raise RuntimeError("partial write failure")
+
+
+class CorruptingWriteKnowledgeStore(InMemoryKnowledgeStore):
+    async def put_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> KnowledgeEntry:
+        await super().put_entry_with_chunks(entry.model_copy(update={"labels": {}}), chunks)
+        raise RuntimeError("corrupt write failure")
 
 
 def _weighted_embedding_vector(text: str) -> list[float]:
@@ -239,6 +275,387 @@ def test_search_knowledge_score_override_is_opt_in() -> None:
         in opt_in_schema["properties"]["min_score"]["description"]
     )
     assert "min_score" not in SearchKnowledgeTool.spec.input_schema["properties"]
+
+
+def test_remember_knowledge_schema_describes_pending_policy() -> None:
+    schema = RememberKnowledgeTool.spec.input_schema
+
+    assert RememberKnowledgeTool.spec.name == "remember_knowledge"
+    assert "pending review" in RememberKnowledgeTool.spec.description
+    assert "edit, archive, or delete" in RememberKnowledgeTool.spec.description
+    assert schema["required"] == ["text"]
+    assert "entry_id" not in schema["properties"]
+    assert "status" not in schema["properties"]
+    assert "max_bytes" not in schema["properties"]
+    assert "namespace" not in schema["properties"]
+    assert "labels" not in schema["properties"]
+    assert "impact_targets" not in schema["properties"]
+    assert "importance" not in schema["properties"]
+    assert "confidence" not in schema["properties"]
+    assert "one stable" in schema["properties"]["text"]["description"]
+    assert "large documents" in schema["properties"]["text"]["description"]
+
+
+def test_remember_knowledge_schema_exposes_allowed_kinds() -> None:
+    default_schema = RememberKnowledgeTool.spec.input_schema
+    restricted_schema = RememberKnowledgeTool(
+        policy=RememberKnowledgePolicy(
+            allowed_kinds=("fact", "procedure"),
+            default_kind="fact",
+        )
+    ).spec.input_schema
+
+    assert "enum" not in default_schema["properties"]["kind"]
+    assert restricted_schema["properties"]["kind"]["enum"] == ["fact", "procedure"]
+    assert (
+        "Choose one of: fact, procedure" in restricted_schema["properties"]["kind"]["description"]
+    )
+    assert "uses fact" in restricted_schema["properties"]["kind"]["description"]
+    assert "enum" not in RememberKnowledgeTool.spec.input_schema["properties"]["kind"]
+
+
+def test_remember_knowledge_schema_does_not_mutate_custom_spec() -> None:
+    spec = RememberKnowledgeTool.spec.model_copy(deep=True)
+
+    tool = RememberKnowledgeTool(
+        spec=spec,
+        policy=RememberKnowledgePolicy(
+            allowed_kinds=("fact", "procedure"),
+            default_kind="fact",
+        ),
+    )
+
+    assert type(spec) is ToolSpec
+    assert "enum" not in spec.input_schema["properties"]["kind"]
+    assert tool.spec.input_schema["properties"]["kind"]["enum"] == ["fact", "procedure"]
+
+
+def test_remember_knowledge_defaults_model_writes_to_pending() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                agent_name="assistant",
+                environment_name="local",
+                workspace_id="workspace_1",
+                knowledge_store=store,
+            ),
+            {
+                "text": "Remote sandbox Git pushes should use a brokered credential proxy.",
+                "title": "Remote sandbox Git credentials",
+                "kind": "procedure",
+                "aspects": ["git", "credentials"],
+            },
+        )
+        assert result.structured is not None
+        entry_id = result.structured["entry"]["entry_id"]
+        entry = await store.get_entry(entry_id)
+        default_search = await store.search(
+            KnowledgeQuery(text="brokered credential proxy", namespace="default")
+        )
+        pending_search = await store.search(
+            KnowledgeQuery(
+                text="brokered credential proxy",
+                namespace="default",
+                statuses=[KnowledgeStatus.PENDING],
+            )
+        )
+        chunks = await store.read_chunks(entry_id, max_chunks=5, max_bytes=20_000)
+        return result, entry, default_search, pending_search, chunks
+
+    result, entry, default_search, pending_search, chunks = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["status"] == "pending"
+    assert entry is not None
+    assert entry.status is KnowledgeStatus.PENDING
+    assert entry.created_by_type.value == "model"
+    assert entry.created_by == "assistant"
+    assert entry.source_type == "tool"
+    assert entry.source_uri == "cayu://sessions/session_1"
+    assert entry.source_id == "session_1"
+    assert entry.metadata == {
+        "tool_name": "remember_knowledge",
+        "session_id": "session_1",
+        "agent_name": "assistant",
+        "environment_name": "local",
+        "workspace_id": "workspace_1",
+    }
+    assert entry.labels == {}
+    assert entry.aspects == ["git", "credentials"]
+    assert entry.importance is None
+    assert entry.importance_source is None
+    assert entry.confidence is None
+    assert default_search.hits == []
+    assert [hit.entry.id for hit in pending_search.hits] == [entry.id]
+    assert len(chunks) == 1
+    assert chunks[0].entry_id == entry.id
+
+
+def test_remember_knowledge_status_is_policy_owned() -> None:
+    async def run_default():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_1", agent_name="assistant", knowledge_store=store),
+            {
+                "text": "Use a trusted proxy for GitHub pushes from remote sandboxes.",
+                "status": "active",
+            },
+        )
+        assert result.structured is not None
+        entry = await store.get_entry(result.structured["entry"]["entry_id"])
+        return result, entry
+
+    async def run_active():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(
+                default_status=KnowledgeStatus.ACTIVE,
+                allow_active_writes=True,
+                require_labels={"project": "cayu"},
+            )
+        ).run(
+            ToolContext(session_id="session_2", agent_name="assistant", knowledge_store=store),
+            {"text": "Invoice refunds require audit logging.", "kind": "warning"},
+        )
+        assert result.structured is not None
+        entry = await store.get_entry(result.structured["entry"]["entry_id"])
+        search = await store.search(KnowledgeQuery(text="invoice refunds audit"))
+        return result, entry, search
+
+    default_result, default_entry = asyncio.run(run_default())
+    active_result, active_entry, active_search = asyncio.run(run_active())
+
+    assert default_result.structured["status"] == "pending"
+    assert default_entry.status is KnowledgeStatus.PENDING
+    assert default_entry.metadata == {
+        "tool_name": "remember_knowledge",
+        "session_id": "session_1",
+        "agent_name": "assistant",
+    }
+    assert "pending review" in default_result.content
+    assert active_result.structured["status"] == "active"
+    assert active_entry.status is KnowledgeStatus.ACTIVE
+    assert active_entry.labels == {"project": "cayu"}
+    assert [hit.entry.id for hit in active_search.hits] == [active_entry.id]
+
+
+def test_remember_knowledge_accepts_policy_dict() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool(
+            policy={
+                "default_status": "active",
+                "allow_active_writes": True,
+                "default_namespace": "project:cayu",
+            }
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "Use the brokered Git HTTP proxy for sandbox pushes."},
+        )
+        assert result.structured is not None
+        entry = await store.get_entry(result.structured["entry"]["entry_id"])
+        return entry
+
+    entry = asyncio.run(run())
+
+    assert entry is not None
+    assert entry.status is KnowledgeStatus.ACTIVE
+    assert entry.namespace == "project:cayu"
+
+
+def test_remember_knowledge_policy_owns_namespace_and_labels() -> None:
+    async def run_policy_scope():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(
+                default_namespace="project:cayu",
+                require_labels={"project": "cayu", "tenant": "trusted"},
+            )
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {
+                "text": "Sandbox pushes use a brokered credential proxy.",
+                "namespace": "attacker",
+                "labels": {"project": "wrong", "area": "git"},
+                "impact_targets": ["sandbox.git.push"],
+                "importance": 1.0,
+                "confidence": 1.0,
+            },
+        )
+        assert result.structured is not None
+        return await store.get_entry(result.structured["entry"]["entry_id"])
+
+    entry = asyncio.run(run_policy_scope())
+
+    assert entry is not None
+    assert entry.namespace == "project:cayu"
+    assert entry.labels == {"project": "cayu", "tenant": "trusted"}
+    assert entry.impact_targets == []
+    assert entry.importance is None
+    assert entry.confidence is None
+
+
+def test_remember_knowledge_policy_restricts_kinds() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        return await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(
+                allowed_kinds=("fact", "procedure"),
+                default_kind="fact",
+            )
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "Never store this as a skill.", "kind": "skill"},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "`kind` must be one of: fact, procedure" in result.content
+
+
+def test_remember_knowledge_rejects_oversized_text() -> None:
+    async def run():
+        return await RememberKnowledgeTool(max_text_bytes=5).run(
+            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            {"text": "abcdef"},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "`text` must be at most 5 bytes" in result.content
+
+
+def test_remember_knowledge_rejects_truncated_index_without_writing() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        result = await RememberKnowledgeTool(chunk_target_bytes=1_000, max_chunks=1).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "alpha " * 1_000},
+        )
+        search = await store.search(
+            KnowledgeQuery(text="alpha", statuses=[KnowledgeStatus.PENDING])
+        )
+        return result, search
+
+    result, search = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "chunk capacity" in result.content
+    assert search.hits == []
+
+
+def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None:
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=FailingEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        result = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "Remembered text should survive failed embedding writes."},
+        )
+        assert result.structured is not None
+        entry_id = result.structured["entry"]["entry_id"]
+        entry = await store.get_entry(entry_id)
+        chunks = await store.read_chunks(
+            entry_id,
+            max_chunks=5,
+            max_bytes=20_000,
+        )
+        return result, entry, chunks
+
+    result, entry, chunks = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured["post_write_error"] == "embedding service unavailable"
+    assert "embedding service unavailable" not in result.content
+    assert "Knowledge stored as pending" in result.content
+    assert entry is not None
+    assert entry.status is KnowledgeStatus.PENDING
+    assert len(chunks) == 1
+
+
+def test_remember_knowledge_rejects_partial_write_failure() -> None:
+    async def run():
+        store = PartialWriteKnowledgeStore()
+        result = await RememberKnowledgeTool(chunk_target_bytes=1_000).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "alpha " * 400},
+        )
+        assert result.structured is not None
+        entry = await store.get_entry(result.structured["entry_id"])
+        chunks = await store.read_chunks(
+            result.structured["entry_id"],
+            max_chunks=5,
+            max_bytes=20_000,
+        )
+        return result, entry, chunks
+
+    result, entry, chunks = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["error"] == "knowledge_write_failed"
+    assert result.structured["cleanup"] == "completed"
+    assert "partial write failure" in result.content
+    assert entry is None
+    assert chunks == []
+
+
+def test_remember_knowledge_rejects_corrupt_post_write_failure() -> None:
+    async def run():
+        store = CorruptingWriteKnowledgeStore()
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(require_labels={"project": "cayu"})
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "Sandbox Git pushes use brokered credentials."},
+        )
+        assert result.structured is not None
+        entry = await store.get_entry(result.structured["entry_id"])
+        chunks = await store.read_chunks(
+            result.structured["entry_id"],
+            max_chunks=5,
+            max_bytes=20_000,
+        )
+        return result, entry, chunks
+
+    result, entry, chunks = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["error"] == "knowledge_write_failed"
+    assert result.structured["cleanup"] == "completed"
+    assert "corrupt write failure" in result.content
+    assert entry is None
+    assert chunks == []
+
+
+def test_remember_knowledge_validates_chunk_configuration() -> None:
+    with pytest.raises(ValueError, match="chunk_target_bytes"):
+        RememberKnowledgeTool(chunk_target_bytes=799)
+
+    with pytest.raises(ValueError, match="max_text_bytes"):
+        RememberKnowledgeTool(max_text_bytes=0)
+
+
+def test_remember_knowledge_runtime_requires_store() -> None:
+    async def run():
+        return await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_1"),
+            {"text": "Remember this later."},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {"error": "missing_knowledge_store"}
 
 
 def test_search_knowledge_semantic_mode_uses_embedding_store() -> None:

@@ -172,6 +172,19 @@ payload. Filters such as namespace, labels, kinds, aspects, and source ids are
 retrieval hints; tenant/user/project isolation should be enforced by the app or
 store wrapper.
 
+`remember_knowledge` is optional. It lets an agent propose a new knowledge entry
+through the same store/indexer path, but model-authored entries are stored as
+`pending` by default and are excluded from normal recall until reviewed or until
+the app registers `RememberKnowledgeTool` with a policy that explicitly allows
+active writes. The policy owns the default namespace and required labels; model
+inputs are limited to the knowledge text plus optional title, kind, and aspects.
+If the app configures `allowed_kinds`, the registered tool schema exposes those
+values as the `kind` enum so the model can choose one instead of guessing.
+The tool creates new entries only and enforces an app-configured text-size cap;
+edits, archival, deletion, and dedupe/rewrite workflows belong in stricter
+app-owned or future tools. See
+`examples/knowledge_remember_local.py` for a runnable local policy example.
+
 For semantic recall, Cayu exposes a provider-neutral `TextEmbeddingProvider`
 contract. `OpenAIProvider.embed_texts(...)` implements that contract against
 OpenAI embeddings, and `InMemoryEmbeddingKnowledgeStore` can use any embedding

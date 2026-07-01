@@ -14,7 +14,13 @@ from cayu.tools.files import (
     WriteFileTool,
     default_artifact_readers,
 )
-from cayu.tools.knowledge import ListKnowledgeTool, ReadKnowledgeTool, SearchKnowledgeTool
+from cayu.tools.knowledge import (
+    ListKnowledgeTool,
+    ReadKnowledgeTool,
+    RememberKnowledgePolicy,
+    RememberKnowledgeTool,
+    SearchKnowledgeTool,
+)
 from cayu.tools.subagents import (
     SubagentContextMode,
     SubagentExecutionMode,
@@ -35,6 +41,8 @@ __all__ = [
     "ReadFileOptions",
     "ReadFileTool",
     "ReadKnowledgeTool",
+    "RememberKnowledgePolicy",
+    "RememberKnowledgeTool",
     "SearchKnowledgeTool",
     "SubagentContextMode",
     "SubagentExecutionMode",

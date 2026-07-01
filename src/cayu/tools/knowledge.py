@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from cayu._validation import copy_label_map, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.storage.knowledge_indexer import (
+    DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
+    KnowledgeIndexer,
+    KnowledgeIndexRequest,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    DEFAULT_KNOWLEDGE_NAMESPACE,
+    KnowledgeActorType,
     KnowledgeChunk,
+    KnowledgeEntry,
     KnowledgeFacet,
     KnowledgeHit,
     KnowledgeListGroup,
@@ -17,6 +31,7 @@ from cayu.storage.memory import (
     KnowledgeListQuery,
     KnowledgeQuery,
     KnowledgeSearchMode,
+    KnowledgeStatus,
     KnowledgeVisibility,
 )
 
@@ -42,6 +57,12 @@ DEFAULT_READ_KNOWLEDGE_MAX_CHUNKS = 5
 MAX_READ_KNOWLEDGE_MAX_CHUNKS = 50
 DEFAULT_READ_KNOWLEDGE_AROUND = 0
 MAX_READ_KNOWLEDGE_AROUND = 10
+DEFAULT_REMEMBER_KNOWLEDGE_MAX_BYTES = 64 * 1024
+MAX_REMEMBER_KNOWLEDGE_MAX_BYTES = 512 * 1024
+DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000
+MAX_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 32 * 1024
+DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 100
+MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 1_000
 _KNOWLEDGE_STORE_METHODS = (
     "put_entry",
     "get_entry",
@@ -53,6 +74,61 @@ _KNOWLEDGE_STORE_METHODS = (
     "search",
     "list_entries",
 )
+
+
+class RememberKnowledgePolicy(BaseModel):
+    """Application policy for model-authored knowledge writes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    default_status: KnowledgeStatus = KnowledgeStatus.PENDING
+    allow_active_writes: bool = False
+    default_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
+    default_visibility: KnowledgeVisibility = KnowledgeVisibility.GLOBAL
+    allowed_kinds: tuple[str, ...] | None = None
+    default_kind: str = "fact"
+    default_created_by: str = "model"
+    require_labels: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("default_namespace", "default_kind", "default_created_by")
+    @classmethod
+    def validate_clean_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("allowed_kinds", mode="before")
+    @classmethod
+    def validate_allowed_kinds(cls, value) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if isinstance(value, str | bytes):
+            raise TypeError("allowed_kinds must be an iterable of strings.")
+        kinds: list[str] = []
+        try:
+            items = list(value)
+        except TypeError as exc:
+            raise TypeError("allowed_kinds must be an iterable of strings.") from exc
+        for index, item in enumerate(items):
+            if type(item) is not str:
+                raise ValueError(f"`allowed_kinds[{index}]` must be a string.")
+            kinds.append(require_clean_nonblank(item, f"allowed_kinds[{index}]"))
+        if not kinds:
+            raise ValueError("allowed_kinds cannot be empty.")
+        return tuple(dict.fromkeys(kinds))
+
+    @field_validator("require_labels", mode="before")
+    @classmethod
+    def copy_required_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "require_labels")
+
+    @model_validator(mode="after")
+    def validate_status_policy(self) -> RememberKnowledgePolicy:
+        if self.default_status is KnowledgeStatus.ACTIVE and not self.allow_active_writes:
+            raise ValueError("default_status='active' requires allow_active_writes=True.")
+        if self.default_status not in {KnowledgeStatus.PENDING, KnowledgeStatus.ACTIVE}:
+            raise ValueError("default_status must be pending or active.")
+        if self.allowed_kinds is not None and self.default_kind not in self.allowed_kinds:
+            raise ValueError("default_kind must be included in allowed_kinds.")
+        return self
 
 
 class SearchKnowledgeTool(Tool):
@@ -298,6 +374,267 @@ class SearchKnowledgeTool(Tool):
                 "filtered_hits": filtered_count,
             },
         )
+
+
+class RememberKnowledgeTool(Tool):
+    spec = ToolSpec(
+        name="remember_knowledge",
+        description=(
+            "Propose new durable knowledge for the active knowledge store. Use this only "
+            "for stable facts, preferences, procedures, warnings, decisions, or lessons "
+            "that should be reusable beyond the current turn. Model-authored knowledge "
+            "is policy-controlled and defaults to pending review unless the application "
+            "explicitly allows active writes. This tool creates new entries only; it does "
+            "not edit, archive, or delete existing knowledge."
+        ),
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "description": (
+                        "Concise knowledge text to remember. Store one stable fact, "
+                        "preference, procedure, warning, decision, or lesson per call; "
+                        "do not paste large documents, transcripts, or raw tool output."
+                    ),
+                },
+                "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "description": "Optional short title for human review and list previews.",
+                },
+                "kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "description": (
+                        "Optional knowledge kind such as fact, preference, procedure, "
+                        "instruction, skill, document, example, warning, decision, event, "
+                        "or summary. Policy may restrict accepted kinds."
+                    ),
+                },
+                "aspects": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                    "description": "Optional controlled aspects for retrieval routing.",
+                },
+            },
+            "required": ["text"],
+        },
+    )
+
+    def __init__(
+        self,
+        spec: ToolSpec | None = None,
+        *,
+        policy: RememberKnowledgePolicy | dict[str, Any] | None = None,
+        max_text_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_BYTES,
+        chunk_target_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES,
+        max_chunks: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
+    ) -> None:
+        super().__init__(spec=spec)
+        self._policy = (
+            RememberKnowledgePolicy()
+            if policy is None
+            else RememberKnowledgePolicy.model_validate(policy)
+        )
+        if self._policy.allowed_kinds is not None:
+            schema = copy_json_value(self.spec.input_schema, "input_schema")
+            schema["properties"]["kind"] = {
+                **schema["properties"]["kind"],
+                "enum": list(self._policy.allowed_kinds),
+                "description": (
+                    "Optional knowledge kind. Choose one of: "
+                    f"{', '.join(self._policy.allowed_kinds)}. If omitted, policy "
+                    f"uses {self._policy.default_kind}."
+                ),
+            }
+            self.spec = self.spec.model_copy(update={"input_schema": schema})
+            self._validate_spec()
+        self._max_text_bytes = _validate_bounded_positive_int(
+            max_text_bytes,
+            "max_text_bytes",
+            maximum=MAX_REMEMBER_KNOWLEDGE_MAX_BYTES,
+        )
+        self._chunk_target_bytes = _validate_bounded_positive_int(
+            chunk_target_bytes,
+            "chunk_target_bytes",
+            minimum=DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES * 2,
+            maximum=MAX_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES,
+        )
+        self._max_chunks = _validate_bounded_positive_int(
+            max_chunks,
+            "max_chunks",
+            maximum=MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
+        )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        store = _require_knowledge_store(ctx)
+        if store is None:
+            return _missing_knowledge_store_result()
+        try:
+            text = _require_arg_string(args, "text")
+            if len(text.encode("utf-8")) > self._max_text_bytes:
+                raise ValueError(f"`text` must be at most {self._max_text_bytes} bytes.")
+            kind = _optional_arg_string(args, "kind") or self._policy.default_kind
+            self._validate_kind(kind)
+            metadata = _remember_metadata(ctx)
+            request = KnowledgeIndexRequest(
+                text=text,
+                entry_id=f"knowledge_{uuid4().hex}",
+                namespace=self._policy.default_namespace,
+                labels=self._policy.require_labels,
+                kind=kind,
+                visibility=self._policy.default_visibility,
+                status=self._policy.default_status,
+                created_by_type=KnowledgeActorType.MODEL,
+                created_by=ctx.agent_name or self._policy.default_created_by,
+                source_type="tool",
+                source_uri=f"cayu://sessions/{ctx.session_id}",
+                source_id=ctx.session_id,
+                aspects=_optional_string_list(args, "aspects") or [],
+                title=_optional_arg_string(args, "title"),
+                metadata=metadata,
+                chunk_metadata=metadata,
+                chunk_target_bytes=self._chunk_target_bytes,
+                max_chunks=self._max_chunks,
+                skip_unchanged=False,
+            )
+            result = KnowledgeIndexer().build(request)
+            if result.truncated:
+                raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
+        except (ValidationError, ValueError) as exc:
+            return _invalid_knowledge_arguments_result(exc)
+        try:
+            stored_entry = await store.put_entry_with_chunks(result.entry, result.chunks)
+        except Exception as exc:
+            inspection_error = None
+            try:
+                stored_entry = await store.get_entry(result.entry.id)
+                stored_chunks = await store.read_chunks(
+                    result.entry.id,
+                    max_chunks=len(result.chunks) + 1,
+                    max_bytes=_remember_chunk_read_max_bytes(result.chunks),
+                )
+            except Exception as inspect_exc:
+                stored_entry = None
+                stored_chunks = []
+                inspection_error = str(inspect_exc)
+            if not _remember_write_matches(result, stored_entry, stored_chunks):
+                cleanup_error = None
+                try:
+                    await store.delete_entry(result.entry.id, hard=True)
+                except Exception as cleanup_exc:
+                    cleanup_error = str(cleanup_exc)
+                return _knowledge_write_failed_result(
+                    exc,
+                    entry_id=result.entry.id,
+                    cleanup_error=cleanup_error,
+                    inspection_error=inspection_error,
+                )
+            result = result.model_copy(update={"entry": stored_entry, "written": True})
+            return _remember_knowledge_success_result(
+                result,
+                post_write_error=str(exc),
+            )
+        result = result.model_copy(update={"entry": stored_entry, "written": True})
+        return _remember_knowledge_success_result(result)
+
+    def _validate_kind(self, kind: str) -> None:
+        if self._policy.allowed_kinds is not None and kind not in self._policy.allowed_kinds:
+            allowed = ", ".join(self._policy.allowed_kinds)
+            raise ValueError(f"`kind` must be one of: {allowed}.")
+
+
+def _remember_knowledge_success_result(
+    result: Any,
+    *,
+    post_write_error: str | None = None,
+) -> ToolResult:
+    entry = result.entry
+    status_note = (
+        "It is active for normal retrieval."
+        if entry.status is KnowledgeStatus.ACTIVE
+        else "It is pending review and normal searches exclude it by default."
+    )
+    content = f"Knowledge stored as {entry.status.value}: {entry.id}. {status_note}"
+    structured: dict[str, Any] = {
+        "entry": _remembered_entry_payload(entry),
+        "chunk_count": result.chunk_count,
+        "written": result.written,
+        "source_hash": result.source_hash,
+        "status": entry.status.value,
+    }
+    if post_write_error is not None:
+        structured["post_write_error"] = post_write_error
+    return ToolResult(
+        content=content,
+        structured=structured,
+    )
+
+
+def _remember_chunk_read_max_bytes(chunks: list[KnowledgeChunk]) -> int:
+    chunk_bytes = sum(len(chunk.text.encode("utf-8")) for chunk in chunks)
+    separator_bytes = max(len(chunks) - 1, 0) * len(b"\n\n")
+    return max(chunk_bytes + separator_bytes + 1, 1)
+
+
+def _remember_write_matches(
+    result: Any,
+    stored_entry: KnowledgeEntry | None,
+    stored_chunks: list[KnowledgeChunk],
+) -> bool:
+    if stored_entry is None:
+        return False
+    expected_entry = result.entry
+    if _remember_entry_write_payload(stored_entry) != _remember_entry_write_payload(expected_entry):
+        return False
+    if len(stored_chunks) != len(result.chunks):
+        return False
+    for expected_chunk, stored_chunk in zip(result.chunks, stored_chunks, strict=True):
+        if stored_chunk.id != expected_chunk.id:
+            return False
+        if stored_chunk.entry_id != expected_chunk.entry_id:
+            return False
+        if stored_chunk.chunk_index != expected_chunk.chunk_index:
+            return False
+        if stored_chunk.content_hash != expected_chunk.content_hash:
+            return False
+        if stored_chunk.text != expected_chunk.text:
+            return False
+    return True
+
+
+def _remember_entry_write_payload(entry: KnowledgeEntry) -> dict[str, Any]:
+    """Fields that must survive a create write before recovery can treat it as stored."""
+
+    return {
+        "id": entry.id,
+        "text": entry.text,
+        "namespace": entry.namespace,
+        "labels": entry.labels,
+        "kind": entry.kind,
+        "visibility": entry.visibility,
+        "status": entry.status,
+        "created_by_type": entry.created_by_type,
+        "created_by": entry.created_by,
+        "source_type": entry.source_type,
+        "source_uri": entry.source_uri,
+        "source_id": entry.source_id,
+        "source_hash": entry.source_hash,
+        "aspects": entry.aspects,
+        "impact_targets": entry.impact_targets,
+        "importance": entry.importance,
+        "importance_source": entry.importance_source,
+        "confidence": entry.confidence,
+        "expires_at": entry.expires_at,
+        "title": entry.title,
+        "metadata": entry.metadata,
+    }
 
 
 class ListKnowledgeTool(Tool):
@@ -642,6 +979,29 @@ def _invalid_knowledge_arguments_result(exc: Exception) -> ToolResult:
     )
 
 
+def _knowledge_write_failed_result(
+    exc: Exception,
+    *,
+    entry_id: str,
+    cleanup_error: str | None,
+    inspection_error: str | None = None,
+) -> ToolResult:
+    structured: dict[str, Any] = {
+        "error": "knowledge_write_failed",
+        "entry_id": entry_id,
+        "cleanup": "failed" if cleanup_error is not None else "completed",
+    }
+    if inspection_error is not None:
+        structured["inspection_error"] = inspection_error
+    if cleanup_error is not None:
+        structured["cleanup_error"] = cleanup_error
+    return ToolResult(
+        content=f"Failed to store knowledge: {exc}",
+        structured=structured,
+        is_error=True,
+    )
+
+
 def _require_arg_string(args: dict, key: str) -> str:
     value = args.get(key)
     if type(value) is not str:
@@ -775,6 +1135,22 @@ def _optional_positive_int(
     return value
 
 
+def _validate_bounded_positive_int(
+    value: int,
+    key: str,
+    *,
+    minimum: int = 1,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ValueError(f"`{key}` must be an integer.")
+    if value < minimum:
+        raise ValueError(f"`{key}` must be at least {minimum}.")
+    if value > maximum:
+        raise ValueError(f"`{key}` must be at most {maximum}.")
+    return value
+
+
 def _optional_unit_float(args: dict, key: str) -> float | None:
     value = args.get(key)
     if value is None:
@@ -839,6 +1215,30 @@ def _knowledge_hit_payload(hit: KnowledgeHit, *, preview_bytes: int) -> dict[str
         "reason": hit.reason,
         "text_preview": text_preview,
         "text_preview_truncated": preview_truncated,
+    }
+
+
+def _remembered_entry_payload(entry: KnowledgeEntry) -> dict[str, Any]:
+    return {
+        "entry_id": entry.id,
+        "namespace": entry.namespace,
+        "kind": entry.kind,
+        "visibility": entry.visibility.value,
+        "status": entry.status.value,
+        "title": entry.title,
+        "labels": dict(entry.labels),
+        "aspects": list(entry.aspects),
+        "impact_targets": list(entry.impact_targets),
+        "source_type": entry.source_type,
+        "source_uri": entry.source_uri,
+        "source_id": entry.source_id,
+        "source_hash": entry.source_hash,
+        "created_by_type": entry.created_by_type.value,
+        "created_by": entry.created_by,
+        "importance": entry.importance,
+        "importance_source": entry.importance_source,
+        "confidence": entry.confidence,
+        "metadata": copy_json_value(entry.metadata, "metadata"),
     }
 
 
@@ -927,6 +1327,20 @@ def _filter_search_hits(hits: list[KnowledgeHit], *, min_score: float | None) ->
     return [
         hit for hit in hits if hit.score_normalized is None or hit.score_normalized >= min_score
     ]
+
+
+def _remember_metadata(ctx: ToolContext) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "tool_name": RememberKnowledgeTool.spec.name,
+        "session_id": ctx.session_id,
+    }
+    if ctx.agent_name is not None:
+        metadata["agent_name"] = ctx.agent_name
+    if ctx.environment_name is not None:
+        metadata["environment_name"] = ctx.environment_name
+    if ctx.workspace_id is not None:
+        metadata["workspace_id"] = ctx.workspace_id
+    return metadata
 
 
 def _knowledge_chunk_payload(chunk: KnowledgeChunk) -> dict[str, Any]:
