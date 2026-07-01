@@ -22,8 +22,10 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("validate", help="Validate an agent project.")
     subparsers.add_parser("serve", help="Start the agent runtime server.")
 
+    from cayu.cli.evals import add_eval_parser, run_eval_command
     from cayu.cli.storage import add_storage_parser, run_storage
 
+    add_eval_parser(subparsers)
     add_storage_parser(subparsers)
 
     args = parser.parse_args(argv)
@@ -34,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "storage":
         return run_storage(args)
+
+    if args.command == "eval":
+        return run_eval_command(args)
 
     if args.command in {"validate", "serve"}:
         parser.error(f"'{args.command}' is not implemented yet")

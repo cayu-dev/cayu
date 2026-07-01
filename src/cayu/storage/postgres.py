@@ -1894,6 +1894,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             score = self.hybrid_keyword_weight * keyword_boost
             if score <= 0:
                 continue
+            text_preview = hit.text_preview
+            if text_preview is None:
+                continue
             seen_entry_ids.add(hit.entry.id)
             merged.append(
                 (
