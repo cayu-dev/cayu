@@ -42,6 +42,7 @@ from cayu.runtime.sessions import (
     SessionOutcome,
     SessionQuery,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
@@ -2403,7 +2404,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
-                    raise ValueError(
+                    raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
                 loaded = await self._load(cur, session_id)
@@ -2435,7 +2436,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
                     if loaded.status not in allowed_statuses:
-                        raise ValueError(
+                        raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
                         )
 
@@ -3339,15 +3340,23 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             _ensure_can_transition(task, TaskStatus.RUNNING)
             raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
-    async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
+    async def complete_task(
+        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_json_object(result, "result")
-        return await self._finish_task(task_id, TaskStatus.COMPLETED, result=result, error=None)
+        return await self._finish_task(
+            task_id, TaskStatus.COMPLETED, result=result, error=None, worker_id=worker_id
+        )
 
-    async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
+    async def fail_task(
+        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_json_object(error, "error")
-        return await self._finish_task(task_id, TaskStatus.FAILED, result=None, error=error)
+        return await self._finish_task(
+            task_id, TaskStatus.FAILED, result=None, error=error, worker_id=worker_id
+        )
 
     async def cancel_task(
         self,
@@ -3705,13 +3714,24 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         *,
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
+        worker_id: str | None = None,
     ) -> Task:
         await self._ensure_ready()
         now = datetime.now(UTC)
+        # When a worker_id is given, only terminalize if that worker still owns an active
+        # lease — a worker that lost its lease must not clobber a task another has reclaimed.
+        owner_clause = ""
+        owner_params: list[Any] = []
+        if worker_id is not None:
+            owner_clause = (
+                "\n                      AND worker_id = %s"
+                "\n                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s"
+            )
+            owner_params = [worker_id, now]
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    """
+                    f"""
                     UPDATE cayu_tasks
                     SET status = %s,
                         status_reason = NULL,
@@ -3724,7 +3744,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         completed_at = %s,
                         updated_at = %s
                     WHERE id = %s
-                      AND status NOT IN (%s, %s, %s)
+                      AND status NOT IN (%s, %s, %s){owner_clause}
                     """,
                     (
                         str(status),
@@ -3737,9 +3757,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         str(TaskStatus.COMPLETED),
                         str(TaskStatus.FAILED),
                         str(TaskStatus.CANCELLED),
+                        *owner_params,
                     ),
                 )
                 if cur.rowcount != 1:
+                    if worker_id is not None:
+                        await self._raise_task_active_lease_error(cur, task_id, worker_id)
                     task = await self._require_task(cur, task_id)
                     _ensure_can_transition(task, status)
                     raise ValueError(f"Task {task.id} cannot transition from {task.status}")

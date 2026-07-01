@@ -30,6 +30,7 @@ from cayu.runtime.sessions import (
     SessionOutcome,
     SessionQuery,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
@@ -527,7 +528,7 @@ class SQLiteSessionStore(SessionStore):
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                raise ValueError(
+                raise SessionStatusConflict(
                     f"Session status transition not allowed: {loaded.status} -> {to_status}"
                 )
 
@@ -559,7 +560,7 @@ class SQLiteSessionStore(SessionStore):
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if loaded.status not in allowed_statuses:
-                    raise ValueError(
+                    raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
 
@@ -591,7 +592,7 @@ class SQLiteSessionStore(SessionStore):
                     current = self._load_unlocked(session_id)
                     if current is None:
                         raise KeyError(f"Session not found: {session_id}")
-                    raise ValueError(
+                    raise SessionStatusConflict(
                         f"Session status transition not allowed: {current.status} -> {to_status}"
                     )
                 if transformed_checkpoint is not None:
@@ -1508,7 +1509,9 @@ class SQLiteTaskStore(TaskStore):
             _ensure_can_transition(task, TaskStatus.RUNNING)
             raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
-    async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
+    async def complete_task(
+        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_json_object(result, "result")
         async with self._lock:
@@ -1517,9 +1520,12 @@ class SQLiteTaskStore(TaskStore):
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
+                worker_id=worker_id,
             )
 
-    async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
+    async def fail_task(
+        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_json_object(error, "error")
         async with self._lock:
@@ -1528,6 +1534,7 @@ class SQLiteTaskStore(TaskStore):
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
+                worker_id=worker_id,
             )
 
     async def cancel_task(
@@ -1860,11 +1867,22 @@ class SQLiteTaskStore(TaskStore):
         *,
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
+        worker_id: str | None = None,
     ) -> Task:
         now = datetime.now(UTC)
+        # When a worker_id is given, only terminalize if that worker still owns an active
+        # lease — a worker that lost its lease must not clobber a task another has reclaimed.
+        owner_clause = ""
+        owner_params: list[str] = []
+        if worker_id is not None:
+            owner_clause = (
+                "\n                  AND worker_id = ?"
+                "\n                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
+            )
+            owner_params = [worker_id, sqlite_support.format_datetime(now)]
         with self._connection:
             cursor = self._connection.execute(
-                """
+                f"""
                 UPDATE cayu_tasks
                 SET status = ?,
                     status_reason = NULL,
@@ -1877,7 +1895,7 @@ class SQLiteTaskStore(TaskStore):
                     completed_at = ?,
                     updated_at = ?
                 WHERE id = ?
-                  AND status NOT IN (?, ?, ?)
+                  AND status NOT IN (?, ?, ?){owner_clause}
                 """,
                 (
                     str(status),
@@ -1890,9 +1908,12 @@ class SQLiteTaskStore(TaskStore):
                     str(TaskStatus.COMPLETED),
                     str(TaskStatus.FAILED),
                     str(TaskStatus.CANCELLED),
+                    *owner_params,
                 ),
             )
         if cursor.rowcount != 1:
+            if worker_id is not None:
+                self._raise_task_active_lease_error(task_id, worker_id)
             task = self._require_task_unlocked(task_id)
             _ensure_can_transition(task, status)
             raise ValueError(f"Task {task.id} cannot transition from {task.status}")

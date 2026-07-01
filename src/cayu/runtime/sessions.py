@@ -33,6 +33,14 @@ from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
 
 
+class SessionStatusConflict(ValueError):
+    """A session status transition was rejected because the session was not in an
+    allowed source status (e.g. resuming a session another worker is already
+    running). Subclasses ``ValueError`` so existing ``except ValueError`` handlers
+    keep working; callers that need to react specifically (e.g. requeue) catch this.
+    """
+
+
 class SessionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -1182,7 +1190,7 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             if session.status not in allowed_statuses:
-                raise ValueError(
+                raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
 
@@ -1214,7 +1222,7 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             if session.status not in allowed_statuses:
-                raise ValueError(
+                raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
 

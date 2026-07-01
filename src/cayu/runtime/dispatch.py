@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from enum import StrEnum
@@ -16,8 +19,12 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.runtime.sessions import SessionStatusConflict
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.tasks import TaskCreate, TaskOrder, TaskQuery, TaskStore
+
+logger = logging.getLogger(__name__)
 
 
 class DispatchStatus(StrEnum):
@@ -159,6 +166,241 @@ class InlineDispatcher(Dispatcher):
             backend=self.backend,
             status=status,
             metadata={"events": event_count},
+        )
+
+
+DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
+
+
+class TaskStoreDispatcher(Dispatcher):
+    """Queue-backed dispatcher that persists work as claimable tasks in a ``TaskStore``.
+
+    ``submit`` enqueues a ``DispatchRequest`` as a PENDING task instead of running it; a
+    worker process claims it (atomically — ``PostgresTaskStore`` uses ``FOR UPDATE SKIP
+    LOCKED``) and runs it through ``dispatch_inline``. Works with any ``TaskStore`` tier:
+    ``InMemoryTaskStore`` (single process), ``SQLiteTaskStore`` (single node), or
+    ``PostgresTaskStore`` (a distributed worker pool). Callers interact through
+    ``DispatchHandle``/``DispatchStatus``; the backing Task id is surfaced as
+    ``metadata["queue_task_id"]`` for observability.
+    """
+
+    backend = "task_store"
+
+    def __init__(
+        self,
+        task_store: TaskStore,
+        *,
+        task_type: str = DEFAULT_DISPATCH_TASK_TYPE,
+        lease_seconds: int = 300,
+    ) -> None:
+        if not isinstance(task_store, TaskStore):
+            raise TypeError("TaskStoreDispatcher requires a TaskStore.")
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be a positive integer.")
+        self._tasks = task_store
+        self._task_type = require_clean_nonblank(task_type, "task_type")
+        self._lease_seconds = lease_seconds
+
+    async def submit(
+        self,
+        runtime: DispatchRuntime,
+        request: DispatchRequest,
+    ) -> DispatchHandle:
+        if request.loop_policies:
+            # loop_policies are process-local callables excluded from JSON serialization, so
+            # they cannot cross a durable queue. Reject rather than silently drop them (which
+            # would make a queued dispatch run with weaker guards than the inline dispatcher).
+            raise ValueError(
+                "TaskStoreDispatcher cannot queue a DispatchRequest with loop_policies; "
+                "they are process-local and do not survive serialization."
+            )
+        # No defensive copy here: app.dispatch already copied the request, model_dump produces
+        # an isolated snapshot, and the handle reads only immutable string fields.
+        # The queue task must be session-unbound (``session_id is None``) to be claimable by
+        # a worker pool; the target session_id rides inside the serialized request payload.
+        task = await self._tasks.create_task(
+            TaskCreate(
+                type=self._task_type,
+                parent_task_id=request.task_id,
+                input={"request": request.model_dump(mode="json")},
+            )
+        )
+        return self._handle(request, DispatchStatus.SUBMITTED, queue_task_id=task.id)
+
+    async def process_next(
+        self,
+        runtime: DispatchRuntime,
+        *,
+        worker_id: str,
+    ) -> DispatchHandle | None:
+        """Claim and run one queued dispatch.
+
+        Returns ``None`` if the queue is empty, or if the claimed task's payload was
+        malformed (in which case the task is failed before returning).
+        """
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        task = await self._tasks.claim_task(
+            worker_id,
+            # FIFO: claim the oldest pending dispatch so steady arrivals can't starve it.
+            TaskQuery(type=self._task_type, order_by=TaskOrder.CREATED_AT_ASC),
+            lease_seconds=self._lease_seconds,
+        )
+        if task is None:
+            return None
+        # Fail a malformed payload (missing or no-longer-valid request — e.g. an older
+        # serialization claimed after a schema change) terminally, rather than letting the
+        # error escape and leave the task to be reclaimed and re-fail forever.
+        payload = task.input.get("request")
+        try:
+            if type(payload) is not dict:
+                raise ValueError("dispatch task request payload is not an object")
+            request = DispatchRequest.model_validate(payload)
+        except Exception as exc:
+            await self._tasks.fail_task(
+                task.id,
+                {
+                    "error": f"invalid dispatch request payload: {exc}",
+                    "error_type": type(exc).__name__,
+                },
+                worker_id=worker_id,
+            )
+            return None
+
+        # Heartbeat in the background so the lease survives long gaps between events (a slow
+        # model/tool turn would otherwise let the lease lapse and another worker re-run it).
+        # The outer try/finally keeps the heartbeat alive THROUGH terminalization — a slow
+        # complete/fail/release must not let the lease expire and get the task reclaimed and
+        # run a second time — and always stops it, including on CancelledError (graceful
+        # worker shutdown), which neither except below catches.
+        status = DispatchStatus.SUBMITTED
+        heartbeat = asyncio.create_task(self._heartbeat(task.id, worker_id))
+        try:
+            try:
+                async for event in runtime.dispatch_inline(request):
+                    status = _dispatch_status_after_event(event, fallback=status)
+            except SessionStatusConflict:
+                # The session is already being run by another worker — requeue rather than
+                # fail, so it runs once that session frees up (per-session serialization).
+                await self._tasks.release_task(task.id, worker_id)
+                return self._handle(
+                    request, DispatchStatus.SUBMITTED, queue_task_id=task.id, requeued=True
+                )
+            except Exception as exc:
+                return await self._terminalize(
+                    task.id,
+                    worker_id,
+                    request,
+                    DispatchStatus.FAILED,
+                    {"error": str(exc), "error_type": type(exc).__name__},
+                )
+            # A run can fail in-band (a SESSION_FAILED event, not an exception); record that as
+            # a failed task so failure queries and retries see it, not a COMPLETED one.
+            return await self._terminalize(
+                task.id, worker_id, request, status, {"status": status.value}
+            )
+        finally:
+            await self._stop_heartbeat(heartbeat)
+
+    async def _terminalize(
+        self,
+        task_id: str,
+        worker_id: str,
+        request: DispatchRequest,
+        status: DispatchStatus,
+        payload: dict[str, Any],
+    ) -> DispatchHandle:
+        """Record the run's terminal outcome, guarded by lease ownership. If this worker lost
+        the lease (the task was reclaimed by another worker), don't clobber its record — log
+        and return a handle marked ``reclaimed``; the reclaiming worker re-runs it."""
+        try:
+            if status is DispatchStatus.FAILED:
+                await self._tasks.fail_task(task_id, payload, worker_id=worker_id)
+            else:
+                await self._tasks.complete_task(task_id, payload, worker_id=worker_id)
+        except ValueError:
+            # Only the ownership/lease guard can raise ValueError here; it means the task is no
+            # longer ours (reclaimed / already terminalized elsewhere), so we must not clobber.
+            logger.warning(
+                "dispatch %s (%s) lost its lease before terminalizing; another worker will re-run it",
+                request.dispatch_id,
+                status.value,
+            )
+            return self._handle(request, status, queue_task_id=task_id, reclaimed=True)
+        return self._handle(request, status, queue_task_id=task_id)
+
+    async def _heartbeat(self, task_id: str, worker_id: str) -> None:
+        """Extend the lease every ``lease_seconds / 3`` until cancelled (best effort)."""
+        interval = self._lease_seconds / 3
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._tasks.heartbeat(task_id, worker_id, extend_seconds=self._lease_seconds)
+            except Exception:
+                logger.warning("dispatch heartbeat failed for task %s", task_id, exc_info=True)
+
+    @staticmethod
+    async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+
+    async def run_worker(
+        self,
+        runtime: DispatchRuntime,
+        *,
+        worker_id: str,
+        stop: asyncio.Event,
+        poll_interval_s: float = 1.0,
+        reclaim_every_s: float = 60.0,
+    ) -> None:
+        """Claim-and-run loop until ``stop`` is set, periodically reclaiming dead leases."""
+        loop = asyncio.get_running_loop()
+        next_reclaim = loop.time()
+        while not stop.is_set():
+            if loop.time() >= next_reclaim:
+                try:
+                    await self._tasks.reclaim_expired(query=TaskQuery(type=self._task_type))
+                except Exception:
+                    logger.warning("dispatch reclaim_expired failed", exc_info=True)
+                next_reclaim = loop.time() + reclaim_every_s
+            try:
+                handle = await self.process_next(runtime, worker_id=worker_id)
+            except Exception:
+                # A transient store error on one task must not kill the durable worker loop.
+                logger.exception("dispatch worker failed while processing a task")
+                handle = None
+            # Back off when idle, after a busy-session requeue, or after a lost-lease reclaim —
+            # otherwise the just-released/reclaimed task (FIFO-oldest) is re-claimed immediately
+            # in a tight loop, re-running the agent with no delay.
+            if (
+                handle is None
+                or handle.metadata.get("requeued")
+                or handle.metadata.get("reclaimed")
+            ):
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
+
+    def _handle(
+        self,
+        request: DispatchRequest,
+        status: DispatchStatus,
+        *,
+        queue_task_id: str,
+        requeued: bool = False,
+        reclaimed: bool = False,
+    ) -> DispatchHandle:
+        metadata: dict[str, Any] = {"queue_task_id": queue_task_id}
+        if requeued:
+            metadata["requeued"] = True
+        if reclaimed:
+            metadata["reclaimed"] = True
+        return DispatchHandle(
+            dispatch_id=request.dispatch_id,
+            session_id=request.session_id,
+            task_id=request.task_id,
+            backend=self.backend,
+            status=status,
+            metadata=metadata,
         )
 
 

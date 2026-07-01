@@ -199,12 +199,25 @@ class TaskStore(ABC):
         """Mark a pending task as running, or attach a live claimed task owned by ``worker_id``."""
 
     @abstractmethod
-    async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
-        """Mark a pending or running task as completed."""
+    async def complete_task(
+        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
+        """Mark a pending or running task as completed.
+
+        If ``worker_id`` is given, the update fails unless that worker still owns an active
+        lease on the task, so a worker that lost its lease cannot clobber a task another
+        worker has since reclaimed.
+        """
 
     @abstractmethod
-    async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
-        """Mark a pending or running task as failed."""
+    async def fail_task(
+        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
+        """Mark a pending or running task as failed.
+
+        If ``worker_id`` is given, the update fails unless that worker still owns an active
+        lease on the task.
+        """
 
     @abstractmethod
     async def cancel_task(
@@ -356,7 +369,9 @@ class InMemoryTaskStore(TaskStore):
             self._tasks[task_id] = updated
             return updated.model_copy(deep=True)
 
-    async def complete_task(self, task_id: str, result: dict[str, Any]) -> Task:
+    async def complete_task(
+        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_json_object(result, "result")
         async with self._lock:
@@ -365,9 +380,12 @@ class InMemoryTaskStore(TaskStore):
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
+                worker_id=worker_id,
             )
 
-    async def fail_task(self, task_id: str, error: dict[str, Any]) -> Task:
+    async def fail_task(
+        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_json_object(error, "error")
         async with self._lock:
@@ -376,6 +394,7 @@ class InMemoryTaskStore(TaskStore):
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
+                worker_id=worker_id,
             )
 
     async def cancel_task(
@@ -594,8 +613,13 @@ class InMemoryTaskStore(TaskStore):
         *,
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
+        worker_id: str | None = None,
     ) -> Task:
         task = self._require_task(task_id)
+        if worker_id is not None:
+            if task.worker_id != worker_id:
+                raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+            _ensure_active_task_lease(task, worker_id)
         _ensure_can_transition(task, status)
         now = datetime.now(UTC)
         updated = task.model_copy(
