@@ -22,6 +22,10 @@ class ToolPolicyDecision(StrEnum):
 
 ANY_TAINT_LABEL = "*"
 TAINT_LABELS_METADATA_KEY = "cayu:taint_labels"
+# Set to True in a ToolPolicyRequest's metadata when a call is being re-authorized because a
+# before_tool_call hook modified the arguments. Stateful policies (rate limiters, counters, audit
+# sinks) can re-check the limit but skip re-incrementing so a hook-modified call counts once.
+TOOL_POLICY_REAUTHORIZATION_METADATA_KEY = "cayu:tool_policy_reauthorization"
 
 
 class ToolPolicyRequest(BaseModel):

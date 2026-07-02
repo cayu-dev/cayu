@@ -88,6 +88,9 @@ from cayu.runtime.event_watchers import (
     InMemoryEventWatcherStore,
 )
 from cayu.runtime.hooks import (
+    AfterToolCallDecision,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
     RuntimeHook,
     RuntimeHookContext,
     RuntimeHookPhase,
@@ -170,6 +173,7 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_policy import (
     ANY_TAINT_LABEL,
     TAINT_LABELS_METADATA_KEY,
+    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
     AllowlistRule,
     DenyPatternRule,
@@ -199,11 +203,15 @@ from cayu.runtime.usage import (
 __all__ = [
     "ANY_TAINT_LABEL",
     "TAINT_LABELS_METADATA_KEY",
+    "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
+    "AfterToolCallDecision",
     "AllowAllToolPolicy",
     "AllowlistRule",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",
+    "BeforeToolCallDecision",
+    "BeforeToolCallHookContext",
     "BudgetAction",
     "BudgetCheck",
     "BudgetLedger",

@@ -5,7 +5,7 @@ import contextlib
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
@@ -155,6 +155,9 @@ from cayu.runtime.event_watchers import (
     run_event_watcher_handler,
 )
 from cayu.runtime.hooks import (
+    AfterToolCallDecision,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
     RuntimeHook,
     RuntimeHookContext,
     RuntimeHookPhase,
@@ -243,6 +246,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
+    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
     TaintAwareToolPolicy,
     ToolPolicy,
@@ -2267,7 +2271,9 @@ class CayuApp:
                 arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
             )
             tool_event = emitted_recovery_events[-1]
-            async for event in self._run_tool_call_hooks(
+            # Manual recovery persists the operator-supplied result before hooks run, so
+            # after_tool_call is observe-only here (v1): the threaded modification is ignored.
+            async for event, _modified in self._run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -2275,6 +2281,8 @@ class CayuApp:
                 tool_call=tool_call,
                 result=recovered_result,
                 task_id=pending_approval.task_id,
+                redactor=self._secret_redactor,
+                allow_modification=False,
             ):
                 yield event
         except Exception:
@@ -4857,6 +4865,7 @@ class CayuApp:
         tool_round_id: str | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
+        started_event: Event | None = None
         if emit_started:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
@@ -4866,19 +4875,17 @@ class CayuApp:
                 payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
-            yield (
-                await self._emit(
-                    Event(
-                        type=EventType.TOOL_CALL_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=tool_call.name,
-                        payload=payload,
-                    )
-                ),
-                None,
+            started_event = await self._emit(
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload=payload,
+                )
             )
+            yield started_event, None
 
         registered_tool = registered_agent.tools.get(tool_call.name)
         if registered_tool is None:
@@ -4991,6 +4998,135 @@ class CayuApp:
                     f"Unsupported tool policy decision: {resolved_policy_result.decision}"
                 )
 
+        # before_tool_call hooks run after policy authorization, before the tool executes. They can
+        # modify arguments, short-circuit with a synthetic result, or block the call.
+        anchor_event = started_event or Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            tool_name=tool_call.name,
+            payload={"tool_call_id": tool_call.id},
+        )
+        before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
+        async for hook_event in self._run_before_tool_call_hooks(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            anchor_event=anchor_event,
+            task_id=task_id,
+            resolution=before_resolution,
+        ):
+            yield hook_event, None
+        # Compute the effective call once, before any branch consumes it: a before-hook may have
+        # rewritten the arguments, and every downstream path (block, short-circuit, re-auth, run)
+        # must see the effective arguments, not the original.
+        effective_tool_call = (
+            tool_call
+            if before_resolution.arguments == tool_call.arguments
+            else replace(tool_call, arguments=before_resolution.arguments)
+        )
+        effective_arguments_payload = (
+            {"effective_arguments": effective_tool_call.arguments}
+            if effective_tool_call is not tool_call
+            else {}
+        )
+        if before_resolution.block_reason is not None:
+            # A block is a gate decision, not a tool outcome: observe-only (allow_modification=False).
+            async for event in self._emit_terminal_tool_result(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                event_type=EventType.TOOL_CALL_BLOCKED,
+                result=ToolResult(content=before_resolution.block_reason, is_error=True),
+                extra_payload={
+                    "reason": before_resolution.block_reason,
+                    "blocked_by": "before_tool_call_hook",
+                    **effective_arguments_payload,
+                },
+                task_id=task_id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                allow_modification=False,
+            ):
+                yield event
+            return
+        if before_resolution.short_circuit_result is not None:
+            short_result = before_resolution.short_circuit_result
+            # A synthetic result stands in for a real tool outcome: after-hooks may modify it.
+            async for event in self._emit_terminal_tool_result(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                event_type=(
+                    EventType.TOOL_CALL_FAILED
+                    if short_result.is_error
+                    else EventType.TOOL_CALL_COMPLETED
+                ),
+                result=short_result,
+                extra_payload={
+                    "short_circuited_by": "before_tool_call_hook",
+                    **effective_arguments_payload,
+                },
+                task_id=task_id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                allow_modification=True,
+            ):
+                yield event
+            return
+
+        # Re-authorize the effective arguments so ToolPolicy always vets what actually runs — a hook
+        # cannot slip modified arguments past the gate. Unchanged arguments skip the second check.
+        if effective_tool_call is not tool_call:
+            reauthorization = await self._authorize_tool_call(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                # Mark the re-check so stateful policies (rate limiters, counters, audit) can
+                # re-verify the effective args without double-counting a hook-modified call.
+                request_metadata={
+                    **request_metadata,
+                    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
+                },
+            )
+            if reauthorization.decision != ToolPolicyDecision.ALLOW:
+                # Fail-safe: DENY or REQUIRE_APPROVAL on hook-modified arguments blocks the call.
+                # REQUIRE_APPROVAL is unsupported here in v1 — approval-resume re-runs before-hooks
+                # and would double-apply the modification.
+                if reauthorization.decision == ToolPolicyDecision.DENY:
+                    reason = tool_execution.policy_denial_reason(reauthorization)
+                else:
+                    reason = (
+                        reauthorization.reason
+                        or "Modified tool arguments require approval, which before_tool_call "
+                        "hook modifications do not support."
+                    )
+                async for event in self._emit_terminal_tool_result(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=effective_tool_call,
+                    event_type=EventType.TOOL_CALL_BLOCKED,
+                    result=ToolResult(content=reason, is_error=True),
+                    extra_payload={
+                        "reason": reason,
+                        "decision": reauthorization.decision.value,
+                        "blocked_by": "tool_policy_reauthorization",
+                        **effective_arguments_payload,
+                    },
+                    task_id=task_id,
+                    tool_round_id=tool_round_id,
+                    approval_id=approval_id,
+                    allow_modification=False,
+                ):
+                    yield event
+                return
+
         resolved_proxy_secrets: list[ResolvedSecret] = []
         proxy_authorizations: list[_ProxyAuthorizationRecord] = []
         try:
@@ -5019,7 +5155,8 @@ class CayuApp:
                         approval_id=approval_id,
                     ),
                 ),
-                arguments=deepcopy(tool_call.arguments),
+                # effective_tool_call.arguments is the (re-authorized) private copy to execute.
+                arguments=effective_tool_call.arguments,
             )
         except asyncio.CancelledError:
             if proxy_authorizations and await self._session_interrupt_requested(session.id):
@@ -5063,6 +5200,10 @@ class CayuApp:
         payload = {
             "tool_call_id": tool_call.id,
             "result": result.model_dump(),
+            # A before_tool_call hook may have rewritten the args; record what actually executed so
+            # audit / replay can reconstruct the effective call (TOOL_CALL_STARTED still shows the
+            # model's originally requested arguments). Empty when unchanged.
+            **effective_arguments_payload,
         }
         if tool_round_id is not None:
             payload["tool_round_id"] = tool_round_id
@@ -5080,10 +5221,11 @@ class CayuApp:
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
-            tool_call=tool_call,
+            tool_call=effective_tool_call,
             result=result,
             task_id=task_id,
             redactor=redactor,
+            allow_modification=True,
         ):
             yield event
 
@@ -6354,6 +6496,145 @@ class CayuApp:
         ):
             yield hook_event
 
+    async def _emit_terminal_tool_result(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        event_type: EventType,
+        result: ToolResult,
+        extra_payload: dict[str, Any],
+        task_id: str | None,
+        tool_round_id: str | None,
+        approval_id: str | None,
+        allow_modification: bool,
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        # Shared emission for the before-hook block / short-circuit terminal results.
+        payload: dict[str, Any] = {
+            "tool_call_id": tool_call.id,
+            **extra_payload,
+            "result": result.model_dump(),
+        }
+        if tool_round_id is not None:
+            payload["tool_round_id"] = tool_round_id
+        if approval_id is not None:
+            payload["approval_id"] = approval_id
+        async for event in self._emit_tool_call_result_with_hooks(
+            event=Event(
+                type=event_type,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                tool_name=tool_call.name,
+                payload=payload,
+            ),
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+            allow_modification=allow_modification,
+        ):
+            yield event
+
+    async def _run_before_tool_call_hooks(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        anchor_event: Event,
+        task_id: str | None,
+        resolution: _BeforeToolCallResolution,
+    ) -> AsyncIterator[Event]:
+        # App-scope then agent-scope, registration order; each hook sees prior hooks' modified
+        # arguments. The first short_circuit/block stops the chain. A raising hook or invalid
+        # decision emits HOOK_FAILED and proceeds unmodified (same isolation as after_tool_call).
+        for hooks, scope in (
+            (self._runtime_hooks, "app"),
+            (registered_agent.runtime_hooks, "agent"),
+        ):
+            for hook in hooks:
+                if not _runtime_hook_supports_phase(
+                    hook=hook,
+                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                ):
+                    continue
+                hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
+                yield await self._emit(
+                    _runtime_hook_event(
+                        event_type=EventType.HOOK_STARTED,
+                        hook_name=hook_name,
+                        scope=scope,
+                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        terminal_event=anchor_event,
+                        payload={
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                        },
+                    )
+                )
+                context = BeforeToolCallHookContext(
+                    runtime=self,
+                    hook_name=hook_name,
+                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                    session=session,
+                    tool_name=tool_call.name,
+                    tool_call_id=tool_call.id,
+                    arguments=resolution.arguments,
+                    task_id=task_id,
+                )
+                try:
+                    decision = await hook.before_tool_call(context)
+                    stop = _resolve_before_tool_call_decision(decision, resolution)
+                except Exception as exc:
+                    yield await self._emit(
+                        _runtime_hook_event(
+                            event_type=EventType.HOOK_FAILED,
+                            hook_name=hook_name,
+                            scope=scope,
+                            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            terminal_event=anchor_event,
+                            payload={
+                                "tool_name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "actions": context.actions,
+                            },
+                        )
+                    )
+                    continue
+                yield await self._emit(
+                    _runtime_hook_event(
+                        event_type=EventType.HOOK_COMPLETED,
+                        hook_name=hook_name,
+                        scope=scope,
+                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        terminal_event=anchor_event,
+                        payload={
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
+                            "actions": context.actions,
+                        },
+                    )
+                )
+                if stop:
+                    return
+
     async def _emit_tool_call_result_with_hooks(
         self,
         *,
@@ -6365,26 +6646,46 @@ class CayuApp:
         result: ToolResult,
         task_id: str | None,
         redactor: SecretRedactor | None = None,
+        allow_modification: bool = False,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         resolved_redactor = redactor if redactor is not None else self._secret_redactor
+        # Redact up front so after_tool_call hooks never observe raw secrets. Hooks run BEFORE
+        # persistence so a modify decision (only honored for real tool outcomes via
+        # allow_modification) rewrites the result the transcript keeps and the model sees; the
+        # rewritten result is re-redacted so hook-injected secrets are scrubbed too. `event` is
+        # unpersisted here but carries a stable id, reused when it persists.
         event, result = _redact_tool_result_event(
             event=event,
             result=result,
             redactor=resolved_redactor,
         )
-        tool_event = await self._emit(event)
-        outcome = runtime_records.ToolCallOutcome(call=tool_call, result=result)
-        yield tool_event, outcome
-        async for hook_event in self._run_tool_call_hooks(
+        final_result = result
+        async for hook_event, modified in self._run_tool_call_hooks(
             session=session,
-            tool_event=tool_event,
+            tool_event=event,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             tool_call=tool_call,
-            result=result,
+            result=final_result,
             task_id=task_id,
+            redactor=resolved_redactor,
+            allow_modification=allow_modification,
         ):
             yield hook_event, None
+            if modified is not None:
+                final_result = modified
+        if final_result is not result:
+            payload = dict(event.payload)
+            payload["result"] = final_result.model_dump()
+            event = event.model_copy(update={"payload": payload})
+            event, final_result = _redact_tool_result_event(
+                event=event,
+                result=final_result,
+                redactor=resolved_redactor,
+            )
+        tool_event = await self._emit(event)
+        outcome = runtime_records.ToolCallOutcome(call=tool_call, result=final_result)
+        yield tool_event, outcome
 
     async def _run_tool_call_hooks(
         self,
@@ -6396,31 +6697,33 @@ class CayuApp:
         tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
-    ) -> AsyncIterator[Event]:
-        async for hook_event in self._run_scoped_tool_call_hooks(
-            session=session,
-            tool_event=tool_event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=result,
-            task_id=task_id,
-            hooks=self._runtime_hooks,
-            scope="app",
+        redactor: SecretRedactor,
+        allow_modification: bool = False,
+    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
+        # Thread the result across app-scope then agent-scope hooks: each hook's `modify` becomes
+        # the next hook's input. When allow_modification is False (non-execution results, recovery),
+        # after-hooks are observe-only — modifications are neither threaded nor applied.
+        current_result = result
+        for hooks, scope in (
+            (self._runtime_hooks, "app"),
+            (registered_agent.runtime_hooks, "agent"),
         ):
-            yield hook_event
-        async for hook_event in self._run_scoped_tool_call_hooks(
-            session=session,
-            tool_event=tool_event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=result,
-            task_id=task_id,
-            hooks=registered_agent.runtime_hooks,
-            scope="agent",
-        ):
-            yield hook_event
+            async for hook_event, modified in self._run_scoped_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=current_result,
+                task_id=task_id,
+                hooks=hooks,
+                scope=scope,
+                redactor=redactor,
+                allow_modification=allow_modification,
+            ):
+                yield hook_event, modified
+                if modified is not None:
+                    current_result = modified
 
     async def _run_scoped_tool_call_hooks(
         self,
@@ -6434,7 +6737,10 @@ class CayuApp:
         task_id: str | None,
         hooks: tuple[RuntimeHook, ...],
         scope: str,
-    ) -> AsyncIterator[Event]:
+        redactor: SecretRedactor,
+        allow_modification: bool = False,
+    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
+        current_result = result
         for hook in hooks:
             if not _runtime_hook_supports_phase(
                 hook=hook,
@@ -6442,40 +6748,10 @@ class CayuApp:
             ):
                 continue
             hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
-            yield await self._emit(
-                _runtime_hook_event(
-                    event_type=EventType.HOOK_STARTED,
-                    hook_name=hook_name,
-                    scope=scope,
-                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    terminal_event=tool_event,
-                    payload={
-                        "tool_name": tool_call.name,
-                        "tool_call_id": tool_call.id,
-                    },
-                )
-            )
-            context = ToolCallHookContext(
-                runtime=self,
-                hook_name=hook_name,
-                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                session=session,
-                tool_event=tool_event,
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                arguments=tool_call.arguments,
-                result=result,
-                task_id=task_id,
-            )
-            try:
-                await hook.after_tool_call(context)
-            except Exception as exc:
-                yield await self._emit(
+            yield (
+                await self._emit(
                     _runtime_hook_event(
-                        event_type=EventType.HOOK_FAILED,
+                        event_type=EventType.HOOK_STARTED,
                         hook_name=hook_name,
                         scope=scope,
                         phase=RuntimeHookPhase.AFTER_TOOL_CALL,
@@ -6486,29 +6762,78 @@ class CayuApp:
                         payload={
                             "tool_name": tool_call.name,
                             "tool_call_id": tool_call.id,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                        },
+                    )
+                ),
+                None,
+            )
+            context = ToolCallHookContext(
+                runtime=self,
+                hook_name=hook_name,
+                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                session=session,
+                tool_event=tool_event,
+                tool_name=tool_call.name,
+                tool_call_id=tool_call.id,
+                # Redact both fields the after-hook reads — it must never observe raw secrets,
+                # whether in the (possibly effective) arguments or the (possibly prior-hook-modified
+                # or recovery-supplied) result. Only the hook's view is redacted; the threaded
+                # result is re-redacted before persistence.
+                arguments=redactor.redact_json(tool_call.arguments),
+                result=tool_results.redact_tool_result(current_result, redactor),
+                task_id=task_id,
+            )
+            try:
+                decision = await hook.after_tool_call(context)
+                # Always validate the decision (raises → hook.failed) even on observe-only paths;
+                # only APPLY the modification when allow_modification.
+                resolved = _resolve_after_tool_call_decision(decision)
+                modified = resolved if allow_modification else None
+            except Exception as exc:
+                yield (
+                    await self._emit(
+                        _runtime_hook_event(
+                            event_type=EventType.HOOK_FAILED,
+                            hook_name=hook_name,
+                            scope=scope,
+                            phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            terminal_event=tool_event,
+                            payload={
+                                "tool_name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "actions": context.actions,
+                            },
+                        )
+                    ),
+                    None,
+                )
+                continue
+            if modified is not None:
+                current_result = modified
+            yield (
+                await self._emit(
+                    _runtime_hook_event(
+                        event_type=EventType.HOOK_COMPLETED,
+                        hook_name=hook_name,
+                        scope=scope,
+                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        terminal_event=tool_event,
+                        payload={
+                            "tool_name": tool_call.name,
+                            "tool_call_id": tool_call.id,
                             "actions": context.actions,
                         },
                     )
-                )
-                continue
-            yield await self._emit(
-                _runtime_hook_event(
-                    event_type=EventType.HOOK_COMPLETED,
-                    hook_name=hook_name,
-                    scope=scope,
-                    phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    terminal_event=tool_event,
-                    payload={
-                        "tool_name": tool_call.name,
-                        "tool_call_id": tool_call.id,
-                        "actions": context.actions,
-                    },
-                )
+                ),
+                modified,
             )
 
     async def _run_runtime_hooks(
@@ -7220,6 +7545,8 @@ def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
         return "after_session_failed"
     if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
         return "after_session_interrupted"
+    if phase == RuntimeHookPhase.BEFORE_TOOL_CALL:
+        return "before_tool_call"
     if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
         return "after_tool_call"
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
@@ -7618,6 +7945,65 @@ async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
     close = getattr(iterator, "aclose", None)
     if close is not None:
         await close()
+
+
+@dataclass
+class _BeforeToolCallResolution:
+    """Mutable outcome threaded through the before_tool_call hook chain.
+
+    Hooks refine `arguments` (proceed_modified); the first hook to short-circuit or block sets the
+    corresponding result and stops the chain.
+    """
+
+    arguments: dict[str, Any]
+    short_circuit_result: ToolResult | None = None
+    block_reason: str | None = None
+
+
+def _resolve_before_tool_call_decision(
+    decision: BeforeToolCallDecision | None,
+    resolution: _BeforeToolCallResolution,
+) -> bool:
+    """Apply a before_tool_call decision to `resolution`; return True to stop the chain."""
+    if decision is None:
+        return False
+    if type(decision) is not BeforeToolCallDecision:
+        raise TypeError("before_tool_call must return a BeforeToolCallDecision or None.")
+    if decision.action == "proceed":
+        return False
+    if decision.action == "proceed_modified":
+        modified_arguments = decision.modified_arguments
+        if modified_arguments is None:
+            raise TypeError("A proceed_modified decision must carry modified_arguments.")
+        resolution.arguments = copy_json_value(modified_arguments, "modified_arguments")
+        return False
+    if decision.action == "short_circuit":
+        synthetic = decision.synthetic_result
+        if synthetic is None:
+            raise TypeError("A short_circuit decision must carry a synthetic_result.")
+        resolution.short_circuit_result = synthetic.model_copy(deep=True)
+        return True
+    reason = decision.block_reason
+    if reason is None:
+        raise TypeError("A block decision must carry a block_reason.")
+    resolution.block_reason = reason
+    return True
+
+
+def _resolve_after_tool_call_decision(
+    decision: AfterToolCallDecision | None,
+) -> ToolResult | None:
+    """Return the replacement result for an after_tool_call decision, or None to pass through."""
+    if decision is None:
+        return None
+    if type(decision) is not AfterToolCallDecision:
+        raise TypeError("after_tool_call must return an AfterToolCallDecision or None.")
+    if decision.action == "modify":
+        modified = decision.modified_result
+        if modified is None:
+            raise TypeError("An after_tool_call modify decision must carry a modified_result.")
+        return modified.model_copy(deep=True)
+    return None
 
 
 def _runtime_hook_event(
