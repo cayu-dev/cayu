@@ -1084,6 +1084,14 @@ The built-in local implementations are:
 - `LocalEnvVault`: maps secret names to environment variables in the trusted app process.
 - `StaticVault`: stores in-memory secrets for tests and trusted local development.
 
+The built-in composition vaults combine other vaults behind one `Vault` (e.g. static API keys +
+per-tenant dynamic tokens in one environment):
+
+- `ChainVault(*vaults)`: tries each vault in order; the first that resolves the secret wins.
+  A vault raising `SecretNotFound` is skipped; any other error propagates.
+- `RoutedVault(routes, *, fallback=None)`: routes each secret name to a specific vault, with an
+  optional fallback for unrouted names.
+
 `SecretEnv` represents a deliberate environment variable injection:
 
 ```python

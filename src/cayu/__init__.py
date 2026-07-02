@@ -410,8 +410,10 @@ from cayu.tools import (
 )
 from cayu.vaults import (
     REDACTED_SECRET,
+    ChainVault,
     LocalEnvVault,
     ResolvedSecret,
+    RoutedVault,
     SecretEnv,
     SecretNotFound,
     SecretRedactor,
@@ -524,6 +526,7 @@ __all__ = [
     "CausalBudgetCostSummary",
     "CausalBudgetUsageSummary",
     "CayuApp",
+    "ChainVault",
     "ChatCompletionsProvider",
     "CheckpointCompactionContextPolicy",
     "CompactionPromptBuilder",
@@ -702,6 +705,7 @@ __all__ = [
     "RetryDecision",
     "RetryPolicy",
     "RetryReason",
+    "RoutedVault",
     "RunLimits",
     "RunRequest",
     "RunnerCancelledError",
