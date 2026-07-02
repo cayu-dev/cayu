@@ -40,6 +40,7 @@ from cayu.providers.base import (
     InputTokenCountResult,
     ModelCompletion,
     ModelContextOverflowError,
+    ModelContextPressureProfile,
     ModelFinishReason,
     ModelProvider,
     ModelRequest,
@@ -51,6 +52,7 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
 DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN = 6
 
 _RESERVED_OPENAI_OPTIONS = {
     "model",
@@ -238,6 +240,12 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
 
     name = "openai"
     supports_native_structured_output = True
+
+    @property
+    def context_pressure_profile(self) -> ModelContextPressureProfile:
+        return ModelContextPressureProfile(
+            tool_schema_chars_per_token=OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
+        )
 
     def __init__(
         self,

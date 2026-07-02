@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -12,7 +14,12 @@ from cayu._validation import (
     require_clean_nonblank,
     require_nonblank,
 )
-from cayu.artifacts import FileAttachment, file_attachment_from_payload
+from cayu.artifacts import (
+    RESOLVED_FILE_ATTACHMENTS_OPTION,
+    FileAttachment,
+    FileAttachmentKind,
+    file_attachment_from_payload,
+)
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
 from cayu.core.messages import (
@@ -26,6 +33,7 @@ from cayu.core.messages import (
     copy_message,
     copy_message_part,
 )
+from cayu.core.tools import ToolSpec
 from cayu.providers.base import (
     ModelProvider,
     ModelRequest,
@@ -50,6 +58,119 @@ _DEFAULT_KNOWLEDGE_INJECTION_MAX_BYTES = 4000
 _DEFAULT_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 2000
 _MIN_KNOWLEDGE_INJECTION_MAX_BYTES = 200
 _MIN_KNOWLEDGE_INJECTION_QUERY_MAX_CHARS = 50
+_DEFAULT_ESTIMATE_CHARS_PER_TOKEN = 5
+_DEFAULT_ESTIMATE_JSON_CHARS_PER_TOKEN = 5
+_DEFAULT_ESTIMATE_JSON_TEXT_CHARS_PER_TOKEN = 3
+_DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN = 3
+_DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS = 32
+_DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS = 0
+_DEFAULT_ESTIMATE_TOOL_SCHEMA_CHARS_PER_TOKEN = 4
+_INTERNAL_REQUEST_OPTION_KEYS = frozenset(
+    {
+        "agent_metadata",
+        "environment_metadata",
+        "step",
+        "structured_output",
+        RESOLVED_FILE_ATTACHMENTS_OPTION,
+    }
+)
+
+
+class ContextPressureOverhead(BaseModel):
+    """Known provider-request overhead included in local context pressure estimates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    structured_output_instruction: str | None = None
+    request_options: dict[str, Any] = Field(default_factory=dict)
+    image_min_tokens: StrictInt = Field(default=_DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS, ge=0)
+    document_min_tokens: StrictInt = Field(
+        default=_DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS,
+        ge=0,
+    )
+    document_bytes_per_token: StrictInt = Field(
+        default=_DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+        ge=1,
+    )
+    tool_schema_chars_per_token: StrictInt = Field(
+        default=_DEFAULT_ESTIMATE_TOOL_SCHEMA_CHARS_PER_TOKEN,
+        ge=1,
+    )
+
+    @field_validator("tools", "request_options", mode="before")
+    @classmethod
+    def copy_json_data(cls, value, info):
+        return copy_json_value(value, info.field_name)
+
+    @field_validator("structured_output_instruction")
+    @classmethod
+    def validate_optional_instruction(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, "structured_output_instruction")
+
+
+def copy_context_pressure_overhead(
+    overhead: ContextPressureOverhead | None,
+) -> ContextPressureOverhead:
+    if overhead is None:
+        return ContextPressureOverhead()
+    if type(overhead) is not ContextPressureOverhead:
+        raise TypeError("Context pressure overhead must be a ContextPressureOverhead instance.")
+    return ContextPressureOverhead(**overhead.model_dump())
+
+
+class ContextPressureEstimate(BaseModel):
+    """Estimated current context pressure.
+
+    This is a local pressure signal, not provider-authoritative token counting and
+    not billing data. Estimates may use previous actual usage plus a transcript delta
+    or a full local estimate of the model-facing request shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: str = "observed_plus_estimated_delta"
+    confidence: str = "estimated"
+    observed_context_input_tokens: StrictInt = Field(ge=0)
+    estimated_delta_input_tokens: StrictInt = Field(ge=0)
+    estimated_message_input_tokens: StrictInt = Field(ge=0)
+    estimated_tool_schema_input_tokens: StrictInt = Field(ge=0)
+    estimated_structured_output_input_tokens: StrictInt = Field(ge=0)
+    estimated_request_options_input_tokens: StrictInt = Field(ge=0)
+    estimated_request_overhead_input_tokens: StrictInt = Field(default=0, ge=0)
+    previous_request_overhead_input_tokens: StrictInt | None = Field(default=None, ge=0)
+    estimated_request_overhead_delta_tokens: StrictInt = 0
+    estimated_attachment_input_tokens: StrictInt = Field(ge=0)
+    estimated_context_input_tokens: StrictInt = Field(ge=0)
+    reserved_output_tokens: StrictInt = Field(default=0, ge=0)
+    estimated_context_window_tokens: StrictInt = Field(ge=0)
+    provider_count_input_tokens: StrictInt | None = Field(default=None, ge=0)
+    provider_count_context_window_tokens: StrictInt | None = Field(default=None, ge=0)
+    anchor_transcript_cursor: StrictInt = Field(ge=0)
+    current_transcript_cursor: StrictInt = Field(ge=0)
+    estimated_message_count: StrictInt = Field(ge=0)
+    chars_per_token: StrictInt = Field(ge=1)
+    json_chars_per_token: StrictInt = Field(ge=1)
+    binary_bytes_per_token: StrictInt = Field(ge=1)
+
+    @field_validator("method", "confidence")
+    @classmethod
+    def validate_nonblank(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
+def copy_context_pressure_estimate(
+    estimate: ContextPressureEstimate | None,
+) -> ContextPressureEstimate | None:
+    if estimate is None:
+        return None
+    if type(estimate) is not ContextPressureEstimate:
+        raise TypeError(
+            "Context pressure estimate must be a ContextPressureEstimate instance."
+        )
+    return ContextPressureEstimate(**estimate.model_dump())
 
 
 class ContextUsageState(BaseModel):
@@ -60,8 +181,11 @@ class ContextUsageState(BaseModel):
     last_input_tokens: StrictInt | None = Field(default=None, ge=0)
     last_output_tokens: StrictInt | None = Field(default=None, ge=0)
     last_total_tokens: StrictInt | None = Field(default=None, ge=0)
+    last_transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    last_context_overhead_input_tokens: StrictInt | None = Field(default=None, ge=0)
     last_provider_name: str | None = None
     last_model: str | None = None
+    input_pressure: ContextPressureEstimate | None = None
 
     @field_validator("last_provider_name", "last_model")
     @classmethod
@@ -70,11 +194,435 @@ class ContextUsageState(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("input_pressure")
+    @classmethod
+    def copy_input_pressure(
+        cls,
+        value: ContextPressureEstimate | None,
+    ) -> ContextPressureEstimate | None:
+        return copy_context_pressure_estimate(value)
+
 
 def copy_context_usage_state(state: ContextUsageState) -> ContextUsageState:
     if type(state) is not ContextUsageState:
         raise TypeError("Context usage state must be a ContextUsageState instance.")
     return ContextUsageState(**state.model_dump())
+
+
+class ObservedDeltaContextEstimator:
+    """Estimates context pressure from actual usage plus a local tail estimate."""
+
+    def __init__(
+        self,
+        *,
+        chars_per_token: int = _DEFAULT_ESTIMATE_CHARS_PER_TOKEN,
+        json_chars_per_token: int = _DEFAULT_ESTIMATE_JSON_CHARS_PER_TOKEN,
+        binary_bytes_per_token: int = _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+    ) -> None:
+        self.chars_per_token = _validate_positive_int(chars_per_token, "chars_per_token")
+        self.json_chars_per_token = _validate_positive_int(
+            json_chars_per_token,
+            "json_chars_per_token",
+        )
+        self.binary_bytes_per_token = _validate_positive_int(
+            binary_bytes_per_token,
+            "binary_bytes_per_token",
+        )
+
+    def estimate(
+        self,
+        *,
+        usage: ContextUsageState,
+        messages: list[Message],
+        image_min_tokens: int = _DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS,
+        document_min_tokens: int = _DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS,
+        document_bytes_per_token: int = _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+    ) -> ContextPressureEstimate | None:
+        if type(usage) is not ContextUsageState:
+            raise TypeError("usage must be a ContextUsageState.")
+        if usage.last_input_tokens is None or usage.last_transcript_cursor is None:
+            return None
+        current_cursor = len(messages)
+        if usage.last_transcript_cursor > current_cursor:
+            return None
+        tail_messages = messages[usage.last_transcript_cursor :]
+        message_tokens = sum(self.estimate_message_tokens(message) for message in tail_messages)
+        attachment_tokens = sum(
+            self.estimate_message_attachment_tokens(
+                message,
+                image_min_tokens=image_min_tokens,
+                document_min_tokens=document_min_tokens,
+                document_bytes_per_token=document_bytes_per_token,
+            )
+            for message in tail_messages
+        )
+        delta_tokens = message_tokens + attachment_tokens
+        return ContextPressureEstimate(
+            observed_context_input_tokens=usage.last_input_tokens,
+            estimated_delta_input_tokens=delta_tokens,
+            estimated_message_input_tokens=message_tokens,
+            estimated_tool_schema_input_tokens=0,
+            estimated_structured_output_input_tokens=0,
+            estimated_request_options_input_tokens=0,
+            estimated_request_overhead_input_tokens=0,
+            previous_request_overhead_input_tokens=usage.last_context_overhead_input_tokens,
+            estimated_request_overhead_delta_tokens=0,
+            estimated_attachment_input_tokens=attachment_tokens,
+            estimated_context_input_tokens=usage.last_input_tokens + delta_tokens,
+            reserved_output_tokens=0,
+            estimated_context_window_tokens=usage.last_input_tokens + delta_tokens,
+            anchor_transcript_cursor=usage.last_transcript_cursor,
+            current_transcript_cursor=current_cursor,
+            estimated_message_count=len(tail_messages),
+            chars_per_token=self.chars_per_token,
+            json_chars_per_token=self.json_chars_per_token,
+            binary_bytes_per_token=self.binary_bytes_per_token,
+        )
+
+    def estimate_full_request(
+        self,
+        *,
+        usage: ContextUsageState,
+        messages: list[Message],
+        overhead: ContextPressureOverhead | None = None,
+        reserved_output_tokens: int = 0,
+    ) -> ContextPressureEstimate:
+        if type(usage) is not ContextUsageState:
+            raise TypeError("usage must be a ContextUsageState.")
+        overhead = copy_context_pressure_overhead(overhead)
+        reserved_output_tokens = _validate_nonnegative_int(
+            reserved_output_tokens,
+            "reserved_output_tokens",
+        )
+        message_tokens = sum(self.estimate_message_tokens(message) for message in messages)
+        attachment_tokens = sum(
+            self.estimate_message_attachment_tokens(
+                message,
+                image_min_tokens=overhead.image_min_tokens,
+                document_min_tokens=overhead.document_min_tokens,
+                document_bytes_per_token=overhead.document_bytes_per_token,
+            )
+            for message in messages
+        )
+        tool_schema_tokens = self.estimate_tool_schema_tokens(
+            overhead.tools,
+            chars_per_token=overhead.tool_schema_chars_per_token,
+        )
+        structured_output_tokens = self._estimate_text(
+            overhead.structured_output_instruction or ""
+        )
+        request_options_tokens = self._estimate_request_options(overhead.request_options)
+        overhead_tokens = (
+            tool_schema_tokens
+            + structured_output_tokens
+            + request_options_tokens
+        )
+        total_tokens = (
+            message_tokens
+            + attachment_tokens
+            + overhead_tokens
+        )
+        return ContextPressureEstimate(
+            method="local_full_request_estimate",
+            observed_context_input_tokens=usage.last_input_tokens or 0,
+            estimated_delta_input_tokens=total_tokens,
+            estimated_message_input_tokens=message_tokens,
+            estimated_tool_schema_input_tokens=tool_schema_tokens,
+            estimated_structured_output_input_tokens=structured_output_tokens,
+            estimated_request_options_input_tokens=request_options_tokens,
+            estimated_request_overhead_input_tokens=overhead_tokens,
+            previous_request_overhead_input_tokens=usage.last_context_overhead_input_tokens,
+            estimated_request_overhead_delta_tokens=overhead_tokens,
+            estimated_attachment_input_tokens=attachment_tokens,
+            estimated_context_input_tokens=total_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            estimated_context_window_tokens=total_tokens + reserved_output_tokens,
+            anchor_transcript_cursor=usage.last_transcript_cursor or 0,
+            current_transcript_cursor=len(messages),
+            estimated_message_count=len(messages),
+            chars_per_token=self.chars_per_token,
+            json_chars_per_token=self.json_chars_per_token,
+            binary_bytes_per_token=self.binary_bytes_per_token,
+        )
+
+    def estimate_anchored_request(
+        self,
+        *,
+        usage: ContextUsageState,
+        messages: list[Message],
+        overhead: ContextPressureOverhead | None = None,
+        reserved_output_tokens: int = 0,
+    ) -> ContextPressureEstimate:
+        if type(usage) is not ContextUsageState:
+            raise TypeError("usage must be a ContextUsageState.")
+        overhead = copy_context_pressure_overhead(overhead)
+        reserved_output_tokens = _validate_nonnegative_int(
+            reserved_output_tokens,
+            "reserved_output_tokens",
+        )
+        base = self.estimate(
+            usage=usage,
+            messages=messages,
+            image_min_tokens=overhead.image_min_tokens,
+            document_min_tokens=overhead.document_min_tokens,
+            document_bytes_per_token=overhead.document_bytes_per_token,
+        )
+        if base is None:
+            return self.estimate_full_request(
+                usage=usage,
+                messages=messages,
+                overhead=overhead,
+                reserved_output_tokens=reserved_output_tokens,
+            )
+
+        tool_schema_tokens = self.estimate_tool_schema_tokens(
+            overhead.tools,
+            chars_per_token=overhead.tool_schema_chars_per_token,
+        )
+        structured_output_tokens = self._estimate_text(
+            overhead.structured_output_instruction or ""
+        )
+        request_options_tokens = self._estimate_request_options(overhead.request_options)
+        overhead_tokens = (
+            tool_schema_tokens
+            + structured_output_tokens
+            + request_options_tokens
+        )
+        previous_overhead_tokens = usage.last_context_overhead_input_tokens
+        overhead_delta_tokens = (
+            0
+            if previous_overhead_tokens is None
+            else overhead_tokens - previous_overhead_tokens
+        )
+        estimated_context_input_tokens = max(
+            0,
+            base.estimated_context_input_tokens + overhead_delta_tokens,
+        )
+        estimated_delta_input_tokens = max(
+            0,
+            base.estimated_delta_input_tokens + overhead_delta_tokens,
+        )
+        return ContextPressureEstimate(
+            method="observed_plus_estimated_delta_with_overhead",
+            observed_context_input_tokens=base.observed_context_input_tokens,
+            estimated_delta_input_tokens=estimated_delta_input_tokens,
+            estimated_message_input_tokens=base.estimated_message_input_tokens,
+            estimated_tool_schema_input_tokens=tool_schema_tokens,
+            estimated_structured_output_input_tokens=structured_output_tokens,
+            estimated_request_options_input_tokens=request_options_tokens,
+            estimated_request_overhead_input_tokens=overhead_tokens,
+            previous_request_overhead_input_tokens=previous_overhead_tokens,
+            estimated_request_overhead_delta_tokens=overhead_delta_tokens,
+            estimated_attachment_input_tokens=base.estimated_attachment_input_tokens,
+            estimated_context_input_tokens=estimated_context_input_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            estimated_context_window_tokens=(
+                estimated_context_input_tokens + reserved_output_tokens
+            ),
+            anchor_transcript_cursor=base.anchor_transcript_cursor,
+            current_transcript_cursor=base.current_transcript_cursor,
+            estimated_message_count=base.estimated_message_count,
+            chars_per_token=self.chars_per_token,
+            json_chars_per_token=self.json_chars_per_token,
+            binary_bytes_per_token=self.binary_bytes_per_token,
+        )
+
+    def estimate_message_tokens(self, message: Message) -> int:
+        if type(message) is not Message:
+            raise TypeError("message must be a Message.")
+        total = 0
+        for part in message.content:
+            if type(part) is TextPart:
+                total += self._estimate_text(part.text)
+            elif type(part) is ToolCallPart:
+                total += self._estimate_text(part.tool_name)
+                total += self._estimate_json(part.arguments)
+            elif type(part) is ToolResultPart:
+                total += self._estimate_text(part.content)
+            elif type(part) is ProviderStatePart:
+                total += self._estimate_text(part.provider)
+                total += self._estimate_json(part.state)
+            elif type(part) is ThinkingPart:
+                total += self._estimate_text(part.text)
+                total += self._estimate_json(part.provider_state)
+            else:  # pragma: no cover - Message validation should keep this closed.
+                total += self._estimate_json(part.model_dump(mode="json"))
+        return total
+
+    def estimate_message_attachment_tokens(
+        self,
+        message: Message,
+        *,
+        image_min_tokens: int = _DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS,
+        document_min_tokens: int = _DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS,
+        document_bytes_per_token: int = _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+    ) -> int:
+        if type(message) is not Message:
+            raise TypeError("message must be a Message.")
+        total = 0
+        for part in message.content:
+            if type(part) is not ToolResultPart:
+                continue
+            for payload in part.artifacts:
+                attachment = file_attachment_from_payload(payload)
+                if attachment is None:
+                    continue
+                total += self._estimate_file_attachment(
+                    attachment,
+                    image_min_tokens=image_min_tokens,
+                    document_min_tokens=document_min_tokens,
+                    document_bytes_per_token=document_bytes_per_token,
+                )
+        return total
+
+    def estimate_tool_schema_tokens(
+        self,
+        tools: list[dict[str, Any]] | list[ToolSpec],
+        *,
+        chars_per_token: int = _DEFAULT_ESTIMATE_TOOL_SCHEMA_CHARS_PER_TOKEN,
+    ) -> int:
+        chars_per_token = _validate_positive_int(chars_per_token, "chars_per_token")
+        total = 0
+        for tool in tools:
+            if type(tool) is ToolSpec:
+                payload = tool.model_dump(mode="json")
+            else:
+                payload = copy_json_value(tool, "tool")
+            total += self._estimate_json(payload, chars_per_token=chars_per_token)
+        return total
+
+    def _estimate_file_attachment(
+        self,
+        attachment: FileAttachment,
+        *,
+        image_min_tokens: int,
+        document_min_tokens: int,
+        document_bytes_per_token: int,
+    ) -> int:
+        metadata_tokens = (
+            self._estimate_text(attachment.filename)
+            + self._estimate_text(attachment.content_type)
+            + self._estimate_json(attachment.metadata)
+        )
+        if attachment.kind == FileAttachmentKind.IMAGE:
+            # Providers account for image blocks with modality-specific formulas.
+            # The provider adapter supplies the conservative floor; the runtime
+            # estimator applies it without branching on provider identity.
+            payload_tokens = max(
+                image_min_tokens,
+                math.ceil(attachment.size_bytes / 16),
+            )
+            return metadata_tokens + payload_tokens
+        if attachment.kind == FileAttachmentKind.DOCUMENT:
+            payload_tokens = max(
+                document_min_tokens,
+                math.ceil(attachment.size_bytes / document_bytes_per_token),
+            )
+            return metadata_tokens + payload_tokens
+        payload_tokens = math.ceil(attachment.size_bytes / self.binary_bytes_per_token)
+        return metadata_tokens + payload_tokens
+
+    def _estimate_request_options(self, options: dict[str, Any]) -> int:
+        visible_options: dict[str, Any] = {}
+        for key, value in options.items():
+            if key not in _INTERNAL_REQUEST_OPTION_KEYS and value is not None:
+                visible_options[key] = value
+        structured_output = options.get("structured_output")
+        if isinstance(structured_output, dict) and structured_output.get("strategy") == "native":
+            visible_options["structured_output"] = structured_output
+        return self._estimate_json(visible_options)
+
+    def _estimate_text(self, value: str) -> int:
+        if not value:
+            return 0
+        if self._looks_like_json_lines(value):
+            return math.ceil(len(value) / _DEFAULT_ESTIMATE_JSON_TEXT_CHARS_PER_TOKEN)
+        return math.ceil(len(value) / self._text_chars_per_token(value))
+
+    def _text_chars_per_token(self, value: str) -> float:
+        length = len(value)
+        if length < 200:
+            return float(self.chars_per_token)
+        whitespace_count = sum(1 for char in value if char.isspace())
+        alnum_count = sum(1 for char in value if char.isalnum())
+        punctuation_count = length - whitespace_count - alnum_count
+        whitespace_ratio = whitespace_count / length
+        punctuation_ratio = punctuation_count / length
+        quote_ratio = value.count('"') / length
+        comma_ratio = value.count(",") / length
+        digit_ratio = sum(1 for char in value if char.isdigit()) / length
+        if whitespace_ratio <= 0.03 or punctuation_ratio >= 0.30:
+            if comma_ratio >= 0.05 or digit_ratio >= 0.12 or punctuation_ratio < 0.10:
+                return min(float(self.chars_per_token), 2.5)
+            return min(float(self.chars_per_token), 3.0)
+        if punctuation_ratio >= 0.25 or quote_ratio >= 0.08:
+            return min(float(self.chars_per_token), 2.5)
+        if digit_ratio >= 0.15 and punctuation_ratio >= 0.10:
+            return min(float(self.chars_per_token), 2.75)
+        if punctuation_ratio >= 0.12:
+            return min(float(self.chars_per_token), 3.75)
+        return float(self.chars_per_token)
+
+    def _estimate_json(
+        self,
+        value: Any,
+        *,
+        chars_per_token: int | None = None,
+    ) -> int:
+        if value is None:
+            return 0
+        if value == {} or value == []:
+            return 0
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if not encoded:
+            return 0
+        return math.ceil(len(encoded) / (chars_per_token or self.json_chars_per_token))
+
+    def _looks_like_json_lines(self, value: str) -> bool:
+        stripped = value.strip()
+        if len(stripped) < 200:
+            return False
+        if stripped[0] not in "[{":
+            return False
+        quote_ratio = stripped.count('"') / len(stripped)
+        colon_ratio = stripped.count(":") / len(stripped)
+        if quote_ratio < 0.05 or colon_ratio < 0.02:
+            return False
+        if "\n" not in stripped:
+            return True
+        if stripped[0] in "[{":
+            return True
+        sample_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        if not sample_lines:
+            return False
+        sample = sample_lines[: min(5, len(sample_lines))]
+        return all(line[0] in "[{" and ("," in line or ":" in line) for line in sample)
+
+
+def estimate_context_pressure(
+    *,
+    usage: ContextUsageState,
+    messages: list[Message],
+    image_min_tokens: int = _DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS,
+    document_min_tokens: int = _DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS,
+    document_bytes_per_token: int = _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+    estimator: ObservedDeltaContextEstimator | None = None,
+) -> ContextUsageState:
+    if estimator is None:
+        estimator = ObservedDeltaContextEstimator()
+    pressure = estimator.estimate(
+        usage=usage,
+        messages=messages,
+        image_min_tokens=image_min_tokens,
+        document_min_tokens=document_min_tokens,
+        document_bytes_per_token=document_bytes_per_token,
+    )
+    return usage.model_copy(update={"input_pressure": pressure})
 
 
 class ContextRequest(BaseModel):
@@ -90,6 +638,11 @@ class ContextRequest(BaseModel):
     knowledge_store: Any = Field(default=None, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
     context_usage: ContextUsageState = Field(default_factory=ContextUsageState)
+    pressure_overhead: ContextPressureOverhead = Field(default_factory=ContextPressureOverhead)
+    count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None = Field(
+        default=None,
+        exclude=True,
+    )
 
     @field_validator("messages")
     @classmethod
@@ -105,6 +658,14 @@ class ContextRequest(BaseModel):
     @classmethod
     def copy_context_usage(cls, value: ContextUsageState) -> ContextUsageState:
         return copy_context_usage_state(value)
+
+    @field_validator("pressure_overhead")
+    @classmethod
+    def copy_pressure_overhead(
+        cls,
+        value: ContextPressureOverhead,
+    ) -> ContextPressureOverhead:
+        return copy_context_pressure_overhead(value)
 
     @field_validator("environment_name")
     @classmethod
@@ -567,6 +1128,11 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         triggered_policy: ContextPolicy,
         base_policy: ContextPolicy | None = None,
         min_input_tokens: int | None = None,
+        trigger_estimated_context_tokens: int | None = None,
+        reserved_output_tokens: int = 0,
+        verify_estimate_with_provider_count: bool = False,
+        provider_count_threshold_ratio: float = 0.9,
+        provider_count_min_delta_tokens: int | None = None,
         min_total_tokens: int | None = None,
         sticky: bool = True,
     ) -> None:
@@ -583,12 +1149,44 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             min_input_tokens,
             "min_input_tokens",
         )
+        self.trigger_estimated_context_tokens = _validate_optional_positive_int(
+            trigger_estimated_context_tokens,
+            "trigger_estimated_context_tokens",
+        )
+        self.reserved_output_tokens = _validate_nonnegative_int(
+            reserved_output_tokens,
+            "reserved_output_tokens",
+        )
+        if type(verify_estimate_with_provider_count) is not bool:
+            raise TypeError("verify_estimate_with_provider_count must be a bool.")
+        self.verify_estimate_with_provider_count = verify_estimate_with_provider_count
+        self.provider_count_threshold_ratio = _validate_ratio(
+            provider_count_threshold_ratio,
+            "provider_count_threshold_ratio",
+        )
+        self.provider_count_min_delta_tokens = _validate_optional_positive_int(
+            provider_count_min_delta_tokens,
+            "provider_count_min_delta_tokens",
+        )
         self.min_total_tokens = _validate_optional_positive_int(
             min_total_tokens,
             "min_total_tokens",
         )
-        if self.min_input_tokens is None and self.min_total_tokens is None:
+        if (
+            self.min_input_tokens is None
+            and self.trigger_estimated_context_tokens is None
+            and self.min_total_tokens is None
+        ):
             raise ValueError("At least one usage threshold must be configured.")
+        if (
+            self.trigger_estimated_context_tokens is not None
+            and isinstance(self.base_policy, RuntimeManagedContextPolicy)
+        ):
+            raise ValueError(
+                "Estimated context triggers require a side-effect-free base_policy. "
+                "Do not use RuntimeManagedContextPolicy as the base policy because "
+                "the base policy must be evaluated before deciding whether to switch."
+            )
         if type(sticky) is not bool:
             raise TypeError("sticky must be a bool.")
         self.sticky = sticky
@@ -602,14 +1200,56 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
         checkpoint_state = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         previous = _usage_triggered_checkpoint(checkpoint_state)
         already_triggered = self.sticky and previous is not None
-        threshold_triggered = self._is_triggered(request)
+        threshold_triggered = self._actual_usage_is_triggered(request)
         use_triggered = already_triggered or threshold_triggered
-        selected = self.triggered_policy if use_triggered else self.base_policy
-        result = await _build_policy_context(
-            selected,
-            request,
-            checkpoint=checkpoint_state,
-        )
+        if use_triggered:
+            result = await _build_policy_context(
+                self.triggered_policy,
+                request,
+                checkpoint=checkpoint_state,
+            )
+        elif self.trigger_estimated_context_tokens is not None:
+            base_result = await _build_policy_context(
+                self.base_policy,
+                request,
+                checkpoint=checkpoint_state,
+            )
+            estimate = _estimate_model_facing_context_pressure(
+                request=request,
+                messages=base_result.messages,
+                reserved_output_tokens=self.reserved_output_tokens,
+            )
+            estimate = await self._maybe_verify_estimate_with_provider_count(
+                request=request,
+                messages=base_result.messages,
+                estimate=estimate,
+            )
+            request = request.model_copy(
+                update={
+                    "context_usage": request.context_usage.model_copy(
+                        update={"input_pressure": estimate}
+                    )
+                }
+            )
+            threshold_triggered = (
+                _context_window_tokens_for_decision(estimate)
+                >= self.trigger_estimated_context_tokens
+            )
+            use_triggered = threshold_triggered
+            if use_triggered:
+                result = await _build_policy_context(
+                    self.triggered_policy,
+                    request,
+                    checkpoint=checkpoint_state,
+                )
+            else:
+                result = base_result
+        else:
+            result = await _build_policy_context(
+                self.base_policy,
+                request,
+                checkpoint=checkpoint_state,
+            )
         if not self.sticky or not use_triggered:
             return result
         if result.checkpoint is None and result.checkpoint_event_payload is not None:
@@ -644,19 +1284,115 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             }
         )
 
-    def _is_triggered(self, request: ContextRequest) -> bool:
+    def _actual_usage_is_triggered(self, request: ContextRequest) -> bool:
         usage = request.context_usage
-        if (
-            self.min_input_tokens is not None
-            and usage.last_input_tokens is not None
-            and usage.last_input_tokens >= self.min_input_tokens
-        ):
-            return True
         return (
-            self.min_total_tokens is not None
-            and usage.last_total_tokens is not None
-            and usage.last_total_tokens >= self.min_total_tokens
+            (
+                self.min_input_tokens is not None
+                and usage.last_input_tokens is not None
+                and usage.last_input_tokens >= self.min_input_tokens
+            )
+            or (
+                self.min_total_tokens is not None
+                and usage.last_total_tokens is not None
+                and usage.last_total_tokens >= self.min_total_tokens
+            )
         )
+
+    async def _maybe_verify_estimate_with_provider_count(
+        self,
+        *,
+        request: ContextRequest,
+        messages: list[Message],
+        estimate: ContextPressureEstimate,
+    ) -> ContextPressureEstimate:
+        if (
+            not self.verify_estimate_with_provider_count
+            or request.count_input_tokens is None
+            or self.trigger_estimated_context_tokens is None
+        ):
+            return estimate
+        near_threshold = estimate.estimated_context_window_tokens >= math.ceil(
+            self.trigger_estimated_context_tokens * self.provider_count_threshold_ratio
+        )
+        large_delta = (
+            self.provider_count_min_delta_tokens is not None
+            and estimate.estimated_delta_input_tokens >= self.provider_count_min_delta_tokens
+        )
+        if not near_threshold and not large_delta:
+            return estimate
+        try:
+            input_tokens = await request.count_input_tokens(messages)
+        except Exception:
+            return estimate
+        if input_tokens is None:
+            return estimate
+        input_tokens = _validate_nonnegative_int(input_tokens, "provider input token count")
+        window_tokens = input_tokens + self.reserved_output_tokens
+        return estimate.model_copy(
+            update={
+                "confidence": "high",
+                "provider_count_input_tokens": input_tokens,
+                "provider_count_context_window_tokens": window_tokens,
+            }
+        )
+
+
+def _estimate_model_facing_context_pressure(
+    *,
+    request: ContextRequest,
+    messages: list[Message],
+    reserved_output_tokens: int = 0,
+) -> ContextPressureEstimate:
+    estimator = ObservedDeltaContextEstimator()
+    if messages == request.messages:
+        return estimator.estimate_anchored_request(
+            usage=request.context_usage,
+            messages=messages,
+            overhead=request.pressure_overhead,
+            reserved_output_tokens=reserved_output_tokens,
+        )
+    return estimator.estimate_full_request(
+        usage=request.context_usage,
+        messages=messages,
+        overhead=request.pressure_overhead,
+        reserved_output_tokens=reserved_output_tokens,
+    )
+
+
+def estimate_model_request_context_pressure(
+    *,
+    model_request: ModelRequest,
+    image_min_tokens: int = _DEFAULT_ESTIMATE_IMAGE_MIN_TOKENS,
+    document_min_tokens: int = _DEFAULT_ESTIMATE_DOCUMENT_MIN_TOKENS,
+    document_bytes_per_token: int = _DEFAULT_ESTIMATE_BINARY_BYTES_PER_TOKEN,
+    tool_schema_chars_per_token: int = _DEFAULT_ESTIMATE_TOOL_SCHEMA_CHARS_PER_TOKEN,
+    reserved_output_tokens: int = 0,
+    estimator: ObservedDeltaContextEstimator | None = None,
+) -> ContextPressureEstimate:
+    if type(model_request) is not ModelRequest:
+        raise TypeError("model_request must be a ModelRequest.")
+    if estimator is None:
+        estimator = ObservedDeltaContextEstimator()
+    return estimator.estimate_full_request(
+        usage=ContextUsageState(),
+        messages=model_request.messages,
+        overhead=ContextPressureOverhead(
+            tools=model_request.tools,
+            request_options=model_request.options,
+            image_min_tokens=image_min_tokens,
+            document_min_tokens=document_min_tokens,
+            document_bytes_per_token=document_bytes_per_token,
+            tool_schema_chars_per_token=tool_schema_chars_per_token,
+        ),
+        reserved_output_tokens=reserved_output_tokens,
+    )
+
+
+def _context_window_tokens_for_decision(estimate: ContextPressureEstimate) -> int:
+    if estimate.provider_count_context_window_tokens is not None:
+        return estimate.provider_count_context_window_tokens
+    return estimate.estimated_context_window_tokens
 
 
 def _usage_triggered_checkpoint_marker(
@@ -664,23 +1400,64 @@ def _usage_triggered_checkpoint_marker(
     policy: UsageTriggeredContextPolicy,
     request: ContextRequest,
 ) -> dict[str, Any]:
-    return {
+    marker: dict[str, Any] = {
         "version": _USAGE_TRIGGERED_CHECKPOINT_VERSION,
         "min_input_tokens": policy.min_input_tokens,
         "min_total_tokens": policy.min_total_tokens,
         "last_input_tokens": request.context_usage.last_input_tokens,
         "last_total_tokens": request.context_usage.last_total_tokens,
     }
+    if policy.trigger_estimated_context_tokens is not None:
+        marker["trigger_estimated_context_tokens"] = (
+            policy.trigger_estimated_context_tokens
+        )
+        marker["reserved_output_tokens"] = policy.reserved_output_tokens
+        marker["last_transcript_cursor"] = request.context_usage.last_transcript_cursor
+        if request.context_usage.input_pressure is not None:
+            marker["estimated_context_input_tokens"] = (
+                request.context_usage.input_pressure.estimated_context_input_tokens
+            )
+            marker["estimated_context_window_tokens"] = (
+                request.context_usage.input_pressure.estimated_context_window_tokens
+            )
+            marker["estimated_delta_input_tokens"] = (
+                request.context_usage.input_pressure.estimated_delta_input_tokens
+            )
+            if request.context_usage.input_pressure.provider_count_input_tokens is not None:
+                marker["provider_count_input_tokens"] = (
+                    request.context_usage.input_pressure.provider_count_input_tokens
+                )
+            if (
+                request.context_usage.input_pressure.provider_count_context_window_tokens
+                is not None
+            ):
+                marker["provider_count_context_window_tokens"] = (
+                    request.context_usage.input_pressure.provider_count_context_window_tokens
+                )
+    return marker
 
 
 def _usage_triggered_checkpoint_event_payload(marker: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         "checkpoint": _USAGE_TRIGGERED_CHECKPOINT_KEY,
         "min_input_tokens": marker.get("min_input_tokens"),
         "min_total_tokens": marker.get("min_total_tokens"),
         "last_input_tokens": marker.get("last_input_tokens"),
         "last_total_tokens": marker.get("last_total_tokens"),
     }
+    for key in (
+        "trigger_estimated_context_tokens",
+        "reserved_output_tokens",
+        "estimated_context_input_tokens",
+        "estimated_context_window_tokens",
+        "estimated_delta_input_tokens",
+        "provider_count_input_tokens",
+        "provider_count_context_window_tokens",
+        "last_transcript_cursor",
+    ):
+        if key in marker:
+            payload[key] = marker.get(key)
+    return payload
 
 
 class CompactionRequest(BaseModel):
@@ -1300,6 +2077,23 @@ def _validate_minimum_int(value: int, field_name: str, *, minimum: int) -> int:
     if value < minimum:
         raise ValueError(f"{field_name} must be at least {minimum}.")
     return value
+
+
+def _validate_nonnegative_int(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative.")
+    return value
+
+
+def _validate_ratio(value: float, field_name: str) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError(f"{field_name} must be a number.")
+    parsed = float(value)
+    if parsed <= 0 or parsed > 1:
+        raise ValueError(f"{field_name} must be greater than 0 and at most 1.")
+    return parsed
 
 
 def _copy_optional_label_map(value: dict[str, str] | None) -> dict[str, str]:

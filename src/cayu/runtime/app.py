@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -60,11 +60,13 @@ from cayu.providers import (
     InputTokenCountResult,
     ModelCompletion,
     ModelContextOverflowError,
+    ModelContextPressureProfile,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
     copy_input_token_count_result,
+    copy_model_context_pressure_profile,
     copy_model_stream_event,
     normalize_model_completion,
 )
@@ -115,11 +117,15 @@ from cayu.runtime.context import (
     ContextCompactionTelemetry,
     ContextKnowledgeTelemetry,
     ContextPolicy,
+    ContextPressureEstimate,
+    ContextPressureOverhead,
     ContextRequest,
     ContextUsageState,
     DefaultContextPolicy,
     RuntimeManagedContextPolicy,
     copy_context_messages,
+    estimate_context_pressure,
+    estimate_model_request_context_pressure,
 )
 from cayu.runtime.context_counting import (
     ContextCountingConfig,
@@ -317,6 +323,12 @@ class _ActiveSessionRun:
 @dataclass(frozen=True)
 class _ContextCountObservation:
     result: InputTokenCountResult
+    observation_id: str
+
+
+@dataclass(frozen=True)
+class _ContextPressureObservation:
+    estimate: ContextPressureEstimate
     observation_id: str
 
 
@@ -2540,6 +2552,24 @@ class CayuApp:
                         environment_name=environment_name,
                         knowledge_store=_knowledge_store(registered_environment),
                         request_metadata=request_metadata,
+                        pressure_overhead=_context_pressure_overhead(
+                            profile=_provider_context_pressure_profile(registered_provider),
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            structured_output=structured_output,
+                            thinking=effective_thinking,
+                            step=step,
+                        ),
+                        count_input_tokens=_context_input_token_counter(
+                            app=self,
+                            provider=provider,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            structured_output=structured_output,
+                            thinking=effective_thinking,
+                            step=step,
+                        ),
                     )
                 except ContextBuildError as exc:
                     for telemetry in exc.compaction_telemetry:
@@ -2671,6 +2701,7 @@ class CayuApp:
                         request_metadata=request_metadata,
                         step=step,
                         retry_policy=retry_policy,
+                        transcript_cursor_before_request=len(messages),
                     )
                     async for event, result in model_step_events:
                         if event is not None:
@@ -3539,6 +3570,7 @@ class CayuApp:
         request_metadata: dict[str, Any],
         step: int,
         retry_policy: RetryPolicy,
+        transcript_cursor_before_request: int,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         overflow_policy = registered_agent.context_overflow_policy
         try:
@@ -3551,6 +3583,7 @@ class CayuApp:
                 environment_name=environment_name,
                 step=step,
                 retry_policy=retry_policy,
+                transcript_cursor_before_request=transcript_cursor_before_request,
             ):
                 yield event, result
             return
@@ -3596,6 +3629,24 @@ class CayuApp:
                 environment_name=environment_name,
                 knowledge_store=knowledge_store,
                 request_metadata=request_metadata,
+                pressure_overhead=_context_pressure_overhead(
+                    profile=_provider_context_pressure_profile(registered_provider),
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    structured_output=structured_output,
+                    thinking=thinking,
+                    step=step,
+                ),
+                count_input_tokens=_context_input_token_counter(
+                    app=self,
+                    provider=provider,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    structured_output=structured_output,
+                    thinking=thinking,
+                    step=step,
+                ),
             )
         except ContextBuildError as build_exc:
             for telemetry in build_exc.compaction_telemetry:
@@ -3742,6 +3793,7 @@ class CayuApp:
                 environment_name=environment_name,
                 step=step,
                 retry_policy=retry_policy,
+                transcript_cursor_before_request=transcript_cursor_before_request,
             ):
                 yield event, result
         except ModelContextOverflowError as exc:
@@ -3776,10 +3828,26 @@ class CayuApp:
         environment_name: str | None,
         step: int,
         retry_policy: RetryPolicy,
+        transcript_cursor_before_request: int,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         attempt = 1
         while True:
+            (
+                context_pressure_observation,
+                context_pressure_event,
+            ) = await self._observe_model_request_context_pressure(
+                model_request=model_request,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=retry_policy.max_attempts,
+            )
+            if context_pressure_event is not None:
+                yield context_pressure_event, None
             (
                 context_count_observation,
                 context_count_event,
@@ -3826,9 +3894,30 @@ class CayuApp:
                     step=step,
                     attempt=attempt,
                     max_attempts=retry_policy.max_attempts,
+                    transcript_cursor_before_request=transcript_cursor_before_request,
                 ):
                     if event is not None:
                         yield event, None
+                        if (
+                            event.type == EventType.MODEL_COMPLETED
+                            and context_pressure_observation is not None
+                        ):
+                            yield (
+                                await self._emit(
+                                    _context_pressure_reconciled_event(
+                                        event,
+                                        observation=context_pressure_observation,
+                                        session=session,
+                                        registered_agent=registered_agent,
+                                        registered_provider=registered_provider,
+                                        environment_name=environment_name,
+                                        step=step,
+                                        attempt=attempt,
+                                        max_attempts=retry_policy.max_attempts,
+                                    )
+                                ),
+                                None,
+                            )
                         if (
                             event.type == EventType.MODEL_COMPLETED
                             and context_count_observation is not None
@@ -3899,6 +3988,54 @@ class CayuApp:
                 )
                 await self._sleep_before_retry(session.id, decision)
                 attempt += 1
+
+    async def _observe_model_request_context_pressure(
+        self,
+        *,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+    ) -> tuple[_ContextPressureObservation | None, Event | None]:
+        if self._context_counting.mode == ContextCountingMode.OFF:
+            return None, None
+        observation_id = str(uuid4())
+        profile = _provider_context_pressure_profile(registered_provider)
+        estimate = estimate_model_request_context_pressure(
+            model_request=model_request,
+            image_min_tokens=profile.image_min_tokens,
+            document_min_tokens=profile.document_min_tokens,
+            document_bytes_per_token=profile.document_bytes_per_token,
+            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
+        )
+        observation = _ContextPressureObservation(
+            estimate=estimate,
+            observation_id=observation_id,
+        )
+        event = await self._emit(
+            Event(
+                type=EventType.CONTEXT_PRESSURE_ESTIMATED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    **_context_count_base_payload(
+                        model_request=model_request,
+                        provider_name=registered_provider.name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        observation_id=observation_id,
+                    ),
+                    "estimate": estimate.model_dump(mode="json"),
+                },
+            )
+        )
+        return observation, event
 
     async def _observe_model_request_context_count(
         self,
@@ -3984,6 +4121,7 @@ class CayuApp:
         step: int,
         attempt: int,
         max_attempts: int,
+        transcript_cursor_before_request: int,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
@@ -4001,6 +4139,14 @@ class CayuApp:
         completed_stream_event: ModelStreamEvent | None = None
         step_result: AssistantStepResult | None = None
         model_completed = False
+        profile = _provider_context_pressure_profile(registered_provider)
+        context_pressure_estimate = estimate_model_request_context_pressure(
+            model_request=model_request,
+            image_min_tokens=profile.image_min_tokens,
+            document_min_tokens=profile.document_min_tokens,
+            document_bytes_per_token=profile.document_bytes_per_token,
+            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
+        )
         try:
             async for raw_stream_event in provider.stream(model_request):
                 stream_event = _validate_stream_event(raw_stream_event)
@@ -4071,6 +4217,11 @@ class CayuApp:
                         attempt=attempt,
                         max_attempts=max_attempts,
                         classification=classification.payload(),
+                        context_pressure_estimate=context_pressure_estimate,
+                        transcript_cursor_after_completion=(
+                            transcript_cursor_before_request
+                            + (1 if assistant_message is not None else 0)
+                        ),
                     )
                     yield await self._emit(event), None
                     continue
@@ -7256,6 +7407,99 @@ def _render_initial_system_prompt(
     return f"[Agent instructions]\n{agent_prompt}\n\n{workspace_section}"
 
 
+def _provider_context_pressure_profile(
+    registered_provider: runtime_records.RegisteredProvider,
+) -> ModelContextPressureProfile:
+    return copy_model_context_pressure_profile(
+        registered_provider.provider.context_pressure_profile
+    )
+
+
+def _context_pressure_overhead(
+    *,
+    profile: ModelContextPressureProfile,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    structured_output: StructuredOutputSpec | None,
+    thinking: ThinkingConfig | None,
+    step: int,
+) -> ContextPressureOverhead:
+    tools = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": deepcopy(tool.schema),
+        }
+        for tool in registered_agent.tools.values()
+    ]
+    structured_output_instruction: str | None = None
+    if (
+        structured_output is not None
+        and structured_output.strategy == StructuredOutputStrategy.TOOL
+    ):
+        tools.append(structured_output_tool_spec(structured_output))
+        structured_output_instruction = structured_output_tool_instruction(structured_output)
+
+    request_options: dict[str, Any] = {
+        **copy_json_value(
+            registered_agent.spec.provider_options,
+            "provider_options",
+        ),
+        "agent_metadata": deepcopy(registered_agent.spec.metadata),
+        "environment_metadata": (
+            deepcopy(registered_environment.spec.metadata)
+            if registered_environment is not None
+            else {}
+        ),
+        "step": step,
+        "structured_output": (
+            structured_output_spec_payload(structured_output)
+            if structured_output is not None
+            else None
+        ),
+    }
+    if thinking is not None:
+        request_options["thinking"] = thinking_config_payload(thinking)
+    return ContextPressureOverhead(
+        tools=tools,
+        structured_output_instruction=structured_output_instruction,
+        request_options=request_options,
+        image_min_tokens=profile.image_min_tokens,
+        document_min_tokens=profile.document_min_tokens,
+        document_bytes_per_token=profile.document_bytes_per_token,
+        tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
+    )
+
+
+def _context_input_token_counter(
+    *,
+    app: CayuApp,
+    provider: ModelProvider,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    structured_output: StructuredOutputSpec | None,
+    thinking: ThinkingConfig | None,
+    step: int,
+) -> Callable[[list[Message]], Awaitable[int | None]]:
+    async def count_input_tokens(context_messages: list[Message]) -> int | None:
+        model_request = await app._build_model_request(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            context_messages=copy_context_messages(context_messages),
+            structured_output=structured_output,
+            thinking=thinking,
+            step=step,
+        )
+        result = await provider.count_input_tokens(model_request)
+        if result is None:
+            return None
+        return result.input_tokens
+
+    return count_input_tokens
+
+
 async def _build_context(
     *,
     context_policy: ContextPolicy,
@@ -7267,6 +7511,8 @@ async def _build_context(
     environment_name: str | None,
     knowledge_store: Any,
     request_metadata: dict[str, Any],
+    pressure_overhead: ContextPressureOverhead,
+    count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
 ) -> tuple[
     list[Message],
     dict[str, Any] | None,
@@ -7278,6 +7524,13 @@ async def _build_context(
         session_store=session_store,
         session_id=session.id,
     )
+    context_usage = estimate_context_pressure(
+        usage=context_usage,
+        messages=messages,
+        image_min_tokens=pressure_overhead.image_min_tokens,
+        document_min_tokens=pressure_overhead.document_min_tokens,
+        document_bytes_per_token=pressure_overhead.document_bytes_per_token,
+    )
     request = ContextRequest(
         session=session.model_copy(deep=True),
         agent=agent_spec.model_copy(deep=True),
@@ -7287,6 +7540,8 @@ async def _build_context(
         knowledge_store=knowledge_store,
         metadata=copy_json_value(request_metadata, "metadata"),
         context_usage=context_usage,
+        pressure_overhead=pressure_overhead,
+        count_input_tokens=count_input_tokens,
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
@@ -7337,9 +7592,30 @@ def _context_usage_state_from_model_completed_event(
         last_input_tokens=metrics.input_tokens,
         last_output_tokens=metrics.output_tokens,
         last_total_tokens=metrics.total_tokens,
+        last_transcript_cursor=_transcript_cursor_from_model_completed_event(event),
+        last_context_overhead_input_tokens=(
+            _context_overhead_input_tokens_from_model_completed_event(event)
+        ),
         last_provider_name=metrics.provider_name,
         last_model=metrics.model,
     )
+
+
+def _transcript_cursor_from_model_completed_event(event: Event) -> int | None:
+    cursor = event.payload.get("transcript_cursor")
+    if type(cursor) is not int or cursor < 0:
+        return None
+    return cursor
+
+
+def _context_overhead_input_tokens_from_model_completed_event(event: Event) -> int | None:
+    pressure = event.payload.get("context_pressure")
+    if type(pressure) is not dict:
+        return None
+    tokens = pressure.get("estimated_request_overhead_input_tokens")
+    if type(tokens) is not int or tokens < 0:
+        return None
+    return tokens
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
@@ -8519,6 +8795,49 @@ def _context_count_reconciled_event(
     )
 
 
+def _context_pressure_reconciled_event(
+    model_completed_event: Event,
+    *,
+    observation: _ContextPressureObservation,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_provider: runtime_records.RegisteredProvider,
+    environment_name: str | None,
+    step: int,
+    attempt: int,
+    max_attempts: int,
+) -> Event:
+    if model_completed_event.type != EventType.MODEL_COMPLETED:
+        raise ValueError("Context pressure reconciliation requires a model.completed event.")
+    actual_input_tokens = _actual_input_tokens_from_completed_event(model_completed_event)
+    estimated_input_tokens = observation.estimate.estimated_context_input_tokens
+    delta_tokens: int | None = None
+    relative_error: float | None = None
+    if actual_input_tokens is not None:
+        delta_tokens = actual_input_tokens - estimated_input_tokens
+        if actual_input_tokens > 0:
+            relative_error = delta_tokens / actual_input_tokens
+    return Event(
+        type=EventType.CONTEXT_PRESSURE_RECONCILED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "model": session.model,
+            "provider": registered_provider.name,
+            "step": step,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "observation_id": observation.observation_id,
+            "pre_call_estimate": observation.estimate.model_dump(mode="json"),
+            "actual_input_tokens": actual_input_tokens,
+            "delta_tokens": delta_tokens,
+            "relative_error": relative_error,
+            "reconciled": actual_input_tokens is not None,
+        },
+    )
+
+
 def _actual_input_tokens_from_completed_event(event: Event) -> int | None:
     usage_metrics = event.payload.get("usage_metrics")
     if type(usage_metrics) is not dict:
@@ -8540,6 +8859,8 @@ def _model_stream_event_to_runtime_event(
     attempt: int,
     max_attempts: int,
     classification: dict[str, str] | None = None,
+    context_pressure_estimate: ContextPressureEstimate | None = None,
+    transcript_cursor_after_completion: int | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -8590,6 +8911,12 @@ def _model_stream_event_to_runtime_event(
         )
         if usage_metrics is not None:
             payload["usage_metrics"] = usage_metrics
+        if context_pressure_estimate is not None:
+            payload["context_pressure"] = _context_pressure_completed_payload(
+                context_pressure_estimate
+            )
+        if transcript_cursor_after_completion is not None:
+            payload["transcript_cursor"] = transcript_cursor_after_completion
         payload = _retry_attempt_payload(
             payload,
             step=step,
@@ -8617,6 +8944,23 @@ def _model_stream_event_to_runtime_event(
             ),
         )
     raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+
+
+def _context_pressure_completed_payload(
+    estimate: ContextPressureEstimate,
+) -> dict[str, int]:
+    return {
+        "estimated_tool_schema_input_tokens": estimate.estimated_tool_schema_input_tokens,
+        "estimated_structured_output_input_tokens": (
+            estimate.estimated_structured_output_input_tokens
+        ),
+        "estimated_request_options_input_tokens": (
+            estimate.estimated_request_options_input_tokens
+        ),
+        "estimated_request_overhead_input_tokens": (
+            estimate.estimated_request_overhead_input_tokens
+        ),
+    }
 
 
 def _with_structured_output_tool_instruction(

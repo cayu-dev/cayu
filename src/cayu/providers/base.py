@@ -144,6 +144,27 @@ class InputTokenCountResult(BaseModel):
         return copied
 
 
+class ModelContextPressureProfile(BaseModel):
+    """Provider-supplied local context-pressure estimation hints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_min_tokens: int = Field(default=32, ge=0)
+    document_min_tokens: int = Field(default=0, ge=0)
+    document_bytes_per_token: int = Field(default=3, ge=1)
+    tool_schema_chars_per_token: int = Field(default=4, ge=1)
+
+
+def copy_model_context_pressure_profile(
+    profile: ModelContextPressureProfile | None,
+) -> ModelContextPressureProfile:
+    if profile is None:
+        return ModelContextPressureProfile()
+    if type(profile) is not ModelContextPressureProfile:
+        raise TypeError("Context pressure profile must be a ModelContextPressureProfile.")
+    return ModelContextPressureProfile(**profile.model_dump())
+
+
 class ModelCompletion(BaseModel):
     """Provider-neutral completion metadata for a model step."""
 
@@ -421,6 +442,10 @@ class ModelProvider(ABC):
     """Normalizes provider-specific model streams."""
 
     name: str
+
+    @property
+    def context_pressure_profile(self) -> ModelContextPressureProfile:
+        return ModelContextPressureProfile()
 
     async def count_input_tokens(
         self,

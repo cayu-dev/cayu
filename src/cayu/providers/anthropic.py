@@ -30,6 +30,7 @@ from cayu.providers.base import (
     InputTokenCountMethod,
     InputTokenCountResult,
     ModelContextOverflowError,
+    ModelContextPressureProfile,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -45,6 +46,8 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
+ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
 
 _RESERVED_ANTHROPIC_OPTIONS = {
     "model",
@@ -199,6 +202,13 @@ class AnthropicProvider(ModelProvider):
     """Anthropic Messages API adapter for Cayu's provider-neutral runtime."""
 
     name = "anthropic"
+
+    @property
+    def context_pressure_profile(self) -> ModelContextPressureProfile:
+        return ModelContextPressureProfile(
+            image_min_tokens=ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS,
+            document_min_tokens=ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS,
+        )
 
     def __init__(
         self,

@@ -1660,11 +1660,39 @@ app.register_agent(
 
 Use `UsageTriggeredContextPolicy` to react to actual provider usage from the
 previous completed model call in the same session. This is post-call state, not
-a pre-call estimator: the next request can switch to a smaller projection after
-the prior call reported high `usage_metrics.input_tokens` or total tokens. The
-trigger is sticky by default: once a threshold is crossed, Cayu stores a session
-checkpoint marker and keeps using `triggered_policy` for later requests in that
-session. Set `sticky=False` only when you explicitly want last-call-only routing.
+a remote pre-call counter: the next request can switch to a smaller projection
+after the prior call reported high `usage_metrics.input_tokens` or total tokens.
+When the previous `model.completed` event includes a transcript cursor, Cayu also
+exposes `context_usage.input_pressure`, which estimates current context pressure
+as previous actual input tokens plus a local estimate for messages appended after
+that cursor. For `UsageTriggeredContextPolicy`, the estimated trigger is computed
+against the base policy's model-facing request shape before switching: context
+messages after the base policy has run, known tool schemas, structured-output
+wiring, provider-visible options, tool-call arguments, tool-result text,
+thinking/provider-state parts, and conservative file-attachment size estimates. Set
+`trigger_estimated_context_tokens` with `reserved_output_tokens` when you want a
+soft proactive threshold based on `estimated_input + output_reserve`; it is not
+billing data or an exact final provider-request context-window guarantee. Cayu
+uses provider pressure profiles for local calibration of image attachments,
+document/PDF attachments, and tool-schema payloads; the runtime consumes those
+profile hints without branching on provider names. Cayu emits
+`context.pressure.estimated` before the model call and
+`context.pressure.reconciled` after `model.completed` when context counting
+observe mode is enabled, so applications can compare the local input estimate
+against provider-reported `actual_input_tokens`. If exact pre-call verification
+is worth an extra provider request, set
+`verify_estimate_with_provider_count=True`; Cayu then calls
+`provider.count_input_tokens(...)` only when the local estimate is near the
+estimated threshold or when `provider_count_min_delta_tokens` marks the new
+estimated delta as large. The provider count, when available, decides the
+estimated trigger; otherwise Cayu falls back to the local estimate.
+Estimated triggers evaluate `base_policy` before deciding whether to switch, so
+`base_policy` must be side-effect-free; runtime-managed base policies such as
+checkpoint compaction are rejected for this mode. The trigger is sticky by
+default: once a threshold is crossed, Cayu stores a session
+checkpoint marker and keeps using
+`triggered_policy` for later requests in that session. Set `sticky=False` only
+when you explicitly want last-call-only routing.
 
 ```python
 from cayu import (
@@ -1679,6 +1707,19 @@ app.register_agent(
         base_policy=RecentTurnsContextPolicy(max_user_turns=20),
         triggered_policy=RecentTurnsContextPolicy(max_user_turns=6),
         min_input_tokens=120_000,
+    ),
+)
+
+app.register_agent(
+    AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+    context_policy=UsageTriggeredContextPolicy(
+        base_policy=RecentTurnsContextPolicy(max_user_turns=20),
+        triggered_policy=RecentTurnsContextPolicy(max_user_turns=6),
+        trigger_estimated_context_tokens=150_000,
+        reserved_output_tokens=20_000,
+        verify_estimate_with_provider_count=True,
+        provider_count_threshold_ratio=0.9,
+        provider_count_min_delta_tokens=10_000,
     ),
 )
 ```
