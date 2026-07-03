@@ -384,6 +384,106 @@ def test_failed_run_with_status_assertion_is_not_overridden():
     assert result.cases[0].status == EvalStatus.PASSED
 
 
+class _HangingProvider(ModelProvider):
+    name = "hanging"
+
+    async def stream(self, request):
+        await asyncio.sleep(60)
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _OverlapProbeProvider(ModelProvider):
+    """Blocks every stream until `expected` are in flight — proves cases overlapped."""
+
+    name = "overlap"
+
+    def __init__(self, expected: int) -> None:
+        self._expected = expected
+        self._gate = asyncio.Event()
+        self._active = 0
+        self.max_active = 0
+
+    async def stream(self, request):
+        self._active += 1
+        self.max_active = max(self.max_active, self._active)
+        if self._active >= self._expected:
+            self._gate.set()
+        try:
+            await asyncio.wait_for(self._gate.wait(), timeout=5)
+        finally:
+            self._active -= 1
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def _app_with_provider(provider: ModelProvider) -> CayuApp:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    return app
+
+
+def _case(case_id: str) -> EvalCase:
+    return EvalCase(
+        id=case_id,
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[FinalOutputContains("done")],
+    )
+
+
+def test_case_timeout_records_error_instead_of_hanging():
+    result = asyncio.run(
+        run_eval_suite(
+            _app_with_provider(_HangingProvider()),
+            EvalSuite(id="timeout", cases=[_case("hangs")]),
+            case_timeout_seconds=0.05,
+        )
+    )
+    assert result.status == EvalStatus.ERROR
+    assert result.cases[0].status == EvalStatus.ERROR
+    assert "timed out after 0.05 seconds" in result.cases[0].error
+
+
+def test_max_concurrency_runs_cases_in_parallel_and_keeps_order():
+    provider = _OverlapProbeProvider(expected=2)
+    suite = EvalSuite(id="parallel", cases=[_case("a"), _case("b")])
+
+    # Sequential execution would deadlock on the gate; overlap is what releases it.
+    result = asyncio.run(run_eval_suite(_app_with_provider(provider), suite, max_concurrency=2))
+
+    assert provider.max_active == 2
+    assert [case.case_id for case in result.cases] == ["a", "b"]
+    assert result.status == EvalStatus.PASSED
+
+
+def test_max_concurrency_semaphore_caps_in_flight_cases():
+    provider = _OverlapProbeProvider(expected=2)
+    suite = EvalSuite(id="capped", cases=[_case("a"), _case("b"), _case("c")])
+
+    result = asyncio.run(run_eval_suite(_app_with_provider(provider), suite, max_concurrency=2))
+
+    assert provider.max_active == 2
+    assert [case.case_id for case in result.cases] == ["a", "b", "c"]
+    assert result.status == EvalStatus.PASSED
+
+
+def test_run_eval_suite_rejects_invalid_concurrency_and_timeout():
+    app = _app_with_provider(_FailingProvider())
+    suite = _failing_suite("invalid", [])
+    with pytest.raises(ValueError, match="max_concurrency"):
+        asyncio.run(run_eval_suite(app, suite, max_concurrency=0))
+    with pytest.raises(TypeError, match="max_concurrency"):
+        asyncio.run(run_eval_suite(app, suite, max_concurrency=True))
+    with pytest.raises(ValueError, match="case_timeout_seconds"):
+        asyncio.run(run_eval_suite(app, suite, case_timeout_seconds=0))
+    with pytest.raises(TypeError, match="case_timeout_seconds"):
+        asyncio.run(run_eval_suite(app, suite, case_timeout_seconds="5"))
+
+
 def _case_result(case_id, status, score) -> EvalCaseResult:
     now = datetime.now(UTC)
     return EvalCaseResult(

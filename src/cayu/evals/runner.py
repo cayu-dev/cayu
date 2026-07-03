@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -129,25 +130,42 @@ class EvalPlan:
 
 
 async def run_eval_suite(
-    app: CayuApp, suite: EvalSuite, *, retain_trajectory: bool = False
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool = False,
+    max_concurrency: int = 1,
+    case_timeout_seconds: float | None = None,
 ) -> EvalRun:
+    """Run every case in the suite and aggregate the results.
+
+    `max_concurrency` runs up to that many cases at once (default 1 = sequential).
+    Results always keep suite order. Note: `ScriptedModelProvider` consumes batches
+    by positional request index, so with concurrency > 1 interleaved cases may pull
+    each other's batches — keep the default for scripted multi-case suites.
+
+    `case_timeout_seconds` bounds each case's run; a case that exceeds it is
+    cancelled and recorded as `EvalStatus.ERROR` instead of stalling the suite.
+    """
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
     if type(suite) is not EvalSuite:
         raise TypeError("run_eval_suite requires an EvalSuite.")
+    if type(max_concurrency) is not int:
+        raise TypeError("run_eval_suite max_concurrency must be an int.")
+    if max_concurrency < 1:
+        raise ValueError("run_eval_suite max_concurrency must be >= 1.")
+    _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
 
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
-    results: list[EvalCaseResult] = []
-    for case in suite.cases:
-        results.append(
-            await run_eval_case(
-                app,
-                case,
-                suite_id=suite.id,
-                retain_trajectory=retain_trajectory,
-            )
-        )
+    results = await _run_suite_cases(
+        app,
+        suite,
+        retain_trajectory=retain_trajectory,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+    )
     completed_at = datetime.now(UTC)
     status = _run_status(results)
     score = _average_score(result.score for result in results)
@@ -164,10 +182,64 @@ async def run_eval_suite(
     )
 
 
-async def run_eval_plan(plan: EvalPlan, *, retain_trajectory: bool = False) -> EvalRun:
+async def run_eval_plan(
+    plan: EvalPlan,
+    *,
+    retain_trajectory: bool = False,
+    max_concurrency: int = 1,
+    case_timeout_seconds: float | None = None,
+) -> EvalRun:
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
-    return await run_eval_suite(plan.app, plan.suite, retain_trajectory=retain_trajectory)
+    return await run_eval_suite(
+        plan.app,
+        plan.suite,
+        retain_trajectory=retain_trajectory,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+    )
+
+
+async def _run_suite_cases(
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool,
+    max_concurrency: int,
+    case_timeout_seconds: float | None,
+) -> list[EvalCaseResult]:
+    if max_concurrency == 1:
+        return [
+            await run_eval_case(
+                app,
+                case,
+                suite_id=suite.id,
+                retain_trajectory=retain_trajectory,
+                timeout_seconds=case_timeout_seconds,
+            )
+            for case in suite.cases
+        ]
+
+    # Fill a positional slot per case so results keep suite order regardless of
+    # completion order. run_eval_case never raises for a failed run (it records an
+    # ERROR result), so a TaskGroup abort only happens on a genuine programming error.
+    slots: list[EvalCaseResult | None] = [None] * len(suite.cases)
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _run_slot(index: int, case: EvalCase) -> None:
+        async with semaphore:
+            slots[index] = await run_eval_case(
+                app,
+                case,
+                suite_id=suite.id,
+                retain_trajectory=retain_trajectory,
+                timeout_seconds=case_timeout_seconds,
+            )
+
+    async with asyncio.TaskGroup() as group:
+        for index, case in enumerate(suite.cases):
+            group.create_task(_run_slot(index, case))
+    return [result for result in slots if result is not None]
 
 
 async def run_eval_case(
@@ -176,17 +248,26 @@ async def run_eval_case(
     *,
     suite_id: str,
     retain_trajectory: bool = False,
+    timeout_seconds: float | None = None,
 ) -> EvalCaseResult:
+    _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
     started_at = datetime.now(UTC)
     emitted_events: list[Event] = []
     session_id: str | None = None
     run_error: str | None = None
 
     try:
-        async for event in app.run(case.request):
-            emitted_events.append(event)
-            if session_id is None:
-                session_id = event.session_id
+        # asyncio.timeout(None) never expires, so the unbounded default shares the path.
+        async with asyncio.timeout(timeout_seconds) as deadline:
+            async for event in app.run(case.request):
+                emitted_events.append(event)
+                if session_id is None:
+                    session_id = event.session_id
+    except TimeoutError as exc:
+        if deadline.expired():
+            run_error = f"Eval case timed out after {timeout_seconds} seconds."
+        else:
+            run_error = str(exc)
     except Exception as exc:
         run_error = str(exc)
 
@@ -431,6 +512,15 @@ async def _load_child_trajectory(
         final_output=final_output_text(transcript),
         children=await _build_child_trajectories(app, session.id, visited=visited),
     )
+
+
+def _validate_timeout_seconds(value: float | None, field_name: str) -> None:
+    if value is None:
+        return
+    if type(value) not in (int, float):
+        raise TypeError(f"{field_name} must be a number or None.")
+    if value != value or value <= 0:  # rejects NaN and non-positive values
+        raise ValueError(f"{field_name} must be a positive number.")
 
 
 def _session_failure_reason(events: Iterable[Event]) -> str:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import logging
 from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
+from functools import partial
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -24,16 +25,122 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_SUBAGENT_RESULT_MAX_CHARS = 12_000
 MAX_SUBAGENT_RESULT_MAX_CHARS = 200_000
 DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 30.0
 MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 600.0
+SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S = 10.0
 SUBAGENT_RESULT_POLL_INTERVAL_S = 0.05
 _SUBAGENT_TERMINAL_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
+BACKGROUND_SUBAGENT_FAILURE_ARTIFACT_TYPE = "cayu.subagent_background_failure.v1"
+_MAX_BACKGROUND_FAILURE_RECORDS = 1000
+
+
+class BackgroundSubagentTaskRegistry:
+    """Strong-reference registry for background subagent drain tasks.
+
+    ``asyncio`` only keeps weak references to running tasks, so background
+    subagent drains must be pinned here until they finish or the parent is
+    torn down (``cancel_parent``). Drain failures are logged and recorded so
+    ``subagent_result`` can report them instead of the error being silently
+    swallowed.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._children_by_parent: dict[str, set[str]] = {}
+        self._failures: dict[str, dict[str, Any]] = {}
+
+    def register(
+        self,
+        task: asyncio.Task[None],
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+    ) -> None:
+        parent_session_id = require_clean_nonblank(parent_session_id, "parent_session_id")
+        child_session_id = require_clean_nonblank(child_session_id, "child_session_id")
+        if not isinstance(task, asyncio.Task):
+            raise TypeError("Background subagent registry requires an asyncio.Task.")
+        if child_session_id in self._tasks:
+            raise ValueError(f"Background subagent task already registered: {child_session_id}")
+        self._tasks[child_session_id] = task
+        self._children_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
+        task.add_done_callback(
+            partial(
+                self._finalize_task,
+                parent_session_id=parent_session_id,
+                child_session_id=child_session_id,
+            )
+        )
+
+    def active_tasks(self, parent_session_id: str) -> tuple[asyncio.Task[None], ...]:
+        child_ids = self._children_by_parent.get(parent_session_id, set())
+        return tuple(
+            self._tasks[child_id] for child_id in sorted(child_ids) if child_id in self._tasks
+        )
+
+    def failure(self, child_session_id: str) -> dict[str, Any] | None:
+        record = self._failures.get(child_session_id)
+        if record is None:
+            return None
+        return copy_json_value(record, "background_failure")
+
+    async def cancel_parent(self, parent_session_id: str) -> None:
+        """Cancel and drain every background subagent task for a parent session."""
+        tasks = self.active_tasks(parent_session_id)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _finalize_task(
+        self,
+        task: asyncio.Task[None],
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+    ) -> None:
+        self._tasks.pop(child_session_id, None)
+        children = self._children_by_parent.get(parent_session_id)
+        if children is not None:
+            children.discard(child_session_id)
+            if not children:
+                self._children_by_parent.pop(parent_session_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        self._failures[child_session_id] = {
+            "type": BACKGROUND_SUBAGENT_FAILURE_ARTIFACT_TYPE,
+            "parent_session_id": parent_session_id,
+            "child_session_id": child_session_id,
+            "error": str(error),
+            "error_type": type(error).__name__,
+        }
+        while len(self._failures) > _MAX_BACKGROUND_FAILURE_RECORDS:
+            del self._failures[next(iter(self._failures))]
+        logger.error(
+            "Background subagent %s (parent %s) failed while draining runtime events.",
+            child_session_id,
+            parent_session_id,
+            exc_info=error,
+        )
+
+
+_default_background_registry = BackgroundSubagentTaskRegistry()
+
+
+def default_background_subagent_registry() -> BackgroundSubagentTaskRegistry:
+    """Shared registry used when subagent tools are not given an explicit one."""
+    return _default_background_registry
 
 
 class _SubagentCancelledError(asyncio.CancelledError):
@@ -117,8 +224,18 @@ class SubagentTool(Tool):
         agents: Mapping[str, SubagentSpec | str],
         name: str = "subagent",
         description: str | None = None,
+        background_registry: BackgroundSubagentTaskRegistry | None = None,
     ) -> None:
+        if background_registry is not None and not isinstance(
+            background_registry, BackgroundSubagentTaskRegistry
+        ):
+            raise TypeError("background_registry must be a BackgroundSubagentTaskRegistry.")
         self._runtime = runtime
+        self._background_registry = (
+            background_registry
+            if background_registry is not None
+            else default_background_subagent_registry()
+        )
         self._agents = _copy_subagent_specs(agents)
         aliases = sorted(self._agents)
         if not aliases:
@@ -209,7 +326,12 @@ class SubagentTool(Tool):
         )
         if spec.mode == SubagentExecutionMode.BACKGROUND:
             try:
-                first_event = await _start_background_subagent(self._runtime.run(request))
+                first_event = await _start_background_subagent(
+                    self._runtime.run(request),
+                    registry=self._background_registry,
+                    parent_session_id=ctx.session_id,
+                    child_session_id=child_session_id,
+                )
             except Exception as exc:
                 return ToolResult(
                     content=f"Subagent {agent_alias} could not be started: {exc}",
@@ -240,16 +362,22 @@ class SubagentTool(Tool):
         try:
             result = await asyncio.shield(child_task)
         except asyncio.CancelledError:
-            _clear_current_task_cancellation()
+            _uncancel_current_task()
             cleanup_error: Exception | None = None
             try:
-                await _interrupt_child_session(
-                    runtime=self._runtime,
-                    child_session_id=child_session_id,
-                    child_task=child_task,
-                )
+                async with asyncio.timeout(SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S):
+                    await _interrupt_child_session(
+                        runtime=self._runtime,
+                        child_session_id=child_session_id,
+                        child_task=child_task,
+                    )
             except Exception as exc:
                 cleanup_error = exc
+            finally:
+                # Backstop: the child collector must never outlive the tool
+                # call, even when cleanup itself timed out or was cancelled.
+                if not child_task.done():
+                    child_task.cancel()
             if cleanup_error is not None:
                 raise _SubagentCancelledError(
                     artifacts=[
@@ -309,7 +437,12 @@ class SubagentResultTool(Tool):
         name: str = "subagent_result",
         description: str | None = None,
         default_timeout_s: float = DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S,
+        background_registry: BackgroundSubagentTaskRegistry | None = None,
     ) -> None:
+        if background_registry is not None and not isinstance(
+            background_registry, BackgroundSubagentTaskRegistry
+        ):
+            raise TypeError("background_registry must be a BackgroundSubagentTaskRegistry.")
         if not isinstance(default_timeout_s, int | float) or isinstance(default_timeout_s, bool):
             raise TypeError("default_timeout_s must be a number.")
         if default_timeout_s < 0 or default_timeout_s > MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S:
@@ -318,6 +451,11 @@ class SubagentResultTool(Tool):
                 f"{MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S:g} seconds."
             )
         self._session_store = session_store
+        self._background_registry = (
+            background_registry
+            if background_registry is not None
+            else default_background_subagent_registry()
+        )
         self._default_timeout_s = float(default_timeout_s)
         super().__init__(
             ToolSpec(
@@ -430,6 +568,7 @@ class SubagentResultTool(Tool):
             self._session_store,
             child,
             max_chars=max_chars,
+            background_failure=self._background_registry.failure(child.id),
         )
         return _tool_result_from_child_summary(summary)
 
@@ -465,6 +604,7 @@ class SubagentResultTool(Tool):
                 self._session_store,
                 child,
                 max_chars=max_chars,
+                background_failure=self._background_registry.failure(child.id),
             )
             for child in children
         ]
@@ -477,6 +617,12 @@ class SubagentResultTool(Tool):
             if summary["retrieval_status"] == "ready":
                 text = summary["result_text"] or f"Subagent ended with status {status}."
                 lines.append(f"- {agent} ({child_id}, {status}): {text}")
+            elif summary.get("background_failure") is not None:
+                failure = summary["background_failure"]
+                lines.append(
+                    f"- {agent} ({child_id}, {status}): background failure: {failure['error']}"
+                )
+                has_error = True
             else:
                 lines.append(f"- {agent} ({child_id}, {status}): still running")
             if summary.get("is_error") is True:
@@ -696,6 +842,7 @@ async def _summarize_child_session(
     child: Session,
     *,
     max_chars: int,
+    background_failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     transcript = await session_store.load_transcript(child.id)
     events = await session_store.load_events(child.id)
@@ -722,6 +869,11 @@ async def _summarize_child_session(
         "events": len(events),
         "terminal_event_type": None if terminal_event is None else str(terminal_event.type),
         "terminal_payload": terminal_payload,
+        "background_failure": (
+            None
+            if background_failure is None
+            else copy_json_value(background_failure, "background_failure")
+        ),
         "is_error": child.status in {SessionStatus.FAILED, SessionStatus.INTERRUPTED},
     }
 
@@ -751,6 +903,16 @@ def _latest_terminal_event(events: list[Event]) -> Event | None:
 def _tool_result_from_child_summary(summary: dict[str, Any]) -> ToolResult:
     status = summary["status"]
     if summary["retrieval_status"] != "ready":
+        background_failure = summary.get("background_failure")
+        if background_failure is not None:
+            return ToolResult(
+                content=(
+                    f"Subagent {summary['child_session_id']} background execution failed: "
+                    f"{background_failure['error']}"
+                ),
+                structured=summary,
+                is_error=True,
+            )
         return ToolResult(
             content=(
                 f"Subagent {summary['child_session_id']} is still running with status {status}."
@@ -774,32 +936,33 @@ async def _collect_subagent_result(
     *,
     max_chars: int,
 ) -> _SubagentResult:
-    chunks: list[str] = []
-    remaining = max_chars
-    text_truncated = False
+    # Mirror the retrieval path (`_last_assistant_text`): the result is the LAST
+    # assistant message's text, tail-truncated to `max_chars`. Accumulate deltas
+    # per model turn and reset on each `MODEL_STARTED` so we keep only the final
+    # message instead of the first `max_chars` of every turn concatenated.
+    message_chunks: list[str] = []
     event_count = 0
     terminal: Event | None = None
     async for event in events:
         event_count += 1
-        if event.type == EventType.MODEL_TEXT_DELTA:
+        if event.type == EventType.MODEL_STARTED:
+            message_chunks = []
+        elif event.type == EventType.MODEL_TEXT_DELTA:
             delta = event.payload.get("delta")
             if isinstance(delta, str):
-                if remaining > 0:
-                    chunk = delta[:remaining]
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                    if len(chunk) < len(delta):
-                        text_truncated = True
-                elif delta:
-                    text_truncated = True
+                message_chunks.append(delta)
         if event.type in {
             EventType.SESSION_COMPLETED,
             EventType.SESSION_FAILED,
             EventType.SESSION_INTERRUPTED,
         }:
             terminal = event
+    text = "".join(message_chunks).strip()
+    text_truncated = len(text) > max_chars
+    if text_truncated:
+        text = text[:max_chars]
     return _SubagentResult(
-        text="".join(chunks).strip(),
+        text=text,
         text_truncated=text_truncated,
         event_count=event_count,
         terminal=terminal,
@@ -824,14 +987,31 @@ async def _interrupt_child_session(
     finally:
         if not child_task.done():
             child_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await child_task
+        # ``asyncio.wait`` (unlike ``await child_task``) never raises the
+        # child's own exception and never swallows an outer cancellation, so
+        # the bounded-cleanup timeout and parent cancellation stay effective
+        # while we drain the collector.
+        await asyncio.wait([child_task])
+        if not child_task.cancelled():
+            # Retrieve a failed collector's exception so asyncio does not log
+            # "Task exception was never retrieved" during teardown.
+            child_task.exception()
 
 
-async def _start_background_subagent(events: AsyncIterator[Event]) -> Event:
+async def _start_background_subagent(
+    events: AsyncIterator[Event],
+    *,
+    registry: BackgroundSubagentTaskRegistry,
+    parent_session_id: str,
+    child_session_id: str,
+) -> Event:
     first_event: asyncio.Future[Event] = asyncio.get_running_loop().create_future()
     task = asyncio.create_task(_drain_background_subagent(events, first_event))
-    task.add_done_callback(_consume_background_task_exception)
+    registry.register(
+        task,
+        parent_session_id=parent_session_id,
+        child_session_id=child_session_id,
+    )
     return await first_event
 
 
@@ -851,16 +1031,14 @@ async def _drain_background_subagent(
         raise
 
 
-def _consume_background_task_exception(task: asyncio.Task[None]) -> None:
-    if task.cancelled():
-        return
-    with contextlib.suppress(Exception):
-        task.result()
+def _uncancel_current_task() -> None:
+    """Consume exactly the cancellation request this handler caught.
 
-
-def _clear_current_task_cancellation() -> None:
+    Draining every pending request (``while cancelling(): uncancel()``) would
+    strip cancellations owned by enclosing scopes such as ``asyncio.timeout``
+    or ``TaskGroup`` and corrupt their bookkeeping, so at most one guarded
+    ``uncancel`` is performed.
+    """
     current_task = asyncio.current_task()
-    if current_task is None:
-        return
-    while current_task.cancelling():
+    if current_task is not None and current_task.cancelling() > 0:
         current_task.uncancel()

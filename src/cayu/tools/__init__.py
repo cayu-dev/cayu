@@ -22,16 +22,19 @@ from cayu.tools.knowledge import (
     SearchKnowledgeTool,
 )
 from cayu.tools.subagents import (
+    BackgroundSubagentTaskRegistry,
     SubagentContextMode,
     SubagentExecutionMode,
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
+    default_background_subagent_registry,
 )
 
 __all__ = [
     "ArtifactReadRequest",
     "ArtifactReader",
+    "BackgroundSubagentTaskRegistry",
     "ExecCommandTool",
     "ImageArtifactReader",
     "ListArtifactsTool",
@@ -52,4 +55,5 @@ __all__ = [
     "TextArtifactReader",
     "WriteFileTool",
     "default_artifact_readers",
+    "default_background_subagent_registry",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from cayu._validation import copy_json_value
@@ -13,9 +14,15 @@ async def run_tool(
     tool: Tool,
     ctx: ToolContext,
     arguments: dict[str, Any],
+    timeout_seconds: float | None = None,
 ) -> ToolResult:
+    timer: asyncio.Timeout | None = None
     try:
-        result = await tool.run(ctx, arguments)
+        if timeout_seconds is None:
+            result = await tool.run(ctx, arguments)
+        else:
+            async with asyncio.timeout(timeout_seconds) as timer:
+                result = await tool.run(ctx, arguments)
         if type(result) is not ToolResult:
             return ToolResult(
                 content=(
@@ -25,6 +32,13 @@ async def run_tool(
                 is_error=True,
             )
         return tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
+    except TimeoutError as exc:
+        if timer is not None and timer.expired():
+            return ToolResult(
+                content=f"Tool call timed out after {timeout_seconds} seconds.",
+                is_error=True,
+            )
+        return ToolResult(content=tool_results.exception_message(exc), is_error=True)
     except Exception as exc:
         return ToolResult(content=tool_results.exception_message(exc), is_error=True)
 
