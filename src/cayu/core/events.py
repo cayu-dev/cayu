@@ -47,6 +47,7 @@ class EventType(StrEnum):
     MODEL_COMPLETED = "model.completed"
     MODEL_ERROR = "model.error"
     MODEL_RETRY = "model.retry"
+    MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
     STRUCTURED_OUTPUT_FAILED = "structured_output.failed"

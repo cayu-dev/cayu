@@ -17,10 +17,13 @@ from cayu import (
 )
 from cayu.providers import (
     HttpxVertexTransport,
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
     ModelContextOverflowError,
     ModelRequest,
     ModelStreamEventType,
     VertexAPIError,
+    VertexContextOverflowError,
     VertexProtocolError,
     VertexProvider,
 )
@@ -567,3 +570,269 @@ async def test_vertex_coexists_with_anthropic_in_one_app() -> None:
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert transport.calls  # the Vertex (default) provider served the run
+
+
+class StreamingRecordingTransport:
+    """Fake transport exposing the SSE streaming and token-count seams."""
+
+    def __init__(
+        self,
+        event_batches: list[list[Mapping[str, Any]]] | None = None,
+        count_responses: list[Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.event_batches = list(event_batches or [])
+        self.count_responses = list(count_responses or [])
+        self.calls: list[dict[str, Any]] = []
+        self.count_calls: list[dict[str, Any]] = []
+
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        self.count_calls.append(
+            {"url": url, "headers": dict(headers), "payload": dict(payload), "timeout_s": timeout_s}
+        )
+        if not self.count_responses:
+            raise AssertionError("No fake Vertex count response queued.")
+        return self.count_responses.pop(0)
+
+    async def create_message(self, *, url, headers, payload, timeout_s) -> Mapping[str, Any]:
+        raise AssertionError("create_message must not be used when streaming is available.")
+
+    async def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ):
+        self.calls.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "payload": dict(payload),
+                "timeout_s": timeout_s,
+                "stream_idle_timeout_s": stream_idle_timeout_s,
+            }
+        )
+        if not self.event_batches:
+            raise AssertionError("No fake Vertex stream queued.")
+        for event in self.event_batches.pop(0):
+            yield event
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_streams_sse_events_incrementally() -> None:
+    transport = StreamingRecordingTransport(
+        event_batches=[
+            [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_v1",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 9},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hel"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "lo"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 4},
+                },
+                {"type": "message_stop"},
+            ]
+        ]
+    )
+    provider = _provider(transport)
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert [events[0].delta, events[1].delta] == ["hel", "lo"]
+    assert events[2].payload["stop_reason"] == "end_turn"
+    assert events[2].payload["usage"] == {"input_tokens": 9, "output_tokens": 4}
+
+    call = transport.calls[0]
+    assert call["url"] == (
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/demo-project"
+        "/locations/us-east5/publishers/anthropic/models/"
+        "claude-sonnet-4-6:streamRawPredict"
+    )
+    assert call["payload"]["stream"] is True
+    assert "model" not in call["payload"]
+    assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
+    assert call["headers"]["Authorization"] == "Bearer fake-token"
+    assert call["stream_idle_timeout_s"] == 120.0
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> None:
+    transport = StreamingRecordingTransport(
+        event_batches=[
+            [
+                {
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": "Overloaded"},
+                }
+            ]
+        ]
+    )
+    provider = _provider(transport)
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error"] == "Vertex streaming error: Overloaded"
+    assert events[0].payload["error_type"] == "VertexAPIError"
+    assert events[0].payload["provider"] == "vertex"
+    assert events[0].payload["provider_error_type"] == "overloaded_error"
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_stream_error_event_propagates_context_overflow() -> None:
+    transport = StreamingRecordingTransport(
+        event_batches=[
+            [
+                {
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": "prompt is too long"},
+                }
+            ]
+        ]
+    )
+    provider = _provider(transport)
+
+    with pytest.raises(VertexContextOverflowError) as exc_info:
+        [event async for event in provider.stream(_request())]
+
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.provider == "vertex"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_counts_input_tokens_with_official_endpoint() -> None:
+    transport = StreamingRecordingTransport(count_responses=[{"input_tokens": 42}])
+    provider = _provider(transport)
+
+    result = await provider.count_input_tokens(_request())
+
+    assert result is not None
+    assert result.input_tokens == 42
+    assert result.method == InputTokenCountMethod.OFFICIAL
+    assert result.confidence == InputTokenCountConfidence.HIGH
+    assert result.metadata == {
+        "endpoint": "count-tokens:rawPredict",
+        "provider_billing_status": "not_documented",
+    }
+    call = transport.count_calls[0]
+    assert call["url"] == (
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/demo-project"
+        "/locations/us-east5/publishers/anthropic/models/count-tokens:rawPredict"
+    )
+    # Unlike message creation, the real model stays in the count-tokens body
+    # (the URL model segment is the literal "count-tokens").
+    assert call["payload"]["model"] == "claude-sonnet-4-6"
+    assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
+    assert "max_tokens" not in call["payload"]
+    assert call["headers"]["Authorization"] == "Bearer fake-token"
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_count_input_tokens_unavailable_without_transport_support() -> None:
+    # Transports predating the count seam stay source-compatible: counting is
+    # reported unavailable instead of raising AttributeError.
+    provider = _provider(FailingTransport())
+
+    assert await provider.count_input_tokens(_request()) is None
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_rejects_invalid_token_count_response() -> None:
+    transport = StreamingRecordingTransport(count_responses=[{"input_tokens": "42"}])
+    provider = _provider(transport)
+
+    with pytest.raises(VertexProtocolError, match="input_tokens"):
+        await provider.count_input_tokens(_request())
+
+
+@pytest.mark.anyio
+async def test_httpx_vertex_transport_classifies_prompt_too_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": "prompt is too long: 250000 tokens > 200000 maximum",
+                }
+            },
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    with pytest.raises(VertexContextOverflowError) as exc_info:
+        await HttpxVertexTransport().create_message(
+            url=_VERTEX_URL, headers={}, payload={"a": 1}, timeout_s=10.0
+        )
+
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.provider == "vertex"
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "INVALID_ARGUMENT"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_httpx_vertex_transport_populates_typed_error_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota"}},
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    with pytest.raises(VertexAPIError) as exc_info:
+        await HttpxVertexTransport().create_message(
+            url=_VERTEX_URL, headers={}, payload={"a": 1}, timeout_s=10.0
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.error_type == "RESOURCE_EXHAUSTED"
+
+
+def test_vertex_provider_rejects_invalid_stream_idle_timeout() -> None:
+    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
+        _provider(FailingTransport(), stream_idle_timeout_s=0)
+    with pytest.raises(TypeError, match="stream_idle_timeout_s"):
+        _provider(FailingTransport(), stream_idle_timeout_s="60")

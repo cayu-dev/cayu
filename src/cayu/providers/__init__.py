@@ -9,6 +9,7 @@ from cayu.providers.anthropic import (
     AnthropicTransport,
     HttpxAnthropicTransport,
     anthropic_response_events,
+    anthropic_stream_events,
     build_anthropic_payload,
 )
 from cayu.providers.base import (
@@ -57,6 +58,7 @@ from cayu.providers.openai import (
 from cayu.providers.vertex import (
     HttpxVertexTransport,
     VertexAPIError,
+    VertexContextOverflowError,
     VertexError,
     VertexProtocolError,
     VertexProvider,
@@ -101,11 +103,13 @@ __all__ = [
     "OpenAIProvider",
     "OpenAITransport",
     "VertexAPIError",
+    "VertexContextOverflowError",
     "VertexError",
     "VertexProtocolError",
     "VertexProvider",
     "VertexTransport",
     "anthropic_response_events",
+    "anthropic_stream_events",
     "build_anthropic_payload",
     "build_chat_completions_payload",
     "build_openai_embedding_payload",

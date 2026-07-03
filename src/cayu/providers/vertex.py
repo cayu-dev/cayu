@@ -9,17 +9,25 @@ from cayu._validation import require_clean_nonblank
 from cayu.providers._http import (
     exception_message,
     json_error_text,
+    optional_error_string,
     post_json,
     safe_error_response_text,
+    stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
     validate_url,
 )
 from cayu.providers.anthropic import (
+    _anthropic_overflow_message,
     anthropic_response_events,
+    anthropic_stream_events,
     build_anthropic_payload,
+    build_anthropic_token_count_payload,
 )
 from cayu.providers.base import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelContextOverflowError,
     ModelProvider,
     ModelProviderError,
@@ -34,6 +42,7 @@ DEFAULT_VERTEX_REGION = "global"
 DEFAULT_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
 DEFAULT_VERTEX_MAX_TOKENS = 4096
 DEFAULT_VERTEX_TIMEOUT_SECONDS = 60.0
+DEFAULT_VERTEX_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 VERTEX_OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
@@ -70,11 +79,46 @@ class VertexAPIError(VertexError, ModelProviderError):
         )
 
 
+class VertexContextOverflowError(VertexAPIError, ModelContextOverflowError):
+    """Raised when Vertex reports that the request exceeds context limits."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelContextOverflowError.__init__(
+            self,
+            message,
+            provider="vertex",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            response_body=response_body,
+        )
+
+
 class VertexProtocolError(VertexError):
     """Raised when Vertex data does not match the expected Messages shape."""
 
 
 class VertexTransport(Protocol):
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        """POST a count-tokens rawPredict payload and return decoded JSON."""
+
     async def create_message(
         self,
         *,
@@ -85,11 +129,79 @@ class VertexTransport(Protocol):
     ) -> Mapping[str, Any]:
         """POST a Vertex rawPredict payload and return decoded JSON."""
 
+    def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        """POST a streamRawPredict payload and yield decoded SSE data objects."""
+
 
 class HttpxVertexTransport:
     """HTTP transport with explicit certifi-backed TLS verification."""
 
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+
     async def create_message(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        return await self._post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+
+    async def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        url = _validate_url(url, "url")
+        events = stream_sse_json_events(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            stream_idle_timeout_s=stream_idle_timeout_s,
+            request_label="Vertex AI",
+            response_label="Vertex",
+            api_error=VertexAPIError,
+            protocol_error=VertexProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_vertex_context_overflow_if_applicable,
+            api_error_from_response=_vertex_api_error_from_response,
+        )
+        async for event in events:
+            yield event
+
+    async def _post_json(
         self,
         *,
         url: str,
@@ -108,6 +220,8 @@ class HttpxVertexTransport:
             api_error=VertexAPIError,
             protocol_error=VertexProtocolError,
             error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_vertex_context_overflow_if_applicable,
+            api_error_from_response=_vertex_api_error_from_response,
         )
 
 
@@ -142,6 +256,7 @@ class VertexProvider(ModelProvider):
         anthropic_version: str = DEFAULT_VERTEX_ANTHROPIC_VERSION,
         max_tokens: int = DEFAULT_VERTEX_MAX_TOKENS,
         timeout_s: float = DEFAULT_VERTEX_TIMEOUT_SECONDS,
+        stream_idle_timeout_s: float = DEFAULT_VERTEX_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: VertexTransport | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -159,6 +274,11 @@ class VertexProvider(ModelProvider):
             raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
         self.timeout_s = float(timeout_s)
+        if type(stream_idle_timeout_s) not in {int, float}:
+            raise TypeError("stream_idle_timeout_s must be a number.")
+        if stream_idle_timeout_s <= 0:
+            raise ValueError("stream_idle_timeout_s must be greater than zero.")
+        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
         self.credentials = _resolve_credentials(
             credentials=credentials,
             service_account_info=service_account_info,
@@ -179,17 +299,36 @@ class VertexProvider(ModelProvider):
             payload.pop("model", None)
             payload["anthropic_version"] = self.anthropic_version
             token = await self._access_token()
-            response = await self.transport.create_message(
-                url=self._endpoint(request.model),
-                headers={
-                    "content-type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                },
-                payload=payload,
-                timeout_s=self.timeout_s,
-            )
-            for event in anthropic_response_events(response):
-                yield event
+            stream_transport = getattr(self.transport, "stream_message_events", None)
+            if stream_transport is None:
+                # Back-compat: transports predating SSE support fall back to one
+                # buffered POST and a synthetic event replay.
+                response = await self.transport.create_message(
+                    url=self._endpoint(request.model),
+                    headers=self._request_headers(token),
+                    payload=payload,
+                    timeout_s=self.timeout_s,
+                )
+                for event in anthropic_response_events(response):
+                    yield event
+            else:
+                payload["stream"] = True
+                raw_events = stream_transport(
+                    url=self._endpoint(request.model, verb="streamRawPredict"),
+                    headers=self._request_headers(token),
+                    payload=payload,
+                    timeout_s=self.timeout_s,
+                    stream_idle_timeout_s=self.stream_idle_timeout_s,
+                )
+                events = anthropic_stream_events(
+                    raw_events,
+                    provider_label="Vertex",
+                    api_error=VertexAPIError,
+                    protocol_error=VertexProtocolError,
+                    context_overflow_error=VertexContextOverflowError,
+                )
+                async for event in events:
+                    yield event
         except ModelContextOverflowError:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
@@ -200,13 +339,55 @@ class VertexProvider(ModelProvider):
                 cause=exc,
             )
 
-    def _endpoint(self, model: str) -> str:
+    async def count_input_tokens(
+        self,
+        request: ModelRequest,
+    ) -> InputTokenCountResult | None:
+        """Count input tokens via the Anthropic count-tokens endpoint on Vertex.
+
+        Vertex exposes the Anthropic Messages count-tokens API as a rawPredict
+        call on the literal ``count-tokens`` model segment; unlike ``stream``,
+        the real model stays in the request body.
+        """
+        count_transport = getattr(self.transport, "count_message_tokens", None)
+        if count_transport is None:
+            # Back-compat: transports predating token counting stay source-compatible.
+            return None
+        payload = build_anthropic_token_count_payload(
+            request,
+            default_max_tokens=self.max_tokens,
+        )
+        payload["anthropic_version"] = self.anthropic_version
+        token = await self._access_token()
+        response = await count_transport(
+            url=self._endpoint("count-tokens"),
+            headers=self._request_headers(token),
+            payload=payload,
+            timeout_s=self.timeout_s,
+        )
+        return InputTokenCountResult(
+            input_tokens=_vertex_input_tokens_from_count_response(response),
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+            metadata={
+                "endpoint": "count-tokens:rawPredict",
+                "provider_billing_status": "not_documented",
+            },
+        )
+
+    def _endpoint(self, model: str, *, verb: str = "rawPredict") -> str:
         model = require_clean_nonblank(model, "model")
         host = self.base_url or _vertex_host(self.region)
         return (
             f"{host}/v1/projects/{self.project_id}/locations/{self.region}"
-            f"/publishers/anthropic/models/{model}:rawPredict"
+            f"/publishers/anthropic/models/{model}:{verb}"
         )
+
+    def _request_headers(self, token: str) -> dict[str, str]:
+        return {
+            "content-type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
 
     async def _access_token(self) -> str:
         credentials = self.credentials
@@ -289,6 +470,75 @@ def _import_google(module_name: str) -> Any:
             "VertexProvider requires the optional google-auth package. "
             "Install it with `pip install cayu[vertex]`."
         ) from exc
+
+
+def _vertex_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
+    if not isinstance(response, Mapping):
+        raise VertexProtocolError("Vertex token count response must be a JSON object.")
+    input_tokens = response.get("input_tokens")
+    if type(input_tokens) is not int or input_tokens < 0:
+        raise VertexProtocolError("Vertex token count response requires input_tokens.")
+    return input_tokens
+
+
+def _decoded_gcp_error(response: httpx.Response) -> Mapping[str, Any] | None:
+    """Extract the GCP error object; some endpoints array-wrap the envelope."""
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return None
+    try:
+        decoded = response.json()
+    except ValueError:
+        return None
+    if isinstance(decoded, list) and decoded:
+        decoded = decoded[0]
+    if not isinstance(decoded, Mapping):
+        return None
+    error = decoded.get("error")
+    return error if isinstance(error, Mapping) else None
+
+
+def _raise_vertex_context_overflow_if_applicable(response: httpx.Response) -> None:
+    error = _decoded_gcp_error(response)
+    if error is None:
+        return
+    raw_message = error.get("message")
+    message = raw_message if isinstance(raw_message, str) else None
+    if not _is_vertex_context_overflow(status_code=response.status_code, message=message):
+        return
+    raise VertexContextOverflowError(
+        "Vertex model context overflow",
+        status_code=response.status_code,
+        error_type=optional_error_string(error.get("status")),
+        response_body=_safe_error_response_text(response),
+    )
+
+
+def _is_vertex_context_overflow(*, status_code: int, message: str | None) -> bool:
+    # Vertex proxies the Anthropic Messages API, so an oversized request comes
+    # back as HTTP 400 INVALID_ARGUMENT carrying the Anthropic overflow message
+    # (or as a request-entity-too-large 413 at the GCP front end).
+    if status_code == 413:
+        return True
+    if status_code != 400 or message is None:
+        return False
+    return _anthropic_overflow_message(message)
+
+
+def _vertex_api_error_from_response(response: httpx.Response, message: str) -> VertexAPIError:
+    """Build a structured `VertexAPIError` from an HTTP error response.
+
+    Keeps the GCP error body's typed identity (``status`` as error_type) and the
+    HTTP status code so runtime retry classification keys off typed fields
+    instead of reparsing the flattened message text.
+    """
+    error = _decoded_gcp_error(response) or {}
+    return VertexAPIError(
+        message,
+        status_code=response.status_code,
+        error_type=optional_error_string(error.get("status")),
+        response_body=_safe_error_response_text(response),
+    )
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:

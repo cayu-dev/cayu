@@ -5,9 +5,10 @@ from cayu.proxies.base import (
     ProxyAuthorizationResult,
     copy_proxy_authorization_result,
 )
-from cayu.proxies.passthrough import PassthroughProxy
+from cayu.proxies.passthrough import AllowlistProxy, PassthroughProxy
 
 __all__ = [
+    "AllowlistProxy",
     "CredentialProxy",
     "PassthroughProxy",
     "ProxyAuthorizationResult",

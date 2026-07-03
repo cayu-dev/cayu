@@ -9,6 +9,7 @@ import pytest
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
+    AllowlistProxy,
     CacheBreakpoint,
     CachePolicy,
     CayuApp,
@@ -31,9 +32,11 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEventType,
     anthropic_response_events,
+    anthropic_stream_events,
     build_anthropic_payload,
 )
 from cayu.providers.cache import resolve_cache_policy
+from cayu.vaults import SecretRef, StaticVault
 
 
 class RecordingTransport:
@@ -725,6 +728,74 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
 
 
 @pytest.mark.anyio
+async def test_httpx_anthropic_transport_populates_typed_retry_fields(monkeypatch) -> None:
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FailingClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+        ) -> httpx.Response:
+            request = httpx.Request("POST", url)
+            response = httpx.Response(
+                429,
+                request=request,
+                headers={
+                    "content-type": "application/json",
+                    "retry-after": "12",
+                    "request-id": "req_rate_limited",
+                },
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "rate limit exceeded",
+                    },
+                },
+            )
+            raise httpx.HTTPStatusError(
+                "rate limited",
+                request=request,
+                response=response,
+            )
+
+    monkeypatch.setattr(
+        "cayu.providers._http.httpx.AsyncClient",
+        FailingClient,
+    )
+
+    with pytest.raises(AnthropicAPIError) as exc_info:
+        await HttpxAnthropicTransport().create_message(
+            url="https://api.anthropic.com/v1/messages",
+            headers={},
+            payload={},
+            timeout_s=1,
+        )
+
+    error = exc_info.value
+    assert error.provider == "anthropic"
+    assert error.status_code == 429
+    assert error.error_type == "rate_limit_error"
+    assert error.request_id == "req_rate_limited"
+    assert error.retry_after_s == 12.0
+    # Typed fields survive into the error-event payload used for retry
+    # classification and observability.
+    payload = error.error_payload_fields()
+    assert payload["status_code"] == 429
+    assert payload["retry_after_s"] == 12.0
+
+
+@pytest.mark.anyio
 async def test_httpx_anthropic_transport_classifies_request_too_large(monkeypatch) -> None:
     class FailingClient:
         def __init__(self, **kwargs: Any) -> None:
@@ -1140,3 +1211,346 @@ async def test_cache_policy_standard_ttl_has_no_beta_header() -> None:
 
     assert "anthropic-beta" not in transport.calls[0]["headers"]
     assert transport.calls[0]["payload"]["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+class StreamingRecordingTransport:
+    """Fake transport exposing the SSE streaming seam."""
+
+    def __init__(self, event_batches: list[list[Mapping[str, Any]]]) -> None:
+        self.event_batches = list(event_batches)
+        self.calls: list[dict[str, Any]] = []
+
+    async def count_message_tokens(self, *, url, headers, payload, timeout_s):
+        raise AssertionError("count_message_tokens should not be called.")
+
+    async def create_message(self, *, url, headers, payload, timeout_s):
+        raise AssertionError("create_message must not be used when streaming is available.")
+
+    async def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ):
+        self.calls.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "payload": dict(payload),
+                "timeout_s": timeout_s,
+                "stream_idle_timeout_s": stream_idle_timeout_s,
+            }
+        )
+        if not self.event_batches:
+            raise AssertionError("No fake Anthropic stream queued.")
+        for event in self.event_batches.pop(0):
+            yield event
+
+
+async def _aiter_events(events: list[Mapping[str, Any]]):
+    for event in events:
+        yield event
+
+
+_STREAM_EVENTS: list[Mapping[str, Any]] = [
+    {
+        "type": "message_start",
+        "message": {"id": "msg_s1", "model": "claude-test", "usage": {"input_tokens": 11}},
+    },
+    {"type": "ping"},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}},
+    {"type": "content_block_stop", "index": 0},
+    {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "thinking_delta", "thinking": "Let me "},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "thinking_delta", "thinking": "reason."},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "signature_delta", "signature": "sig-abc"},
+    },
+    {"type": "content_block_stop", "index": 1},
+    {
+        "type": "content_block_start",
+        "index": 2,
+        "content_block": {"type": "tool_use", "id": "toolu_9", "name": "echo", "input": {}},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 2,
+        "delta": {"type": "input_json_delta", "partial_json": '{"text": '},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 2,
+        "delta": {"type": "input_json_delta", "partial_json": '"hi"}'},
+    },
+    {"type": "content_block_stop", "index": 2},
+    {
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+        "usage": {"output_tokens": 7},
+    },
+    {"type": "message_stop"},
+]
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_streams_sse_events_incrementally() -> None:
+    transport = StreamingRecordingTransport([_STREAM_EVENTS])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "Say hello.")])
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert [events[0].delta, events[1].delta] == ["hel", "lo"]
+    # The thinking block is emitted whole so its signature round-trips over the
+    # complete text (a partial block would be rejected on the next turn).
+    assert events[2].delta == "Let me reason."
+    assert events[2].payload["provider_state"] == {"type": "thinking", "signature": "sig-abc"}
+    assert events[3].payload == {"id": "toolu_9", "name": "echo", "arguments": {"text": "hi"}}
+    completed = events[4].payload
+    assert completed["id"] == "msg_s1"
+    assert completed["model"] == "claude-test"
+    assert completed["stop_reason"] == "tool_use"
+    # Usage merges message_start input counts with message_delta output counts.
+    assert completed["usage"] == {"input_tokens": 11, "output_tokens": 7}
+
+    call = transport.calls[0]
+    assert call["url"] == "https://api.anthropic.com/v1/messages"
+    assert call["payload"]["stream"] is True
+    assert call["stream_idle_timeout_s"] == 120.0
+    assert call["headers"]["x-api-key"] == "test-key"
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_events_emits_redacted_thinking_and_empty_tool_input() -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_s2", "model": "claude-test", "usage": {"input_tokens": 3}},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque-blob"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "ping", "input": {}},
+        },
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}},
+        {"type": "message_stop"},
+    ]
+
+    translated = [event async for event in anthropic_stream_events(_aiter_events(events))]
+
+    assert [event.type for event in translated] == [
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert translated[0].delta == ""
+    assert translated[0].payload["provider_state"] == {
+        "type": "redacted_thinking",
+        "data": "opaque-blob",
+    }
+    # A tool_use block with no input_json_delta events has empty arguments.
+    assert translated[1].payload == {"id": "toolu_1", "name": "ping", "arguments": {}}
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_stream_error_event_yields_typed_error() -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_s3", "model": "claude-test", "usage": {}},
+        },
+        {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+    ]
+    transport = StreamingRecordingTransport([events])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hello")])
+
+    emitted = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in emitted] == [ModelStreamEventType.ERROR]
+    assert emitted[0].payload["error"] == "Anthropic streaming error: Overloaded"
+    assert emitted[0].payload["error_type"] == "AnthropicAPIError"
+    assert emitted[0].payload["provider"] == "anthropic"
+    assert emitted[0].payload["provider_error_type"] == "overloaded_error"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_stream_error_event_propagates_context_overflow() -> None:
+    events = [
+        {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "prompt is too long"},
+        },
+    ]
+    transport = StreamingRecordingTransport([events])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hello")])
+
+    with pytest.raises(AnthropicContextOverflowError) as exc_info:
+        [event async for event in provider.stream(request)]
+
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.retryable is False
+    assert exc_info.value.error_type == "invalid_request_error"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_stream_without_message_stop_is_protocol_error() -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_s4", "model": "claude-test", "usage": {}},
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+    ]
+    transport = StreamingRecordingTransport([events])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hello")])
+
+    emitted = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in emitted] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.ERROR,
+    ]
+    assert "ended before message_stop" in emitted[1].payload["error"]
+    assert emitted[1].payload["error_type"] == "AnthropicProtocolError"
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_events_rejects_unordered_deltas() -> None:
+    events = [
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "x"}},
+    ]
+
+    with pytest.raises(AnthropicProtocolError, match="before content_block_start"):
+        [event async for event in anthropic_stream_events(_aiter_events(events))]
+
+
+def test_anthropic_provider_rejects_invalid_stream_idle_timeout() -> None:
+    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
+        AnthropicProvider(api_key="test-key", stream_idle_timeout_s=0)
+    with pytest.raises(TypeError, match="stream_idle_timeout_s"):
+        AnthropicProvider(api_key="test-key", stream_idle_timeout_s="60")  # type: ignore[arg-type]
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_resolves_api_key_ref_through_allowlist_proxy() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_1",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "hello"}],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+        ],
+        count_responses=[{"input_tokens": 5}],
+    )
+    proxy = AllowlistProxy(
+        StaticVault({"anthropic_api_key": "sk-vaulted-key"}),
+        allowed_destinations=["api.anthropic.com"],
+    )
+    provider = AnthropicProvider(
+        api_key_ref=SecretRef(name="anthropic_api_key"),
+        credential_proxy=proxy,
+        transport=transport,
+    )
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hi")])
+
+    events = [event async for event in provider.stream(request)]
+    count = await provider.count_input_tokens(request)
+
+    # The raw key never lives in provider config; it is resolved per request.
+    assert provider.api_key is None
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert transport.calls[0]["headers"]["x-api-key"] == "sk-vaulted-key"
+    assert count is not None
+    assert transport.count_calls[0]["headers"]["x-api-key"] == "sk-vaulted-key"
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_fails_closed_when_proxy_denies_destination() -> None:
+    transport = RecordingTransport([])
+    proxy = AllowlistProxy(
+        StaticVault({"anthropic_api_key": "sk-vaulted-key"}),
+        allowed_destinations=["allowed.example.com"],
+    )
+    provider = AnthropicProvider(
+        api_key_ref=SecretRef(name="anthropic_api_key"),
+        credential_proxy=proxy,
+        transport=transport,
+    )
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hi")])
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert "denied" in events[0].payload["error"]
+    assert events[0].payload["retryable"] is False
+    assert transport.calls == []
+
+    with pytest.raises(AnthropicAPIError, match="denied"):
+        await provider.count_input_tokens(request)
+    assert transport.count_calls == []
+
+
+def test_anthropic_provider_validates_credential_source_configuration() -> None:
+    proxy = AllowlistProxy(
+        StaticVault({"anthropic_api_key": "sk-vaulted-key"}),
+        allowed_destinations=["api.anthropic.com"],
+    )
+
+    with pytest.raises(ValueError, match="not both"):
+        AnthropicProvider(
+            api_key="test-key",
+            api_key_ref=SecretRef(name="anthropic_api_key"),
+            credential_proxy=proxy,
+        )
+
+    with pytest.raises(TypeError, match="credential_proxy"):
+        AnthropicProvider(api_key_ref=SecretRef(name="anthropic_api_key"))
+
+    with pytest.raises(ValueError, match="requires api_key_ref"):
+        AnthropicProvider(api_key="test-key", credential_proxy=proxy)
+
+    with pytest.raises(TypeError, match="SecretRef"):
+        AnthropicProvider(api_key_ref="anthropic_api_key", credential_proxy=proxy)  # type: ignore[arg-type]

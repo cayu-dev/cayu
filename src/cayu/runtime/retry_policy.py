@@ -124,7 +124,20 @@ def retry_decision(
     policy: RetryPolicy,
     attempt: int,
     error: str,
+    status_code: int | None = None,
+    retryable: bool | None = None,
+    retry_after_s: float | None = None,
 ) -> RetryDecision:
+    """Classify one failed model attempt into a retry decision.
+
+    `status_code`, `retryable`, and `retry_after_s` are the typed fields a
+    provider exposes on `ModelProviderError`. When supplied they take precedence
+    over reparsing `error` text: `status_code` seeds classification directly,
+    `retryable=False` forces a terminal decision, and `retry_after_s` overrides
+    the computed backoff so a provider `Retry-After` directive is honored. They
+    default to `None` so string-only callers keep the legacy regex behavior.
+    """
+
     policy = copy_retry_policy(policy)
     if type(attempt) is not int:
         raise TypeError("attempt must be an integer.")
@@ -132,14 +145,25 @@ def retry_decision(
         raise ValueError("attempt must be greater than or equal to 1.")
     if type(error) is not str:
         raise TypeError("error must be a string.")
+    if retry_after_s is not None:
+        if type(retry_after_s) not in {int, float} or retry_after_s < 0:
+            raise ValueError("retry_after_s must be a non-negative number.")
+        retry_after_s = float(retry_after_s)
 
-    reason, status_code = classify_retryable_error(policy=policy, error=error)
+    reason, classified_status = classify_retryable_error(
+        policy=policy,
+        error=error,
+        status_code=status_code,
+        retryable=retryable,
+    )
     can_retry = reason is not None and attempt < policy.max_attempts
     return RetryDecision(
         retry=can_retry,
         reason=reason,
-        status_code=status_code,
-        delay_seconds=_retry_delay(policy, attempt) if can_retry else 0.0,
+        status_code=classified_status,
+        delay_seconds=(
+            _retry_delay(policy, attempt, retry_after_s=retry_after_s) if can_retry else 0.0
+        ),
         attempt=attempt,
         next_attempt=attempt + 1 if can_retry else None,
         max_attempts=policy.max_attempts,
@@ -150,33 +174,63 @@ def classify_retryable_error(
     *,
     policy: RetryPolicy,
     error: str,
+    status_code: int | None = None,
+    retryable: bool | None = None,
 ) -> tuple[RetryReason | None, int | None]:
+    """Classify a failure into a retry reason and effective HTTP status code.
+
+    A typed `status_code` (e.g. from `ModelProviderError.status_code`) is
+    preferred over the regex scan of `error`. A typed `retryable` flag is the
+    provider's own tri-state verdict: `False` short-circuits to a terminal
+    decision, `True` is honored as a transient failure when neither the status
+    code nor the message text already matched a configured pattern.
+    """
+
     policy = copy_retry_policy(policy)
     if type(error) is not str:
         raise TypeError("error must be a string.")
+    if status_code is not None and (
+        type(status_code) is not int or status_code < 100 or status_code > 599
+    ):
+        raise ValueError("status_code must be a valid HTTP status code.")
+    if retryable is not None and type(retryable) is not bool:
+        raise TypeError("retryable must be a boolean.")
     normalized = error.lower()
 
-    status_code = _http_status_code(error)
-    if _is_permanent_provider_error(status_code=status_code, normalized_error=normalized):
-        return None, status_code
+    effective_status = status_code if status_code is not None else _http_status_code(error)
 
-    if status_code is not None and status_code in policy.retry_on_status_codes:
-        return RetryReason.HTTP_STATUS, status_code
+    # The provider already classified this failure as terminal; don't burn a
+    # retry on an error it told us can never succeed as-is.
+    if retryable is False:
+        return None, effective_status
+
+    if _is_permanent_provider_error(status_code=effective_status, normalized_error=normalized):
+        return None, effective_status
+
+    if effective_status is not None and effective_status in policy.retry_on_status_codes:
+        return RetryReason.HTTP_STATUS, effective_status
 
     if policy.retry_on_rate_limit and any(
         pattern in normalized for pattern in _RATE_LIMIT_PATTERNS
     ):
-        return RetryReason.RATE_LIMIT, status_code
+        return RetryReason.RATE_LIMIT, effective_status
 
     if policy.retry_on_timeout and any(pattern in normalized for pattern in _TIMEOUT_PATTERNS):
-        return RetryReason.TIMEOUT, status_code
+        return RetryReason.TIMEOUT, effective_status
 
     if policy.retry_on_connection_error and any(
         pattern in normalized for pattern in _CONNECTION_PATTERNS
     ):
-        return RetryReason.CONNECTION, status_code
+        return RetryReason.CONNECTION, effective_status
 
-    return None, status_code
+    # The provider explicitly flagged the failure retryable, but neither its
+    # status code nor the message text matched a configured pattern. Honor the
+    # typed signal as a transient (connection-class) failure rather than drop a
+    # retry the provider asked for.
+    if retryable is True and policy.retry_on_connection_error:
+        return RetryReason.CONNECTION, effective_status
+
+    return None, effective_status
 
 
 def retry_event_payload(
@@ -219,7 +273,17 @@ def _is_permanent_provider_error(*, status_code: int | None, normalized_error: s
     return 400 <= status_code < 500
 
 
-def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
+def _retry_delay(
+    policy: RetryPolicy,
+    attempt: int,
+    *,
+    retry_after_s: float | None = None,
+) -> float:
+    if retry_after_s is not None:
+        # A provider `Retry-After` directive is authoritative: waiting less just
+        # earns another rejection. Still bound it by `max_delay_s` so a hostile
+        # or buggy header can't stall the run indefinitely.
+        return float(min(retry_after_s, policy.max_delay_s))
     base_delay = policy.initial_delay_s * (policy.backoff_multiplier ** (attempt - 1))
     delay = min(base_delay, policy.max_delay_s)
     if policy.jitter_s > 0:

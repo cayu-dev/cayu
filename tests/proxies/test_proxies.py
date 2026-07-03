@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from cayu import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
+from cayu import AllowlistProxy, CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.core.tools import ToolContext
 from cayu.environments import Environment, EnvironmentSpec, copy_environment
 from cayu.vaults import SecretNotFound, SecretRef, StaticVault
@@ -122,3 +122,84 @@ def test_tool_context_accepts_and_excludes_proxy_from_serialization() -> None:
 
     assert context.proxy is proxy
     assert "proxy" not in context.model_dump()
+
+
+def test_allowlist_proxy_authorizes_only_listed_destinations() -> None:
+    proxy = AllowlistProxy(
+        StaticVault({"api_key": "sk-secret-123"}),
+        allowed_destinations=["https://api.anthropic.com", "*.internal.example.com"],
+    )
+
+    allowed = asyncio.run(proxy.authorize_request(destination="https://api.anthropic.com/v1"))
+    allowed_bare_host = asyncio.run(proxy.authorize_request(destination="API.ANTHROPIC.COM:443"))
+    wildcard = asyncio.run(
+        proxy.authorize_request(destination="https://tools.internal.example.com/x")
+    )
+    apex_of_wildcard = asyncio.run(
+        proxy.authorize_request(destination="https://internal.example.com")
+    )
+    denied = asyncio.run(
+        proxy.authorize_request(
+            destination="https://evil.example.net",
+            credential=SecretRef(name="api_key"),
+            action="exfiltrate",
+        )
+    )
+
+    assert allowed.allowed is True
+    assert allowed.metadata["destination_host"] == "api.anthropic.com"
+    assert allowed_bare_host.allowed is True
+    assert wildcard.allowed is True
+    assert apex_of_wildcard.allowed is False
+    assert denied.allowed is False
+    assert "evil.example.net" in (denied.reason or "")
+
+
+def test_allowlist_proxy_resolve_is_fail_closed_on_destination_scope() -> None:
+    proxy = AllowlistProxy(
+        StaticVault({"api_key": "sk-secret-123"}),
+        allowed_destinations=["api.anthropic.com"],
+    )
+
+    resolved = asyncio.run(
+        proxy.resolve(
+            SecretRef(name="api_key"),
+            scope={"destination": "https://api.anthropic.com"},
+        )
+    )
+    assert resolved.value.get_secret_value() == "sk-secret-123"
+
+    with pytest.raises(ValueError, match="destination"):
+        asyncio.run(proxy.resolve(SecretRef(name="api_key")))
+
+    with pytest.raises(PermissionError, match="denied"):
+        asyncio.run(
+            proxy.resolve(
+                SecretRef(name="api_key"),
+                scope={"destination": "https://evil.example.net"},
+            )
+        )
+
+
+def test_allowlist_proxy_validates_inputs() -> None:
+    vault = StaticVault({"api_key": "sk-secret-123"})
+
+    with pytest.raises(TypeError, match="requires a Vault"):
+        AllowlistProxy("not a vault", allowed_destinations=["api.anthropic.com"])  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="sequence"):
+        AllowlistProxy(vault, allowed_destinations="api.anthropic.com")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="at least one"):
+        AllowlistProxy(vault, allowed_destinations=[])
+
+    with pytest.raises(ValueError, match="cannot be blank"):
+        AllowlistProxy(vault, allowed_destinations=[" "])
+
+    proxy = AllowlistProxy(vault, allowed_destinations=["api.anthropic.com"])
+    assert proxy.allowed_destinations == ("api.anthropic.com",)
+
+    with pytest.raises(TypeError, match="SecretRef"):
+        asyncio.run(
+            proxy.resolve("not a ref", scope={"destination": "api.anthropic.com"})  # type: ignore[arg-type]
+        )

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
@@ -28,6 +31,7 @@ from cayu.providers._http import (
     post_json,
     response_json_object,
     safe_error_response_text,
+    stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
     validate_url,
@@ -48,6 +52,8 @@ from cayu.providers.cache import (
     CachePolicy,
     resolve_cache_policy,
 )
+from cayu.proxies import CredentialProxy
+from cayu.vaults import SecretRef
 
 if TYPE_CHECKING:
     import httpx
@@ -56,6 +62,7 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
+DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
 ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
 
@@ -157,6 +164,17 @@ class AnthropicTransport(Protocol):
     ) -> Mapping[str, Any]:
         """POST a Messages API payload and return decoded JSON."""
 
+    def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        """POST a streaming Messages API payload and yield decoded SSE data objects."""
+
 
 class HttpxAnthropicTransport:
     """HTTP transport with explicit certifi-backed TLS verification."""
@@ -191,6 +209,33 @@ class HttpxAnthropicTransport:
             timeout_s=timeout_s,
         )
 
+    async def stream_message_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        url = _validate_url(url, "url")
+        events = stream_sse_json_events(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            stream_idle_timeout_s=stream_idle_timeout_s,
+            request_label="Anthropic API",
+            response_label="Anthropic",
+            api_error=AnthropicAPIError,
+            protocol_error=AnthropicProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_anthropic_context_overflow_if_applicable,
+            api_error_from_response=_anthropic_api_error_from_response,
+        )
+        async for event in events:
+            yield event
+
     async def _post_json(
         self,
         *,
@@ -211,11 +256,20 @@ class HttpxAnthropicTransport:
             protocol_error=AnthropicProtocolError,
             error_response_text=_safe_error_response_text,
             raise_context_overflow=_raise_anthropic_context_overflow_if_applicable,
+            api_error_from_response=_anthropic_api_error_from_response,
         )
 
 
 class AnthropicProvider(ModelProvider):
-    """Anthropic Messages API adapter for Cayu's provider-neutral runtime."""
+    """Anthropic Messages API adapter for Cayu's provider-neutral runtime.
+
+    The API key comes from one of two credential sources: a plain ``api_key``
+    string (or ``ANTHROPIC_API_KEY``), or an async vault-backed path — pass
+    ``api_key_ref`` (a ``SecretRef``) plus ``credential_proxy`` (e.g.
+    ``AllowlistProxy``). With a ref, every request first authorizes the
+    provider destination against the proxy and then resolves the key at the
+    last moment, so raw credentials never live in provider config.
+    """
 
     name = "anthropic"
 
@@ -230,20 +284,36 @@ class AnthropicProvider(ModelProvider):
         self,
         *,
         api_key: str | None = None,
+        api_key_ref: SecretRef | None = None,
+        credential_proxy: CredentialProxy | None = None,
         name: str = "anthropic",
         base_url: str = DEFAULT_ANTHROPIC_BASE_URL,
         anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
         max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
         timeout_s: float = DEFAULT_ANTHROPIC_TIMEOUT_SECONDS,
+        stream_idle_timeout_s: float = DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: AnthropicTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
         cache_policy: CachePolicy | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
-        self.api_key = require_nonblank(
-            api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", ""),
-            "api_key",
-        )
+        if api_key_ref is not None:
+            if type(api_key_ref) is not SecretRef:
+                raise TypeError("api_key_ref must be a SecretRef.")
+            if api_key is not None:
+                raise ValueError("Pass either api_key or api_key_ref, not both.")
+            if not isinstance(credential_proxy, CredentialProxy):
+                raise TypeError("api_key_ref requires a credential_proxy (CredentialProxy).")
+            self.api_key = None
+        else:
+            if credential_proxy is not None:
+                raise ValueError("credential_proxy requires api_key_ref.")
+            self.api_key = require_nonblank(
+                api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", ""),
+                "api_key",
+            )
+        self.api_key_ref = api_key_ref
+        self.credential_proxy = credential_proxy
         self.base_url = _validate_base_url(base_url)
         self.anthropic_version = require_clean_nonblank(
             anthropic_version,
@@ -259,6 +329,11 @@ class AnthropicProvider(ModelProvider):
             raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
         self.timeout_s = float(timeout_s)
+        if type(stream_idle_timeout_s) not in {int, float}:
+            raise TypeError("stream_idle_timeout_s must be a number.")
+        if stream_idle_timeout_s <= 0:
+            raise ValueError("stream_idle_timeout_s must be greater than zero.")
+        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
         self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
@@ -270,20 +345,36 @@ class AnthropicProvider(ModelProvider):
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
+            headers = self._headers(await self._resolve_api_key())
             policy = resolve_cache_policy(self.cache_policy, request.options)
             payload = build_anthropic_payload(
                 request,
                 default_max_tokens=self.max_tokens,
                 cache_policy=policy,
             )
-            response = await self.transport.create_message(
-                url=f"{self.base_url}/v1/messages",
-                headers=self._headers(),
-                payload=payload,
-                timeout_s=self.timeout_s,
-            )
-            for event in anthropic_response_events(response):
-                yield event
+            stream_transport = getattr(self.transport, "stream_message_events", None)
+            if stream_transport is None:
+                # Back-compat: transports predating SSE support fall back to one
+                # buffered POST and a synthetic event replay.
+                response = await self.transport.create_message(
+                    url=f"{self.base_url}/v1/messages",
+                    headers=headers,
+                    payload=payload,
+                    timeout_s=self.timeout_s,
+                )
+                for event in anthropic_response_events(response):
+                    yield event
+            else:
+                payload["stream"] = True
+                raw_events = stream_transport(
+                    url=f"{self.base_url}/v1/messages",
+                    headers=headers,
+                    payload=payload,
+                    timeout_s=self.timeout_s,
+                    stream_idle_timeout_s=self.stream_idle_timeout_s,
+                )
+                async for event in anthropic_stream_events(raw_events):
+                    yield event
         except ModelContextOverflowError:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
@@ -306,7 +397,7 @@ class AnthropicProvider(ModelProvider):
         )
         response = await self.transport.count_message_tokens(
             url=f"{self.base_url}/v1/messages/count_tokens",
-            headers=self._headers(),
+            headers=self._headers(await self._resolve_api_key()),
             payload=payload,
             timeout_s=self.timeout_s,
         )
@@ -321,10 +412,39 @@ class AnthropicProvider(ModelProvider):
             },
         )
 
-    def _headers(self) -> dict[str, str]:
+    async def _resolve_api_key(self) -> str:
+        """Return the API key from the configured credential source.
+
+        With ``api_key_ref``, the destination is authorized against the
+        credential proxy (egress allowlist) and the key resolved per request,
+        so denials fail closed and rotated secrets are picked up live.
+        """
+
+        if self.api_key_ref is None or self.credential_proxy is None:
+            if self.api_key is None:
+                raise AnthropicError("Anthropic API key is not configured.")
+            return self.api_key
+        authorization = await self.credential_proxy.authorize_request(
+            destination=self.base_url,
+            credential=self.api_key_ref,
+            action="anthropic.messages",
+        )
+        if not authorization.allowed:
+            raise AnthropicAPIError(
+                "Anthropic credential use denied by credential proxy for "
+                f"{self.base_url}: {authorization.reason}",
+                retryable=False,
+            )
+        resolved = await self.credential_proxy.resolve(
+            self.api_key_ref,
+            scope={"destination": self.base_url, "provider": self.name},
+        )
+        return resolved.value.get_secret_value()
+
+    def _headers(self, api_key: str) -> dict[str, str]:
         headers = {
             "content-type": "application/json",
-            "x-api-key": self.api_key,
+            "x-api-key": api_key,
             "anthropic-version": self.anthropic_version,
         }
         headers.update(self.extra_headers)
@@ -568,6 +688,264 @@ def anthropic_response_events(
         )
     )
     return events
+
+
+class _PendingContentBlock:
+    """Accumulates one streamed Anthropic content block until content_block_stop."""
+
+    def __init__(self, block_type: str) -> None:
+        self.type = block_type
+        self.thinking_parts: list[str] = []
+        self.signature_parts: list[str] = []
+        self.json_parts: list[str] = []
+        self.data: str | None = None
+        self.tool_id: str | None = None
+        self.tool_name: str | None = None
+
+
+async def anthropic_stream_events(
+    events: AsyncIterator[Mapping[str, Any]],
+    *,
+    provider_label: str = "Anthropic",
+    api_error: Callable[..., Exception] = AnthropicAPIError,
+    protocol_error: type[Exception] = AnthropicProtocolError,
+    context_overflow_error: Callable[..., Exception] = AnthropicContextOverflowError,
+) -> AsyncIterator[ModelStreamEvent]:
+    """Translate Anthropic Messages SSE events into Cayu model stream events.
+
+    Text streams incrementally as it arrives. Thinking and tool_use blocks are
+    buffered per content-block index and emitted whole at ``content_block_stop``:
+    a thinking block's signature is computed over its complete text (a partial
+    block cannot round-trip), and tool_use arguments arrive as partial JSON that
+    only parses once complete. Usage merges ``message_start`` input counts with
+    the ``message_delta`` output counts. The error classes are parameterized so
+    Anthropic-compatible hosts (Vertex) surface their own typed errors.
+    """
+    blocks: dict[int, _PendingContentBlock] = {}
+    message_id: str | None = None
+    model: str | None = None
+    stop_reason: str | None = None
+    stop_sequence: str | None = None
+    usage: dict[str, Any] | None = None
+    completed = False
+
+    def optional_string(mapping: Mapping[str, Any], key: str) -> str | None:
+        value = mapping.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise protocol_error(f"{provider_label} stream {key} must be a string.")
+        return value
+
+    def block_index(event: Mapping[str, Any]) -> int:
+        index = event.get("index")
+        if type(index) is not int or index < 0:
+            raise protocol_error(f"{provider_label} stream event requires non-negative index.")
+        return index
+
+    def required_string(mapping: Mapping[str, Any], key: str, label: str) -> str:
+        value = mapping.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise protocol_error(f"{provider_label} {label} requires nonblank {key}.")
+        return value
+
+    async for event in events:
+        if not isinstance(event, Mapping):
+            raise protocol_error(f"{provider_label} stream event must be a JSON object.")
+        event_type = event.get("type")
+        if event_type == "ping":
+            continue
+        if event_type == "message_start":
+            message = event.get("message")
+            if not isinstance(message, Mapping):
+                raise protocol_error(f"{provider_label} message_start requires message object.")
+            message_id = optional_string(message, "id")
+            model = optional_string(message, "model")
+            start_usage = message.get("usage")
+            if isinstance(start_usage, Mapping):
+                usage = {**(usage or {}), **start_usage}
+            continue
+        if event_type == "content_block_start":
+            index = block_index(event)
+            content_block = event.get("content_block")
+            if not isinstance(content_block, Mapping):
+                raise protocol_error(
+                    f"{provider_label} content_block_start requires content_block object."
+                )
+            block_type = content_block.get("type")
+            if block_type == "text":
+                blocks[index] = _PendingContentBlock("text")
+                text = content_block.get("text")
+                if isinstance(text, str) and text:
+                    yield ModelStreamEvent.text_delta(text)
+            elif block_type == "thinking":
+                pending = _PendingContentBlock("thinking")
+                initial = content_block.get("thinking")
+                if isinstance(initial, str) and initial:
+                    pending.thinking_parts.append(initial)
+                signature = content_block.get("signature")
+                if isinstance(signature, str) and signature:
+                    pending.signature_parts.append(signature)
+                blocks[index] = pending
+            elif block_type == "redacted_thinking":
+                pending = _PendingContentBlock("redacted_thinking")
+                pending.data = required_string(content_block, "data", "redacted_thinking block")
+                blocks[index] = pending
+            elif block_type == "tool_use":
+                pending = _PendingContentBlock("tool_use")
+                pending.tool_id = required_string(content_block, "id", "tool_use block")
+                pending.tool_name = required_string(content_block, "name", "tool_use block")
+                blocks[index] = pending
+            else:
+                raise protocol_error(
+                    f"Unsupported {provider_label} content block type: {block_type!r}."
+                )
+            continue
+        if event_type == "content_block_delta":
+            index = block_index(event)
+            pending = blocks.get(index)
+            if pending is None:
+                raise protocol_error(
+                    f"{provider_label} content_block_delta arrived before content_block_start."
+                )
+            delta = event.get("delta")
+            if not isinstance(delta, Mapping):
+                raise protocol_error(f"{provider_label} content_block_delta requires delta object.")
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = delta.get("text")
+                if not isinstance(text, str):
+                    raise protocol_error(f"{provider_label} text_delta requires string text.")
+                if text:
+                    yield ModelStreamEvent.text_delta(text)
+            elif delta_type == "thinking_delta":
+                thinking = delta.get("thinking")
+                if not isinstance(thinking, str):
+                    raise protocol_error(
+                        f"{provider_label} thinking_delta requires string thinking."
+                    )
+                if thinking:
+                    pending.thinking_parts.append(thinking)
+            elif delta_type == "signature_delta":
+                signature = delta.get("signature")
+                if not isinstance(signature, str):
+                    raise protocol_error(
+                        f"{provider_label} signature_delta requires string signature."
+                    )
+                if signature:
+                    pending.signature_parts.append(signature)
+            elif delta_type == "input_json_delta":
+                partial_json = delta.get("partial_json")
+                if not isinstance(partial_json, str):
+                    raise protocol_error(
+                        f"{provider_label} input_json_delta requires string partial_json."
+                    )
+                if partial_json:
+                    pending.json_parts.append(partial_json)
+            else:
+                raise protocol_error(
+                    f"Unsupported {provider_label} stream delta type: {delta_type!r}."
+                )
+            continue
+        if event_type == "content_block_stop":
+            index = block_index(event)
+            pending = blocks.pop(index, None)
+            if pending is None:
+                raise protocol_error(
+                    f"{provider_label} content_block_stop arrived before content_block_start."
+                )
+            if pending.type == "thinking":
+                provider_state: dict[str, Any] = {"type": "thinking"}
+                signature = "".join(pending.signature_parts)
+                if signature:
+                    provider_state["signature"] = signature
+                yield ModelStreamEvent.thinking(
+                    "".join(pending.thinking_parts),
+                    provider_state=provider_state,
+                )
+            elif pending.type == "redacted_thinking":
+                yield ModelStreamEvent.thinking(
+                    provider_state={"type": "redacted_thinking", "data": pending.data}
+                )
+            elif pending.type == "tool_use":
+                joined = "".join(pending.json_parts)
+                if joined:
+                    try:
+                        arguments = json.loads(joined)
+                    except ValueError as exc:
+                        raise protocol_error(
+                            f"{provider_label} tool_use input was not valid JSON."
+                        ) from exc
+                else:
+                    arguments = {}
+                if type(arguments) is not dict:
+                    raise protocol_error(
+                        f"{provider_label} tool_use input must decode to an object."
+                    )
+                if pending.tool_name is None:
+                    raise protocol_error(f"{provider_label} tool_use block is missing a name.")
+                yield ModelStreamEvent.tool_call(
+                    id=pending.tool_id,
+                    name=pending.tool_name,
+                    arguments=copy_json_value(arguments, "tool_input"),
+                )
+            continue
+        if event_type == "message_delta":
+            delta = event.get("delta")
+            if isinstance(delta, Mapping):
+                stop_reason = optional_string(delta, "stop_reason") or stop_reason
+                stop_sequence = optional_string(delta, "stop_sequence") or stop_sequence
+            delta_usage = event.get("usage")
+            if isinstance(delta_usage, Mapping):
+                usage = {**(usage or {}), **delta_usage}
+            continue
+        if event_type == "message_stop":
+            completed = True
+            yield ModelStreamEvent.completed(
+                {
+                    "id": message_id,
+                    "model": model,
+                    "stop_reason": stop_reason,
+                    "stop_sequence": stop_sequence,
+                    "usage": copy_json_value(usage, "usage"),
+                }
+            )
+            continue
+        if event_type == "error":
+            raw_error = event.get("error")
+            error = raw_error if isinstance(raw_error, Mapping) else {}
+            error_type = optional_error_string(error.get("type"))
+            error_message = optional_error_string(error.get("message"))
+            if _is_anthropic_stream_error_context_overflow(
+                error_type=error_type,
+                message=error_message,
+            ):
+                raise context_overflow_error(
+                    f"{provider_label} model context overflow",
+                    error_type=error_type,
+                )
+            detail = error_message or error_type or "unknown error"
+            raise api_error(
+                f"{provider_label} streaming error: {detail}",
+                error_type=error_type,
+            )
+        # Unknown event types are ignored for forward compatibility, as the
+        # Anthropic streaming docs require.
+
+    if not completed:
+        raise protocol_error(f"{provider_label} streaming response ended before message_stop.")
+
+
+def _is_anthropic_stream_error_context_overflow(
+    *,
+    error_type: str | None,
+    message: str | None,
+) -> bool:
+    if error_type == "request_too_large":
+        return True
+    if error_type != "invalid_request_error" or message is None:
+        return False
+    return _anthropic_overflow_message(message)
 
 
 def _anthropic_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
@@ -847,6 +1225,61 @@ def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) ->
     )
 
 
+def _anthropic_api_error_from_response(
+    response: httpx.Response,
+    message: str,
+) -> AnthropicAPIError:
+    """Build a structured `AnthropicAPIError` from an HTTP error response.
+
+    Preserves the response status code, the Anthropic error body's typed
+    identity (`type`/`code`), the `request-id` header, and any `Retry-After`
+    directive so runtime retry classification keys off typed fields instead of
+    reparsing the flattened message text.
+    """
+    decoded = response_json_object(response)
+    error: Mapping[str, Any] = {}
+    if decoded is not None:
+        raw_error = decoded.get("error")
+        error = raw_error if isinstance(raw_error, Mapping) else decoded
+    return AnthropicAPIError(
+        message,
+        status_code=response.status_code,
+        error_type=optional_error_string(error.get("type")),
+        error_code=optional_error_string(error.get("code")),
+        request_id=optional_error_string(response.headers.get("request-id")),
+        retry_after_s=_anthropic_retry_after_seconds(response),
+        response_body=_safe_error_response_text(response),
+    )
+
+
+def _anthropic_retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a `Retry-After` header (delta-seconds or HTTP-date) into seconds."""
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _anthropic_retry_after_from_http_date(raw)
+    return seconds if seconds >= 0 else None
+
+
+def _anthropic_retry_after_from_http_date(raw: str) -> float | None:
+    try:
+        target = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if target is None:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    delta = (target - datetime.now(UTC)).total_seconds()
+    return max(0.0, delta)
+
+
 def _is_anthropic_context_overflow(
     *,
     status_code: int,
@@ -857,6 +1290,11 @@ def _is_anthropic_context_overflow(
         return True
     if status_code != 400 or error_type != "invalid_request_error" or message is None:
         return False
+    return _anthropic_overflow_message(message)
+
+
+def _anthropic_overflow_message(message: str) -> bool:
+    """Whether an Anthropic-shaped error message describes a context overflow."""
     normalized = message.lower()
     return (
         "prompt is too long" in normalized
