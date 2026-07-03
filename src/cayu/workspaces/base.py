@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import posixpath
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
+
+from cayu._validation import require_nonblank
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,104 @@ class WorkspaceListResult:
         object.__setattr__(self, "paths", paths)
 
 
+def validate_list_pattern(pattern: str) -> str:
+    """Validate a Workspace ``list()`` pattern shared by every backend."""
+    value = require_nonblank(pattern, "pattern")
+    if posixpath.isabs(value):
+        raise ValueError("Workspace list pattern must stay inside the workspace.")
+    parts = tuple(part for part in value.split("/") if part)
+    if ".." in parts:
+        raise ValueError("Workspace list pattern must stay inside the workspace.")
+    return value
+
+
+def translate_list_pattern(pattern: str) -> str:
+    """Translate a Workspace ``list()`` pattern into an anchored regular expression.
+
+    This defines the one normative matching semantics shared by every
+    Workspace backend, applied to a file's full workspace-relative POSIX path:
+
+    - The pattern is anchored at both ends (``*.txt`` does NOT match
+      ``nested/a.txt``).
+    - ``*`` matches any run of characters within one path segment, ``?``
+      matches one character within a segment, and ``[...]``/``[!...]``
+      character classes match one character within a segment; none of them
+      cross ``/``.
+    - ``**`` as a whole segment matches zero or more directories when more
+      pattern follows (``**/*.txt`` matches ``a.txt`` and ``d/a.txt``), and
+      matches any remaining path when it is the final segment.
+    - Empty segments and ``.`` segments in the pattern are ignored.
+    """
+    segments = [segment for segment in pattern.split("/") if segment not in {"", "."}]
+    if not segments:
+        return r"(?!)"
+    parts: list[str] = []
+    last_index = len(segments) - 1
+    for index, segment in enumerate(segments):
+        is_last = index == last_index
+        if segment == "**":
+            if is_last:
+                parts.append(r"[^/]+(?:/[^/]+)*")
+            else:
+                parts.append(r"(?:[^/]+/)*")
+            continue
+        parts.append(_segment_regex(segment) + ("" if is_last else "/"))
+    return "".join(parts)
+
+
+def matches_list_pattern(path: str, pattern: str) -> bool:
+    """Report whether a workspace-relative POSIX file path matches a list pattern."""
+    return _compiled_list_pattern(pattern).fullmatch(path) is not None
+
+
+@lru_cache(maxsize=256)
+def _compiled_list_pattern(pattern: str) -> re.Pattern[str]:
+    return re.compile(translate_list_pattern(pattern))
+
+
+def _segment_regex(segment: str) -> str:
+    parts: list[str] = []
+    index = 0
+    length = len(segment)
+    while index < length:
+        char = segment[index]
+        if char == "*":
+            parts.append(r"[^/]*")
+        elif char == "?":
+            parts.append(r"[^/]")
+        elif char == "[":
+            closing = index + 1
+            if closing < length and segment[closing] in "!^":
+                closing += 1
+            if closing < length and segment[closing] == "]":
+                closing += 1
+            while closing < length and segment[closing] != "]":
+                closing += 1
+            if closing >= length:
+                parts.append(r"\[")
+            else:
+                inner = segment[index + 1 : closing]
+                inner = (
+                    "^" + _literal_regex_class(inner[1:])
+                    if inner.startswith("!")
+                    else _literal_regex_class(inner)
+                )
+                parts.append(f"[{inner}]")
+                index = closing
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return "".join(parts)
+
+
+def _literal_regex_class(value: str) -> str:
+    """Escape glob class content where every character is a literal option."""
+    escaped = value.replace("\\", "\\\\")
+    if escaped.startswith("^"):
+        escaped = "\\" + escaped
+    return escaped
+
+
 class Workspace(ABC):
     """Filesystem/artifact area an agent can work in."""
 
@@ -87,4 +190,8 @@ class Workspace(ABC):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
-        """List files in the workspace."""
+        """List files in the workspace.
+
+        Every backend must match ``pattern`` against workspace-relative POSIX
+        file paths with the normative semantics of ``matches_list_pattern``.
+        """

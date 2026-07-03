@@ -6,6 +6,7 @@ from math import isfinite
 from typing import Any, Literal
 
 DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS = 5.0
+RUNNER_COMMAND_KILL_ATTEMPTS = 2
 RUNNER_CLEANUP_ARTIFACT_TYPE = "cayu.runner_cleanup.v1"
 RunnerCleanupPolicy = Literal["command", "sandbox", "none"]
 DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY: RunnerCleanupPolicy = "command"

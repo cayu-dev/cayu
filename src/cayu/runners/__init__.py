@@ -11,6 +11,7 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerCancelledError,
+    attach_cancellation_artifacts,
 )
 from cayu.runners.docker import (
     DEFAULT_DOCKER_CWD,
@@ -64,4 +65,5 @@ __all__ = [
     "RunnerCleanupPolicy",
     "SbxCloseAction",
     "SbxRunner",
+    "attach_cancellation_artifacts",
 ]

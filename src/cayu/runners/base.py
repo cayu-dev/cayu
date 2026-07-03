@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import posixpath
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -14,13 +15,22 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_json_value, require_nonblank
+from cayu.runners._cleanup import RunnerCleanupResult
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 
 
 class RunnerCancelledError(asyncio.CancelledError):
-    """Cancelled runner execution with optional cleanup diagnostics."""
+    """Cancelled runner execution with optional cleanup diagnostics.
+
+    Retained for backward compatibility with third-party runners. Built-in
+    runners no longer raise this subclass: they re-raise the original plain
+    ``asyncio.CancelledError`` (preserving asyncio's cancellation bookkeeping)
+    with diagnostics attached out-of-band via
+    :func:`attach_cancellation_artifacts`. The runtime reads diagnostics from
+    the exception's ``artifacts`` attribute either way.
+    """
 
     def __init__(
         self,
@@ -30,6 +40,35 @@ class RunnerCancelledError(asyncio.CancelledError):
     ) -> None:
         super().__init__(message)
         self.artifacts = copy_json_value([] if artifacts is None else artifacts, "artifacts")
+
+
+def attach_cancellation_artifacts(
+    exc: BaseException,
+    artifacts: list[dict[str, Any]],
+) -> None:
+    """Attach runner cleanup diagnostics to a cancellation out-of-band.
+
+    Substituting an exception subclass for the in-flight ``CancelledError``
+    discards the exception instance asyncio saved for the awaiting task.
+    Instead runners record diagnostics on the original exception's
+    ``artifacts`` attribute and re-raise it unchanged; the runtime reads the
+    attribute via ``getattr``.
+    """
+
+    copied = copy_json_value(artifacts, "artifacts")
+    existing = getattr(exc, "artifacts", None)
+    if isinstance(existing, list):
+        existing.extend(copied)
+        return
+    exc.artifacts = copied  # type: ignore
+
+
+def is_same_or_child(path: str, root: str) -> bool:
+    """Return whether a normalized absolute POSIX path is ``root`` or inside it."""
+
+    if root == "/":
+        return posixpath.isabs(path)
+    return path == root or path.startswith(f"{root.rstrip('/')}/")
 
 
 class ExecCommand(BaseModel):
@@ -99,9 +138,26 @@ class ExecResult(BaseModel):
 
 
 class Runner(ABC):
-    """Executes commands/code in a workspace or sandbox."""
+    """Executes commands/code in a workspace or sandbox.
+
+    Shared lifecycle contract:
+
+    - ``close()`` applies the adapter's configured lifecycle action once;
+      further ``exec`` calls fail.
+    - Interrupted commands (cancellation/timeout) run cleanup. When command
+      cleanup cannot confirm the command stopped, the exec path latches shut
+      (``_close_exec``) so an unknown still-running command cannot race new
+      work.
+    - ``reopen_exec()`` explicitly clears that latch after the caller verified
+      out-of-band that no stale command is running.
+    """
 
     isolation: str = "unknown"
+    default_cwd: str = "/"
+
+    _closed: bool = False
+    _exec_closed: bool = False
+    _exec_closed_reason: str | None = None
 
     @abstractmethod
     async def exec(
@@ -115,3 +171,66 @@ class Runner(ABC):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         """Execute a command and return stdout/stderr/exit metadata."""
+
+    async def close(self) -> None:
+        """Release the runner. The default implementation only marks it closed."""
+
+        self._closed = True
+
+    def reopen_exec(self) -> None:
+        """Clear a latched exec-closed state on an otherwise-open runner.
+
+        Cleanup after an interrupted command latches the exec path shut when it
+        cannot confirm the command stopped (for example a flaky pid-file wait).
+        After verifying out-of-band that no stale command is running, callers
+        use this to resume executing instead of discarding the runner.
+        """
+
+        if self._closed:
+            raise RuntimeError(f"{type(self).__name__} is closed.")
+        self._open_exec()
+
+    def resolve_cwd(self, cwd: str | None = None) -> str:
+        if cwd is None:
+            return self.default_cwd
+        relative_cwd = require_nonblank(cwd, "cwd")
+        if posixpath.isabs(relative_cwd):
+            raise ValueError("Runner cwd must be relative.")
+        resolved = posixpath.normpath(posixpath.join(self.default_cwd, relative_cwd))
+        if not is_same_or_child(resolved, self.default_cwd):
+            raise ValueError("Runner cwd escapes the runner root.")
+        return resolved
+
+    def _ensure_exec_open(self) -> None:
+        if self._closed:
+            raise RuntimeError(f"{type(self).__name__} is closed.")
+        if self._exec_closed:
+            reason = self._exec_closed_reason or "runner exec path is closed"
+            raise RuntimeError(f"{type(self).__name__} is closed: {reason}")
+
+    def _close_exec(self, reason: str) -> None:
+        self._exec_closed = True
+        self._exec_closed_reason = reason
+
+    def _open_exec(self) -> None:
+        self._exec_closed = False
+        self._exec_closed_reason = None
+
+    def _apply_cleanup_result(self, cleanup: RunnerCleanupResult) -> None:
+        artifact = cleanup.artifact
+        if cleanup.close_runner:
+            self._close_exec("runner cleanup closed the exec path")
+        if artifact.get("action") == "kill_sandbox" and artifact.get("status") == "completed":
+            self._closed = True
+            return
+        if artifact.get("action") == "kill_command" and artifact.get("status") != "completed":
+            self._close_exec(
+                f"{self.isolation} command cleanup did not complete; command state is unknown"
+            )
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        await self.close()
+        return False

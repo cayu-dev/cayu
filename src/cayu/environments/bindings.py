@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import io
+import tarfile
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -56,8 +59,13 @@ class SyncBindingContext:
 
 @dataclass(frozen=True)
 class _SyncBindingState:
+    session_id: str
+    created_at: float
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
+
+
+DEFAULT_SYNC_STATE_TTL_S = 24 * 60 * 60.0
 
 
 SYNC_FINAL_METADATA_KEYS = frozenset(
@@ -484,6 +492,13 @@ class SyncBinding(WorkspaceBinding):
     during the run, typically a sandbox filesystem wrapper. The target workspace
     should be dedicated to this binding because the default clean policy deletes
     files in the target before copying source files in.
+
+    File copies use one bulk tar transfer per direction when a workspace
+    exposes ``read_tar_bytes``/``write_tar_bytes`` (RunnerWorkspace does), and
+    fall back to per-file copies otherwise. Per-bind state is keyed by session:
+    rebinding a session replaces its leaked state, ``abandon`` drops state for
+    a bind whose finalize will never run, and states older than
+    ``state_ttl_s`` are pruned on the next bind.
     """
 
     def __init__(
@@ -498,6 +513,7 @@ class SyncBinding(WorkspaceBinding):
         clean_target: SyncTargetCleanPolicy = "always",
         sync_back: SyncBackPolicy = "always",
         delete_missing: bool = True,
+        state_ttl_s: float | None = DEFAULT_SYNC_STATE_TTL_S,
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -520,6 +536,7 @@ class SyncBinding(WorkspaceBinding):
         if type(delete_missing) is not bool:
             raise TypeError("SyncBinding delete_missing must be a bool.")
         self.delete_missing = delete_missing
+        self.state_ttl_s = _validate_optional_positive_number(state_ttl_s, "state_ttl_s")
         self._states: dict[str, _SyncBindingState] = {}
 
     async def bind(
@@ -544,6 +561,7 @@ class SyncBinding(WorkspaceBinding):
             raise ValueError("SyncBinding requires a source workspace.")
         if "sync_binding" in request_metadata:
             raise ValueError("SyncBinding metadata key 'sync_binding' is reserved.")
+        self._prune_sync_states(session_id=session_id)
         context = SyncBindingContext(
             source_workspace=workspace,
             runner=runner,
@@ -615,6 +633,8 @@ class SyncBinding(WorkspaceBinding):
         if bound.state_key is None:
             raise RuntimeError("SyncBinding bound workspace missing state key.")
         self._states[bound.state_key] = _SyncBindingState(
+            session_id=session_id,
+            created_at=time.monotonic(),
             source_paths=source_paths,
             target_baseline_paths=target_baseline_paths,
         )
@@ -693,6 +713,29 @@ class SyncBinding(WorkspaceBinding):
         if not isinstance(result, Workspace):
             raise TypeError("SyncBinding target workspace factory must return a Workspace.")
         return result
+
+    def abandon(self, bound: BoundWorkspace) -> None:
+        """Drop in-process bind state for a bind whose finalize will never run.
+
+        Lifecycle owners that skip ``finalize`` (crash recovery, cancelled
+        sessions) should call this so per-bind state does not leak until the
+        TTL prune catches it.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding abandon requires a BoundWorkspace.")
+        self._discard_sync_state(bound)
+
+    def _prune_sync_states(self, *, session_id: str) -> None:
+        now = time.monotonic()
+        stale_keys = [
+            key
+            for key, state in self._states.items()
+            if state.session_id == session_id
+            or (self.state_ttl_s is not None and now - state.created_at > self.state_ttl_s)
+        ]
+        for key in stale_keys:
+            del self._states[key]
 
     def _get_sync_state(self, bound: BoundWorkspace) -> _SyncBindingState:
         if bound.state_key is not None:
@@ -837,6 +880,16 @@ def _validate_optional_positive_int(value: int | None, field_name: str) -> int |
     return _validate_positive_int(value, field_name)
 
 
+def _validate_optional_positive_number(value: float | None, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in {int, float}:
+        raise TypeError(f"SyncBinding {field_name} must be a number or None.")
+    if value <= 0:
+        raise ValueError(f"SyncBinding {field_name} must be greater than zero.")
+    return float(value)
+
+
 def _validate_optional_timeout(value: int | None, field_name: str) -> int | None:
     if value is None:
         return None
@@ -882,19 +935,119 @@ async def _copy_paths(
     paths: tuple[str, ...],
     max_file_bytes: int | None,
 ) -> int:
+    """Copy files between workspaces, preferring one bulk tar transfer.
+
+    When either side exposes the optional ``read_tar_bytes``/``write_tar_bytes``
+    capability (RunnerWorkspace does), the whole file set moves as a single
+    tar so a runner-backed workspace costs O(1) execs instead of one exec per
+    file. Workspaces without the capability fall back to per-file copies.
+    """
+
+    if not paths:
+        return 0
+    read_tar = getattr(source, "read_tar_bytes", None)
+    write_tar = getattr(target, "write_tar_bytes", None)
+    if not callable(read_tar) and not callable(write_tar):
+        return await _copy_paths_per_file(
+            source=source,
+            target=target,
+            paths=paths,
+            max_file_bytes=max_file_bytes,
+        )
+    if callable(read_tar):
+        tar_data = await read_tar(paths, max_file_bytes=max_file_bytes)
+    else:
+        tar_data = await _pack_workspace_tar(source, paths, max_file_bytes=max_file_bytes)
+    copied_bytes = _validate_sync_tar(tar_data, paths, max_file_bytes=max_file_bytes)
+    if callable(write_tar):
+        await write_tar(tar_data)
+    else:
+        await _extract_tar_to_workspace(target, tar_data)
+    return copied_bytes
+
+
+async def _copy_paths_per_file(
+    *,
+    source: Workspace,
+    target: Workspace,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+) -> int:
     copied_bytes = 0
     for path in paths:
         result = await source.read_bytes(path, max_bytes=max_file_bytes)
         if result.truncated:
-            limit = (
-                "the workspace read limit"
-                if max_file_bytes is None
-                else f"max_file_bytes={max_file_bytes}"
+            raise RuntimeError(
+                f"SyncBinding file exceeds {_copy_limit_label(max_file_bytes)}: {path}"
             )
-            raise RuntimeError(f"SyncBinding file exceeds {limit}: {path}")
         await target.write_bytes(path, result.content)
         copied_bytes += len(result.content)
     return copied_bytes
+
+
+async def _pack_workspace_tar(
+    source: Workspace,
+    paths: tuple[str, ...],
+    *,
+    max_file_bytes: int | None,
+) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for path in paths:
+            result = await source.read_bytes(path, max_bytes=max_file_bytes)
+            if result.truncated:
+                raise RuntimeError(
+                    f"SyncBinding file exceeds {_copy_limit_label(max_file_bytes)}: {path}"
+                )
+            info = tarfile.TarInfo(name=path)
+            info.size = len(result.content)
+            archive.addfile(info, io.BytesIO(result.content))
+    return buffer.getvalue()
+
+
+async def _extract_tar_to_workspace(target: Workspace, tar_data: bytes) -> None:
+    with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r") as archive:
+        for member in archive.getmembers():
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
+            await target.write_bytes(member.name, extracted.read())
+
+
+def _validate_sync_tar(
+    tar_data: bytes,
+    paths: tuple[str, ...],
+    *,
+    max_file_bytes: int | None,
+) -> int:
+    if type(tar_data) is not bytes:
+        raise TypeError("SyncBinding bulk transfer must produce tar bytes.")
+    copied_bytes = 0
+    member_names: list[str] = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r") as archive:
+            for member in archive.getmembers():
+                if not member.isreg():
+                    raise RuntimeError(
+                        f"SyncBinding tar member must be a regular file: {member.name}"
+                    )
+                if max_file_bytes is not None and member.size > max_file_bytes:
+                    raise RuntimeError(
+                        f"SyncBinding file exceeds max_file_bytes={max_file_bytes}: {member.name}"
+                    )
+                member_names.append(member.name)
+                copied_bytes += member.size
+    except tarfile.TarError as exc:
+        raise RuntimeError("SyncBinding bulk transfer returned an invalid tar archive.") from exc
+    if sorted(member_names) != sorted(paths):
+        raise RuntimeError("SyncBinding bulk transfer paths do not match the requested files.")
+    return copied_bytes
+
+
+def _copy_limit_label(max_file_bytes: int | None) -> str:
+    if max_file_bytes is None:
+        return "the workspace read limit"
+    return f"max_file_bytes={max_file_bytes}"
 
 
 def _validate_sync_binding_metadata(bound: BoundWorkspace) -> dict[str, Any]:

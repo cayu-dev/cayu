@@ -117,9 +117,9 @@ class LocalRunner(Runner):
         )
         return redact_exec_result(result, resolved_secrets)
 
-    def resolve_cwd(self, cwd: str | None = None) -> Path:
+    def resolve_cwd(self, cwd: str | None = None) -> str:
         if cwd is None:
-            return self.root
+            return str(self.root)
         cwd = require_nonblank(cwd, "cwd")
         candidate = Path(cwd)
         if candidate.is_absolute():
@@ -133,7 +133,7 @@ class LocalRunner(Runner):
             raise FileNotFoundError(f"Runner cwd does not exist: {cwd}")
         if not resolved.is_dir():
             raise NotADirectoryError(f"Runner cwd is not a directory: {cwd}")
-        return resolved
+        return str(resolved)
 
 
 def _safe_host_env() -> dict[str, str]:

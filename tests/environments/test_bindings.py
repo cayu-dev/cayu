@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
-from dataclasses import FrozenInstanceError
+import sys
+import time
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
@@ -740,6 +742,157 @@ def test_sync_binding_rejects_truncated_file_copy(tmp_path) -> None:
         asyncio.run(run())
 
 
+class _CountingLocalRunner(LocalRunner):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.exec_calls = 0
+
+    async def exec(self, *args: Any, **kwargs: Any) -> ExecResult:
+        self.exec_calls += 1
+        return await super().exec(*args, **kwargs)
+
+
+def test_sync_binding_bulk_transfers_runner_workspace_files(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("alpha", encoding="utf-8")
+    (source_root / "b.txt").write_text("bravo", encoding="utf-8")
+    (source_root / "nested").mkdir()
+    (source_root / "nested" / "c.txt").write_text("charlie", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    runner = _CountingLocalRunner(target_root, inherit_env=False)
+    target = RunnerWorkspace(
+        runner,
+        workspace_id="target",
+        python_executable=sys.executable,
+    )
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> tuple[int, WorkspaceSnapshot | None]:
+        bound = await binding.bind(source, None, session_id="sess_bulk")
+        bind_execs = runner.exec_calls
+        await target.write_bytes("a.txt", b"changed")
+        await target.write_bytes("new.txt", b"created")
+        final_snapshot = await binding.finalize(bound, outcome="completed")
+        return bind_execs, final_snapshot
+
+    bind_execs, final_snapshot = asyncio.run(run())
+
+    # Bind costs one exec to list the target for cleaning plus one bulk tar
+    # write, independent of how many files are copied in.
+    assert bind_execs == 2
+    # Two manual writes plus finalize's list + bulk tar read.
+    assert runner.exec_calls == 6
+    assert (target_root / "nested" / "c.txt").read_text(encoding="utf-8") == "charlie"
+    assert (source_root / "a.txt").read_text(encoding="utf-8") == "changed"
+    assert (source_root / "new.txt").read_text(encoding="utf-8") == "created"
+    assert final_snapshot is not None
+    assert final_snapshot.metadata["copied_files"] == 4
+    assert final_snapshot.metadata["copied_bytes"] == len("changed") + len("created") + len(
+        "bravo"
+    ) + len("charlie")
+    assert binding._states == {}
+
+
+def test_sync_binding_bulk_transfer_respects_max_file_bytes(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "big.txt").write_text("too large", encoding="utf-8")
+    source = RunnerWorkspace(
+        LocalRunner(source_root, inherit_env=False),
+        workspace_id="source",
+        python_executable=sys.executable,
+    )
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target, max_file_bytes=3).bind(
+            source,
+            None,
+            session_id="sess_bulk_limit",
+        )
+
+    with pytest.raises(RuntimeError, match="exceeds max_file_bytes=3"):
+        asyncio.run(run())
+
+
+def test_sync_binding_abandon_releases_state_without_syncing(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_abandon")
+        assert len(binding._states) == 1
+        binding.abandon(bound)
+        assert binding._states == {}
+        with pytest.raises(ValueError, match="in-process bind state"):
+            await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    invalid_bound: Any = object()
+    with pytest.raises(TypeError, match="BoundWorkspace"):
+        binding.abandon(invalid_bound)
+    assert (source_root / "a.txt").read_text(encoding="utf-8") == "before"
+
+
+def test_sync_binding_rebind_replaces_leaked_state_for_same_session(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        first = await binding.bind(source, None, session_id="sess_leak")
+        await binding.bind(source, None, session_id="sess_other")
+        rebound = await binding.bind(source, None, session_id="sess_leak")
+        assert len(binding._states) == 2
+        assert first.state_key not in binding._states
+        assert rebound.state_key in binding._states
+        with pytest.raises(ValueError, match="in-process bind state"):
+            await binding.finalize(first, outcome="completed")
+
+    asyncio.run(run())
+
+
+def test_sync_binding_prunes_expired_states_on_bind(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target, state_ttl_s=60)
+
+    async def run() -> None:
+        stale = await binding.bind(source, None, session_id="sess_stale")
+        assert stale.state_key is not None
+        binding._states[stale.state_key] = replace(
+            binding._states[stale.state_key],
+            created_at=time.monotonic() - 120.0,
+        )
+        fresh = await binding.bind(source, None, session_id="sess_fresh")
+        assert set(binding._states) == {fresh.state_key}
+        assert binding._states[fresh.state_key].session_id == "sess_fresh"
+
+    asyncio.run(run())
+
+
 def test_sync_binding_rejects_reserved_metadata_key(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -930,6 +1083,10 @@ def test_binding_constructors_validate_values() -> None:
         SyncBinding(sync_back=invalid_sync_back)
     with pytest.raises(TypeError, match="delete_missing"):
         SyncBinding(delete_missing=invalid_delete_missing)
+    with pytest.raises(ValueError, match="state_ttl_s"):
+        SyncBinding(state_ttl_s=0)
+    with pytest.raises(TypeError, match="state_ttl_s"):
+        SyncBinding(state_ttl_s=invalid_delete_missing)
 
 
 def test_copy_bound_workspace_defensively_copies_metadata_and_snapshot() -> None:

@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand, ExecResult, RunnerCancelledError
+from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand, ExecResult
 
 
 @dataclass
@@ -333,6 +333,33 @@ def test_e2b_runner_kills_command_on_timeout_by_default() -> None:
     assert after.exit_code == 0
 
 
+def test_e2b_runner_shares_one_deadline_across_start_and_wait_phases() -> None:
+    # A slow command start must consume the exec timeout budget, so the wait
+    # phase gets only the *remaining* time rather than a fresh full timeout.
+    # Otherwise total wall-clock could reach ~2x the requested timeout.
+    sandbox = FakeSandbox()
+    sandbox.commands.next_handle = BlockingHandle()
+    sandbox.commands.background_delay_s = 0.9
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    async def run() -> tuple[ExecResult, float]:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        result = await runner.exec(
+            ExecCommand.process("sleep", "30"),
+            timeout_s=1,
+            output_limit_bytes=10,
+        )
+        return result, loop.time() - started
+
+    result, elapsed = asyncio.run(run())
+
+    assert result.timed_out is True
+    assert result.exit_code == -9
+    # Bug behaviour would be ~0.9 (start) + 1.0 (fresh wait) ~= 1.9s.
+    assert elapsed < 1.4, f"exec ran {elapsed:.3f}s, expected a single ~1s deadline"
+
+
 def test_e2b_runner_can_kill_sandbox_on_timeout_explicitly() -> None:
     sandbox = FakeSandbox()
     handle = BlockingHandle()
@@ -398,7 +425,7 @@ def test_e2b_runner_reports_timeout_cleanup_failure() -> None:
 
 
 def test_e2b_runner_kills_command_on_cancellation_by_default() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -406,7 +433,7 @@ def test_e2b_runner_kills_command_on_cancellation_by_default() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -429,7 +456,7 @@ def test_e2b_runner_kills_command_on_cancellation_by_default() -> None:
 
 
 def test_e2b_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError]:
+    async def run() -> tuple[FakeSandbox, FakeHandle]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -441,7 +468,7 @@ def test_e2b_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         with pytest.raises(RuntimeError, match="closed"):
             await runner.exec(ExecCommand.process("pwd"))
@@ -463,7 +490,7 @@ def test_e2b_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
 
 
 def test_e2b_runner_can_skip_cancellation_cleanup_explicitly() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -475,7 +502,7 @@ def test_e2b_runner_can_skip_cancellation_cleanup_explicitly() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -498,7 +525,7 @@ def test_e2b_runner_can_skip_cancellation_cleanup_explicitly() -> None:
 
 
 def test_e2b_runner_waits_for_start_handle_on_cancellation() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -507,7 +534,7 @@ def test_e2b_runner_waits_for_start_handle_on_cancellation() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -530,12 +557,12 @@ def test_e2b_runner_waits_for_start_handle_on_cancellation() -> None:
 
 
 def test_e2b_runner_stays_reusable_when_cancelled_before_handle_is_returned() -> None:
-    async def run() -> tuple[FakeSandbox, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeSandbox, int]:
         sandbox = FakeSandbox()
         sandbox.commands.cancel_next_background = True
         runner = E2BRunner(sandbox, close_action="kill", e2b_module=FakeE2BModule)
 
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await runner.exec(ExecCommand.process("sleep", "30"))
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -559,7 +586,7 @@ def test_e2b_runner_stays_reusable_when_cancelled_before_handle_is_returned() ->
 
 
 def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> None:
-    async def run() -> tuple[FakeSandbox, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeSandbox, int]:
         sandbox = FakeSandbox()
         sandbox.commands.background_delay_s = 1
         runner = E2BRunner(
@@ -570,7 +597,7 @@ def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> N
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
         await asyncio.sleep(0)
         sandbox.commands.next_handle = FakeHandle()
@@ -595,7 +622,7 @@ def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> N
 
 
 def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellation() -> None:
-    async def run() -> tuple[FakeSandbox, RunnerCancelledError, bool, int]:
+    async def run() -> tuple[FakeSandbox, bool, int]:
         sandbox = FakeSandbox()
         sandbox.commands.background_delay_s = 1
         sandbox.commands.hang_after_start_cancel = True
@@ -607,7 +634,7 @@ def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellatio
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
         await asyncio.sleep(0.05)
         with pytest.raises(RuntimeError, match="command state is unknown"):
@@ -634,7 +661,7 @@ def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellatio
 
 
 def test_e2b_runner_kills_late_handle_after_start_cancellation_timeout() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool, int]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, bool, int]:
         sandbox = FakeSandbox()
         late_handle = FakeHandle()
         sandbox.commands.next_handle = late_handle
@@ -648,7 +675,7 @@ def test_e2b_runner_kills_late_handle_after_start_cancellation_timeout() -> None
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
 
         with pytest.raises(RuntimeError, match="cleanup is pending"):
@@ -684,7 +711,7 @@ def test_e2b_runner_kills_late_handle_after_start_cancellation_timeout() -> None
 
 
 def test_e2b_runner_late_start_sandbox_cleanup_keeps_runner_closed() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool, bool]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, bool, bool]:
         sandbox = FakeSandbox()
         late_handle = FakeHandle()
         sandbox.commands.next_handle = late_handle
@@ -699,7 +726,7 @@ def test_e2b_runner_late_start_sandbox_cleanup_keeps_runner_closed() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
 
         for _ in range(20):
@@ -730,7 +757,7 @@ def test_e2b_runner_late_start_sandbox_cleanup_keeps_runner_closed() -> None:
 
 
 def test_e2b_runner_late_start_skip_cleanup_keeps_exec_closed() -> None:
-    async def run() -> tuple[FakeSandbox, FakeHandle, RunnerCancelledError, bool]:
+    async def run() -> tuple[FakeSandbox, FakeHandle, bool]:
         sandbox = FakeSandbox()
         late_handle = FakeHandle()
         sandbox.commands.next_handle = late_handle
@@ -745,7 +772,7 @@ def test_e2b_runner_late_start_skip_cleanup_keeps_exec_closed() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
 
         await asyncio.sleep(0.05)
@@ -874,7 +901,7 @@ def test_e2b_runner_closes_exec_when_delayed_start_timeout_cannot_be_resolved() 
 
 
 def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
-    async def run() -> tuple[FakeHandle, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeHandle, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -887,7 +914,7 @@ def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -909,7 +936,7 @@ def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
 
 
 def test_e2b_runner_stays_reusable_when_command_kill_fails() -> None:
-    async def run() -> tuple[FakeHandle, RunnerCancelledError, int]:
+    async def run() -> tuple[FakeHandle, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         handle.fail_kill = True
@@ -921,7 +948,7 @@ def test_e2b_runner_stays_reusable_when_command_kill_fails() -> None:
         task = asyncio.create_task(runner.exec(ExecCommand.process("sleep", "30")))
         await handle.wait_started.wait()
         task.cancel()
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))

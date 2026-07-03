@@ -22,8 +22,10 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    TranscriptQuery,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.tools._errors import structured_invalid_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,16 @@ MAX_SUBAGENT_RESULT_MAX_CHARS = 200_000
 DEFAULT_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 30.0
 MAX_SUBAGENT_RESULT_WAIT_TIMEOUT_S = 600.0
 SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S = 10.0
-SUBAGENT_RESULT_POLL_INTERVAL_S = 0.05
+# Poll for terminal status with exponential backoff instead of a fixed tight
+# interval: a background subagent may run for many seconds, and reloading every
+# child every 50ms wastes store round-trips. Start responsive, then back off.
+SUBAGENT_RESULT_POLL_MIN_INTERVAL_S = 0.05
+SUBAGENT_RESULT_POLL_MAX_INTERVAL_S = 1.0
+# Retained for backward compatibility with callers importing the old name.
+SUBAGENT_RESULT_POLL_INTERVAL_S = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
+# Page size for enumerating a parent's background children. ``SessionQuery.limit``
+# caps at 1000; we keyset-paginate rather than truncate at a single page.
+_SUBAGENT_CHILD_LIST_PAGE_SIZE = 1000
 _SUBAGENT_TERMINAL_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -269,6 +280,7 @@ class SubagentTool(Tool):
             )
         )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         agent_alias = _string_argument(args, "agent", clean=True)
         task = _string_argument(args, "task", clean=False)
@@ -503,6 +515,7 @@ class SubagentResultTool(Tool):
             )
         )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         all_children = _bool_argument(args, "all", default=False)
         wait = _bool_argument(args, "wait", default=True)
@@ -777,14 +790,24 @@ async def _list_background_subagent_children(
     *,
     parent_session_id: str,
 ) -> list[Session]:
-    result = await session_store.list_sessions(
-        SessionQuery(
-            parent_session_id=parent_session_id,
-            limit=1000,
-            order_by=SessionOrder.CREATED_AT_ASC,
+    children: list[Session] = []
+    cursor: str | None = None
+    while True:
+        result = await session_store.list_sessions(
+            SessionQuery(
+                parent_session_id=parent_session_id,
+                limit=_SUBAGENT_CHILD_LIST_PAGE_SIZE,
+                cursor=cursor,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
         )
-    )
-    return [session for session in result.sessions if _is_background_subagent_session(session)]
+        children.extend(
+            session for session in result.sessions if _is_background_subagent_session(session)
+        )
+        cursor = result.next_cursor
+        if cursor is None:
+            break
+    return children
 
 
 def _is_background_subagent_session(session: Session) -> bool:
@@ -804,16 +827,20 @@ async def _wait_for_subagent_terminal(
 ) -> Session:
     if not wait or child.status in _SUBAGENT_TERMINAL_STATUSES:
         return child
-    deadline = asyncio.get_running_loop().time() + timeout_s
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
     loaded = child
+    delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
     while loaded.status not in _SUBAGENT_TERMINAL_STATUSES:
-        if asyncio.get_running_loop().time() >= deadline:
+        now = loop.time()
+        if now >= deadline:
             return loaded
-        await asyncio.sleep(SUBAGENT_RESULT_POLL_INTERVAL_S)
+        await asyncio.sleep(min(delay, deadline - now))
         refreshed = await session_store.load(loaded.id)
         if refreshed is None:
             raise RuntimeError(f"Subagent session disappeared: {loaded.id}")
         loaded = refreshed
+        delay = min(delay * 2, SUBAGENT_RESULT_POLL_MAX_INTERVAL_S)
     return loaded
 
 
@@ -823,17 +850,30 @@ async def _wait_for_all_subagents_terminal(
     *,
     timeout_s: float,
 ) -> list[Session]:
-    deadline = asyncio.get_running_loop().time() + timeout_s
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
     loaded_by_id = {child.id: child for child in children}
-    while any(child.status not in _SUBAGENT_TERMINAL_STATUSES for child in loaded_by_id.values()):
-        if asyncio.get_running_loop().time() >= deadline:
-            return list(loaded_by_id.values())
-        await asyncio.sleep(SUBAGENT_RESULT_POLL_INTERVAL_S)
-        for child_id in list(loaded_by_id):
+    # Only children that have not yet reached a terminal status need reloading;
+    # terminal children are done and are never polled again.
+    pending = {
+        child_id
+        for child_id, child in loaded_by_id.items()
+        if child.status not in _SUBAGENT_TERMINAL_STATUSES
+    }
+    delay = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
+    while pending:
+        now = loop.time()
+        if now >= deadline:
+            break
+        await asyncio.sleep(min(delay, deadline - now))
+        for child_id in list(pending):
             refreshed = await session_store.load(child_id)
             if refreshed is None:
                 raise RuntimeError(f"Subagent session disappeared: {child_id}")
             loaded_by_id[child_id] = refreshed
+            if refreshed.status in _SUBAGENT_TERMINAL_STATUSES:
+                pending.discard(child_id)
+        delay = min(delay * 2, SUBAGENT_RESULT_POLL_MAX_INTERVAL_S)
     return list(loaded_by_id.values())
 
 
@@ -844,10 +884,16 @@ async def _summarize_child_session(
     max_chars: int,
     background_failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    transcript = await session_store.load_transcript(child.id)
-    events = await session_store.load_events(child.id)
-    result_text, result_truncated = _last_assistant_text(transcript, max_chars=max_chars)
-    terminal_event = _latest_terminal_event(events)
+    # Tail-limited retrieval: fetch only the last assistant message and an event
+    # summary/outcome instead of reloading the child's full transcript and every
+    # event, which scales badly for long-running subagents.
+    result_text, result_truncated = await _load_last_assistant_text(
+        session_store, child.id, max_chars=max_chars
+    )
+    event_summary = await session_store.summarize_events(child.id)
+    outcome = await session_store.summarize_outcome(child.id)
+    terminal_record = outcome.terminal_event
+    terminal_event = terminal_record.event if terminal_record is not None else None
     subagent = child.metadata.get("subagent")
     subagent_metadata = subagent if isinstance(subagent, dict) else {}
     terminal_payload = (
@@ -866,7 +912,7 @@ async def _summarize_child_session(
         "retrieval_status": "ready" if ready else "not_ready",
         "result_text": result_text,
         "result_truncated": result_truncated,
-        "events": len(events),
+        "events": event_summary.total_events,
         "terminal_event_type": None if terminal_event is None else str(terminal_event.type),
         "terminal_payload": terminal_payload,
         "background_failure": (
@@ -878,26 +924,42 @@ async def _summarize_child_session(
     }
 
 
-def _last_assistant_text(messages: list[Message], *, max_chars: int) -> tuple[str, bool]:
-    for message in reversed(messages):
-        if message.role != MessageRole.ASSISTANT:
-            continue
-        text = "".join(part.text for part in message.content if type(part) is TextPart).strip()
-        if len(text) <= max_chars:
-            return text, False
-        return text[:max_chars], True
-    return "", False
+async def _load_last_assistant_text(
+    session_store: SessionStore,
+    session_id: str,
+    *,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Return the last assistant message's text, tail-truncated to ``max_chars``.
 
-
-def _latest_terminal_event(events: list[Event]) -> Event | None:
-    for event in reversed(events):
-        if event.type in {
-            EventType.SESSION_COMPLETED,
-            EventType.SESSION_FAILED,
-            EventType.SESSION_INTERRUPTED,
-        }:
-            return event
-    return None
+    Uses a role-filtered, offset-based transcript query so only the final
+    assistant message is materialized instead of the whole transcript.
+    """
+    head = await session_store.query_transcript(
+        TranscriptQuery(session_id=session_id, role=MessageRole.ASSISTANT, offset=0, limit=1)
+    )
+    total = head.total_records
+    if total == 0:
+        return "", False
+    if total == 1:
+        records = head.records
+    else:
+        tail = await session_store.query_transcript(
+            TranscriptQuery(
+                session_id=session_id,
+                role=MessageRole.ASSISTANT,
+                offset=total - 1,
+                limit=1,
+            )
+        )
+        records = tail.records
+    if not records:
+        return "", False
+    message = records[-1].message
+    text = "".join(part.text for part in message.content if type(part) is TextPart).strip()
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
 
 
 def _tool_result_from_child_summary(summary: dict[str, Any]) -> ToolResult:
@@ -936,7 +998,7 @@ async def _collect_subagent_result(
     *,
     max_chars: int,
 ) -> _SubagentResult:
-    # Mirror the retrieval path (`_last_assistant_text`): the result is the LAST
+    # Mirror the retrieval path (`_load_last_assistant_text`): the result is the LAST
     # assistant message's text, tail-truncated to `max_chars`. Accumulate deltas
     # per model turn and reset on each `MODEL_STARTED` so we keep only the final
     # message instead of the first `max_chars` of every turn concatenated.

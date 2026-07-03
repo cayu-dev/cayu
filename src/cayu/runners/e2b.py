@@ -8,7 +8,7 @@ import shlex
 from types import ModuleType
 from typing import Any, Literal
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -31,7 +31,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
+    attach_cancellation_artifacts,
 )
 
 DEFAULT_E2B_CWD = "/home/user/workspace"
@@ -78,9 +78,6 @@ class E2BRunner(Runner):
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         self._sandbox = sandbox
         self._e2b_module = e2b_module
-        self._closed = False
-        self._exec_closed = False
-        self._exec_closed_reason: str | None = None
         self._late_start_cleanup_timeout_s = self.cancel_timeout_s * (
             E2B_LATE_START_CLEANUP_TIMEOUT_MULTIPLIER
         )
@@ -223,18 +220,6 @@ class E2BRunner(Runner):
             e2b_module=module,
         )
 
-    async def __aenter__(self) -> E2BRunner:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> bool:
-        await self.close()
-        return False
-
     async def close(self) -> None:
         """Apply the configured lifecycle action once."""
 
@@ -269,11 +254,7 @@ class E2BRunner(Runner):
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("E2BRunner command must be an ExecCommand.")
-        if self._closed:
-            raise RuntimeError("E2BRunner is closed.")
-        if self._exec_closed:
-            reason = self._exec_closed_reason or "runner exec path is closed"
-            raise RuntimeError(f"E2BRunner is closed: {reason}")
+        self._ensure_exec_open()
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
@@ -292,6 +273,8 @@ class E2BRunner(Runner):
         async def on_stderr(chunk: str) -> None:
             stderr.append(chunk)
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
         try:
             start_task = asyncio.create_task(
                 self._sandbox.commands.run(
@@ -305,14 +288,15 @@ class E2BRunner(Runner):
                     timeout=float(timeout) if timeout is not None else 0,
                 )
             )
-            handle = await self._await_started_handle(start_task, timeout_s=timeout)
+            handle = await self._await_started_handle(start_task, deadline=deadline)
             if standard_input is not None:
                 await handle.send_stdin(standard_input)
                 await handle.close_stdin()
-            if timeout is None:
+            if deadline is None:
                 result = await handle.wait()
             else:
-                result = await asyncio.wait_for(handle.wait(), timeout=timeout)
+                remaining = max(deadline - loop.time(), 0.0)
+                result = await asyncio.wait_for(handle.wait(), timeout=remaining)
         except asyncio.CancelledError as exc:
             cleanup = await self._cleanup_interrupted_command(
                 start_task,
@@ -320,7 +304,8 @@ class E2BRunner(Runner):
                 cleanup_policy=self.cancellation_cleanup,
                 wait_for_handle_before_cancelling=True,
             )
-            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
+            attach_cancellation_artifacts(exc, [cleanup.artifact])
+            raise
         except Exception as exc:
             if _is_timeout_error(exc):
                 cleanup = await self._cleanup_interrupted_command(
@@ -348,11 +333,12 @@ class E2BRunner(Runner):
         self,
         start_task: asyncio.Task[Any],
         *,
-        timeout_s: int | None,
+        deadline: float | None,
     ) -> Any:
-        if timeout_s is None:
+        if deadline is None:
             return await asyncio.shield(start_task)
-        return await asyncio.wait_for(asyncio.shield(start_task), timeout=timeout_s)
+        remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
+        return await asyncio.wait_for(asyncio.shield(start_task), timeout=remaining)
 
     async def _cleanup_interrupted_command(
         self,
@@ -394,14 +380,6 @@ class E2BRunner(Runner):
             and cleanup.artifact.get("status") == "completed"
         ):
             self._closed = True
-
-    def _close_exec(self, reason: str) -> None:
-        self._exec_closed = True
-        self._exec_closed_reason = reason
-
-    def _open_exec(self) -> None:
-        self._exec_closed = False
-        self._exec_closed_reason = None
 
     async def _resolve_started_handle_after_interruption(
         self,
@@ -534,17 +512,6 @@ class E2BRunner(Runner):
                 asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)),
                 timeout=self.cancel_timeout_s,
             )
-
-    def resolve_cwd(self, cwd: str | None = None) -> str:
-        if cwd is None:
-            return self.default_cwd
-        relative_cwd = require_nonblank(cwd, "cwd")
-        if posixpath.isabs(relative_cwd):
-            raise ValueError("Runner cwd must be relative.")
-        resolved = posixpath.normpath(posixpath.join(self.default_cwd, relative_cwd))
-        if not _is_same_or_child(resolved, self.default_cwd):
-            raise ValueError("Runner cwd escapes the runner root.")
-        return resolved
 
 
 class _LimitedText:
@@ -697,12 +664,6 @@ def _late_start_cleanup_deferred_artifact(
         "late_start_cleanup_timeout_s": late_start_cleanup_timeout_s,
         "reason": "command handle is not available yet; cleanup will continue in background",
     }
-
-
-def _is_same_or_child(path: str, root: str) -> bool:
-    if root == "/":
-        return posixpath.isabs(path)
-    return path == root or path.startswith(f"{root.rstrip('/')}/")
 
 
 async def _cleanup_created_sandbox(sandbox: Any) -> None:

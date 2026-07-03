@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from cayu.runners.base import ExecCommand, ExecResult, RunnerCancelledError
+from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.sbx import (
     DEFAULT_SBX_CWD,
     SBX_COMMAND_STATE_DIR,
@@ -309,7 +309,7 @@ def test_exec_timeout_can_remove_sandbox_when_configured(monkeypatch):
     ]
 
 
-def test_exec_cancellation_raises_runner_cancelled_error(monkeypatch):
+def test_exec_cancellation_reraises_plain_cancelled_error_with_artifacts(monkeypatch):
     issued = []
 
     async def fake_run_subprocess(command, **kwargs):
@@ -322,12 +322,14 @@ def test_exec_cancellation_raises_runner_cancelled_error(monkeypatch):
     r = SbxRunner("a1", mount_path="/tmp/m", sbx_path="/usr/bin/sbx")
 
     async def run():
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await r.exec(ExecCommand.process("sleep", "999"))
         return exc_info.value
 
     error = asyncio.run(run())
 
+    # The original cancellation propagates unchanged; diagnostics ride out-of-band.
+    assert type(error) is asyncio.CancelledError
     assert r._exec_closed is False
     assert len(issued) == 2
     assert "setsid" in issued[0][-1]
@@ -368,6 +370,53 @@ def test_exec_marks_exec_closed_when_command_cleanup_fails(monkeypatch):
             "error": "kill returned false",
         }
     ]
+
+
+def test_command_kill_verifies_missing_pid_file_as_stopped(monkeypatch):
+    kill_attempts = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        if "kill -TERM" in command.argv[-1]:
+            kill_attempts.append(command.argv)
+            return ExecResult(exit_code=1)
+        if command.argv[-1].startswith("test -f"):
+            # pid file absent: the supervised command is not running.
+            return ExecResult(exit_code=1)
+        return ExecResult(timed_out=True, exit_code=-9)
+
+    monkeypatch.setattr("cayu.runners.sbx.run_subprocess", fake_run_subprocess)
+    r = SbxRunner("a1", mount_path="/tmp/m", sbx_path="/usr/bin/sbx")
+
+    result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
+
+    assert result.timed_out is True
+    assert len(kill_attempts) == 2
+    assert r._exec_closed is False
+    assert r._exec_closed_reason is None
+    assert result.artifacts[0]["status"] == "completed"
+
+
+def test_reopen_exec_recovers_latched_runner(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult(exit_code=1)
+        if command.argv[-1].startswith("test -f"):
+            # pid file still present: the command state stays unknown.
+            return ExecResult(exit_code=0)
+        return ExecResult(timed_out=True, exit_code=-9)
+
+    monkeypatch.setattr("cayu.runners.sbx.run_subprocess", fake_run_subprocess)
+    r = SbxRunner("a1", mount_path="/tmp/m", sbx_path="/usr/bin/sbx")
+
+    result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
+    assert result.timed_out is True
+    assert r._exec_closed is True
+
+    with pytest.raises(RuntimeError, match="SbxRunner is closed: sbx command cleanup"):
+        asyncio.run(r.exec(ExecCommand.process("true")))
+
+    r.reopen_exec()
+    assert r._exec_closed is False
 
 
 def test_exec_validates_env_before_building_sbx_env(monkeypatch):

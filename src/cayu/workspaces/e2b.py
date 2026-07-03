@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import fnmatch
+import math
 import posixpath
-from pathlib import PurePosixPath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import DEFAULT_E2B_CWD, E2BRunner, ExecCommand
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.runners import DEFAULT_E2B_CWD, E2BRunner
+from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
+from cayu.workspaces.base import (
+    Workspace,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+    matches_list_pattern,
+    validate_list_pattern,
+)
 
 DEFAULT_E2B_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
 DEFAULT_E2B_WORKSPACE_LIST_LIMIT = 500
@@ -15,7 +21,18 @@ DEFAULT_E2B_WORKSPACE_LIST_DEPTH = 64
 
 
 class E2BWorkspace(Workspace):
-    """Workspace implementation backed by E2B's native filesystem API."""
+    """Workspace backed by an E2B sandbox.
+
+    ``read_bytes``/``write_bytes``/``delete`` run through a guest-side guard
+    program (see :mod:`cayu.workspaces._guest_guard`) that resolves and opens
+    every path component atomically with ``O_NOFOLLOW`` inside the sandbox, so
+    a co-resident guest process cannot race a host-side symlink check
+    (TOCTOU). Those operations require ``python3`` inside the guest and run as
+    the runner's default exec user (the ``user`` override applies only to
+    ``list``). ``list`` uses E2B's native filesystem API and is advisory:
+    symlinked entries are skipped best-effort, and any subsequent read is
+    re-checked by the guard.
+    """
 
     def __init__(
         self,
@@ -52,12 +69,16 @@ class E2BWorkspace(Workspace):
         *,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
-        guest_path = self.resolve(path)
-        await self._reject_symlink_path(guest_path, allow_missing_suffix=False)
-        fs = self._filesystem()
-        metadata = await _get_file_info(fs, guest_path, original_path=path, workspace=self)
-        content = await _read_limited(fs, guest_path, self._effective_read_limit(max_bytes), self)
-        total_bytes = _metadata_size(metadata)
+        rel_path = self._contained_rel_path(path)
+        content, total_bytes = await guard_read(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            limit=self._effective_read_limit(max_bytes),
+            original_path=path,
+            backend="E2B",
+            timeout_s=self._guard_timeout_s(),
+        )
         return WorkspaceReadResult(
             content=content,
             total_bytes=max(total_bytes, len(content)),
@@ -65,43 +86,29 @@ class E2BWorkspace(Workspace):
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
-        guest_path = self.resolve(path)
+        rel_path = self._contained_rel_path(path)
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
-        await self._reject_symlink_path(posixpath.dirname(guest_path), allow_missing_suffix=True)
-        await self._reject_symlink_path(guest_path, allow_missing_suffix=True)
-        await self._filesystem().write(
-            guest_path,
-            content,
-            user=self.user,
-            request_timeout=self.request_timeout_s,
+        await guard_write(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            content=content,
+            original_path=path,
+            backend="E2B",
+            timeout_s=self._guard_timeout_s(),
         )
 
     async def delete(self, path: str) -> None:
-        guest_path = self.resolve(path)
-        await self._reject_symlink_path(posixpath.dirname(guest_path), allow_missing_suffix=True)
-        try:
-            metadata = await self._filesystem().get_info(
-                guest_path,
-                user=self.user,
-                request_timeout=self.request_timeout_s,
-            )
-        except Exception as exc:
-            if _is_path_not_found_error(exc):
-                return
-            raise RuntimeError(f"Failed to inspect E2B workspace path: {guest_path}") from exc
-        if _is_symlink(metadata):
-            raise ValueError("Workspace path escapes the workspace root.")
-        if _entry_type(metadata) != "file":
-            raise IsADirectoryError(f"Workspace path is not a file: {path}")
-        result = await self.runner.exec(
-            ExecCommand.process("rm", "-f", "--", guest_path),
+        rel_path = self._contained_rel_path(path)
+        await guard_delete(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            original_path=path,
+            backend="E2B",
+            timeout_s=self._guard_timeout_s(),
         )
-        if result.exit_code != 0:
-            raise RuntimeError(
-                "Failed to delete E2B workspace file: "
-                f"{path}: {result.stderr.strip() or result.stdout.strip()}"
-            )
 
     async def list(
         self,
@@ -109,7 +116,7 @@ class E2BWorkspace(Workspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
-        pattern = _validate_list_pattern(pattern)
+        pattern = validate_list_pattern(pattern)
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")
         )
@@ -135,7 +142,7 @@ class E2BWorkspace(Workspace):
             if guest_path is None or not _is_same_or_child(guest_path, self.root):
                 continue
             rel_path = posixpath.relpath(guest_path, self.root)
-            if _matches_pattern(rel_path, pattern):
+            if matches_list_pattern(rel_path, pattern):
                 total_count += 1
                 if len(paths) < effective_limit:
                     paths.append(rel_path)
@@ -154,6 +161,14 @@ class E2BWorkspace(Workspace):
 
     def _filesystem(self) -> Any:
         return self.runner.filesystem()
+
+    def _contained_rel_path(self, path: str) -> str:
+        return posixpath.relpath(self.resolve(path), self.root)
+
+    def _guard_timeout_s(self) -> int | None:
+        if self.request_timeout_s is None:
+            return None
+        return max(1, math.ceil(self.request_timeout_s))
 
     def _effective_read_limit(self, max_bytes: int | None) -> int:
         if max_bytes is None:
@@ -182,55 +197,6 @@ class E2BWorkspace(Workspace):
                 raise ValueError("Workspace path escapes the workspace root.")
 
 
-async def _get_file_info(
-    fs: Any,
-    guest_path: str,
-    *,
-    original_path: str,
-    workspace: E2BWorkspace,
-) -> Any:
-    try:
-        metadata = await fs.get_info(
-            guest_path,
-            user=workspace.user,
-            request_timeout=workspace.request_timeout_s,
-        )
-    except Exception as exc:
-        if _is_path_not_found_error(exc):
-            raise FileNotFoundError(f"Workspace file not found: {original_path}") from exc
-        raise RuntimeError(f"Failed to stat E2B workspace file: {original_path}: {exc}") from exc
-    if _entry_type(metadata) != "file":
-        raise FileNotFoundError(f"Workspace file not found: {original_path}")
-    if _is_symlink(metadata):
-        raise ValueError("Workspace path escapes the workspace root.")
-    return metadata
-
-
-async def _read_limited(
-    fs: Any,
-    guest_path: str,
-    limit: int,
-    workspace: E2BWorkspace,
-) -> bytes:
-    content = bytearray()
-    stream = await fs.read(
-        guest_path,
-        format="stream",
-        user=workspace.user,
-        request_timeout=workspace.request_timeout_s,
-    )
-    async for chunk in stream:
-        if type(chunk) is not bytes:
-            raise TypeError("E2B filesystem read stream yielded non-bytes data.")
-        remaining = limit - len(content)
-        if remaining <= 0:
-            break
-        content.extend(chunk[:remaining])
-        if len(chunk) > remaining:
-            break
-    return bytes(content)
-
-
 def _entry_guest_path(entry_path: Any) -> str | None:
     if type(entry_path) is not str or not entry_path:
         return None
@@ -254,15 +220,6 @@ def _is_symlink(entry: Any) -> bool:
     return type(symlink_target) is str and bool(symlink_target)
 
 
-def _metadata_size(metadata: Any) -> int:
-    size = getattr(metadata, "size", None)
-    if type(size) is not int:
-        raise TypeError("E2B filesystem metadata missing integer size.")
-    if size < 0:
-        raise ValueError("E2B filesystem metadata size must be non-negative.")
-    return size
-
-
 def _validate_guest_root(path: str) -> str:
     root = require_clean_nonblank(path, "root")
     if not posixpath.isabs(root):
@@ -280,16 +237,6 @@ def _validate_relative_path(path: str) -> str:
     if normalized == ".." or normalized.startswith("../"):
         raise ValueError("Workspace path escapes the workspace root.")
     return normalized
-
-
-def _validate_list_pattern(pattern: str) -> str:
-    value = require_nonblank(pattern, "pattern")
-    if posixpath.isabs(value):
-        raise ValueError("Workspace list pattern must stay inside the workspace.")
-    parts = tuple(part for part in value.split("/") if part)
-    if ".." in parts:
-        raise ValueError("Workspace list pattern must stay inside the workspace.")
-    return value
 
 
 def _validate_required_limit(value: int, field_name: str) -> int:
@@ -326,11 +273,3 @@ def _is_path_not_found_error(exc: Exception) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
     return type(exc).__name__ in {"FileNotFoundException", "PathNotFoundError"}
-
-
-def _matches_pattern(path: str, pattern: str) -> bool:
-    return (
-        PurePosixPath(path).match(pattern)
-        or fnmatch.fnmatchcase(path, pattern)
-        or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
-    )

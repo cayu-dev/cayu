@@ -1,6 +1,13 @@
 """Workspace contracts."""
 
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces.base import (
+    Workspace,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+    matches_list_pattern,
+    translate_list_pattern,
+    validate_list_pattern,
+)
 from cayu.workspaces.e2b import (
     DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
     DEFAULT_E2B_WORKSPACE_LIST_LIMIT,
@@ -34,4 +41,7 @@ __all__ = [
     "Workspace",
     "WorkspaceListResult",
     "WorkspaceReadResult",
+    "matches_list_pattern",
+    "translate_list_pattern",
+    "validate_list_pattern",
 ]

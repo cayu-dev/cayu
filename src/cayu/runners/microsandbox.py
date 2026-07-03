@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import posixpath
 from types import ModuleType
 from typing import Any, Literal
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -27,7 +28,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
+    attach_cancellation_artifacts,
 )
 
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
@@ -70,8 +71,9 @@ class MicrosandboxRunner(Runner):
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         self._sandbox = sandbox
         self._sandbox_module = sandbox_module
-        self._closed = False
-        self._exec_closed = False
+        self._sftp_client: Any = None
+        self._sftp: Any = None
+        self._sftp_lock = asyncio.Lock()
 
     @classmethod
     async def create(
@@ -177,23 +179,12 @@ class MicrosandboxRunner(Runner):
             sandbox_module=module,
         )
 
-    async def __aenter__(self) -> MicrosandboxRunner:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> bool:
-        await self.close()
-        return False
-
     async def close(self) -> None:
         """Apply the configured lifecycle action once."""
 
         if self._closed:
             return
+        await self._close_sftp_session()
         if self.close_action == "none":
             self._closed = True
             return
@@ -220,23 +211,55 @@ class MicrosandboxRunner(Runner):
         return self._sandbox.fs
 
     async def real_path(self, path: str) -> str:
-        """Resolve a guest path through Microsandbox's SFTP realpath API."""
+        """Resolve a guest path through Microsandbox's SFTP realpath API.
+
+        The SSH client and SFTP channel are opened once and cached for reuse:
+        listing a directory resolves one path per entry, and a fresh SSH
+        handshake per call made large listings pathologically slow (~500
+        handshakes to resolve 500 files). On any session error the cached
+        session is dropped and the call is retried once against a fresh
+        handshake, so a transient disconnect does not fail the whole listing.
+        """
 
         if self._closed:
             raise RuntimeError("MicrosandboxRunner is closed.")
+        async with self._sftp_lock:
+            try:
+                return await self._sftp_real_path(path)
+            except Exception:
+                await self._close_sftp_session()
+                return await self._sftp_real_path(path)
+
+    async def _sftp_real_path(self, path: str) -> str:
+        sftp = await self._ensure_sftp_session()
+        resolved = await sftp.real_path(path)
+        if type(resolved) is not str or not resolved:
+            raise RuntimeError("Microsandbox real_path returned an invalid path.")
+        return posixpath.normpath(resolved)
+
+    async def _ensure_sftp_session(self) -> Any:
+        if self._sftp is not None:
+            return self._sftp
         ssh = self._sandbox.ssh()
         client = await ssh.open_client(sftp=True)
-        sftp = None
         try:
             sftp = await client.sftp()
-            resolved = await sftp.real_path(path)
-            if type(resolved) is not str or not resolved:
-                raise RuntimeError("Microsandbox real_path returned an invalid path.")
-            return posixpath.normpath(resolved)
-        finally:
-            if sftp is not None:
-                await sftp.close()
-            await client.close()
+        except BaseException:
+            await _close_quietly(client)
+            raise
+        self._sftp_client = client
+        self._sftp = sftp
+        return sftp
+
+    async def _close_sftp_session(self) -> None:
+        sftp = self._sftp
+        client = self._sftp_client
+        self._sftp = None
+        self._sftp_client = None
+        if sftp is not None:
+            await _close_quietly(sftp)
+        if client is not None:
+            await _close_quietly(client)
 
     async def exec(
         self,
@@ -250,8 +273,7 @@ class MicrosandboxRunner(Runner):
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
-        if self._closed or self._exec_closed:
-            raise RuntimeError("MicrosandboxRunner is closed.")
+        self._ensure_exec_open()
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
@@ -318,7 +340,8 @@ class MicrosandboxRunner(Runner):
                 policy=self.cancellation_cleanup,
             )
             self._apply_cleanup_result(cleanup)
-            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
+            attach_cancellation_artifacts(exc, [cleanup.artifact])
+            raise
         except Exception as exc:
             if not _is_timeout_error(exc):
                 raise
@@ -350,24 +373,16 @@ class MicrosandboxRunner(Runner):
         )
 
     def _apply_cleanup_result(self, cleanup: Any) -> None:
+        # Unlike the base contract, a failed command kill does not latch the
+        # exec path: the microsandbox supervisor still owns the command, so the
+        # runner stays reusable (covered by the adapter's tests).
         if cleanup.close_runner:
-            self._exec_closed = True
+            self._close_exec("runner cleanup closed the exec path")
         if (
             cleanup.artifact.get("action") == "kill_sandbox"
             and cleanup.artifact.get("status") == "completed"
         ):
             self._closed = True
-
-    def resolve_cwd(self, cwd: str | None = None) -> str:
-        if cwd is None:
-            return self.default_cwd
-        relative_cwd = require_nonblank(cwd, "cwd")
-        if posixpath.isabs(relative_cwd):
-            raise ValueError("Runner cwd must be relative.")
-        resolved = posixpath.normpath(posixpath.join(self.default_cwd, relative_cwd))
-        if not _is_same_or_child(resolved, self.default_cwd):
-            raise ValueError("Runner cwd escapes the runner root.")
-        return resolved
 
 
 class _LimitedBytes:
@@ -397,6 +412,13 @@ class _LimitedBytes:
 
     def text(self) -> str:
         return bytes(self.content).decode("utf-8", errors="replace")
+
+
+async def _close_quietly(resource: Any) -> None:
+    # Closing a stale/broken SSH or SFTP handle must not mask the original
+    # error that prompted the teardown, so swallow close-time failures.
+    with contextlib.suppress(Exception):
+        await resource.close()
 
 
 def _microsandbox_module(module: ModuleType | Any | None = None) -> ModuleType | Any:
@@ -431,12 +453,6 @@ def _validate_close_action(action: MicrosandboxCloseAction) -> MicrosandboxClose
     if action not in {"remove", "stop", "detach", "none"}:
         raise ValueError("Microsandbox close_action must be remove, stop, detach, or none.")
     return action
-
-
-def _is_same_or_child(path: str, root: str) -> bool:
-    if root == "/":
-        return posixpath.isabs(path)
-    return path == root or path.startswith(f"{root.rstrip('/')}/")
 
 
 def _event_bytes(data: Any) -> bytes:

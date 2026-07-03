@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import mimetypes
 from collections.abc import Iterable
@@ -20,6 +21,7 @@ from cayu.artifacts import (
     file_attachment,
 )
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.tools._errors import structured_invalid_arguments
 from cayu.workspaces import Workspace, WorkspaceReadResult
 
 DEFAULT_READ_LIMIT_BYTES = 256 * 1024
@@ -204,6 +206,7 @@ class ReadFileTool(Tool):
                 *default_artifact_readers(),
             ]
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         path = _optional_arg_string(args, "path")
         artifact_id = _optional_arg_string(args, "artifact_id")
@@ -663,43 +666,54 @@ class ImageArtifactReader:
                     structured=request.structured,
                     is_error=True,
                 )
-            try:
-                resized = _resize_image_bytes(
-                    source.content,
-                    content_type=detected_content_type,
-                    max_bytes=request.options.max_attachment_bytes,
-                )
-            except Exception as exc:
-                return ToolResult(
-                    content=f"Image '{artifact.filename}' could not be inspected: {exc}",
-                    structured=request.structured,
-                    is_error=True,
-                )
-            if resized is None:
-                return ToolResult(
-                    content=(
-                        f"Image '{artifact.filename}' exceeds max_attachment_bytes="
-                        f"{request.options.max_attachment_bytes}. Install cayu[files] or "
-                        "register a custom reader to resize this image."
-                    ),
-                    structured=request.structured,
-                    is_error=True,
-                )
-            image_bytes, content_type = resized
-            attachment_artifact = await artifact_store.put_bytes(
-                image_bytes,
-                filename=artifact.filename,
-                content_type=content_type,
-                scope=ArtifactScope.SESSION,
-                session_id=request.ctx.session_id,
-                agent_name=request.ctx.agent_name,
-                environment_name=request.ctx.environment_name,
-                metadata={
-                    "derived_from_artifact_id": artifact.id,
-                    "reader": type(self).__name__,
-                    "operation": "resize_image",
-                },
+            derivation_key = _derivation_key(
+                source_hash=_content_hash(source.content),
+                operation="resize_image",
+                params=str(request.options.max_attachment_bytes),
             )
+            reused = await _find_derived_artifact(artifact_store, request.ctx, derivation_key)
+            if reused is not None:
+                attachment_artifact = reused
+            else:
+                try:
+                    resized = _resize_image_bytes(
+                        source.content,
+                        content_type=detected_content_type,
+                        max_bytes=request.options.max_attachment_bytes,
+                    )
+                except Exception as exc:
+                    return ToolResult(
+                        content=f"Image '{artifact.filename}' could not be inspected: {exc}",
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                if resized is None:
+                    return ToolResult(
+                        content=(
+                            f"Image '{artifact.filename}' exceeds max_attachment_bytes="
+                            f"{request.options.max_attachment_bytes}. Install cayu[files] or "
+                            "register a custom reader to resize this image."
+                        ),
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                image_bytes, content_type = resized
+                attachment_artifact = await artifact_store.put_bytes(
+                    image_bytes,
+                    filename=artifact.filename,
+                    content_type=content_type,
+                    scope=ArtifactScope.SESSION,
+                    session_id=request.ctx.session_id,
+                    agent_name=request.ctx.agent_name,
+                    environment_name=request.ctx.environment_name,
+                    metadata={
+                        "derived_from_artifact_id": artifact.id,
+                        "reader": type(self).__name__,
+                        "operation": "resize_image",
+                        "cayu_derivation_key": derivation_key,
+                        "content_hash": _content_hash(image_bytes),
+                    },
+                )
         else:
             detected_content_type, validation_error = _detect_image_content_type(result.content)
             if validation_error is not None:
@@ -760,6 +774,7 @@ class PdfArtifactReader:
                 structured=request.structured,
                 is_error=True,
             )
+        source_content: bytes | None = None
         if (
             request.options.pages is None
             and artifact.size_bytes <= request.options.max_attachment_bytes
@@ -775,61 +790,89 @@ class PdfArtifactReader:
                     structured=request.structured,
                     is_error=True,
                 )
-            attachment_artifact = artifact
-            page_note = ""
+            total_pages = _count_pdf_pages(result.content)
+            if total_pages is not None and total_pages > MAX_PDF_PAGES_PER_READ:
+                # A short-but-many-page PDF fits under the byte cap yet still needs
+                # the 10-page limit enforced; fall through to page extraction reusing
+                # the bytes we already read (they are complete, not truncated).
+                source_content = result.content
+                attachment_artifact = None
+            else:
+                attachment_artifact = artifact
+                page_note = ""
         else:
-            source = await artifact_store.read_bytes(artifact.id, max_bytes=MAX_PDF_SOURCE_BYTES)
-            if source.truncated:
-                return ToolResult(
-                    content=(
-                        f"PDF '{artifact.filename}' is too large to inspect "
-                        f"({artifact.size_bytes} bytes)."
-                    ),
-                    structured=request.structured,
-                    is_error=True,
+            attachment_artifact = None
+        if attachment_artifact is None:
+            if source_content is None:
+                source = await artifact_store.read_bytes(
+                    artifact.id, max_bytes=MAX_PDF_SOURCE_BYTES
                 )
-            try:
-                extracted = _extract_pdf_pages(source.content, request.options.pages)
-            except Exception as exc:
-                return ToolResult(
-                    content=f"PDF '{artifact.filename}' could not be inspected: {exc}",
-                    structured=request.structured,
-                    is_error=True,
-                )
-            if extracted is None:
-                return ToolResult(
-                    content=(
-                        "PDF page extraction requires the optional files dependencies. "
-                        "Install cayu[files] or register a custom PDF reader."
-                    ),
-                    structured=request.structured,
-                    is_error=True,
-                )
-            pdf_bytes, page_note = extracted
-            if len(pdf_bytes) > request.options.max_attachment_bytes:
-                return ToolResult(
-                    content=(
-                        f"PDF selection for '{artifact.filename}' is {len(pdf_bytes)} bytes, "
-                        f"which exceeds max_attachment_bytes={request.options.max_attachment_bytes}."
-                    ),
-                    structured=request.structured,
-                    is_error=True,
-                )
-            attachment_artifact = await artifact_store.put_bytes(
-                pdf_bytes,
-                filename=artifact.filename,
-                content_type=PDF_CONTENT_TYPE,
-                scope=ArtifactScope.SESSION,
-                session_id=request.ctx.session_id,
-                agent_name=request.ctx.agent_name,
-                environment_name=request.ctx.environment_name,
-                metadata={
-                    "derived_from_artifact_id": artifact.id,
-                    "reader": type(self).__name__,
-                    "operation": "extract_pdf_pages",
-                    "pages": request.options.pages,
-                },
+                if source.truncated:
+                    return ToolResult(
+                        content=(
+                            f"PDF '{artifact.filename}' is too large to inspect "
+                            f"({artifact.size_bytes} bytes)."
+                        ),
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                source_content = source.content
+            derivation_key = _derivation_key(
+                source_hash=_content_hash(source_content),
+                operation="extract_pdf_pages",
+                params=request.options.pages or "",
             )
+            reused = await _find_derived_artifact(artifact_store, request.ctx, derivation_key)
+            if reused is not None:
+                attachment_artifact = reused
+                page_note = reused.metadata.get("page_note", "")
+            else:
+                try:
+                    extracted = _extract_pdf_pages(source_content, request.options.pages)
+                except Exception as exc:
+                    return ToolResult(
+                        content=f"PDF '{artifact.filename}' could not be inspected: {exc}",
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                if extracted is None:
+                    return ToolResult(
+                        content=(
+                            "PDF page extraction requires the optional files dependencies. "
+                            "Install cayu[files] or register a custom PDF reader."
+                        ),
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                pdf_bytes, page_note = extracted
+                if len(pdf_bytes) > request.options.max_attachment_bytes:
+                    return ToolResult(
+                        content=(
+                            f"PDF selection for '{artifact.filename}' is {len(pdf_bytes)} bytes, "
+                            f"which exceeds "
+                            f"max_attachment_bytes={request.options.max_attachment_bytes}."
+                        ),
+                        structured=request.structured,
+                        is_error=True,
+                    )
+                attachment_artifact = await artifact_store.put_bytes(
+                    pdf_bytes,
+                    filename=artifact.filename,
+                    content_type=PDF_CONTENT_TYPE,
+                    scope=ArtifactScope.SESSION,
+                    session_id=request.ctx.session_id,
+                    agent_name=request.ctx.agent_name,
+                    environment_name=request.ctx.environment_name,
+                    metadata={
+                        "derived_from_artifact_id": artifact.id,
+                        "reader": type(self).__name__,
+                        "operation": "extract_pdf_pages",
+                        "pages": request.options.pages,
+                        "cayu_derivation_key": derivation_key,
+                        "content_hash": _content_hash(pdf_bytes),
+                        "page_note": page_note,
+                    },
+                )
         attachment = file_attachment(
             artifact_id=attachment_artifact.id,
             kind=FileAttachmentKind.DOCUMENT,
@@ -924,6 +967,7 @@ class WriteFileTool(Tool):
         },
     )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         workspace = _require_workspace(ctx)
         if workspace is None:
@@ -983,6 +1027,7 @@ class ListFilesTool(Tool):
         },
     )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         workspace = _require_workspace(ctx)
         if workspace is None:
@@ -1037,6 +1082,7 @@ class ListArtifactsTool(Tool):
         },
     )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         artifact_store = _require_artifact_store(ctx)
         if artifact_store is None:
@@ -1319,6 +1365,51 @@ def _extract_pdf_pages(content: bytes, pages: str | None) -> tuple[bytes, str] |
     else:
         page_note = f" (showing pages {start + 1}-{end} of {total_pages})"
     return buffer.getvalue(), page_note
+
+
+def _count_pdf_pages(content: bytes) -> int | None:
+    try:
+        pypdf = import_module("pypdf")
+    except ImportError:
+        return None
+    reader = pypdf.PdfReader(io.BytesIO(content))
+    return len(reader.pages)
+
+
+def _content_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _derivation_key(*, source_hash: str, operation: str, params: str) -> str:
+    payload = f"{source_hash}\x00{operation}\x00{params}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _find_derived_artifact(
+    artifact_store: ArtifactStore,
+    ctx: ToolContext,
+    derivation_key: str,
+) -> ArtifactMetadata | None:
+    """Return a previously derived session artifact for this derivation, if any.
+
+    Re-reading the same image/PDF each turn re-runs the same resize/page-extract
+    and would otherwise store an identical (potentially multi-MB) copy every time.
+    Derivations are deterministic in (source bytes, operation, params), so a prior
+    result carrying the same derivation key can be reused verbatim.
+    """
+    if ctx.session_id is None:
+        return None
+    try:
+        listing = await artifact_store.list(
+            scope=ArtifactScope.SESSION,
+            session_id=ctx.session_id,
+        )
+    except Exception:
+        return None
+    for meta in listing.artifacts:
+        if meta.metadata.get("cayu_derivation_key") == derivation_key:
+            return meta
+    return None
 
 
 def _validate_pdf_bytes(content: bytes) -> str | None:

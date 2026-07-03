@@ -6,7 +6,13 @@ from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.workspaces.base import (
+    Workspace,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+    matches_list_pattern,
+    validate_list_pattern,
+)
 
 
 class LocalWorkspace(Workspace):
@@ -55,9 +61,7 @@ class LocalWorkspace(Workspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
-        pattern = require_nonblank(pattern, "pattern")
-        if Path(pattern).is_absolute() or _has_parent_reference(pattern):
-            raise ValueError("Workspace list pattern must stay inside the workspace.")
+        pattern = validate_list_pattern(pattern)
         validated_limit = _validate_limit(limit, "limit")
 
         return await asyncio.to_thread(
@@ -106,10 +110,6 @@ class LocalWorkspace(Workspace):
         return current
 
 
-def _has_parent_reference(pattern: str) -> bool:
-    return ".." in Path(pattern).parts
-
-
 def _write_file(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
@@ -150,12 +150,14 @@ def _list_files(
 ) -> WorkspaceListResult:
     paths: list[str] = []
     total_count = 0
-    for path in root.glob(pattern):
+    for path in root.rglob("*"):
         if _has_symlink_component(root, path):
             continue
         resolved = path.resolve()
         _ensure_inside_root(root, resolved)
         if resolved == root or not resolved.is_file():
+            continue
+        if not matches_list_pattern(resolved.relative_to(root).as_posix(), pattern):
             continue
         total_count += 1
         if limit is None or len(paths) < limit:

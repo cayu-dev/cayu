@@ -1,20 +1,34 @@
 from __future__ import annotations
 
-import fnmatch
 import posixpath
-from pathlib import PurePosixPath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import DEFAULT_MICROSANDBOX_CWD, ExecCommand, MicrosandboxRunner
-from cayu.workspaces.base import Workspace, WorkspaceListResult, WorkspaceReadResult
+from cayu.runners import DEFAULT_MICROSANDBOX_CWD, MicrosandboxRunner
+from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
+from cayu.workspaces.base import (
+    Workspace,
+    WorkspaceListResult,
+    WorkspaceReadResult,
+    matches_list_pattern,
+    validate_list_pattern,
+)
 
 DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
 DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT = 500
 
 
 class MicrosandboxWorkspace(Workspace):
-    """Workspace implementation backed by Microsandbox's native filesystem API."""
+    """Workspace backed by a Microsandbox sandbox.
+
+    ``read_bytes``/``write_bytes``/``delete`` run through a guest-side guard
+    program (see :mod:`cayu.workspaces._guest_guard`) that resolves and opens
+    every path component atomically with ``O_NOFOLLOW`` inside the sandbox, so
+    a co-resident guest process cannot race a host-side ``realpath`` check
+    (TOCTOU). Those operations require ``python3`` inside the guest. ``list``
+    uses Microsandbox's native filesystem API with best-effort ``realpath``
+    containment; any subsequent read is re-checked by the guard.
+    """
 
     def __init__(
         self,
@@ -45,17 +59,20 @@ class MicrosandboxWorkspace(Workspace):
         *,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
-        guest_path = self.resolve(path)
-        checked_path = await self._require_contained_real_path(guest_path)
+        rel_path = self._contained_rel_path(path)
         limit = (
             self.default_read_limit_bytes
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        fs = self._filesystem()
-        metadata = await _stat_file(fs, checked_path, original_path=path)
-        content = await _read_limited(fs, checked_path, limit)
-        total_bytes = _metadata_size(metadata)
+        content, total_bytes = await guard_read(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            limit=limit,
+            original_path=path,
+            backend="Microsandbox",
+        )
         return WorkspaceReadResult(
             content=content,
             total_bytes=max(total_bytes, len(content)),
@@ -63,53 +80,27 @@ class MicrosandboxWorkspace(Workspace):
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
-        guest_path = self.resolve(path)
+        rel_path = self._contained_rel_path(path)
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
-        fs = self._filesystem()
-        await _mkdir_parents(fs, posixpath.dirname(guest_path), stop_at=self.root)
-        parent_path = posixpath.dirname(guest_path)
-        parent_real_path = await self._require_contained_real_path(parent_path)
-        if parent_real_path != parent_path:
-            raise ValueError("Workspace path escapes the workspace root.")
-        existing_path = await self._optional_contained_real_path(guest_path)
-        if existing_path is not None and existing_path != guest_path:
-            raise ValueError("Workspace path escapes the workspace root.")
-        await fs.write(guest_path, content)
+        await guard_write(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            content=content,
+            original_path=path,
+            backend="Microsandbox",
+        )
 
     async def delete(self, path: str) -> None:
-        guest_path = self.resolve(path)
-        parent_path = posixpath.dirname(guest_path)
-        try:
-            parent_real_path = await self._require_contained_real_path(parent_path)
-        except FileNotFoundError:
-            return
-        if parent_real_path != parent_path:
-            raise ValueError("Workspace path escapes the workspace root.")
-        existing_path = await self._optional_contained_real_path(guest_path)
-        if existing_path is None:
-            return
-        if existing_path != guest_path:
-            raise ValueError("Workspace path escapes the workspace root.")
-        try:
-            metadata = await self._filesystem().stat(existing_path)
-        except Exception as exc:
-            if _is_path_not_found_error(exc):
-                return
-            raise RuntimeError(
-                f"Failed to stat Microsandbox workspace file: {path}: {exc}"
-            ) from exc
-        kind = getattr(metadata, "kind", None)
-        if kind not in {"file", "regular"}:
-            raise IsADirectoryError(f"Workspace path is not a file: {path}")
-        result = await self.runner.exec(
-            ExecCommand.process("rm", "-f", "--", existing_path),
+        rel_path = self._contained_rel_path(path)
+        await guard_delete(
+            self.runner,
+            root=self.root,
+            rel_path=rel_path,
+            original_path=path,
+            backend="Microsandbox",
         )
-        if result.exit_code != 0:
-            raise RuntimeError(
-                "Failed to delete Microsandbox workspace file: "
-                f"{path}: {result.stderr.strip() or result.stdout.strip()}"
-            )
 
     async def list(
         self,
@@ -117,7 +108,7 @@ class MicrosandboxWorkspace(Workspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
-        pattern = _validate_list_pattern(pattern)
+        pattern = validate_list_pattern(pattern)
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")
         )
@@ -126,7 +117,7 @@ class MicrosandboxWorkspace(Workspace):
         paths: list[str] = []
         total_count = 0
         async for rel_path in _iter_files(self, fs, self.root):
-            if _matches_pattern(rel_path, pattern):
+            if matches_list_pattern(rel_path, pattern):
                 total_count += 1
                 if len(paths) < effective_limit:
                     paths.append(rel_path)
@@ -146,6 +137,9 @@ class MicrosandboxWorkspace(Workspace):
     def _filesystem(self) -> Any:
         return self.runner.filesystem()
 
+    def _contained_rel_path(self, path: str) -> str:
+        return posixpath.relpath(self.resolve(path), self.root)
+
     async def _require_contained_real_path(self, guest_path: str) -> str:
         try:
             real_path = await self.runner.real_path(guest_path)
@@ -157,84 +151,6 @@ class MicrosandboxWorkspace(Workspace):
             ) from exc
         _ensure_real_path_inside_root(real_path, self.root)
         return real_path
-
-    async def _optional_contained_real_path(self, guest_path: str) -> str | None:
-        try:
-            real_path = await self.runner.real_path(guest_path)
-        except Exception as exc:
-            if _is_path_not_found_error(exc):
-                return None
-            raise RuntimeError(
-                f"Failed to resolve Microsandbox workspace path: {guest_path}: {exc}"
-            ) from exc
-        _ensure_real_path_inside_root(real_path, self.root)
-        return real_path
-
-
-async def _stat_file(fs: Any, guest_path: str, *, original_path: str) -> Any:
-    try:
-        metadata = await fs.stat(guest_path)
-    except Exception as exc:
-        if _is_path_not_found_error(exc):
-            raise FileNotFoundError(f"Workspace file not found: {original_path}") from exc
-        raise RuntimeError(
-            f"Failed to stat Microsandbox workspace file: {original_path}: {exc}"
-        ) from exc
-    kind = getattr(metadata, "kind", None)
-    if kind not in {"file", "regular"}:
-        raise FileNotFoundError(f"Workspace file not found: {original_path}")
-    return metadata
-
-
-async def _read_limited(fs: Any, guest_path: str, limit: int) -> bytes:
-    read_stream = getattr(fs, "read_stream", None)
-    if read_stream is not None:
-        chunks = bytearray()
-        stream = await read_stream(guest_path)
-        async for chunk in stream:
-            if type(chunk) is not bytes:
-                raise TypeError("Microsandbox filesystem read_stream yielded non-bytes data.")
-            remaining = limit - len(chunks)
-            if remaining <= 0:
-                break
-            chunks.extend(chunk[:remaining])
-            if len(chunk) > remaining:
-                break
-        return bytes(chunks)
-    content = await fs.read(guest_path)
-    if type(content) is not bytes:
-        raise TypeError("Microsandbox filesystem read returned non-bytes data.")
-    return content[:limit]
-
-
-async def _mkdir_parents(fs: Any, guest_path: str, *, stop_at: str) -> None:
-    if guest_path in {"", "/", stop_at}:
-        return
-    if not _is_same_or_child(guest_path, stop_at):
-        raise ValueError("Workspace path escapes the workspace root.")
-    current = stop_at
-    rel_path = posixpath.relpath(guest_path, stop_at)
-    for part in rel_path.split("/"):
-        if not part or part == ".":
-            continue
-        current = posixpath.join(current, part)
-        try:
-            await fs.mkdir(current)
-        except Exception as exc:
-            if await _is_existing_directory(fs, current):
-                continue
-            raise RuntimeError(
-                f"Failed to create Microsandbox workspace directory: {current}: {exc}"
-            ) from exc
-
-
-async def _is_existing_directory(fs: Any, guest_path: str) -> bool:
-    try:
-        metadata = await fs.stat(guest_path)
-    except Exception:
-        return False
-    kind = getattr(metadata, "kind", None)
-    return kind in {"dir", "directory"}
 
 
 async def _iter_files(workspace: MicrosandboxWorkspace, fs: Any, root: str):
@@ -273,15 +189,6 @@ def _entry_guest_path(current_dir: str, entry_path: Any) -> str | None:
     return posixpath.normpath(posixpath.join(current_dir, entry_path))
 
 
-def _metadata_size(metadata: Any) -> int:
-    size = getattr(metadata, "size", None)
-    if type(size) is not int:
-        raise TypeError("Microsandbox filesystem metadata missing integer size.")
-    if size < 0:
-        raise ValueError("Microsandbox filesystem metadata size must be non-negative.")
-    return size
-
-
 def _validate_guest_root(path: str) -> str:
     root = require_clean_nonblank(path, "root")
     if not posixpath.isabs(root):
@@ -299,16 +206,6 @@ def _validate_relative_path(path: str) -> str:
     if normalized == ".." or normalized.startswith("../"):
         raise ValueError("Workspace path escapes the workspace root.")
     return normalized
-
-
-def _validate_list_pattern(pattern: str) -> str:
-    value = require_nonblank(pattern, "pattern")
-    if posixpath.isabs(value):
-        raise ValueError("Workspace list pattern must stay inside the workspace.")
-    parts = tuple(part for part in value.split("/") if part)
-    if ".." in parts:
-        raise ValueError("Workspace list pattern must stay inside the workspace.")
-    return value
 
 
 def _validate_required_limit(value: int, field_name: str) -> int:
@@ -342,11 +239,3 @@ def _is_path_not_found_error(exc: Exception) -> bool:
     # microsandbox 0.5.x SFTP real_path raises a generic error whose message
     # carries the ENOENT text rather than a typed not-found error.
     return "no such file" in str(exc).lower()
-
-
-def _matches_pattern(path: str, pattern: str) -> bool:
-    return (
-        PurePosixPath(path).match(pattern)
-        or fnmatch.fnmatchcase(path, pattern)
-        or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
-    )

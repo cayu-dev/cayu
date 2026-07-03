@@ -5,13 +5,14 @@ from typing import Any
 
 import pytest
 
-from cayu.runners.base import ExecCommand, ExecResult, RunnerCancelledError
+from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.docker import (
     DEFAULT_DOCKER_CWD,
     DOCKER_COMMAND_STATE_DIR,
     DockerRunner,
     _build_docker_exec_argv,
     _require_docker,
+    _validate_mount_path,
 )
 from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRef, StaticVault
 
@@ -221,7 +222,7 @@ def test_close_stop_failure_keeps_runner_open(monkeypatch):
     assert r._closed is False
 
 
-def test_create_bind_mount_mode(monkeypatch):
+def test_create_bind_mount_mode(monkeypatch, tmp_path):
     issued = []
 
     async def fake_run_subprocess(command, **kwargs):
@@ -230,12 +231,13 @@ def test_create_bind_mount_mode(monkeypatch):
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
 
+    host_ws = str(tmp_path)
     runner = asyncio.run(
         DockerRunner.create(
             "a1",
             docker_path="/usr/bin/docker",
             image="debian:stable-slim",
-            mount_path="/host/ws",
+            mount_path=host_ws,
             setup_commands=("apt-get install -y whois",),
         )
     )
@@ -249,15 +251,15 @@ def test_create_bind_mount_mode(monkeypatch):
         "--name",
         "a1",
         "--mount",
-        "type=bind,source=/host/ws,target=/host/ws",
+        f"type=bind,source={host_ws},target={host_ws}",
         "debian:stable-slim",
         "sleep",
         "infinity",
     ] in issued
     # bind mode: default_cwd defaults to the mount, and NO mkdir exec is issued
-    assert runner.default_cwd == "/host/ws"
+    assert runner.default_cwd == host_ws
     assert not any(
-        a[:4] == ["/usr/bin/docker", "exec", "-u", "root"] and "mkdir -p /host/ws" in a
+        a[:4] == ["/usr/bin/docker", "exec", "-u", "root"] and f"mkdir -p {host_ws}" in a
         for a in issued
     )
     # setup command runs as root
@@ -272,6 +274,49 @@ def test_create_bind_mount_mode(monkeypatch):
         "apt-get install -y whois",
     ] in issued
     assert runner.close_action == "remove"
+
+
+def test_validate_mount_path_normalizes_existing_dir(tmp_path):
+    messy = f"{tmp_path}/sub/.."
+    assert _validate_mount_path(messy) == str(tmp_path)
+
+
+def test_validate_mount_path_rejects_relative():
+    with pytest.raises(ValueError, match="absolute host path"):
+        _validate_mount_path("relative/ws")
+
+
+def test_validate_mount_path_rejects_comma(tmp_path):
+    with pytest.raises(ValueError, match="must not contain commas"):
+        _validate_mount_path(f"{tmp_path},readonly")
+
+
+def test_validate_mount_path_rejects_missing(tmp_path):
+    with pytest.raises(ValueError, match="existing directory"):
+        _validate_mount_path(str(tmp_path / "does-not-exist"))
+
+
+def test_validate_mount_path_rejects_file(tmp_path):
+    target = tmp_path / "file.txt"
+    target.write_text("x")
+    with pytest.raises(ValueError, match="existing directory"):
+        _validate_mount_path(str(target))
+
+
+def test_create_rejects_bad_mount_path(monkeypatch, tmp_path):
+    async def fake_run_subprocess(command, **kwargs):
+        raise AssertionError("docker should not be invoked when mount_path is invalid")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(ValueError, match="must not contain commas"):
+        asyncio.run(
+            DockerRunner.create(
+                "a1",
+                docker_path="/usr/bin/docker",
+                mount_path=f"{tmp_path},z",
+            )
+        )
 
 
 def test_create_isolated_mode_with_runtime(monkeypatch):
@@ -415,7 +460,7 @@ def test_exec_timeout_can_remove_container_when_configured(monkeypatch):
     ]
 
 
-def test_exec_cancellation_raises_runner_cancelled_error(monkeypatch):
+def test_exec_cancellation_reraises_plain_cancelled_error_with_artifacts(monkeypatch):
     issued = []
 
     async def fake_run_subprocess(command, **kwargs):
@@ -428,12 +473,14 @@ def test_exec_cancellation_raises_runner_cancelled_error(monkeypatch):
     r = DockerRunner("a1", docker_path="/usr/bin/docker")
 
     async def run():
-        with pytest.raises(RunnerCancelledError) as exc_info:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await r.exec(ExecCommand.process("sleep", "999"))
         return exc_info.value
 
     error = asyncio.run(run())
 
+    # The original cancellation propagates unchanged; diagnostics ride out-of-band.
+    assert type(error) is asyncio.CancelledError
     assert r._exec_closed is False
     assert len(issued) == 2
     assert "setsid" in issued[0][-1]
@@ -476,6 +523,89 @@ def test_exec_marks_exec_closed_when_command_cleanup_fails(monkeypatch):
             "error": "kill returned false",
         }
     ]
+
+
+def test_command_kill_retries_before_reporting_failure(monkeypatch):
+    kill_attempts = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        if "kill -TERM" in command.argv[-1]:
+            kill_attempts.append(command.argv)
+            # First attempt flakes (pid file not visible yet), second succeeds.
+            if len(kill_attempts) == 1:
+                return ExecResult(exit_code=1)
+            return ExecResult()
+        return ExecResult(timed_out=True, exit_code=-9)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    r = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
+
+    assert result.timed_out is True
+    assert len(kill_attempts) == 2
+    assert r._exec_closed is False
+    assert result.artifacts[0]["status"] == "completed"
+
+
+def test_command_kill_verifies_missing_pid_file_as_stopped(monkeypatch):
+    issued = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        issued.append(command.argv)
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult(exit_code=1)
+        if command.argv[-1].startswith("test -f"):
+            # pid file absent: the supervised command is not running.
+            return ExecResult(exit_code=1)
+        return ExecResult(timed_out=True, exit_code=-9)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    r = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
+
+    assert result.timed_out is True
+    assert r._exec_closed is False
+    assert r._exec_closed_reason is None
+    assert result.artifacts[0]["status"] == "completed"
+
+
+def test_reopen_exec_recovers_latched_runner(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult(exit_code=1)
+        if command.argv[-1].startswith("test -f"):
+            # pid file still present: the command state stays unknown.
+            return ExecResult(exit_code=0)
+        return ExecResult(timed_out=True, exit_code=-9)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    r = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    result = asyncio.run(r.exec(ExecCommand.process("sleep", "999"), timeout_s=1))
+    assert result.timed_out is True
+    assert r._exec_closed is True
+
+    with pytest.raises(RuntimeError, match="DockerRunner is closed: docker command cleanup"):
+        asyncio.run(r.exec(ExecCommand.process("true")))
+
+    r.reopen_exec()
+
+    after = asyncio.run(r.exec(ExecCommand.process("true"), timeout_s=None))
+    assert after.timed_out is True  # fake still reports timeouts; exec path is open again
+
+
+def test_reopen_exec_rejects_closed_runner(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    r = DockerRunner("a1", docker_path="/usr/bin/docker", close_action="none")
+    asyncio.run(r.close())
+
+    with pytest.raises(RuntimeError, match="DockerRunner is closed."):
+        r.reopen_exec()
 
 
 def test_exec_validates_env_before_building_docker_env(monkeypatch):

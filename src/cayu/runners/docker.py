@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import posixpath
 import shlex
 import shutil
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal
+from typing import Literal
 from uuid import uuid4
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+    RUNNER_COMMAND_KILL_ATTEMPTS,
     RunnerCleanupPolicy,
     cleanup_runner_command_with_diagnostic,
     validate_cancel_timeout,
@@ -30,7 +32,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
-    RunnerCancelledError,
+    attach_cancellation_artifacts,
 )
 from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
 
@@ -70,10 +72,18 @@ def _validate_runtime(runtime: str | None) -> str | None:
     return require_clean_nonblank(runtime, "runtime")
 
 
-def _is_same_or_child(path: str, root: str) -> bool:
-    if root == "/":
-        return posixpath.isabs(path)
-    return path == root or path.startswith(f"{root.rstrip('/')}/")
+def _validate_mount_path(mount_path: str) -> str:
+    value = require_clean_nonblank(mount_path, "mount_path")
+    if not os.path.isabs(value):
+        raise ValueError("DockerRunner mount_path must be an absolute host path.")
+    if "," in value:
+        # docker's ``--mount`` uses commas to separate key=value pairs, so a
+        # comma in the path would silently corrupt the bind specification.
+        raise ValueError("DockerRunner mount_path must not contain commas.")
+    value = os.path.normpath(value)
+    if not os.path.isdir(value):
+        raise ValueError(f"DockerRunner mount_path must be an existing directory: {value!r}")
+    return value
 
 
 def _build_docker_exec_argv(
@@ -183,11 +193,27 @@ class _DockerCommandHandle:
         self.pid_file = pid_file
 
     async def kill(self) -> bool:
-        result = await _run_docker(
+        for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
+            result = await _run_docker(
+                self.docker_path,
+                ["exec", self.name, "sh", "-c", _kill_supervised_command_script(self.pid_file)],
+            )
+            if result.exit_code == 0:
+                return True
+        return await self._verify_command_not_running()
+
+    async def _verify_command_not_running(self) -> bool:
+        # The supervised wrapper writes the pid file before running the command
+        # and removes it when the command exits, so `test -f` exiting 1 (file
+        # absent) after the kill attempts' wait windows means no tracked
+        # command is running — a flaky pid-file wait must not report a live
+        # command. Any other exit code (docker transport failure with the
+        # container still up, etc.) stays a failure.
+        probe = await _run_docker(
             self.docker_path,
-            ["exec", self.name, "sh", "-c", _kill_supervised_command_script(self.pid_file)],
+            ["exec", self.name, "sh", "-c", f"test -f {shlex.quote(self.pid_file)}"],
         )
-        return result.exit_code == 0
+        return probe.exit_code == 1
 
 
 class DockerRunner(Runner):
@@ -230,9 +256,6 @@ class DockerRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
-        self._closed = False
-        self._exec_closed = False
-        self._exec_closed_reason: str | None = None
 
     @classmethod
     async def create(
@@ -266,6 +289,8 @@ class DockerRunner(Runner):
         name = require_clean_nonblank(name, "name")
         image = require_clean_nonblank(image, "image")
         runtime = _validate_runtime(runtime)
+        if mount_path is not None:
+            mount_path = _validate_mount_path(mount_path)
         _validate_close_action(close_action)
         cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
@@ -341,11 +366,7 @@ class DockerRunner(Runner):
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("DockerRunner command must be an ExecCommand.")
-        if self._closed:
-            raise RuntimeError("DockerRunner is closed.")
-        if self._exec_closed:
-            reason = self._exec_closed_reason or "runner exec path is closed"
-            raise RuntimeError(f"DockerRunner is closed: {reason}")
+        self._ensure_exec_open()
         environment = copy_runner_env(env, inherit_env=False)
         resolved_secrets = (
             await resolve_secret_env(self.secret_env, self.secret_resolver)
@@ -391,8 +412,9 @@ class DockerRunner(Runner):
                     timeout_s=self.cancel_timeout_s,
                     policy=self.cancellation_cleanup,
                 )
-                self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
-                raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
+                self._apply_cleanup_result(cleanup)
+                attach_cancellation_artifacts(exc, [cleanup.artifact])
+                raise
         if result.timed_out:
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self,
@@ -401,7 +423,7 @@ class DockerRunner(Runner):
                 timeout_s=self.cancel_timeout_s,
                 policy=self.timeout_cleanup,
             )
-            self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
+            self._apply_cleanup_result(cleanup)
             result = result.model_copy(update={"artifacts": [*result.artifacts, cleanup.artifact]})
         return redact_exec_result(result, resolved_secrets)
 
@@ -438,33 +460,3 @@ class DockerRunner(Runner):
                 f"docker stop failed for container '{self.name}' "
                 f"(exit {result.exit_code}): {result.stderr[:300]}"
             )
-
-    def _apply_cleanup_result(self, artifact: dict[str, Any], *, close_runner: bool) -> None:
-        if close_runner:
-            self._exec_closed = True
-        if artifact.get("action") == "kill_sandbox" and artifact.get("status") == "completed":
-            self._closed = True
-            return
-        if artifact.get("action") == "kill_command" and artifact.get("status") != "completed":
-            self._exec_closed = True
-            self._exec_closed_reason = (
-                "docker command cleanup did not complete; command state is unknown"
-            )
-
-    def resolve_cwd(self, cwd: str | None = None) -> str:
-        if cwd is None:
-            return self.default_cwd
-        relative_cwd = require_nonblank(cwd, "cwd")
-        if posixpath.isabs(relative_cwd):
-            raise ValueError("Runner cwd must be relative.")
-        resolved = posixpath.normpath(posixpath.join(self.default_cwd, relative_cwd))
-        if not _is_same_or_child(resolved, self.default_cwd):
-            raise ValueError("Runner cwd escapes the runner root.")
-        return resolved
-
-    async def __aenter__(self) -> DockerRunner:
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-        await self.close()
-        return False

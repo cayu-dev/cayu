@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
+import tarfile
 
 import pytest
 
@@ -150,6 +152,19 @@ def test_runner_workspace_uses_default_remote_bounds(tmp_path) -> None:
     assert list_result.truncated is True
 
 
+def test_runner_workspace_list_limit_returns_sorted_prefix(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    asyncio.run(workspace.write_bytes("c.txt", b""))
+    asyncio.run(workspace.write_bytes("a.txt", b""))
+    asyncio.run(workspace.write_bytes("b.txt", b""))
+
+    result = asyncio.run(workspace.list("*.txt", limit=2))
+
+    assert result.paths == ("a.txt", "b.txt")
+    assert result.total_count == 3
+    assert result.truncated is True
+
+
 def test_runner_workspace_rejects_path_and_pattern_escape(tmp_path) -> None:
     workspace = _workspace(tmp_path)
 
@@ -192,6 +207,85 @@ def test_runner_workspace_reports_runner_failure_when_python_cannot_start(tmp_pa
 
     with pytest.raises(RuntimeError, match="Runner workspace operation failed"):
         asyncio.run(workspace.read_bytes("notes/result.txt"))
+
+
+def test_runner_workspace_bulk_tar_round_trip(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = _workspace(source_root)
+    target = _workspace(target_root)
+    asyncio.run(source.write_bytes("a.txt", b"alpha"))
+    asyncio.run(source.write_bytes("nested/b.txt", b"beta"))
+
+    data = asyncio.run(source.read_tar_bytes(("a.txt", "nested/b.txt")))
+
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+        names = sorted(member.name for member in archive.getmembers())
+    assert names == ["a.txt", "nested/b.txt"]
+
+    asyncio.run(target.write_tar_bytes(data))
+
+    assert (target_root / "a.txt").read_bytes() == b"alpha"
+    assert (target_root / "nested" / "b.txt").read_bytes() == b"beta"
+
+
+def test_runner_workspace_read_tar_rejects_oversized_file(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    asyncio.run(workspace.write_bytes("big.txt", b"abcdef"))
+
+    with pytest.raises(RuntimeError, match="exceeds max_file_bytes=3"):
+        asyncio.run(workspace.read_tar_bytes(("big.txt",), max_file_bytes=3))
+
+
+def test_runner_workspace_read_tar_validates_paths(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="at least one path"):
+        asyncio.run(workspace.read_tar_bytes(()))
+
+    with pytest.raises(TypeError, match="sequence of strings"):
+        asyncio.run(workspace.read_tar_bytes("a.txt"))
+
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.read_tar_bytes(("../outside.txt",)))
+
+
+def test_runner_workspace_write_tar_rejects_escaping_member(tmp_path) -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(name="../evil.txt")
+        info.size = 4
+        archive.addfile(info, io.BytesIO(b"evil"))
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="inside the workspace"):
+        asyncio.run(workspace.write_tar_bytes(buffer.getvalue()))
+
+    assert not (tmp_path.parent / "evil.txt").exists()
+
+
+def test_runner_workspace_write_tar_rejects_symlink_member(tmp_path) -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(name="link.txt")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        archive.addfile(info)
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="regular file"):
+        asyncio.run(workspace.write_tar_bytes(buffer.getvalue()))
+
+    assert not (tmp_path / "link.txt").exists()
+
+
+def test_runner_workspace_write_tar_rejects_non_bytes(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(TypeError, match="bytes"):
+        asyncio.run(workspace.write_tar_bytes("not-bytes"))
 
 
 def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:

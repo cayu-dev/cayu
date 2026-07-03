@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from guard_harness import make_local_guard_exec
 
 from cayu.runners import E2BRunner, ExecResult
 from cayu.workspaces import DEFAULT_E2B_WORKSPACE_LIST_DEPTH, E2BWorkspace
+from cayu.workspaces._guest_guard import GUEST_PYTHON
 
 
 class FakeFileType(Enum):
@@ -25,20 +29,6 @@ class FakeEntry:
     symlink_target: str | None = None
 
 
-class FakeStream:
-    def __init__(self, chunks: list[bytes]) -> None:
-        self.chunks = list(chunks)
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> bytes:
-        await asyncio.sleep(0)
-        if not self.chunks:
-            raise StopAsyncIteration
-        return self.chunks.pop(0)
-
-
 class FakeE2BFs:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
@@ -46,7 +36,6 @@ class FakeE2BFs:
         self.symlinks: dict[str, str] = {}
         self.fail_list_paths: set[str] = set()
         self.fail_info_paths: set[str] = set()
-        self.write_calls: list[tuple[str, bytes, dict[str, Any]]] = []
         self.list_calls: list[tuple[str, int | None, dict[str, Any]]] = []
 
     async def get_info(self, path: str, **kwargs: Any) -> FakeEntry:
@@ -64,17 +53,6 @@ class FakeE2BFs:
         if path in self.dirs:
             return FakeEntry(path=path, type=FakeFileType.DIR, size=0)
         raise FileNotFoundError(path)
-
-    async def read(self, path: str, *, format: str, **kwargs: Any) -> FakeStream:
-        assert format == "stream"
-        content = self.files[path]
-        return FakeStream([content[:2], content[2:]])
-
-    async def write(self, path: str, content: bytes, **kwargs: Any) -> None:
-        self.write_calls.append((path, content, dict(kwargs)))
-        parent = posix_parent(path)
-        self.dirs.add(parent)
-        self.files[path] = content
 
     async def list(
         self,
@@ -112,20 +90,19 @@ class FakeSandbox:
         self.files = fs
 
 
-def posix_parent(path: str) -> str:
-    parent = path.rsplit("/", 1)[0]
-    return parent or "/"
-
-
-def _workspace() -> tuple[E2BWorkspace, FakeE2BFs]:
+def _workspace(root: str | None = None) -> tuple[E2BWorkspace, FakeE2BFs]:
     fs = FakeE2BFs()
     runner = E2BRunner(FakeSandbox(fs), e2b_module=object())
+    kwargs: dict[str, Any] = {}
+    if root is not None:
+        kwargs["root"] = root
     return (
         E2BWorkspace(
             runner,
             workspace_id="e2b-workspace",
             user="sandbox-user",
             request_timeout_s=5,
+            **kwargs,
         ),
         fs,
     )
@@ -136,70 +113,98 @@ def _replace_runner_exec(workspace: E2BWorkspace, func: Any) -> None:
     runner.exec = func
 
 
-def test_e2b_workspace_reads_writes_and_lists_native_fs() -> None:
-    workspace, fs = _workspace()
+def _guard_workspace(tmp_path: Path) -> tuple[E2BWorkspace, Any]:
+    """Workspace rooted at tmp_path whose exec runs the real guard locally."""
+
+    workspace, _ = _workspace(root=str(tmp_path))
+    fake_exec = make_local_guard_exec()
+    _replace_runner_exec(workspace, fake_exec)
+    return workspace, fake_exec
+
+
+def test_e2b_workspace_reads_and_writes_through_guest_guard(tmp_path: Path) -> None:
+    workspace, fake_exec = _guard_workspace(tmp_path)
 
     asyncio.run(workspace.write_bytes("notes/a.txt", b"abcdef"))
-    asyncio.run(workspace.write_bytes("root.txt", b"root"))
-
     read_result = asyncio.run(workspace.read_bytes("notes/a.txt", max_bytes=3))
-    list_result = asyncio.run(workspace.list("**/*.txt", limit=10))
 
+    assert (tmp_path / "notes" / "a.txt").read_bytes() == b"abcdef"
     assert read_result.content == b"abc"
     assert read_result.total_bytes == 6
     assert read_result.truncated is True
-    assert list_result.paths == ("notes/a.txt", "root.txt")
+    assert all(command.argv[0] == GUEST_PYTHON for command in fake_exec.calls)
+
+
+def test_e2b_workspace_read_missing_file_raises_not_found(tmp_path: Path) -> None:
+    workspace, _ = _guard_workspace(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        asyncio.run(workspace.read_bytes("missing.txt"))
+
+
+def test_e2b_workspace_read_rejects_directory(tmp_path: Path) -> None:
+    workspace, _ = _guard_workspace(tmp_path)
+    (tmp_path / "notes").mkdir()
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        asyncio.run(workspace.read_bytes("notes"))
+
+
+def test_e2b_workspace_deletes_files_through_guest_guard(tmp_path: Path) -> None:
+    workspace, _ = _guard_workspace(tmp_path)
+    target = tmp_path / "notes" / "a.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"abcdef")
+
+    asyncio.run(workspace.delete("notes/a.txt"))
+    asyncio.run(workspace.delete("notes/a.txt"))  # missing file is a no-op
+
+    assert not target.exists()
+
+
+def test_e2b_workspace_uses_default_read_limit(tmp_path: Path) -> None:
+    workspace, _ = _guard_workspace(tmp_path)
+    workspace.default_read_limit_bytes = 4
+    (tmp_path / "a.txt").write_bytes(b"abcdef")
+
+    read_result = asyncio.run(workspace.read_bytes("a.txt"))
+
+    assert read_result.content == b"abcd"
+    assert read_result.total_bytes == 6
+    assert read_result.truncated is True
+
+
+def test_e2b_workspace_list_uses_native_fs_and_default_bounds() -> None:
+    workspace, fs = _workspace()
+    workspace.default_list_limit = 1
+    fs.files["/home/user/workspace/a.txt"] = b"abcdef"
+    fs.files["/home/user/workspace/b.txt"] = b""
+
+    list_result = asyncio.run(workspace.list("*.txt"))
+
+    assert len(list_result.paths) == 1
     assert list_result.total_count == 2
-    assert list_result.truncated is False
-    assert fs.write_calls[0] == (
-        "/home/user/workspace/notes/a.txt",
-        b"abcdef",
-        {"user": "sandbox-user", "request_timeout": 5.0},
-    )
-    assert fs.list_calls[0] == (
+    assert list_result.truncated is True
+    assert fs.list_calls[-1] == (
         "/home/user/workspace",
         DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
         {"user": "sandbox-user", "request_timeout": 5.0},
     )
 
 
-def test_e2b_workspace_deletes_files_through_runner_exec() -> None:
+def test_e2b_workspace_list_pattern_is_anchored() -> None:
     workspace, fs = _workspace()
-    fs.files["/home/user/workspace/notes/a.txt"] = b"abcdef"
-    calls: list[tuple[list[str], str | None]] = []
+    fs.files["/home/user/workspace/root.txt"] = b"root"
+    fs.files["/home/user/workspace/notes/a.txt"] = b"nested"
+    fs.dirs.add("/home/user/workspace/notes")
 
-    async def fake_exec(command, *, cwd=None, **kwargs):
-        calls.append((list(command.argv or []), cwd))
-        assert command.argv == ["rm", "-f", "--", "/home/user/workspace/notes/a.txt"]
-        assert cwd is None
-        fs.files.pop("/home/user/workspace/notes/a.txt", None)
-        return ExecResult(exit_code=0)
+    top_level = asyncio.run(workspace.list("*.txt"))
+    recursive = asyncio.run(workspace.list("**/*.txt"))
 
-    _replace_runner_exec(workspace, fake_exec)
-
-    asyncio.run(workspace.delete("notes/a.txt"))
-
-    assert calls == [(["rm", "-f", "--", "/home/user/workspace/notes/a.txt"], None)]
-    assert "/home/user/workspace/notes/a.txt" not in fs.files
-
-
-def test_e2b_workspace_uses_default_bounds() -> None:
-    workspace, _ = _workspace()
-    workspace.default_read_limit_bytes = 4
-    workspace.default_list_limit = 1
-
-    asyncio.run(workspace.write_bytes("a.txt", b"abcdef"))
-    asyncio.run(workspace.write_bytes("b.txt", b""))
-
-    read_result = asyncio.run(workspace.read_bytes("a.txt"))
-    list_result = asyncio.run(workspace.list("*.txt"))
-
-    assert read_result.content == b"abcd"
-    assert read_result.total_bytes == 6
-    assert read_result.truncated is True
-    assert len(list_result.paths) == 1
-    assert list_result.total_count == 2
-    assert list_result.truncated is True
+    assert top_level.paths == ("root.txt",)
+    assert top_level.total_count == 1
+    assert recursive.paths == ("notes/a.txt", "root.txt")
+    assert recursive.total_count == 2
 
 
 def test_e2b_workspace_rejects_path_and_pattern_escape() -> None:
@@ -218,70 +223,67 @@ def test_e2b_workspace_rejects_path_and_pattern_escape() -> None:
         E2BWorkspace(workspace.runner, root="workspace")
 
 
-def test_e2b_workspace_rejects_symlink_escape() -> None:
-    workspace, fs = _workspace()
-    fs.symlinks["/home/user/workspace/link"] = "/etc"
-    fs.files["/etc/passwd"] = b"secret"
+def test_e2b_workspace_rejects_symlink_component_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "passwd").write_bytes(b"secret")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+    workspace, _ = _guard_workspace(root)
 
     with pytest.raises(ValueError, match="escapes"):
         asyncio.run(workspace.read_bytes("link/passwd"))
 
-
-def test_e2b_workspace_rejects_writing_through_symlink_leaf() -> None:
-    workspace, fs = _workspace()
-    fs.symlinks["/home/user/workspace/out"] = "/etc/passwd"
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link/passwd", b"overwrite"))
 
     with pytest.raises(ValueError, match="escapes"):
-        asyncio.run(workspace.write_bytes("out", b"secret"))
+        asyncio.run(workspace.delete("link/passwd"))
 
-    assert "/etc/passwd" not in fs.files
+    assert (outside / "passwd").read_bytes() == b"secret"
 
 
-def test_e2b_workspace_rejects_writing_symlink_leaf_inside_workspace() -> None:
-    workspace, fs = _workspace()
-    fs.symlinks["/home/user/workspace/link"] = "/home/user/workspace/target.txt"
-    fs.files["/home/user/workspace/target.txt"] = b"keep"
+def test_e2b_workspace_rejects_symlink_leaf(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"secret")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "out").symlink_to(outside)
+    workspace, _ = _guard_workspace(root)
 
     with pytest.raises(ValueError, match="escapes"):
-        asyncio.run(workspace.write_bytes("link", b"overwrite"))
+        asyncio.run(workspace.read_bytes("out"))
 
-    assert fs.files["/home/user/workspace/target.txt"] == b"keep"
-
-
-def test_e2b_workspace_rejects_deleting_through_symlink_leaf() -> None:
-    workspace, fs = _workspace()
-    fs.symlinks["/home/user/workspace/out"] = "/etc/passwd"
-    called = False
-
-    async def fake_exec(command, **kwargs):
-        nonlocal called
-        called = True
-        return ExecResult(exit_code=0)
-
-    _replace_runner_exec(workspace, fake_exec)
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("out", b"overwrite"))
 
     with pytest.raises(ValueError, match="escapes"):
         asyncio.run(workspace.delete("out"))
 
-    assert called is False
+    assert outside.read_bytes() == b"secret"
+    assert (root / "out").is_symlink()
 
 
-def test_e2b_workspace_rejects_deleting_directory_before_exec() -> None:
-    workspace, fs = _workspace()
-    fs.dirs.add("/home/user/workspace/notes")
-    called = False
+def test_e2b_workspace_rejects_symlink_leaf_inside_workspace(tmp_path: Path) -> None:
+    (tmp_path / "target.txt").write_bytes(b"keep")
+    os.symlink(tmp_path / "target.txt", tmp_path / "link")
+    workspace, _ = _guard_workspace(tmp_path)
 
-    async def fake_exec(command, **kwargs):
-        nonlocal called
-        called = True
-        return ExecResult(exit_code=0)
+    with pytest.raises(ValueError, match="escapes"):
+        asyncio.run(workspace.write_bytes("link", b"overwrite"))
 
-    _replace_runner_exec(workspace, fake_exec)
+    assert (tmp_path / "target.txt").read_bytes() == b"keep"
+
+
+def test_e2b_workspace_rejects_deleting_directory(tmp_path: Path) -> None:
+    (tmp_path / "notes").mkdir()
+    workspace, _ = _guard_workspace(tmp_path)
 
     with pytest.raises(IsADirectoryError, match="not a file"):
         asyncio.run(workspace.delete("notes"))
 
-    assert called is False
+    assert (tmp_path / "notes").is_dir()
 
 
 def test_e2b_workspace_skips_symlinks_when_listing() -> None:
@@ -301,9 +303,34 @@ def test_e2b_workspace_surfaces_operational_failures() -> None:
     with pytest.raises(RuntimeError, match="Failed to list"):
         asyncio.run(workspace.list("**/*"))
 
-    fs.fail_info_paths.add("/home/user/workspace/a.txt")
-    with pytest.raises(RuntimeError, match="Failed to inspect"):
+    async def failing_exec(command: Any, **kwargs: Any) -> ExecResult:
+        return ExecResult(exit_code=1, stderr="disk exploded")
+
+    _replace_runner_exec(workspace, failing_exec)
+    with pytest.raises(RuntimeError, match="Failed to write.*disk exploded"):
         asyncio.run(workspace.write_bytes("a.txt", b"no"))
+
+
+def test_e2b_workspace_surfaces_missing_guest_python() -> None:
+    workspace, _ = _workspace()
+
+    async def missing_python_exec(command: Any, **kwargs: Any) -> ExecResult:
+        return ExecResult(exit_code=127, stderr="python3: command not found")
+
+    _replace_runner_exec(workspace, missing_python_exec)
+    with pytest.raises(RuntimeError, match="python3 is required inside the guest"):
+        asyncio.run(workspace.read_bytes("a.txt"))
+
+
+def test_e2b_workspace_rejects_truncated_guard_output() -> None:
+    workspace, _ = _workspace()
+
+    async def truncated_exec(command: Any, **kwargs: Any) -> ExecResult:
+        return ExecResult(exit_code=0, stdout="ok 6\nabc", stdout_truncated=True)
+
+    _replace_runner_exec(workspace, truncated_exec)
+    with pytest.raises(RuntimeError, match="truncated"):
+        asyncio.run(workspace.read_bytes("a.txt"))
 
 
 def test_e2b_workspace_rejects_closed_runner() -> None:
@@ -312,3 +339,6 @@ def test_e2b_workspace_rejects_closed_runner() -> None:
 
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(workspace.list("**/*"))
+
+    with pytest.raises(RuntimeError, match="closed"):
+        asyncio.run(workspace.read_bytes("a.txt"))
