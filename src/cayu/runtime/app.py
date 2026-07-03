@@ -33,6 +33,7 @@ from cayu.artifacts import (
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -406,11 +407,11 @@ class _SessionUsageTracker:
     Run-limit and request-budget checks run at every phase boundary (before
     the model step, after the model step, before a tool round, and before each
     tool call). Instead of reloading and re-parsing the session's full event
-    log on every check, the tracker loads one ordered tail after the last
-    sequence it has seen, filters usage-bearing event types in memory, and
-    folds them into an in-memory list. Advancing the watermark from a single
-    ordered read preserves sequence semantics even if other code appends events
-    between checks.
+    log on every check, the tracker tail-queries only the usage-bearing event
+    types (``model.completed`` for token usage and cost, ``tool.call.started``
+    for the tool-call counter) appended after the last sequence it has seen
+    and folds them into an in-memory list. Events are append-only with
+    monotonically increasing sequences, so the tail can never miss an update.
     """
 
     _EVENT_TYPES = (EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED)
@@ -422,18 +423,22 @@ class _SessionUsageTracker:
         self._events: list[Event] = []
 
     async def usage_events(self) -> list[Event]:
-        records = await self._app._query_all_event_records(
-            EventQuery(
-                session_id=self._session_id,
-                after_sequence=self._after_sequence,
+        new_records: list[EventRecord] = []
+        for event_type in self._EVENT_TYPES:
+            new_records.extend(
+                await self._app._query_all_event_records(
+                    EventQuery(
+                        session_id=self._session_id,
+                        event_type=event_type,
+                        after_sequence=self._after_sequence,
+                    )
+                )
             )
-        )
-        if records:
-            self._events.extend(
-                record.event for record in records if record.event.type in self._EVENT_TYPES
-            )
-            self._after_sequence = records[-1].sequence
-        return list(self._events)
+        if new_records:
+            new_records.sort(key=lambda record: record.sequence)
+            self._events.extend(record.event for record in new_records)
+            self._after_sequence = new_records[-1].sequence
+        return self._events
 
 
 class _StreamInterruptPoll:
@@ -1333,7 +1338,12 @@ class CayuApp:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
         registered_agent = self._get_registered_agent(request.agent_name)
-        registered_provider = self._get_registered_provider()
+        # Provider resolution for new sessions: per-run override, then the
+        # agent's pinned provider, then the app default. Resume/fork keep
+        # honoring the provider recorded on the session.
+        registered_provider = self._get_registered_provider(
+            request.provider_name or registered_agent.spec.provider_name
+        )
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
@@ -1698,12 +1708,6 @@ class CayuApp:
             yield first_terminal_event
             async for event in terminal_event_stream:
                 yield event
-        except GeneratorExit:
-            if terminal_event_stream is not None:
-                with contextlib.suppress(Exception):
-                    async for _ in terminal_event_stream:
-                        pass
-            raise
         except Exception:
             if terminal_event_stream is not None:
                 with contextlib.suppress(Exception):
@@ -2364,20 +2368,17 @@ class CayuApp:
             to_status=SessionStatus.RUNNING,
         )
 
-        approval_stream = self._continue_tool_approval_resolution(
-            request=request,
-            session=session,
-            pending_approval=pending_approval,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-        )
         try:
-            async for event in approval_stream:
+            async for event in self._continue_tool_approval_resolution(
+                request=request,
+                session=session,
+                pending_approval=pending_approval,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+            ):
                 yield event
         except GeneratorExit:
-            with contextlib.suppress(Exception):
-                await _close_async_iterator(approval_stream)
             await self._finalize_abandoned_session_by_id(session.id)
             raise
 
@@ -2395,7 +2396,6 @@ class CayuApp:
         environment_name = _environment_name(registered_environment)
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        run_stream: AsyncIterator[Event] | None = None
         try:
             transcript = await self.session_store.load_transcript(session.id)
             approval_events = await self.session_store.load_events(session.id)
@@ -2662,7 +2662,7 @@ class CayuApp:
                 )
             )
 
-            run_stream = self._run_session(
+            async for event in self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -2690,13 +2690,9 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
-            )
-            async for event in run_stream:
+            ):
                 yield event
         except GeneratorExit:
-            if run_stream is not None:
-                with contextlib.suppress(Exception):
-                    await _close_async_iterator(run_stream)
             await self._finalize_abandoned_session_by_id(session.id)
             raise
         except Exception as exc:
@@ -3051,8 +3047,6 @@ class CayuApp:
                 task_started=task_started,
                 task_finished=task_finished,
             )
-        active_budget_reservations: list[_BudgetStepReservation] = []
-        active_model_completed_event: Event | None = None
         try:
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
@@ -3310,13 +3304,11 @@ class CayuApp:
                     registered_agent=registered_agent,
                     registered_provider=registered_provider,
                     environment_name=environment_name,
+                    request_budget_limits=budget_limits,
                 )
-                active_budget_reservations = budget_reservations
-                active_model_completed_event = None
                 for event in reservation_events:
                     yield event
                 if reservation_failure is not None:
-                    active_budget_reservations = []
                     async for event in self._stop_session_for_budget_reservation_failed(
                         session=session,
                         registered_agent=registered_agent,
@@ -3354,7 +3346,6 @@ class CayuApp:
                         if event is not None:
                             if event.type == EventType.MODEL_COMPLETED:
                                 model_completed_event = event
-                                active_model_completed_event = event
                             yield event
                         if result is not None:
                             assistant_step_result = result
@@ -3400,8 +3391,6 @@ class CayuApp:
                         environment_name=environment_name,
                     ):
                         yield event
-                    active_budget_reservations = []
-                    active_model_completed_event = None
 
                 pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
@@ -3775,13 +3764,6 @@ class CayuApp:
                 return
             raise
         except GeneratorExit:
-            await self._settle_abandoned_budget_reservations(
-                active_budget_reservations,
-                model_completed_event=active_model_completed_event,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-            )
             # The consumer closed the event stream (client disconnect / abandoned
             # async generator) while the session was still live. Finalize instead of
             # stranding it in RUNNING; an async generator must not yield while
@@ -4642,6 +4624,7 @@ class CayuApp:
                             transcript_cursor_before_request
                             + (1 if assistant_message is not None else 0)
                         ),
+                        usage_dialect=registered_provider.provider.usage_dialect,
                     )
                     yield await self._emit(event), None
                     continue
@@ -4668,6 +4651,7 @@ class CayuApp:
                     step=step,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    usage_dialect=registered_provider.provider.usage_dialect,
                 )
                 emitted_event = await self._emit(event)
                 if stream_event.type == ModelStreamEventType.ERROR:
@@ -4751,9 +4735,8 @@ class CayuApp:
         if not has_run_limits(limits) and not budget_limits:
             return None, SessionUsageSummary(session_id=session.id), None, []
         # Usage and cost derive only from model.completed / tool.call.started
-        # events; the tracker reads one ordered event tail and filters those
-        # types in memory so its sequence watermark cannot skip interleaved
-        # usage-bearing events.
+        # events; the tracker tail-queries just those types instead of loading
+        # the full event log (which is dominated by per-delta stream events).
         if usage_tracker is not None:
             events = await usage_tracker.usage_events()
         else:
@@ -4982,13 +4965,20 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
     ) -> tuple[list[_BudgetStepReservation], BudgetReservationResult | None, list[Event]]:
+        # Reservations come from the app budget policy and from request-scoped
+        # limits on shared scopes (app/agent/causal); both route through the
+        # atomic ledger so concurrent sessions cannot jointly overshoot.
         limits = [
             limit
-            for limit in budget_limits_for_session(
-                policy=self.budget_policy,
-                agent_name=registered_agent.spec.name,
-                causal_budget_id=session.causal_budget_id,
+            for limit in (
+                *budget_limits_for_session(
+                    policy=self.budget_policy,
+                    agent_name=registered_agent.spec.name,
+                    causal_budget_id=session.causal_budget_id,
+                ),
+                *request_budget_limits,
             )
             if limit.reservation is not None
         ]
@@ -5097,43 +5087,6 @@ class CayuApp:
                     payload=budget_reconciliation_payload(reconciliation),
                 )
             )
-
-    async def _settle_abandoned_budget_reservations(
-        self,
-        reservations: list[_BudgetStepReservation],
-        *,
-        model_completed_event: Event | None,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        environment_name: str | None,
-    ) -> None:
-        if not reservations:
-            return
-        for reservation in reservations:
-            try:
-                if model_completed_event is not None:
-                    async for _ in self._reconcile_budget_reservations(
-                        [reservation],
-                        model_completed_event=model_completed_event,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                    ):
-                        pass
-                    continue
-                async for _ in self._release_budget_reservations(
-                    [reservation],
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    reason="event stream closed",
-                ):
-                    pass
-            except Exception:
-                # GeneratorExit cleanup is best-effort and must not replace the
-                # caller's close with a new exception. Keep trying later
-                # reservations even if an earlier one was already settled.
-                continue
 
     async def _stop_session_for_limit_reached(
         self,
@@ -6348,7 +6301,7 @@ class CayuApp:
                 },
                 to_status=SessionStatus.INTERRUPTED,
             )
-        except Exception:
+        except (KeyError, ValueError):
             # Already terminal (or gone): nothing to finalize.
             return
         with contextlib.suppress(Exception):
@@ -6393,10 +6346,9 @@ class CayuApp:
         try:
             registered_agent = self._get_registered_agent(session.agent_name)
         except Exception:
-            # Agent no longer registered: still finalize and persist the terminal
-            # event so later recovery/interrupt calls have a durable outcome.
-            with contextlib.suppress(Exception):
-                finalized = await self.session_store.transition_status(
+            # Agent no longer registered: still leave the live status rather than strand.
+            with contextlib.suppress(KeyError, ValueError):
+                await self.session_store.transition_status(
                     session.id,
                     from_statuses={
                         SessionStatus.PENDING,
@@ -6405,34 +6357,16 @@ class CayuApp:
                     },
                     to_status=SessionStatus.INTERRUPTED,
                 )
-                await self._emit(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=finalized.id,
-                        agent_name=finalized.agent_name,
-                        environment_name=finalized.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                            "reason": _ABANDONED_RUN_REASON,
-                            "abandoned": True,
-                        },
-                    )
-                )
             return
-        try:
-            registered_environment = self._get_registered_environment_for_session(
-                session.environment_name
-            )
-            environment_name = _environment_name(registered_environment)
-        except Exception:
-            registered_environment = None
-            environment_name = session.environment_name
+        registered_environment = self._get_registered_environment_for_session(
+            session.environment_name
+        )
         with contextlib.suppress(Exception):
             await self._finalize_abandoned_session_run(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                environment_name=environment_name,
+                environment_name=_environment_name(registered_environment),
             )
 
     async def _handle_session_interrupted(
@@ -7898,6 +7832,7 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
     return AgentSpec(
         name=spec.name,
         model=spec.model,
+        provider_name=spec.provider_name,
         system_prompt=spec.system_prompt,
         metadata=copy_json_value(spec.metadata, "metadata"),
         provider_options=copy_json_value(spec.provider_options, "provider_options"),
@@ -8001,6 +7936,7 @@ def _session_agent_spec(
     return AgentSpec(
         name=registered_agent.spec.name,
         model=session.model,
+        provider_name=session.provider_name,
         system_prompt=registered_agent.spec.system_prompt,
         metadata=copy_json_value(registered_agent.spec.metadata, "metadata"),
         provider_options=copy_json_value(
@@ -9113,9 +9049,13 @@ def _file_attachment_refs(messages: list[Message]) -> tuple[FileAttachment, ...]
     ordered_refs: list[FileAttachment] = []
     for message in messages:
         for part in message.content:
-            if type(part) is not ToolResultPart:
+            if type(part) is ToolResultPart:
+                payloads: list[dict[str, Any]] = part.artifacts
+            elif type(part) is FilePart:
+                payloads = [part.attachment]
+            else:
                 continue
-            for payload in part.artifacts:
+            for payload in payloads:
                 attachment = file_attachment_from_payload(payload)
                 if attachment is None:
                     continue
@@ -9548,6 +9488,7 @@ def _model_stream_event_to_runtime_event(
     classification: dict[str, str] | None = None,
     context_pressure_estimate: ContextPressureEstimate | None = None,
     transcript_cursor_after_completion: int | None = None,
+    usage_dialect: str | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -9594,6 +9535,7 @@ def _model_stream_event_to_runtime_event(
                 provider_name=provider_name,
                 model=_payload_model(payload, fallback=session.model),
                 raw_usage=payload.get("usage"),
+                usage_dialect=usage_dialect,
             )
         )
         if usage_metrics is not None:

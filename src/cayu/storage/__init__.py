@@ -68,6 +68,7 @@ __all__ = [
     "KnowledgeStatus",
     "KnowledgeStore",
     "KnowledgeVisibility",
+    "PostgresBudgetLedger",
     "PostgresEmbeddingBackfillResult",
     "PostgresEmbeddingKnowledgeStore",
     "PostgresEventWatcherStore",
@@ -86,6 +87,7 @@ def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so the base package import does not depend on psycopg.
     if name in {
+        "PostgresBudgetLedger",
         "PostgresEmbeddingBackfillResult",
         "PostgresEmbeddingKnowledgeStore",
         "PostgresEventWatcherStore",

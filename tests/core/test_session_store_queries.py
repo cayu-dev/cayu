@@ -1389,6 +1389,175 @@ def test_session_query_rejects_cursor_with_offset() -> None:
         SessionQuery(cursor="abc", offset=5)
 
 
+def test_decode_session_cursor_rejects_naive_datetimes() -> None:
+    from cayu.runtime.sessions import decode_session_cursor
+
+    # A UTC-aware cursor round-trips.
+    aware = base64.urlsafe_b64encode(b'["2026-01-02T03:04:05+00:00","sess_ok"]').decode("ascii")
+    value, session_id = decode_session_cursor(aware)
+    assert session_id == "sess_ok"
+    assert value.tzinfo is not None
+
+    # A hand-forged cursor with a naive sort value must be rejected up front so it
+    # never reaches the timezone-aware comparisons in the keyset walk.
+    naive = base64.urlsafe_b64encode(b'["2026-01-02T03:04:05","sess_naive"]').decode("ascii")
+    with pytest.raises(ValueError, match="Invalid session cursor."):
+        decode_session_cursor(naive)
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_delete_session_guards_in_flight_status(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_running",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_running", SessionStatus.RUNNING)
+
+        # A running session cannot be deleted; the status guard is evaluated
+        # atomically inside the delete so a concurrent transition cannot slip in.
+        with pytest.raises(ValueError, match="Cannot delete a session while it is"):
+            await store.delete_session("sess_running")
+        assert await store.load("sess_running") is not None
+
+        # Deleting a missing session stays an idempotent no-op.
+        await store.delete_session("sess_absent")
+
+        # Once interrupted, delete succeeds.
+        await store.update_status("sess_running", SessionStatus.INTERRUPTED)
+        await store.delete_session("sess_running")
+        assert await store.load("sess_running") is None
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_update_status_delegates_to_transition_machine(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_update_status",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        # update_status is the unconditional setter: every source status is allowed,
+        # including moving "backwards" from RUNNING to PENDING.
+        running = await store.update_status("sess_update_status", SessionStatus.RUNNING)
+        assert running.status == SessionStatus.RUNNING
+        back = await store.update_status("sess_update_status", SessionStatus.PENDING)
+        assert back.status == SessionStatus.PENDING
+
+        # A missing session still surfaces as KeyError through the transition path.
+        with pytest.raises(KeyError):
+            await store.update_status("sess_missing", SessionStatus.RUNNING)
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_in_memory_store_event_indexes_stay_consistent_across_delete() -> None:
+    # The InMemory store keeps per-session and per-type indexes so summaries and
+    # scoped/budget queries stop scanning the global event list. Deleting a session
+    # must evict its rows from every index so later scoped queries never resurrect them.
+    store = InMemorySessionStore()
+
+    async def run() -> None:
+        for name in ("sess_a", "sess_b"):
+            await store.create(
+                RunRequest(
+                    agent_name=name,
+                    session_id=name,
+                    causal_budget_id=f"job_{name}",
+                    messages=[Message.text("user", "hi")],
+                ),
+                identity=_identity(),
+            )
+        await store.append_events(
+            "sess_a",
+            [
+                Event(
+                    id="a_started",
+                    type=EventType.SESSION_STARTED,
+                    session_id="sess_a",
+                    agent_name="sess_a",
+                    timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+                ),
+                Event(
+                    id="a_model",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_a",
+                    agent_name="sess_a",
+                    timestamp=datetime(2026, 1, 1, 12, 1, tzinfo=UTC),
+                    payload={"finish_reason": "stop"},
+                ),
+            ],
+        )
+        await store.append_event(
+            "sess_b",
+            Event(
+                id="b_model",
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_b",
+                agent_name="sess_b",
+                timestamp=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
+                payload={"finish_reason": "stop"},
+            ),
+        )
+
+        # Per-session index feeds summarize_events and session_id/session_ids queries.
+        summary = await store.summarize_events("sess_a")
+        assert summary.total_events == 2
+        session_a = await store.query_events(EventQuery(session_id="sess_a"))
+        assert [record.event.id for record in session_a] == ["a_started", "a_model"]
+        merged = await store.query_events(EventQuery(session_ids=("sess_b", "sess_a"), limit=10))
+        assert [record.event.id for record in merged] == ["a_started", "a_model", "b_model"]
+
+        # Per-type index feeds the model-completed budget read path.
+        model_completed = await store.query_events(
+            EventQuery(event_type=EventType.MODEL_COMPLETED, limit=10)
+        )
+        assert [record.event.id for record in model_completed] == ["a_model", "b_model"]
+
+        # Internal indexes are populated for both sessions before delete.
+        assert set(store._session_event_records) == {"sess_a", "sess_b"}
+        assert set(store._type_event_records) == {"model.completed", "session.started"}
+
+        await store.delete_session("sess_a")
+
+        # Deleted session is evicted from both indexes; empty type buckets are dropped.
+        assert set(store._session_event_records) == {"sess_b"}
+        assert set(store._type_event_records) == {"model.completed"}
+        remaining_model = await store.query_events(
+            EventQuery(event_type=EventType.MODEL_COMPLETED, limit=10)
+        )
+        assert [record.event.id for record in remaining_model] == ["b_model"]
+        remaining_merged = await store.query_events(
+            EventQuery(session_ids=("sess_a", "sess_b"), limit=10)
+        )
+        assert [record.event.id for record in remaining_merged] == ["b_model"]
+        assert await store.query_events(EventQuery(session_id="sess_a")) == []
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
 def _make_store(store_factory: StoreFactory, tmp_path) -> SessionStore:
     if store_factory is SQLiteSessionStore:
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")

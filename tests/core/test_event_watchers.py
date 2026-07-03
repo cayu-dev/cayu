@@ -22,6 +22,7 @@ from cayu.runtime.sessions import EventRecord, SessionIdentity
 from cayu.storage.migrations import SchemaMode
 
 _POSTGRES_TABLES = (
+    "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
     "cayu_events",
     "cayu_session_labels",
@@ -495,3 +496,123 @@ def test_event_watcher_rejects_cursor_in_query() -> None:
             query=EventQuery(after_sequence=10),
             handler=lambda _context: None,
         )
+
+
+async def _dead_letter_first_event(app: CayuApp) -> tuple[Event, Event]:
+    session_store = app.session_store
+    first = await _append_event(session_store, payload={"number": 1})
+    second = await _append_event(session_store, payload={"number": 2})
+
+    async def handler(context: EventWatcherContext) -> None:
+        if context.record.event.id == first.id:
+            raise RuntimeError("permanent webhook failure")
+
+    watcher = EventWatcher(
+        name="budget-webhook",
+        query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+        handler=handler,
+        max_attempts=1,
+    )
+    await app.run_event_watchers([watcher], limit=10)
+    return first, second
+
+
+def test_inmemory_event_watcher_store_persists_and_resolves_dead_letters() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        store = InMemoryEventWatcherStore()
+        app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=store,
+            enable_logging=False,
+        )
+        first, _second = await _dead_letter_first_event(app)
+        unresolved = await store.list_dead_letters("budget-webhook")
+        resolved_record = await store.resolve_dead_letter(
+            "budget-webhook", unresolved[0].event_sequence
+        )
+        after_resolve = await store.list_dead_letters("budget-webhook")
+        including = await store.list_dead_letters("budget-webhook", include_resolved=True)
+        return first, unresolved, resolved_record, after_resolve, including
+
+    first, unresolved, resolved_record, after_resolve, including = asyncio.run(run())
+    assert [record.event_id for record in unresolved] == [first.id]
+    assert unresolved[0].watcher_name == "budget-webhook"
+    assert unresolved[0].attempts == 1
+    assert unresolved[0].error == "permanent webhook failure"
+    assert unresolved[0].resolved_at is None
+    assert resolved_record.resolved_at is not None
+    # A resolved record drops out of the default listing but is still retrievable.
+    assert after_resolve == []
+    assert [record.event_id for record in including] == [first.id]
+    assert including[0].resolved_at is not None
+
+
+def test_inmemory_event_watcher_store_resolve_missing_dead_letter_raises() -> None:
+    async def run():
+        store = InMemoryEventWatcherStore()
+        await store.resolve_dead_letter("budget-webhook", 7)
+
+    with pytest.raises(ValueError, match="No dead-letter record"):
+        asyncio.run(run())
+
+
+def test_sqlite_event_watcher_store_persists_and_resolves_dead_letters(tmp_path: Path) -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        db_path = tmp_path / "dead_letters.sqlite"
+        store = SQLiteEventWatcherStore(db_path)
+        app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=store,
+            enable_logging=False,
+        )
+        first, _second = await _dead_letter_first_event(app)
+        first_listing = await store.list_dead_letters("budget-webhook")
+        await store.close()
+
+        # Records survive a store reopen — they are durable, not in-process state.
+        reopened = SQLiteEventWatcherStore(db_path)
+        after_reopen = await reopened.list_dead_letters("budget-webhook")
+        resolved_record = await reopened.resolve_dead_letter(
+            "budget-webhook", after_reopen[0].event_sequence
+        )
+        # Resolving is idempotent — the second call keeps the first resolved_at.
+        resolved_again = await reopened.resolve_dead_letter(
+            "budget-webhook", after_reopen[0].event_sequence
+        )
+        default_after = await reopened.list_dead_letters("budget-webhook")
+        including = await reopened.list_dead_letters("budget-webhook", include_resolved=True)
+        with pytest.raises(ValueError, match="No dead-letter record"):
+            await reopened.resolve_dead_letter("budget-webhook", 999)
+        await reopened.close()
+        return (
+            first,
+            first_listing,
+            after_reopen,
+            resolved_record,
+            resolved_again,
+            default_after,
+            including,
+        )
+
+    (
+        first,
+        first_listing,
+        after_reopen,
+        resolved_record,
+        resolved_again,
+        default_after,
+        including,
+    ) = asyncio.run(run())
+    assert [record.event_id for record in first_listing] == [first.id]
+    assert [record.event_id for record in after_reopen] == [first.id]
+    assert after_reopen[0].attempts == 1
+    assert after_reopen[0].error == "permanent webhook failure"
+    assert after_reopen[0].resolved_at is None
+    assert resolved_record.resolved_at is not None
+    assert resolved_again.resolved_at == resolved_record.resolved_at
+    assert default_after == []
+    assert [record.event_id for record in including] == [first.id]

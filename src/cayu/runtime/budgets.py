@@ -801,10 +801,28 @@ def copy_budget_limits(
 def copy_request_budget_limits(
     limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
 ) -> tuple[BudgetLimit, ...]:
+    """Copy per-request budget limits, allowing reservations on shared scopes.
+
+    Request limits scoped ``app``/``agent``/``causal`` may configure a
+    reservation: those budgets are shared across sessions, so the runtime
+    routes them through the atomic budget ledger before each model step,
+    keeping concurrent sessions from jointly overshooting the limit.
+
+    ``session``/``run`` scoped limits must not reserve. They are accounted
+    from a single session's own event stream, and a session executes its
+    model steps sequentially, so there is no cross-session race to close.
+    Without a reservation the residual race for those scopes is only the
+    usage of the one model step that is in flight when the read-then-act
+    check passes.
+    """
     copied = copy_budget_limits(limits, field_name="budget_limits")
     for limit in copied:
-        if limit.reservation is not None:
-            raise ValueError("Request budget limits must not use reservations.")
+        if limit.reservation is not None and limit.scope in ("session", "run"):
+            raise ValueError(
+                "Request budget limits must not use reservations for "
+                f"{limit.scope!r} scope; reservations require a shared "
+                "budget scope (app, agent, or causal)."
+            )
     return copied
 
 

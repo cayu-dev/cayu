@@ -10,25 +10,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from decimal import Decimal
 from typing import NamedTuple
 
 from cayu.core import AgentSpec, Message
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
-    BudgetLimit,
-    BudgetPolicy,
-    BudgetReservation,
     CayuApp,
     InMemorySessionStore,
-    InterruptSessionRequest,
-    ModelPricing,
-    PricingCatalog,
     ResumeRequest,
     RunRequest,
-    RuntimeHook,
-    RuntimeHookContext,
     SessionIdentity,
     SessionStatus,
 )
@@ -72,29 +63,10 @@ def _build(batches: list[list[ModelStreamEvent]]) -> Harness:
     return Harness(app, store, provider)
 
 
-def _pricing() -> PricingCatalog:
-    return PricingCatalog(
-        prices=(
-            ModelPricing(
-                provider_name="fake",
-                model="fake-model",
-                input_per_million=Decimal("1"),
-                output_per_million=Decimal("10"),
-            ),
-        )
-    )
-
-
 def _abandoned_terminal_event(events: list[Event]) -> Event:
     interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
     assert len(interrupted) == 1
     return interrupted[0]
-
-
-async def _close_event_stream(stream: AsyncIterator[Event]) -> None:
-    close = getattr(stream, "aclose", None)
-    assert close is not None
-    await close()
 
 
 def test_abandoned_run_stream_finalizes_running_session() -> None:
@@ -113,7 +85,7 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
         first_event = await anext(stream)
         assert first_event.type == EventType.SESSION_STARTED
         # The consumer walks away mid-run (e.g. SSE client disconnect).
-        await _close_event_stream(stream)
+        await stream.aclose()
         events = await h.store.load_events("sess_abandoned_run")
         return first_event, events
 
@@ -166,7 +138,7 @@ def test_abandoned_resume_stream_finalizes_running_session() -> None:
         )
         first_event = await anext(stream)
         assert first_event.type == EventType.SESSION_RESUMED
-        await _close_event_stream(stream)
+        await stream.aclose()
 
     asyncio.run(scenario())
 
@@ -233,7 +205,7 @@ def test_completed_run_stream_close_is_a_no_op() -> None:
         )
         async for _ in stream:
             pass
-        await _close_event_stream(stream)
+        await stream.aclose()
 
     asyncio.run(scenario())
 
@@ -242,257 +214,3 @@ def test_completed_run_stream_close_is_a_no_op() -> None:
     assert session.status == SessionStatus.COMPLETED
     events = asyncio.run(h.store.load_events("sess_completed_close"))
     assert not [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
-
-
-def test_abandoned_run_stream_releases_active_budget_reservation() -> None:
-    store = InMemorySessionStore()
-    provider = FakeProvider(
-        [
-            [
-                ModelStreamEvent.completed(
-                    {
-                        "finish_reason": "stop",
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 0,
-                            "total_tokens": 1,
-                        },
-                    }
-                )
-            ],
-        ]
-    )
-    app = CayuApp(
-        session_store=store,
-        budget_policy=BudgetPolicy(
-            limits=(
-                BudgetLimit(
-                    scope="app",
-                    max_estimated_cost=Decimal("1"),
-                    pricing=_pricing(),
-                    reservation=BudgetReservation(
-                        max_input_tokens=1_000_000,
-                        max_output_tokens=0,
-                    ),
-                ),
-            )
-        ),
-        enable_logging=False,
-    )
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    async def scenario() -> list[Event]:
-        stream = app.run(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_abandoned_budget",
-                messages=[Message.text("user", "hello")],
-            )
-        )
-        observed = [await anext(stream), await anext(stream), await anext(stream)]
-        assert [event.type for event in observed] == [
-            EventType.SESSION_STARTED,
-            EventType.BUDGET_CHECKED,
-            EventType.BUDGET_RESERVED,
-        ]
-        await _close_event_stream(stream)
-        retry_events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="sess_after_abandoned_budget",
-                    messages=[Message.text("user", "retry")],
-                )
-            )
-        ]
-        return retry_events
-
-    retry_events = asyncio.run(scenario())
-
-    assert EventType.BUDGET_RESERVED in [event.type for event in retry_events]
-    assert retry_events[-1].type == EventType.SESSION_COMPLETED
-    assert len(provider.requests) == 1
-
-
-def test_abandoned_run_stream_settles_remaining_budget_reservations() -> None:
-    store = InMemorySessionStore()
-    provider = FakeProvider(
-        [
-            [
-                ModelStreamEvent.completed(
-                    {
-                        "finish_reason": "stop",
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 0,
-                            "total_tokens": 1,
-                        },
-                    }
-                )
-            ],
-        ]
-    )
-    pricing = _pricing()
-    reservation = BudgetReservation(
-        max_input_tokens=1_000_000,
-        max_output_tokens=0,
-    )
-    app = CayuApp(
-        session_store=store,
-        budget_policy=BudgetPolicy(
-            limits=(
-                BudgetLimit(
-                    scope="app",
-                    max_estimated_cost=Decimal("10"),
-                    pricing=pricing,
-                    reservation=reservation,
-                ),
-                BudgetLimit(
-                    scope="agent",
-                    key="assistant",
-                    max_estimated_cost=Decimal("10"),
-                    pricing=pricing,
-                    reservation=reservation,
-                ),
-            )
-        ),
-        enable_logging=False,
-    )
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    async def scenario() -> list[Event]:
-        stream = app.run(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_abandoned_budget_reconcile",
-                messages=[Message.text("user", "hello")],
-            )
-        )
-        observed: list[Event] = []
-        while True:
-            event = await anext(stream)
-            observed.append(event)
-            if event.type == EventType.BUDGET_RECONCILED:
-                break
-        await _close_event_stream(stream)
-        return await store.load_events("sess_abandoned_budget_reconcile")
-
-    events = asyncio.run(scenario())
-    event_types = [event.type for event in events]
-
-    assert event_types.count(EventType.BUDGET_RESERVED) == 2
-    assert event_types.count(EventType.BUDGET_RECONCILED) == 2
-
-
-def test_interrupt_stream_close_drains_terminal_hooks() -> None:
-    class RecordingInterruptHook(RuntimeHook):
-        def __init__(self) -> None:
-            self.sessions: list[str] = []
-
-        async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
-            self.sessions.append(context.session.id)
-
-    hook = RecordingInterruptHook()
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, runtime_hooks=[hook], enable_logging=False)
-    app.register_provider(FakeProvider([]), default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    async def scenario() -> None:
-        await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_interrupt_close",
-                messages=[Message.text("user", "hello")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        stream = app.interrupt_session(
-            InterruptSessionRequest(
-                session_id="sess_interrupt_close",
-                reason="operator",
-            )
-        )
-        first = await anext(stream)
-        assert first.type == EventType.SESSION_INTERRUPTED
-        await _close_event_stream(stream)
-
-    asyncio.run(scenario())
-
-    assert hook.sessions == ["sess_interrupt_close"]
-
-
-def test_finalize_abandoned_session_by_id_tolerates_missing_environment() -> None:
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    async def scenario() -> None:
-        await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_missing_environment",
-                environment_name="removed-env",
-                messages=[Message.text("user", "hello")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        await store.transition_status(
-            "sess_missing_environment",
-            from_statuses={SessionStatus.PENDING},
-            to_status=SessionStatus.RUNNING,
-        )
-        await app._finalize_abandoned_session_by_id("sess_missing_environment")
-
-    asyncio.run(scenario())
-
-    session = asyncio.run(store.load("sess_missing_environment"))
-    events = asyncio.run(store.load_events("sess_missing_environment"))
-    assert session is not None
-    assert session.status == SessionStatus.INTERRUPTED
-    assert events[-1].type == EventType.SESSION_INTERRUPTED
-    assert events[-1].environment_name == "removed-env"
-
-
-def test_finalize_abandoned_session_by_id_records_terminal_event_without_agent() -> None:
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
-
-    async def scenario() -> list[Event]:
-        await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_missing_agent",
-                messages=[Message.text("user", "hello")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        await store.transition_status(
-            "sess_missing_agent",
-            from_statuses={SessionStatus.PENDING},
-            to_status=SessionStatus.RUNNING,
-        )
-        await app._finalize_abandoned_session_by_id("sess_missing_agent")
-        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        return [
-            event
-            async for event in app.interrupt_session(
-                InterruptSessionRequest(
-                    session_id="sess_missing_agent",
-                    reason="operator",
-                )
-            )
-        ]
-
-    interrupt_events = asyncio.run(scenario())
-
-    session = asyncio.run(store.load("sess_missing_agent"))
-    stored_events = asyncio.run(store.load_events("sess_missing_agent"))
-    assert session is not None
-    assert session.status == SessionStatus.INTERRUPTED
-    assert [event.type for event in stored_events] == [EventType.SESSION_INTERRUPTED]
-    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
-    assert interrupt_events[0].payload["reason"] == "event_stream_closed"

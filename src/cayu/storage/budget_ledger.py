@@ -27,10 +27,15 @@ from cayu.runtime.budgets import (
 )
 
 from . import _sqlite_support as sqlite_support
+from . import migrations as schema
 
 
 class SQLiteBudgetLedger(BudgetLedger):
-    """SQLite-backed atomic budget reservation ledger."""
+    """SQLite-backed atomic budget reservation ledger.
+
+    The ``cayu_budget_reservations`` table is owned by the shared migration
+    machinery (ADR 0001 revision 8), not created ad hoc by this class.
+    """
 
     def __init__(
         self,
@@ -38,6 +43,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         *,
         clock: Callable[[], datetime] | None = None,
         reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -45,6 +51,8 @@ class SQLiteBudgetLedger(BudgetLedger):
             db_path = Path(require_nonblank(path, "path"))
         else:
             raise TypeError("SQLiteBudgetLedger path must be a string or Path.")
+        if not isinstance(schema_mode, schema.SchemaMode):
+            raise TypeError("schema_mode must be a SchemaMode.")
 
         self.path = db_path
         self._lock = asyncio.Lock()
@@ -52,8 +60,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
         self._connection = sqlite_support.connect(db_path)
         self._connection.row_factory = sqlite3.Row
-        sqlite_support.initialize_schema(self._connection)
-        self._initialize_schema()
+        sqlite_support.reconcile_schema(self._connection, schema_mode)
 
     async def reserve(
         self,
@@ -190,36 +197,6 @@ class SQLiteBudgetLedger(BudgetLedger):
         async with self._lock:
             self._connection.close()
 
-    def _initialize_schema(self) -> None:
-        with self._connection:
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS budget_reservations (
-                    reservation_id TEXT PRIMARY KEY,
-                    scope TEXT NOT NULL,
-                    budget_key TEXT,
-                    window TEXT NOT NULL,
-                    currency TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    agent_name TEXT NOT NULL,
-                    provider_name TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    reserved_amount TEXT NOT NULL,
-                    actual_amount TEXT,
-                    status TEXT NOT NULL,
-                    reason TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_budget_reservations_scope
-                ON budget_reservations(scope, budget_key, window, currency, status)
-                """
-            )
-
     def _used_amount_unlocked(self, limit: BudgetLimit, *, now: datetime) -> Decimal:
         since, until = limit.window.bounds(now=now)
         cutoff = None if since is None else sqlite_support.format_datetime(since)
@@ -227,10 +204,10 @@ class SQLiteBudgetLedger(BudgetLedger):
         rows = self._connection.execute(
             """
             SELECT reserved_amount, actual_amount, status
-            FROM budget_reservations
+            FROM cayu_budget_reservations
             WHERE scope = ?
               AND budget_key IS ?
-              AND window = ?
+              AND budget_window = ?
               AND currency = ?
               AND status IN ('active', 'reconciled')
               AND (? IS NULL OR updated_at >= ?)
@@ -261,7 +238,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
         self._connection.execute(
             """
-            UPDATE budget_reservations
+            UPDATE cayu_budget_reservations
             SET status = 'released',
                 reason = ?,
                 updated_at = ?
@@ -280,11 +257,11 @@ class SQLiteBudgetLedger(BudgetLedger):
         updated_at = sqlite_support.format_datetime(record.updated_at)
         self._connection.execute(
             """
-            INSERT INTO budget_reservations (
+            INSERT INTO cayu_budget_reservations (
                 reservation_id,
                 scope,
                 budget_key,
-                window,
+                budget_window,
                 currency,
                 session_id,
                 agent_name,
@@ -322,7 +299,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         updated_at = sqlite_support.format_datetime(record.updated_at)
         cursor = self._connection.execute(
             """
-            UPDATE budget_reservations
+            UPDATE cayu_budget_reservations
             SET actual_amount = ?,
                 status = ?,
                 reason = ?,
@@ -343,10 +320,10 @@ class SQLiteBudgetLedger(BudgetLedger):
     def _load_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         row = self._connection.execute(
             """
-            SELECT reservation_id, scope, budget_key, window, currency, session_id,
+            SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
                    agent_name, provider_name, model, reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
-            FROM budget_reservations
+            FROM cayu_budget_reservations
             WHERE reservation_id = ?
             """,
             (reservation_id,),
@@ -357,7 +334,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             reservation_id=row["reservation_id"],
             scope=row["scope"],
             key=row["budget_key"],
-            window=row["window"],
+            window=row["budget_window"],
             currency=row["currency"],
             session_id=row["session_id"],
             agent_name=row["agent_name"],

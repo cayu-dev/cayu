@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from cayu.core import Event, EventType, Message
+from cayu.providers import UsageDialect
 from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
@@ -908,6 +910,90 @@ def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path
     assert session.id == "sess_shared_budget_db"
 
 
+def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None:
+    # Before ADR 0001 revision 8 the ledger created an ad-hoc unprefixed
+    # `budget_reservations` table. Opening such a database must carry active
+    # reservations into `cayu_budget_reservations` and drop the legacy table.
+    path = tmp_path / "budget.sqlite"
+    now = datetime.now(UTC).isoformat()
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        """
+        CREATE TABLE budget_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            budget_key TEXT,
+            window TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reserved_amount TEXT NOT NULL,
+            actual_amount TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO budget_reservations VALUES "
+        "(?, 'app', NULL, 'all_time', 'USD', 'sess_legacy', 'assistant', "
+        "'fake', 'fake-model', '0.22', NULL, 'active', NULL, ?, ?)",
+        ("bres_legacy", now, now),
+    )
+    legacy.commit()
+    legacy.close()
+
+    async def run():
+        ledger = SQLiteBudgetLedger(path)
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            blocked = await ledger.reserve(
+                limit=limit,
+                session_id="sess_1",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            reconciled = await ledger.reconcile(
+                reservation_id="bres_legacy",
+                actual_amount=Decimal("0.01"),
+            )
+            accepted = await ledger.reserve(
+                limit=limit,
+                session_id="sess_2",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return blocked, reconciled, accepted
+        finally:
+            await ledger.close()
+
+    blocked, reconciled, accepted = asyncio.run(run())
+
+    # The migrated legacy reservation still counts against the budget…
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+    # …and remains reconcilable under its original reservation_id.
+    assert reconciled.released_amount == Decimal("0.21")
+    assert accepted.accepted is True
+
+    inspector = sqlite3.connect(path)
+    try:
+        tables = {
+            row[0]
+            for row in inspector.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    finally:
+        inspector.close()
+    assert "cayu_budget_reservations" in tables
+    assert "budget_reservations" not in tables
+
+
 def test_in_memory_budget_store_filters_app_and_agent_events() -> None:
     async def run():
         store = InMemoryBudgetStore()
@@ -1482,6 +1568,91 @@ def test_normalize_vertex_usage_metrics_matches_anthropic() -> None:
     assert metrics.cache.uncached_input_tokens == 100
 
 
+def test_normalize_bedrock_anthropic_shape_by_payload() -> None:
+    # Claude reached through Bedrock/a gateway registers under a name that is not
+    # in the built-in alias set. The payload shape (Anthropic-only cache fields)
+    # must still drive cache-token folding so tokens are not undercounted.
+    raw_usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 70,
+        "cache_creation_input_tokens": 5,
+    }
+    metrics = normalize_usage_metrics(
+        provider_name="bedrock", model="claude-sonnet-4-6", raw_usage=dict(raw_usage)
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 175
+    assert metrics.total_tokens == 195
+    assert metrics.cache.read_tokens == 70
+    assert metrics.cache.write_tokens == 5
+    assert metrics.cache.cached_input_tokens == 70
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+def test_normalize_declared_anthropic_dialect_overrides_unknown_name() -> None:
+    # A renamed adapter can declare its dialect even when the payload carries no
+    # cache fields yet (so shape detection alone cannot classify it).
+    metrics = normalize_usage_metrics(
+        provider_name="claude-proxy",
+        model="claude-sonnet-4-6",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 70,
+            "cache_creation_input_tokens": 0,
+        },
+        usage_dialect=UsageDialect.ANTHROPIC,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 170
+    assert metrics.cache.read_tokens == 70
+    assert metrics.cache.cached_input_tokens == 70
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+def test_normalize_declared_dialect_beats_name_alias() -> None:
+    # An explicit dialect wins over the built-in name allowlist: a payload routed
+    # through a provider registered as "vertex" but declaring the OpenAI dialect
+    # must not fold cache tokens into input.
+    metrics = normalize_usage_metrics(
+        provider_name="vertex",
+        model="gpt-5.5",
+        raw_usage={
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 40},
+        },
+        usage_dialect="openai",
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.cache.read_tokens == 40
+    assert metrics.cache.cached_input_tokens == 40
+    assert metrics.cache.uncached_input_tokens == 60
+
+
+def test_normalize_unknown_dialect_falls_back_to_detection() -> None:
+    # An unrecognized dialect string is treated as "auto" and detection applies.
+    metrics = normalize_usage_metrics(
+        provider_name="gateway",
+        model="claude-sonnet-4-6",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+        },
+        usage_dialect="mystery",
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 130
+    assert metrics.cache.read_tokens == 30
+
+
 def test_normalize_anthropic_top_level_cache_write_counter() -> None:
     metrics = normalize_usage_metrics(
         provider_name="anthropic",
@@ -1981,7 +2152,7 @@ def test_request_budget_limits_validate_currency_and_copy_pricing() -> None:
     assert copied.pricing.prices[0] is not budget.pricing.prices[0]
 
 
-def test_request_budget_limits_reject_reservations() -> None:
+def test_request_budget_limits_reject_reservations_on_session_and_run_scopes() -> None:
     pricing = PricingCatalog(
         prices=(
             ModelPricing(
@@ -1993,15 +2164,58 @@ def test_request_budget_limits_reject_reservations() -> None:
         )
     )
 
-    budget = BudgetLimit(
-        scope="session",
-        max_estimated_cost=Decimal("0.01"),
-        pricing=pricing,
-        reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+    for scope in ("session", "run"):
+        budget = BudgetLimit(
+            scope=scope,
+            max_estimated_cost=Decimal("0.01"),
+            pricing=pricing,
+            reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+        )
+        with pytest.raises(ValueError, match="must not use reservations"):
+            copy_request_budget_limits((budget,))
+
+
+def test_request_budget_limits_allow_reservations_on_shared_scopes() -> None:
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.5",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        )
     )
 
-    with pytest.raises(ValueError, match="must not use reservations"):
-        copy_request_budget_limits((budget,))
+    limits = copy_request_budget_limits(
+        (
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("0.01"),
+                pricing=pricing,
+                reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
+            ),
+            BudgetLimit(
+                scope="agent",
+                key="assistant",
+                max_estimated_cost=Decimal("0.02"),
+                pricing=pricing,
+                reservation=BudgetReservation(max_input_tokens=2, max_output_tokens=1),
+            ),
+            BudgetLimit(
+                scope="causal",
+                key="job_1",
+                max_estimated_cost=Decimal("0.03"),
+                pricing=pricing,
+                reservation=BudgetReservation(max_input_tokens=3, max_output_tokens=0),
+            ),
+        )
+    )
+
+    assert [limit.scope for limit in limits] == ["app", "agent", "causal"]
+    assert all(limit.reservation is not None for limit in limits)
+    assert limits[1].reservation is not None
+    assert limits[1].reservation.max_input_tokens == 2
 
 
 def test_request_budget_limits_validate_agent_and_causal_keys() -> None:

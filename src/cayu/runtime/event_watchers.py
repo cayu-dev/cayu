@@ -106,6 +106,48 @@ class EventWatcherDelivery(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class EventWatcherDeadLetter(BaseModel):
+    """A durable record of one event that exhausted its delivery attempts.
+
+    Persisting these (rather than only bumping a counter and overwriting a single
+    ``last_error`` on the watcher state) keeps every dead-lettered event
+    individually inspectable and replayable: the durable event log remains the
+    source of truth, and ``event_sequence`` + ``event_id`` point back at the exact
+    event a handler can be re-dispatched against.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    watcher_name: str
+    event_id: str
+    event_sequence: StrictInt = Field(ge=1)
+    attempts: StrictInt = Field(ge=1)
+    error: str
+    dead_lettered_at: datetime
+    resolved_at: datetime | None = None
+
+    @field_validator("watcher_name", "event_id")
+    @classmethod
+    def validate_clean_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("error")
+    @classmethod
+    def validate_error(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("error cannot be blank.")
+        return value
+
+    @field_validator("dead_lettered_at", "resolved_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
 class EventWatcherContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -217,7 +259,37 @@ class EventWatcherStore(ABC):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
-        """Mark a claimed event failed or dead-lettered."""
+        """Mark a claimed event failed or dead-lettered.
+
+        When the final attempt is exhausted the store also persists a durable
+        :class:`EventWatcherDeadLetter` record for the event (see
+        :meth:`list_dead_letters`) so it can be inspected and replayed later.
+        """
+
+    @abstractmethod
+    async def list_dead_letters(
+        self,
+        watcher_name: str,
+        *,
+        include_resolved: bool = False,
+        limit: int = 100,
+    ) -> list[EventWatcherDeadLetter]:
+        """Return persisted dead-letter records for a watcher, oldest first.
+
+        Unresolved records are returned by default; pass ``include_resolved`` to
+        also surface ones already marked handled via :meth:`resolve_dead_letter`.
+        """
+
+    @abstractmethod
+    async def resolve_dead_letter(
+        self,
+        watcher_name: str,
+        event_sequence: int,
+    ) -> EventWatcherDeadLetter:
+        """Mark a dead-letter record handled (e.g. after a successful replay).
+
+        Raises :class:`ValueError` when no such record exists for the watcher.
+        """
 
 
 class InMemoryEventWatcherStore(EventWatcherStore):
@@ -226,6 +298,7 @@ class InMemoryEventWatcherStore(EventWatcherStore):
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._lock = asyncio.Lock()
         self._states: dict[str, EventWatcherState] = {}
+        self._dead_letters: dict[str, dict[int, EventWatcherDeadLetter]] = {}
         self._clock = _clock_or_utc_now(clock)
 
     async def load_state(self, watcher_name: str) -> EventWatcherState:
@@ -345,6 +418,10 @@ class InMemoryEventWatcherStore(EventWatcherStore):
                     deep=True,
                 )
                 status = EventWatcherDeliveryStatus.DEAD_LETTERED
+                dead_letter = _dead_letter_from_claim(claim, error=error, now=now)
+                self._dead_letters.setdefault(claim.watcher_name, {})[
+                    dead_letter.event_sequence
+                ] = dead_letter
             else:
                 updated = state.model_copy(
                     update={
@@ -364,6 +441,46 @@ class InMemoryEventWatcherStore(EventWatcherStore):
                 cursor_sequence=updated.cursor_sequence,
                 error=error,
             )
+
+    async def list_dead_letters(
+        self,
+        watcher_name: str,
+        *,
+        include_resolved: bool = False,
+        limit: int = 100,
+    ) -> list[EventWatcherDeadLetter]:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        limit = _validate_dead_letter_limit(limit)
+        async with self._lock:
+            records = self._dead_letters.get(watcher_name, {})
+            selected = [
+                record.model_copy(deep=True)
+                for _, record in sorted(records.items())
+                if include_resolved or record.resolved_at is None
+            ]
+            return selected[:limit]
+
+    async def resolve_dead_letter(
+        self,
+        watcher_name: str,
+        event_sequence: int,
+    ) -> EventWatcherDeadLetter:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        event_sequence = _validate_event_sequence(event_sequence)
+        now = self._clock()
+        async with self._lock:
+            record = self._dead_letters.get(watcher_name, {}).get(event_sequence)
+            if record is None:
+                raise ValueError(
+                    f"No dead-letter record for watcher {watcher_name!r} "
+                    f"at sequence {event_sequence}."
+                )
+            resolved = record.model_copy(
+                update={"resolved_at": record.resolved_at or now},
+                deep=True,
+            )
+            self._dead_letters[watcher_name][event_sequence] = resolved
+            return resolved.model_copy(deep=True)
 
 
 async def run_event_watcher_handler(
@@ -414,6 +531,14 @@ def copy_event_watcher_delivery(delivery: EventWatcherDelivery) -> EventWatcherD
     if type(delivery) is not EventWatcherDelivery:
         raise TypeError("delivery must be an EventWatcherDelivery.")
     return delivery.model_copy(deep=True)
+
+
+def copy_event_watcher_dead_letter(
+    dead_letter: EventWatcherDeadLetter,
+) -> EventWatcherDeadLetter:
+    if type(dead_letter) is not EventWatcherDeadLetter:
+        raise TypeError("dead_letter must be an EventWatcherDeadLetter.")
+    return dead_letter.model_copy(deep=True)
 
 
 def event_watcher_error_payload(error: BaseException) -> str:
@@ -468,6 +593,34 @@ def _delivery_from_claim(
         cursor_sequence=cursor_sequence,
         error=error,
     )
+
+
+def _dead_letter_from_claim(
+    claim: EventWatcherClaim,
+    *,
+    error: str,
+    now: datetime,
+) -> EventWatcherDeadLetter:
+    return EventWatcherDeadLetter(
+        watcher_name=claim.watcher_name,
+        event_id=claim.event_id,
+        event_sequence=claim.event_sequence,
+        attempts=claim.attempt,
+        error=error,
+        dead_lettered_at=now,
+    )
+
+
+def _validate_dead_letter_limit(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("limit must be an integer greater than or equal to 1.")
+    return value
+
+
+def _validate_event_sequence(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("event_sequence must be an integer greater than or equal to 1.")
+    return value
 
 
 def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], datetime]:

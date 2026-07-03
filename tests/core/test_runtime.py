@@ -4608,79 +4608,6 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
     assert len(provider.requests) == 1
 
 
-def test_session_usage_tracker_advances_from_single_ordered_tail() -> None:
-    async def run() -> tuple[list[Event], list[Event], list[Event]]:
-        store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
-        await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_usage_tracker",
-                messages=[Message.text("user", "track usage")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        await store.update_status("sess_usage_tracker", SessionStatus.RUNNING)
-        tracker = runtime_app_module._SessionUsageTracker(app, session_id="sess_usage_tracker")
-        observed_queries: list[EventQuery] = []
-        original_query_all_event_records = app._query_all_event_records
-
-        async def query_all_event_records(query: EventQuery):
-            observed_queries.append(query)
-            return await original_query_all_event_records(query)
-
-        app._query_all_event_records = query_all_event_records  # type: ignore[method-assign]
-
-        ignored = await app._emit(
-            Event(
-                type=EventType.MODEL_STARTED,
-                session_id="sess_usage_tracker",
-                agent_name="assistant",
-                payload={},
-            )
-        )
-        first = await tracker.usage_events()
-
-        tool_started = await app._emit(
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
-                session_id="sess_usage_tracker",
-                agent_name="assistant",
-                tool_name="read_file",
-                payload={"tool_call_id": "call_1", "arguments": {}},
-            )
-        )
-        model_completed = await app._emit(
-            Event(
-                type=EventType.MODEL_COMPLETED,
-                session_id="sess_usage_tracker",
-                agent_name="assistant",
-                payload={
-                    "usage": {
-                        "input_tokens": 1,
-                        "output_tokens": 2,
-                        "total_tokens": 3,
-                    }
-                },
-            )
-        )
-        second = await tracker.usage_events()
-        third = await tracker.usage_events()
-        assert third == second
-        assert all(query.event_type is None for query in observed_queries)
-        return [ignored, tool_started, model_completed], first, second
-
-    emitted, first, later = asyncio.run(run())
-
-    assert first == []
-    assert [event.type for event in later] == [
-        EventType.TOOL_CALL_STARTED,
-        EventType.MODEL_COMPLETED,
-    ]
-    assert later[0].id == emitted[1].id
-    assert later[1].id == emitted[2].id
-
-
 def test_cayu_app_before_stop_policy_can_continue_with_durable_message():
     async def run():
         store = InMemorySessionStore()
@@ -5962,6 +5889,121 @@ def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unav
         EventType.SESSION_LIMIT_REACHED,
         EventType.SESSION_INTERRUPTED,
     ]
+    failed = next(
+        event for event in second_events if event.type == EventType.BUDGET_RESERVATION_FAILED
+    )
+    assert failed.payload["accepted"] is False
+    assert failed.payload["requested"] == "1"
+    assert failed.payload["actual"] == "1.75"
+    assert len(provider.requests) == 1
+
+
+def test_cayu_app_request_budget_reservation_reconciles_model_step():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 250_000,
+                        "output_tokens": 0,
+                        "total_tokens": 250_000,
+                    },
+                }
+            )
+        ]
+    )
+    app = CayuApp(session_store=store, budget_ledger=InMemoryBudgetLedger())
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_budget_reservation",
+                messages=[Message.text("user", "hello")],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("2"),
+                        pricing=fake_budget_limit("10").pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=1_000_000,
+                            max_output_tokens=0,
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    reserved = next(event for event in events if event.type == EventType.BUDGET_RESERVED)
+    reconciled = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+    assert reserved.payload["requested"] == "1"
+    assert reserved.payload["actual"] == "1"
+    assert reconciled.payload["actual_amount"] == "0.25"
+    assert reconciled.payload["released_amount"] == "0.75"
+
+
+def test_cayu_app_request_budget_reservation_stops_second_session_sharing_the_budget():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 750_000,
+                        "output_tokens": 0,
+                        "total_tokens": 750_000,
+                    },
+                }
+            )
+        ]
+    )
+    app = CayuApp(session_store=store, budget_ledger=InMemoryBudgetLedger())
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    shared_limit = BudgetLimit(
+        scope="agent",
+        key="assistant",
+        max_estimated_cost=Decimal("1"),
+        pricing=fake_budget_limit("10").pricing,
+        reservation=BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=0,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_reservation_first",
+                messages=[Message.text("user", "first")],
+                budget_limits=(shared_limit,),
+            ),
+        )
+    )
+    second_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_reservation_second",
+                messages=[Message.text("user", "second")],
+                budget_limits=(shared_limit,),
+            ),
+        )
+    )
+
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert second_events[-1].type == EventType.SESSION_INTERRUPTED
     failed = next(
         event for event in second_events if event.type == EventType.BUDGET_RESERVATION_FAILED
     )
@@ -17863,6 +17905,58 @@ def test_strip_old_file_attachments_preserves_latest_attachment_result_only():
     strip_all = strip_old_file_attachments(messages, max_attachment_results=0)
     assert strip_all[2].content[0].artifacts == []
     assert strip_all[6].content[0].artifacts == []
+
+
+def test_file_attachment_refs_include_user_file_parts():
+    from cayu.core.messages import FilePart
+    from cayu.runtime.app import _file_attachment_refs
+
+    user_attachment = file_attachment(
+        artifact_id="art_user",
+        kind="image",
+        filename="photo.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    tool_attachment = file_attachment(
+        artifact_id="art_tool",
+        kind="document",
+        filename="report.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[TextPart(text="look"), FilePart(attachment=user_attachment)],
+        ),
+        Message.tool_call(tool_call_id="call_1", tool_name="read_file"),
+        Message.tool_result(
+            tool_call_id="call_1",
+            tool_name="read_file",
+            content="attached",
+            artifacts=[tool_attachment],
+        ),
+    ]
+
+    refs = _file_attachment_refs(messages)
+
+    assert [ref.artifact_id for ref in refs] == ["art_user", "art_tool"]
+
+    conflicting = file_attachment(
+        artifact_id="art_user",
+        kind="image",
+        filename="different.png",
+        content_type="image/png",
+        size_bytes=7,
+    )
+    with pytest.raises(RuntimeError, match="Conflicting file attachment"):
+        _file_attachment_refs(
+            [
+                *messages,
+                Message(role="user", content=[FilePart(attachment=conflicting)]),
+            ]
+        )
 
 
 def test_cayu_app_sends_agent_system_prompt_as_first_message():

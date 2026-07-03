@@ -54,6 +54,7 @@ from cayu.runtime.sessions import (
 from cayu.runtime.tasks import (
     Task,
     TaskCreate,
+    TaskOrder,
     TaskQuery,
     TaskStatus,
     TaskStore,
@@ -180,12 +181,43 @@ def _event_query_with_session_ids(
     )
 
 
+# Columns needed to reconstruct an Event, in a stable order. The formerly-stored
+# event_json blob duplicated exactly these (plus payload_json), so the store now
+# rebuilds Events from the individual columns instead of parsing a redundant copy.
+_EVENT_COLUMN_NAMES: tuple[str, ...] = (
+    "session_id",
+    "event_id",
+    "event_type",
+    "timestamp",
+    "agent_name",
+    "environment_name",
+    "workflow_name",
+    "tool_name",
+    "payload_json",
+)
+
+
+def _event_from_row(row: sqlite3.Row) -> Event:
+    """Reconstruct an :class:`Event` from its individual cayu_events columns."""
+    return Event(
+        type=row["event_type"],
+        session_id=row["session_id"],
+        id=row["event_id"],
+        timestamp=row["timestamp"],
+        agent_name=row["agent_name"],
+        environment_name=row["environment_name"],
+        workflow_name=row["workflow_name"],
+        tool_name=row["tool_name"],
+        payload=json.loads(row["payload_json"]),
+    )
+
+
 def _event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
     if row is None:
         return None
     return EventRecord(
         sequence=row["sequence"],
-        event=Event(**json.loads(row["event_json"])),
+        event=_event_from_row(row),
     )
 
 
@@ -457,25 +489,15 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
-
-        updated_at = datetime.now(UTC)
-        async with self._lock:
-            with self._connection:
-                cursor = self._connection.execute(
-                    """
-                    UPDATE cayu_sessions
-                    SET status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (str(status), sqlite_support.format_datetime(updated_at), session_id),
-                )
-            if cursor.rowcount != 1:
-                raise KeyError(f"Session not found: {session_id}")
-
-            loaded = self._load_unlocked(session_id)
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
-            return loaded
+        # Route the unconditional setter through the guarded transition machine so
+        # both write paths share one atomic UPDATE-and-check. Allowing every source
+        # status preserves update_status semantics (any -> status) while inheriting
+        # the row-level not-found guard.
+        return await self.transition_status(
+            session_id,
+            from_statuses=set(SessionStatus),
+            to_status=status,
+        )
 
     async def update_model(self, session_id: str, model: str) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -501,25 +523,35 @@ class SQLiteSessionStore(SessionStore):
 
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        blocked = [str(status) for status in DELETE_BLOCKED_SESSION_STATUSES]
+        placeholders = ", ".join("?" for _ in blocked)
         async with self._lock:
-            row = self._connection.execute(
-                "SELECT status FROM cayu_sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return  # idempotent: deleting a missing session is a no-op
-            status = SessionStatus(row["status"])
-            if status in DELETE_BLOCKED_SESSION_STATUSES:
+            with self._connection:
+                # Guard the status check inside the statement so a concurrent
+                # transition into a delete-blocked status cannot slip between a
+                # separate SELECT and the DELETE. ON DELETE CASCADE removes
+                # events/labels/checkpoint/transcript; the self-FK is ON DELETE
+                # SET NULL so children keep loading with no parent.
+                cursor = self._connection.execute(
+                    f"""
+                    DELETE FROM cayu_sessions
+                    WHERE id = ? AND status NOT IN ({placeholders})
+                    """,
+                    (session_id, *blocked),
+                )
+            if cursor.rowcount == 0:
+                # Nothing was deleted: either the session is already gone
+                # (idempotent no-op) or it is in a delete-blocked status.
+                row = self._connection.execute(
+                    "SELECT status FROM cayu_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return  # idempotent: deleting a missing session is a no-op
+                status = SessionStatus(row["status"])
                 raise ValueError(
                     f"Cannot delete a session while it is {status}; "
                     f"interrupt it first: {session_id}"
-                )
-            with self._connection:
-                # ON DELETE CASCADE removes events/labels/checkpoint/transcript; the
-                # self-FK is ON DELETE SET NULL so children keep loading with no parent.
-                self._connection.execute(
-                    "DELETE FROM cayu_sessions WHERE id = ?",
-                    (session_id,),
                 )
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
@@ -745,10 +777,9 @@ class SQLiteSessionStore(SessionStore):
                             environment_name,
                             workflow_name,
                             tool_name,
-                            payload_json,
-                            event_json
+                            payload_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
                             (
@@ -761,7 +792,6 @@ class SQLiteSessionStore(SessionStore):
                                 event.workflow_name,
                                 event.tool_name,
                                 sqlite_support.json_dumps(event.payload),
-                                sqlite_support.json_dumps(event.model_dump(mode="json")),
                             )
                             for event in copied_events
                         ],
@@ -787,15 +817,15 @@ class SQLiteSessionStore(SessionStore):
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             rows = connection.execute(
-                """
-                SELECT event_json
+                f"""
+                SELECT {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                 ORDER BY sequence ASC
                 """,
                 (session_id,),
             ).fetchall()
-            return [Event(**json.loads(row["event_json"])) for row in rows]
+            return [_event_from_row(row) for row in rows]
 
         return await self._run_read(query)
 
@@ -847,9 +877,10 @@ class SQLiteSessionStore(SessionStore):
         params.append(query.limit)
 
         def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
+            event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
             rows = connection.execute(
                 f"""
-                SELECT cayu_events.sequence, cayu_events.event_json
+                SELECT cayu_events.sequence, {event_columns}
                 FROM cayu_events
                 JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                 {where_sql}
@@ -859,11 +890,7 @@ class SQLiteSessionStore(SessionStore):
                 params,
             ).fetchall()
             return [
-                EventRecord(
-                    sequence=row["sequence"],
-                    event=Event(**json.loads(row["event_json"])),
-                )
-                for row in rows
+                EventRecord(sequence=row["sequence"], event=_event_from_row(row)) for row in rows
             ]
 
         return await self._run_read(run_query)
@@ -907,8 +934,8 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             latest_row = self._connection.execute(
-                """
-                SELECT sequence, event_json
+                f"""
+                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                 ORDER BY sequence DESC
@@ -921,14 +948,7 @@ class SQLiteSessionStore(SessionStore):
                 session_id=session_id,
                 total_events=int(total_row["total_events"]),
                 counts_by_type={row["event_type"]: int(row["count"]) for row in count_rows},
-                latest_event=(
-                    None
-                    if latest_row is None
-                    else EventRecord(
-                        sequence=latest_row["sequence"],
-                        event=Event(**json.loads(latest_row["event_json"])),
-                    )
-                ),
+                latest_event=_event_record_from_row(latest_row),
             )
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
@@ -939,8 +959,8 @@ class SQLiteSessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
 
             terminal_row = self._connection.execute(
-                """
-                SELECT sequence, event_json
+                f"""
+                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                   AND event_type IN ('session.completed', 'session.failed', 'session.interrupted')
@@ -959,8 +979,8 @@ class SQLiteSessionStore(SessionStore):
                 (session_id, session_id),
             ).fetchone()
             retry_row = self._connection.execute(
-                """
-                SELECT sequence, event_json
+                f"""
+                SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
                 WHERE session_id = ?
                   AND event_type = 'model.retry'
@@ -984,6 +1004,78 @@ class SQLiteSessionStore(SessionStore):
                 terminal_event=_event_record_from_row(terminal_row),
                 latest_retry_event=_event_record_from_row(retry_row),
             )
+
+    async def prune_events(
+        self,
+        *,
+        before: datetime,
+        session_id: str | None = None,
+    ) -> int:
+        """Delete events older than ``before`` to bound unbounded event growth.
+
+        ``before`` is compared against each event's timestamp (events strictly
+        older are removed). When ``session_id`` is given the prune is scoped to
+        that session (which must exist); otherwise every session is pruned.
+        Returns the number of events deleted.
+        """
+        if not isinstance(before, datetime):
+            raise TypeError("prune_events 'before' must be a datetime.")
+        cutoff = sqlite_support.format_datetime(before)
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+
+        def statement(connection: sqlite3.Connection) -> int:
+            if session_id is not None and not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            with connection:
+                if session_id is None:
+                    cursor = connection.execute(
+                        "DELETE FROM cayu_events WHERE timestamp < ?",
+                        (cutoff,),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "DELETE FROM cayu_events WHERE session_id = ? AND timestamp < ?",
+                        (session_id, cutoff),
+                    )
+            return cursor.rowcount
+
+        return await self._run_write(statement)
+
+    async def compact_transcript(self, session_id: str, *, keep_last: int) -> int:
+        """Compact a session's transcript, keeping only its most recent messages.
+
+        Retains the ``keep_last`` newest transcript messages (by insertion order)
+        for ``session_id`` and deletes the rest, bounding transcript growth for
+        long-lived sessions. Returns the number of messages deleted.
+        """
+        if type(keep_last) is not int:
+            raise TypeError("compact_transcript 'keep_last' must be an int.")
+        if keep_last < 0:
+            raise ValueError("compact_transcript 'keep_last' must be >= 0.")
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def statement(connection: sqlite3.Connection) -> int:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            with connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM cayu_transcript_messages
+                    WHERE session_id = ?
+                      AND sequence NOT IN (
+                          SELECT sequence
+                          FROM cayu_transcript_messages
+                          WHERE session_id = ?
+                          ORDER BY sequence DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (session_id, session_id, keep_last),
+                )
+            return cursor.rowcount
+
+        return await self._run_write(statement)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
@@ -1701,7 +1793,9 @@ class SQLiteTaskStore(TaskStore):
             return None
         clauses, params = self._task_filter_clauses(query)
         where_sql = " AND ".join(["status = ?", "session_id IS NULL", *clauses])
-        order_sql = sqlite_support.task_order_sql(query.order_by)
+        # Claiming is always FIFO by creation time, independent of the query's
+        # display ordering, so the oldest pending task is dispatched first.
+        order_sql = sqlite_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
 

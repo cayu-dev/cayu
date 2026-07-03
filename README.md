@@ -937,16 +937,14 @@ request = RunRequest(
 ```
 
 Token and tool-call limits are evaluated from durable session events, so they
-can apply across resume and dispatch paths when configured with
-`scope="session"`. `scope="run"` is the default and evaluates token/tool-call
-limits against only the current `run(...)`, `resume(...)`, dispatch, or
-approval-continuation invocation. `scope="session"` treats token/tool-call
-limits as lifetime session budgets. Elapsed time follows the same scope:
-`scope="run"` measures the active runtime invocation and resets on each call,
-while `scope="session"` measures the session lifetime from durable session
-creation. Estimated-cost budget limits use the same scope names:
-`scope="session"` enforces a lifetime estimated-cost budget, while
-`scope="run"` compares only estimated cost added during the current invocation.
+apply across resume and dispatch paths by default. `scope="session"` is the
+default and treats token/tool-call limits as lifetime session budgets.
+`scope="run"` evaluates token/tool-call limits against only the current
+`run(...)`, `resume(...)`, dispatch, or approval-continuation invocation. Elapsed
+time is always evaluated for the active runtime invocation and resets on each
+call. Estimated-cost budget limits use the same scope names: `scope="session"`
+enforces a lifetime estimated-cost budget, while `scope="run"` compares only
+estimated cost added during the current invocation.
 
 Budget limits are estimates derived from normalized usage metrics and the
 pricing catalog supplied by your app. They are not provider invoices. By

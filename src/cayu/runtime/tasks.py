@@ -496,7 +496,9 @@ class InMemoryTaskStore(TaskStore):
             ]
             if not candidates:
                 return None
-            task = _sort_tasks(candidates, query.order_by)[0]
+            # Claiming is always FIFO by creation time, independent of the query's
+            # display ordering, so the oldest pending task is dispatched first.
+            task = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[0]
             now = datetime.now(UTC)
             updated = task.model_copy(
                 update={

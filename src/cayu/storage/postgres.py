@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any, LiteralString, cast
 
@@ -21,8 +24,26 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
+from cayu.runtime.budgets import (
+    DEFAULT_RESERVATION_TTL_SECONDS,
+    BudgetLedger,
+    BudgetLimit,
+    BudgetReconciliation,
+    BudgetReservationRecord,
+    BudgetReservationResult,
+    _budget_reservation_amount,
+    _clock_or_utc_now,
+    _expired_reservation_reason,
+    _is_expired_reservation_reason,
+    _reconciled_record,
+    _reconciliation_from_record,
+    _reservation_result,
+    _validate_amount,
+    _validate_reservation_ttl,
+)
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
+    EventWatcherDeadLetter,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
     EventWatcherState,
@@ -125,6 +146,13 @@ _KNOWLEDGE_SEARCH_PAGE_SIZE = 500
 _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
 _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS = 2000
 _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER = 8
+# Upper bound on chunks a single semantic search will lazily embed when it finds
+# entries whose write-time embedding was deferred (provider outage). The
+# missing-embedding LEFT JOIN returns nothing in steady state, so this cap only
+# bites while backfilling a write that flag-and-continued.
+_PGVECTOR_LAZY_BACKFILL_LIMIT = 500
+
+logger = logging.getLogger(__name__)
 _PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7665_6374 & 0x7FFF_FFFF_FFFF_FFFF
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
@@ -307,6 +335,62 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_knowledge_entries USING GIN (to_tsvector('simple', text))",
         "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_text_fts "
         "ON cayu_knowledge_chunks USING GIN (to_tsvector('simple', text))",
+    ),
+    8: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_budget_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            budget_key TEXT,
+            budget_window TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reserved_amount NUMERIC NOT NULL,
+            actual_amount NUMERIC,
+            status TEXT NOT NULL,
+            reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_scope "
+        "ON cayu_budget_reservations(scope, budget_key, budget_window, currency, status)",
+    ),
+    10: (
+        # Per-session monotonic counter that append_events advances with a single
+        # UPDATE ... RETURNING (replacing the row-lock + COALESCE(MAX()) scan).
+        # IF NOT EXISTS keeps the greenfield-through-migrations path a no-op, since
+        # the baseline schema already declares the column.
+        "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS event_seq BIGINT NOT NULL DEFAULT 0",
+        # Seed the counter from the highest existing session_order so the first
+        # post-migration append continues the sequence instead of colliding with
+        # already-stored rows.
+        """
+        UPDATE cayu_sessions AS s
+        SET event_seq = COALESCE(
+            (SELECT MAX(e.session_order) FROM cayu_events AS e WHERE e.session_id = s.id),
+            0
+        )
+        """,
+    ),
+    11: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_dead_letters (
+            watcher_name TEXT NOT NULL,
+            event_sequence BIGINT NOT NULL,
+            event_id TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            error TEXT NOT NULL,
+            dead_lettered_at TIMESTAMPTZ NOT NULL,
+            resolved_at TIMESTAMPTZ,
+            PRIMARY KEY (watcher_name, event_sequence)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved "
+        "ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence)",
     ),
 }
 
@@ -621,6 +705,17 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
                     deep=True,
                 )
                 status = EventWatcherDeliveryStatus.DEAD_LETTERED
+                await self._insert_dead_letter(
+                    cur,
+                    EventWatcherDeadLetter(
+                        watcher_name=claim.watcher_name,
+                        event_id=claim.event_id,
+                        event_sequence=claim.event_sequence,
+                        attempts=claim.attempt,
+                        error=error,
+                        dead_lettered_at=now,
+                    ),
+                )
             else:
                 updated = state.model_copy(
                     update={
@@ -641,6 +736,116 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
                 cursor_sequence=updated.cursor_sequence,
                 error=error,
             )
+
+    async def list_dead_letters(
+        self,
+        watcher_name: str,
+        *,
+        include_resolved: bool = False,
+        limit: int = 100,
+    ) -> list[EventWatcherDeadLetter]:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        limit = _validate_dead_letter_limit(limit)
+        await self._ensure_ready()
+        clause = "" if include_resolved else "AND resolved_at IS NULL"
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT
+                    watcher_name,
+                    event_id,
+                    event_sequence,
+                    attempts,
+                    error,
+                    dead_lettered_at,
+                    resolved_at
+                FROM cayu_event_watcher_dead_letters
+                WHERE watcher_name = %s
+                {clause}
+                ORDER BY event_sequence ASC
+                LIMIT %s
+                """,
+                (watcher_name, limit),
+            )
+            rows = await cur.fetchall()
+            return [_event_watcher_dead_letter_from_row(row) for row in rows]
+
+    async def resolve_dead_letter(
+        self,
+        watcher_name: str,
+        event_sequence: int,
+    ) -> EventWatcherDeadLetter:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        event_sequence = _validate_event_sequence(event_sequence)
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT
+                    watcher_name,
+                    event_id,
+                    event_sequence,
+                    attempts,
+                    error,
+                    dead_lettered_at,
+                    resolved_at
+                FROM cayu_event_watcher_dead_letters
+                WHERE watcher_name = %s AND event_sequence = %s
+                FOR UPDATE
+                """,
+                (watcher_name, event_sequence),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise ValueError(
+                    f"No dead-letter record for watcher {watcher_name!r} "
+                    f"at sequence {event_sequence}."
+                )
+            record = _event_watcher_dead_letter_from_row(row)
+            if record.resolved_at is None:
+                await cur.execute(
+                    """
+                    UPDATE cayu_event_watcher_dead_letters
+                    SET resolved_at = %s
+                    WHERE watcher_name = %s AND event_sequence = %s
+                    """,
+                    (now, watcher_name, event_sequence),
+                )
+                record = record.model_copy(update={"resolved_at": now}, deep=True)
+            await conn.commit()
+            return record
+
+    async def _insert_dead_letter(self, cur: Any, dead_letter: EventWatcherDeadLetter) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_event_watcher_dead_letters (
+                watcher_name,
+                event_sequence,
+                event_id,
+                attempts,
+                error,
+                dead_lettered_at,
+                resolved_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (watcher_name, event_sequence) DO UPDATE SET
+                event_id = excluded.event_id,
+                attempts = excluded.attempts,
+                error = excluded.error,
+                dead_lettered_at = excluded.dead_lettered_at,
+                resolved_at = excluded.resolved_at
+            """,
+            (
+                dead_letter.watcher_name,
+                dead_letter.event_sequence,
+                dead_letter.event_id,
+                dead_letter.attempts,
+                dead_letter.error,
+                pg_support.to_utc(dead_letter.dead_lettered_at),
+                pg_support.to_utc_optional(dead_letter.resolved_at),
+            ),
+        )
 
     async def _load_watcher_state_for_update(
         self,
@@ -749,6 +954,363 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
                 pg_support.to_utc(state.updated_at),
             ),
         )
+
+
+def _budget_advisory_lock_key(limit: BudgetLimit) -> int:
+    """Stable 63-bit advisory-lock key for one budget scope/key/window/currency."""
+    material = "|".join(
+        (
+            "cayu_budget_reservations",
+            limit.scope,
+            limit.key or "",
+            limit.window.storage_key,
+            limit.currency.upper(),
+        )
+    )
+    digest = sha256(material.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
+    """Postgres-backed atomic budget reservation ledger for multi-worker apps.
+
+    ``reserve`` serializes per budget (scope/key/window/currency) under a
+    transaction-scoped advisory lock, so concurrent workers on separate
+    connections cannot jointly overshoot ``max_estimated_cost``; ``reconcile``
+    and ``release`` row-lock the reservation with ``SELECT ... FOR UPDATE``.
+    The ``cayu_budget_reservations`` table is owned by the shared migration
+    machinery (ADR 0001 revision 8).
+    """
+
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        clock: Callable[[], datetime] | None = None,
+        reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
+    ) -> None:
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+        )
+        self._clock = _clock_or_utc_now(clock)
+        self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
+
+    async def reserve(
+        self,
+        *,
+        limit: BudgetLimit,
+        session_id: str,
+        agent_name: str,
+        provider_name: str,
+        model: str,
+    ) -> BudgetReservationResult:
+        if type(limit) is not BudgetLimit:
+            raise TypeError("limit must be a BudgetLimit.")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        agent_name = require_clean_nonblank(agent_name, "agent_name")
+        provider_name = require_clean_nonblank(provider_name, "provider_name")
+        model = require_clean_nonblank(model, "model")
+        requested = _budget_reservation_amount(
+            limit=limit,
+            provider_name=provider_name,
+            model=model,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (_budget_advisory_lock_key(limit),),
+                    )
+                    now = self._clock()
+                    await self._reap_expired(cur, now)
+                    current = await self._used_amount(cur, limit, now=now)
+                    projected = current + requested
+                    if projected > limit.max_estimated_cost:
+                        await conn.rollback()
+                        return _reservation_result(
+                            limit=limit,
+                            accepted=False,
+                            requested=requested,
+                            actual=projected,
+                            message=(
+                                "Budget reservation failed: "
+                                f"{projected} > {limit.max_estimated_cost} {limit.currency}."
+                            ),
+                        )
+                    record = BudgetReservationRecord(
+                        scope=limit.scope,
+                        key=limit.key,
+                        window=limit.window,
+                        currency=limit.currency,
+                        session_id=session_id,
+                        agent_name=agent_name,
+                        provider_name=provider_name,
+                        model=model,
+                        reserved_amount=requested,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    await self._insert_record(cur, record)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return _reservation_result(
+            limit=limit,
+            accepted=True,
+            requested=requested,
+            actual=projected,
+            message=(f"Budget reserved: {requested} {limit.currency} for {provider_name}/{model}."),
+            record=record,
+        )
+
+    async def reconcile(
+        self,
+        *,
+        reservation_id: str,
+        actual_amount: Decimal,
+        reason: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> BudgetReconciliation:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        actual_amount = _validate_amount(actual_amount, "actual_amount")
+        reconciled_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    record = await self._reconcilable_record_for_update(cur, reservation_id)
+                    reconciled = _reconciled_record(
+                        record,
+                        actual_amount=actual_amount,
+                        reason=reason,
+                        updated_at=reconciled_at,
+                    )
+                    await self._update_record(cur, reconciled)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return _reconciliation_from_record(reconciled)
+
+    async def release(
+        self,
+        *,
+        reservation_id: str,
+        reason: str,
+    ) -> BudgetReconciliation:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        reason = require_clean_nonblank(reason, "reason")
+        released_at = self._clock()
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    record = await self._active_record_for_update(cur, reservation_id)
+                    released = record.model_copy(
+                        update={
+                            "status": "released",
+                            "reason": reason,
+                            "updated_at": released_at,
+                        },
+                        deep=True,
+                    )
+                    await self._update_record(cur, released)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return _reconciliation_from_record(released)
+
+    async def _reap_expired(self, cur: Any, now: datetime) -> None:
+        if self._reservation_ttl_seconds is None:
+            return
+        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        await cur.execute(
+            """
+            UPDATE cayu_budget_reservations
+            SET status = 'released',
+                reason = %s,
+                updated_at = %s
+            WHERE status = 'active'
+              AND updated_at <= %s
+            """,
+            (
+                _expired_reservation_reason(self._reservation_ttl_seconds),
+                pg_support.to_utc(now),
+                pg_support.to_utc(cutoff),
+            ),
+        )
+
+    async def _used_amount(self, cur: Any, limit: BudgetLimit, *, now: datetime) -> Decimal:
+        since, until = limit.window.bounds(now=now)
+        bound_sql = ""
+        params: list[object] = [
+            limit.scope,
+            limit.key,
+            limit.window.storage_key,
+            limit.currency.upper(),
+        ]
+        if since is not None:
+            bound_sql += " AND updated_at >= %s"
+            params.append(pg_support.to_utc(since))
+        if until is not None:
+            bound_sql += " AND updated_at < %s"
+            params.append(pg_support.to_utc(until))
+        await cur.execute(
+            f"""
+            SELECT reserved_amount, actual_amount, status
+            FROM cayu_budget_reservations
+            WHERE scope = %s
+              AND budget_key IS NOT DISTINCT FROM %s
+              AND budget_window = %s
+              AND currency = %s
+              AND status IN ('active', 'reconciled')
+            {bound_sql}
+            """,
+            params,
+        )
+        total = Decimal("0")
+        for row in await cur.fetchall():
+            if row[2] == "active":
+                total += row[0]
+            elif row[2] == "reconciled":
+                total += Decimal("0") if row[1] is None else row[1]
+        return total
+
+    async def _insert_record(self, cur: Any, record: BudgetReservationRecord) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_budget_reservations (
+                reservation_id,
+                scope,
+                budget_key,
+                budget_window,
+                currency,
+                session_id,
+                agent_name,
+                provider_name,
+                model,
+                reserved_amount,
+                actual_amount,
+                status,
+                reason,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                record.reservation_id,
+                record.scope,
+                record.key,
+                record.window.storage_key,
+                record.currency,
+                record.session_id,
+                record.agent_name,
+                record.provider_name,
+                record.model,
+                record.reserved_amount,
+                record.actual_amount,
+                record.status,
+                record.reason,
+                pg_support.to_utc(record.created_at),
+                pg_support.to_utc(record.updated_at),
+            ),
+        )
+
+    async def _update_record(self, cur: Any, record: BudgetReservationRecord) -> None:
+        await cur.execute(
+            """
+            UPDATE cayu_budget_reservations
+            SET actual_amount = %s,
+                status = %s,
+                reason = %s,
+                updated_at = %s
+            WHERE reservation_id = %s
+            """,
+            (
+                record.actual_amount,
+                record.status,
+                record.reason,
+                pg_support.to_utc(record.updated_at),
+                record.reservation_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise KeyError(f"Budget reservation not found: {record.reservation_id}")
+
+    async def _load_record_for_update(
+        self,
+        cur: Any,
+        reservation_id: str,
+    ) -> BudgetReservationRecord:
+        await cur.execute(
+            """
+            SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
+                   agent_name, provider_name, model, reserved_amount, actual_amount,
+                   status, reason, created_at, updated_at
+            FROM cayu_budget_reservations
+            WHERE reservation_id = %s
+            FOR UPDATE
+            """,
+            (reservation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise KeyError(f"Budget reservation not found: {reservation_id}")
+        return BudgetReservationRecord(
+            reservation_id=row[0],
+            scope=row[1],
+            key=row[2],
+            window=row[3],
+            currency=row[4],
+            session_id=row[5],
+            agent_name=row[6],
+            provider_name=row[7],
+            model=row[8],
+            reserved_amount=row[9],
+            actual_amount=row[10],
+            status=row[11],
+            reason=row[12],
+            created_at=pg_support.to_utc(row[13]),
+            updated_at=pg_support.to_utc(row[14]),
+        )
+
+    async def _active_record_for_update(
+        self,
+        cur: Any,
+        reservation_id: str,
+    ) -> BudgetReservationRecord:
+        record = await self._load_record_for_update(cur, reservation_id)
+        if record.status != "active":
+            raise ValueError(f"Budget reservation is not active: {reservation_id}")
+        return record
+
+    async def _reconcilable_record_for_update(
+        self,
+        cur: Any,
+        reservation_id: str,
+    ) -> BudgetReservationRecord:
+        record = await self._load_record_for_update(cur, reservation_id)
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
+            # Reconcile it anyway so the actual spend is recorded rather than crashing the
+            # billed run and silently undercounting the shared budget window.
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
 
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
@@ -1062,11 +1624,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 [*params, query.limit],
             )
             rows = await cur.fetchall()
-            entries = [
-                entry
-                for row in rows
-                if (entry := await self._load_entry(cur, str(row[0]))) is not None
-            ]
+            entry_map = await self._load_entries(cur, [str(row[0]) for row in rows])
+            entries = [entry for row in rows if (entry := entry_map.get(str(row[0]))) is not None]
             facets, facets_truncated = await self._list_facets(cur, query, where_sql, params)
             items, byte_truncated = await self._list_items(cur, entries, query)
         return KnowledgeListResult(
@@ -1292,6 +1851,157 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         return [row[0] for row in await cur.fetchall()]
 
+    async def _load_entries(
+        self,
+        cur: Any,
+        entry_ids: list[str],
+    ) -> dict[str, KnowledgeEntry]:
+        unique_ids = list(dict.fromkeys(entry_ids))
+        if not unique_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT
+                id,
+                namespace,
+                text,
+                kind,
+                visibility,
+                status,
+                created_by_type,
+                created_by,
+                created_at,
+                updated_at,
+                source_type,
+                source_uri,
+                source_id,
+                source_hash,
+                importance,
+                importance_source,
+                confidence,
+                last_used_at,
+                expires_at,
+                title,
+                metadata
+            FROM cayu_knowledge_entries
+            WHERE id = ANY(%s)
+            """,
+            (unique_ids,),
+        )
+        rows = await cur.fetchall()
+        labels = await self._load_labels_for_entries(cur, unique_ids)
+        aspects = await self._load_aspects_for_entries(cur, unique_ids)
+        impact_targets = await self._load_impact_targets_for_entries(cur, unique_ids)
+        return {
+            row[0]: _knowledge_entry_from_row(
+                row,
+                labels=labels.get(row[0], {}),
+                aspects=aspects.get(row[0], []),
+                impact_targets=impact_targets.get(row[0], []),
+            )
+            for row in rows
+        }
+
+    async def _load_chunks_by_ids(
+        self,
+        cur: Any,
+        chunk_ids: list[str],
+    ) -> dict[str, KnowledgeChunk]:
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        if not unique_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT id, entry_id, chunk_index, text, content_hash, source_uri, metadata
+            FROM cayu_knowledge_chunks
+            WHERE id = ANY(%s)
+            """,
+            (unique_ids,),
+        )
+        return {row[0]: _knowledge_chunk_from_row(row) for row in await cur.fetchall()}
+
+    async def _count_chunks_by_entry(
+        self,
+        cur: Any,
+        entry_ids: list[str],
+    ) -> dict[str, int]:
+        unique_ids = list(dict.fromkeys(entry_ids))
+        if not unique_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT entry_id, COUNT(*)
+            FROM cayu_knowledge_chunks
+            WHERE entry_id = ANY(%s)
+            GROUP BY entry_id
+            """,
+            (unique_ids,),
+        )
+        return {row[0]: int(row[1]) for row in await cur.fetchall()}
+
+    async def _load_labels_for_entries(
+        self,
+        cur: Any,
+        entry_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        if not entry_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT entry_id, key, value
+            FROM cayu_knowledge_labels
+            WHERE entry_id = ANY(%s)
+            ORDER BY entry_id ASC, key ASC
+            """,
+            (entry_ids,),
+        )
+        result: dict[str, dict[str, str]] = {}
+        for row in await cur.fetchall():
+            result.setdefault(row[0], {})[row[1]] = row[2]
+        return result
+
+    async def _load_aspects_for_entries(
+        self,
+        cur: Any,
+        entry_ids: list[str],
+    ) -> dict[str, list[str]]:
+        if not entry_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT entry_id, aspect
+            FROM cayu_knowledge_aspects
+            WHERE entry_id = ANY(%s)
+            ORDER BY entry_id ASC, aspect ASC
+            """,
+            (entry_ids,),
+        )
+        result: dict[str, list[str]] = {}
+        for row in await cur.fetchall():
+            result.setdefault(row[0], []).append(row[1])
+        return result
+
+    async def _load_impact_targets_for_entries(
+        self,
+        cur: Any,
+        entry_ids: list[str],
+    ) -> dict[str, list[str]]:
+        if not entry_ids:
+            return {}
+        await cur.execute(
+            """
+            SELECT entry_id, impact_target
+            FROM cayu_knowledge_impact_targets
+            WHERE entry_id = ANY(%s)
+            ORDER BY entry_id ASC, impact_target ASC
+            """,
+            (entry_ids,),
+        )
+        result: dict[str, list[str]] = {}
+        for row in await cur.fetchall():
+            result.setdefault(row[0], []).append(row[1])
+        return result
+
     async def _count_search_hits(
         self,
         cur: Any,
@@ -1376,6 +2086,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         query: KnowledgeQuery,
         terms: list[str],
     ) -> tuple[list[KnowledgeHit], bool]:
+        entries = await self._load_entries(cur, [str(row[0]) for row in rows])
+        chunks = await self._load_chunks_by_ids(cur, [str(row[1]) for row in rows])
         hits: list[KnowledgeHit] = []
         remaining = query.max_bytes
         truncated = False
@@ -1383,8 +2095,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             if remaining <= 0:
                 truncated = True
                 break
-            entry = await self._load_entry(cur, row[0])
-            chunk = await self._load_chunk(cur, row[1])
+            entry = entries.get(str(row[0]))
+            chunk = chunks.get(str(row[1]))
             if entry is None or chunk is None:
                 continue
             reason, preview_text = _knowledge_preview_for_match(entry, chunk, terms)
@@ -1434,6 +2146,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         entries: list[KnowledgeEntry],
         query: KnowledgeListQuery,
     ) -> tuple[list[KnowledgeListItem], bool]:
+        chunk_counts = await self._count_chunks_by_entry(cur, [entry.id for entry in entries])
         items: list[KnowledgeListItem] = []
         remaining = query.max_bytes
         truncated = False
@@ -1454,7 +2167,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             items.append(
                 KnowledgeListItem(
                     entry=entry,
-                    chunk_count=len(await self._load_chunks(cur, entry.id)),
+                    chunk_count=chunk_counts.get(entry.id, 0),
                     text_preview=preview,
                 )
             )
@@ -1548,7 +2261,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         stored = await super().put_entry(entry)
-        await self._embed_entry_chunks(stored.id)
+        await self._embed_entry_chunks_best_effort(stored.id)
         return stored
 
     async def delete_entry(
@@ -1568,8 +2281,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         chunks: list[KnowledgeChunk],
     ) -> list[KnowledgeChunk]:
         stored_chunks = await super().replace_chunks(entry_id, chunks)
-        await self._embed_chunks(stored_chunks)
-        await self._drop_stale_entry_embeddings(entry_id, stored_chunks)
+        await self._embed_entry_chunks_best_effort(entry_id, chunks=stored_chunks)
         return stored_chunks
 
     async def put_entry_with_chunks(
@@ -1578,7 +2290,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         chunks: list[KnowledgeChunk],
     ) -> KnowledgeEntry:
         stored = await super().put_entry_with_chunks(entry, chunks)
-        await self._embed_entry_chunks(stored.id)
+        await self._embed_entry_chunks_best_effort(stored.id)
         return stored
 
     async def backfill_embeddings(
@@ -1631,6 +2343,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 "and hybrid search modes."
             )
         await self._ensure_ready()
+        await self._lazy_backfill_search_scope(query)
         semantic_query_text = _semantic_query_text(query)
         query_vector = await self._embed_query(query, semantic_query_text)
         rows, candidate_limit_reached = await self._semantic_search_rows(query, query_vector)
@@ -2000,12 +2713,69 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         )
         return merged
 
-    async def _embed_entry_chunks(self, entry_id: str) -> None:
+    async def _embed_entry_chunks(
+        self,
+        entry_id: str,
+        *,
+        chunks: list[KnowledgeChunk] | None = None,
+    ) -> None:
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
-            chunks = await self._load_chunks(cur, entry_id)
+        if chunks is None:
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                chunks = await self._load_chunks(cur, entry_id)
         await self._embed_chunks(chunks)
         await self._drop_stale_entry_embeddings(entry_id, chunks)
+
+    async def _embed_entry_chunks_best_effort(
+        self,
+        entry_id: str,
+        *,
+        chunks: list[KnowledgeChunk] | None = None,
+    ) -> None:
+        """Embed an entry's chunks, flag-and-continuing on failure.
+
+        The durable entry/chunk write has already committed by the time this runs,
+        so an embedding-provider outage must not surface to the caller (which would
+        make a successfully-stored entry look like a failed write). We swallow the
+        error and leave the embedding rows absent; their absence is the flag that
+        ``search`` reads to lazily backfill the embeddings on the next query.
+        """
+        try:
+            await self._embed_entry_chunks(entry_id, chunks=chunks)
+        except Exception:
+            logger.warning(
+                "Deferred embedding for knowledge entry %r after a durable write; "
+                "embeddings will be backfilled lazily on the next search.",
+                entry_id,
+                exc_info=True,
+            )
+
+    async def _lazy_backfill_search_scope(self, query: KnowledgeQuery) -> None:
+        """Backfill missing embeddings within the search's filter scope.
+
+        Entries whose write-time embedding was deferred (provider outage) have no
+        embedding rows and would be invisible to semantic search. Before running
+        the semantic query we embed any such chunks that match this query's
+        structural filters, bounded by ``_PGVECTOR_LAZY_BACKFILL_LIMIT``. In steady
+        state the missing-embedding scan returns nothing, so this is a single cheap
+        query. A provider failure here is itself flag-and-continued: the search
+        proceeds against whatever embeddings already exist.
+        """
+        list_query = _knowledge_list_query_for_search(query)
+        try:
+            chunks = await self._backfill_candidate_chunks(
+                list_query,
+                _PGVECTOR_LAZY_BACKFILL_LIMIT,
+                refresh_existing=False,
+            )
+            if chunks:
+                await self._embed_chunks(chunks)
+        except Exception:
+            logger.warning(
+                "Lazy embedding backfill during search failed; searching against "
+                "already-embedded chunks only.",
+                exc_info=True,
+            )
 
     async def _embed_chunks(
         self,
@@ -2577,29 +3347,32 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    # Lock the session row so the per-session order assignment is
-                    # serialized against concurrent appends to the same session.
+                    # Reserve a contiguous block of per-session order values by
+                    # advancing the session's event counter. UPDATE ... RETURNING
+                    # row-locks the session row (serializing concurrent appends to
+                    # the same session) and hands back the new counter in one round
+                    # trip, replacing a SELECT ... FOR UPDATE + COALESCE(MAX())
+                    # scan on this hot write path. A no-op (+0) update on an empty
+                    # batch still returns the row, so a missing session is caught.
                     await cur.execute(
-                        "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
-                        (session_id,),
+                        """
+                        UPDATE cayu_sessions
+                        SET event_seq = event_seq + %s
+                        WHERE id = %s
+                        RETURNING event_seq
+                        """,
+                        (len(copied_events), session_id),
                     )
-                    if await cur.fetchone() is None:
+                    order_row = await cur.fetchone()
+                    if order_row is None:
                         raise KeyError(f"Session not found: {session_id}")
                     if not copied_events:
                         await conn.commit()
                         return
 
-                    await cur.execute(
-                        """
-                        SELECT COALESCE(MAX(session_order), 0)
-                        FROM cayu_events
-                        WHERE session_id = %s
-                        """,
-                        (session_id,),
-                    )
-                    order_row = await cur.fetchone()
-                    # COALESCE(MAX(session_order), 0) always returns exactly one row.
-                    next_order = order_row[0] if order_row is not None else 0
+                    # RETURNING yields the post-increment counter, i.e. the order
+                    # of the last event in this batch; walk back to the first.
+                    next_order = order_row[0] - len(copied_events)
                     rows = []
                     for event in copied_events:
                         next_order += 1
@@ -4072,6 +4845,28 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
     )
 
 
+def _knowledge_list_query_for_search(query: KnowledgeQuery) -> KnowledgeListQuery:
+    """Project a search query's structural filters onto a list query.
+
+    Used to bound the lazy embedding backfill to the entries a semantic search
+    could actually return. Free-text terms are dropped (backfill is scope-based),
+    but namespace/labels/kinds/statuses/visibility/aspect/impact/source/expiry
+    carry over so the backfill never embeds chunks outside the query's reach.
+    """
+    return KnowledgeListQuery(
+        namespace=query.namespace,
+        labels=dict(query.labels),
+        kinds=None if query.kinds is None else list(query.kinds),
+        statuses=list(query.statuses),
+        visibilities=None if query.visibilities is None else list(query.visibilities),
+        aspects=list(query.aspects),
+        impact_targets=list(query.impact_targets),
+        source_type=query.source_type,
+        source_id=query.source_id,
+        include_expired=query.include_expired,
+    )
+
+
 def _postgres_knowledge_list_filter_sql(
     query: KnowledgeListQuery,
 ) -> tuple[str, list[object]]:
@@ -4671,6 +5466,30 @@ def _event_watcher_state_from_row(row: tuple[Any, ...]) -> EventWatcherState:
         dead_lettered_count=row[9],
         updated_at=pg_support.to_utc(row[10]),
     )
+
+
+def _event_watcher_dead_letter_from_row(row: tuple[Any, ...]) -> EventWatcherDeadLetter:
+    return EventWatcherDeadLetter(
+        watcher_name=row[0],
+        event_id=row[1],
+        event_sequence=row[2],
+        attempts=row[3],
+        error=row[4],
+        dead_lettered_at=pg_support.to_utc(row[5]),
+        resolved_at=pg_support.to_utc_optional(row[6]),
+    )
+
+
+def _validate_dead_letter_limit(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("limit must be an integer greater than or equal to 1.")
+    return value
+
+
+def _validate_event_sequence(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("event_sequence must be an integer greater than or equal to 1.")
+    return value
 
 
 def _event_watcher_delivery_from_claim(

@@ -26,6 +26,7 @@ from cayu.artifacts import (
 from cayu.core.agents import Agent, AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -132,6 +133,7 @@ from cayu.mcp import (
     DEFAULT_MCP_REQUEST_TIMEOUT_S,
     DEFAULT_MCP_WRITE_TIMEOUT_S,
     MCP_PROTOCOL_VERSION,
+    SUPPORTED_MCP_PROTOCOL_VERSIONS,
     HttpMcpClient,
     HttpMcpSession,
     McpClient,
@@ -167,6 +169,7 @@ from cayu.providers import (
     ModelContextPressureProfile,
     ModelFinishReason,
     OpenAIProvider,
+    UsageDialect,
     VertexProvider,
 )
 from cayu.proxies import (
@@ -257,6 +260,7 @@ from cayu.runtime import (
     EventWatcher,
     EventWatcherClaim,
     EventWatcherContext,
+    EventWatcherDeadLetter,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
     EventWatcherRunResult,
@@ -507,6 +511,7 @@ __all__ = [
     "MICROSANDBOX_NAME_MAX_BYTES",
     "REDACTED_SECRET",
     "RESOLVED_FILE_ATTACHMENTS_OPTION",
+    "SUPPORTED_MCP_PROTOCOL_VERSIONS",
     "TAINT_LABELS_METADATA_KEY",
     "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
     "TRACE_LEVEL",
@@ -607,6 +612,7 @@ __all__ = [
     "EventWatcher",
     "EventWatcherClaim",
     "EventWatcherContext",
+    "EventWatcherDeadLetter",
     "EventWatcherDelivery",
     "EventWatcherDeliveryStatus",
     "EventWatcherRunResult",
@@ -617,6 +623,7 @@ __all__ = [
     "ExecResult",
     "FileAttachment",
     "FileAttachmentKind",
+    "FilePart",
     "FinalOutputContains",
     "FinalOutputMatches",
     "ForkSessionRequest",
@@ -712,6 +719,7 @@ __all__ = [
     "PdfArtifactReader",
     "PendingToolApproval",
     "PendingToolCallApproval",
+    "PostgresBudgetLedger",
     "PostgresEmbeddingBackfillResult",
     "PostgresEmbeddingKnowledgeStore",
     "PostgresEventWatcherStore",
@@ -830,6 +838,7 @@ __all__ = [
     "TranscriptPage",
     "TranscriptQuery",
     "TranscriptRecord",
+    "UsageDialect",
     "UsageMetrics",
     "UsageTriggeredContextPolicy",
     "Vault",
@@ -913,6 +922,7 @@ def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so ``import cayu`` does not depend on psycopg being installed.
     if name in {
+        "PostgresBudgetLedger",
         "PostgresEmbeddingBackfillResult",
         "PostgresEmbeddingKnowledgeStore",
         "PostgresEventWatcherStore",

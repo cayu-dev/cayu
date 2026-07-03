@@ -26,11 +26,13 @@ def _request(agent_name: str) -> RunRequest:
 
 
 _TABLES = (
+    "cayu_budget_reservations",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
     "cayu_knowledge_chunks",
     "cayu_knowledge_entries",
+    "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
     "cayu_events",
     "cayu_session_labels",

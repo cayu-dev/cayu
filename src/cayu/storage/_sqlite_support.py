@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,7 +81,6 @@ _BASELINE_DDL = """
         workflow_name TEXT,
         tool_name TEXT,
         payload_json TEXT NOT NULL,
-        event_json TEXT NOT NULL,
         UNIQUE(session_id, event_id)
     );
 
@@ -136,6 +137,17 @@ _BASELINE_DDL = """
         updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_event_watcher_dead_letters (
+        watcher_name TEXT NOT NULL,
+        event_sequence INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        error TEXT NOT NULL,
+        dead_lettered_at TEXT NOT NULL,
+        resolved_at TEXT,
+        PRIMARY KEY (watcher_name, event_sequence)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_cayu_sessions_status
         ON cayu_sessions(status);
     CREATE INDEX IF NOT EXISTS idx_cayu_sessions_agent_name
@@ -174,6 +186,8 @@ _BASELINE_DDL = """
         ON cayu_tasks(assigned_agent_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
         ON cayu_event_watcher_state(delivery_status, lease_expires_at);
+    CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved
+        ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence);
 """
 
 # Bookkeeping table created/owned by the migrator (separate from a revision's DDL).
@@ -220,18 +234,14 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
             ON cayu_event_watcher_state(delivery_status, lease_expires_at);
     """,
+    # The ADD COLUMN steps for revisions 4 and 5 live in _MIGRATION_ADD_COLUMNS
+    # (applied idempotently before this DDL) because SQLite's ALTER TABLE ADD
+    # COLUMN is not IF-NOT-EXISTS-guarded and would fail a re-run after a crash.
     4: """
-        ALTER TABLE cayu_tasks ADD COLUMN worker_id TEXT;
-        ALTER TABLE cayu_tasks ADD COLUMN lease_expires_at TEXT;
-
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_worker_id
             ON cayu_tasks(worker_id);
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status_lease
             ON cayu_tasks(status, lease_expires_at);
-    """,
-    5: """
-        ALTER TABLE cayu_tasks ADD COLUMN status_reason TEXT;
-        ALTER TABLE cayu_tasks ADD COLUMN status_payload_json TEXT;
     """,
     6: """
         CREATE TABLE IF NOT EXISTS cayu_knowledge_entries (
@@ -310,6 +320,109 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_chunks_entry_index
             ON cayu_knowledge_chunks(entry_id, chunk_index);
     """,
+    8: """
+        CREATE TABLE IF NOT EXISTS cayu_budget_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            budget_key TEXT,
+            budget_window TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reserved_amount TEXT NOT NULL,
+            actual_amount TEXT,
+            status TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_scope
+            ON cayu_budget_reservations(scope, budget_key, budget_window, currency, status);
+    """,
+    11: """
+        CREATE TABLE IF NOT EXISTS cayu_event_watcher_dead_letters (
+            watcher_name TEXT NOT NULL,
+            event_sequence INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            attempts INTEGER NOT NULL,
+            error TEXT NOT NULL,
+            dead_lettered_at TEXT NOT NULL,
+            resolved_at TEXT,
+            PRIMARY KEY (watcher_name, event_sequence)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved
+            ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence);
+    """,
+}
+
+# Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
+# ``ADD COLUMN IF NOT EXISTS``, so these are applied via _add_column_if_missing
+# (a table_info existence check) rather than raw DDL, making a re-run after a
+# crash a no-op instead of a "duplicate column name" error that wedges migrate.
+# They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
+# columns are created only after the columns exist.
+_MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    4: (
+        ("cayu_tasks", "worker_id", "TEXT"),
+        ("cayu_tasks", "lease_expires_at", "TEXT"),
+    ),
+    5: (
+        ("cayu_tasks", "status_reason", "TEXT"),
+        ("cayu_tasks", "status_payload_json", "TEXT"),
+    ),
+}
+
+# Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
+# steps, these are applied conditionally (via _drop_column_if_present) so that a
+# fresh baseline (which never created the column) and a re-run after a crash are
+# both no-ops rather than an "no such column" error that would wedge migrate.
+# Revision 9 drops cayu_events.event_json: the full serialized Event duplicated
+# what the individual indexed columns plus payload_json already carry, so it was
+# pure write amplification and unbounded storage growth. The store now
+# reconstructs Events from those columns.
+_MIGRATION_DROP_COLUMNS: dict[int, tuple[tuple[str, str], ...]] = {
+    9: (("cayu_events", "event_json"),),
+}
+
+
+def _migrate_legacy_budget_reservations(connection: sqlite3.Connection) -> None:
+    """Carry rows from the pre-revision-8 ad-hoc ``budget_reservations`` table.
+
+    Before revision 8 the SQLite budget ledger created an unprefixed
+    ``budget_reservations`` table outside the migration machinery. When such a
+    legacy table exists, copy its rows into ``cayu_budget_reservations`` and drop
+    it so active reservations survive the rename.
+    """
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'budget_reservations'"
+    ).fetchone()
+    if exists is None:
+        return
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO cayu_budget_reservations (
+            reservation_id, scope, budget_key, budget_window, currency, session_id,
+            agent_name, provider_name, model, reserved_amount, actual_amount,
+            status, reason, created_at, updated_at
+        )
+        SELECT reservation_id, scope, budget_key, window, currency, session_id,
+               agent_name, provider_name, model, reserved_amount, actual_amount,
+               status, reason, created_at, updated_at
+        FROM budget_reservations
+        """
+    )
+    connection.execute("DROP TABLE budget_reservations")
+
+
+# Per-revision Python follow-ups that cannot be expressed as unconditional DDL
+# (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
+# after its revision's DDL and before the revision is recorded.
+_MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    8: _migrate_legacy_budget_reservations,
 }
 
 
@@ -364,13 +477,63 @@ def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
     return schema.SchemaState(revision=row[0], compatible_from=row[1])
 
 
+@contextmanager
+def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """Run a block inside one explicit SQLite transaction (BEGIN/COMMIT/ROLLBACK).
+
+    Applying a revision's DDL, its data hook, the ``cayu_schema_migrations`` row,
+    and ``user_version`` in a single transaction makes each revision atomic: a
+    crash mid-revision leaves the recorded revision unchanged, so ``migrate`` can
+    safely re-run. (``executescript`` cannot be used here — it force-commits any
+    open transaction — so revision DDL is executed statement-by-statement.)
+    """
+    connection.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def _iter_statements(script: str) -> Iterator[str]:
+    """Yield the non-empty statements of a semicolon-separated DDL script.
+
+    The migration DDL contains no semicolons inside statements (no triggers or
+    string literals), so a plain split is sufficient and lets each statement run
+    individually inside an explicit transaction.
+    """
+    for raw in script.split(";"):
+        statement = raw.strip()
+        if statement:
+            yield statement
+
+
+def _add_column_if_missing(
+    connection: sqlite3.Connection, table: str, column: str, decl: str
+) -> None:
+    """Idempotently ``ALTER TABLE ... ADD COLUMN`` (SQLite lacks IF NOT EXISTS)."""
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _drop_column_if_present(connection: sqlite3.Connection, table: str, column: str) -> None:
+    """Idempotently ``ALTER TABLE ... DROP COLUMN`` (SQLite lacks IF EXISTS)."""
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column in existing:
+        connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+
 def _apply_baseline(connection: sqlite3.Connection) -> None:
-    connection.executescript(_BASELINE_DDL)
-    _record_revision(connection, schema.revision(schema.BASELINE_REVISION))
-    # user_version mirrors the revision as a cheap SQLite-native marker; the
-    # cayu_schema_migrations table remains the cross-backend source of truth.
-    connection.execute(f"PRAGMA user_version = {schema.BASELINE_REVISION}")
-    connection.commit()
+    with _transaction(connection):
+        for statement in _iter_statements(_BASELINE_DDL):
+            connection.execute(statement)
+        _record_revision(connection, schema.revision(schema.BASELINE_REVISION))
+        # user_version mirrors the revision as a cheap SQLite-native marker; the
+        # cayu_schema_migrations table remains the cross-backend source of truth.
+        connection.execute(f"PRAGMA user_version = {schema.BASELINE_REVISION}")
 
 
 def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) -> None:
@@ -379,12 +542,24 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
     for rev in schema.pending(current):
+        _apply_revision(connection, rev)
+
+
+def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:
+    with _transaction(connection):
+        for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
+            _add_column_if_missing(connection, table, column, decl)
+        for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
+            _drop_column_if_present(connection, table, column)
         ddl = _MIGRATION_STEPS.get(rev.revision)
         if ddl:
-            connection.executescript(ddl)
+            for statement in _iter_statements(ddl):
+                connection.execute(statement)
+        hook = _MIGRATION_HOOKS.get(rev.revision)
+        if hook is not None:
+            hook(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
-        connection.commit()
 
 
 def _record_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:

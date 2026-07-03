@@ -105,8 +105,18 @@ class CausalBudgetUsageSummary(BaseModel):
         return result
 
 
-# Providers whose raw usage payload follows the Anthropic shape (cache tokens in
-# separate fields, excluded from input_tokens). Claude on Vertex AI is one of them.
+# Canonical usage dialects (string values mirror ``providers.base.UsageDialect``
+# so a declared enum can be passed straight through as ``str``).
+_DIALECT_ANTHROPIC = "anthropic"
+_DIALECT_OPENAI = "openai"
+_DIALECT_GENERIC = "generic"
+_KNOWN_DIALECTS = frozenset({_DIALECT_ANTHROPIC, _DIALECT_OPENAI, _DIALECT_GENERIC})
+
+# Registered names whose raw usage payload follows the Anthropic shape (cache
+# tokens in separate fields, excluded from input_tokens). Claude on Vertex AI is
+# one of them. Retained as a fallback for the built-in aliases; unknown names
+# (Bedrock, gateways, renamed adapters) are resolved from a declared dialect or
+# the payload shape so their cache tokens are not silently undercounted.
 _ANTHROPIC_SHAPED_PROVIDERS = frozenset({"anthropic", "vertex"})
 
 
@@ -115,8 +125,16 @@ def normalize_usage_metrics(
     provider_name: str | None,
     model: str | None,
     raw_usage: Any,
+    usage_dialect: str | None = None,
 ) -> UsageMetrics | None:
-    """Normalize provider usage payloads without hiding the original raw usage."""
+    """Normalize provider usage payloads without hiding the original raw usage.
+
+    ``usage_dialect`` (a ``providers.base.UsageDialect`` value or its string) lets
+    a provider declare how it encodes cache tokens. When omitted or ``"auto"``,
+    the dialect is inferred from the provider name and then the payload shape, so
+    Anthropic-shaped payloads (Claude via Bedrock/gateways/renamed adapters) fold
+    cache read/write tokens back into ``input_tokens`` instead of undercounting.
+    """
 
     if type(raw_usage) is not dict:
         return None
@@ -159,8 +177,13 @@ def normalize_usage_metrics(
             cache_write_tokens = cache_creation_tokens
 
     provider = provider_name.strip().lower() if type(provider_name) is str else None
-    anthropic_shaped = provider in _ANTHROPIC_SHAPED_PROVIDERS
-    if provider == "openai":
+    dialect = _resolve_usage_dialect(
+        provider=provider,
+        declared_dialect=usage_dialect,
+        raw_usage=raw_usage,
+    )
+    anthropic_shaped = dialect == _DIALECT_ANTHROPIC
+    if dialect == _DIALECT_OPENAI:
         cache_read_tokens = max(cache_read_tokens, cached_input_tokens)
     elif anthropic_shaped:
         cached_input_tokens = max(cached_input_tokens, cache_read_tokens)
@@ -296,6 +319,50 @@ def _copy_string_list(value: list[str], field_name: str) -> list[str]:
             raise ValueError(f"{field_name}[{index}] must be a string.")
         result.append(require_clean_nonblank(item, f"{field_name}[{index}]"))
     return result
+
+
+def _resolve_usage_dialect(
+    *,
+    provider: str | None,
+    declared_dialect: str | None,
+    raw_usage: dict[str, Any],
+) -> str:
+    """Pick the usage dialect from an explicit declaration, name, then shape.
+
+    An explicit non-``auto`` declaration wins. Otherwise the built-in name
+    aliases are honored for backward compatibility, and finally the payload
+    shape is inspected so Anthropic-shaped usage from an unknown provider name
+    (Bedrock, gateways, renamed adapters) is still folded correctly.
+    """
+
+    declared = declared_dialect.strip().lower() if type(declared_dialect) is str else None
+    if declared in _KNOWN_DIALECTS:
+        return declared
+    if provider in _ANTHROPIC_SHAPED_PROVIDERS:
+        return _DIALECT_ANTHROPIC
+    if provider == _DIALECT_OPENAI:
+        return _DIALECT_OPENAI
+    if _is_anthropic_shaped_payload(raw_usage):
+        return _DIALECT_ANTHROPIC
+    # OpenAI-style nested ``*_tokens_details.cached_tokens`` is left as generic
+    # unless a provider declares the ``openai`` dialect: the generic path already
+    # records the cached-input counter, so shape-detecting it would only shift
+    # where those tokens surface without correcting an undercount.
+    return _DIALECT_GENERIC
+
+
+def _is_anthropic_shaped_payload(raw_usage: dict[str, Any]) -> bool:
+    """True when the payload carries Anthropic-only cache-token fields.
+
+    These top-level counters (separate cache read/write fields excluded from
+    ``input_tokens``) are unique to the Anthropic Messages usage shape, so their
+    presence classifies Claude reached through an unrecognized provider name
+    (Bedrock, gateways, renamed adapters) without a name allowlist.
+    """
+
+    if "cache_read_input_tokens" in raw_usage or "cache_creation_input_tokens" in raw_usage:
+        return True
+    return type(raw_usage.get("cache_creation")) is dict
 
 
 def _nonnegative_int(value: Any) -> int:

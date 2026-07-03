@@ -65,12 +65,42 @@ class Revision:
 # ``compatible_from`` at the prior value, a breaking one sets it to its own number.
 REVISIONS: tuple[Revision, ...] = (
     Revision(revision=1, kind=RevisionKind.BREAKING, compatible_from=1),
-    Revision(revision=2, kind=RevisionKind.BREAKING, compatible_from=2),
-    Revision(revision=3, kind=RevisionKind.BREAKING, compatible_from=3),
-    Revision(revision=4, kind=RevisionKind.BREAKING, compatible_from=4),
-    Revision(revision=5, kind=RevisionKind.BREAKING, compatible_from=5),
-    Revision(revision=6, kind=RevisionKind.BREAKING, compatible_from=6),
-    Revision(revision=7, kind=RevisionKind.ADDITIVE, compatible_from=6),
+    # Revisions 2-6 are purely additive (new tables/columns/indexes only): they
+    # add cayu_session_labels (2), cayu_event_watcher_state (3), the task
+    # worker/lease columns (4), the task status_reason/payload columns (5), and
+    # the knowledge tables (6). Older binaries keep working because the stores
+    # select explicit columns, so each inherits revision 1's floor rather than
+    # raising it.
+    Revision(revision=2, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    Revision(revision=3, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    Revision(revision=4, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    Revision(revision=5, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    Revision(revision=6, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    Revision(revision=7, kind=RevisionKind.ADDITIVE, compatible_from=1),
+    # Budget ledger DDL moves into the migration machinery and the table is
+    # renamed to the cayu_ prefix (breaking: rename + ownership change).
+    Revision(revision=8, kind=RevisionKind.BREAKING, compatible_from=8),
+    # Drop the redundant cayu_events.event_json column: the full serialized Event
+    # duplicated the individual indexed columns plus payload_json (write
+    # amplification + unbounded growth). The store now reconstructs Events from
+    # those columns, so an older binary that still SELECTs event_json can no
+    # longer read the table (breaking: floor rises to itself).
+    Revision(revision=9, kind=RevisionKind.BREAKING, compatible_from=9),
+    # Add cayu_sessions.event_seq, a per-session monotonic counter, so the
+    # Postgres append path reserves session_order values with a single
+    # UPDATE ... RETURNING instead of a SELECT ... FOR UPDATE + COALESCE(MAX())
+    # scan on the hottest write path. How session_order is assigned is now
+    # welded to that counter: a pre-10 binary appending via MAX() would leave
+    # the counter stale, so a rev-10 binary must not share the database with one
+    # (breaking: floor rises to itself). SQLite is single-connection-serialized
+    # and keeps MAX(); the revision carries no SQLite DDL.
+    Revision(revision=10, kind=RevisionKind.BREAKING, compatible_from=10),
+    # Add cayu_event_watcher_dead_letters: a durable, replayable record per event
+    # that exhausted its delivery attempts, replacing the lossy single
+    # dead_lettered_count counter + overwritten last_error on the watcher state.
+    # Purely additive (new table only) — older binaries never touch it and keep
+    # working, so the floor stays at revision 10's compatible_from.
+    Revision(revision=11, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

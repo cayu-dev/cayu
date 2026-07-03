@@ -63,6 +63,9 @@ class RunRequest(BaseModel):
     causal_budget_id: str | None = None
     task_id: str | None = None
     task_worker_id: str | None = None
+    # Per-run provider override. Resolution order for new sessions:
+    # request.provider_name -> agent spec provider_name -> app default provider.
+    provider_name: str | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -121,6 +124,7 @@ class RunRequest(BaseModel):
         "causal_budget_id",
         "task_id",
         "task_worker_id",
+        "provider_name",
         "environment_name",
     )
     @classmethod
@@ -967,6 +971,12 @@ class InMemorySessionStore(SessionStore):
         self._sessions: dict[str, Session] = {}
         self._events: dict[str, list[Event]] = {}
         self._event_records: list[EventRecord] = []
+        # Secondary indexes over ``_event_records`` (same EventRecord objects, kept in
+        # sequence-ascending order) so per-session summaries and type/session-scoped
+        # queries — including the per-step budget read path — stop scanning the global
+        # event list. Keyed by session id and by ``str(event.type)`` respectively.
+        self._session_event_records: dict[str, list[EventRecord]] = {}
+        self._type_event_records: dict[str, list[EventRecord]] = {}
         self._event_ids: dict[str, set[str]] = {}
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
@@ -1014,6 +1024,7 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session.id] = session
             self._events[session.id] = []
             self._event_ids[session.id] = set()
+            self._session_event_records[session.id] = []
             self._transcripts[session.id] = []
             return session.model_copy(deep=True)
 
@@ -1074,6 +1085,7 @@ class InMemorySessionStore(SessionStore):
             self._sessions[fork.id] = fork.model_copy(deep=True)
             self._events[fork.id] = []
             self._event_ids[fork.id] = set()
+            self._session_event_records[fork.id] = []
             self._transcripts[fork.id] = copied_transcript
             if copied_checkpoint is not None:
                 self._checkpoints[fork.id] = copied_checkpoint
@@ -1091,19 +1103,14 @@ class InMemorySessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-
-            updated = session.model_copy(
-                update={
-                    "status": status,
-                    "updated_at": datetime.now(UTC),
-                }
-            )
-            self._sessions[session_id] = updated
-            return updated.model_copy(deep=True)
+        # Delegate to the guarded transition machine with every source status
+        # allowed: preserves the unconditional (any -> status) setter contract
+        # while sharing one write path and its not-found guard.
+        return await self.transition_status(
+            session_id,
+            from_statuses=set(SessionStatus),
+            to_status=status,
+        )
 
     async def update_model(self, session_id: str, model: str) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1136,11 +1143,18 @@ class InMemorySessionStore(SessionStore):
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
+            self._session_event_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
             self._event_records = [
                 record for record in self._event_records if record.event.session_id != session_id
             ]
+            for event_type, records in list(self._type_event_records.items()):
+                remaining = [record for record in records if record.event.session_id != session_id]
+                if remaining:
+                    self._type_event_records[event_type] = remaining
+                else:
+                    del self._type_event_records[event_type]
             # Mirror the SQL FK's ON DELETE SET NULL: children keep loading, parent ref cleared.
             for child_id, child in list(self._sessions.items()):
                 if child.parent_session_id == session_id:
@@ -1278,15 +1292,19 @@ class InMemorySessionStore(SessionStore):
                 if event.id in existing_ids:
                     raise ValueError(f"Event already exists for session {session_id}: {event.id}")
 
+            session_records = self._session_event_records.setdefault(session_id, [])
             for event in copied_events:
                 stored_event = event.model_copy(deep=True)
                 self._events[session_id].append(stored_event)
-                self._event_records.append(
-                    EventRecord(
-                        sequence=self._next_event_sequence,
-                        event=stored_event,
-                    )
+                record = EventRecord(
+                    sequence=self._next_event_sequence,
+                    event=stored_event,
                 )
+                self._event_records.append(record)
+                # Share the same EventRecord across the secondary indexes; records are
+                # immutable in practice and query paths copy before returning.
+                session_records.append(record)
+                self._type_event_records.setdefault(str(stored_event.type), []).append(record)
                 existing_ids.add(stored_event.id)
                 self._next_event_sequence += 1
 
@@ -1301,9 +1319,10 @@ class InMemorySessionStore(SessionStore):
         query = copy_event_query(query)
         event_type = str(query.event_type) if query.event_type is not None else None
         async with self._lock:
+            candidates = self._query_candidate_records(query, event_type)
             records = [
                 record
-                for record in self._event_records
+                for record in candidates
                 if _event_record_matches(record, query, event_type)
                 and _event_record_matches_session(record, query, self._sessions)
             ]
@@ -1317,15 +1336,35 @@ class InMemorySessionStore(SessionStore):
                 for record in records[: query.limit]
             ]
 
+    def _query_candidate_records(
+        self,
+        query: EventQuery,
+        event_type: str | None,
+    ) -> list[EventRecord]:
+        """Pick the narrowest index that still covers a query's candidate rows.
+
+        All returned lists stay sequence-ascending so downstream ordering and
+        ``after_sequence`` paging behave exactly as a full scan would.
+        """
+        if query.session_id is not None:
+            return self._session_event_records.get(query.session_id, [])
+        if query.session_ids:
+            merged: list[EventRecord] = []
+            for session_id in query.session_ids:
+                merged.extend(self._session_event_records.get(session_id, []))
+            merged.sort(key=lambda record: record.sequence)
+            return merged
+        if event_type is not None:
+            return self._type_event_records.get(event_type, [])
+        return self._event_records
+
     async def summarize_events(self, session_id: str) -> EventSummary:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
 
-            records = [
-                record for record in self._event_records if record.event.session_id == session_id
-            ]
+            records = self._session_event_records.get(session_id, [])
             return event_summary_from_records(session_id, records)
 
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
@@ -1335,9 +1374,7 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
 
-            records = [
-                record for record in self._event_records if record.event.session_id == session_id
-            ]
+            records = self._session_event_records.get(session_id, [])
             return session_outcome_from_records(session, records)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
@@ -1669,6 +1706,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
+        provider_name=request.provider_name,
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),
@@ -1955,6 +1993,11 @@ def decode_session_cursor(cursor: str) -> tuple[datetime, str]:
         sort_value = datetime.fromisoformat(decoded[0])
     except ValueError as exc:
         raise ValueError("Invalid session cursor.") from exc
+    # Sort values are always encoded as UTC-aware timestamps; a naive datetime is
+    # a malformed/forged cursor that would raise TypeError when later compared
+    # against the timezone-aware session timestamps.
+    if sort_value.tzinfo is None:
+        raise ValueError("Invalid session cursor.")
     return sort_value, decoded[1]
 
 

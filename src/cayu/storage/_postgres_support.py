@@ -36,6 +36,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         status TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL,
+        event_seq BIGINT NOT NULL DEFAULT 0,
         metadata JSONB NOT NULL
     )
     """,
@@ -114,6 +115,18 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at TIMESTAMPTZ NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_event_watcher_dead_letters (
+        watcher_name TEXT NOT NULL,
+        event_sequence BIGINT NOT NULL,
+        event_id TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        error TEXT NOT NULL,
+        dead_lettered_at TIMESTAMPTZ NOT NULL,
+        resolved_at TIMESTAMPTZ,
+        PRIMARY KEY (watcher_name, event_sequence)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_status ON cayu_sessions(status)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_agent_name ON cayu_sessions(agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_environment_name "
@@ -139,6 +152,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_tasks(assigned_agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery "
     "ON cayu_event_watcher_state(delivery_status, lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved "
+    "ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence)",
 )
 
 # Bookkeeping table created/owned by the migrator (separate from a revision's DDL).

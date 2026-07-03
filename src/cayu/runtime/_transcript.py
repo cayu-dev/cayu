@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from cayu._validation import copy_json_value
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -48,7 +49,9 @@ def assistant_message(
     content_parts: list[AssistantTextPart | AssistantThinkingPart | ToolCallPart],
     provider_state_parts: list[ProviderStatePart],
 ) -> Message | None:
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart] = []
+    content: list[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+    ] = []
     for part in content_parts:
         if type(part) is AssistantTextPart:
             if part.text.strip():

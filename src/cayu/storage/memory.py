@@ -266,6 +266,7 @@ class KnowledgeQuery(BaseModel):
     source_type: str | None = None
     source_id: str | None = None
     mode: KnowledgeSearchMode = KnowledgeSearchMode.AUTO
+    min_score: float | None = None
     include_expired: bool = False
     limit: int = DEFAULT_KNOWLEDGE_LIMIT
     max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
@@ -281,6 +282,13 @@ class KnowledgeQuery(BaseModel):
         if value is None:
             return None
         return require_nonblank(value, info.field_name)
+
+    @field_validator("min_score", mode="before")
+    @classmethod
+    def validate_optional_min_score(cls, value, info) -> float | None:
+        if value is None:
+            return None
+        return _validate_unit_float(value, info.field_name)
 
     @field_validator("namespace")
     @classmethod
@@ -1354,6 +1362,7 @@ def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
         source_type=query.source_type,
         source_id=query.source_id,
         mode=query.mode,
+        min_score=query.min_score,
         include_expired=query.include_expired,
         limit=query.limit,
         max_bytes=query.max_bytes,

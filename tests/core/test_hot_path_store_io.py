@@ -185,8 +185,8 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
             EventType.TOOL_CALL_STARTED,
         ]
 
-        # No new events: no duplicate usage-bearing events are accumulated.
-        assert await tracker.usage_events() == first
+        # No new events: the cached tail is returned as-is.
+        assert await tracker.usage_events() is first
 
         await store.append_events(
             "sess_tracker",

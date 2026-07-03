@@ -952,6 +952,85 @@ def test_postgres_session_store_concurrent_appends_keep_contiguous_order(postgre
     _run(postgres_dsn, ops)
 
 
+def test_postgres_session_store_append_advances_event_seq_counter(postgres_dsn):
+    """append_events must advance cayu_sessions.event_seq to the last order."""
+
+    async def ops(store):
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_counter",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+
+        import psycopg
+
+        async def read_counter() -> int:
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute(
+                    "SELECT event_seq FROM cayu_sessions WHERE id = %s",
+                    ("sess_counter",),
+                )
+                row = await cur.fetchone()
+            assert row is not None
+            return row[0]
+
+        # A freshly created session starts at 0 (no events reserved yet).
+        assert await read_counter() == 0
+
+        await store.append_events(
+            "sess_counter",
+            [
+                Event(
+                    id=f"a_{i}",
+                    type=EventType.MODEL_TEXT_DELTA,
+                    session_id="sess_counter",
+                    payload={"i": i},
+                )
+                for i in range(3)
+            ],
+        )
+        assert await read_counter() == 3
+
+        await store.append_event(
+            "sess_counter",
+            Event(
+                id="a_last",
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_counter",
+                payload={"finish_reason": "stop"},
+            ),
+        )
+        assert await read_counter() == 4
+
+        # An empty batch neither advances the counter nor raises for a live session.
+        await store.append_events("sess_counter", [])
+        assert await read_counter() == 4
+
+        # The counter tracks the highest stored session_order exactly.
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT MAX(session_order) FROM cayu_events WHERE session_id = %s",
+                ("sess_counter",),
+            )
+            max_order = (await cur.fetchone())[0]
+        assert max_order == 4
+
+        # A missing session still raises, even for an empty batch.
+        with pytest.raises(KeyError):
+            await store.append_events("missing_counter", [])
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_session_store_failed_checkpoint_transition_is_transactional(postgres_dsn):
     """If the transform raises, neither status nor checkpoint may change."""
 

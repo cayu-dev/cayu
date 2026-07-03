@@ -24,6 +24,7 @@ from cayu.artifacts import (
 from cayu.core.agents import AgentSpec
 from cayu.core.events import EventType
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -1759,6 +1760,7 @@ class ModelCompactor(ContextCompactor):
                     provider_name=provider_name,
                     fallback_model=self.model,
                     compactor=type(self).__name__,
+                    usage_dialect=self.provider.usage_dialect,
                 )
             ],
         )
@@ -2062,7 +2064,7 @@ def strip_old_file_attachments(
             continue
 
         projected_parts: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
         ] = []
         for part_index, part in enumerate(message.content):
             if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
@@ -2508,7 +2510,7 @@ def _messages_digest(messages: list[Message]) -> str:
 
 
 def _message_part_digest(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
 ) -> str:
     if type(part) is TextPart:
         return part.text
@@ -2528,6 +2530,11 @@ def _message_part_digest(
         # Marker only: reasoning text is provider-internal and must not leak into the
         # compaction digest shown to the model.
         return "[thinking]"
+    if type(part) is FilePart:
+        return (
+            f"[file filename={part.attachment.get('filename')} "
+            f"content_type={part.attachment.get('content_type')}]"
+        )
     raise TypeError("Unsupported message part.")
 
 
@@ -2545,6 +2552,7 @@ def _compaction_model_completed_payload(
     provider_name: str,
     fallback_model: str,
     compactor: str,
+    usage_dialect: str | None = None,
 ) -> dict[str, Any]:
     """Build an event-ready ``model.completed`` payload for a compaction call.
 
@@ -2567,6 +2575,7 @@ def _compaction_model_completed_payload(
             provider_name=provider_name,
             model=resolved_model,
             raw_usage=payload.get("usage"),
+            usage_dialect=usage_dialect,
         )
     )
     if usage_metrics is not None:

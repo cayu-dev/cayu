@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -889,8 +890,124 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    assert revisions == [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 6)]
+    # Revisions 2-7 and 11 are purely additive, so they inherit the prior floor;
+    # only the breaking revisions (1, 8, 9, 10) raise compatible_from to themselves.
+    assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
+    assert revisions == [
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (5, 1),
+        (6, 1),
+        (7, 1),
+        (8, 8),
+        (9, 9),
+        (10, 10),
+        (11, 10),
+    ]
     assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_migrate_recovers_from_a_crashed_partial_revision(tmp_path):
+    # Simulate a crash that applied revision 4's ADD COLUMN steps but died before
+    # recording the revision (the exact wedge the atomic/idempotent hardening
+    # closes): the recorded revision is still 1 but cayu_tasks already has the
+    # revision-4 columns. A re-run must not fail with "duplicate column name".
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(sqlite_support._BASELINE_DDL)
+        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.execute(
+            "INSERT INTO cayu_schema_migrations "
+            "(revision, kind, compatible_from, checksum, applied_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1, str(schema_migrations.RevisionKind.BREAKING), 1, None, "2026-01-01T00:00:00+00:00"),
+        )
+        # Partial revision-4 application: columns added, revision not yet recorded.
+        connection.execute("ALTER TABLE cayu_tasks ADD COLUMN worker_id TEXT")
+        connection.execute("ALTER TABLE cayu_tasks ADD COLUMN lease_expires_at TEXT")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Must not raise; the idempotent ADD COLUMN skips the already-present columns.
+    store = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def _use() -> None:
+        created = await store.create(
+            RunRequest(agent_name="assistant", messages=[Message.text("user", "hi")]),
+            identity=_identity(),
+        )
+        assert await store.load(created.id) is not None
+        await _close(store)
+
+    asyncio.run(_use())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revisions = connection.execute(
+            "SELECT revision FROM cayu_schema_migrations ORDER BY revision"
+        ).fetchall()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert [row[0] for row in revisions] == [rev.revision for rev in schema_migrations.REVISIONS]
+    assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_migrate_revision_is_atomic_on_failure(tmp_path):
+    # If a revision's data hook raises, the whole revision rolls back: no columns,
+    # no recorded revision, user_version unchanged (crash cannot wedge migrate).
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(sqlite_support._BASELINE_DDL)
+        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        connection.execute(
+            "INSERT INTO cayu_schema_migrations "
+            "(revision, kind, compatible_from, checksum, applied_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1, str(schema_migrations.RevisionKind.BREAKING), 1, None, "2026-01-01T00:00:00+00:00"),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    def _boom(_conn: sqlite3.Connection) -> None:
+        raise RuntimeError("simulated crash during revision 4")
+
+    connection = sqlite_support.connect(db_path)
+    try:
+        original = dict(sqlite_support._MIGRATION_HOOKS)
+        sqlite_support._MIGRATION_HOOKS[4] = _boom
+        try:
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                sqlite_support._apply_pending(
+                    connection, sqlite_support.read_schema_state(connection)
+                )
+        finally:
+            sqlite_support._MIGRATION_HOOKS.clear()
+            sqlite_support._MIGRATION_HOOKS.update(original)
+
+        # Revision 4's ADD COLUMN was rolled back atomically with the failed hook.
+        task_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_tasks)").fetchall()
+        }
+        assert "worker_id" not in task_columns
+        # Revisions 2 and 3 (which precede 4 and have no hook) committed cleanly.
+        recorded = {
+            row[0]
+            for row in connection.execute("SELECT revision FROM cayu_schema_migrations").fetchall()
+        }
+        assert recorded == {1, 2, 3}
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    finally:
+        connection.close()
 
 
 def test_sqlite_session_store_filters_session_label_selectors(tmp_path):
@@ -1197,3 +1314,222 @@ def test_sqlite_connect_rejects_read_only_in_memory_database():
 
     with pytest.raises(ValueError, match="file-backed"):
         sqlite_support.connect(Path(":memory:"), read_only=True)
+
+
+def _make_event(session_id: str, *, seq: int, timestamp) -> Event:
+    return Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id=session_id,
+        agent_name="assistant",
+        tool_name="read_file",
+        timestamp=timestamp,
+        payload={"n": seq},
+    )
+
+
+def test_sqlite_events_reconstructed_from_columns_without_event_json(tmp_path):
+    from cayu.runtime import EventQuery
+
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_events",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        original = _make_event(session.id, seq=1, timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        await store.append_event(session.id, original)
+
+        loaded = await store.load_events(session.id)
+        assert loaded == [original]
+
+        records = await store.query_events(EventQuery(session_id=session.id))
+        assert [record.event for record in records] == [original]
+
+        summary = await store.summarize_events(session.id)
+        assert summary.latest_event is not None
+        assert summary.latest_event.event == original
+        await _close(store)
+
+    asyncio.run(run())
+
+    # The redundant event_json column must be absent from a freshly created DB.
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_events)").fetchall()
+        }
+    finally:
+        connection.close()
+    assert "event_json" not in columns
+    assert "payload_json" in columns
+
+
+def test_sqlite_migrate_drops_legacy_event_json_column(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    connection = sqlite3.connect(db_path)
+    try:
+        # Recreate the pre-revision-9 cayu_events shape (with event_json), plus
+        # the minimal sessions table the FK/reads need, recorded at revision 8.
+        connection.executescript(sqlite_support._BASELINE_DDL)
+        connection.execute("DROP TABLE cayu_events")
+        connection.execute(
+            """
+            CREATE TABLE cayu_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                agent_name TEXT,
+                environment_name TEXT,
+                workflow_name TEXT,
+                tool_name TEXT,
+                payload_json TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                UNIQUE(session_id, event_id)
+            )
+            """
+        )
+        connection.execute(sqlite_support._MIGRATIONS_TABLE_DDL)
+        for rev in schema_migrations.REVISIONS:
+            if rev.revision > 8:
+                continue
+            connection.execute(
+                "INSERT INTO cayu_schema_migrations "
+                "(revision, kind, compatible_from, checksum, applied_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    rev.revision,
+                    str(rev.kind),
+                    rev.compatible_from,
+                    None,
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+        connection.execute("PRAGMA user_version = 8")
+        # A pre-existing event row (with the redundant event_json populated).
+        connection.execute(
+            """
+            INSERT INTO cayu_sessions (
+                id, agent_name, provider_name, model, parent_session_id,
+                causal_budget_id, runtime_name, runtime_version, environment_name,
+                status, created_at, updated_at, metadata_json
+            ) VALUES ('sess_legacy', 'assistant', 'fake', 'fake-model', NULL,
+                'sess_legacy', 'cayu', NULL, NULL, 'pending',
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_events (
+                session_id, event_id, event_type, timestamp, agent_name,
+                environment_name, workflow_name, tool_name, payload_json, event_json
+            ) VALUES ('sess_legacy', 'evt_1', 'tool.call.completed',
+                '2026-01-01T00:00:00+00:00', 'assistant', NULL, NULL, 'read_file',
+                '{"n":1}',
+                '{"type":"tool.call.completed","session_id":"sess_legacy","id":"evt_1","timestamp":"2026-01-01T00:00:00+00:00","agent_name":"assistant","environment_name":null,"workflow_name":null,"tool_name":"read_file","payload":{"n":1}}')
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def run() -> None:
+        events = await store.load_events("sess_legacy")
+        assert len(events) == 1
+        assert events[0].id == "evt_1"
+        assert events[0].payload == {"n": 1}
+        assert events[0].tool_name == "read_file"
+        await _close(store)
+
+    asyncio.run(run())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_events)").fetchall()
+        }
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+    assert "event_json" not in columns
+    assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_prune_events_bounds_growth(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prune",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        old = _make_event(session.id, seq=1, timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        new = _make_event(session.id, seq=2, timestamp=datetime(2026, 3, 1, tzinfo=UTC))
+        await store.append_events(session.id, [old, new])
+
+        deleted = await store.prune_events(
+            before=datetime(2026, 2, 1, tzinfo=UTC), session_id=session.id
+        )
+        assert deleted == 1
+        remaining = await store.load_events(session.id)
+        assert [event.payload for event in remaining] == [{"n": 2}]
+
+        # Unknown session is rejected; wrong-type cutoff is rejected.
+        with pytest.raises(KeyError):
+            await store.prune_events(before=datetime(2026, 2, 1, tzinfo=UTC), session_id="missing")
+        with pytest.raises(TypeError):
+            await store.prune_events(before="2026-02-01")  # type: ignore[arg-type]
+
+        # A store-wide prune (no session_id) drops the rest.
+        assert await store.prune_events(before=datetime(2026, 4, 1, tzinfo=UTC)) == 1
+        assert await store.load_events(session.id) == []
+        await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_compact_transcript_keeps_recent_messages(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        messages = [Message.text("user", f"m{index}") for index in range(5)]
+        await store.append_transcript_messages(session.id, messages)
+
+        deleted = await store.compact_transcript(session.id, keep_last=2)
+        assert deleted == 3
+        kept = await store.load_transcript(session.id)
+        assert [message.content[0].text for message in kept] == ["m3", "m4"]
+
+        # keep_last larger than the transcript deletes nothing.
+        assert await store.compact_transcript(session.id, keep_last=10) == 0
+
+        with pytest.raises(ValueError):
+            await store.compact_transcript(session.id, keep_last=-1)
+        with pytest.raises(KeyError):
+            await store.compact_transcript("missing", keep_last=1)
+        await _close(store)
+
+    asyncio.run(run())

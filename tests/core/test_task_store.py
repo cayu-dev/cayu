@@ -637,6 +637,37 @@ def test_sqlite_task_store_rejects_stale_cross_connection_transitions(tmp_path):
     asyncio.run(run_store_operations())
 
 
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_claim_is_fifo_regardless_of_display_order(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_old", type="review"))
+        await store.create_task(TaskCreate(task_id="task_new", type="review"))
+
+        # Even when the query asks for a descending display order, claiming stays
+        # FIFO and dispatches the oldest pending task first.
+        first = await store.claim_task(
+            "worker_a",
+            TaskQuery(type="review", order_by=TaskOrder.CREATED_AT_DESC),
+        )
+        assert first is not None
+        assert first.id == "task_old"
+
+        second = await store.claim_task(
+            "worker_b",
+            TaskQuery(type="review", order_by=TaskOrder.UPDATED_AT_DESC),
+        )
+        assert second is not None
+        assert second.id == "task_new"
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
 def _make_store(store_factory: StoreFactory, tmp_path) -> TaskStore:
     if store_factory is SQLiteTaskStore:
         return SQLiteTaskStore(tmp_path / "tasks.sqlite")

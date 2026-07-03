@@ -9,6 +9,7 @@ from pathlib import Path
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
+    EventWatcherDeadLetter,
     EventWatcherDelivery,
     EventWatcherDeliveryStatus,
     EventWatcherState,
@@ -187,6 +188,16 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                         deep=True,
                     )
                     status = EventWatcherDeliveryStatus.DEAD_LETTERED
+                    self._insert_dead_letter_unlocked(
+                        EventWatcherDeadLetter(
+                            watcher_name=claim.watcher_name,
+                            event_id=claim.event_id,
+                            event_sequence=claim.event_sequence,
+                            attempts=claim.attempt,
+                            error=error,
+                            dead_lettered_at=now,
+                        )
+                    )
                 else:
                     updated = state.model_copy(
                         update={
@@ -211,9 +222,121 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                 self._connection.rollback()
                 raise
 
+    async def list_dead_letters(
+        self,
+        watcher_name: str,
+        *,
+        include_resolved: bool = False,
+        limit: int = 100,
+    ) -> list[EventWatcherDeadLetter]:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        limit = _validate_dead_letter_limit(limit)
+        clause = "" if include_resolved else "AND resolved_at IS NULL"
+        async with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT
+                    watcher_name,
+                    event_id,
+                    event_sequence,
+                    attempts,
+                    error,
+                    dead_lettered_at,
+                    resolved_at
+                FROM cayu_event_watcher_dead_letters
+                WHERE watcher_name = ?
+                {clause}
+                ORDER BY event_sequence ASC
+                LIMIT ?
+                """,
+                (watcher_name, limit),
+            ).fetchall()
+            return [_dead_letter_from_row(row) for row in rows]
+
+    async def resolve_dead_letter(
+        self,
+        watcher_name: str,
+        event_sequence: int,
+    ) -> EventWatcherDeadLetter:
+        watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
+        event_sequence = _validate_event_sequence(event_sequence)
+        now = self._clock()
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    """
+                    SELECT
+                        watcher_name,
+                        event_id,
+                        event_sequence,
+                        attempts,
+                        error,
+                        dead_lettered_at,
+                        resolved_at
+                    FROM cayu_event_watcher_dead_letters
+                    WHERE watcher_name = ? AND event_sequence = ?
+                    """,
+                    (watcher_name, event_sequence),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"No dead-letter record for watcher {watcher_name!r} "
+                        f"at sequence {event_sequence}."
+                    )
+                record = _dead_letter_from_row(row)
+                if record.resolved_at is None:
+                    resolved_at = now
+                    self._connection.execute(
+                        """
+                        UPDATE cayu_event_watcher_dead_letters
+                        SET resolved_at = ?
+                        WHERE watcher_name = ? AND event_sequence = ?
+                        """,
+                        (
+                            sqlite_support.format_datetime(resolved_at),
+                            watcher_name,
+                            event_sequence,
+                        ),
+                    )
+                    record = record.model_copy(update={"resolved_at": resolved_at}, deep=True)
+                self._connection.commit()
+                return record
+            except Exception:
+                self._connection.rollback()
+                raise
+
     async def close(self) -> None:
         async with self._lock:
             self._connection.close()
+
+    def _insert_dead_letter_unlocked(self, dead_letter: EventWatcherDeadLetter) -> None:
+        # INSERT OR REPLACE keeps a re-dead-lettering of the same (watcher, sequence)
+        # idempotent; in practice the cursor advances past a dead-lettered event so
+        # this collides only on a replayed-then-refailed record.
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO cayu_event_watcher_dead_letters (
+                watcher_name,
+                event_sequence,
+                event_id,
+                attempts,
+                error,
+                dead_lettered_at,
+                resolved_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dead_letter.watcher_name,
+                dead_letter.event_sequence,
+                dead_letter.event_id,
+                dead_letter.attempts,
+                dead_letter.error,
+                sqlite_support.format_datetime(dead_letter.dead_lettered_at),
+                _format_optional_datetime(dead_letter.resolved_at),
+            ),
+        )
 
     def _load_state_unlocked(self, watcher_name: str) -> EventWatcherState:
         row = self._connection.execute(
@@ -303,6 +426,30 @@ def _state_from_row(row: sqlite3.Row) -> EventWatcherState:
         dead_lettered_count=row["dead_lettered_count"],
         updated_at=sqlite_support.parse_datetime(row["updated_at"]),
     )
+
+
+def _dead_letter_from_row(row: sqlite3.Row) -> EventWatcherDeadLetter:
+    return EventWatcherDeadLetter(
+        watcher_name=row["watcher_name"],
+        event_id=row["event_id"],
+        event_sequence=row["event_sequence"],
+        attempts=row["attempts"],
+        error=row["error"],
+        dead_lettered_at=sqlite_support.parse_datetime(row["dead_lettered_at"]),
+        resolved_at=_parse_optional_datetime(row["resolved_at"]),
+    )
+
+
+def _validate_dead_letter_limit(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("limit must be an integer greater than or equal to 1.")
+    return value
+
+
+def _validate_event_sequence(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("event_sequence must be an integer greater than or equal to 1.")
+    return value
 
 
 def _delivery_from_claim(
