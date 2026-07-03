@@ -10,6 +10,15 @@ from cayu.runtime.usage import SessionUsageSummary
 
 
 class StopLimit(StrEnum):
+    """Kinds of limits that can stop a session run.
+
+    ``first_reached_limit`` produces the token, tool-call, and elapsed-time
+    kinds. ``ESTIMATED_COST`` is produced by request-budget evaluation
+    (``BudgetLimit``), whose ``StopDecision`` carries ``Decimal`` cost values
+    in ``maximum`` and ``actual``; it is never returned by
+    ``first_reached_limit``.
+    """
+
     INPUT_TOKENS = "input_tokens"
     OUTPUT_TOKENS = "output_tokens"
     TOTAL_TOKENS = "total_tokens"
@@ -21,8 +30,15 @@ class StopLimit(StrEnum):
 class RunLimits(BaseModel):
     """Optional hard limits for one session run or resume call.
 
-    Token and tool-call limits are evaluated against the durable session event
-    stream. Elapsed time is evaluated against the current runtime invocation.
+    Every limit is evaluated against the clock selected by ``scope``:
+
+    - ``scope="run"`` (the default): token, tool-call, and elapsed-time
+      limits all measure the current runtime invocation — usage deltas since
+      the run entered and wall time since the run started.
+    - ``scope="session"``: token, tool-call, and elapsed-time limits all
+      measure the whole durable session — cumulative usage from the session
+      event stream and wall time since the session was created. A resumed
+      session that already meets a limit stops immediately.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -32,7 +48,7 @@ class RunLimits(BaseModel):
     max_total_tokens: StrictInt | None = Field(default=None, ge=1)
     max_tool_calls: StrictInt | None = Field(default=None, ge=1)
     max_elapsed_seconds: StrictInt | None = Field(default=None, ge=1)
-    scope: Literal["session", "run"] = "session"
+    scope: Literal["session", "run"] = "run"
 
 
 class StopDecision(BaseModel):
@@ -131,10 +147,11 @@ def first_reached_limit(
     )
     for limit, maximum, actual, stop_on_equal in checks:
         if maximum is not None and (actual > maximum or (stop_on_equal and actual == maximum)):
+            comparator = ">=" if stop_on_equal else ">"
             return StopDecision(
                 limit=limit,
                 maximum=maximum,
                 actual=actual,
-                message=f"Run limit reached: {limit.value} {actual} >= {maximum}.",
+                message=f"Run limit reached: {limit.value} {actual} {comparator} {maximum}.",
             )
     return None

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
+from math import isfinite
 from types import MappingProxyType
 from typing import Any, cast
 from uuid import uuid4
@@ -62,6 +63,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelContextPressureProfile,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
@@ -382,6 +384,7 @@ _INTERRUPTED_EVENT_WAIT_ATTEMPTS = 10
 _INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
 _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 600
 _ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
+_STREAM_INTERRUPT_POLL_INTERVAL_S = 0.05
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
@@ -389,11 +392,78 @@ _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 _ABANDONED_RUN_REASON = "event_stream_closed"
+DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 
 def _is_background_subagent_session(session: Session) -> bool:
     subagent = session.metadata.get("subagent")
     return isinstance(subagent, dict) and subagent.get("mode") == "background"
+
+
+class _SessionUsageTracker:
+    """Incrementally accumulates usage-bearing events for limit checks.
+
+    Run-limit and request-budget checks run at every phase boundary (before
+    the model step, after the model step, before a tool round, and before each
+    tool call). Instead of reloading and re-parsing the session's full event
+    log on every check, the tracker loads one ordered tail after the last
+    sequence it has seen, filters usage-bearing event types in memory, and
+    folds them into an in-memory list. Advancing the watermark from a single
+    ordered read preserves sequence semantics even if other code appends events
+    between checks.
+    """
+
+    _EVENT_TYPES = (EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED)
+
+    def __init__(self, app: CayuApp, *, session_id: str) -> None:
+        self._app = app
+        self._session_id = session_id
+        self._after_sequence: int | None = None
+        self._events: list[Event] = []
+
+    async def usage_events(self) -> list[Event]:
+        records = await self._app._query_all_event_records(
+            EventQuery(
+                session_id=self._session_id,
+                after_sequence=self._after_sequence,
+            )
+        )
+        if records:
+            self._events.extend(
+                record.event for record in records if record.event.type in self._EVENT_TYPES
+            )
+            self._after_sequence = records[-1].sequence
+        return list(self._events)
+
+
+class _StreamInterruptPoll:
+    """Bounds per-delta interrupt polling while a model response streams.
+
+    Phase-boundary interrupt checks always read the session store, so
+    cooperative interrupts keep their exact semantics at every step, tool
+    round, and tool call. The per-delta check inside the provider stream only
+    bounds interrupt latency mid-response; loading the session on every text
+    delta turns streaming into a store hot loop. The poll therefore hits the
+    store at most every ``_STREAM_INTERRUPT_POLL_INTERVAL_S`` seconds — unless
+    the in-process interrupt signal (set by ``interrupt_session`` after it
+    persists ``INTERRUPTING``) is set, which bypasses the throttle so
+    in-process interrupts are still observed on the next delta.
+    """
+
+    def __init__(self, app: CayuApp, *, session_id: str) -> None:
+        self._app = app
+        self._session_id = session_id
+        self._last_poll = time.monotonic()
+
+    async def raise_if_interrupted(self) -> None:
+        now = time.monotonic()
+        if (
+            not self._app._session_interrupt_signalled(self._session_id)
+            and now - self._last_poll < _STREAM_INTERRUPT_POLL_INTERVAL_S
+        ):
+            return
+        self._last_poll = now
+        await self._app._raise_if_session_interrupted(self._session_id)
 
 
 class _LimitGate:
@@ -433,6 +503,7 @@ class _LimitGate:
         self._run_baseline = run_baseline
         self._budget_baseline_events = budget_baseline_events
         self._budget_notify_events = budget_notify_events
+        self._usage_tracker = _SessionUsageTracker(app, session_id=session.id)
         self.tripped = False
 
     async def evaluate_limits(
@@ -461,6 +532,7 @@ class _LimitGate:
             budget_baseline_events=self._budget_baseline_events,
             pending_tool_calls=pending_tool_calls,
             budget_notify_events=self._budget_notify_events,
+            usage_tracker=self._usage_tracker,
         )
         for event in budget_events:
             yield event
@@ -703,34 +775,28 @@ class _ToolRoundRunner:
             raise _SessionInterrupted(approval)
 
         policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_plan.outcomes}
+        if len(tool_calls) > 1 and app._max_parallel_tool_calls > 1:
+            call_stream = self._run_tool_calls_parallel(
+                tool_calls=tool_calls,
+                tool_outcomes=tool_outcomes,
+                policy_results_by_id=policy_results_by_id,
+                tool_round_id=tool_round_id,
+            )
+        else:
+            call_stream = self._run_tool_calls_sequential(
+                messages=messages,
+                tool_calls=tool_calls,
+                tool_outcomes=tool_outcomes,
+                policy_results_by_id=policy_results_by_id,
+                tool_round_id=tool_round_id,
+            )
         try:
-            for tool_call in tool_calls:
-                await app._raise_if_session_interrupted(session.id)
-                async for event in self._limit_gate.evaluate_limits(
-                    messages=messages,
-                    tool_calls=tool_calls,
-                    completed_tool_outcomes=tool_outcomes,
-                    pending_tool_calls=1,
-                    tool_round_id=tool_round_id,
-                ):
-                    yield event
-                if self._limit_gate.tripped:
-                    self.stopped_for_limit = True
-                    return
-                async for event, outcome in app._execute_tool_call(
-                    session=session,
-                    registered_agent=self._registered_agent,
-                    registered_environment=self._registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=self._request_metadata,
-                    task_id=self._task_id,
-                    policy_result=policy_results_by_id.get(tool_call.id),
-                    tool_round_id=tool_round_id,
-                ):
-                    yield event
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
-                await app._raise_if_session_interrupted(session.id)
+            async for event, outcome in call_stream:
+                yield event
+                if outcome is not None:
+                    tool_outcomes.append(outcome)
+            if self.stopped_for_limit:
+                return
         except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
             async for event in self._interrupt_guard.close_tool_round(
                 exc,
@@ -761,6 +827,144 @@ class _ToolRoundRunner:
                 )
             raise
 
+    async def _run_tool_calls_sequential(
+        self,
+        *,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        tool_outcomes: list[runtime_records.ToolCallOutcome],
+        policy_results_by_id: dict[str, ToolPolicyResult | None],
+        tool_round_id: str | None,
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        """Execute tool calls one at a time with per-call limit re-evaluation.
+
+        ``tool_outcomes`` is the caller-owned accumulator; the caller appends
+        yielded outcomes to it, so mid-round limit checks observe completed
+        calls. Sets ``stopped_for_limit`` and returns when a limit trips.
+        """
+        app = self._app
+        session = self._session
+        for tool_call in tool_calls:
+            await app._raise_if_session_interrupted(session.id)
+            async for event in self._limit_gate.evaluate_limits(
+                messages=messages,
+                tool_calls=tool_calls,
+                completed_tool_outcomes=tool_outcomes,
+                pending_tool_calls=1,
+                tool_round_id=tool_round_id,
+            ):
+                yield event, None
+            if self._limit_gate.tripped:
+                self.stopped_for_limit = True
+                return
+            async for event, outcome in app._execute_tool_call(
+                session=session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                tool_call=tool_call,
+                request_metadata=self._request_metadata,
+                task_id=self._task_id,
+                policy_result=policy_results_by_id.get(tool_call.id),
+                tool_round_id=tool_round_id,
+            ):
+                yield event, outcome
+            await app._raise_if_session_interrupted(session.id)
+
+    async def _run_tool_calls_parallel(
+        self,
+        *,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        tool_outcomes: list[runtime_records.ToolCallOutcome],
+        policy_results_by_id: dict[str, ToolPolicyResult | None],
+        tool_round_id: str | None,
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        """Execute a multi-call tool round concurrently, capped by a semaphore.
+
+        Each call's events are buffered and yielded in the model's original
+        tool-call order so consumers and the transcript observe the same
+        ordering as sequential execution. The round was gated against run
+        limits as a whole before execution; mid-round re-evaluation is
+        skipped. When the round is interrupted, completed outcomes are
+        flushed into the caller-owned ``tool_outcomes`` accumulator (nothing
+        has been yielded yet) so the interrupt guard preserves finished
+        results, and a child cancellation carrying runner cleanup artifacts
+        is re-raised in place of the bare cancellation.
+        """
+        app = self._app
+        session = self._session
+        semaphore = asyncio.Semaphore(app._max_parallel_tool_calls)
+        buffers: list[list[tuple[Event, runtime_records.ToolCallOutcome | None]]] = [
+            [] for _ in tool_calls
+        ]
+        child_cancellations: list[asyncio.CancelledError | None] = [None] * len(tool_calls)
+
+        async def execute_call(index: int, tool_call: runtime_records.ToolCallRequest) -> None:
+            async with semaphore:
+                await app._raise_if_session_interrupted(session.id)
+                try:
+                    async for item in app._execute_tool_call(
+                        session=session,
+                        registered_agent=self._registered_agent,
+                        registered_environment=self._registered_environment,
+                        tool_call=tool_call,
+                        request_metadata=self._request_metadata,
+                        task_id=self._task_id,
+                        policy_result=policy_results_by_id.get(tool_call.id),
+                        tool_round_id=tool_round_id,
+                    ):
+                        buffers[index].append(item)
+                except asyncio.CancelledError as exc:
+                    child_cancellations[index] = exc
+                    raise
+
+        def flush_completed_outcomes() -> None:
+            for buffer in buffers:
+                for _, outcome in buffer:
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                for index, tool_call in enumerate(tool_calls):
+                    task_group.create_task(execute_call(index, tool_call))
+        except BaseExceptionGroup as exc_group:
+            flush_completed_outcomes()
+            raise _parallel_tool_round_exception(exc_group) from exc_group
+        except asyncio.CancelledError:
+            flush_completed_outcomes()
+            for child_exc in child_cancellations:
+                if child_exc is not None and _cancellation_artifacts(child_exc):
+                    raise child_exc from None
+            raise
+        for buffer in buffers:
+            for item in buffer:
+                yield item
+
+
+def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
+    """Pick the exception to surface from a parallel tool round.
+
+    Session interrupts win so the interrupt guard closes the round exactly as
+    in sequential execution; otherwise the first real failure surfaces.
+    """
+    flattened: list[BaseException] = []
+
+    def _flatten(exc: BaseException) -> None:
+        if isinstance(exc, BaseExceptionGroup):
+            for sub_exc in exc.exceptions:
+                _flatten(sub_exc)
+        else:
+            flattened.append(exc)
+
+    _flatten(group)
+    for exc in flattened:
+        if isinstance(exc, _SessionInterruptedByRequest | _SessionInterrupted):
+            return exc
+    for exc in flattened:
+        if not isinstance(exc, asyncio.CancelledError):
+            return exc
+    return flattened[0]
+
 
 class CayuApp:
     """Application runtime for registered agents, providers, and session state."""
@@ -789,6 +993,8 @@ class CayuApp:
         max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
         max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
+        tool_timeout_seconds: float | None = None,
+        max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
@@ -846,6 +1052,14 @@ class CayuApp:
             max_file_attachments_per_request,
             "max_file_attachments_per_request",
         )
+        self._tool_timeout_seconds = _validate_optional_positive_seconds(
+            tool_timeout_seconds,
+            "tool_timeout_seconds",
+        )
+        self._max_parallel_tool_calls = _validate_positive_int(
+            max_parallel_tool_calls,
+            "max_parallel_tool_calls",
+        )
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.knowledge_store = knowledge_store
@@ -882,6 +1096,7 @@ class CayuApp:
         self._active_session_runs: dict[str, dict[asyncio.Task[Any], _ActiveSessionRun]] = {}
         self._sessions_emitting_interrupted: set[str] = set()
         self._sessions_requesting_interruption: set[str] = set()
+        self._session_interrupt_signals: dict[str, asyncio.Event] = {}
 
     def register_agent(
         self,
@@ -1365,6 +1580,7 @@ class CayuApp:
                 to_status=SessionStatus.INTERRUPTING,
                 checkpoint_transform=_checkpoint_with_pending_session_interrupt(interrupt_payload),
             )
+            self._signal_session_interrupt(session.id)
             active_work_signalled = self._interrupt_active_session_runs(session.id)
             if active_work_signalled:
                 existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
@@ -1401,6 +1617,7 @@ class CayuApp:
             if reloaded_session is None:
                 raise KeyError(f"Session not found: {loaded_session.id}") from None
             if reloaded_session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES:
+                self._signal_session_interrupt(reloaded_session.id)
                 existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
                     reloaded_session.id
                 )
@@ -1647,6 +1864,17 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
+        events = await self._session_usage_events(session_id)
+        return session_usage_summary(session_id, events)
+
+    async def _session_usage_events(self, session_id: str) -> list[Event]:
+        """Load only the usage-bearing events for a session, in sequence order.
+
+        ``model.completed`` carries token usage (and cost inputs);
+        ``tool.call.started`` drives the tool-call counter. Everything else in
+        the event log — per-delta stream events in particular — is irrelevant
+        to usage summaries and budget checks, so it is never loaded here.
+        """
         usage_event_records = await self._query_all_event_records(
             EventQuery(
                 session_id=session_id,
@@ -1659,14 +1887,13 @@ class CayuApp:
                 event_type=EventType.TOOL_CALL_STARTED,
             )
         )
-        events = [
+        return [
             record.event
             for record in sorted(
                 [*usage_event_records, *tool_event_records],
                 key=lambda record: record.sequence,
             )
         ]
-        return session_usage_summary(session_id, events)
 
     async def get_causal_budget_usage(
         self,
@@ -1871,10 +2098,16 @@ class CayuApp:
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
-        events = await self.session_store.load_events(session_id)
+        # Cost derives only from model.completed events; skip the rest of the log.
+        cost_event_records = await self._query_all_event_records(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.MODEL_COMPLETED,
+            )
+        )
         return estimate_session_cost(
             session_id=session_id,
-            events=events,
+            events=[record.event for record in cost_event_records],
             pricing=pricing,
             currency=currency,
         )
@@ -2779,6 +3012,10 @@ class CayuApp:
         current_task = asyncio.current_task()
         active_run: _ActiveSessionRun | None = None
         run_started_at = time.monotonic()
+        # A fresh run means any earlier interrupt was fully handled before the
+        # session transitioned back to RUNNING; drop a stale signal so it does
+        # not force per-delta store polling for the whole resumed run.
+        self._discard_session_interrupt_signal(session.id)
         limits = copy_run_limits(limits)
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -2796,7 +3033,7 @@ class CayuApp:
         if (limits.scope == "run" and has_run_limits(limits)) or _has_run_budget_limit(
             budget_limits
         ):
-            baseline_events = await self.session_store.load_events(session.id)
+            baseline_events = await self._session_usage_events(session.id)
         else:
             baseline_events = []
         if limits.scope == "run" and has_run_limits(limits):
@@ -3611,6 +3848,7 @@ class CayuApp:
             ):
                 yield event
         finally:
+            self._discard_session_interrupt_signal(session.id)
             if current_task is not None:
                 self._unregister_active_session_task(session.id, current_task)
 
@@ -4105,10 +4343,14 @@ class CayuApp:
                 yield None, result
                 return
             except _ModelAttemptFailed as exc:
+                status_code, retryable, retry_after_s = _typed_retry_fields(exc)
                 decision = retry_decision(
                     policy=retry_policy,
                     attempt=attempt,
                     error=exc.message,
+                    status_code=status_code,
+                    retryable=retryable,
+                    retry_after_s=retry_after_s,
                 )
                 if decision.reason is not None and not exc.emitted_error_event:
                     yield (
@@ -4142,6 +4384,23 @@ class CayuApp:
                             step=step,
                             decision=decision,
                             error=exc.message,
+                        )
+                    ),
+                    None,
+                )
+                # The failed attempt may have already streamed partial text /
+                # thinking deltas. Mark them discardable so consumers rebuilding
+                # output from the event stream drop this attempt's deltas before
+                # the retry emits fresh ones.
+                yield (
+                    await self._emit(
+                        _model_attempt_discarded_event(
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            registered_provider=registered_provider,
+                            step=step,
+                            decision=decision,
                         )
                     ),
                     None,
@@ -4307,10 +4566,11 @@ class CayuApp:
             document_bytes_per_token=profile.document_bytes_per_token,
             tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
         )
+        interrupt_poll = _StreamInterruptPoll(self, session_id=session.id)
         try:
             async for raw_stream_event in provider.stream(model_request):
                 stream_event = _validate_stream_event(raw_stream_event)
-                await self._raise_if_session_interrupted(session.id)
+                await interrupt_poll.raise_if_interrupted()
                 if model_completed:
                     raise _ModelAttemptFailed(
                         message=(
@@ -4481,6 +4741,7 @@ class CayuApp:
         budget_baseline_events: list[Event] | None = None,
         pending_tool_calls: int = 0,
         budget_notify_events: list[Event] | None = None,
+        usage_tracker: _SessionUsageTracker | None = None,
     ) -> tuple[StopDecision | None, SessionUsageSummary, SessionCostSummary | None, list[Event]]:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -4489,7 +4750,14 @@ class CayuApp:
         )
         if not has_run_limits(limits) and not budget_limits:
             return None, SessionUsageSummary(session_id=session.id), None, []
-        events = await self.session_store.load_events(session.id)
+        # Usage and cost derive only from model.completed / tool.call.started
+        # events; the tracker reads one ordered event tail and filters those
+        # types in memory so its sequence watermark cannot skip interleaved
+        # usage-bearing events.
+        if usage_tracker is not None:
+            events = await usage_tracker.usage_events()
+        else:
+            events = await self._session_usage_events(session.id)
         usage_summary = session_usage_summary(session.id, events)
         usage_for_limits = usage_summary
         if limits.scope == "run" and run_baseline is not None:
@@ -4503,7 +4771,16 @@ class CayuApp:
                     total_tokens=max(0, cur.total_tokens - base.total_tokens),
                 ),
             )
-        elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
+        # Elapsed time follows the same scope clock as the usage limits: the
+        # current invocation for scope="run", the whole session lifetime for
+        # scope="session".
+        if limits.scope == "session":
+            created_at = session.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            elapsed_seconds = max(0, int((datetime.now(UTC) - created_at).total_seconds()))
+        else:
+            elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
         decision = first_reached_limit(
             limits=limits,
             usage=usage_for_limits,
@@ -4945,7 +5222,7 @@ class CayuApp:
                 payload=payload,
             )
         )
-        session_events = await self.session_store.load_events(session.id)
+        session_events = await self._session_usage_events(session.id)
         usage_summary = session_usage_summary(session.id, session_events)
         decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
@@ -4996,7 +5273,7 @@ class CayuApp:
             actual=check.actual,
             message=check.message,
         )
-        session_events = await self.session_store.load_events(session.id)
+        session_events = await self._session_usage_events(session.id)
         usage_summary = session_usage_summary(session.id, session_events)
         async for event in self._stop_session_for_limit_reached(
             session=session,
@@ -5518,6 +5795,7 @@ class CayuApp:
                 ),
                 # effective_tool_call.arguments is the (re-authorized) private copy to execute.
                 arguments=effective_tool_call.arguments,
+                timeout_seconds=self._tool_timeout_seconds,
             )
         except asyncio.CancelledError:
             if proxy_authorizations and await self._session_interrupt_requested(session.id):
@@ -6414,11 +6692,36 @@ class CayuApp:
             raise KeyError(f"Session not found: {session_id}")
         return session.status == SessionStatus.INTERRUPTING
 
+    def _signal_session_interrupt(self, session_id: str) -> None:
+        """Set the in-process interrupt signal for a session.
+
+        Only set after the interrupt request has been persisted to the session
+        store, so the signal never claims an interrupt the store does not
+        know about. The signal is a latency hint: throttled stream polling
+        bypasses its store-poll interval when the signal is set.
+        """
+        self._session_interrupt_signals.setdefault(session_id, asyncio.Event()).set()
+
+    def _session_interrupt_signalled(self, session_id: str) -> bool:
+        signal = self._session_interrupt_signals.get(session_id)
+        return signal is not None and signal.is_set()
+
+    def _discard_session_interrupt_signal(self, session_id: str) -> None:
+        self._session_interrupt_signals.pop(session_id, None)
+
     async def _latest_session_interrupted_event(self, session_id: str) -> Event | None:
-        events = await self.session_store.load_events(session_id)
-        for event in reversed(events):
-            if event.type == EventType.SESSION_INTERRUPTED:
-                return event.model_copy(deep=True)
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_INTERRUPTED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if records:
+            return records[0].event.model_copy(deep=True)
+        if await self.session_store.load(session_id) is None:
+            raise KeyError(f"Session not found: {session_id}")
         return None
 
     async def _wait_for_session_interrupted_event(self, session_id: str) -> Event | None:
@@ -7559,6 +7862,16 @@ def _validate_positive_int(value: int, field_name: str) -> int:
     return value
 
 
+def _validate_optional_positive_seconds(value: float | None, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in {int, float}:
+        raise TypeError(f"{field_name} must be a number or None.")
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+    return float(value)
+
+
 def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
@@ -8104,6 +8417,58 @@ def _model_retry_event(
             step=step,
             error=error,
         ),
+    )
+
+
+def _model_attempt_discarded_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    registered_provider: runtime_records.RegisteredProvider,
+    step: int,
+    decision: RetryDecision,
+) -> Event:
+    return Event(
+        type=EventType.MODEL_ATTEMPT_DISCARDED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "provider": registered_provider.name,
+            "model": session.model,
+            "step": step,
+            "attempt": decision.attempt,
+            "next_attempt": decision.next_attempt,
+            "max_attempts": decision.max_attempts,
+            "reason": None if decision.reason is None else decision.reason.value,
+            "status_code": decision.status_code,
+        },
+    )
+
+
+def _typed_retry_fields(
+    exc: _ModelAttemptFailed,
+) -> tuple[int | None, bool | None, float | None]:
+    """Extract typed retry-classification fields from a failed model attempt.
+
+    Prefers the structured `ModelProviderError` cause; falls back to the typed
+    keys a provider surfaced on the error-event payload (`error_payload_fields`)
+    so classification survives whether the failure was raised or flattened into
+    a `ModelStreamEvent.error`.
+    """
+
+    cause = exc.cause
+    if isinstance(cause, ModelProviderError):
+        return cause.status_code, cause.retryable, cause.retry_after_s
+    payload = exc.payload
+    status_code = payload.get("status_code")
+    retryable = payload.get("retryable")
+    retry_after_s = payload.get("retry_after_s")
+    return (
+        status_code if type(status_code) is int else None,
+        retryable if type(retryable) is bool else None,
+        float(retry_after_s) if type(retry_after_s) in {int, float} else None,
     )
 
 

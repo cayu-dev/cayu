@@ -1120,3 +1120,80 @@ def test_sqlite_session_store_rejects_incompatibly_new_database(tmp_path):
 
     with pytest.raises(schema_migrations.SchemaTooNew):
         SQLiteSessionStore(db_path)
+
+
+def test_sqlite_session_store_reads_through_dedicated_read_only_connection(tmp_path):
+    db_path = tmp_path / "read_only.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    # File-backed stores query through a dedicated read-only connection so
+    # reads run off the event loop without contending with the writer.
+    assert store._read_connection is not store._connection
+    assert store._read_lock is not store._lock
+    with pytest.raises(sqlite3.OperationalError):
+        store._read_connection.execute(
+            "INSERT INTO cayu_session_labels (session_id, key, value) VALUES ('x', 'k', 'v')"
+        )
+
+    async def run() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_read_only",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            "sess_read_only",
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="sess_read_only",
+                agent_name="assistant",
+                payload={"step": 1},
+            ),
+        )
+        await store.checkpoint("sess_read_only", {"step": 1})
+
+        # Writes on the writer connection are immediately visible to reads on
+        # the read-only connection.
+        session = await store.load("sess_read_only")
+        assert session is not None
+        assert session.agent_name == "assistant"
+        events = await store.load_events("sess_read_only")
+        assert [event.type for event in events] == [EventType.SESSION_STARTED]
+        assert await store.load_checkpoint("sess_read_only") == {"step": 1}
+        await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_session_store_in_memory_shares_single_connection():
+    store = SQLiteSessionStore(":memory:")
+
+    # An in-memory database is private to its connection, so the read path
+    # falls back to the writer connection and its lock.
+    assert store._read_connection is store._connection
+    assert store._read_lock is store._lock
+
+    async def run() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_memory_shared",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        session = await store.load("sess_memory_shared")
+        assert session is not None
+        await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_connect_rejects_read_only_in_memory_database():
+    from pathlib import Path
+
+    with pytest.raises(ValueError, match="file-backed"):
+        sqlite_support.connect(Path(":memory:"), read_only=True)

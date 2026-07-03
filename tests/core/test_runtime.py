@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -33,6 +34,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelContextPressureProfile,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
@@ -114,6 +116,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    TranscriptDigestCompactor,
     UsageTriggeredContextPolicy,
     default_compaction_prompt,
     strip_old_file_attachments,
@@ -1226,14 +1229,23 @@ def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_trans
         EventType.MODEL_STARTED,
     ]
     provider_context = provider.requests[0].messages
-    assert [message.role for message in provider_context] == ["user", "user"]
-    injected_text = provider_context[0].content[0].text
+    assert [message.role for message in provider_context] == ["user", "assistant", "tool"]
+    assert provider_context[0].content[0].text == "How should I push to GitHub from a sandbox?"
+    injected_call = provider_context[1].content[0]
+    assert injected_call.tool_name == "cayu_knowledge_retrieval"
+    assert injected_call.tool_call_id == "cayu_knowledge_step_1"
+    injected_result = provider_context[2].content[0]
+    assert injected_result.tool_call_id == injected_call.tool_call_id
+    injected_text = injected_result.content
     assert "entry_id='git_policy'" in injected_text
     assert "brokered Git HTTP proxy" in injected_text
-    assert provider_context[1].content[0].text == "How should I push to GitHub from a sandbox?"
+    assert "untrusted reference data" in injected_text
+    assert "<untrusted_knowledge>" in injected_text
+    assert "</untrusted_knowledge>" in injected_text
 
     injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
     assert injected_event.payload["hit_count"] == 1
+    assert injected_event.payload["tool_call_id"] == "cayu_knowledge_step_1"
     source = injected_event.payload["sources"][0]
     assert source["entry_id"] == "git_policy"
     assert source["namespace"] == "project:cayu"
@@ -1356,14 +1368,14 @@ def test_cayu_app_knowledge_injection_caps_inserted_context_bytes() -> None:
         )
     )
 
-    injected_text = provider.requests[0].messages[0].content[0].text
+    injected_text = provider.requests[0].messages[2].content[0].content
     assert len(injected_text.encode("utf-8")) <= 220
     assert "[knowledge context truncated]" in injected_text
     injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
     assert injected_event.payload["injected_bytes"] <= 220
 
 
-def test_cayu_app_knowledge_injection_search_failure_is_fail_open_by_default() -> None:
+def test_cayu_app_knowledge_injection_search_failure_can_opt_into_fail_open() -> None:
     class FailingKnowledgeStore(InMemoryKnowledgeStore):
         async def search(self, query):
             raise RuntimeError("knowledge search unavailable")
@@ -1387,7 +1399,7 @@ def test_cayu_app_knowledge_injection_search_failure_is_fail_open_by_default() -
     )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        context_policy=KnowledgeInjectionPolicy(),
+        context_policy=KnowledgeInjectionPolicy(fail_open=True),
     )
 
     events = asyncio.run(
@@ -1416,7 +1428,7 @@ def test_cayu_app_knowledge_injection_search_failure_is_fail_open_by_default() -
     ]
 
 
-def test_cayu_app_knowledge_injection_fail_closed_emits_failure_before_session_failure() -> None:
+def test_cayu_app_knowledge_injection_fails_closed_by_default_and_emits_failure_first() -> None:
     class FailingKnowledgeStore(InMemoryKnowledgeStore):
         async def search(self, query):
             raise RuntimeError("knowledge search unavailable")
@@ -1440,7 +1452,8 @@ def test_cayu_app_knowledge_injection_fail_closed_emits_failure_before_session_f
     )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        context_policy=KnowledgeInjectionPolicy(fail_open=False),
+        # No `fail_open` argument: search failures must fail closed by default.
+        context_policy=KnowledgeInjectionPolicy(),
     )
 
     events = asyncio.run(
@@ -1613,12 +1626,13 @@ def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> Non
         EventType.SESSION_CHECKPOINTED,
     ]
     provider_context = provider.requests[0].messages
-    assert [message.role for message in provider_context] == ["user", "user", "user"]
+    assert [message.role for message in provider_context] == ["user", "user", "assistant", "tool"]
     assert (
         provider_context[0].content[0].text == "Previous session context summary:\nold|old answer"
     )
-    assert "entry_id='current_policy'" in provider_context[1].content[0].text
-    assert provider_context[2].content[0].text == "current deployment"
+    assert provider_context[1].content[0].text == "current deployment"
+    assert provider_context[2].content[0].tool_name == "cayu_knowledge_retrieval"
+    assert "entry_id='current_policy'" in provider_context[3].content[0].content
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
     assert checkpoint == {
@@ -4594,6 +4608,79 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
     assert len(provider.requests) == 1
 
 
+def test_session_usage_tracker_advances_from_single_ordered_tail() -> None:
+    async def run() -> tuple[list[Event], list[Event], list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_usage_tracker",
+                messages=[Message.text("user", "track usage")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_usage_tracker", SessionStatus.RUNNING)
+        tracker = runtime_app_module._SessionUsageTracker(app, session_id="sess_usage_tracker")
+        observed_queries: list[EventQuery] = []
+        original_query_all_event_records = app._query_all_event_records
+
+        async def query_all_event_records(query: EventQuery):
+            observed_queries.append(query)
+            return await original_query_all_event_records(query)
+
+        app._query_all_event_records = query_all_event_records  # type: ignore[method-assign]
+
+        ignored = await app._emit(
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id="sess_usage_tracker",
+                agent_name="assistant",
+                payload={},
+            )
+        )
+        first = await tracker.usage_events()
+
+        tool_started = await app._emit(
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="sess_usage_tracker",
+                agent_name="assistant",
+                tool_name="read_file",
+                payload={"tool_call_id": "call_1", "arguments": {}},
+            )
+        )
+        model_completed = await app._emit(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_usage_tracker",
+                agent_name="assistant",
+                payload={
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3,
+                    }
+                },
+            )
+        )
+        second = await tracker.usage_events()
+        third = await tracker.usage_events()
+        assert third == second
+        assert all(query.event_type is None for query in observed_queries)
+        return [ignored, tool_started, model_completed], first, second
+
+    emitted, first, later = asyncio.run(run())
+
+    assert first == []
+    assert [event.type for event in later] == [
+        EventType.TOOL_CALL_STARTED,
+        EventType.MODEL_COMPLETED,
+    ]
+    assert later[0].id == emitted[1].id
+    assert later[1].id == emitted[2].id
+
+
 def test_cayu_app_before_stop_policy_can_continue_with_durable_message():
     async def run():
         store = InMemorySessionStore()
@@ -4944,7 +5031,8 @@ def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
             ),
         ]
     )
-    app = CayuApp(session_store=store)
+    # Mid-round elapsed re-checks between tool calls are sequential-mode behavior.
+    app = CayuApp(session_store=store, max_parallel_tool_calls=1)
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -5089,7 +5177,7 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
             ResumeRequest(
                 session_id="sess_resume_limit",
                 messages=[Message.text("user", "second")],
-                limits=RunLimits(max_total_tokens=10),
+                limits=RunLimits(max_total_tokens=10, scope="session"),
             ),
         )
     )
@@ -5176,6 +5264,128 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
+
+
+def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 4,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_default_scope",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+
+    # RunLimits defaults to scope="run", so a resume with an unstated scope
+    # measures only this invocation's usage — the prior turn's 10 tokens do
+    # not count against the cap.
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_default_scope",
+                messages=[Message.text("user", "second")],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(provider.requests) == 2
+
+
+def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("first answer"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_session_elapsed",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    # Backdate the session so its lifetime already exceeds the cap; the resume
+    # itself starts fresh on the invocation clock.
+    store._sessions["sess_session_elapsed"].created_at = datetime.now(UTC) - timedelta(seconds=120)
+
+    events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_session_elapsed",
+                messages=[Message.text("user", "second")],
+                limits=RunLimits(max_elapsed_seconds=60, scope="session"),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[1].payload["limit"] == "elapsed_seconds"
+    assert len(provider.requests) == 1
 
 
 def test_cayu_app_budget_limit_fails_closed_when_model_step_is_unpriced():
@@ -7261,6 +7471,62 @@ def test_subagent_tool_caps_child_result_text():
     assert tool_result.content == "abcd"
     assert tool_result.structured["result_truncated"] is True
     assert tool_result.structured["result_max_chars"] == 4
+
+
+def test_collect_subagent_result_returns_last_message_tail_truncated():
+    from cayu.tools.subagents import _collect_subagent_result
+
+    def _delta(text: str) -> Event:
+        return Event(
+            type=EventType.MODEL_TEXT_DELTA,
+            session_id="sess_child",
+            payload={"delta": text},
+        )
+
+    events = [
+        Event(type=EventType.MODEL_STARTED, session_id="sess_child"),
+        _delta("EARLY draft that should be discarded entirely"),
+        Event(type=EventType.MODEL_STARTED, session_id="sess_child"),
+        _delta("final "),
+        _delta("answer"),
+        Event(type=EventType.SESSION_COMPLETED, session_id="sess_child"),
+    ]
+
+    async def _stream():
+        for event in events:
+            yield event
+
+    result = asyncio.run(_collect_subagent_result(_stream(), max_chars=64))
+
+    # The result is the LAST assistant message, not the first deltas of every turn.
+    assert result.text == "final answer"
+    assert result.text_truncated is False
+    assert result.event_count == len(events)
+    assert result.terminal is not None
+    assert result.terminal.type == EventType.SESSION_COMPLETED
+
+
+def test_collect_subagent_result_tail_truncates_last_message_only():
+    from cayu.tools.subagents import _collect_subagent_result
+
+    events = [
+        Event(type=EventType.MODEL_STARTED, session_id="sess_child"),
+        Event(
+            type=EventType.MODEL_TEXT_DELTA,
+            session_id="sess_child",
+            payload={"delta": "abcdefgh"},
+        ),
+        Event(type=EventType.SESSION_COMPLETED, session_id="sess_child"),
+    ]
+
+    async def _stream():
+        for event in events:
+            yield event
+
+    result = asyncio.run(_collect_subagent_result(_stream(), max_chars=4))
+
+    assert result.text == "abcd"
+    assert result.text_truncated is True
 
 
 def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
@@ -10061,6 +10327,7 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
         EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
@@ -10076,7 +10343,10 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     assert events[3].payload["status_code"] == 429
     assert events[3].payload["attempt"] == 1
     assert events[3].payload["next_attempt"] == 2
-    assert events[6].payload["tool_call_id"] == "call_successful_attempt"
+    assert events[4].payload["attempt"] == 1
+    assert events[4].payload["next_attempt"] == 2
+    assert events[4].payload["status_code"] == 429
+    assert events[7].payload["tool_call_id"] == "call_successful_attempt"
     assert [message.role for message in transcript] == [
         "user",
         "assistant",
@@ -10190,6 +10460,7 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
         EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
@@ -10197,6 +10468,8 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
     ]
     assert len(provider.requests) == 2
     assert events[3].payload["reason"] == "timeout"
+    assert events[4].payload["reason"] == "timeout"
+    assert events[4].payload["attempt"] == 1
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[1].content[0].text == "ok"
 
@@ -10238,6 +10511,7 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_ERROR,
         EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
@@ -10251,14 +10525,17 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
     }
     assert events[3].payload["attempt"] == 1
     assert events[3].payload["max_attempts"] == 2
-    assert events[6].payload == {
+    assert events[4].payload["attempt"] == 1
+    assert events[4].payload["next_attempt"] == 2
+    assert events[4].payload["status_code"] == 500
+    assert events[7].payload == {
         "delta": "final answer",
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
     }
-    assert events[7].payload["attempt"] == 2
-    assert events[7].payload["max_attempts"] == 2
+    assert events[8].payload["attempt"] == 2
+    assert events[8].payload["max_attempts"] == 2
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[1].content[0].text == "final answer"
 
@@ -10298,6 +10575,7 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
         EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
         EventType.SESSION_FAILED,
@@ -10310,13 +10588,94 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "attempt": 1,
         "max_attempts": 2,
     }
-    assert events[5].payload == {
+    assert events[4].payload["attempt"] == 1
+    assert events[4].payload["reason"] == "timeout"
+    assert events[6].payload == {
         "error": "stream idle timeout",
         "error_type": "TimeoutError",
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
     }
+
+
+def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
+    # The error message carries no HTTP token; retry classification must come
+    # from the typed provider status code preserved on the error-event payload.
+    typed_error = ModelProviderError(
+        "provider overloaded",
+        provider="fake",
+        status_code=529,
+    )
+    provider = FakeProvider(
+        [
+            [ModelStreamEvent.error("provider overloaded", cause=typed_error)],
+            [
+                ModelStreamEvent.text_delta("recovered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_typed_status_retry",
+                messages=[Message.text("user", "hi")],
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+        )
+    )
+
+    types = [event.type for event in events]
+    assert EventType.MODEL_RETRY in types
+    discarded = next(e for e in events if e.type == EventType.MODEL_ATTEMPT_DISCARDED)
+    assert discarded.payload["status_code"] == 529
+    assert discarded.payload["attempt"] == 1
+    assert discarded.payload["next_attempt"] == 2
+    retry_event = next(e for e in events if e.type == EventType.MODEL_RETRY)
+    assert retry_event.payload["status_code"] == 529
+    assert retry_event.payload["reason"] == "http_status"
+
+
+def test_cayu_app_does_not_retry_when_provider_marks_error_non_retryable():
+    # Message text looks like a transient timeout, but the provider's typed
+    # verdict (retryable=False) forces a terminal decision.
+    typed_error = ModelProviderError(
+        "request timed out",
+        provider="fake",
+        retryable=False,
+    )
+    provider = FakeProvider(
+        [
+            [ModelStreamEvent.error("request timed out", cause=typed_error)],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_typed_non_retryable",
+                messages=[Message.text("user", "hi")],
+                retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+            ),
+        )
+    )
+
+    types = [event.type for event in events]
+    assert EventType.MODEL_RETRY not in types
+    assert EventType.MODEL_ATTEMPT_DISCARDED not in types
+    assert len(provider.requests) == 1
 
 
 def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure():
@@ -14331,6 +14690,227 @@ def test_model_compactor_summarizes_context_with_provider():
     assert "assistant: old answer" in prompt
 
 
+def test_model_compactor_reports_model_completed_payload_with_usage_metrics():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model-2026-01-01",
+                    "usage": {"input_tokens": 40, "output_tokens": 8},
+                    "provider_state": {"opaque": True},
+                }
+            ),
+        ]
+    )
+    compactor = ModelCompactor(provider=provider, model="summary-model")
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert result.model_completed_payloads == [
+        {
+            "model": "summary-model-2026-01-01",
+            "usage": {"input_tokens": 40, "output_tokens": 8},
+            "provider_name": "fake",
+            "purpose": "context_compaction",
+            "compactor": "ModelCompactor",
+            "usage_metrics": {
+                "provider_name": "fake",
+                "model": "summary-model-2026-01-01",
+                "input_tokens": 40,
+                "output_tokens": 8,
+                "total_tokens": 48,
+                "reasoning_output_tokens": 0,
+                "cache": {
+                    "read_tokens": 0,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "uncached_input_tokens": 40,
+                },
+            },
+        }
+    ]
+
+
+class FlakyCompactionProvider(ModelProvider):
+    name = "flaky"
+
+    def __init__(self, *, failures: int, error: ModelProviderError) -> None:
+        self.failures = failures
+        self.error = error
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) <= self.failures:
+            raise self.error
+        yield ModelStreamEvent.text_delta("recovered summary")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def test_model_compactor_retries_transient_provider_errors():
+    provider = FlakyCompactionProvider(
+        failures=1,
+        error=ModelProviderError(
+            "provider overloaded",
+            provider="flaky",
+            status_code=503,
+            retryable=True,
+        ),
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert result.summary == "recovered summary"
+    assert len(provider.requests) == 2
+
+
+def test_model_compactor_does_not_retry_by_default():
+    provider = FlakyCompactionProvider(
+        failures=1,
+        error=ModelProviderError(
+            "provider overloaded",
+            provider="flaky",
+            status_code=503,
+            retryable=True,
+        ),
+    )
+    compactor = ModelCompactor(provider=provider, model="summary-model")
+
+    with pytest.raises(ModelProviderError, match="provider overloaded"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+    assert len(provider.requests) == 1
+
+
+def test_model_compactor_does_not_retry_terminal_provider_errors():
+    provider = FlakyCompactionProvider(
+        failures=1,
+        error=ModelProviderError(
+            "invalid request",
+            provider="flaky",
+            status_code=400,
+            retryable=False,
+        ),
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+    )
+
+    with pytest.raises(ModelProviderError, match="invalid request"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+    assert len(provider.requests) == 1
+
+
+def test_transcript_digest_compactor_preserves_previous_summary_when_clipping():
+    # A large batch of newly compacted messages must not clip the accumulated
+    # previous summary out of the front of the combined text.
+    compactor = TranscriptDigestCompactor(max_summary_chars=400)
+    previous_summary = "decision: ship plan A"
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.text("user", f"filler {index} " + "x" * 40) for index in range(30)
+                ],
+                existing_summary=previous_summary,
+            )
+        )
+    )
+
+    assert len(result.summary) <= 400
+    assert f"Previous summary:\n{previous_summary}" in result.summary
+    assert "Newly compacted transcript:\n[clipped to latest content]" in result.summary
+    assert result.summary.endswith("filler 29 " + "x" * 40)
+
+
+def test_transcript_digest_compactor_budgets_both_oversized_sections():
+    compactor = TranscriptDigestCompactor(max_summary_chars=400)
+    previous_summary = ("earlier decision " * 40).strip()
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "latest work " * 50)],
+                existing_summary=previous_summary,
+            )
+        )
+    )
+
+    assert len(result.summary) <= 400
+    previous_section, digest_section = result.summary.split("\n\n")
+    assert previous_section.startswith("Previous summary:\n[clipped to latest content]")
+    assert previous_section.endswith("earlier decision")
+    assert digest_section.startswith("Newly compacted transcript:\n[clipped to latest content]")
+    assert len(previous_section) == 199
+    assert len(digest_section) == 199
+
+
+def test_transcript_digest_compactor_keeps_small_previous_summary_unclipped():
+    compactor = TranscriptDigestCompactor()
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("assistant", "old answer"),
+                ],
+                existing_summary="previous context",
+            )
+        )
+    )
+    assert result.summary == (
+        "Previous summary:\nprevious context\n\n"
+        "Newly compacted transcript:\nuser: old request\nassistant: old answer"
+    )
+    assert compactor.max_summary_chars == 8000
+
+
 def test_runtime_adds_usage_metrics_to_model_completed_events():
     provider = FakeProvider(
         [
@@ -16512,6 +17092,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
         EventType.MODEL_STARTED,
@@ -16532,6 +17113,13 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "recent_message_count": 1,
     }
     assert events[2].payload == {
+        "finish_reason": "stop",
+        "model": "summary-model",
+        "provider_name": "fake",
+        "purpose": "context_compaction",
+        "compactor": "ModelCompactor",
+    }
+    assert events[3].payload == {
         "checkpoint": "context_compaction",
         "compactor": "ModelCompactor",
         "compacted_transcript_cursor": 2,
@@ -16548,7 +17136,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
             "completed": {"finish_reason": "stop"},
         },
     }
-    assert "model summary" not in str(events[2].payload)
+    assert "model summary" not in str(events[3].payload)
 
     provider_context = runtime_provider.requests[0].messages
     assert [message.role for message in provider_context] == ["user", "user"]
@@ -16573,6 +17161,72 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
             },
         }
     }
+
+
+def test_cayu_app_counts_compaction_model_spend_in_session_usage():
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 40, "output_tokens": 8},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_usage",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    compaction_completed = [
+        event
+        for event in events
+        if event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(compaction_completed) == 1
+    assert compaction_completed[0].payload["usage_metrics"]["input_tokens"] == 40
+    assert compaction_completed[0].payload["usage_metrics"]["model"] == "summary-model"
+
+    summary = asyncio.run(app.get_session_usage("sess_compaction_usage"))
+    assert summary.model_steps == 2
+    assert summary.provider_names == ["fake"]
+    assert summary.models == ["summary-model", "fake-model"]
+    assert summary.usage.input_tokens == 50
+    assert summary.usage.output_tokens == 10
+    assert summary.usage.total_tokens == 60
 
 
 def test_cayu_app_emits_compaction_failed_event_before_session_failure():
@@ -16683,10 +17337,11 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[2].payload == {
+    assert events[3].payload == {
         "checkpoint": "context_compaction",
         "compactor": "ModelCompactor",
         "compacted_transcript_cursor": 2,
@@ -16703,7 +17358,7 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
             "completed": {"finish_reason": "stop"},
         },
     }
-    assert events[3].payload == {
+    assert events[4].payload == {
         "error": "checkpoint unavailable",
         "error_type": "RuntimeError",
     }
@@ -22270,7 +22925,8 @@ def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool()
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    app = CayuApp()
+    # A "not yet started" trailing tool call requires sequential execution.
+    app = CayuApp(max_parallel_tool_calls=1)
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -23034,3 +23690,324 @@ def test_interrupt_session_preserves_tool_results_when_interrupted_before_append
     assert transcript[-1].content[0].tool_call_id == "call_echo"
     assert transcript[-1].content[0].content == "finished"
     assert transcript[-1].content[0].is_error is False
+
+
+def test_tool_call_times_out_and_session_continues():
+    class SlowTool(Tool):
+        spec = ToolSpec(
+            name="slow_tool",
+            description="Sleep past the configured tool timeout.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            await asyncio.sleep(30)
+            return ToolResult(content="unexpected")
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_slow", name="slow_tool", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("recovered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, tool_timeout_seconds=0.05)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SlowTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tool_timeout",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+
+    failed_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
+    assert len(failed_events) == 1
+    assert failed_events[0].payload["result"]["content"] == (
+        "Tool call timed out after 0.05 seconds."
+    )
+    assert failed_events[0].payload["result"]["is_error"] is True
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+    transcript = asyncio.run(store.load_transcript("sess_tool_timeout"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    assert tool_message.content[0].content == "Tool call timed out after 0.05 seconds."
+    assert tool_message.content[0].is_error is True
+
+
+def test_run_tool_does_not_mislabel_tool_raised_timeout_error():
+    from cayu.runtime._tool_execution import run_tool
+
+    class TimeoutRaisingTool(Tool):
+        spec = ToolSpec(
+            name="timeout_raiser",
+            description="Raise TimeoutError from inside the tool.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            raise TimeoutError("upstream service timed out")
+
+    result = asyncio.run(
+        run_tool(
+            tool=TimeoutRaisingTool(),
+            ctx=ToolContext(session_id="sess_tool_raised_timeout"),
+            arguments={},
+            timeout_seconds=5,
+        )
+    )
+
+    assert result.is_error is True
+    assert "upstream service timed out" in result.content
+    assert "timed out after" not in result.content
+
+
+def test_parallel_tool_round_executes_calls_concurrently_by_default():
+    class RendezvousTool(Tool):
+        spec = ToolSpec(
+            name="rendezvous",
+            description="Wait until every call in the round has started.",
+            input_schema={
+                "type": "object",
+                "properties": {"slot": {"type": "string"}},
+                "required": ["slot"],
+            },
+        )
+
+        def __init__(self, expected_arrivals: int) -> None:
+            self.expected_arrivals = expected_arrivals
+            self.arrivals = 0
+            self.all_arrived = asyncio.Event()
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            self.arrivals += 1
+            if self.arrivals >= self.expected_arrivals:
+                self.all_arrived.set()
+            # Deadlocks under sequential execution: each call waits for the
+            # other call in the same round to start.
+            await asyncio.wait_for(self.all_arrived.wait(), timeout=2)
+            return ToolResult(content=args["slot"])
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_a",
+                    name="rendezvous",
+                    arguments={"slot": "a"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_b",
+                    name="rendezvous",
+                    arguments={"slot": "b"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[RendezvousTool(expected_arrivals=2)],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_parallel_round",
+                messages=[Message.text("user", "fan out")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    tool_events = [
+        (event.type, event.payload["tool_call_id"])
+        for event in events
+        if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
+    ]
+    # Buffered parallel execution preserves the model's tool-call order.
+    assert tool_events == [
+        (EventType.TOOL_CALL_STARTED, "call_a"),
+        (EventType.TOOL_CALL_COMPLETED, "call_a"),
+        (EventType.TOOL_CALL_STARTED, "call_b"),
+        (EventType.TOOL_CALL_COMPLETED, "call_b"),
+    ]
+
+    transcript = asyncio.run(store.load_transcript("sess_parallel_round"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    assert [part.tool_call_id for part in tool_message.content] == ["call_a", "call_b"]
+    assert [part.content for part in tool_message.content] == ["a", "b"]
+
+
+def test_parallel_tool_round_concurrency_is_capped_by_semaphore():
+    class ConcurrencyProbeTool(Tool):
+        spec = ToolSpec(
+            name="probe",
+            description="Record how many calls run concurrently.",
+            input_schema={
+                "type": "object",
+                "properties": {"step": {"type": "integer"}},
+                "required": ["step"],
+            },
+        )
+
+        def __init__(self) -> None:
+            self.current = 0
+            self.max_concurrent = 0
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            self.current += 1
+            self.max_concurrent = max(self.max_concurrent, self.current)
+            await asyncio.sleep(0.02)
+            self.current -= 1
+            return ToolResult(content=str(args["step"]))
+
+    probe = ConcurrencyProbeTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_1", name="probe", arguments={"step": 1}),
+                ModelStreamEvent.tool_call(id="call_2", name="probe", arguments={"step": 2}),
+                ModelStreamEvent.tool_call(id="call_3", name="probe", arguments={"step": 3}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(max_parallel_tool_calls=2)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[probe],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_parallel_capped",
+                messages=[Message.text("user", "fan out")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert probe.max_concurrent == 2
+    completed_ids = [
+        event.payload["tool_call_id"]
+        for event in events
+        if event.type == EventType.TOOL_CALL_COMPLETED
+    ]
+    assert completed_ids == ["call_1", "call_2", "call_3"]
+
+
+def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
+    class SleepyTool(Tool):
+        spec = ToolSpec(
+            name="sleepy",
+            description="Sleep forever; the per-call timeout stops it.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            await asyncio.sleep(30)
+            return ToolResult(content="unexpected")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_1", name="sleepy", arguments={}),
+                ModelStreamEvent.tool_call(id="call_2", name="sleepy", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(tool_timeout_seconds=0.05)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SleepyTool()],
+    )
+
+    started = time.monotonic()
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_parallel_timeouts",
+                messages=[Message.text("user", "fan out")],
+            ),
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    failed_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
+    assert [event.payload["tool_call_id"] for event in failed_events] == ["call_1", "call_2"]
+    for event in failed_events:
+        assert event.payload["result"]["content"] == "Tool call timed out after 0.05 seconds."
+    # Both timeouts elapse concurrently; well under two sequential timeouts
+    # plus scheduling slack.
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error_type", "error"),
+    [
+        (
+            {"tool_timeout_seconds": 0},
+            ValueError,
+            "tool_timeout_seconds must be greater than zero.",
+        ),
+        (
+            {"tool_timeout_seconds": "5"},
+            TypeError,
+            "tool_timeout_seconds must be a number or None.",
+        ),
+        (
+            {"max_parallel_tool_calls": 0},
+            ValueError,
+            "max_parallel_tool_calls must be greater than zero.",
+        ),
+        (
+            {"max_parallel_tool_calls": 2.5},
+            TypeError,
+            "max_parallel_tool_calls must be an integer.",
+        ),
+    ],
+)
+def test_cayu_app_validates_tool_execution_settings(kwargs, error_type, error):
+    with pytest.raises(error_type, match=error):
+        CayuApp(**kwargs)

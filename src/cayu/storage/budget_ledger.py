@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runtime.budgets import (
+    DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
@@ -16,10 +17,13 @@ from cayu.runtime.budgets import (
     BudgetReservationResult,
     _budget_reservation_amount,
     _clock_or_utc_now,
+    _expired_reservation_reason,
+    _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
     _reservation_result,
     _validate_amount,
+    _validate_reservation_ttl,
 )
 
 from . import _sqlite_support as sqlite_support
@@ -28,7 +32,13 @@ from . import _sqlite_support as sqlite_support
 class SQLiteBudgetLedger(BudgetLedger):
     """SQLite-backed atomic budget reservation ledger."""
 
-    def __init__(self, path: str | Path, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
+    ) -> None:
         if isinstance(path, Path):
             db_path = path
         elif type(path) is str:
@@ -39,6 +49,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         self.path = db_path
         self._lock = asyncio.Lock()
         self._clock = _clock_or_utc_now(clock)
+        self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
         self._connection = sqlite_support.connect(db_path)
         self._connection.row_factory = sqlite3.Row
         sqlite_support.initialize_schema(self._connection)
@@ -69,6 +80,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 now = self._clock()
+                self._reap_expired_unlocked(now)
                 current = self._used_amount_unlocked(limit, now=now)
                 projected = current + requested
                 if projected > limit.max_estimated_cost:
@@ -132,7 +144,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                record = self._active_record_unlocked(reservation_id)
+                record = self._reconcilable_record_unlocked(reservation_id)
                 reconciled = _reconciled_record(
                     record,
                     actual_amount=actual_amount,
@@ -221,16 +233,8 @@ class SQLiteBudgetLedger(BudgetLedger):
               AND window = ?
               AND currency = ?
               AND status IN ('active', 'reconciled')
-              AND (
-                    ? IS NULL
-                    OR status = 'active'
-                    OR updated_at >= ?
-                  )
-              AND (
-                    ? IS NULL
-                    OR status = 'active'
-                    OR updated_at < ?
-                  )
+              AND (? IS NULL OR updated_at >= ?)
+              AND (? IS NULL OR updated_at < ?)
             """,
             (
                 limit.scope,
@@ -250,6 +254,26 @@ class SQLiteBudgetLedger(BudgetLedger):
             elif row["status"] == "reconciled":
                 total += Decimal(row["actual_amount"] or "0")
         return total
+
+    def _reap_expired_unlocked(self, now: datetime) -> None:
+        if self._reservation_ttl_seconds is None:
+            return
+        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        self._connection.execute(
+            """
+            UPDATE budget_reservations
+            SET status = 'released',
+                reason = ?,
+                updated_at = ?
+            WHERE status = 'active'
+              AND updated_at <= ?
+            """,
+            (
+                _expired_reservation_reason(self._reservation_ttl_seconds),
+                sqlite_support.format_datetime(now),
+                sqlite_support.format_datetime(cutoff),
+            ),
+        )
 
     def _insert_record_unlocked(self, record: BudgetReservationRecord) -> None:
         now = sqlite_support.format_datetime(record.created_at)
@@ -316,7 +340,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         if cursor.rowcount != 1:
             raise KeyError(f"Budget reservation not found: {record.reservation_id}")
 
-    def _active_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
+    def _load_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         row = self._connection.execute(
             """
             SELECT reservation_id, scope, budget_key, window, currency, session_id,
@@ -329,7 +353,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         ).fetchone()
         if row is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
-        record = BudgetReservationRecord(
+        return BudgetReservationRecord(
             reservation_id=row["reservation_id"],
             scope=row["scope"],
             key=row["budget_key"],
@@ -346,6 +370,20 @@ class SQLiteBudgetLedger(BudgetLedger):
             created_at=sqlite_support.parse_datetime(row["created_at"]),
             updated_at=sqlite_support.parse_datetime(row["updated_at"]),
         )
+
+    def _active_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._load_record_unlocked(reservation_id)
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
+
+    def _reconcilable_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._load_record_unlocked(reservation_id)
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
+            # Reconcile it anyway so the actual spend is recorded rather than crashing the
+            # billed run and silently undercounting the shared budget window.
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")

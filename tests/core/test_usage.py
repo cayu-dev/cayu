@@ -35,6 +35,7 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
+    StopDecision,
     StopLimit,
     copy_run_limits,
     first_reached_limit,
@@ -355,7 +356,7 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
     assert released.released_amount == Decimal("0.22")
 
 
-def test_in_memory_budget_ledger_keeps_active_reservations_inside_rolling_window() -> None:
+def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock)
@@ -378,8 +379,16 @@ def test_in_memory_budget_ledger_keeps_active_reservations_inside_rolling_window
             provider_name="fake",
             model="fake-model",
         )
+        clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
+        blocked_now = await ledger.reserve(
+            limit=rolling_limit,
+            session_id="sess_rolling_blocked",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
         clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
-        rolling_blocked = await ledger.reserve(
+        rolling_second = await ledger.reserve(
             limit=rolling_limit,
             session_id="sess_rolling_2",
             agent_name="assistant",
@@ -393,13 +402,15 @@ def test_in_memory_budget_ledger_keeps_active_reservations_inside_rolling_window
             provider_name="fake",
             model="fake-model",
         )
-        return rolling_first, rolling_blocked, all_time_first, all_time_second
+        return rolling_first, blocked_now, rolling_second, all_time_first, all_time_second
 
-    rolling_first, rolling_blocked, all_time_first, all_time_second = asyncio.run(run())
+    rolling_first, blocked_now, rolling_second, all_time_first, all_time_second = asyncio.run(run())
 
     assert rolling_first.accepted is True
-    assert rolling_blocked.accepted is False
-    assert rolling_blocked.actual == Decimal("0.44")
+    assert blocked_now.accepted is False
+    assert blocked_now.actual == Decimal("0.44")
+    assert rolling_second.accepted is True
+    assert rolling_second.actual == Decimal("0.22")
     assert all_time_first.accepted is True
     assert all_time_second.accepted is False
     assert all_time_second.actual == Decimal("0.44")
@@ -592,7 +603,7 @@ def test_sqlite_budget_ledger_persists_rolling_window_key(tmp_path) -> None:
     assert all_time.window.storage_key == "all_time"
 
 
-def test_sqlite_budget_ledger_keeps_active_reservations_inside_rolling_window(tmp_path) -> None:
+def test_sqlite_budget_ledger_window_bounds_active_reservations(tmp_path) -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite", clock=clock)
@@ -616,8 +627,16 @@ def test_sqlite_budget_ledger_keeps_active_reservations_inside_rolling_window(tm
                 provider_name="fake",
                 model="fake-model",
             )
+            clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
+            blocked_now = await ledger.reserve(
+                limit=rolling_limit,
+                session_id="sess_rolling_blocked",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
             clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
-            rolling_blocked = await ledger.reserve(
+            rolling_second = await ledger.reserve(
                 limit=rolling_limit,
                 session_id="sess_rolling_2",
                 agent_name="assistant",
@@ -631,15 +650,17 @@ def test_sqlite_budget_ledger_keeps_active_reservations_inside_rolling_window(tm
                 provider_name="fake",
                 model="fake-model",
             )
-            return rolling_first, rolling_blocked, all_time_first, all_time_second
+            return rolling_first, blocked_now, rolling_second, all_time_first, all_time_second
         finally:
             await ledger.close()
 
-    rolling_first, rolling_blocked, all_time_first, all_time_second = asyncio.run(run())
+    rolling_first, blocked_now, rolling_second, all_time_first, all_time_second = asyncio.run(run())
 
     assert rolling_first.accepted is True
-    assert rolling_blocked.accepted is False
-    assert rolling_blocked.actual == Decimal("0.44")
+    assert blocked_now.accepted is False
+    assert blocked_now.actual == Decimal("0.44")
+    assert rolling_second.accepted is True
+    assert rolling_second.actual == Decimal("0.22")
     assert all_time_first.accepted is True
     assert all_time_second.accepted is False
     assert all_time_second.actual == Decimal("0.44")
@@ -742,6 +763,125 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_calendar_window(tmp_p
     assert next_day.window.storage_key == "calendar:day:UTC"
     assert active.accepted is False
     assert active.actual == Decimal("0.44")
+
+
+def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        orphaned = await ledger.reserve(
+            limit=limit,
+            session_id="sess_orphaned",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert orphaned.accepted is True
+        assert orphaned.record is not None
+        clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+        recovered = await ledger.reserve(
+            limit=limit,
+            session_id="sess_recovered",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        # V3: reconciling a reservation reaped while still in flight records the actual
+        # spend instead of crashing the billed run (which would also undercount).
+        reconciled = await ledger.reconcile(
+            reservation_id=orphaned.record.reservation_id,
+            actual_amount=Decimal("0.01"),
+        )
+        return recovered, reconciled
+
+    recovered, reconciled = asyncio.run(run())
+
+    assert recovered.accepted is True
+    assert recovered.actual == Decimal("0.22")
+    assert reconciled.status == "reconciled"
+    assert reconciled.actual_amount == Decimal("0.01")
+
+
+def test_in_memory_budget_ledger_reservation_ttl_none_disables_reap() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=None)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        first = await ledger.reserve(
+            limit=limit,
+            session_id="sess_1",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert first.accepted is True
+        clock.value = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        blocked = await ledger.reserve(
+            limit=limit,
+            session_id="sess_2",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        return blocked
+
+    blocked = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+
+
+def test_budget_ledgers_reject_invalid_reservation_ttl(tmp_path) -> None:
+    with pytest.raises(ValueError, match="positive integer or None"):
+        InMemoryBudgetLedger(reservation_ttl_seconds=0)
+    with pytest.raises(ValueError, match="positive integer or None"):
+        SQLiteBudgetLedger(tmp_path / "budget.sqlite", reservation_ttl_seconds=-5)
+
+
+def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            orphaned = await ledger.reserve(
+                limit=limit,
+                session_id="sess_orphaned",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert orphaned.accepted is True
+            assert orphaned.record is not None
+            clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+            recovered = await ledger.reserve(
+                limit=limit,
+                session_id="sess_recovered",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            # V3: reconciling a reservation reaped while still in flight records the
+            # actual spend instead of crashing the billed run (which would undercount).
+            reconciled = await ledger.reconcile(
+                reservation_id=orphaned.record.reservation_id,
+                actual_amount=Decimal("0.01"),
+            )
+            return recovered, reconciled
+        finally:
+            await ledger.close()
+
+    recovered, reconciled = asyncio.run(run())
+
+    assert recovered.accepted is True
+    assert recovered.actual == Decimal("0.22")
+    assert reconciled.status == "reconciled"
+    assert reconciled.actual_amount == Decimal("0.01")
 
 
 def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path) -> None:
@@ -1951,6 +2091,7 @@ def test_run_limits_detect_reached_token_budget() -> None:
     assert decision.limit == StopLimit.TOTAL_TOKENS
     assert decision.maximum == 10
     assert decision.actual == 10
+    assert decision.message == "Run limit reached: total_tokens 10 >= 10."
 
 
 def test_run_limits_allow_tool_call_until_capacity_is_exceeded() -> None:
@@ -1976,6 +2117,8 @@ def test_run_limits_allow_tool_call_until_capacity_is_exceeded() -> None:
     assert blocked is not None
     assert blocked.limit == StopLimit.TOOL_CALLS
     assert blocked.actual == 3
+    # Tool calls only stop past capacity, so the message uses a strict ">".
+    assert blocked.message == "Run limit reached: tool_calls 3 > 2."
 
 
 def test_has_run_limits_detects_empty_and_configured_limits() -> None:
@@ -1983,8 +2126,8 @@ def test_has_run_limits_detects_empty_and_configured_limits() -> None:
     assert has_run_limits(RunLimits(max_elapsed_seconds=1))
 
 
-def test_run_limits_scope_defaults_to_session() -> None:
-    assert RunLimits().scope == "session"
+def test_run_limits_scope_defaults_to_run() -> None:
+    assert RunLimits().scope == "run"
 
 
 def test_copy_run_limits_preserves_scope() -> None:
@@ -1995,6 +2138,19 @@ def test_copy_run_limits_preserves_scope() -> None:
 
 def test_run_limits_scope_alone_is_not_a_limit() -> None:
     assert not has_run_limits(RunLimits(scope="run"))
+
+
+def test_stop_decision_supports_estimated_cost_with_decimal_values() -> None:
+    decision = StopDecision(
+        limit=StopLimit.ESTIMATED_COST,
+        maximum=Decimal("0.50"),
+        actual=Decimal("0.51"),
+        message="Budget reached: 0.51 >= 0.50 USD.",
+    )
+
+    assert decision.limit == StopLimit.ESTIMATED_COST
+    assert decision.maximum == Decimal("0.50")
+    assert decision.actual == Decimal("0.51")
 
 
 def test_cayu_app_get_session_cost_uses_durable_events() -> None:

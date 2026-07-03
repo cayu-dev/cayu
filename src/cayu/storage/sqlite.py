@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from cayu._validation import (
     copy_json_object,
@@ -73,6 +74,81 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 
+_T = TypeVar("_T")
+
+
+def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM cayu_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _load_labels(connection: sqlite3.Connection, session_id: str) -> dict[str, str]:
+    rows = connection.execute(
+        """
+        SELECT key, value
+        FROM cayu_session_labels
+        WHERE session_id = ?
+        ORDER BY key ASC
+        """,
+        (session_id,),
+    ).fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | None:
+    row = connection.execute(
+        """
+        SELECT id, agent_name, provider_name, model, parent_session_id,
+               causal_budget_id, runtime_name, runtime_version, environment_name,
+               status, created_at,
+               updated_at, metadata_json
+        FROM cayu_sessions
+        WHERE id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return sqlite_support.session_from_row(
+        row,
+        labels=_load_labels(connection, session_id),
+    )
+
+
+def _load_checkpoint_state(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT state_json
+        FROM cayu_checkpoints
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return copy_json_value(json.loads(row["state_json"]), "checkpoint")
+
+
+def _first_existing_event_id(
+    connection: sqlite3.Connection,
+    session_id: str,
+    event_ids: list[str],
+) -> str | None:
+    for event_id in event_ids:
+        row = connection.execute(
+            "SELECT 1 FROM cayu_events WHERE session_id = ? AND event_id = ?",
+            (session_id, event_id),
+        ).fetchone()
+        if row is not None:
+            return event_id
+    return None
+
 
 def _event_query_session_id_batches(
     session_ids: tuple[str, ...],
@@ -136,6 +212,27 @@ class SQLiteSessionStore(SessionStore):
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
+        # Hot-path queries run on a dedicated read-only connection in worker
+        # threads so the event loop never blocks on SQLite I/O and reads never
+        # queue behind the writer connection's transactions. In-memory
+        # databases are private to their connection, so they fall back to the
+        # writer connection (and its lock).
+        if str(db_path) == ":memory:":
+            self._read_connection = self._connection
+            self._read_lock = self._lock
+        else:
+            self._read_connection = self._connect_read_only(db_path)
+            self._read_lock = asyncio.Lock()
+
+    async def _run_read(self, query: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Run a read-only query off the event loop on the read connection."""
+        async with self._read_lock:
+            return await asyncio.to_thread(query, self._read_connection)
+
+    async def _run_write(self, statement: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Run a write statement off the event loop on the writer connection."""
+        async with self._lock:
+            return await asyncio.to_thread(statement, self._connection)
 
     async def create(
         self,
@@ -354,24 +451,7 @@ class SQLiteSessionStore(SessionStore):
 
     async def load(self, session_id: str) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT id, agent_name, provider_name, model, parent_session_id,
-                       causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at,
-                       updated_at, metadata_json
-                FROM cayu_sessions
-                WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            return sqlite_support.session_from_row(
-                row,
-                labels=self._load_labels_unlocked(session_id),
-            )
+        return await self._run_read(lambda connection: _load_session(connection, session_id))
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -646,15 +726,15 @@ class SQLiteSessionStore(SessionStore):
             seen_event_ids.add(copied_event.id)
             copied_events.append(copied_event)
 
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+        def statement(connection: sqlite3.Connection) -> None:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             if not copied_events:
                 return
 
             try:
-                with self._connection:
-                    self._connection.executemany(
+                with connection:
+                    connection.executemany(
                         """
                         INSERT INTO cayu_events (
                             session_id,
@@ -687,7 +767,8 @@ class SQLiteSessionStore(SessionStore):
                         ],
                     )
             except sqlite3.IntegrityError as exc:
-                existing_event_id = self._first_existing_event_id_unlocked(
+                existing_event_id = _first_existing_event_id(
+                    connection,
                     session_id,
                     [event.id for event in copied_events],
                 )
@@ -697,12 +778,15 @@ class SQLiteSessionStore(SessionStore):
                     ) from exc
                 raise
 
+        await self._run_write(statement)
+
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+
+        def query(connection: sqlite3.Connection) -> list[Event]:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            rows = self._connection.execute(
+            rows = connection.execute(
                 """
                 SELECT event_json
                 FROM cayu_events
@@ -712,6 +796,8 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             return [Event(**json.loads(row["event_json"])) for row in rows]
+
+        return await self._run_read(query)
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
@@ -760,8 +846,8 @@ class SQLiteSessionStore(SessionStore):
         order_direction = "DESC" if query.order_by.value == "sequence_desc" else "ASC"
         params.append(query.limit)
 
-        async with self._lock:
-            rows = self._connection.execute(
+        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
+            rows = connection.execute(
                 f"""
                 SELECT cayu_events.sequence, cayu_events.event_json
                 FROM cayu_events
@@ -779,6 +865,8 @@ class SQLiteSessionStore(SessionStore):
                 )
                 for row in rows
             ]
+
+        return await self._run_read(run_query)
 
     async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []
@@ -1044,13 +1132,13 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
 
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+        def statement(connection: sqlite3.Connection) -> None:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             if not copied_messages:
                 return
-            with self._connection:
-                self._connection.executemany(
+            with connection:
+                connection.executemany(
                     """
                     INSERT INTO cayu_transcript_messages (
                         session_id,
@@ -1069,6 +1157,8 @@ class SQLiteSessionStore(SessionStore):
                     ],
                 )
 
+        await self._run_write(statement)
+
     async def append_transcript_messages_and_checkpoint(
         self,
         session_id: str,
@@ -1082,12 +1172,12 @@ class SQLiteSessionStore(SessionStore):
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
         updated_at = datetime.now(UTC)
 
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+        def statement(connection: sqlite3.Connection) -> None:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            with self._connection:
+            with connection:
                 if copied_messages:
-                    self._connection.executemany(
+                    connection.executemany(
                         """
                         INSERT INTO cayu_transcript_messages (
                             session_id,
@@ -1105,7 +1195,7 @@ class SQLiteSessionStore(SessionStore):
                             for message in copied_messages
                         ],
                     )
-                self._connection.execute(
+                connection.execute(
                     """
                     INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                     VALUES (?, ?, ?)
@@ -1120,12 +1210,15 @@ class SQLiteSessionStore(SessionStore):
                     ),
                 )
 
+        await self._run_write(statement)
+
     async def load_transcript(self, session_id: str) -> list[Message]:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+
+        def query(connection: sqlite3.Connection) -> list[Message]:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            rows = self._connection.execute(
+            rows = connection.execute(
                 """
                 SELECT message_json
                 FROM cayu_transcript_messages
@@ -1135,6 +1228,8 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             return [Message(**json.loads(row["message_json"])) for row in rows]
+
+        return await self._run_read(query)
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
@@ -1206,11 +1301,11 @@ class SQLiteSessionStore(SessionStore):
         checkpoint = copy_json_value(state, "checkpoint")
         updated_at = datetime.now(UTC)
 
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+        def statement(connection: sqlite3.Connection) -> None:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
-            with self._connection:
-                self._connection.execute(
+            with connection:
+                connection.execute(
                     """
                     INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
                     VALUES (?, ?, ?)
@@ -1225,63 +1320,38 @@ class SQLiteSessionStore(SessionStore):
                     ),
                 )
 
+        await self._run_write(statement)
+
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            return self._load_checkpoint_unlocked(session_id)
+        return await self._run_read(
+            lambda connection: _load_checkpoint_state(connection, session_id)
+        )
 
     def _load_checkpoint_unlocked(self, session_id: str) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            """
-            SELECT state_json
-            FROM cayu_checkpoints
-            WHERE session_id = ?
-            """,
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return copy_json_value(json.loads(row["state_json"]), "checkpoint")
+        return _load_checkpoint_state(self._connection, session_id)
 
     async def close(self) -> None:
         async with self._lock:
+            if self._read_connection is not self._connection:
+                async with self._read_lock:
+                    self._read_connection.close()
             self._connection.close()
 
     def _connect(self, path: Path) -> sqlite3.Connection:
         return sqlite_support.connect(path)
 
+    def _connect_read_only(self, path: Path) -> sqlite3.Connection:
+        return sqlite_support.connect(path, read_only=True)
+
     def _initialize_schema(self) -> None:
         sqlite_support.reconcile_schema(self._connection, self._schema_mode)
 
     def _load_unlocked(self, session_id: str) -> Session | None:
-        row = self._connection.execute(
-            """
-            SELECT id, agent_name, provider_name, model, parent_session_id,
-                   causal_budget_id, runtime_name, runtime_version, environment_name, status, created_at,
-                   updated_at, metadata_json
-            FROM cayu_sessions
-            WHERE id = ?
-            """,
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return sqlite_support.session_from_row(
-            row,
-            labels=self._load_labels_unlocked(session_id),
-        )
+        return _load_session(self._connection, session_id)
 
     def _load_labels_unlocked(self, session_id: str) -> dict[str, str]:
-        rows = self._connection.execute(
-            """
-            SELECT key, value
-            FROM cayu_session_labels
-            WHERE session_id = ?
-            ORDER BY key ASC
-            """,
-            (session_id,),
-        ).fetchall()
-        return {row["key"]: row["value"] for row in rows}
+        return _load_labels(self._connection, session_id)
 
     def _load_labels_for_sessions_unlocked(
         self,
@@ -1307,25 +1377,14 @@ class SQLiteSessionStore(SessionStore):
         return labels_by_session_id
 
     def _session_exists_unlocked(self, session_id: str) -> bool:
-        row = self._connection.execute(
-            "SELECT 1 FROM cayu_sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        return row is not None
+        return _session_exists(self._connection, session_id)
 
     def _first_existing_event_id_unlocked(
         self,
         session_id: str,
         event_ids: list[str],
     ) -> str | None:
-        for event_id in event_ids:
-            row = self._connection.execute(
-                "SELECT 1 FROM cayu_events WHERE session_id = ? AND event_id = ?",
-                (session_id, event_id),
-            ).fetchone()
-            if row is not None:
-                return event_id
-        return None
+        return _first_existing_event_id(self._connection, session_id, event_ids)
 
 
 class SQLiteTaskStore(TaskStore):

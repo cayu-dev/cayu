@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, copy_label_map
@@ -21,9 +22,23 @@ from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
 from cayu.storage import migrations as schema
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    if str(path) != ":memory:":
+def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    if str(path) == ":memory:":
+        if read_only:
+            raise ValueError("Read-only connections require a file-backed SQLite database.")
+    else:
         path.parent.mkdir(parents=True, exist_ok=True)
+    if read_only:
+        # A dedicated read-only connection lets queries run in worker threads
+        # without contending with the writer connection's transactions (WAL
+        # readers never block on the writer). query_only guards against any
+        # accidental write slipping onto the read path.
+        uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA query_only = ON")
+        return connection
     connection = sqlite3.connect(path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")

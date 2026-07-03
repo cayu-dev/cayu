@@ -29,6 +29,7 @@ BudgetCalendarPeriod = Literal["day", "week", "month"]
 BudgetAction = Literal["interrupt", "notify"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
+DEFAULT_RESERVATION_TTL_SECONDS = 3600
 _ALL_TIME_WINDOW = "all_time"
 _ROLLING_PREFIX = "rolling:"
 _ROLLING_SUFFIX = "s"
@@ -581,10 +582,16 @@ class SessionBudgetStore(BudgetStore):
 class InMemoryBudgetLedger(BudgetLedger):
     """In-memory reservation ledger for single-process apps and tests."""
 
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
+    ) -> None:
         self._records: dict[str, BudgetReservationRecord] = {}
         self._lock = asyncio.Lock()
         self._clock = _clock_or_utc_now(clock)
+        self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
     async def reserve(
         self,
@@ -602,6 +609,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         )
         now = self._clock()
         async with self._lock:
+            self._reap_expired_unlocked(now)
             current = _ledger_used_amount(
                 self._records.values(),
                 scope=limit.scope,
@@ -659,7 +667,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         actual_amount = _validate_amount(actual_amount, "actual_amount")
         reconciled_at = _utc_datetime(occurred_at, "occurred_at") if occurred_at else self._clock()
         async with self._lock:
-            record = self._active_record(reservation_id)
+            record = self._reconcilable_record(reservation_id)
             reconciled = _reconciled_record(
                 record,
                 actual_amount=actual_amount,
@@ -691,6 +699,22 @@ class InMemoryBudgetLedger(BudgetLedger):
             self._records[reservation_id] = released
             return _reconciliation_from_record(released)
 
+    def _reap_expired_unlocked(self, now: datetime) -> None:
+        if self._reservation_ttl_seconds is None:
+            return
+        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        for reservation_id, record in self._records.items():
+            if record.status != "active" or record.updated_at > cutoff:
+                continue
+            self._records[reservation_id] = record.model_copy(
+                update={
+                    "status": "released",
+                    "reason": _expired_reservation_reason(self._reservation_ttl_seconds),
+                    "updated_at": now,
+                },
+                deep=True,
+            )
+
     def _active_record(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._records.get(reservation_id)
         if record is None:
@@ -698,6 +722,19 @@ class InMemoryBudgetLedger(BudgetLedger):
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
+
+    def _reconcilable_record(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._records.get(reservation_id)
+        if record is None:
+            raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
+            # Reconcile it anyway so the actual spend is recorded rather than crashing the
+            # billed run and silently undercounting the shared budget window.
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
 
 def copy_budget_reservation(reservation: BudgetReservation) -> BudgetReservation:
@@ -1049,15 +1086,35 @@ def _ledger_used_amount(
             or record.currency.upper() != currency.upper()
         ):
             continue
+        if since is not None and record.updated_at < since:
+            continue
+        if until is not None and record.updated_at >= until:
+            continue
         if record.status == "active":
             total += record.reserved_amount
         elif record.status == "reconciled":
-            if since is not None and record.updated_at < since:
-                continue
-            if until is not None and record.updated_at >= until:
-                continue
             total += record.actual_amount or Decimal("0")
     return total
+
+
+def _validate_reservation_ttl(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise ValueError("reservation_ttl_seconds must be a positive integer or None.")
+    return value
+
+
+_EXPIRED_RESERVATION_REASON_PREFIX = "Reservation expired:"
+
+
+def _expired_reservation_reason(ttl_seconds: int) -> str:
+    return f"{_EXPIRED_RESERVATION_REASON_PREFIX} not reconciled within {ttl_seconds}s."
+
+
+def _is_expired_reservation_reason(reason: str | None) -> bool:
+    """True when a released reservation was reaped by the TTL (vs. explicitly released)."""
+    return reason is not None and reason.startswith(_EXPIRED_RESERVATION_REASON_PREFIX)
 
 
 def _reservation_result(
