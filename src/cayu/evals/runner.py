@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import traceback
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.assertions import EvalAssertion, SessionStatusIs
 from cayu.evals.models import (
+    WORKSPACE_PROBE_MAX_BYTES,
     EvalAssertionResult,
     EvalCaseResult,
     EvalContext,
@@ -25,6 +28,7 @@ from cayu.evals.models import (
     ProbeRequirements,
     Trajectory,
     TrajectoryProbes,
+    WorkspaceFileProbe,
 )
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
@@ -35,6 +39,29 @@ from cayu.runtime.sessions import (
     copy_run_request,
 )
 from cayu.runtime.usage import SessionUsageSummary
+
+# Sessions per page when walking the sub-agent tree, and the max pages walked per node. The walk
+# pages past the first 1000 children (rather than silently keeping only the first page) but stays
+# bounded so a pathological fan-out can't stall the eval; hitting the cap sets children_incomplete.
+_CHILD_TRAJECTORY_PAGE_SIZE = 1000
+_CHILD_TRAJECTORY_MAX_PAGES = 100
+
+
+class _IncompleteFlag:
+    """Node-local, mutable "children were not fully enumerated" signal for the sub-agent walk."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = False
+
+
+def _format_exception(exc: BaseException) -> str:
+    # Record the exception type name + traceback, not a bare str(exc): an empty-message error
+    # (e.g. KeyError() or a re-raised cancellation) otherwise collapsed to a blank, untraceable
+    # eval error string. format_exception's final line already carries "TypeName: message".
+    formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    return formatted or f"{type(exc).__name__}: {exc}"
 
 
 class EvalCase(BaseModel):
@@ -136,6 +163,7 @@ async def run_eval_suite(
     retain_trajectory: bool = False,
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
+    trials: int = 1,
 ) -> EvalRun:
     """Run every case in the suite and aggregate the results.
 
@@ -146,6 +174,10 @@ async def run_eval_suite(
 
     `case_timeout_seconds` bounds each case's run; a case that exceeds it is
     cancelled and recorded as `EvalStatus.ERROR` instead of stalling the suite.
+
+    `trials` runs each case N times and reports the mean per-assertion score, so a
+    stochastic model whose score wobbles (e.g. 0.83 -> 0.82) settles to a stable
+    average instead of flipping a baseline comparison on every run.
     """
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -155,6 +187,7 @@ async def run_eval_suite(
         raise TypeError("run_eval_suite max_concurrency must be an int.")
     if max_concurrency < 1:
         raise ValueError("run_eval_suite max_concurrency must be >= 1.")
+    _validate_trials(trials, "run_eval_suite trials")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
 
     run_id = str(uuid4())
@@ -165,6 +198,7 @@ async def run_eval_suite(
         retain_trajectory=retain_trajectory,
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
     )
     completed_at = datetime.now(UTC)
     status = _run_status(results)
@@ -188,6 +222,7 @@ async def run_eval_plan(
     retain_trajectory: bool = False,
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
+    trials: int = 1,
 ) -> EvalRun:
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
@@ -197,6 +232,7 @@ async def run_eval_plan(
         retain_trajectory=retain_trajectory,
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
     )
 
 
@@ -207,6 +243,7 @@ async def _run_suite_cases(
     retain_trajectory: bool,
     max_concurrency: int,
     case_timeout_seconds: float | None,
+    trials: int,
 ) -> list[EvalCaseResult]:
     if max_concurrency == 1:
         return [
@@ -216,6 +253,7 @@ async def _run_suite_cases(
                 suite_id=suite.id,
                 retain_trajectory=retain_trajectory,
                 timeout_seconds=case_timeout_seconds,
+                trials=trials,
             )
             for case in suite.cases
         ]
@@ -234,6 +272,7 @@ async def _run_suite_cases(
                 suite_id=suite.id,
                 retain_trajectory=retain_trajectory,
                 timeout_seconds=case_timeout_seconds,
+                trials=trials,
             )
 
     async with asyncio.TaskGroup() as group:
@@ -249,8 +288,53 @@ async def run_eval_case(
     suite_id: str,
     retain_trajectory: bool = False,
     timeout_seconds: float | None = None,
+    trials: int = 1,
 ) -> EvalCaseResult:
+    """Run one case, optionally `trials` times, aggregating to the mean per-assertion score.
+
+    `trials=1` (the default) returns the single run unchanged. `trials>1` runs the case N
+    times and reports each assertion's mean score across trials, so a stochastic model whose
+    score wobbles run-to-run settles to a stable average instead of a coin-flip pass/fail.
+    """
+    _validate_trials(trials, "run_eval_case trials")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
+    if trials == 1:
+        return await _run_case_once(
+            app,
+            case,
+            suite_id=suite_id,
+            retain_trajectory=retain_trajectory,
+            timeout_seconds=timeout_seconds,
+        )
+    started_at = datetime.now(UTC)
+    trial_results = [
+        await _run_case_once(
+            app,
+            case,
+            suite_id=suite_id,
+            retain_trajectory=retain_trajectory,
+            timeout_seconds=timeout_seconds,
+        )
+        for _ in range(trials)
+    ]
+    completed_at = datetime.now(UTC)
+    return _aggregate_trials(
+        case,
+        trial_results,
+        started_at=started_at,
+        completed_at=completed_at,
+        retain_trajectory=retain_trajectory,
+    )
+
+
+async def _run_case_once(
+    app: CayuApp,
+    case: EvalCase,
+    *,
+    suite_id: str,
+    retain_trajectory: bool = False,
+    timeout_seconds: float | None = None,
+) -> EvalCaseResult:
     started_at = datetime.now(UTC)
     emitted_events: list[Event] = []
     session_id: str | None = None
@@ -267,9 +351,9 @@ async def run_eval_case(
         if deadline.expired():
             run_error = f"Eval case timed out after {timeout_seconds} seconds."
         else:
-            run_error = str(exc)
+            run_error = _format_exception(exc)
     except Exception as exc:
-        run_error = str(exc)
+        run_error = _format_exception(exc)
 
     if session_id is None:
         session_id = case.request.session_id
@@ -284,7 +368,7 @@ async def run_eval_case(
             events, transcript, usage_summary = await _load_session_records(app, session_id)
         except Exception as exc:
             if run_error is None:
-                run_error = f"Failed to load eval session state: {exc}"
+                run_error = f"Failed to load eval session state: {_format_exception(exc)}"
 
     # app.run() does not raise on a model/tool failure; it ends the session as
     # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
@@ -301,8 +385,12 @@ async def run_eval_case(
     final_output = final_output_text(transcript)
     probe_requirements = _collect_probe_requirements(case.assertions)
     probes = await _capture_probes(app, session, probe_requirements)
+    children_incomplete = _IncompleteFlag()
     children = await _build_child_trajectories(
-        app, session_id, visited={session_id} if session_id is not None else set()
+        app,
+        session_id,
+        visited={session_id} if session_id is not None else set(),
+        incomplete=children_incomplete,
     )
     trajectory = Trajectory(
         session=session,
@@ -312,6 +400,7 @@ async def run_eval_case(
         final_output=final_output,
         probes=probes,
         children=children,
+        children_incomplete=children_incomplete.value,
         metadata=case.metadata,
     )
     context = EvalContext(
@@ -427,13 +516,25 @@ async def _capture_probes(
 
     workspace_available = False
     workspace_files: dict[str, bytes | None] = {}
+    workspace_file_stats: dict[str, WorkspaceFileProbe] = {}
     workspace = getattr(env, "workspace", None)
     if requirements.workspace_paths and workspace is not None:
         workspace_available = True
         for path in sorted(requirements.workspace_paths):
             try:
-                result = await workspace.read_bytes(path)
-                workspace_files[path] = result.content
+                # Cap the read so an oversized workspace file can't balloon the trajectory JSON
+                # (bytes are base64-encoded there). The full size + a content hash are recorded
+                # alongside so a truncated capture is still identifiable and stat-able.
+                result = await workspace.read_bytes(path, max_bytes=WORKSPACE_PROBE_MAX_BYTES)
+                content = result.content
+                workspace_files[path] = content
+                total_bytes = getattr(result, "total_bytes", len(content))
+                truncated = getattr(result, "truncated", len(content) < total_bytes)
+                workspace_file_stats[path] = WorkspaceFileProbe(
+                    total_bytes=total_bytes,
+                    truncated=truncated,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
             except Exception:
                 # Absent/unreadable: record the path as probed-but-missing (None), distinct
                 # from "never probed" (key absent), which the assertion reports differently.
@@ -460,6 +561,7 @@ async def _capture_probes(
     return TrajectoryProbes(
         workspace_available=workspace_available,
         workspace_files=workspace_files,
+        workspace_file_stats=workspace_file_stats,
         artifacts_available=artifacts_available,
         artifacts=tuple(artifacts),
     )
@@ -470,25 +572,44 @@ async def _build_child_trajectories(
     parent_session_id: str | None,
     *,
     visited: set[str],
+    incomplete: _IncompleteFlag | None = None,
 ) -> tuple[Trajectory, ...]:
     # Walk the sub-agent tree by parent linkage so a run's sub-agents are captured in the
-    # trajectory. `visited` guards against cycles / re-visiting a shared id.
+    # trajectory. `visited` guards against cycles / re-visiting a shared id. The walk pages
+    # through the keyset cursor so a parent with more than one page of children is captured in
+    # full; a store error mid-walk or hitting the page cap sets `incomplete` (surfaced on the
+    # node's Trajectory.children_incomplete) instead of being silently swallowed.
     if parent_session_id is None:
         return ()
-    try:
-        result = await app.session_store.list_sessions(
-            SessionQuery(parent_session_id=parent_session_id, limit=1000)
-        )
-    except Exception:
-        return ()
     children: list[Trajectory] = []
-    for child_session in result.sessions:
-        if child_session.id in visited:
-            continue
-        visited.add(child_session.id)
-        child = await _load_child_trajectory(app, child_session, visited=visited)
-        if child is not None:
-            children.append(child)
+    cursor: str | None = None
+    for _ in range(_CHILD_TRAJECTORY_MAX_PAGES):
+        try:
+            result = await app.session_store.list_sessions(
+                SessionQuery(
+                    parent_session_id=parent_session_id,
+                    limit=_CHILD_TRAJECTORY_PAGE_SIZE,
+                    cursor=cursor,
+                )
+            )
+        except Exception:
+            if incomplete is not None:
+                incomplete.value = True
+            return tuple(children)
+        for child_session in result.sessions:
+            if child_session.id in visited:
+                continue
+            visited.add(child_session.id)
+            child = await _load_child_trajectory(app, child_session, visited=visited)
+            if child is not None:
+                children.append(child)
+        cursor = result.next_cursor
+        if cursor is None:
+            return tuple(children)
+    # Fell out of the page loop with a cursor still pending: more children remain than the cap
+    # allows us to walk. Mark the capture partial rather than dropping the rest silently.
+    if incomplete is not None:
+        incomplete.value = True
     return tuple(children)
 
 
@@ -504,14 +625,109 @@ async def _load_child_trajectory(
         return None
     # Sub-agent nodes are captured for visibility/serialization; assertions in v1 evaluate
     # against the root case only, so child nodes carry no probe snapshot.
+    grandchildren_incomplete = _IncompleteFlag()
+    grandchildren = await _build_child_trajectories(
+        app, session.id, visited=visited, incomplete=grandchildren_incomplete
+    )
     return Trajectory(
         session=session,
         events=events,
         transcript=transcript,
         usage_summary=usage_summary,
         final_output=final_output_text(transcript),
-        children=await _build_child_trajectories(app, session.id, visited=visited),
+        children=grandchildren,
+        children_incomplete=grandchildren_incomplete.value,
     )
+
+
+def _validate_trials(value: int, field_name: str) -> None:
+    # bool is an int subclass; reject it so trials=True can't silently mean 1 trial.
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an int.")
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1.")
+
+
+def _aggregate_trials(
+    case: EvalCase,
+    results: list[EvalCaseResult],
+    *,
+    started_at: datetime,
+    completed_at: datetime,
+    retain_trajectory: bool,
+) -> EvalCaseResult:
+    # Collapse N trial runs of one case into a single result whose per-assertion score is the
+    # mean across trials. Any errored trial keeps the aggregate in ERROR so execution failures
+    # cannot disappear behind assertion-list mismatch handling.
+    n = len(results)
+    errored = [result for result in results if result.status == EvalStatus.ERROR]
+    all_error = all(result.status == EvalStatus.ERROR for result in results)
+    combined_error: str | None = None
+    if errored:
+        errors = [result.error for result in errored if result.error]
+        prefix = f"All {n} trials errored" if all_error else f"{len(errored)} of {n} trials errored"
+        combined_error = f"{prefix}; first: {errors[0]}" if errors else f"{prefix}."
+    aggregated = [] if errored else _aggregate_trial_assertions(results, n)
+    status = _case_status(combined_error, aggregated)
+    score = _case_score(status, aggregated)
+    # The last trial supplies the representative session/output/trajectory for export.
+    last = results[-1]
+    metadata = {
+        **case.metadata,
+        "trials": n,
+        "trial_scores": [result.score for result in results],
+        "trial_statuses": [result.status.value for result in results],
+    }
+    return EvalCaseResult(
+        case_id=case.id,
+        status=status,
+        session_id=last.session_id,
+        score=score,
+        final_output=last.final_output,
+        assertions=tuple(aggregated),
+        error=combined_error,
+        events_count=last.events_count,
+        usage_summary=last.usage_summary,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=_duration_ms(started_at, completed_at),
+        metadata=metadata,
+        trajectory=last.trajectory if retain_trajectory else None,
+    )
+
+
+def _aggregate_trial_assertions(
+    results: list[EvalCaseResult], trials: int
+) -> list[EvalAssertionResult]:
+    assertion_lists = [result.assertions for result in results]
+    first = assertion_lists[0]
+    # Same case, same assertion list, so every trial yields the same assertions in order. If a
+    # trial diverges (defensive), skip aggregation so the case reports SKIPPED rather than
+    # zipping mismatched assertions together.
+    if not first or not all(len(a) == len(first) for a in assertion_lists):
+        return []
+    aggregated: list[EvalAssertionResult] = []
+    for index in range(len(first)):
+        group = [assertions[index] for assertions in assertion_lists]
+        mean_score = sum(assertion.score for assertion in group) / trials
+        threshold = group[0].threshold
+        bar = threshold if threshold is not None else 1.0
+        pass_count = sum(1 for assertion in group if assertion.passed)
+        aggregated.append(
+            EvalAssertionResult(
+                name=group[0].name,
+                score=mean_score,
+                threshold=threshold,
+                passed=mean_score >= bar,
+                message=f"mean score {mean_score:.3f} over {trials} trials ({pass_count}/{trials} passed)",
+                metadata={
+                    "trials": trials,
+                    "trial_scores": [assertion.score for assertion in group],
+                    "pass_count": pass_count,
+                },
+            )
+        )
+    return aggregated
 
 
 def _validate_timeout_seconds(value: float | None, field_name: str) -> None:
@@ -546,20 +762,24 @@ def final_output_text(transcript: Iterable[Message]) -> str:
 
 def _case_status(
     run_error: str | None,
-    assertions: list[EvalAssertionResult],
+    assertions: Sequence[EvalAssertionResult],
 ) -> EvalStatus:
     if run_error is not None:
         return EvalStatus.ERROR
+    # A case that asserts nothing used to pass at score 1.0 — a fail-open default that let an
+    # unfinished case masquerade as green. Record it as SKIPPED so it is visible, not counted.
+    if not assertions:
+        return EvalStatus.SKIPPED
     if all(assertion.passed for assertion in assertions):
         return EvalStatus.PASSED
     return EvalStatus.FAILED
 
 
-def _case_score(status: EvalStatus, assertions: list[EvalAssertionResult]) -> float:
-    if status == EvalStatus.ERROR:
+def _case_score(status: EvalStatus, assertions: Sequence[EvalAssertionResult]) -> float:
+    if status in (EvalStatus.ERROR, EvalStatus.SKIPPED):
         return 0.0
     if not assertions:
-        return 1.0 if status == EvalStatus.PASSED else 0.0
+        return 0.0
     return sum(assertion.score for assertion in assertions) / len(assertions)
 
 
@@ -568,6 +788,10 @@ def _run_status(results: list[EvalCaseResult]) -> EvalStatus:
         return EvalStatus.ERROR
     if any(result.status == EvalStatus.FAILED for result in results):
         return EvalStatus.FAILED
+    # A skipped case (zero assertions) is not a pass; surface it at the run level so the
+    # suite is not reported green while a case asserted nothing.
+    if any(result.status == EvalStatus.SKIPPED for result in results):
+        return EvalStatus.SKIPPED
     return EvalStatus.PASSED
 
 

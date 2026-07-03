@@ -125,6 +125,7 @@ def render_html_report(run: EvalRun) -> str:
     .passed {{ color: #0f5132; background: #d9f2e3; }}
     .failed {{ color: #842029; background: #f8d7da; }}
     .error {{ color: #664d03; background: #fff3cd; }}
+    .skipped {{ color: #41505b; background: #e2e8ef; }}
     .case {{ padding: 16px; margin-top: 12px; }}
     .assertion {{ display: grid; grid-template-columns: 120px 1fr; gap: 12px; padding: 8px 0; border-top: 1px solid #e6ebe8; }}
     pre {{ white-space: pre-wrap; background: #f0f4f3; padding: 12px; border-radius: 6px; overflow: auto; }}
@@ -162,7 +163,20 @@ def write_html_report(run: EvalRun, path: str | Path) -> None:
     Path(path).write_text(render_html_report(run), encoding="utf-8")
 
 
-def compare_eval_runs(baseline: EvalRun, current: EvalRun) -> EvalRunComparison:
+def compare_eval_runs(
+    baseline: EvalRun, current: EvalRun, *, score_tolerance: float = 0.0
+) -> EvalRunComparison:
+    """Compare two runs and flag regressions.
+
+    `score_tolerance` (>= 0) is the amount a score may drop before it counts as a regression:
+    a current score below ``baseline - score_tolerance`` regresses, so a stochastic wobble
+    (e.g. 0.83 -> 0.82) inside the tolerance no longer fails a baseline comparison every run.
+    A status regression (PASSED -> not PASSED) is always flagged regardless of tolerance.
+    """
+    if type(score_tolerance) not in (int, float) or isinstance(score_tolerance, bool):
+        raise TypeError("compare_eval_runs score_tolerance must be a number.")
+    if score_tolerance != score_tolerance or score_tolerance < 0:  # rejects NaN and negatives
+        raise ValueError("compare_eval_runs score_tolerance must be >= 0.")
     if baseline.suite_id != current.suite_id:
         raise ValueError(
             "Cannot compare eval runs from different suites: "
@@ -197,7 +211,7 @@ def compare_eval_runs(baseline: EvalRun, current: EvalRun) -> EvalRunComparison:
                 case_regressions.append(
                     f"status regressed from {base.status.value} to {cur.status.value}"
                 )
-            if cur.score < base.score:
+            if cur.score < base.score - score_tolerance:
                 case_regressions.append(f"score regressed from {base.score:.2f} to {cur.score:.2f}")
         for item in case_regressions:
             regressions.append(f"{case_id}: {item}")
@@ -217,7 +231,7 @@ def compare_eval_runs(baseline: EvalRun, current: EvalRun) -> EvalRunComparison:
             0,
             f"run status regressed from {baseline.status.value} to {current.status.value}",
         )
-    if current.score < baseline.score:
+    if current.score < baseline.score - score_tolerance:
         regressions.insert(
             0, f"run score regressed from {baseline.score:.2f} to {current.score:.2f}"
         )

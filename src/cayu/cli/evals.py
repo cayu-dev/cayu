@@ -64,6 +64,13 @@ def add_eval_parser(subparsers: Any) -> None:
         help="Comparison format (default: json).",
     )
     compare.add_argument("--output", "-o", metavar="FILE", help="Write comparison to FILE.")
+    compare.add_argument(
+        "--score-tolerance",
+        type=float,
+        default=0.0,
+        metavar="DELTA",
+        help="Allowed score drop before a regression is flagged (default: 0.0).",
+    )
 
 
 def run_eval_command(args: argparse.Namespace) -> int:
@@ -105,7 +112,7 @@ def _report(args: argparse.Namespace) -> int:
 def _compare(args: argparse.Namespace) -> int:
     baseline = load_eval_run(args.baseline)
     current = load_eval_run(args.current)
-    comparison = compare_eval_runs(baseline, current)
+    comparison = compare_eval_runs(baseline, current, score_tolerance=args.score_tolerance)
     if args.format == "json":
         output = comparison_to_json(comparison)
     else:

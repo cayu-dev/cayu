@@ -30,11 +30,20 @@ from cayu.runtime.usage import SessionUsageSummary
 # baselines is a follow-up; today the guard only rejects newer-than-supported.)
 EVAL_SCHEMA_VERSION = 1
 
+# Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
+# larger than this is captured truncated — with its true size and a content hash still recorded —
+# so a multi-GB workspace file can never balloon the trajectory JSON (which base64-encodes bytes)
+# or the in-memory result. Assertions still see the leading window of the file.
+WORKSPACE_PROBE_MAX_BYTES = 1 << 20  # 1 MiB
+
 
 class EvalStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     ERROR = "error"
+    # A case with zero assertions is not scored as a pass (that would fail open); it is
+    # recorded as SKIPPED so an author sees the case ran but asserted nothing.
+    SKIPPED = "skipped"
 
 
 class EvalAssertionResult(BaseModel):
@@ -171,6 +180,27 @@ class ProbeRequirements:
         )
 
 
+class WorkspaceFileProbe(BaseModel):
+    """Stat + integrity record for a probed workspace file.
+
+    Companion to ``TrajectoryProbes.workspace_files`` (the captured, possibly-truncated bytes):
+    records the file's true size on disk, whether the captured window was truncated at
+    ``WORKSPACE_PROBE_MAX_BYTES``, and a sha256 of the captured bytes. This lets a large file's
+    size and identity survive in the trajectory without base64-ing its whole content into JSON.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_bytes: StrictInt = Field(ge=0)
+    truncated: StrictBool = False
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
 class TrajectoryProbes(BaseModel):
     """Serializable snapshot of the live-environment data assertions need.
 
@@ -182,9 +212,14 @@ class TrajectoryProbes(BaseModel):
     model_config = ConfigDict(extra="forbid", ser_json_bytes="base64", val_json_bytes="base64")
 
     workspace_available: StrictBool = False
-    # path -> file bytes, or None when the file is absent/unreadable. A declared path is
-    # always a key (so "missing key" means it was never probed), distinct from a None value.
+    # path -> file bytes (capped at WORKSPACE_PROBE_MAX_BYTES), or None when the file is
+    # absent/unreadable. A declared path is always a key (so "missing key" means it was never
+    # probed), distinct from a None value.
     workspace_files: dict[str, bytes | None] = Field(default_factory=dict)
+    # path -> stat/hash for each present, readable probed file. A path is absent here when the
+    # file was missing/unreadable (its workspace_files value is None); consult total_bytes /
+    # truncated to tell a fully-captured file from one whose bytes were truncated to the cap.
+    workspace_file_stats: dict[str, WorkspaceFileProbe] = Field(default_factory=dict)
     artifacts_available: StrictBool = False
     artifacts: tuple[ArtifactMetadata, ...] = Field(default_factory=tuple)
 
@@ -210,6 +245,9 @@ class Trajectory(BaseModel):
     final_output: str = ""
     probes: TrajectoryProbes = Field(default_factory=TrajectoryProbes)
     children: tuple[Trajectory, ...] = Field(default_factory=tuple)
+    # True when the sub-agent walk stopped before enumerating every child — a store error mid-walk
+    # or hitting the page cap — so a partial `children` capture is never mistaken for "no more".
+    children_incomplete: StrictBool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

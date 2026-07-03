@@ -86,12 +86,18 @@ class _SessionSpans:
     Keeping spans per-session (rather than in one flat dict keyed by formatted
     strings) avoids cross-session key collisions and bounds session-end cleanup to
     that session's own spans.
+
+    ``last_activity_ns`` records the event timestamp (epoch nanoseconds) of the most
+    recent event that touched this session. The staleness safety net evicts the
+    least-recently-active session, so a long-lived but still-progressing trace is
+    never the one truncated.
     """
 
-    def __init__(self, root: Any) -> None:
+    def __init__(self, root: Any, last_activity_ns: int) -> None:
         self.root = root
         self.model: Any | None = None
         self.tools: dict[str, Any] = {}
+        self.last_activity_ns = last_activity_ns
 
 
 class OpenTelemetryEventSink(EventSink):
@@ -114,7 +120,13 @@ class OpenTelemetryEventSink(EventSink):
         - Spans are closed by the matching terminal event. A session that ends without
           one (e.g. a bare task cancellation that re-raises without emitting a terminal
           ``session.*`` event) leaves its open spans unflushed; the sink relies on the
-          runtime emitting a terminal event per session.
+          runtime emitting a terminal event per session. As a bounded safety net, once
+          more than ``_MAX_OPEN_SESSIONS`` are open a new session evicts the
+          least-recently-active one (by event timestamp), incrementing
+          :attr:`evicted_sessions`.
+        - Timing: span ``start_time``/``end_time`` come from ``Event.timestamp`` (when
+          the work happened), not from when the sink processes the event, so a buffered
+          event bus or a slow downstream sink does not skew latency traces.
     """
 
     def __init__(
@@ -130,6 +142,17 @@ class OpenTelemetryEventSink(EventSink):
         self._tracer = tracer if tracer is not None else self._trace.get_tracer(tracer_name)
         self._propagator_instance: Any | None = None
         self._sessions: dict[str, _SessionSpans] = {}
+        self._evicted_sessions = 0
+
+    @property
+    def evicted_sessions(self) -> int:
+        """Number of sessions force-closed by the staleness safety net.
+
+        A non-zero value means the runtime failed to emit a terminal ``session.*``
+        event for that many sessions (their spans were orphaned and swept). Surface
+        it in health checks: it points at a runtime-side event leak, not a bug here.
+        """
+        return self._evicted_sessions
 
     async def emit(self, event: Event) -> None:
         if type(event) is not Event:
@@ -175,45 +198,64 @@ class OpenTelemetryEventSink(EventSink):
         if session_id in self._sessions:
             # Idempotent: a RESUMED after STARTED, or a duplicate, keeps the first span.
             return
+        event_ns = _event_time_ns(event)
         if len(self._sessions) >= _MAX_OPEN_SESSIONS:
             # Safety net: a session whose terminal event never arrived would otherwise
-            # grow _sessions unboundedly. Evict the oldest (insertion order).
-            oldest = next(iter(self._sessions))
-            self._close_session_state(self._sessions.pop(oldest), error=None, root_incomplete=True)
+            # grow _sessions unboundedly. Evict by *staleness* (least-recently-active),
+            # not insertion order — a long-lived but still-progressing trace is the
+            # oldest inserted yet must not be truncated mid-run. Close the orphan's
+            # spans at its last known activity so their duration reflects real work,
+            # and count it: a non-zero evicted_sessions points at a runtime event leak.
+            stale_id = min(self._sessions, key=lambda sid: self._sessions[sid].last_activity_ns)
+            stale = self._sessions.pop(stale_id)
+            self._evicted_sessions += 1
+            self._close_session_state(
+                stale, error=None, root_incomplete=True, end_time=stale.last_activity_ns
+            )
         name = _span_name("cayu.session", event.agent_name)
-        span = self._tracer.start_span(name, context=self._resolve_parent_context(event))
+        span = self._tracer.start_span(
+            name, context=self._resolve_parent_context(event), start_time=event_ns
+        )
         span.set_attribute(CAYU_SESSION_ID, session_id)
         _set_str(span, CAYU_AGENT_NAME, event.agent_name)
         _set_str(span, CAYU_ENVIRONMENT_NAME, event.environment_name)
-        self._sessions[session_id] = _SessionSpans(span)
+        self._sessions[session_id] = _SessionSpans(span, event_ns)
 
     def _end_session_span(self, event: Event, *, error: str | None) -> None:
         state = self._sessions.pop(event.session_id, None)
         if state is not None:
-            self._close_session_state(state, error=error)
+            self._close_session_state(state, error=error, end_time=_event_time_ns(event))
 
     def _close_session_state(
-        self, state: _SessionSpans, *, error: str | None, root_incomplete: bool = False
+        self,
+        state: _SessionSpans,
+        *,
+        error: str | None,
+        root_incomplete: bool = False,
+        end_time: int | None = None,
     ) -> None:
         # End any still-open child spans (a missing model/tool completion event, e.g.
         # an interrupt mid-step). They are left UNSET, not ERROR: we never received a
         # completion for them, so we don't know they failed — only the session root
         # carries the failure status. Mark them incomplete so they are not read as a
-        # clean success.
+        # clean success. Close them at the same instant as the root (the terminal event
+        # time, or the orphan's last activity) so a slow/buffered sink can't skew them.
         if state.model is not None:
-            self._finish(state.model, error=None, incomplete=True)
+            self._finish(state.model, error=None, incomplete=True, end_time=end_time)
         for tool_span in state.tools.values():
-            self._finish(tool_span, error=None, incomplete=True)
-        self._finish(state.root, error=error, incomplete=root_incomplete)
+            self._finish(tool_span, error=None, incomplete=True, end_time=end_time)
+        self._finish(state.root, error=error, incomplete=root_incomplete, end_time=end_time)
 
     def _start_model_span(self, event: Event) -> None:
         state = self._sessions.get(event.session_id)
         if state is None:
             return
+        event_ns = _event_time_ns(event)
+        state.last_activity_ns = event_ns
         if state.model is not None:
             # No completion arrived for the previous step (out-of-order/duplicate
             # MODEL_STARTED); close it rather than leak it.
-            self._finish(state.model, error=None, incomplete=True)
+            self._finish(state.model, error=None, incomplete=True, end_time=event_ns)
         payload = event.payload
         model = payload.get("model")
         name = _span_name(_OPERATION_CHAT, model)
@@ -223,6 +265,7 @@ class OpenTelemetryEventSink(EventSink):
             name,
             context=self._trace.set_span_in_context(state.root),
             kind=self._trace.SpanKind.CLIENT,
+            start_time=event_ns,
         )
         span.set_attribute(GEN_AI_OPERATION_NAME, _OPERATION_CHAT)
         provider = payload.get("provider")
@@ -236,6 +279,8 @@ class OpenTelemetryEventSink(EventSink):
         state = self._sessions.get(event.session_id)
         if state is None or state.model is None:
             return
+        event_ns = _event_time_ns(event)
+        state.last_activity_ns = event_ns
         span = state.model
         state.model = None
         payload = event.payload
@@ -260,18 +305,24 @@ class OpenTelemetryEventSink(EventSink):
                 _set_int(span, GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS, cache.get("write_tokens"))
         else:
             _set_str(span, GEN_AI_RESPONSE_MODEL, payload.get("model"))
-        self._finish(span, error=error)
+        self._finish(span, error=error, end_time=event_ns)
 
     def _start_tool_span(self, event: Event) -> None:
         state = self._sessions.get(event.session_id)
         if state is None:
             return
+        event_ns = _event_time_ns(event)
+        state.last_activity_ns = event_ns
         tool_call_id = _tool_call_id(event)
         if tool_call_id in state.tools:
-            self._finish(state.tools.pop(tool_call_id), error=None, incomplete=True)
+            self._finish(
+                state.tools.pop(tool_call_id), error=None, incomplete=True, end_time=event_ns
+            )
         tool_name = event.tool_name
         name = _span_name(_OPERATION_EXECUTE_TOOL, tool_name)
-        span = self._tracer.start_span(name, context=self._trace.set_span_in_context(state.root))
+        span = self._tracer.start_span(
+            name, context=self._trace.set_span_in_context(state.root), start_time=event_ns
+        )
         span.set_attribute(GEN_AI_OPERATION_NAME, _OPERATION_EXECUTE_TOOL)
         _set_str(span, GEN_AI_TOOL_NAME, tool_name)
         _set_str(span, GEN_AI_TOOL_CALL_ID, tool_call_id)
@@ -281,9 +332,11 @@ class OpenTelemetryEventSink(EventSink):
         state = self._sessions.get(event.session_id)
         if state is None:
             return
+        event_ns = _event_time_ns(event)
+        state.last_activity_ns = event_ns
         span = state.tools.pop(_tool_call_id(event), None)
         if span is not None:
-            self._finish(span, error=error)
+            self._finish(span, error=error, end_time=event_ns)
 
     def _resolve_parent_context(self, event: Event) -> Any:
         payload = event.payload
@@ -305,18 +358,36 @@ class OpenTelemetryEventSink(EventSink):
         # span happens to be active on the current OTel context.
         return self._empty_context
 
-    def _finish(self, span: Any, *, error: str | None, incomplete: bool = False) -> None:
+    def _finish(
+        self, span: Any, *, error: str | None, incomplete: bool = False, end_time: int | None = None
+    ) -> None:
         if error:
             span.set_status(self._status(self._status_error, error))
         if incomplete:
             span.set_attribute(CAYU_INCOMPLETE, True)
-        span.end()
+        # Pass the event's own timestamp (epoch ns) so a buffered/slow sink processing
+        # the event late does not stretch the span past when the work actually ended.
+        if end_time is None:
+            span.end()
+        else:
+            span.end(end_time=end_time)
 
     def _propagator(self) -> Any:
         if self._propagator_instance is None:
             module = _import_otel("opentelemetry.trace.propagation.tracecontext")
             self._propagator_instance = module.TraceContextTextMapPropagator()
         return self._propagator_instance
+
+
+def _event_time_ns(event: Event) -> int:
+    """Convert an event's timestamp to epoch nanoseconds for OTel span timing.
+
+    OTel ``start_span(start_time=...)`` and ``span.end(end_time=...)`` take epoch
+    nanoseconds. Using the event's timestamp (set when the work happened) rather than
+    ``time.time_ns()`` at sink-processing time keeps latency traces accurate even when
+    the event bus buffers or a downstream sink is slow.
+    """
+    return int(event.timestamp.timestamp() * 1_000_000_000)
 
 
 def _span_name(base: str, suffix: Any) -> str:

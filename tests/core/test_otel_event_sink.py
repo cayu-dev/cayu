@@ -588,7 +588,128 @@ def test_import_cayu_works_without_opentelemetry_installed() -> None:
     assert "import-ok" in result.stdout
 
 
-def test_session_start_event_carries_inbound_traceparent() -> None:
+def test_span_timing_comes_from_event_timestamps_not_processing_time() -> None:
+    # A buffered event bus / slow sink processes events well after the work happened.
+    # Span start/end must reflect Event.timestamp, not wall-clock at emit() time, so
+    # latency traces are not skewed. Drive events whose timestamps are minutes in the
+    # past and assert the exported spans carry exactly those instants.
+    from datetime import UTC, datetime, timedelta
+
+    exporter, sink = _make_sink()
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def at(offset_s: float) -> datetime:
+        return base + timedelta(seconds=offset_s)
+
+    def ns(dt: datetime) -> int:
+        return int(dt.timestamp() * 1_000_000_000)
+
+    _drive(
+        sink,
+        [
+            Event(type=EventType.SESSION_STARTED, session_id="s", payload={}, timestamp=at(0)),
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id="s",
+                payload={"model": "m"},
+                timestamp=at(1),
+            ),
+            Event(type=EventType.MODEL_COMPLETED, session_id="s", payload={}, timestamp=at(3)),
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="s",
+                tool_name="exec_command",
+                payload={"tool_call_id": "c1"},
+                timestamp=at(4),
+            ),
+            Event(
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="s",
+                payload={"tool_call_id": "c1"},
+                timestamp=at(7),
+            ),
+            Event(type=EventType.SESSION_COMPLETED, session_id="s", payload={}, timestamp=at(10)),
+        ],
+    )
+    spans = _spans_by_name(exporter)
+    session = spans["cayu.session"]
+    model = spans["chat m"]
+    tool = spans["execute_tool exec_command"]
+    assert session.start_time == ns(at(0))
+    assert session.end_time == ns(at(10))
+    assert model.start_time == ns(at(1))
+    assert model.end_time == ns(at(3))
+    assert tool.start_time == ns(at(4))
+    assert tool.end_time == ns(at(7))
+
+
+def test_staleness_eviction_evicts_least_recently_active_not_oldest_inserted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the cap reached, opening a new session must evict the *least-recently-active*
+    # session — NOT the oldest inserted. A long-lived trace that is still progressing is
+    # the oldest inserted yet must survive; a session that went idle is the one swept.
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setattr(otel, "_MAX_OPEN_SESSIONS", 2)
+    exporter, sink = _make_sink()
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    def at(offset_s: float) -> datetime:
+        return base + timedelta(seconds=offset_s)
+
+    def ns(dt: datetime) -> int:
+        return int(dt.timestamp() * 1_000_000_000)
+
+    _drive(
+        sink,
+        [
+            # "long" started first (oldest inserted) but keeps working.
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="long",
+                agent_name="long",
+                payload={},
+                timestamp=at(0),
+            ),
+            # "idle" started second, then never does anything else.
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="idle",
+                agent_name="idle",
+                payload={},
+                timestamp=at(1),
+            ),
+            # "long" keeps progressing -> its last activity moves well past "idle".
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id="long",
+                payload={"model": "m"},
+                timestamp=at(10),
+            ),
+            Event(type=EventType.MODEL_COMPLETED, session_id="long", payload={}, timestamp=at(11)),
+        ],
+    )
+    assert sink.evicted_sessions == 0
+    # Third session over the cap -> evict the most stale ("idle"), keeping "long".
+    _drive(
+        sink,
+        [
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="new",
+                agent_name="new",
+                payload={},
+                timestamp=at(20),
+            )
+        ],
+    )
+    assert set(sink._sessions) == {"long", "new"}
+    assert sink.evicted_sessions == 1
+    # "idle" was force-closed incomplete, ending at its last known activity (not now).
+    idle = _spans_by_name(exporter)["cayu.session idle"]
+    assert idle.attributes["cayu.incomplete"] is True
+    assert idle.end_time == ns(at(1))
     # The runtime must surface metadata['traceparent'] on SESSION_STARTED so the sink
     # can root the span under the caller's trace.
     app = CayuApp(enable_logging=False)

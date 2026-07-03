@@ -26,6 +26,7 @@ from cayu.evals.assertions import (
 from cayu.evals.judges import LLMJudge
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
+    WORKSPACE_PROBE_MAX_BYTES,
     EvalAssertionResult,
     EvalCaseResult,
     EvalContext,
@@ -34,6 +35,7 @@ from cayu.evals.models import (
     ProbeRequirements,
     Trajectory,
     TrajectoryProbes,
+    WorkspaceFileProbe,
 )
 from cayu.evals.reporting import (
     EvalCaseComparison,
@@ -64,6 +66,7 @@ from cayu.evals.testing import ScriptedModelProvider
 
 __all__ = [
     "EVAL_SCHEMA_VERSION",
+    "WORKSPACE_PROBE_MAX_BYTES",
     "ArtifactCreated",
     "EvalAssertion",
     "EvalAssertionResult",
@@ -100,6 +103,7 @@ __all__ = [
     "TranscriptContains",
     "WorkspaceFileContains",
     "WorkspaceFileExists",
+    "WorkspaceFileProbe",
     "compare_eval_runs",
     "comparison_to_json",
     "eval_run_to_json",
