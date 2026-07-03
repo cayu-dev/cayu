@@ -63,7 +63,7 @@ class EnvironmentFactoryResult:
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if type(self.environment) is not Environment:
+        if not isinstance(self.environment, Environment):
             raise TypeError("EnvironmentFactoryResult.environment must be an Environment.")
         object.__setattr__(self, "environment", copy_environment(self.environment))
         object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
@@ -85,7 +85,7 @@ class EnvironmentFactory(ABC):
 def copy_environment_factory_request(
     request: EnvironmentFactoryRequest,
 ) -> EnvironmentFactoryRequest:
-    if type(request) is not EnvironmentFactoryRequest:
+    if not isinstance(request, EnvironmentFactoryRequest):
         raise TypeError("Environment factory request copies require an EnvironmentFactoryRequest.")
     return EnvironmentFactoryRequest(
         session_id=request.session_id,
@@ -100,7 +100,7 @@ def copy_environment_factory_request(
 
 
 def copy_environment_factory_result(result: EnvironmentFactoryResult) -> EnvironmentFactoryResult:
-    if type(result) is not EnvironmentFactoryResult:
+    if not isinstance(result, EnvironmentFactoryResult):
         raise TypeError("Environment factory result copies require an EnvironmentFactoryResult.")
     return EnvironmentFactoryResult(
         environment=result.environment,

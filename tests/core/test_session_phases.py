@@ -22,6 +22,7 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
     InMemorySessionStore,
+    RetryPolicy,
     RunLimits,
     RunRequest,
     SessionStatus,
@@ -319,6 +320,10 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
             task_id=None,
             structured_output=None,
             thinking=None,
+            max_steps=16,
+            limits=RunLimits(),
+            budget_limits=(),
+            retry_policy=RetryPolicy(),
         )
         events = [
             event
@@ -362,6 +367,10 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
             task_id=None,
             structured_output=None,
             thinking=None,
+            max_steps=16,
+            limits=RunLimits(),
+            budget_limits=(),
+            retry_policy=RetryPolicy(),
         )
         messages: list[Message] = []
         events = [

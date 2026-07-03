@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -165,8 +165,99 @@ class ToolResult(BaseModel):
         return copy_json_value(value, info.field_name)
 
 
+@runtime_checkable
+class WorkspaceHandle(Protocol):
+    """Structural contract for the workspace handed to tools.
+
+    Mirrors ``cayu.workspaces.Workspace`` without importing it, so custom
+    workspaces only need to implement the file operations tools rely on.
+    """
+
+    async def read_bytes(self, path: str, *, max_bytes: int | None = None) -> Any: ...
+
+    async def write_bytes(self, path: str, content: bytes) -> None: ...
+
+    async def delete(self, path: str) -> None: ...
+
+    async def list(self, pattern: str = "**/*", *, limit: int | None = None) -> Any: ...
+
+
+@runtime_checkable
+class ArtifactStoreHandle(Protocol):
+    """Structural contract for the artifact store handed to tools.
+
+    Mirrors ``cayu.artifacts.ArtifactStore``.
+    """
+
+    async def put_bytes(self, content: bytes, *, filename: str, **kwargs: Any) -> Any: ...
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None) -> Any: ...
+
+    async def list(self, **kwargs: Any) -> Any: ...
+
+    async def delete(self, artifact_id: str) -> None: ...
+
+
+@runtime_checkable
+class RunnerHandle(Protocol):
+    """Structural contract for the command runner handed to tools.
+
+    Mirrors ``cayu.runners.Runner``.
+    """
+
+    async def exec(self, command: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class VaultHandle(Protocol):
+    """Structural contract for the vault handed to tools.
+
+    Mirrors ``cayu.vaults.Vault``.
+    """
+
+    async def get(self, name: str, *, scope: dict[str, Any] | None = None) -> Any: ...
+
+    async def resolve(self, ref: Any, *, scope: dict[str, Any] | None = None) -> Any: ...
+
+
+@runtime_checkable
+class CredentialProxyHandle(Protocol):
+    """Structural contract for the credential proxy handed to tools.
+
+    Mirrors ``cayu.proxies.CredentialProxy``.
+    """
+
+    async def resolve(self, ref: Any, *, scope: dict[str, Any] | None = None) -> Any: ...
+
+    async def authorize_request(
+        self,
+        *,
+        destination: str,
+        credential: Any = None,
+        action: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class KnowledgeStoreHandle(Protocol):
+    """Structural contract for the knowledge store handed to tools.
+
+    Deliberately the minimal *read* surface (search/list/read) so read-only
+    stores can back read-path knowledge tools. Full read/write stores such as
+    ``cayu.storage.memory.KnowledgeStore`` are a superset and also satisfy it;
+    write-path tools check for their extra methods at call time.
+    """
+
+    async def search(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    async def list_entries(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    async def read_chunks(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
 class ToolContext(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     session_id: str
     agent_name: str | None = None
@@ -174,12 +265,12 @@ class ToolContext(BaseModel):
     causal_budget_id: str | None = None
     workspace_id: str | None = None
     artifact_store_id: str | None = None
-    workspace: Any = Field(default=None, exclude=True)
-    artifact_store: Any = Field(default=None, exclude=True)
-    runner: Any = Field(default=None, exclude=True)
-    vault: Any = Field(default=None, exclude=True)
-    proxy: Any = Field(default=None, exclude=True)
-    knowledge_store: Any = Field(default=None, exclude=True)
+    workspace: WorkspaceHandle | None = Field(default=None, exclude=True)
+    artifact_store: ArtifactStoreHandle | None = Field(default=None, exclude=True)
+    runner: RunnerHandle | None = Field(default=None, exclude=True)
+    vault: VaultHandle | None = Field(default=None, exclude=True)
+    proxy: CredentialProxyHandle | None = Field(default=None, exclude=True)
+    knowledge_store: KnowledgeStoreHandle | None = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -233,7 +324,7 @@ class Tool(ABC):
             self.spec = spec
         else:
             class_spec = getattr(type(self), "spec", None)
-            if type(class_spec) is ToolSpec:
+            if isinstance(class_spec, ToolSpec):
                 # ToolSpec is frozen and deeply immutable; instances can share
                 # the class-level spec without copying.
                 self.spec = class_spec
@@ -255,7 +346,7 @@ class Tool(ABC):
 
     def _validate_spec(self) -> None:
         spec = getattr(self, "spec", None)
-        if type(spec) is not ToolSpec:
+        if not isinstance(spec, ToolSpec):
             raise TypeError(
                 f"{self.__class__.__name__} must define `spec = ToolSpec(...)` "
                 "or pass a ToolSpec to Tool.__init__()."

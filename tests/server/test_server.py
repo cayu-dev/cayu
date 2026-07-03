@@ -603,6 +603,75 @@ def test_server_run_accepts_budget_limits() -> None:
     assert sessions[0]["status"] == "interrupted"
 
 
+def test_server_run_defaults_and_overrides_max_steps() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    captured: list[int] = []
+    original_run = app.run
+
+    def spy_run(request: RunRequest):
+        captured.append(request.max_steps)
+        return original_run(request)
+
+    app.run = spy_run  # type: ignore[method-assign]
+    client = TestClient(create_server(app))
+
+    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    with client.stream("POST", "/api/run", json={"prompt": "hello", "max_steps": 7}) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    assert captured == [20, 7]
+
+
+def test_server_resume_overrides_max_steps() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
+    session_id = started["session_id"]
+
+    captured: list[int] = []
+    original_resume = app.resume
+
+    def spy_resume(request):
+        captured.append(request.max_steps)
+        return original_resume(request)
+
+    app.resume = spy_resume  # type: ignore[method-assign]
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "again", "max_steps": 42},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    assert captured == [42]
+
+
+@pytest.mark.parametrize("path", ["/api/run", "/api/resume"])
+@pytest.mark.parametrize("bad_value", [0, 257, -1])
+def test_server_rejects_out_of_range_max_steps(path: str, bad_value: int) -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    body: dict = {"prompt": "hello", "max_steps": bad_value}
+    if path == "/api/resume":
+        body["session_id"] = "session-does-not-matter"
+    response = client.post(path, json=body)
+    assert response.status_code == 422
+
+
 def test_server_lists_sessions_with_label_filters() -> None:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
@@ -1950,6 +2019,33 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
         ).status_code
         == 422
     )
+    for bad_max_steps in (True, "7"):
+        assert (
+            client.post(
+                "/api/tool-approvals/resolve",
+                json={
+                    "session_id": "session_1",
+                    "approval_id": "approval_1",
+                    "decision": "approve",
+                    "max_steps": bad_max_steps,
+                },
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/tool-approvals/recover",
+                json={
+                    "session_id": "session_1",
+                    "approval_id": "approval_1",
+                    "tool_call_id": "call_1",
+                    "outcome": "completed",
+                    "message": "confirmed externally",
+                    "max_steps": bad_max_steps,
+                },
+            ).status_code
+            == 422
+        )
 
 
 def test_run_endpoint_passes_retry_policy_to_runtime() -> None:

@@ -1,6 +1,12 @@
 """Framework-native tools."""
 
-from cayu.tools.commands import ExecCommandTool
+from cayu.tools.commands import (
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
+    ExecCommandTool,
+)
 from cayu.tools.files import (
     ArtifactReader,
     ArtifactReadRequest,
@@ -35,6 +41,10 @@ __all__ = [
     "ArtifactReadRequest",
     "ArtifactReader",
     "BackgroundSubagentTaskRegistry",
+    "CommandPolicy",
+    "CommandPolicyDecision",
+    "CommandPolicyResult",
+    "CommandRequest",
     "ExecCommandTool",
     "ImageArtifactReader",
     "ListArtifactsTool",

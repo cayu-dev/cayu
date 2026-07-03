@@ -37,6 +37,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeVisibility,
 )
+from cayu.tools._errors import invalid_tool_arguments_result
 
 DEFAULT_KNOWLEDGE_TOOL_LIMIT = DEFAULT_KNOWLEDGE_LIMIT
 MAX_KNOWLEDGE_TOOL_LIMIT = 25
@@ -1102,11 +1103,7 @@ def _missing_knowledge_store_result() -> ToolResult:
 
 
 def _invalid_knowledge_arguments_result(exc: Exception) -> ToolResult:
-    return ToolResult(
-        content=str(exc),
-        structured={"error": "invalid_arguments"},
-        is_error=True,
-    )
+    return invalid_tool_arguments_result(exc)
 
 
 def _knowledge_write_failed_result(

@@ -55,5 +55,13 @@ class Agent(ABC):
     tools: list[Tool]
 
     @abstractmethod
-    async def run(self, messages: list[Message]) -> AsyncIterator[Event]:
-        """Run the agent and stream structured events."""
+    def run(self, messages: list[Message]) -> AsyncIterator[Event]:
+        """Run the agent and return a stream of structured events.
+
+        Declared non-async on purpose: implementations are expected to be
+        async generators (``async def run(...): yield ...``), which are plain
+        callables returning an ``AsyncIterator``. Keeping the abstract method
+        non-async gives every implementation the same calling convention —
+        ``async for event in agent.run(messages)`` — instead of some callers
+        needing ``await agent.run(...)`` first.
+        """

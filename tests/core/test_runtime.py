@@ -21475,8 +21475,8 @@ def test_cayu_app_rejects_invalid_environment_registration_inputs():
     with pytest.raises(TypeError, match="Environment"):
         app.register_environment(EnvironmentLike())  # type: ignore[arg-type]
 
-    with pytest.raises(TypeError, match="Environment"):
-        app.register_environment(EnvironmentSubclass(EnvironmentSpec(name="subclass")))
+    # Environment subclasses are advertised extension points and are accepted.
+    app.register_environment(EnvironmentSubclass(EnvironmentSpec(name="subclass")))
 
     with pytest.raises(TypeError, match="bool"):
         app.register_environment(
@@ -21806,6 +21806,75 @@ def test_run_stops_after_session_is_interrupted_before_tool_execution():
     assert len(provider.requests) == 1
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert EventType.TOOL_CALL_STARTED not in [event.type for event in events]
+
+
+def test_run_interrupt_during_tool_execution_persists_completed_tool_event():
+    store = InMemorySessionStore()
+
+    class InterruptRequestingTool(Tool):
+        spec = ToolSpec(
+            name="side_effect",
+            description="Commit a side effect while an interrupt lands.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            await store.update_status(ctx.session_id, SessionStatus.INTERRUPTING)
+            return ToolResult(content="side effect committed")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[InterruptRequestingTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_mid_tool",
+                messages=[Message.text("user", "call tool")],
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_interrupt_mid_tool"))
+    stored_events = asyncio.run(store.load_events("sess_interrupt_mid_tool"))
+    transcript = asyncio.run(store.load_transcript("sess_interrupt_mid_tool"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+    # The completed result was in hand before the interrupt raised, so the
+    # terminal tool event must be persisted; recovery would otherwise report
+    # the outcome as unknown and invite a retry of the side effect.
+    completed_events = [
+        event for event in stored_events if event.type == EventType.TOOL_CALL_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    assert completed_events[0].payload["tool_call_id"] == "call_1"
+    assert completed_events[0].payload["result"]["content"] == "side effect committed"
+    assert EventType.TOOL_CALL_FAILED not in [event.type for event in stored_events]
+
+    # The transcript records the real outcome, not an interrupted placeholder.
+    tool_parts = [
+        part
+        for message in transcript
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    ]
+    assert len(tool_parts) == 1
+    assert tool_parts[0].tool_call_id == "call_1"
+    assert tool_parts[0].content == "side effect committed"
+    assert tool_parts[0].is_error is False
 
 
 def test_run_interrupt_leaves_linked_task_running():
@@ -24165,3 +24234,258 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
 def test_cayu_app_validates_tool_execution_settings(kwargs, error_type, error):
     with pytest.raises(error_type, match=error):
         CayuApp(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Pending tool approvals persist the original run's config (limits, budgets,
+# max_steps, retry policy) so resolving does not restart with fresh defaults.
+# --------------------------------------------------------------------------- #
+def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
+    from cayu.runtime.approvals import (
+        PendingToolApproval,
+        PendingToolCallApproval,
+        copy_pending_tool_approval,
+    )
+
+    pending = PendingToolApproval(
+        approval_id="appr_1",
+        tool_call_id="call_1",
+        tool_name="side_effect",
+        agent_name="assistant",
+        tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
+        max_steps=7,
+        limits=RunLimits(max_tool_calls=3, scope="session"),
+        budget_limits=(fake_budget_limit("2.50"),),
+        retry_policy=RetryPolicy(max_attempts=3),
+    )
+
+    # Same round-trip as the durable checkpoint: model_dump(mode="json") in,
+    # PendingToolApproval(**payload) out.
+    restored = PendingToolApproval(**pending.model_dump(mode="json"))
+    assert restored.max_steps == 7
+    assert restored.limits == RunLimits(max_tool_calls=3, scope="session")
+    assert restored.budget_limits == (fake_budget_limit("2.50"),)
+    assert restored.retry_policy == RetryPolicy(max_attempts=3)
+
+    copied = copy_pending_tool_approval(pending)
+    assert copied.max_steps == 7
+    assert copied.limits == pending.limits
+    assert copied.budget_limits == pending.budget_limits
+    assert copied.retry_policy == pending.retry_policy
+
+
+def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
+    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+
+    legacy = PendingToolApproval(
+        approval_id="appr_legacy",
+        tool_call_id="call_1",
+        tool_name="side_effect",
+        agent_name="assistant",
+        tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
+    )
+    payload = legacy.model_dump(mode="json")
+    for key in ("max_steps", "limits", "budget_limits", "retry_policy"):
+        payload.pop(key)
+
+    restored = PendingToolApproval(**payload)
+    assert restored.max_steps is None
+    assert restored.limits is None
+    assert restored.budget_limits is None
+    assert restored.retry_policy is None
+
+
+def test_effective_approval_run_config_prefers_override_then_pending_then_default():
+    from cayu.runtime.app import (
+        _DEFAULT_APPROVAL_MAX_STEPS,
+        _effective_approval_budget_limits,
+        _effective_approval_max_steps,
+        _effective_approval_retry_policy,
+        _effective_approval_run_limits,
+    )
+    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+
+    def pending(**kwargs) -> PendingToolApproval:
+        return PendingToolApproval(
+            approval_id="appr_1",
+            tool_call_id="call_1",
+            tool_name="side_effect",
+            agent_name="assistant",
+            tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
+            **kwargs,
+        )
+
+    persisted = pending(
+        max_steps=9,
+        limits=RunLimits(max_tool_calls=2, scope="session"),
+        budget_limits=(fake_budget_limit("1.00"),),
+        retry_policy=RetryPolicy(max_attempts=4),
+    )
+    legacy = pending()
+
+    # Explicit overrides on the approval request win.
+    assert _effective_approval_max_steps(max_steps=3, pending_approval=persisted) == 3
+    assert _effective_approval_run_limits(
+        limits=RunLimits(max_tool_calls=5),
+        pending_approval=persisted,
+    ) == RunLimits(max_tool_calls=5)
+    assert (
+        _effective_approval_budget_limits(
+            budget_limits=(),
+            pending_approval=persisted,
+        )
+        == ()
+    )
+    override_policy = RetryPolicy(max_attempts=2)
+    assert (
+        _effective_approval_retry_policy(
+            retry_policy=override_policy,
+            pending_approval=persisted,
+        )
+        is override_policy
+    )
+
+    # No override -> the original run's persisted config is restored.
+    assert _effective_approval_max_steps(max_steps=None, pending_approval=persisted) == 9
+    assert _effective_approval_run_limits(
+        limits=None,
+        pending_approval=persisted,
+    ) == RunLimits(max_tool_calls=2, scope="session")
+    assert _effective_approval_budget_limits(
+        budget_limits=None,
+        pending_approval=persisted,
+    ) == (fake_budget_limit("1.00"),)
+    assert _effective_approval_retry_policy(
+        retry_policy=None,
+        pending_approval=persisted,
+    ) == RetryPolicy(max_attempts=4)
+
+    # Legacy approvals without persisted config fall back to the old defaults.
+    assert (
+        _effective_approval_max_steps(max_steps=None, pending_approval=legacy)
+        == _DEFAULT_APPROVAL_MAX_STEPS
+    )
+    assert _effective_approval_run_limits(limits=None, pending_approval=legacy) == RunLimits()
+    assert _effective_approval_budget_limits(budget_limits=None, pending_approval=legacy) == ()
+    assert _effective_approval_retry_policy(retry_policy=None, pending_approval=legacy) is None
+
+
+def _run_config_approval_app() -> tuple[InMemorySessionStore, SideEffectTool, CayuApp]:
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_2",
+                    name="echo",
+                    arguments={"text": "after approval"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool, EchoTool()],
+        tool_policy=SideEffectApprovalPolicy(),
+    )
+    return store, tool, app
+
+
+def test_cayu_app_resolving_tool_approval_restores_original_run_limits():
+    store, tool, app = _run_config_approval_app()
+    session_id = "sess_approval_restores_run_config"
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+                max_steps=7,
+                limits=RunLimits(max_tool_calls=1, scope="session"),
+                retry_policy=RetryPolicy(max_attempts=3),
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None
+    pending = checkpoint["pending_tool_approval"]
+    assert pending["max_steps"] == 7
+    assert pending["limits"]["max_tool_calls"] == 1
+    assert pending["limits"]["scope"] == "session"
+    assert pending["retry_policy"]["max_attempts"] == 3
+    assert pending["budget_limits"] == []
+
+    # Approving without overrides resumes under the ORIGINAL run's limits: the
+    # approved tool call consumes the session's single allowed tool call, so
+    # the follow-up echo round trips the limit instead of executing.
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=pending["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+    assert tool.calls == [{"value": "secret"}]
+    limit_events = [event for event in events if event.type == EventType.SESSION_LIMIT_REACHED]
+    assert len(limit_events) == 1
+    assert limit_events[0].payload["limit"] == "tool_calls"
+    session = asyncio.run(store.load(session_id))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_tool_approval_explicit_limits_override_persisted_run_config():
+    store, tool, app = _run_config_approval_app()
+    session_id = "sess_approval_override_run_config"
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+                limits=RunLimits(max_tool_calls=1, scope="session"),
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None
+    pending = checkpoint["pending_tool_approval"]
+
+    # An explicit limits override on the approval request wins over the
+    # persisted run config, so the session runs to completion.
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=pending["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+                limits=RunLimits(),
+            ),
+        )
+    )
+    assert tool.calls == [{"value": "secret"}]
+    assert events[-1].type == EventType.SESSION_COMPLETED

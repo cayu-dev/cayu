@@ -38,6 +38,10 @@ from cayu.tools.commands import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_OUTPUT_LIMIT_BYTES,
     MAX_TIMEOUT_SECONDS,
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
 )
 from cayu.tools.files import (
     DEFAULT_ATTACHMENT_LIMIT_BYTES,
@@ -297,6 +301,9 @@ class CustomPdfReader:
 class RecordingRunner(Runner):
     def __init__(self, result: ExecResult | None = None) -> None:
         self.result = result or ExecResult(stdout="ok\n")
+        self.command: ExecCommand | None = None
+        self.cwd: str | None = None
+        self.env: dict[str, str] | None = None
         self.timeout_s: int | None = None
 
     async def exec(
@@ -309,6 +316,9 @@ class RecordingRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = None,
     ) -> ExecResult:
+        self.command = command
+        self.cwd = cwd
+        self.env = env
         self.timeout_s = timeout_s
         return self.result
 
@@ -704,6 +714,92 @@ def _tiny_pdf_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _multi_page_pdf_bytes(page_count: int) -> bytes:
+    pypdf = import_module("pypdf")
+    writer = pypdf.PdfWriter()
+    for _ in range(page_count):
+        writer.add_blank_page(width=72, height=72)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_read_file_caps_pages_for_small_many_page_pdf(tmp_path):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(12),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    # The 12-page PDF is tiny and fits comfortably under the byte cap, but the
+    # 10-page limit must still be enforced instead of attaching the whole file.
+    assert pdf.size_bytes < DEFAULT_ATTACHMENT_LIMIT_BYTES
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id}))
+
+    assert result.is_error is False
+    assert "showing pages 1-10 of 12" in result.content
+    attachment_id = result.structured["attachment_artifact_id"]
+    assert attachment_id != pdf.id
+    attachment = asyncio.run(artifact_store.read_bytes(attachment_id))
+    pypdf = import_module("pypdf")
+    assert len(pypdf.PdfReader(io.BytesIO(attachment.content)).pages) == 10
+
+
+def test_read_file_dedupes_repeated_pdf_page_extraction(tmp_path):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(12),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id}))
+    second = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id}))
+
+    assert first.structured["attachment_artifact_id"] == second.structured["attachment_artifact_id"]
+    # Re-reading must not store a second multi-page copy: the source plus a single
+    # derived attachment are the only session artifacts.
+    listing = asyncio.run(artifact_store.list(scope=ArtifactScope.SESSION, session_id="sess_1"))
+    assert listing.total_count == 2
+
+
+def test_read_file_dedupes_across_page_selections(tmp_path):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(12),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id, "pages": "1-2"}))
+    second = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id, "pages": "3-4"}))
+    third = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id, "pages": "1-2"}))
+
+    ids = {
+        first.structured["attachment_artifact_id"],
+        second.structured["attachment_artifact_id"],
+        third.structured["attachment_artifact_id"],
+    }
+    # Distinct page selections are distinct derivations; the repeated selection reuses.
+    assert len(ids) == 2
+    assert first.structured["attachment_artifact_id"] == third.structured["attachment_artifact_id"]
+    listing = asyncio.run(artifact_store.list(scope=ArtifactScope.SESSION, session_id="sess_1"))
+    assert listing.total_count == 3
+
+
 def test_workspace_tools_return_error_without_workspace():
     ctx = ToolContext(session_id="sess_1")
 
@@ -777,11 +873,15 @@ def test_read_file_requires_exactly_one_source(tmp_path):
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     ctx = ToolContext(session_id="sess_1", workspace=workspace, artifact_store=artifact_store)
 
-    with pytest.raises(ValueError, match="exactly one"):
-        asyncio.run(ReadFileTool().run(ctx, {}))
+    missing_result = asyncio.run(ReadFileTool().run(ctx, {}))
+    assert missing_result.is_error is True
+    assert missing_result.structured == {"error": "invalid_arguments"}
+    assert "exactly one" in missing_result.content
 
-    with pytest.raises(ValueError, match="exactly one"):
-        asyncio.run(ReadFileTool().run(ctx, {"path": "a.txt", "artifact_id": "art_1"}))
+    both_result = asyncio.run(ReadFileTool().run(ctx, {"path": "a.txt", "artifact_id": "art_1"}))
+    assert both_result.is_error is True
+    assert both_result.structured == {"error": "invalid_arguments"}
+    assert "exactly one" in both_result.content
 
 
 def test_read_file_returns_provider_neutral_image_attachment_without_base64(tmp_path, monkeypatch):
@@ -1195,8 +1295,11 @@ def test_exec_command_tool_runs_process_and_reports_failures(tmp_path):
     assert ok.structured["exit_code"] == 0
     assert ok.structured["stdout_truncated"] is False
     assert ok.structured["stderr_truncated"] is False
-    assert failed.is_error is True
+    # A plain nonzero exit is a normal command outcome the model should read,
+    # not a tool error; only timeouts and cancellations flag is_error.
+    assert failed.is_error is False
     assert failed.structured["exit_code"] == 3
+    assert failed.content == "Command exited with code 3."
 
 
 def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
@@ -1270,16 +1373,18 @@ def test_exec_command_tool_applies_default_and_max_timeout(tmp_path):
 
     assert result.is_error is False
     assert runner.timeout_s == 60
-    with pytest.raises(ValueError, match="at most 600"):
-        asyncio.run(
-            ExecCommandTool().run(
-                ctx,
-                {
-                    "argv": [sys.executable, "-c", "print('ok')"],
-                    "timeout_s": 601,
-                },
-            )
+    over_limit_result = asyncio.run(
+        ExecCommandTool().run(
+            ctx,
+            {
+                "argv": [sys.executable, "-c", "print('ok')"],
+                "timeout_s": 601,
+            },
         )
+    )
+    assert over_limit_result.is_error is True
+    assert over_limit_result.structured == {"error": "invalid_arguments"}
+    assert "at most 600" in over_limit_result.content
 
 
 def test_exec_command_tool_reports_timeout_and_cancellation():
@@ -1310,6 +1415,164 @@ def test_exec_command_tool_reports_timeout_and_cancellation():
     assert cancelled.is_error is True
     assert cancelled.content == "Command was cancelled."
     assert cancelled.structured["cancelled"] is True
+
+
+def test_exec_command_tool_nonzero_exit_prefixes_output_with_exit_code():
+    runner = RecordingRunner(ExecResult(stdout="partial\n", stderr="boom\n", exit_code=2))
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+
+    result = asyncio.run(ExecCommandTool().run(ctx, {"argv": [sys.executable, "-c", "pass"]}))
+
+    assert result.is_error is False
+    assert result.content == ("Command exited with code 2.\n\nstdout:\npartial\n\nstderr:\nboom")
+    assert result.structured["exit_code"] == 2
+
+
+def test_exec_command_tool_rejects_argv_and_shell_together():
+    ctx = ToolContext(session_id="sess_1", runner=RecordingRunner())
+    tool = ExecCommandTool()
+
+    both = asyncio.run(tool.run(ctx, {"argv": ["echo", "hi"], "shell": "echo hi"}))
+    process_with_shell = asyncio.run(tool.run(ctx, {"kind": "process", "shell": "echo hi"}))
+    shell_with_argv = asyncio.run(tool.run(ctx, {"kind": "shell", "argv": ["echo", "hi"]}))
+    neither = asyncio.run(tool.run(ctx, {}))
+
+    assert both.is_error is True
+    assert both.structured == {"error": "invalid_arguments"}
+    assert "cannot both be provided" in both.content
+    assert process_with_shell.is_error is True
+    assert "`shell` cannot be provided when kind is `process`" in process_with_shell.content
+    assert shell_with_argv.is_error is True
+    assert "`argv` cannot be provided when kind is `shell`" in shell_with_argv.content
+    assert neither.is_error is True
+    assert "must include `argv` or `shell`" in neither.content
+
+
+def test_exec_command_tool_infers_kind_from_arguments():
+    process_runner = RecordingRunner()
+    shell_runner = RecordingRunner()
+
+    process_result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=process_runner),
+            {"argv": ["echo", "hi"]},
+        )
+    )
+    shell_result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=shell_runner),
+            {"shell": "echo hi"},
+        )
+    )
+
+    assert process_result.is_error is False
+    assert process_runner.command == ExecCommand.process("echo", "hi")
+    assert shell_result.is_error is False
+    assert shell_runner.command == ExecCommand.bash("echo hi")
+
+
+class _StaticCommandPolicy(CommandPolicy):
+    def __init__(self, result: CommandPolicyResult) -> None:
+        self.result = result
+        self.requests: list[tuple[ToolContext, CommandRequest]] = []
+
+    async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+        self.requests.append((ctx, request))
+        return self.result
+
+
+def test_exec_command_tool_policy_receives_resolved_request_and_allows():
+    runner = RecordingRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ctx,
+            {
+                "argv": ["echo", "hi"],
+                "cwd": "/tmp",
+                "env": {"FOO": "bar"},
+                "timeout_s": 5,
+            },
+        )
+    )
+
+    assert result.is_error is False
+    assert runner.command == ExecCommand.process("echo", "hi")
+    assert len(policy.requests) == 1
+    seen_ctx, seen_request = policy.requests[0]
+    assert seen_ctx is ctx
+    assert seen_request.command == ExecCommand.process("echo", "hi")
+    assert seen_request.cwd == "/tmp"
+    assert seen_request.env == {"FOO": "bar"}
+    assert seen_request.timeout_s == 5
+
+
+def test_exec_command_tool_policy_deny_blocks_runner():
+    runner = RecordingRunner()
+    policy = _StaticCommandPolicy(
+        CommandPolicyResult(
+            decision=CommandPolicyDecision.DENY,
+            reason="Shell scripts are not allowed here.",
+        )
+    )
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"shell": "rm -rf /"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == ("Command denied by policy. Shell scripts are not allowed here.")
+    assert result.structured == {
+        "error": "command_denied",
+        "decision": "deny",
+        "reason": "Shell scripts are not allowed here.",
+    }
+    assert runner.command is None
+
+
+def test_exec_command_tool_policy_require_approval_blocks_runner():
+    runner = RecordingRunner()
+    policy = _StaticCommandPolicy(
+        CommandPolicyResult(decision=CommandPolicyDecision.REQUIRE_APPROVAL)
+    )
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["curl", "https://example.com"]},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "Command requires approval before it can run."
+    assert result.structured == {
+        "error": "command_approval_required",
+        "decision": "require_approval",
+        "reason": None,
+    }
+    assert runner.command is None
+
+
+def test_exec_command_tool_rejects_invalid_policy_wiring():
+    with pytest.raises(TypeError, match="must implement CommandPolicy"):
+        ExecCommandTool(policy=object())  # type: ignore[arg-type]
+
+    class _WrongResultPolicy(CommandPolicy):
+        async def evaluate(self, ctx: ToolContext, request: CommandRequest):
+            return "allow"
+
+    with pytest.raises(TypeError, match="must return a CommandPolicyResult"):
+        asyncio.run(
+            ExecCommandTool(policy=_WrongResultPolicy()).run(
+                ToolContext(session_id="sess_1", runner=RecordingRunner()),
+                {"argv": ["echo", "hi"]},
+            )
+        )
 
 
 def test_exec_command_tool_returns_error_without_runner():

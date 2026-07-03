@@ -8,7 +8,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -26,7 +26,13 @@ class ToolApprovalRecoveryOutcome(StrEnum):
 
 
 class ToolApprovalRequest(BaseModel):
-    """Caller decision for a pending tool approval."""
+    """Caller decision for a pending tool approval.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+    to ``None``, which means "inherit the original run's configuration" as
+    persisted on the pending approval checkpoint. Passing an explicit value
+    overrides the persisted configuration for the resumed run.
+    """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -35,9 +41,9 @@ class ToolApprovalRequest(BaseModel):
     decision: ToolApprovalDecision
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
-    limits: RunLimits = Field(default_factory=RunLimits)
-    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
@@ -71,9 +77,18 @@ class ToolApprovalRequest(BaseModel):
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
 
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
+        if value is None:
+            return None
+        return copy_run_limits(value)
+
     @field_validator("budget_limits", mode="before")
     @classmethod
-    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
         return copy_request_budget_limits(value)
 
     @field_validator("loop_policies", mode="before")
@@ -83,7 +98,13 @@ class ToolApprovalRequest(BaseModel):
 
 
 class ToolApprovalRecoveryRequest(BaseModel):
-    """Caller-supplied terminal outcome for an approved tool with unknown result."""
+    """Caller-supplied terminal outcome for an approved tool with unknown result.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+    to ``None``, which means "inherit the original run's configuration" as
+    persisted on the pending approval checkpoint. Passing an explicit value
+    overrides the persisted configuration for the resumed run.
+    """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -96,9 +117,9 @@ class ToolApprovalRecoveryRequest(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    max_steps: StrictInt = Field(default=16, ge=1, le=256)
-    limits: RunLimits = Field(default_factory=RunLimits)
-    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
@@ -141,9 +162,18 @@ class ToolApprovalRecoveryRequest(BaseModel):
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
 
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
+        if value is None:
+            return None
+        return copy_run_limits(value)
+
     @field_validator("budget_limits", mode="before")
     @classmethod
-    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
         return copy_request_budget_limits(value)
 
     @field_validator("loop_policies", mode="before")
@@ -189,7 +219,16 @@ class PendingToolCallApproval(BaseModel):
 
 
 class PendingToolApproval(BaseModel):
-    """Durable checkpoint state for a tool call waiting on caller approval."""
+    """Durable checkpoint state for a tool call waiting on caller approval.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` persist
+    the original run's configuration across the approval pause so resolving
+    the approval resumes with the same config instead of fresh defaults
+    (unless the resolution request overrides them explicitly). They are
+    optional so checkpoints written before this state existed still load.
+    Loop policies are runtime callables and cannot be checkpointed; they must
+    be re-supplied on the resolution request when needed.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -206,6 +245,10 @@ class PendingToolApproval(BaseModel):
     tool_calls: list[PendingToolCallApproval]
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
@@ -249,6 +292,27 @@ class PendingToolApproval(BaseModel):
             raise ValueError("Pending tool approval must include tool calls.")
         return copied
 
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
+        if value is None:
+            return None
+        return copy_run_limits(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_budget_limits(value, field_name="budget_limits")
+
+    @field_validator("retry_policy")
+    @classmethod
+    def copy_retry(cls, value: RetryPolicy | None) -> RetryPolicy | None:
+        if value is None:
+            return None
+        return copy_retry_policy(value)
+
 
 def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
     if type(request) is not ToolApprovalRequest:
@@ -260,8 +324,12 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
-        budget_limits=copy_request_budget_limits(request.budget_limits),
+        limits=copy_run_limits(request.limits) if request.limits is not None else None,
+        budget_limits=(
+            copy_request_budget_limits(request.budget_limits)
+            if request.budget_limits is not None
+            else None
+        ),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
         thinking=request.thinking,
@@ -285,8 +353,12 @@ def copy_tool_approval_recovery_request(
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
-        budget_limits=copy_request_budget_limits(request.budget_limits),
+        limits=copy_run_limits(request.limits) if request.limits is not None else None,
+        budget_limits=(
+            copy_request_budget_limits(request.budget_limits)
+            if request.budget_limits is not None
+            else None
+        ),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
         thinking=request.thinking,
@@ -311,6 +383,14 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
         structured_output=copy_structured_output_spec(approval.structured_output),
         thinking=approval.thinking,
+        max_steps=approval.max_steps,
+        limits=copy_run_limits(approval.limits) if approval.limits is not None else None,
+        budget_limits=(
+            copy_budget_limits(approval.budget_limits, field_name="budget_limits")
+            if approval.budget_limits is not None
+            else None
+        ),
+        retry_policy=copy_retry_policy(approval.retry_policy) if approval.retry_policy else None,
     )
 
 

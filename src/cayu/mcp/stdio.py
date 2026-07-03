@@ -378,6 +378,10 @@ class StdioMcpSession(McpSession):
         except TimeoutError:
             await self._close_after_interrupted_transport_write()
             raise TimeoutError(timeout_message) from None
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            await self._await_stderr_drain()
+            await self._close_after_interrupted_transport_write()
+            raise self._protocol_error("MCP stdio process closed stdout.") from exc
         except asyncio.CancelledError:
             await self._close_after_interrupted_transport_write()
             raise

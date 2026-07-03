@@ -33,5 +33,13 @@ class Workflow(ABC):
     spec: WorkflowSpec
 
     @abstractmethod
-    async def run(self, session_id: str) -> AsyncIterator[Event]:
-        """Run the workflow and stream structured events."""
+    def run(self, session_id: str) -> AsyncIterator[Event]:
+        """Run the workflow and return a stream of structured events.
+
+        Declared non-async on purpose: implementations are expected to be
+        async generators (``async def run(...): yield ...``), which are plain
+        callables returning an ``AsyncIterator``. Keeping the abstract method
+        non-async gives every implementation the same calling convention —
+        ``async for event in workflow.run(session_id)`` — instead of some
+        callers needing ``await workflow.run(...)`` first.
+        """

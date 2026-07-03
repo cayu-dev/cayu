@@ -393,6 +393,9 @@ _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 _ABANDONED_RUN_REASON = "event_stream_closed"
+# Fallback for approvals checkpointed before the original run config was
+# persisted on PendingToolApproval (the historical ToolApprovalRequest default).
+_DEFAULT_APPROVAL_MAX_STEPS = 16
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 
@@ -681,6 +684,10 @@ class _ToolRoundRunner:
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
+        max_steps: int,
+        limits: RunLimits,
+        budget_limits: tuple[BudgetLimit, ...],
+        retry_policy: RetryPolicy,
     ) -> None:
         self._app = app
         self._session = session
@@ -693,6 +700,10 @@ class _ToolRoundRunner:
         self._task_id = task_id
         self._structured_output = structured_output
         self._thinking = thinking
+        self._max_steps = max_steps
+        self._limits = limits
+        self._budget_limits = budget_limits
+        self._retry_policy = retry_policy
         self.stopped_for_limit = False
 
     async def run(
@@ -752,6 +763,10 @@ class _ToolRoundRunner:
                     policy_result=approval_plan.policy_result,
                     structured_output=self._structured_output,
                     thinking=self._thinking,
+                    max_steps=self._max_steps,
+                    limits=self._limits,
+                    budget_limits=self._budget_limits,
+                    retry_policy=self._retry_policy,
                 )
                 yield await app._emit(checkpoint_event)
                 yield await app._emit(
@@ -1204,7 +1219,7 @@ class CayuApp:
         *,
         default: bool = False,
     ) -> Environment:
-        if type(environment) is not Environment:
+        if not isinstance(environment, Environment):
             raise TypeError("Environment registration requires an Environment.")
         if not isinstance(default, bool):
             raise TypeError("Environment default flag must be a bool.")
@@ -1228,7 +1243,7 @@ class CayuApp:
         *,
         default: bool = False,
     ) -> EnvironmentFactory:
-        if type(spec) is not EnvironmentSpec:
+        if not isinstance(spec, EnvironmentSpec):
             raise TypeError("Environment factory registration requires an EnvironmentSpec.")
         if not isinstance(factory, EnvironmentFactory):
             raise TypeError("Environment factory registration requires an EnvironmentFactory.")
@@ -2405,6 +2420,27 @@ class CayuApp:
         environment_name = _environment_name(registered_environment)
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        # Restore the original run's config persisted on the pending approval;
+        # explicit overrides on the approval request win. Approvals persisted
+        # before this state existed fall back to the historical defaults.
+        effective_max_steps = _effective_approval_max_steps(
+            max_steps=request.max_steps,
+            pending_approval=pending_approval,
+        )
+        effective_limits = _effective_approval_run_limits(
+            limits=request.limits,
+            pending_approval=pending_approval,
+        )
+        effective_budget_limits = _effective_approval_budget_limits(
+            budget_limits=request.budget_limits,
+            pending_approval=pending_approval,
+        )
+        effective_retry_policy = self._effective_retry_policy(
+            _effective_approval_retry_policy(
+                retry_policy=request.retry_policy,
+                pending_approval=pending_approval,
+            )
+        )
         try:
             transcript = await self.session_store.load_transcript(session.id)
             approval_events = await self.session_store.load_events(session.id)
@@ -2458,9 +2494,9 @@ class CayuApp:
 
             if request.decision == ToolApprovalDecision.APPROVE:
                 run_started_at = time.monotonic()
-                limits = copy_run_limits(request.limits)
+                limits = copy_run_limits(effective_limits)
                 budget_limits = request_budget_limits_for_session(
-                    limits=request.budget_limits,
+                    limits=effective_budget_limits,
                     agent_name=registered_agent.spec.name,
                     causal_budget_id=session.causal_budget_id,
                 )
@@ -2678,10 +2714,10 @@ class CayuApp:
                 registered_environment=registered_environment,
                 messages=transcript,
                 messages_to_append=[],
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=self._effective_retry_policy(request.retry_policy),
+                max_steps=effective_max_steps,
+                limits=effective_limits,
+                budget_limits=effective_budget_limits,
+                retry_policy=effective_retry_policy,
                 structured_output=_effective_approval_structured_output(
                     structured_output=request.structured_output,
                     pending_approval=pending_approval,
@@ -3168,6 +3204,10 @@ class CayuApp:
                 task_id=task_id,
                 structured_output=structured_output,
                 thinking=effective_thinking,
+                max_steps=max_steps,
+                limits=limits,
+                budget_limits=budget_limits,
+                retry_policy=retry_policy,
             )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
@@ -5575,6 +5615,10 @@ class CayuApp:
                     policy_result=resolved_policy_result,
                     structured_output=None,
                     thinking=None,
+                    max_steps=None,
+                    limits=None,
+                    budget_limits=None,
+                    retry_policy=None,
                 )
                 yield (await self._emit(checkpoint_event), None)
                 yield (
@@ -5793,7 +5837,13 @@ class CayuApp:
             redactor=redactor,
         ):
             yield event, None
-        if await self._session_is_interrupting(session.id):
+        # A result produced only because the tool swallowed a delivered
+        # cancellation is a late result: the interrupt matrix already treats
+        # the call as interrupted, so suppress it instead of persisting a
+        # completion the operator raced to prevent.
+        current_task = asyncio.current_task()
+        tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
+        if tool_swallowed_cancellation and await self._session_is_interrupting(session.id):
             raise _SessionInterruptedByRequest(session.id)
         event_type = (
             EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
@@ -5829,6 +5879,15 @@ class CayuApp:
             allow_modification=True,
         ):
             yield event
+        # For a tool that completed normally the cooperative interrupt check
+        # runs only after the terminal tool event has been emitted and the
+        # completed outcome yielded: the tool already ran (possibly with
+        # non-idempotent side effects), so the outcome must be persisted
+        # before the interrupt propagates. Otherwise round-close records the
+        # call as interrupted and recovery reports the outcome as unknown,
+        # inviting an unsafe retry.
+        if await self._session_is_interrupting(session.id):
+            raise _SessionInterruptedByRequest(session.id)
 
     async def _emit_mcp_manifest_checks(
         self,
@@ -5989,6 +6048,10 @@ class CayuApp:
         policy_result: ToolPolicyResult,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
+        max_steps: int | None,
+        limits: RunLimits | None,
+        budget_limits: tuple[BudgetLimit, ...] | None,
+        retry_policy: RetryPolicy | None,
     ) -> tuple[PendingToolApproval, Event]:
         checkpoint = await self.session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
@@ -6013,6 +6076,12 @@ class CayuApp:
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
+            max_steps=max_steps,
+            limits=copy_run_limits(limits) if limits is not None else None,
+            budget_limits=(
+                copy_request_budget_limits(budget_limits) if budget_limits is not None else None
+            ),
+            retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
         )
         checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
             mode="json"
@@ -7891,6 +7960,64 @@ def _effective_approval_thinking(
     if thinking is not None:
         return thinking
     return pending_approval.thinking
+
+
+def _effective_approval_max_steps(
+    *,
+    max_steps: int | None,
+    pending_approval: PendingToolApproval,
+) -> int:
+    # Restore the original run's max_steps on an approval continuation; an explicit
+    # override on the approval request wins. Approvals persisted before run config
+    # was checkpointed fall back to the historical request default.
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if max_steps is not None:
+        return max_steps
+    if pending_approval.max_steps is not None:
+        return pending_approval.max_steps
+    return _DEFAULT_APPROVAL_MAX_STEPS
+
+
+def _effective_approval_run_limits(
+    *,
+    limits: RunLimits | None,
+    pending_approval: PendingToolApproval,
+) -> RunLimits:
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if limits is not None:
+        return copy_run_limits(limits)
+    if pending_approval.limits is not None:
+        return copy_run_limits(pending_approval.limits)
+    return RunLimits()
+
+
+def _effective_approval_budget_limits(
+    *,
+    budget_limits: tuple[BudgetLimit, ...] | None,
+    pending_approval: PendingToolApproval,
+) -> tuple[BudgetLimit, ...]:
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if budget_limits is not None:
+        return copy_request_budget_limits(budget_limits)
+    if pending_approval.budget_limits is not None:
+        return copy_request_budget_limits(pending_approval.budget_limits)
+    return ()
+
+
+def _effective_approval_retry_policy(
+    *,
+    retry_policy: RetryPolicy | None,
+    pending_approval: PendingToolApproval,
+) -> RetryPolicy | None:
+    # RetryPolicy is frozen, so the persisted reference is safe to reuse.
+    if type(pending_approval) is not PendingToolApproval:
+        raise TypeError("Pending approval must be a PendingToolApproval.")
+    if retry_policy is not None:
+        return retry_policy
+    return pending_approval.retry_policy
 
 
 def _effective_approval_structured_output(

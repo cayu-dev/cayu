@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     StringConstraints,
     ValidationError,
     field_validator,
@@ -73,6 +74,11 @@ from cayu.storage import (
 )
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# Server-entrypoint step budget. The default preserves the historical value while the
+# ceiling matches the runtime's own ``max_steps`` bound (RunRequest/ResumeRequest and the
+# tool-approval bodies all cap at 256) so a request cannot ask for an unbounded run.
+_DEFAULT_RUN_MAX_STEPS = 20
+_MAX_RUN_STEPS = 256
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
@@ -141,6 +147,7 @@ class RunBody(BaseModel):
     agent: NonBlankString = "assistant"
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
+    max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -161,6 +168,7 @@ class RunBody(BaseModel):
 class ResumeBody(BaseModel):
     session_id: NonBlankString
     prompt: NonBlankString
+    max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
     retry_policy: RetryPolicy | None = None
@@ -208,24 +216,41 @@ class TaskHoldBody(BaseModel):
 
 
 class ToolApprovalBody(BaseModel):
+    """Body for resolving a pending tool approval.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+    to ``None``: the resumed run inherits the original run's configuration
+    persisted on the pending approval. Explicit values override it.
+    """
+
     session_id: NonBlankString
     approval_id: NonBlankString
     decision: ToolApprovalDecision
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    limits: RunLimits = Field(default_factory=RunLimits)
-    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
-    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
         return copy_request_budget_limits(value)
 
 
 class ToolApprovalRecoveryBody(BaseModel):
+    """Body for recovering an approved tool call with an unknown result.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+    to ``None``: the resumed run inherits the original run's configuration
+    persisted on the pending approval. Explicit values override it.
+    """
+
     session_id: NonBlankString
     approval_id: NonBlankString
     tool_call_id: NonBlankString
@@ -235,15 +260,18 @@ class ToolApprovalRecoveryBody(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    limits: RunLimits = Field(default_factory=RunLimits)
-    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
 
     @field_validator("budget_limits", mode="before")
     @classmethod
-    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
         return copy_request_budget_limits(value)
 
 
@@ -737,7 +765,7 @@ def create_router(
             task_id=task_id,
             labels=body.labels,
             messages=[Message.text("user", body.prompt)],
-            max_steps=20,
+            max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
@@ -767,7 +795,7 @@ def create_router(
         request = ResumeRequest(
             session_id=body.session_id,
             messages=[Message.text("user", body.prompt)],
-            max_steps=20,
+            max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
@@ -845,7 +873,7 @@ def create_router(
             decision=body.decision,
             reason=body.reason,
             metadata=body.metadata,
-            max_steps=20,
+            max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,
@@ -874,7 +902,7 @@ def create_router(
             artifacts=body.artifacts,
             reason=body.reason,
             metadata=body.metadata,
-            max_steps=20,
+            max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
             retry_policy=body.retry_policy,

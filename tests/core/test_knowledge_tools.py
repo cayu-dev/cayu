@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import (
     Environment,
@@ -1454,15 +1455,26 @@ def test_knowledge_tools_name_missing_store_methods() -> None:
         async def search(self, query):
             raise AssertionError("not reached")
 
-    ctx = ToolContext(session_id="session_1", knowledge_store=SearchOnlyStore())
+    # A store missing the read surface is rejected when the context is built.
+    with pytest.raises(ValidationError, match="KnowledgeStoreHandle"):
+        ToolContext(session_id="session_1", knowledge_store=SearchOnlyStore())
 
-    with pytest.raises(TypeError, match=r"read_knowledge: read_chunks"):
-        asyncio.run(ReadKnowledgeTool().run(ctx, {"entry_id": "policy"}))
-    with pytest.raises(TypeError, match=r"list_knowledge: list_entries"):
-        asyncio.run(ListKnowledgeTool().run(ctx, {}))
+    class ReadOnlyStore:
+        async def search(self, query):
+            raise AssertionError("not reached")
+
+        async def list_entries(self, query):
+            raise AssertionError("not reached")
+
+        async def read_chunks(self, entry_id, **kwargs):
+            raise AssertionError("not reached")
+
+    ctx = ToolContext(session_id="session_1", knowledge_store=ReadOnlyStore())
+
+    # Write-path tools still name the write methods a read-only store lacks.
     with pytest.raises(
         TypeError,
-        match=r"remember_knowledge: get_entry, put_entry_with_chunks, read_chunks, delete_entry",
+        match=r"remember_knowledge: get_entry, put_entry_with_chunks, delete_entry",
     ):
         asyncio.run(RememberKnowledgeTool().run(ctx, {"text": "fact"}))
 

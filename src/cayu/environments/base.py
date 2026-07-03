@@ -135,7 +135,7 @@ class Environment:
         mcp_servers: Iterable[McpServerSpec] | None = None,
         workspace_instructions: WorkspaceInstructionsInput | None = None,
     ) -> None:
-        if type(spec) is not EnvironmentSpec:
+        if not isinstance(spec, EnvironmentSpec):
             raise TypeError("Environment requires an EnvironmentSpec.")
         self.spec = copy_environment_spec(spec)
 
@@ -184,7 +184,7 @@ class Environment:
     ) -> ResolvedSecret:
         """Resolve a secret ref through the environment vault."""
 
-        if type(ref) is not SecretRef:
+        if not isinstance(ref, SecretRef):
             raise TypeError("Environment secret refs must be SecretRef instances.")
         if self.vault is None:
             raise VaultError(f"Environment has no vault configured: {self.spec.name}")
@@ -192,9 +192,9 @@ class Environment:
 
 
 def copy_environment(environment: Environment) -> Environment:
-    if type(environment) is not Environment:
+    if not isinstance(environment, Environment):
         raise TypeError("Environment copies require an Environment.")
-    return Environment(
+    return type(environment)(
         copy_environment_spec(environment.spec),
         workspace=environment.workspace,
         artifact_store=environment.artifact_store,
@@ -215,20 +215,22 @@ def _validate_knowledge_store(value: Any) -> None:
 
 
 def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
-    if type(spec) is not EnvironmentSpec:
+    if not isinstance(spec, EnvironmentSpec):
         raise TypeError("Environment specs must be EnvironmentSpec instances.")
     if type(spec.name) is not str:
+        # Exact-type on purpose: str subclasses can override strip()/__eq__
+        # and defeat validation (see require_nonblank).
         raise ValueError("`name` must be a string.")
-    return EnvironmentSpec(
+    return type(spec)(
         name=spec.name,
         metadata=copy_json_value(spec.metadata, "metadata"),
     )
 
 
 def copy_mcp_server_spec(spec: McpServerSpec) -> McpServerSpec:
-    if type(spec) is not McpServerSpec:
+    if not isinstance(spec, McpServerSpec):
         raise TypeError("MCP server entries must be McpServerSpec instances.")
-    return McpServerSpec.model_validate(spec.model_dump())
+    return type(spec).model_validate(spec.model_dump())
 
 
 def copy_workspace_instructions_input(
@@ -236,12 +238,12 @@ def copy_workspace_instructions_input(
 ) -> WorkspaceInstructionsInput | None:
     if instructions is None:
         return None
-    if type(instructions) is str:
-        return WorkspaceInstructions(content=instructions)
-    if type(instructions) is WorkspaceInstructions:
-        return WorkspaceInstructions.model_validate(instructions.model_dump())
-    if type(instructions) is WorkspaceInstructionsConfig:
-        return WorkspaceInstructionsConfig.model_validate(instructions.model_dump())
+    if isinstance(instructions, WorkspaceInstructions):
+        return type(instructions).model_validate(instructions.model_dump())
+    if isinstance(instructions, WorkspaceInstructionsConfig):
+        return type(instructions).model_validate(instructions.model_dump())
+    if isinstance(instructions, str):
+        return WorkspaceInstructions(content=str(instructions))
     raise TypeError(
         "workspace_instructions must be a string, WorkspaceInstructions, "
         "WorkspaceInstructionsConfig, or None."
@@ -249,16 +251,16 @@ def copy_workspace_instructions_input(
 
 
 async def load_workspace_instructions(environment: Environment) -> WorkspaceInstructions | None:
-    if type(environment) is not Environment:
+    if not isinstance(environment, Environment):
         raise TypeError("Environment instructions require an Environment.")
     instructions = environment.workspace_instructions
     if instructions is None:
         return None
-    if type(instructions) is WorkspaceInstructions:
-        return WorkspaceInstructions.model_validate(instructions.model_dump())
-    if type(instructions) is str:
-        return WorkspaceInstructions(content=instructions)
-    if type(instructions) is not WorkspaceInstructionsConfig:
+    if isinstance(instructions, WorkspaceInstructions):
+        return type(instructions).model_validate(instructions.model_dump())
+    if isinstance(instructions, str):
+        return WorkspaceInstructions(content=str(instructions))
+    if not isinstance(instructions, WorkspaceInstructionsConfig):
         raise TypeError("Invalid workspace_instructions configuration.")
     if environment.workspace is None:
         return None

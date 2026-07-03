@@ -95,9 +95,12 @@ def checkpoint_for_fork(
             "Cannot fork a pending tool approval to a different environment: "
             f"{pending_approval.environment_name} -> {environment_name}"
         )
+    # Dump in JSON mode to match the checkpoint write path: persisted run
+    # config (budget limits) carries Decimal values that python-mode dumps
+    # would leak into the JSON-only checkpoint.
     copied_checkpoint[PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = pending_approval.model_copy(
         update={"task_id": None}
-    ).model_dump()
+    ).model_dump(mode="json")
     return copied_checkpoint
 
 
