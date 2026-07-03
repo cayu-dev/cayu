@@ -63,11 +63,16 @@ def _build(
     *,
     task_store: TaskStore | None = None,
     task_type: str = _DISPATCH_TASK_TYPE,
+    recover_stalled_sessions_after_seconds: int | None = None,
 ) -> Harness:
     store = InMemorySessionStore()
     tasks = task_store if task_store is not None else InMemoryTaskStore()
     provider = FakeProvider(batches)
-    dispatcher = TaskStoreDispatcher(tasks, task_type=task_type)
+    dispatcher = TaskStoreDispatcher(
+        tasks,
+        task_type=task_type,
+        recover_stalled_sessions_after_seconds=recover_stalled_sessions_after_seconds,
+    )
     app = CayuApp(
         session_store=store,
         task_store=tasks,
@@ -177,6 +182,79 @@ def test_busy_session_requeues_dispatch_task() -> None:
     task = asyncio.run(h.tasks.load_task(handle.metadata["queue_task_id"]))
     assert task is not None
     assert task.status == TaskStatus.PENDING
+
+
+def test_busy_session_conflict_leaves_fresh_session_alone() -> None:
+    # A conflicting session with recent store activity looks live (another worker is
+    # really running it), so the dispatcher must requeue without recovering it.
+    h = _build([_batch("first answer")])
+    _create_resumable_session(h.app, "sess_fresh_conflict")
+    asyncio.run(h.app.dispatch(_dispatch_request("sess_fresh_conflict", "d_fresh")))
+    asyncio.run(
+        h.store.transition_status(
+            "sess_fresh_conflict",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+    )
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is not None
+    assert result.metadata.get("requeued") is True
+    assert "recovered_session" not in result.metadata
+    session = asyncio.run(h.store.load("sess_fresh_conflict"))
+    assert session is not None
+    assert session.status == SessionStatus.RUNNING  # untouched
+
+
+def test_conflict_after_worker_crash_recovers_stalled_session_and_reruns() -> None:
+    # A worker crashed mid-run: its queue task was reclaimed, but the session row is
+    # stranded RUNNING, so every re-claim conflicts. With the recovery horizon elapsed
+    # (0 here), the dispatcher must recover the session and requeue, and the next
+    # claim must run the dispatch to completion instead of conflict-spinning forever.
+    h = _build(
+        [_batch("first answer"), _batch("dispatch answer")],
+        recover_stalled_sessions_after_seconds=0,
+    )
+    _create_resumable_session(h.app, "sess_crash")
+    handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_crash", "d_crash")))
+    # Simulate the crash: the session is stuck RUNNING with no live run anywhere.
+    asyncio.run(
+        h.store.transition_status(
+            "sess_crash",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+    )
+
+    first = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_b"))
+
+    assert first is not None
+    assert first.status == DispatchStatus.SUBMITTED
+    assert first.metadata.get("requeued") is True
+    assert first.metadata.get("recovered_session") is True
+    # The stranded session was finalized to a resumable status, not left RUNNING.
+    session = asyncio.run(h.store.load("sess_crash"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+    second = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_b"))
+
+    assert second is not None
+    assert second.status == DispatchStatus.COMPLETED
+    assert len(h.provider.requests) == 2
+    task = asyncio.run(h.tasks.load_task(handle.metadata["queue_task_id"]))
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    session = asyncio.run(h.store.load("sess_crash"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="recover_stalled_sessions_after_seconds"):
+        TaskStoreDispatcher(InMemoryTaskStore(), recover_stalled_sessions_after_seconds=-1)
 
 
 def test_failed_run_marks_dispatch_task_failed() -> None:

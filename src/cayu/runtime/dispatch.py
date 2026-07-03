@@ -5,6 +5,7 @@ import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import uuid4
@@ -19,7 +20,12 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.sessions import SessionStatusConflict
+from cayu.runtime.sessions import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    SessionStatus,
+    SessionStatusConflict,
+)
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.runtime.tasks import TaskCreate, TaskOrder, TaskQuery, TaskStore
@@ -170,6 +176,19 @@ class InlineDispatcher(Dispatcher):
 
 
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
+DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
+
+_STALLED_RECOVERABLE_SESSION_STATUSES = {
+    SessionStatus.PENDING,
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTING,
+}
+_STALLED_RECOVERED_ACTIONS = {
+    IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+    IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+    IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,
+    IncompleteSessionRecoveryAction.PENDING_APPROVAL,
+}
 
 
 class TaskStoreDispatcher(Dispatcher):
@@ -192,14 +211,30 @@ class TaskStoreDispatcher(Dispatcher):
         *,
         task_type: str = DEFAULT_DISPATCH_TASK_TYPE,
         lease_seconds: int = 300,
+        recover_stalled_sessions_after_seconds: int | None = None,
     ) -> None:
         if not isinstance(task_store, TaskStore):
             raise TypeError("TaskStoreDispatcher requires a TaskStore.")
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise ValueError("lease_seconds must be a positive integer.")
+        if recover_stalled_sessions_after_seconds is not None and (
+            type(recover_stalled_sessions_after_seconds) is not int
+            or recover_stalled_sessions_after_seconds < 0
+        ):
+            raise ValueError(
+                "recover_stalled_sessions_after_seconds must be a non-negative integer."
+            )
         self._tasks = task_store
         self._task_type = require_clean_nonblank(task_type, "task_type")
         self._lease_seconds = lease_seconds
+        # Horizon after which a conflicting live-status session is considered stranded
+        # by a crashed worker (defaults to the task lease: a healthy run whose lease
+        # would already have expired is treated the same as a crashed one).
+        self._recover_stalled_after_seconds = (
+            lease_seconds
+            if recover_stalled_sessions_after_seconds is None
+            else recover_stalled_sessions_after_seconds
+        )
 
     async def submit(
         self,
@@ -281,9 +316,17 @@ class TaskStoreDispatcher(Dispatcher):
             except SessionStatusConflict:
                 # The session is already being run by another worker — requeue rather than
                 # fail, so it runs once that session frees up (per-session serialization).
+                # After a worker crash, though, the session is stranded in a live status
+                # forever and every re-claim of the reclaimed task would conflict in a
+                # loop; recover a stalled session so the requeued dispatch can proceed.
+                recovered = await self._recover_stalled_session(runtime, request)
                 await self._tasks.release_task(task.id, worker_id)
                 return self._handle(
-                    request, DispatchStatus.SUBMITTED, queue_task_id=task.id, requeued=True
+                    request,
+                    DispatchStatus.SUBMITTED,
+                    queue_task_id=task.id,
+                    requeued=True,
+                    recovered_session=recovered,
                 )
             except Exception as exc:
                 return await self._terminalize(
@@ -327,6 +370,49 @@ class TaskStoreDispatcher(Dispatcher):
             )
             return self._handle(request, status, queue_task_id=task_id, reclaimed=True)
         return self._handle(request, status, queue_task_id=task_id)
+
+    async def _recover_stalled_session(
+        self,
+        runtime: DispatchRuntime,
+        request: DispatchRequest,
+    ) -> bool:
+        """Best-effort finalization of a session stranded in a live status by a crashed worker.
+
+        Uses the runtime's incomplete-session recovery when available (duck-typed so the
+        ``DispatchRuntime`` protocol stays minimal). Only sessions with no store activity
+        for at least the recovery horizon are touched — a genuinely live run on another
+        worker keeps updating the session (status transitions, transcript appends,
+        checkpoints) and is left alone; the runtime additionally skips sessions with
+        active work in this process. Returns True when the session was recovered out of
+        its stranded status.
+        """
+        recover = getattr(runtime, "recover_incomplete_session", None)
+        session_store = getattr(runtime, "session_store", None)
+        if recover is None or session_store is None:
+            return False
+        try:
+            session = await session_store.load(request.session_id)
+            if session is None or session.status not in _STALLED_RECOVERABLE_SESSION_STATUSES:
+                return False
+            stalled_seconds = (datetime.now(UTC) - session.updated_at).total_seconds()
+            if stalled_seconds < self._recover_stalled_after_seconds:
+                return False
+            result = await recover(
+                IncompleteSessionRecoveryRequest(
+                    session_id=request.session_id,
+                    reason=DISPATCH_CONFLICT_RECOVERY_REASON,
+                    metadata={"dispatch_id": request.dispatch_id},
+                )
+            )
+        except Exception:
+            logger.warning(
+                "dispatch %s could not recover stalled session %s",
+                request.dispatch_id,
+                request.session_id,
+                exc_info=True,
+            )
+            return False
+        return bool(_STALLED_RECOVERED_ACTIONS & set(result.actions))
 
     async def _heartbeat(self, task_id: str, worker_id: str) -> None:
         """Extend the lease every ``lease_seconds / 3`` until cancelled (best effort)."""
@@ -388,12 +474,15 @@ class TaskStoreDispatcher(Dispatcher):
         queue_task_id: str,
         requeued: bool = False,
         reclaimed: bool = False,
+        recovered_session: bool = False,
     ) -> DispatchHandle:
         metadata: dict[str, Any] = {"queue_task_id": queue_task_id}
         if requeued:
             metadata["requeued"] = True
         if reclaimed:
             metadata["reclaimed"] = True
+        if recovered_session:
+            metadata["recovered_session"] = True
         return DispatchHandle(
             dispatch_id=request.dispatch_id,
             session_id=request.session_id,

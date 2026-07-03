@@ -211,6 +211,37 @@ class ContextOverflowProvider(ModelProvider):
             yield event
 
 
+class EventFlattenedOverflowProvider(ModelProvider):
+    """Contract-violating provider: flattens overflow into an error event.
+
+    `stream()` must raise `ModelContextOverflowError`, but a provider that
+    wraps every failure with `ModelStreamEvent.error(..., cause=exc)` still
+    carries the typed overflow identity in the payload. The runtime must route
+    that into context-overflow recovery instead of generic retries.
+    """
+
+    name = "overflow-event"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.error(
+                "context too large",
+                cause=ModelContextOverflowError(
+                    "context too large",
+                    provider=self.name,
+                    status_code=400,
+                    error_code="context_length_exceeded",
+                ),
+            )
+            return
+        yield ModelStreamEvent.text_delta("recovered")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 class OtherProvider(FakeProvider):
     name = "other"
 
@@ -238,10 +269,17 @@ class MutatingProvider(FakeProvider):
             ]
         )
 
+    mutation_blocked = False
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         async for event in super().stream(request):
             if len(self.requests) == 1:
-                request.messages[0].content[0].text = "mutated by provider"
+                # Messages are frozen; the runtime history cannot be corrupted
+                # even by a misbehaving provider.
+                try:
+                    request.messages[0].content[0].text = "mutated by provider"
+                except ValidationError:
+                    self.mutation_blocked = True
             yield event
 
 
@@ -960,7 +998,10 @@ def test_context_counting_uses_defensive_request_copy_for_provider_counter() -> 
             result = await super().count_input_tokens(request)
             part = request.messages[0].content[0]
             assert isinstance(part, TextPart)
-            part.text = "mutated by counter"
+            # Message parts are frozen; a misbehaving counter cannot corrupt
+            # the shared transcript at all.
+            with pytest.raises(ValidationError):
+                part.text = "mutated by counter"  # type: ignore[misc]
             request.tools.append({"name": "mutated_tool"})
             request.options["temperature"] = 1
             return result
@@ -998,7 +1039,7 @@ def test_context_counting_uses_defensive_request_copy_for_provider_counter() -> 
     stream_part = provider.requests[0].messages[0].content[0]
     assert isinstance(count_part, TextPart)
     assert isinstance(stream_part, TextPart)
-    assert count_part.text == "mutated by counter"
+    assert count_part.text == "original prompt"
     assert stream_part.text == "original prompt"
     assert provider.count_requests[0].tools == [{"name": "mutated_tool"}]
     assert provider.requests[0].tools == []
@@ -13961,7 +14002,9 @@ def test_cayu_app_context_policy_can_trim_model_facing_messages():
 
         async def build(self, request: ContextRequest) -> list[Message]:
             self.seen.append(request)
-            request.messages[0].content[0].text = "mutated inside policy"
+            # Messages are frozen; policies cannot corrupt the transcript.
+            with pytest.raises(ValidationError):
+                request.messages[0].content[0].text = "mutated"  # type: ignore[misc]
             return [request.messages[-1]]
 
     policy = LastMessagePolicy()
@@ -14581,16 +14624,12 @@ def test_observed_delta_context_estimator_counts_only_overhead_delta_after_ancho
         overhead=overhead,
     )
     increased = estimator.estimate_anchored_request(
-        usage=usage.model_copy(
-            update={"last_context_overhead_input_tokens": overhead_tokens - 5}
-        ),
+        usage=usage.model_copy(update={"last_context_overhead_input_tokens": overhead_tokens - 5}),
         messages=messages,
         overhead=overhead,
     )
     decreased = estimator.estimate_anchored_request(
-        usage=usage.model_copy(
-            update={"last_context_overhead_input_tokens": overhead_tokens + 5}
-        ),
+        usage=usage.model_copy(update={"last_context_overhead_input_tokens": overhead_tokens + 5}),
         messages=messages,
         overhead=overhead,
     )
@@ -14664,40 +14703,33 @@ def test_observed_delta_context_estimator_uses_provider_specific_image_floor():
 def test_observed_delta_context_estimator_uses_adaptive_text_density():
     prose = (
         "Remote sandbox Git authentication should use a brokered Git HTTP proxy. "
-        "Credentials stay outside the sandbox boundary. "
-        * 100
+        "Credentials stay outside the sandbox boundary. " * 100
     )
     dense_json = (
         '{"path":"src/cayu/runtime/context.py","line":123,'
-        '"value":"x_y-z.abc/def","ok":true}\n'
-        * 100
+        '"value":"x_y-z.abc/def","ok":true}\n' * 100
     )
     pretty_json = (
         '{\n  "path": "src/cayu/runtime/context.py",\n  "line": 123,\n'
-        '  "value": "x_y-z.abc/def",\n  "ok": true\n}\n'
-        * 100
+        '  "value": "x_y-z.abc/def",\n  "ok": true\n}\n' * 100
     )
     logs = (
         "2026-07-02T12:34:56Z INFO session=sess_123 step=4 "
-        "tool=search_knowledge latency_ms=42 status=ok input_tokens=14947\n"
-        * 100
+        "tool=search_knowledge latency_ms=42 status=ok input_tokens=14947\n" * 100
     )
     csv = (
         "timestamp,session_id,agent,model,input_tokens,output_tokens,status\n"
-        "2026-07-02T12:34:56Z,sess_123,assistant,gpt-5.5,14947,7,ok\n"
-        * 100
+        "2026-07-02T12:34:56Z,sess_123,assistant,gpt-5.5,14947,7,ok\n" * 100
     )
     code = (
         "def estimate_context_pressure(request):\n"
         "    if request.count_input_tokens is None:\n"
         "        return estimate\n"
-        "    return request.count_input_tokens(messages)\n"
-        * 100
+        "    return request.count_input_tokens(messages)\n" * 100
     )
     markdown = (
-        '# Heading\n\n- `code/path.py`: explanation with punctuation, numbers 12345, '
-        'and JSON {"ok": true}.\n'
-        * 100
+        "# Heading\n\n- `code/path.py`: explanation with punctuation, numbers 12345, "
+        'and JSON {"ok": true}.\n' * 100
     )
     estimator = ObservedDeltaContextEstimator(chars_per_token=5)
 
@@ -14745,8 +14777,7 @@ def test_observed_delta_context_estimator_uses_tool_schema_density_override():
 
     assert default_tokens > openai_profile_tokens
     assert openai_profile_tokens == math.ceil(
-        len(json.dumps(tools[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True))
-        / 6
+        len(json.dumps(tools[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True)) / 6
     )
 
 
@@ -14799,7 +14830,9 @@ def test_context_policy_receives_estimated_context_pressure_on_next_call():
         )
     )
 
-    first_completed = next(event for event in first_events if event.type == EventType.MODEL_COMPLETED)
+    first_completed = next(
+        event for event in first_events if event.type == EventType.MODEL_COMPLETED
+    )
     assert first_completed.payload["transcript_cursor"] == 2
     assert len(policy.requests) == 2
     pressure = policy.requests[1].context_usage.input_pressure
@@ -14893,7 +14926,7 @@ def test_context_policy_input_pressure_uses_provider_profile_image_floor():
                                 size_bytes=120,
                             )
                         ],
-                    )
+                    ),
                 ],
             ),
         )
@@ -15059,10 +15092,7 @@ def test_usage_triggered_context_policy_does_not_double_count_stable_overhead():
         event for event in first_events if event.type == EventType.MODEL_COMPLETED
     )
     assert (
-        first_completed.payload["context_pressure"][
-            "estimated_request_overhead_input_tokens"
-        ]
-        > 300
+        first_completed.payload["context_pressure"]["estimated_request_overhead_input_tokens"] > 300
     )
     assert len(provider.requests[1].messages) == 3
     assert not [event for event in second_events if event.type == EventType.SESSION_CHECKPOINTED]
@@ -15758,6 +15788,86 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "old request",
         "new request",
     ]
+
+
+def test_context_overflow_recovery_from_error_stream_event():
+    provider = EventFlattenedOverflowProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_event_recovery",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    assert len(provider.requests[1].messages) == 1
+    # The typed overflow is rehydrated before the generic MODEL_ERROR/retry
+    # path, so recovery runs exactly like the raised-exception contract.
+    assert EventType.MODEL_ERROR not in [event.type for event in events]
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_OVERFLOW_RECOVERING,
+            EventType.CONTEXT_OVERFLOW_FAILED,
+            EventType.SESSION_COMPLETED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.SESSION_COMPLETED,
+    ]
+    detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
+    assert detected.payload == {
+        "step": 1,
+        "phase": "initial",
+        "error": "context too large",
+        "error_type": "ModelContextOverflowError",
+        "provider": "overflow-event",
+        "original_message_count": 2,
+        "status_code": 400,
+        "provider_error_code": "context_length_exceeded",
+    }
+
+
+def test_context_overflow_error_stream_event_without_policy_fails_typed():
+    provider = EventFlattenedOverflowProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_event_no_policy",
+                messages=[Message.text("user", "too much")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    failed = events[-1]
+    assert failed.type == EventType.SESSION_FAILED
+    assert failed.payload["error"] == "context too large"
+    assert failed.payload["error_type"] == "ModelContextOverflowError"
 
 
 def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
@@ -17840,7 +17950,8 @@ def test_cayu_app_protects_runtime_history_from_provider_mutation():
     )
 
     assert events[-1].type == EventType.SESSION_COMPLETED
-    assert provider.requests[0].messages[0].content[0].text == "mutated by provider"
+    assert provider.mutation_blocked
+    assert provider.requests[0].messages[0].content[0].text == "original"
     assert provider.requests[1].messages[0].content[0].text == "original"
 
 

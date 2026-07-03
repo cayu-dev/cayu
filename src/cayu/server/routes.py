@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -18,7 +20,7 @@ from pydantic import (
 from sse_starlette.sse import EventSourceResponse
 
 from cayu._validation import copy_label_map, require_clean_nonblank
-from cayu.core.events import EventType
+from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
@@ -57,7 +59,11 @@ from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
-from cayu.server.sse import event_to_sse_data
+from cayu.server.sse import (
+    error_to_sse_message,
+    event_to_sse_message,
+    parse_last_event_id,
+)
 from cayu.storage import (
     KnowledgeChunk,
     KnowledgeEntry,
@@ -78,6 +84,56 @@ _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.INTERRUPTING,
     SessionStatus.INTERRUPTED,
 }
+_REPLAY_ACTIVE_SESSION_STATUSES = {
+    SessionStatus.PENDING,
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTING,
+}
+_REPLAY_POLL_INTERVAL_S = 0.05
+
+# Detached event pumps must outlive their SSE consumer (a client disconnect must not
+# cancel agent work), so hold strong references until each pump finishes — the event
+# loop only keeps weak references to tasks.
+_detached_event_pumps: set[asyncio.Task[None]] = set()
+
+
+def _detached_event_stream_response(event_stream: AsyncIterator[Event]) -> EventSourceResponse:
+    """Run ``event_stream`` to completion in a detached task; stream it as an observer.
+
+    The run is driven by the pump task, not by the SSE consumer: a client disconnect
+    stops the observer while the session still runs to a terminal state (finalized,
+    not stranded RUNNING). Each frame carries a resumable ``id:`` field, and a runtime
+    failure surfaces as a terminal structured ``error`` frame instead of an aborted
+    connection.
+    """
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for event in event_stream:
+                queue.put_nowait(("event", event))
+        except BaseException as exc:
+            queue.put_nowait(("error", exc))
+            if not isinstance(exc, Exception):
+                raise
+        else:
+            queue.put_nowait(("done", None))
+
+    pump_task = asyncio.create_task(pump())
+    _detached_event_pumps.add(pump_task)
+    pump_task.add_done_callback(_detached_event_pumps.discard)
+
+    async def observe() -> AsyncIterator[dict[str, str]]:
+        while True:
+            kind, item = await queue.get()
+            if kind == "event":
+                yield event_to_sse_message(item)
+                continue
+            if kind == "error":
+                yield error_to_sse_message(item)
+            return
+
+    return EventSourceResponse(observe())
 
 
 class RunBody(BaseModel):
@@ -566,8 +622,83 @@ def create_router(
 
     router = APIRouter(prefix="/api")
 
+    async def _marker_sequence(session_id: str, event_id: str) -> int | None:
+        """Sequence of the persisted event named by a ``Last-Event-ID`` marker.
+
+        Returns ``None`` when the marker event is unknown, so the caller replays the
+        full history (at-least-once delivery beats silently dropping events).
+        """
+        after_sequence: int | None = None
+        while True:
+            page = await session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    after_sequence=after_sequence,
+                    limit=_EVENT_PAGE_LIMIT_MAX,
+                )
+            )
+            for record in page:
+                if record.event.id == event_id:
+                    return record.sequence
+            if len(page) < _EVENT_PAGE_LIMIT_MAX:
+                return None
+            after_sequence = page[-1].sequence
+
+    async def _replay_events_response(http_request: Request) -> EventSourceResponse | None:
+        """SSE resume for reconnecting clients (``Last-Event-ID`` header).
+
+        Instead of starting new work, replay the session's persisted events after the
+        last one the client saw and keep following until the session reaches a
+        terminal status (the detached pump finishes the run even after a disconnect).
+        """
+        last_event_id = http_request.headers.get("last-event-id")
+        if last_event_id is None:
+            return None
+        marker = parse_last_event_id(last_event_id)
+        if marker is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Last-Event-ID must use `session_id:event_id`.",
+            )
+        session_id, last_seen_event_id = marker
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            )
+
+        async def replay() -> AsyncIterator[dict[str, str]]:
+            after_sequence = await _marker_sequence(session_id, last_seen_event_id)
+            while True:
+                page = await session_store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        after_sequence=after_sequence,
+                        limit=_EVENT_PAGE_LIMIT_MAX,
+                    )
+                )
+                for record in page:
+                    after_sequence = record.sequence
+                    yield event_to_sse_message(record.event)
+                if len(page) == _EVENT_PAGE_LIMIT_MAX:
+                    continue
+                current = await session_store.load(session_id)
+                if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
+                    return
+                await asyncio.sleep(_REPLAY_POLL_INTERVAL_S)
+
+        return EventSourceResponse(replay())
+
     @router.post("/run")
-    async def run_agent(body: RunBody, trace_metadata: TraceContextMetadata):
+    async def run_agent(
+        body: RunBody,
+        http_request: Request,
+        trace_metadata: TraceContextMetadata,
+    ):
+        replay = await _replay_events_response(http_request)
+        if replay is not None:
+            return replay
         session_id = f"session-{uuid4().hex[:8]}"
 
         if task_store is not None:
@@ -599,14 +730,17 @@ def create_router(
             thinking=body.thinking,
         )
 
-        async def generate():
-            async for event in cayu_app.run(request):
-                yield event_to_sse_data(event)
-
-        return EventSourceResponse(generate())
+        return _detached_event_stream_response(cayu_app.run(request))
 
     @router.post("/resume")
-    async def resume_agent(body: ResumeBody, trace_metadata: TraceContextMetadata):
+    async def resume_agent(
+        body: ResumeBody,
+        http_request: Request,
+        trace_metadata: TraceContextMetadata,
+    ):
+        replay = await _replay_events_response(http_request)
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -626,11 +760,7 @@ def create_router(
             thinking=body.thinking,
         )
 
-        async def generate():
-            async for event in cayu_app.resume(request):
-                yield event_to_sse_data(event)
-
-        return EventSourceResponse(generate())
+        return _detached_event_stream_response(cayu_app.resume(request))
 
     @router.post("/sessions/{session_id}/interrupt")
     async def interrupt_session(
@@ -678,9 +808,9 @@ def create_router(
             raise
 
         async def generate():
-            yield event_to_sse_data(first_event)
+            yield event_to_sse_message(first_event)
             async for event in event_stream:
-                yield event_to_sse_data(event)
+                yield event_to_sse_message(event)
 
         return EventSourceResponse(generate())
 
@@ -707,11 +837,7 @@ def create_router(
             thinking=body.thinking,
         )
 
-        async def generate():
-            async for event in cayu_app.resolve_tool_approval(request):
-                yield event_to_sse_data(event)
-
-        return EventSourceResponse(generate())
+        return _detached_event_stream_response(cayu_app.resolve_tool_approval(request))
 
     @router.post("/tool-approvals/recover")
     async def recover_tool_approval(body: ToolApprovalRecoveryBody):
@@ -740,11 +866,7 @@ def create_router(
             thinking=body.thinking,
         )
 
-        async def generate():
-            async for event in cayu_app.recover_tool_approval(request):
-                yield event_to_sse_data(event)
-
-        return EventSourceResponse(generate())
+        return _detached_event_stream_response(cayu_app.recover_tool_approval(request))
 
     @router.get("/sessions")
     async def list_sessions(

@@ -2420,3 +2420,135 @@ def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
     parts = [part for message in collected for part in message["content"]]
     assert any(part["type"] == "text" for part in parts)  # the answer survives
     assert all(part["type"] != "thinking" for part in parts)  # thinking excluded
+
+
+def _sse_frames(response) -> list[dict]:
+    """Collect SSE frames as dicts with optional `id`, `event`, and parsed `data`."""
+    frames: list[dict] = []
+    current: dict = {}
+    for line in response.iter_lines():
+        if not line.strip():
+            if current:
+                frames.append(current)
+                current = {}
+            continue
+        if line.startswith("id:"):
+            current["id"] = line[len("id:") :].strip()
+        elif line.startswith("event:"):
+            current["event"] = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            current["data"] = json.loads(line[len("data:") :].strip())
+    if current:
+        frames.append(current)
+    return frames
+
+
+def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    assert frames
+    session_id = frames[0]["data"]["session_id"]
+    # Every frame carries a resumable id of the form `<session_id>:<event_id>`.
+    for frame in frames:
+        assert frame["id"] == f"{session_id}:{frame['data']['id']}"
+
+    # A reconnect with Last-Event-ID replays the persisted events the client missed
+    # instead of starting a new run.
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello"},
+        headers={"Last-Event-ID": frames[0]["id"]},
+    ) as response:
+        assert response.status_code == 200
+        replayed = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    assert [frame["data"]["id"] for frame in replayed] == [
+        frame["data"]["id"] for frame in frames[1:]
+    ]
+    assert replayed[-1]["data"]["type"] == "session.completed"
+    # No new session was created by the replay request.
+    sessions = client.get("/api/sessions").json()["sessions"]
+    assert [session["id"] for session in sessions] == [session_id]
+
+
+def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    malformed = client.post(
+        "/api/run",
+        json={"prompt": "hello"},
+        headers={"Last-Event-ID": "not-a-marker"},
+    )
+    assert malformed.status_code == 422
+
+    unknown = client.post(
+        "/api/run",
+        json={"prompt": "hello"},
+        headers={"Last-Event-ID": "missing_session:event_1"},
+    )
+    assert unknown.status_code == 404
+
+
+def test_client_disconnect_does_not_cancel_detached_run() -> None:
+    import time
+
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    session_id = None
+    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("data:"):
+                session_id = json.loads(line[len("data:") :].strip())["session_id"]
+                break  # disconnect after the first event
+
+    assert session_id is not None
+    # The run is driven by a detached pump, so it still finishes after the disconnect.
+    deadline = time.monotonic() + 10
+    status = None
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{session_id}").json()["session"]["status"]
+        if status == "completed":
+            break
+        time.sleep(0.05)
+    assert status == "completed"
+
+
+def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app))
+
+    async def broken_run(request):
+        raise RuntimeError("run exploded before streaming")
+        yield  # pragma: no cover - makes this an async generator
+
+    app.run = broken_run
+
+    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames
+    error_frame = frames[-1]
+    assert error_frame.get("event") == "error"
+    assert error_frame["data"] == {
+        "type": "stream.error",
+        "error": "run exploded before streaming",
+        "error_type": "RuntimeError",
+    }

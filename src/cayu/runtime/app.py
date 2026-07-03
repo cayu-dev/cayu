@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -388,11 +388,378 @@ _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
+_ABANDONED_RUN_REASON = "event_stream_closed"
 
 
 def _is_background_subagent_session(session: Session) -> bool:
     subagent = session.metadata.get("subagent")
     return isinstance(subagent, dict) and subagent.get("mode") == "background"
+
+
+class _LimitGate:
+    """Evaluates the run-limit / request-budget matrix at one phase boundary.
+
+    The session loop checks the same limits before the model step, after the
+    model step, before a tool round, and before each tool call. This gate owns
+    that shared sequence: it yields any budget-notify events produced by the
+    check and, when a limit trips, the full stop-session event stream.
+    Callers must stop the session loop when ``tripped`` is True after
+    draining the generator.
+    """
+
+    def __init__(
+        self,
+        app: CayuApp,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        limits: RunLimits,
+        budget_limits: tuple[BudgetLimit, ...],
+        run_started_at: float,
+        run_baseline: SessionUsageSummary | None,
+        budget_baseline_events: list[Event],
+        budget_notify_events: list[Event],
+    ) -> None:
+        self._app = app
+        self._session = session
+        self._registered_agent = registered_agent
+        self._registered_environment = registered_environment
+        self._environment_name = environment_name
+        self._limits = limits
+        self._budget_limits = budget_limits
+        self._run_started_at = run_started_at
+        self._run_baseline = run_baseline
+        self._budget_baseline_events = budget_baseline_events
+        self._budget_notify_events = budget_notify_events
+        self.tripped = False
+
+    async def evaluate_limits(
+        self,
+        *,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest] | None = None,
+        completed_tool_outcomes: list[runtime_records.ToolCallOutcome] | None = None,
+        pending_tool_calls: int = 0,
+        tool_round_id: str | None = None,
+    ) -> AsyncIterator[Event]:
+        self.tripped = False
+        (
+            decision,
+            usage_summary,
+            cost_summary,
+            budget_events,
+        ) = await self._app._first_limit_decision(
+            session=self._session,
+            registered_agent=self._registered_agent,
+            environment_name=self._environment_name,
+            limits=self._limits,
+            budget_limits=self._budget_limits,
+            run_started_at=self._run_started_at,
+            run_baseline=self._run_baseline,
+            budget_baseline_events=self._budget_baseline_events,
+            pending_tool_calls=pending_tool_calls,
+            budget_notify_events=self._budget_notify_events,
+        )
+        for event in budget_events:
+            yield event
+        if decision is None:
+            return
+        self.tripped = True
+        async for event in self._app._stop_session_for_limit_reached(
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            environment_name=self._environment_name,
+            decision=decision,
+            usage_summary=usage_summary,
+            cost_summary=cost_summary,
+            messages=messages,
+            tool_calls=tool_calls if tool_calls is not None else [],
+            completed_tool_outcomes=(
+                completed_tool_outcomes if completed_tool_outcomes is not None else []
+            ),
+            tool_round_id=tool_round_id,
+        ):
+            yield event
+
+    async def evaluate_budget(
+        self,
+        *,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest] | None = None,
+        tool_round_id: str | None = None,
+    ) -> AsyncIterator[Event]:
+        self.tripped = False
+        budget_decision, budget_events = await self._app._first_budget_decision(
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            environment_name=self._environment_name,
+        )
+        for event in budget_events:
+            yield event
+        if budget_decision is None:
+            return
+        self.tripped = True
+        async for event in self._app._stop_session_for_budget_limit_reached(
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            environment_name=self._environment_name,
+            check=budget_decision,
+            messages=messages,
+            tool_calls=tool_calls if tool_calls is not None else [],
+            completed_tool_outcomes=[],
+            tool_round_id=tool_round_id,
+        ):
+            yield event
+
+
+class _InterruptGuard:
+    """Applies the session-interrupt matrix around a tool round phase.
+
+    Both interrupt signals — the cooperative ``_SessionInterruptedByRequest``
+    and an ``asyncio.CancelledError`` raised while an interrupt request is
+    pending — must close the tool round the same way. Callers catch either
+    exception, drain :meth:`close_tool_round`, and re-raise. A cancellation
+    without a pending interrupt request yields nothing (the cancellation
+    simply propagates).
+    """
+
+    def __init__(
+        self,
+        app: CayuApp,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> None:
+        self._app = app
+        self._session = session
+        self._registered_agent = registered_agent
+        self._registered_environment = registered_environment
+
+    async def close_tool_round(
+        self,
+        exc: BaseException,
+        *,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        tool_outcomes: list[runtime_records.ToolCallOutcome],
+        tool_round_id: str | None,
+        clear_pending_approval: bool = False,
+    ) -> AsyncIterator[Event]:
+        cancellation_artifacts: list[dict[str, Any]] | None = None
+        if isinstance(exc, _SessionInterruptedByRequest):
+            pass
+        elif isinstance(exc, asyncio.CancelledError):
+            if not await self._app._session_interrupt_requested(self._session.id):
+                return
+            _clear_current_task_cancellation()
+            cancellation_artifacts = _cancellation_artifacts(exc)
+        else:
+            raise TypeError(f"Unsupported interrupt exception: {type(exc).__name__}")
+        if clear_pending_approval:
+            await self._app._clear_pending_tool_approval_for_tool_round(
+                self._session.id,
+                tool_calls,
+            )
+        async for event in self._app._close_interrupted_tool_round(
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            messages=messages,
+            tool_calls=tool_calls,
+            tool_outcomes=tool_outcomes,
+            tool_round_id=tool_round_id,
+            cancellation_artifacts=cancellation_artifacts,
+        ):
+            yield event
+
+
+class _ToolRoundRunner:
+    """Runs one tool round: policy planning, approval checkpointing, execution.
+
+    Yields the round's event stream. When a run limit trips mid-round the
+    runner stops the session through the limit gate and sets
+    ``stopped_for_limit``; callers must return from the session loop when it
+    is True after draining the generator. A pending tool approval raises
+    ``_SessionInterrupted``; interrupt requests propagate after the round is
+    closed by the interrupt guard.
+    """
+
+    def __init__(
+        self,
+        app: CayuApp,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        limit_gate: _LimitGate,
+        interrupt_guard: _InterruptGuard,
+        request_metadata: dict[str, Any],
+        task_id: str | None,
+        structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+    ) -> None:
+        self._app = app
+        self._session = session
+        self._registered_agent = registered_agent
+        self._registered_environment = registered_environment
+        self._environment_name = environment_name
+        self._limit_gate = limit_gate
+        self._interrupt_guard = interrupt_guard
+        self._request_metadata = request_metadata
+        self._task_id = task_id
+        self._structured_output = structured_output
+        self._thinking = thinking
+        self.stopped_for_limit = False
+
+    async def run(
+        self,
+        *,
+        messages: list[Message],
+        tool_calls: list[runtime_records.ToolCallRequest],
+        tool_round_id: str | None,
+    ) -> AsyncIterator[Event]:
+        self.stopped_for_limit = False
+        app = self._app
+        session = self._session
+        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        try:
+            await app._raise_if_session_interrupted(session.id)
+            policy_plan = await app._policy_plan_for_tool_round(
+                session=session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                tool_calls=tool_calls,
+                request_metadata=self._request_metadata,
+            )
+            await app._raise_if_session_interrupted(session.id)
+        except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+            async for event in self._interrupt_guard.close_tool_round(
+                exc,
+                messages=messages,
+                tool_calls=tool_calls,
+                tool_outcomes=tool_outcomes,
+                tool_round_id=tool_round_id,
+            ):
+                yield event
+            raise
+
+        async for event in self._limit_gate.evaluate_limits(
+            messages=messages,
+            tool_calls=tool_calls,
+            pending_tool_calls=len(tool_calls),
+            tool_round_id=tool_round_id,
+        ):
+            yield event
+        if self._limit_gate.tripped:
+            self.stopped_for_limit = True
+            return
+
+        if policy_plan.pending_approval is not None:
+            approval_plan = policy_plan.pending_approval
+            try:
+                approval, checkpoint_event = await app._checkpoint_pending_tool_approval(
+                    session=session,
+                    registered_agent=self._registered_agent,
+                    registered_environment=self._registered_environment,
+                    tool_call=approval_plan.call,
+                    tool_calls=approval_plan.calls,
+                    policy_outcomes=approval_plan.policy_outcomes,
+                    task_id=self._task_id,
+                    policy_result=approval_plan.policy_result,
+                    structured_output=self._structured_output,
+                    thinking=self._thinking,
+                )
+                yield await app._emit(checkpoint_event)
+                yield await app._emit(
+                    Event(
+                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                        session_id=session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        tool_name=approval.tool_name,
+                        payload={
+                            "approval": approval.model_dump(mode="json"),
+                        },
+                    )
+                )
+            except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+                async for event in self._interrupt_guard.close_tool_round(
+                    exc,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_outcomes=tool_outcomes,
+                    tool_round_id=tool_round_id,
+                    clear_pending_approval=True,
+                ):
+                    yield event
+                raise
+            raise _SessionInterrupted(approval)
+
+        policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_plan.outcomes}
+        try:
+            for tool_call in tool_calls:
+                await app._raise_if_session_interrupted(session.id)
+                async for event in self._limit_gate.evaluate_limits(
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    completed_tool_outcomes=tool_outcomes,
+                    pending_tool_calls=1,
+                    tool_round_id=tool_round_id,
+                ):
+                    yield event
+                if self._limit_gate.tripped:
+                    self.stopped_for_limit = True
+                    return
+                async for event, outcome in app._execute_tool_call(
+                    session=session,
+                    registered_agent=self._registered_agent,
+                    registered_environment=self._registered_environment,
+                    tool_call=tool_call,
+                    request_metadata=self._request_metadata,
+                    task_id=self._task_id,
+                    policy_result=policy_results_by_id.get(tool_call.id),
+                    tool_round_id=tool_round_id,
+                ):
+                    yield event
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+                await app._raise_if_session_interrupted(session.id)
+        except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+            async for event in self._interrupt_guard.close_tool_round(
+                exc,
+                messages=messages,
+                tool_calls=tool_calls,
+                tool_outcomes=tool_outcomes,
+                tool_round_id=tool_round_id,
+            ):
+                yield event
+            raise
+
+        tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        messages.extend(tool_result_messages)
+        cleared_checkpoint = await app._checkpoint_without_pending_tool_round(session.id)
+        try:
+            await app.session_store.append_transcript_messages_and_checkpoint(
+                session.id,
+                tool_result_messages,
+                cleared_checkpoint,
+            )
+        except asyncio.CancelledError:
+            if await app._session_interrupt_requested(session.id):
+                _clear_current_task_cancellation()
+                await app.session_store.append_transcript_messages_and_checkpoint(
+                    session.id,
+                    tool_result_messages,
+                    cleared_checkpoint,
+                )
+            raise
 
 
 class CayuApp:
@@ -867,6 +1234,12 @@ class CayuApp:
             ):
                 yield event
             return
+        except GeneratorExit:
+            # A consumer that closes the stream during factory-resolution yields would
+            # otherwise strand the session RUNNING (this window is outside _run_session's
+            # own finalizer). Finalize before propagating the close.
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
         finally:
             if current_task is not None and active_factory_run is not None:
                 self._unregister_active_session_task(session.id, current_task)
@@ -878,27 +1251,28 @@ class CayuApp:
             ),
             request_messages=request.messages,
         )
+        session_stream = self._run_session(
+            session=session,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            messages=messages,
+            messages_to_append=messages,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=self._effective_retry_policy(request.retry_policy),
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            request_loop_policies=request.loop_policies,
+            request_metadata=request.metadata,
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            start_event_type=EventType.SESSION_STARTED,
+            start_event_payload={"agent_name": registered_agent.spec.name},
+        )
         try:
-            async for event in self._run_session(
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                messages=messages,
-                messages_to_append=messages,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=self._effective_retry_policy(request.retry_policy),
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                request_loop_policies=request.loop_policies,
-                request_metadata=request.metadata,
-                task_id=request.task_id,
-                task_worker_id=request.task_worker_id,
-                start_event_type=EventType.SESSION_STARTED,
-                start_event_payload={"agent_name": registered_agent.spec.name},
-            ):
+            async for event in session_stream:
                 yield event
         except asyncio.CancelledError:
             if await self._session_interrupt_requested(session.id):
@@ -911,17 +1285,27 @@ class CayuApp:
                     yield event
                 return
             raise
+        except GeneratorExit:
+            # Close the inner run stream deterministically so it finalizes (not
+            # strands) the RUNNING session before the consumer's close returns.
+            await session_stream.aclose()
+            raise
 
     async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
         request = _validate_resume_request(request)
-        async for event in self._resume_session(
+        session_stream = self._resume_session(
             request=request,
             task_id=None,
             start_event_payload_extra={},
-        ):
-            yield event
+        )
+        try:
+            async for event in session_stream:
+                yield event
+        except GeneratorExit:
+            await session_stream.aclose()
+            raise
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not InterruptSessionRequest:
@@ -1097,6 +1481,12 @@ class CayuApp:
             yield first_terminal_event
             async for event in terminal_event_stream:
                 yield event
+        except GeneratorExit:
+            if terminal_event_stream is not None:
+                with contextlib.suppress(Exception):
+                    async for _ in terminal_event_stream:
+                        pass
+            raise
         except Exception:
             if terminal_event_stream is not None:
                 with contextlib.suppress(Exception):
@@ -1191,12 +1581,17 @@ class CayuApp:
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
             start_event_payload_extra["task_id"] = request.task_id
-        async for event in self._resume_session(
+        session_stream = self._resume_session(
             request=resume_request,
             task_id=request.task_id,
             start_event_payload_extra=start_event_payload_extra,
-        ):
-            yield event
+        )
+        try:
+            async for event in session_stream:
+                yield event
+        except GeneratorExit:
+            await session_stream.aclose()
+            raise
 
     async def create_task(self, request: TaskCreate) -> Task:
         if type(request) is not TaskCreate:
@@ -1537,7 +1932,7 @@ class CayuApp:
         request: ResumeRequest,
         task_id: str | None,
         start_event_payload_extra: dict[str, Any],
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
@@ -1579,7 +1974,7 @@ class CayuApp:
             return
         messages = transcript + request.messages
 
-        async for event in self._run_session(
+        session_stream = self._run_session(
             session=session,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
@@ -1602,8 +1997,13 @@ class CayuApp:
                 "appended_messages": len(request.messages),
                 **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
             },
-        ):
-            yield event
+        )
+        try:
+            async for event in session_stream:
+                yield event
+        except GeneratorExit:
+            await session_stream.aclose()
+            raise
 
     async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
@@ -1731,15 +2131,22 @@ class CayuApp:
             to_status=SessionStatus.RUNNING,
         )
 
-        async for event in self._continue_tool_approval_resolution(
+        approval_stream = self._continue_tool_approval_resolution(
             request=request,
             session=session,
             pending_approval=pending_approval,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
-        ):
-            yield event
+        )
+        try:
+            async for event in approval_stream:
+                yield event
+        except GeneratorExit:
+            with contextlib.suppress(Exception):
+                await _close_async_iterator(approval_stream)
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
 
     async def _continue_tool_approval_resolution(
         self,
@@ -1755,6 +2162,7 @@ class CayuApp:
         environment_name = _environment_name(registered_environment)
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        run_stream: AsyncIterator[Event] | None = None
         try:
             transcript = await self.session_store.load_transcript(session.id)
             approval_events = await self.session_store.load_events(session.id)
@@ -2021,7 +2429,7 @@ class CayuApp:
                 )
             )
 
-            async for event in self._run_session(
+            run_stream = self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -2049,8 +2457,15 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
-            ):
+            )
+            async for event in run_stream:
                 yield event
+        except GeneratorExit:
+            if run_stream is not None:
+                with contextlib.suppress(Exception):
+                    await _close_async_iterator(run_stream)
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
         except Exception as exc:
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self.session_store.update_status(
@@ -2297,6 +2712,10 @@ class CayuApp:
                 allow_modification=False,
             ):
                 yield event
+        except GeneratorExit:
+            # Abandonment: finalize to INTERRUPTED (do NOT roll back to a live status).
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
         except Exception:
             await self.session_store.update_status(session.id, loaded_session.status)
             raise
@@ -2348,7 +2767,7 @@ class CayuApp:
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         provider = registered_provider.provider
         # Per-run thinking override (RunRequest/ResumeRequest) wins over the agent's
         # default (AgentSpec.thinking); the agent default applies on every path,
@@ -2395,6 +2814,8 @@ class CayuApp:
                 task_started=task_started,
                 task_finished=task_finished,
             )
+        active_budget_reservations: list[_BudgetStepReservation] = []
+        active_model_completed_event: Event | None = None
         try:
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
@@ -2476,61 +2897,47 @@ class CayuApp:
                 session.id,
                 messages_to_append,
             )
+            limit_gate = _LimitGate(
+                self,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                limits=limits,
+                budget_limits=budget_limits,
+                run_started_at=run_started_at,
+                run_baseline=run_baseline,
+                budget_baseline_events=baseline_events,
+                budget_notify_events=request_budget_notify_events,
+            )
+            interrupt_guard = _InterruptGuard(
+                self,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            tool_round_runner = _ToolRoundRunner(
+                self,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                limit_gate=limit_gate,
+                interrupt_guard=interrupt_guard,
+                request_metadata=request_metadata,
+                task_id=task_id,
+                structured_output=structured_output,
+                thinking=effective_thinking,
+            )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
-                budget_decision, budget_events = await self._first_budget_decision(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                )
-                for event in budget_events:
+                async for event in limit_gate.evaluate_budget(messages=messages):
                     yield event
-                if budget_decision is not None:
-                    async for event in self._stop_session_for_budget_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        check=budget_decision,
-                        messages=messages,
-                        tool_calls=[],
-                        completed_tool_outcomes=[],
-                    ):
-                        yield event
+                if limit_gate.tripped:
                     return
-                (
-                    decision,
-                    usage_summary,
-                    cost_summary,
-                    budget_events,
-                ) = await self._first_limit_decision(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    limits=limits,
-                    budget_limits=budget_limits,
-                    run_started_at=run_started_at,
-                    run_baseline=run_baseline,
-                    budget_baseline_events=baseline_events,
-                    budget_notify_events=request_budget_notify_events,
-                )
-                for event in budget_events:
+                async for event in limit_gate.evaluate_limits(messages=messages):
                     yield event
-                if decision is not None:
-                    async for event in self._stop_session_for_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        decision=decision,
-                        usage_summary=usage_summary,
-                        cost_summary=cost_summary,
-                        messages=messages,
-                        tool_calls=[],
-                        completed_tool_outcomes=[],
-                    ):
-                        yield event
+                if limit_gate.tripped:
                     return
                 try:
                     (
@@ -2667,9 +3074,12 @@ class CayuApp:
                     registered_provider=registered_provider,
                     environment_name=environment_name,
                 )
+                active_budget_reservations = budget_reservations
+                active_model_completed_event = None
                 for event in reservation_events:
                     yield event
                 if reservation_failure is not None:
+                    active_budget_reservations = []
                     async for event in self._stop_session_for_budget_reservation_failed(
                         session=session,
                         registered_agent=registered_agent,
@@ -2707,6 +3117,7 @@ class CayuApp:
                         if event is not None:
                             if event.type == EventType.MODEL_COMPLETED:
                                 model_completed_event = event
+                                active_model_completed_event = event
                             yield event
                         if result is not None:
                             assistant_step_result = result
@@ -2752,6 +3163,8 @@ class CayuApp:
                         environment_name=environment_name,
                     ):
                         yield event
+                    active_budget_reservations = []
+                    active_model_completed_event = None
 
                 pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
@@ -2787,63 +3200,23 @@ class CayuApp:
                     pending_tool_round.round_id if pending_tool_round is not None else None
                 )
 
-                (
-                    decision,
-                    usage_summary,
-                    cost_summary,
-                    budget_events,
-                ) = await self._first_limit_decision(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    limits=limits,
-                    budget_limits=budget_limits,
-                    run_started_at=run_started_at,
-                    run_baseline=run_baseline,
-                    budget_baseline_events=baseline_events,
+                async for event in limit_gate.evaluate_limits(
+                    messages=messages,
+                    tool_calls=tool_calls,
                     pending_tool_calls=_user_tool_call_count(tool_calls),
-                    budget_notify_events=request_budget_notify_events,
-                )
-                for event in budget_events:
+                    tool_round_id=tool_round_id,
+                ):
                     yield event
-                if decision is not None:
-                    async for event in self._stop_session_for_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        decision=decision,
-                        usage_summary=usage_summary,
-                        cost_summary=cost_summary,
-                        messages=messages,
-                        tool_calls=tool_calls,
-                        completed_tool_outcomes=[],
-                        tool_round_id=tool_round_id,
-                    ):
-                        yield event
+                if limit_gate.tripped:
                     return
 
-                budget_decision, budget_events = await self._first_budget_decision(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                )
-                for event in budget_events:
+                async for event in limit_gate.evaluate_budget(
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_round_id=tool_round_id,
+                ):
                     yield event
-                if budget_decision is not None:
-                    async for event in self._stop_session_for_budget_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        check=budget_decision,
-                        messages=messages,
-                        tool_calls=tool_calls,
-                        completed_tool_outcomes=[],
-                        tool_round_id=tool_round_id,
-                    ):
-                        yield event
+                if limit_gate.tripped:
                     return
 
                 if (
@@ -3080,247 +3453,14 @@ class CayuApp:
                             )
                     break
 
-                tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-                try:
-                    await self._raise_if_session_interrupted(session.id)
-                    policy_plan = await self._policy_plan_for_tool_round(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_calls=tool_calls,
-                        request_metadata=request_metadata,
-                    )
-                    await self._raise_if_session_interrupted(session.id)
-                except _SessionInterruptedByRequest:
-                    async for event in self._close_interrupted_tool_round(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        messages=messages,
-                        tool_calls=tool_calls,
-                        tool_outcomes=tool_outcomes,
-                        tool_round_id=tool_round_id,
-                    ):
-                        yield event
-                    raise
-                except asyncio.CancelledError as exc:
-                    if await self._session_interrupt_requested(session.id):
-                        _clear_current_task_cancellation()
-                        async for event in self._close_interrupted_tool_round(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            messages=messages,
-                            tool_calls=tool_calls,
-                            tool_outcomes=tool_outcomes,
-                            tool_round_id=tool_round_id,
-                            cancellation_artifacts=_cancellation_artifacts(exc),
-                        ):
-                            yield event
-                    raise
-
-                (
-                    decision,
-                    usage_summary,
-                    cost_summary,
-                    budget_events,
-                ) = await self._first_limit_decision(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    limits=limits,
-                    budget_limits=budget_limits,
-                    run_started_at=run_started_at,
-                    run_baseline=run_baseline,
-                    budget_baseline_events=baseline_events,
-                    pending_tool_calls=len(tool_calls),
-                    budget_notify_events=request_budget_notify_events,
-                )
-                for event in budget_events:
+                async for event in tool_round_runner.run(
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_round_id=tool_round_id,
+                ):
                     yield event
-                if decision is not None:
-                    async for event in self._stop_session_for_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        decision=decision,
-                        usage_summary=usage_summary,
-                        cost_summary=cost_summary,
-                        messages=messages,
-                        tool_calls=tool_calls,
-                        completed_tool_outcomes=[],
-                        tool_round_id=tool_round_id,
-                    ):
-                        yield event
+                if tool_round_runner.stopped_for_limit:
                     return
-
-                if policy_plan.pending_approval is not None:
-                    approval_plan = policy_plan.pending_approval
-                    try:
-                        approval, checkpoint_event = await self._checkpoint_pending_tool_approval(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            tool_call=approval_plan.call,
-                            tool_calls=approval_plan.calls,
-                            policy_outcomes=approval_plan.policy_outcomes,
-                            task_id=task_id,
-                            policy_result=approval_plan.policy_result,
-                            structured_output=structured_output,
-                            thinking=effective_thinking,
-                        )
-                        yield await self._emit(checkpoint_event)
-                        yield await self._emit(
-                            Event(
-                                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                tool_name=approval.tool_name,
-                                payload={
-                                    "approval": approval.model_dump(mode="json"),
-                                },
-                            )
-                        )
-                    except _SessionInterruptedByRequest:
-                        await self._clear_pending_tool_approval_for_tool_round(
-                            session.id,
-                            tool_calls,
-                        )
-                        async for event in self._close_interrupted_tool_round(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            messages=messages,
-                            tool_calls=tool_calls,
-                            tool_outcomes=tool_outcomes,
-                            tool_round_id=tool_round_id,
-                        ):
-                            yield event
-                        raise
-                    except asyncio.CancelledError as exc:
-                        if await self._session_interrupt_requested(session.id):
-                            _clear_current_task_cancellation()
-                            await self._clear_pending_tool_approval_for_tool_round(
-                                session.id,
-                                tool_calls,
-                            )
-                            async for event in self._close_interrupted_tool_round(
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                messages=messages,
-                                tool_calls=tool_calls,
-                                tool_outcomes=tool_outcomes,
-                                tool_round_id=tool_round_id,
-                                cancellation_artifacts=_cancellation_artifacts(exc),
-                            ):
-                                yield event
-                        raise
-                    raise _SessionInterrupted(approval)
-
-                policy_results_by_id = {
-                    outcome.call.id: outcome.result for outcome in policy_plan.outcomes
-                }
-                try:
-                    for tool_call in tool_calls:
-                        await self._raise_if_session_interrupted(session.id)
-                        (
-                            decision,
-                            usage_summary,
-                            cost_summary,
-                            budget_events,
-                        ) = await self._first_limit_decision(
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            limits=limits,
-                            budget_limits=budget_limits,
-                            run_started_at=run_started_at,
-                            run_baseline=run_baseline,
-                            budget_baseline_events=baseline_events,
-                            pending_tool_calls=1,
-                            budget_notify_events=request_budget_notify_events,
-                        )
-                        for event in budget_events:
-                            yield event
-                        if decision is not None:
-                            async for event in self._stop_session_for_limit_reached(
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                environment_name=environment_name,
-                                decision=decision,
-                                usage_summary=usage_summary,
-                                cost_summary=cost_summary,
-                                messages=messages,
-                                tool_calls=tool_calls,
-                                completed_tool_outcomes=tool_outcomes,
-                                tool_round_id=tool_round_id,
-                            ):
-                                yield event
-                            return
-                        async for event, outcome in self._execute_tool_call(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            tool_call=tool_call,
-                            request_metadata=request_metadata,
-                            task_id=task_id,
-                            policy_result=policy_results_by_id.get(tool_call.id),
-                            tool_round_id=tool_round_id,
-                        ):
-                            yield event
-                            if outcome is not None:
-                                tool_outcomes.append(outcome)
-                        await self._raise_if_session_interrupted(session.id)
-                except _SessionInterruptedByRequest:
-                    async for event in self._close_interrupted_tool_round(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        messages=messages,
-                        tool_calls=tool_calls,
-                        tool_outcomes=tool_outcomes,
-                        tool_round_id=tool_round_id,
-                    ):
-                        yield event
-                    raise
-                except asyncio.CancelledError as exc:
-                    if await self._session_interrupt_requested(session.id):
-                        _clear_current_task_cancellation()
-                        async for event in self._close_interrupted_tool_round(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            messages=messages,
-                            tool_calls=tool_calls,
-                            tool_outcomes=tool_outcomes,
-                            tool_round_id=tool_round_id,
-                            cancellation_artifacts=_cancellation_artifacts(exc),
-                        ):
-                            yield event
-                    raise
-
-                tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
-                messages.extend(tool_result_messages)
-                cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
-                try:
-                    await self.session_store.append_transcript_messages_and_checkpoint(
-                        session.id,
-                        tool_result_messages,
-                        cleared_checkpoint,
-                    )
-                except asyncio.CancelledError:
-                    if await self._session_interrupt_requested(session.id):
-                        _clear_current_task_cancellation()
-                        await self.session_store.append_transcript_messages_and_checkpoint(
-                            session.id,
-                            tool_result_messages,
-                            cleared_checkpoint,
-                        )
-                    raise
             else:
                 raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
 
@@ -3396,6 +3536,26 @@ class CayuApp:
                 ):
                     yield event
                 return
+            raise
+        except GeneratorExit:
+            await self._settle_abandoned_budget_reservations(
+                active_budget_reservations,
+                model_completed_event=active_model_completed_event,
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+            )
+            # The consumer closed the event stream (client disconnect / abandoned
+            # async generator) while the session was still live. Finalize instead of
+            # stranding it in RUNNING; an async generator must not yield while
+            # handling GeneratorExit, so the terminal emission is drained, not
+            # streamed.
+            await self._finalize_abandoned_session_run(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+            )
             raise
         except Exception as exc:
             task_failure_error: Exception | None = None
@@ -4226,6 +4386,19 @@ class CayuApp:
                     yield await self._emit(event), None
                     continue
 
+                if stream_event.type == ModelStreamEventType.ERROR:
+                    overflow_error = _stream_error_context_overflow(
+                        stream_event.payload,
+                        fallback_provider=registered_provider.name,
+                    )
+                    if overflow_error is not None:
+                        # A provider flattened a context overflow into an error
+                        # event instead of raising it. Rehydrate the typed
+                        # exception so overflow recovery can shrink context and
+                        # retry instead of burning generic retries on a request
+                        # that can never fit.
+                        raise overflow_error
+
                 event = _model_stream_event_to_runtime_event(
                     stream_event,
                     session=session,
@@ -4647,6 +4820,43 @@ class CayuApp:
                     payload=budget_reconciliation_payload(reconciliation),
                 )
             )
+
+    async def _settle_abandoned_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        model_completed_event: Event | None,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> None:
+        if not reservations:
+            return
+        for reservation in reservations:
+            try:
+                if model_completed_event is not None:
+                    async for _ in self._reconcile_budget_reservations(
+                        [reservation],
+                        model_completed_event=model_completed_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    ):
+                        pass
+                    continue
+                async for _ in self._release_budget_reservations(
+                    [reservation],
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    reason="event stream closed",
+                ):
+                    pass
+            except Exception:
+                # GeneratorExit cleanup is best-effort and must not replace the
+                # caller's close with a new exception. Keep trying later
+                # reservations even if an earlier one was already settled.
+                continue
 
     async def _stop_session_for_limit_reached(
         self,
@@ -5834,6 +6044,118 @@ class CayuApp:
             events=tuple(events),
             message=message,
         )
+
+    async def _finalize_abandoned_session_run(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+    ) -> None:
+        """Finalize a session whose event-stream consumer went away mid-run.
+
+        Called while handling ``GeneratorExit``, so it must not yield: it transitions
+        the still-live session to INTERRUPTED and persists the terminal event (hook
+        events included) without streaming them. Best effort — a closing consumer
+        must never turn into a new exception.
+        """
+        try:
+            finalized = await self.session_store.transition_status(
+                session.id,
+                from_statuses={
+                    SessionStatus.PENDING,
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                },
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        except Exception:
+            # Already terminal (or gone): nothing to finalize.
+            return
+        with contextlib.suppress(Exception):
+            async for _ in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=finalized.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "reason": _ABANDONED_RUN_REASON,
+                        "abandoned": True,
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=finalized,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                pass
+
+    async def _finalize_abandoned_session_by_id(self, session_id: str) -> None:
+        """Finalize a session stranded in a live status by an abandoned stream.
+
+        Invoked from ``except GeneratorExit`` guards at entry points and pre-resolution
+        windows where the run-body finalizer (``_finalize_abandoned_session_run``) never
+        runs — e.g. a consumer that closes the stream during environment-factory
+        resolution or a tool-approval continuation. Idempotent and never raises: a
+        session already terminal (or gone) is a no-op. MUST NOT yield.
+        """
+        try:
+            session = await self.session_store.load(session_id)
+        except Exception:
+            return
+        if session is None or session.status not in {
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }:
+            return
+        try:
+            registered_agent = self._get_registered_agent(session.agent_name)
+        except Exception:
+            # Agent no longer registered: still finalize and persist the terminal
+            # event so later recovery/interrupt calls have a durable outcome.
+            with contextlib.suppress(Exception):
+                finalized = await self.session_store.transition_status(
+                    session.id,
+                    from_statuses={
+                        SessionStatus.PENDING,
+                        SessionStatus.RUNNING,
+                        SessionStatus.INTERRUPTING,
+                    },
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+                await self._emit(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=finalized.id,
+                        agent_name=finalized.agent_name,
+                        environment_name=finalized.environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "reason": _ABANDONED_RUN_REASON,
+                            "abandoned": True,
+                        },
+                    )
+                )
+            return
+        try:
+            registered_environment = self._get_registered_environment_for_session(
+                session.environment_name
+            )
+            environment_name = _environment_name(registered_environment)
+        except Exception:
+            registered_environment = None
+            environment_name = session.environment_name
+        with contextlib.suppress(Exception):
+            await self._finalize_abandoned_session_run(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+            )
 
     async def _handle_session_interrupted(
         self,
@@ -8954,9 +9276,7 @@ def _context_pressure_completed_payload(
         "estimated_structured_output_input_tokens": (
             estimate.estimated_structured_output_input_tokens
         ),
-        "estimated_request_options_input_tokens": (
-            estimate.estimated_request_options_input_tokens
-        ),
+        "estimated_request_options_input_tokens": (estimate.estimated_request_options_input_tokens),
         "estimated_request_overhead_input_tokens": (
             estimate.estimated_request_overhead_input_tokens
         ),
@@ -9189,6 +9509,46 @@ def _context_overflow_event_payload(
     if recovery_message_count is not None:
         payload["recovery_message_count"] = recovery_message_count
     return payload
+
+
+def _stream_error_context_overflow(
+    payload: dict[str, Any],
+    *,
+    fallback_provider: str,
+) -> ModelContextOverflowError | None:
+    """Rehydrate a typed overflow from an error stream event payload.
+
+    Providers must raise `ModelContextOverflowError` from `stream()`, but a
+    provider that flattens the overflow into `ModelStreamEvent.error(...)`
+    still carries the typed identity (`context_overflow` plus the structured
+    `provider_error_*` fields). Rebuilding the exception here routes such
+    events into context-overflow recovery instead of the generic retry path.
+    All fields are read defensively: the payload crosses a provider trust
+    boundary and must not be able to crash classification.
+    """
+    if payload.get("context_overflow") is not True:
+        return None
+    return ModelContextOverflowError(
+        _clean_payload_string(payload.get("error")) or "Model provider context overflow",
+        provider=_clean_payload_string(payload.get("provider")) or fallback_provider,
+        status_code=_payload_status_code(payload.get("status_code")),
+        error_type=_clean_payload_string(payload.get("provider_error_type")),
+        error_code=_clean_payload_string(payload.get("provider_error_code")),
+        request_id=_clean_payload_string(payload.get("request_id")),
+    )
+
+
+def _clean_payload_string(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
+
+
+def _payload_status_code(value: Any) -> int | None:
+    if type(value) is not int or value < 100:
+        return None
+    return value
 
 
 def _retry_attempt_payload(

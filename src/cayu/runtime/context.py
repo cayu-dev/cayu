@@ -167,9 +167,7 @@ def copy_context_pressure_estimate(
     if estimate is None:
         return None
     if type(estimate) is not ContextPressureEstimate:
-        raise TypeError(
-            "Context pressure estimate must be a ContextPressureEstimate instance."
-        )
+        raise TypeError("Context pressure estimate must be a ContextPressureEstimate instance.")
     return ContextPressureEstimate(**estimate.model_dump())
 
 
@@ -308,20 +306,10 @@ class ObservedDeltaContextEstimator:
             overhead.tools,
             chars_per_token=overhead.tool_schema_chars_per_token,
         )
-        structured_output_tokens = self._estimate_text(
-            overhead.structured_output_instruction or ""
-        )
+        structured_output_tokens = self._estimate_text(overhead.structured_output_instruction or "")
         request_options_tokens = self._estimate_request_options(overhead.request_options)
-        overhead_tokens = (
-            tool_schema_tokens
-            + structured_output_tokens
-            + request_options_tokens
-        )
-        total_tokens = (
-            message_tokens
-            + attachment_tokens
-            + overhead_tokens
-        )
+        overhead_tokens = tool_schema_tokens + structured_output_tokens + request_options_tokens
+        total_tokens = message_tokens + attachment_tokens + overhead_tokens
         return ContextPressureEstimate(
             method="local_full_request_estimate",
             observed_context_input_tokens=usage.last_input_tokens or 0,
@@ -379,20 +367,12 @@ class ObservedDeltaContextEstimator:
             overhead.tools,
             chars_per_token=overhead.tool_schema_chars_per_token,
         )
-        structured_output_tokens = self._estimate_text(
-            overhead.structured_output_instruction or ""
-        )
+        structured_output_tokens = self._estimate_text(overhead.structured_output_instruction or "")
         request_options_tokens = self._estimate_request_options(overhead.request_options)
-        overhead_tokens = (
-            tool_schema_tokens
-            + structured_output_tokens
-            + request_options_tokens
-        )
+        overhead_tokens = tool_schema_tokens + structured_output_tokens + request_options_tokens
         previous_overhead_tokens = usage.last_context_overhead_input_tokens
         overhead_delta_tokens = (
-            0
-            if previous_overhead_tokens is None
-            else overhead_tokens - previous_overhead_tokens
+            0 if previous_overhead_tokens is None else overhead_tokens - previous_overhead_tokens
         )
         estimated_context_input_tokens = max(
             0,
@@ -1178,9 +1158,8 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
             and self.min_total_tokens is None
         ):
             raise ValueError("At least one usage threshold must be configured.")
-        if (
-            self.trigger_estimated_context_tokens is not None
-            and isinstance(self.base_policy, RuntimeManagedContextPolicy)
+        if self.trigger_estimated_context_tokens is not None and isinstance(
+            self.base_policy, RuntimeManagedContextPolicy
         ):
             raise ValueError(
                 "Estimated context triggers require a side-effect-free base_policy. "
@@ -1287,16 +1266,13 @@ class UsageTriggeredContextPolicy(RuntimeManagedContextPolicy):
     def _actual_usage_is_triggered(self, request: ContextRequest) -> bool:
         usage = request.context_usage
         return (
-            (
-                self.min_input_tokens is not None
-                and usage.last_input_tokens is not None
-                and usage.last_input_tokens >= self.min_input_tokens
-            )
-            or (
-                self.min_total_tokens is not None
-                and usage.last_total_tokens is not None
-                and usage.last_total_tokens >= self.min_total_tokens
-            )
+            self.min_input_tokens is not None
+            and usage.last_input_tokens is not None
+            and usage.last_input_tokens >= self.min_input_tokens
+        ) or (
+            self.min_total_tokens is not None
+            and usage.last_total_tokens is not None
+            and usage.last_total_tokens >= self.min_total_tokens
         )
 
     async def _maybe_verify_estimate_with_provider_count(
@@ -1408,9 +1384,7 @@ def _usage_triggered_checkpoint_marker(
         "last_total_tokens": request.context_usage.last_total_tokens,
     }
     if policy.trigger_estimated_context_tokens is not None:
-        marker["trigger_estimated_context_tokens"] = (
-            policy.trigger_estimated_context_tokens
-        )
+        marker["trigger_estimated_context_tokens"] = policy.trigger_estimated_context_tokens
         marker["reserved_output_tokens"] = policy.reserved_output_tokens
         marker["last_transcript_cursor"] = request.context_usage.last_transcript_cursor
         if request.context_usage.input_pressure is not None:
@@ -1938,7 +1912,7 @@ def strip_old_file_attachments(
                 projected_parts.append(copy_message_part(part))
                 continue
             projected_parts.append(_strip_file_attachments_from_tool_result(part))
-        projected_messages.append(Message(role=message.role, content=projected_parts))
+        projected_messages.append(Message(role=message.role, content=tuple(projected_parts)))
 
     validate_context_messages(projected_messages)
     return [copy_message(message) for message in projected_messages]
