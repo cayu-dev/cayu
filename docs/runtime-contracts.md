@@ -636,13 +636,14 @@ deployment.
 `BudgetLimit` provides estimated-cost stop controls backed by a caller-supplied
 `PricingCatalog`. Request-scoped `BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
-`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `scope="session"` is
-the default: token, tool-call, and cost limits are session-cumulative because
-they are evaluated from durable `model.completed` and `tool.call.started`
-events. `scope="run"` evaluates token, tool-call, and cost limits against the
-delta since the current `run(...)`, `resume(...)`, dispatch, or
-approval-continuation invocation started. `max_elapsed_seconds` is always scoped
-to the current runtime invocation and resets for each call.
+`ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. For `RunLimits`,
+`scope="run"` is the default and evaluates token and tool-call limits against
+the delta since the current `run(...)`, `resume(...)`, dispatch, or
+approval-continuation invocation started. `scope="session"` makes token and
+tool-call limits session-cumulative by evaluating durable `model.completed` and
+`tool.call.started` events across the session. `max_elapsed_seconds` follows the
+same scope: `scope="run"` measures the current runtime invocation, while
+`scope="session"` measures session lifetime from durable session creation.
 
 Budget limits are estimates, not billing records. They use normalized usage
 metrics and the app's pricing table. By default, a request-scoped interrupt
@@ -1488,8 +1489,9 @@ injects bounded snippets as model-facing synthetic user context before the lates
 real user message. It does not append those snippets to the durable transcript.
 It emits `knowledge.search.started`, `knowledge.search.completed`,
 `knowledge.search.failed`, and `knowledge.injected` events for audit/debugging.
-Search failures are fail-open by default; configure `fail_open=False` when a
-missing knowledge lookup should fail the session before the provider request.
+Search failures fail closed by default; configure `fail_open=True` only when a
+missing knowledge lookup should continue to the provider request without
+injected knowledge.
 
 This slice does not add graph retrieval, remote source connectors, background
 remembering workers, or agent-led mutation of existing knowledge. Those layers

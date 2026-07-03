@@ -169,7 +169,12 @@ from cayu.providers import (
     OpenAIProvider,
     VertexProvider,
 )
-from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
+from cayu.proxies import (
+    AllowlistProxy,
+    CredentialProxy,
+    PassthroughProxy,
+    ProxyAuthorizationResult,
+)
 from cayu.runners import (
     DEFAULT_DOCKER_CWD,
     DEFAULT_DOCKER_IMAGE,
@@ -396,6 +401,7 @@ from cayu.storage import (
 from cayu.tools import (
     ArtifactReader,
     ArtifactReadRequest,
+    BackgroundSubagentTaskRegistry,
     ExecCommandTool,
     ImageArtifactReader,
     ListArtifactsTool,
@@ -416,6 +422,7 @@ from cayu.tools import (
     TextArtifactReader,
     WriteFileTool,
     default_artifact_readers,
+    default_background_subagent_registry,
 )
 from cayu.vaults import (
     REDACTED_SECRET,
@@ -427,11 +434,15 @@ from cayu.vaults import (
     SecretNotFound,
     SecretRedactor,
     SecretRef,
+    SecretResolver,
     StaticVault,
     Vault,
     VaultError,
     copy_resolved_secret,
     copy_secret_env,
+    resolve_secret_env,
+    secret_env_refs,
+    validate_secret_resolver,
 )
 from cayu.workspaces import (
     DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
@@ -503,6 +514,7 @@ __all__ = [
     "Agent",
     "AgentSpec",
     "AllowAllToolPolicy",
+    "AllowlistProxy",
     "AllowlistRule",
     "AnthropicProvider",
     "ArtifactCreated",
@@ -514,6 +526,7 @@ __all__ = [
     "ArtifactScope",
     "ArtifactStore",
     "ArtifactToWorkspaceResult",
+    "BackgroundSubagentTaskRegistry",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",
@@ -744,6 +757,7 @@ __all__ = [
     "SecretNotFound",
     "SecretRedactor",
     "SecretRef",
+    "SecretResolver",
     "SessionBudgetStore",
     "SessionCompleted",
     "SessionCostSummary",
@@ -852,6 +866,7 @@ __all__ = [
     "copy_workspace_file_to_artifact",
     "copy_workspace_snapshot",
     "default_artifact_readers",
+    "default_background_subagent_registry",
     "default_compaction_prompt",
     "estimate_causal_budget_cost",
     "estimate_model_request_context_pressure",
@@ -874,10 +889,12 @@ __all__ = [
     "normalize_usage_metrics",
     "render_comparison_html",
     "render_html_report",
+    "resolve_secret_env",
     "retry_decision",
     "run_eval_case",
     "run_eval_plan",
     "run_eval_suite",
+    "secret_env_refs",
     "session_usage_summary",
     "strip_old_file_attachments",
     "taint_labels_from_metadata",
@@ -885,6 +902,7 @@ __all__ = [
     "trim_context_messages",
     "trim_context_turns",
     "usage_metrics_from_event_payload",
+    "validate_secret_resolver",
     "write_eval_run_json",
     "write_html_report",
     "write_trajectory_json",
