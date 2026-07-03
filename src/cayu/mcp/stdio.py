@@ -535,7 +535,8 @@ class StdioMcpSession(McpSession):
     def _stderr_snapshot(self) -> str:
         if not self._stderr_tail:
             return ""
-        return bytes(self._stderr_tail).decode("utf-8", "replace").strip()
+        tail = bytes(self._stderr_tail).decode("utf-8", "replace").strip()
+        return self._secret_redactor.redact_text(tail)
 
     def _protocol_error(self, message: str) -> McpProtocolError:
         tail = self._stderr_snapshot()

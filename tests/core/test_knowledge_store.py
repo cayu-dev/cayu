@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -509,6 +510,31 @@ def test_in_memory_embedding_knowledge_store_min_score_uses_normalized_score() -
     assert result.hits[0].score_normalized == 1.0
 
 
+def test_in_memory_embedding_knowledge_store_query_min_score_overrides_store_default() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            semantic_min_score=1.0,
+        )
+        await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+        await store.put_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
+        return await store.search(
+            KnowledgeQuery(
+                text="auth broker",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                min_score=0.0,
+            )
+        )
+
+    result = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["matching", "orthogonal"]
+    assert result.hits[0].score_normalized == 1.0
+    assert result.hits[1].score_normalized == 0.5
+
+
 def test_in_memory_embedding_knowledge_store_refreshes_changed_chunks() -> None:
     async def run():
         provider = KeywordEmbeddingProvider()
@@ -680,7 +706,7 @@ def test_text_embedding_usage_rejects_bool_token_counts() -> None:
         TextEmbeddingResult(
             model="test-embedding",
             embeddings=[TextEmbedding(index=0, vector=[1.0])],
-            usage={"input_tokens": True},
+            usage=cast("Any", {"input_tokens": True}),
         )
 
 

@@ -1116,7 +1116,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    record = await self._active_record_for_update(cur, reservation_id)
+                    record = await self._releasable_record_for_update(cur, reservation_id)
+                    if record.status == "released":
+                        await conn.commit()
+                        return _reconciliation_from_record(record)
                     released = record.model_copy(
                         update={
                             "status": "released",
@@ -1296,6 +1299,18 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
+
+    async def _releasable_record_for_update(
+        self,
+        cur: Any,
+        reservation_id: str,
+    ) -> BudgetReservationRecord:
+        record = await self._load_record_for_update(cur, reservation_id)
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
     async def _reconcilable_record_for_update(
         self,
@@ -2492,6 +2507,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             query.limit,
             query.limit * _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
         )
+        semantic_min_score = self.semantic_min_score if query.min_score is None else query.min_score
         min_score_sql = (
             ""
             if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}
@@ -2500,7 +2516,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         min_score_params: list[object] = (
             []
             if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}
-            else [self.semantic_min_score]
+            else [semantic_min_score]
         )
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
@@ -2630,12 +2646,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
         ] = []
         byte_truncated = False
+        semantic_min_score = self.semantic_min_score if query.min_score is None else query.min_score
         for entry_id, chunk_id, normalized_score in rows:
             entry = await self._load_entry(cur, entry_id)
             chunk = await self._load_chunk(cur, chunk_id)
             if entry is None or chunk is None:
                 continue
-            semantic_matched = normalized_score >= self.semantic_min_score
+            semantic_matched = normalized_score >= semantic_min_score
             score = normalized_score if semantic_matched else 0.0
             reason = "semantic chunk match"
             preview_text = chunk.text
@@ -3155,24 +3172,50 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
+        blocked_statuses = [str(status) for status in DELETE_BLOCKED_SESSION_STATUSES]
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT status FROM cayu_sessions WHERE id = %s",
-                    (session_id,),
+                    """
+                    DELETE FROM cayu_sessions
+                    WHERE id = %s
+                      AND status <> ALL(%s)
+                    RETURNING id
+                    """,
+                    (session_id, blocked_statuses),
                 )
-                row = await cur.fetchone()
-                if row is None:
-                    return  # idempotent: deleting a missing session is a no-op
-                status = SessionStatus(row[0])
-                if status in DELETE_BLOCKED_SESSION_STATUSES:
-                    raise ValueError(
-                        f"Cannot delete a session while it is {status}; "
-                        f"interrupt it first: {session_id}"
+                deleted = await cur.fetchone()
+                if deleted is None:
+                    await cur.execute(
+                        "SELECT status FROM cayu_sessions WHERE id = %s",
+                        (session_id,),
                     )
+                    row = await cur.fetchone()
+                    if row is None:
+                        return  # idempotent: deleting a missing session is a no-op
+                    status = SessionStatus(row[0])
+                    if status in DELETE_BLOCKED_SESSION_STATUSES:
+                        raise ValueError(
+                            f"Cannot delete a session while it is {status}; "
+                            f"interrupt it first: {session_id}"
+                        )
+                    await cur.execute(
+                        """
+                        DELETE FROM cayu_sessions
+                        WHERE id = %s
+                          AND status <> ALL(%s)
+                        RETURNING id
+                        """,
+                        (session_id, blocked_statuses),
+                    )
+                    deleted = await cur.fetchone()
+                    if deleted is None:
+                        raise ValueError(
+                            f"Cannot delete a session while its status is changing; "
+                            f"retry later: {session_id}"
+                        )
                 # ON DELETE CASCADE removes events/labels/checkpoint/transcript; the
                 # self-FK is ON DELETE SET NULL so children keep loading with no parent.
-                await cur.execute("DELETE FROM cayu_sessions WHERE id = %s", (session_id,))
             await conn.commit()
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:

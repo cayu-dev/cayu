@@ -459,10 +459,17 @@ class ObservedDeltaContextEstimator:
             raise TypeError("message must be a Message.")
         total = 0
         for part in message.content:
-            if type(part) is not ToolResultPart:
+            if type(part) is FilePart:
+                attachments = (file_attachment_from_payload(part.attachment),)
+            elif type(part) is ToolResultPart:
+                attachments = tuple(
+                    attachment
+                    for payload in part.artifacts
+                    if (attachment := file_attachment_from_payload(payload)) is not None
+                )
+            else:
                 continue
-            for payload in part.artifacts:
-                attachment = file_attachment_from_payload(payload)
+            for attachment in attachments:
                 if attachment is None:
                     continue
                 total += self._estimate_file_attachment(

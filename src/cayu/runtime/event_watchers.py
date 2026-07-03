@@ -266,7 +266,6 @@ class EventWatcherStore(ABC):
         :meth:`list_dead_letters`) so it can be inspected and replayed later.
         """
 
-    @abstractmethod
     async def list_dead_letters(
         self,
         watcher_name: str,
@@ -279,8 +278,8 @@ class EventWatcherStore(ABC):
         Unresolved records are returned by default; pass ``include_resolved`` to
         also surface ones already marked handled via :meth:`resolve_dead_letter`.
         """
+        raise NotImplementedError("Event watcher dead letters are not supported by this store.")
 
-    @abstractmethod
     async def resolve_dead_letter(
         self,
         watcher_name: str,
@@ -290,6 +289,7 @@ class EventWatcherStore(ABC):
 
         Raises :class:`ValueError` when no such record exists for the watcher.
         """
+        raise NotImplementedError("Event watcher dead letters are not supported by this store.")
 
 
 class InMemoryEventWatcherStore(EventWatcherStore):

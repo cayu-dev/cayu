@@ -1183,6 +1183,11 @@ The first MCP implementation supports stdio servers:
 
 - `StdioMcpClient` launches an explicit argv command and speaks newline-delimited
   JSON-RPC over stdin/stdout.
+- `inherit_env=False` does not pass an empty environment. It copies only a small
+  launcher safelist (`PATH`, `HOME`, locale/temp/profile variables) so common
+  stdio launchers such as `npx` and `uvx` can start while host secrets remain
+  excluded by default. Use explicit `env` for non-secret configuration and
+  `secret_env` for vault-resolved child secrets.
 - stderr is treated as server logging, not protocol output.
 - The client rejects servers that negotiate an unsupported MCP protocol version.
 - Stdio writes are timeout-bounded separately from server response waits, so a

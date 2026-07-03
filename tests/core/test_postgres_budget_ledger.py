@@ -237,6 +237,31 @@ def test_postgres_budget_ledger_reaps_expired_active_reservations(postgres_dsn) 
     assert reconciled.actual_amount == Decimal("0.01")
 
 
+def test_postgres_budget_ledger_release_tolerates_ttl_reaped_reservation(postgres_dsn) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    async def ops(ledger):
+        limit = _reservation_budget_limit(max_cost="0.25")
+        orphaned = await _reserve(ledger, limit, "sess_orphaned")
+        assert orphaned.accepted is True
+        assert orphaned.record is not None
+        clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+        recovered = await _reserve(ledger, limit, "sess_recovered")
+        released = await ledger.release(
+            reservation_id=orphaned.record.reservation_id,
+            reason="cleanup",
+        )
+        return recovered, released
+
+    recovered, released = _run(postgres_dsn, ops, clock=clock, reservation_ttl_seconds=60)
+
+    assert recovered.accepted is True
+    assert released.status == "released"
+    assert released.actual_amount is None
+    assert released.released_amount == released.reserved_amount
+    assert released.reason == "Reservation expired: not reconciled within 60s."
+
+
 def test_postgres_budget_ledger_rejects_unknown_reservation(postgres_dsn) -> None:
     async def ops(ledger):
         with pytest.raises(KeyError, match="bres_missing"):

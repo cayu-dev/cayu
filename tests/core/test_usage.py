@@ -805,6 +805,43 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
     assert reconciled.actual_amount == Decimal("0.01")
 
 
+def test_in_memory_budget_ledger_release_tolerates_ttl_reaped_reservation() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        orphaned = await ledger.reserve(
+            limit=limit,
+            session_id="sess_orphaned",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert orphaned.accepted is True
+        assert orphaned.record is not None
+        clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+        recovered = await ledger.reserve(
+            limit=limit,
+            session_id="sess_recovered",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        released = await ledger.release(
+            reservation_id=orphaned.record.reservation_id,
+            reason="cleanup",
+        )
+        return recovered, released
+
+    recovered, released = asyncio.run(run())
+
+    assert recovered.accepted is True
+    assert released.status == "released"
+    assert released.actual_amount is None
+    assert released.released_amount == released.reserved_amount
+    assert released.reason == "Reservation expired: not reconciled within 60s."
+
+
 def test_in_memory_budget_ledger_reservation_ttl_none_disables_reap() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
@@ -884,6 +921,50 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
     assert recovered.actual == Decimal("0.22")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
+
+
+def test_sqlite_budget_ledger_release_tolerates_ttl_reaped_reservation(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            orphaned = await ledger.reserve(
+                limit=limit,
+                session_id="sess_orphaned",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert orphaned.accepted is True
+            assert orphaned.record is not None
+            clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+            recovered = await ledger.reserve(
+                limit=limit,
+                session_id="sess_recovered",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            released = await ledger.release(
+                reservation_id=orphaned.record.reservation_id,
+                reason="cleanup",
+            )
+            return recovered, released
+        finally:
+            await ledger.close()
+
+    recovered, released = asyncio.run(run())
+
+    assert recovered.accepted is True
+    assert released.status == "released"
+    assert released.actual_amount is None
+    assert released.released_amount == released.reserved_amount
+    assert released.reason == "Reservation expired: not reconciled within 60s."
 
 
 def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path) -> None:

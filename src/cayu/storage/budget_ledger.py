@@ -177,7 +177,10 @@ class SQLiteBudgetLedger(BudgetLedger):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                record = self._active_record_unlocked(reservation_id)
+                record = self._releasable_record_unlocked(reservation_id)
+                if record.status == "released":
+                    self._connection.commit()
+                    return _reconciliation_from_record(record)
                 released = record.model_copy(
                     update={
                         "status": "released",
@@ -353,6 +356,14 @@ class SQLiteBudgetLedger(BudgetLedger):
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
+
+    def _releasable_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._load_record_unlocked(reservation_id)
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
     def _reconcilable_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._load_record_unlocked(reservation_id)

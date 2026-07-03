@@ -18,7 +18,13 @@ from cayu import (
     SQLiteEventWatcherStore,
 )
 from cayu.runtime import InMemoryEventWatcherStore, InMemorySessionStore
-from cayu.runtime.sessions import EventRecord, SessionIdentity
+from cayu.runtime.event_watchers import (
+    EventWatcherClaim,
+    EventWatcherDelivery,
+    EventWatcherState,
+    EventWatcherStore,
+)
+from cayu.runtime.sessions import EventRecord, SessionIdentity, SessionStore
 from cayu.storage.migrations import SchemaMode
 
 _POSTGRES_TABLES = (
@@ -44,6 +50,51 @@ class CountingSessionStore(InMemorySessionStore):
         return await super().query_events(query)
 
 
+class LegacyEventWatcherStore(EventWatcherStore):
+    async def load_state(self, watcher_name: str) -> EventWatcherState:
+        raise NotImplementedError
+
+    async def claim_event(
+        self,
+        *,
+        watcher_name: str,
+        record: EventRecord,
+        lease_seconds: float,
+    ) -> EventWatcherClaim | None:
+        raise NotImplementedError
+
+    async def claim_next(
+        self,
+        *,
+        watcher_name: str,
+        record: EventRecord,
+        lease_seconds: float,
+    ) -> EventWatcherClaim | None:
+        raise NotImplementedError
+
+    async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
+        raise NotImplementedError
+
+    async def mark_failure(
+        self,
+        claim: EventWatcherClaim,
+        *,
+        error: str,
+        max_attempts: int,
+    ) -> EventWatcherDelivery:
+        raise NotImplementedError
+
+
+def test_event_watcher_store_dead_letter_methods_are_optional_for_existing_stores() -> None:
+    store = LegacyEventWatcherStore()
+
+    with pytest.raises(NotImplementedError, match="dead letters"):
+        asyncio.run(store.list_dead_letters("watcher"))
+
+    with pytest.raises(NotImplementedError, match="dead letters"):
+        asyncio.run(store.resolve_dead_letter("watcher", 1))
+
+
 async def _create_session(store: InMemorySessionStore, session_id: str = "sess_1") -> None:
     await store.create(
         RunRequest(
@@ -57,7 +108,7 @@ async def _create_session(store: InMemorySessionStore, session_id: str = "sess_1
 
 
 async def _append_event(
-    store: InMemorySessionStore,
+    store: SessionStore,
     *,
     session_id: str = "sess_1",
     event_type: EventType | str = EventType.BUDGET_LIMIT_REACHED,

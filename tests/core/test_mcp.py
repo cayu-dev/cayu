@@ -1335,6 +1335,16 @@ def test_collect_paginated_rejects_repeated_cursor() -> None:
         asyncio.run(collect_paginated(request, "tools/list", "tools"))
 
 
+def test_collect_paginated_treats_blank_cursor_as_end_of_list() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    async def request(method, params):
+        assert params == {}
+        return {"tools": [{"name": "only"}], "nextCursor": ""}
+
+    assert asyncio.run(collect_paginated(request, "tools/list", "tools")) == [{"name": "only"}]
+
+
 def test_collect_paginated_rejects_non_string_cursor() -> None:
     from cayu.mcp._jsonrpc import collect_paginated
 
@@ -1746,6 +1756,30 @@ def test_stdio_mcp_client_surfaces_stderr_tail_on_startup_crash() -> None:
 
     assert "closed stdout" in message
     assert "fatal: missing config value" in message
+
+
+def test_stdio_mcp_client_redacts_secret_stderr_tail_on_startup_crash() -> None:
+    async def run():
+        script = (
+            "import os, sys; "
+            "sys.stderr.write('fatal token=' + os.environ['TOKEN'] + '\\n'); "
+            "sys.stderr.flush()"
+        )
+        spec = McpServerSpec(
+            name="crash-secret-mcp",
+            command=[sys.executable, "-c", script],
+            secret_env={"TOKEN": SecretRef(name="token")},
+        )
+        vault = StaticVault({"token": "mcp-secret-token"})
+        with pytest.raises(McpProtocolError) as excinfo:
+            await StdioMcpClient(secret_resolver=vault).connect(spec)
+        return str(excinfo.value)
+
+    message = asyncio.run(run())
+
+    assert "closed stdout" in message
+    assert "mcp-secret-token" not in message
+    assert REDACTED_SECRET in message
 
 
 def test_stdio_mcp_session_fast_fails_after_reader_stops() -> None:

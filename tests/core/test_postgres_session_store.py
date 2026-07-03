@@ -1434,6 +1434,32 @@ def test_postgres_session_store_delete_rejects_in_flight_sessions(postgres_dsn):
     _run(postgres_dsn, ops)
 
 
+def test_postgres_session_store_delete_rechecks_status_after_waiting_for_row_lock(postgres_dsn):
+    async def ops(store):
+        import psycopg
+
+        session_id = "sess_delete_race"
+        await store.create(_lifecycle_request(session_id), identity=_identity())
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET status = %s WHERE id = %s",
+                    (str(SessionStatus.RUNNING), session_id),
+                )
+                delete_task = asyncio.create_task(store.delete_session(session_id))
+                await asyncio.sleep(0.1)
+                assert delete_task.done() is False
+            await conn.commit()
+
+        with pytest.raises(ValueError, match="interrupt it first"):
+            await asyncio.wait_for(delete_task, timeout=2.0)
+        loaded = await store.load(session_id)
+        assert loaded is not None
+        assert loaded.status == SessionStatus.RUNNING
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_session_store_delete_parent_nulls_child_parent(postgres_dsn):
     async def ops(store):
         await store.create(_lifecycle_request("sess_parent"), identity=_identity())

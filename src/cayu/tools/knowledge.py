@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -362,7 +363,11 @@ class SearchKnowledgeTool(Tool):
         filtered_hits = _filter_search_hits(result.hits, min_score=effective_min_score)
         hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in filtered_hits]
         filtered_count = len(result.hits) - len(filtered_hits)
-        min_score_applied = _min_score_applied(result.hits, min_score=effective_min_score)
+        min_score_applied = _min_score_applied(
+            result.hits,
+            min_score=effective_min_score,
+            store_can_apply=_search_can_apply_min_score(search_modes, result.query.mode),
+        )
         content = (
             "No knowledge results found."
             if not hits
@@ -519,12 +524,24 @@ class RememberKnowledgeTool(Tool):
             # path, which has its own failure handling.
             existing_entry = None
         if existing_entry is not None:
-            if existing_entry.source_hash == source_hash:
+            if existing_entry.source_hash == source_hash and _remember_existing_entry_is_live(
+                existing_entry
+            ):
                 return _remember_knowledge_already_known_result(existing_entry)
-            # A different payload occupies the content-derived id (for example a
-            # truncated-hash collision); write under a unique id instead of
-            # overwriting the existing entry.
-            entry_id = f"knowledge_{uuid4().hex}"
+            if existing_entry.source_hash == source_hash:
+                replacement_entry = await _remember_live_or_next_replacement_entry(
+                    store,
+                    entry_id=entry_id,
+                    source_hash=source_hash,
+                )
+                if isinstance(replacement_entry, KnowledgeEntry):
+                    return _remember_knowledge_already_known_result(replacement_entry)
+                entry_id = replacement_entry
+            elif existing_entry.source_hash != source_hash:
+                # A different payload occupies the content-derived id (for
+                # example a truncated-hash collision); write under a unique id
+                # instead of overwriting the existing entry.
+                entry_id = f"knowledge_{uuid4().hex}"
         try:
             request = KnowledgeIndexRequest(
                 text=text,
@@ -619,6 +636,38 @@ def _remember_knowledge_success_result(
         content=content,
         structured=structured,
     )
+
+
+def _remember_existing_entry_is_live(entry: KnowledgeEntry) -> bool:
+    if entry.status not in {KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING}:
+        return False
+    return entry.expires_at is None or entry.expires_at > datetime.now(UTC)
+
+
+async def _remember_live_or_next_replacement_entry(
+    store: Any,
+    *,
+    entry_id: str,
+    source_hash: str,
+) -> KnowledgeEntry | str:
+    for index in range(1, 11):
+        replacement_entry_id = _remember_stale_replacement_entry_id(entry_id, index)
+        try:
+            replacement_entry = await store.get_entry(replacement_entry_id)
+        except Exception:
+            return replacement_entry_id
+        if replacement_entry is None:
+            return replacement_entry_id
+        if replacement_entry.source_hash == source_hash and _remember_existing_entry_is_live(
+            replacement_entry
+        ):
+            return replacement_entry
+    return f"knowledge_{uuid4().hex}"
+
+
+def _remember_stale_replacement_entry_id(entry_id: str, index: int) -> str:
+    suffix = "_live" if index == 1 else f"_live_{index}"
+    return f"{entry_id}{suffix}"
 
 
 def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResult:
@@ -1399,16 +1448,23 @@ def _effective_search_min_score(
     return auto_min_score
 
 
-def _min_score_applied(hits: list[KnowledgeHit], *, min_score: float | None) -> bool | None:
+def _min_score_applied(
+    hits: list[KnowledgeHit],
+    *,
+    min_score: float | None,
+    store_can_apply: bool,
+) -> bool | None:
     """Whether the requested score threshold could actually take effect.
 
-    Returns None when no threshold was in force, False when a threshold was
-    requested but the store returned only unscored hits (so the threshold was
-    not applied), and True otherwise.
+    Returns None when no threshold was in force, True when the active store can
+    apply scored semantic thresholds, and False when a threshold was requested
+    against an unscored keyword-only result shape.
     """
 
     if min_score is None or min_score <= 0:
         return None
+    if store_can_apply:
+        return True
     return not hits or any(hit.score_normalized is not None for hit in hits)
 
 
@@ -1421,6 +1477,20 @@ def _filter_search_hits(hits: list[KnowledgeHit], *, min_score: float | None) ->
     return [
         hit for hit in hits if hit.score_normalized is None or hit.score_normalized >= min_score
     ]
+
+
+def _search_can_apply_min_score(
+    search_modes: list[str],
+    mode: KnowledgeSearchMode,
+) -> bool:
+    if mode is KnowledgeSearchMode.SEMANTIC:
+        return KnowledgeSearchMode.SEMANTIC.value in search_modes
+    if mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
+        return (
+            KnowledgeSearchMode.SEMANTIC.value in search_modes
+            or KnowledgeSearchMode.HYBRID.value in search_modes
+        )
+    return False
 
 
 def _remember_metadata(ctx: ToolContext) -> dict[str, Any]:

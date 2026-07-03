@@ -1140,6 +1140,11 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         semantic_query_text = _semantic_query_text(knowledge_query)
         await self._embed_entries(candidates)
         query_vector = await self._embed_query(knowledge_query, semantic_query_text)
+        semantic_min_score = (
+            self.semantic_min_score
+            if knowledge_query.min_score is None
+            else knowledge_query.min_score
+        )
         scored: list[
             tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
         ] = []
@@ -1148,7 +1153,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if semantic_score is None:
                 continue
             normalized_semantic = _normalize_cosine_similarity(semantic_score)
-            semantic_matched = normalized_semantic >= self.semantic_min_score
+            semantic_matched = normalized_semantic >= semantic_min_score
             score = normalized_semantic if semantic_matched else 0.0
             semantic_reason = (
                 "semantic chunk match" if chunk is not None else "semantic entry match"

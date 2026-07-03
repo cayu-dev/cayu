@@ -2264,6 +2264,15 @@ class CayuApp:
         registered_provider = self._get_registered_provider(source_session.provider_name)
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
+        if (
+            request.agent_name is not None
+            and registered_agent.spec.provider_name is not None
+            and registered_agent.spec.provider_name != source_session.provider_name
+        ):
+            raise ValueError(
+                "Forking a session to an agent with a different provider is not supported: "
+                f"{registered_agent.spec.provider_name} != {source_session.provider_name}"
+            )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
         )

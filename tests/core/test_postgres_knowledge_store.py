@@ -270,6 +270,35 @@ def test_postgres_embedding_knowledge_store_persists_semantic_vectors(postgres_d
     ]
 
 
+def test_postgres_embedding_knowledge_store_query_min_score_overrides_store_default(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        store.semantic_min_score = 1.0
+        try:
+            await store.put_entry(KnowledgeEntry(id="matching", text="GitHub credential proxy."))
+            await store.put_entry(KnowledgeEntry(id="orthogonal", text="Invoice payment policy."))
+            return await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    min_score=0.0,
+                )
+            )
+        finally:
+            await store.close()
+
+    result = asyncio.run(ops())
+
+    assert [hit.entry.id for hit in result.hits] == ["matching", "orthogonal"]
+    assert result.hits[0].score_normalized == 1.0
+    assert result.hits[1].score_normalized == 0.5
+
+
 def test_postgres_embedding_knowledge_store_skips_hnsw_for_large_dimensions(
     postgres_dsn: str,
 ) -> None:

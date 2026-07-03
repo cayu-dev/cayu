@@ -487,7 +487,7 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     safely re-run. (``executescript`` cannot be used here — it force-commits any
     open transaction — so revision DDL is executed statement-by-statement.)
     """
-    connection.execute("BEGIN")
+    connection.execute("BEGIN IMMEDIATE")
     try:
         yield
     except BaseException:

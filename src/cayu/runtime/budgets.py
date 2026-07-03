@@ -687,7 +687,9 @@ class InMemoryBudgetLedger(BudgetLedger):
         reason = require_clean_nonblank(reason, "reason")
         released_at = self._clock()
         async with self._lock:
-            record = self._active_record(reservation_id)
+            record = self._releasable_record(reservation_id)
+            if record.status == "released":
+                return _reconciliation_from_record(record)
             released = record.model_copy(
                 update={
                     "status": "released",
@@ -722,6 +724,16 @@ class InMemoryBudgetLedger(BudgetLedger):
         if record.status != "active":
             raise ValueError(f"Budget reservation is not active: {reservation_id}")
         return record
+
+    def _releasable_record(self, reservation_id: str) -> BudgetReservationRecord:
+        record = self._records.get(reservation_id)
+        if record is None:
+            raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if record.status == "active":
+            return record
+        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+            return record
+        raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
     def _reconcilable_record(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._records.get(reservation_id)

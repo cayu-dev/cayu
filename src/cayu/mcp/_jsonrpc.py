@@ -122,7 +122,12 @@ async def collect_paginated(
             return items
         if not isinstance(next_cursor, str):
             raise McpProtocolError(f"MCP {method} nextCursor must be a string.")
-        cursor = require_nonblank(next_cursor, "nextCursor")
+        if next_cursor == "":
+            return items
+        try:
+            cursor = require_nonblank(next_cursor, "nextCursor")
+        except ValueError as exc:
+            raise McpProtocolError(f"MCP {method} nextCursor must not be blank.") from exc
         if cursor in seen_cursors:
             raise McpProtocolError(
                 f"MCP {method} repeated pagination cursor {cursor!r}; refusing to loop."

@@ -723,7 +723,7 @@ def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> N
             KnowledgeIndexRequest(
                 entry_id="sendgrid_proxy",
                 namespace="ops",
-                text="For SendGrid, prefer a trusted credential proxy outside the sandbox.",
+                text="For SendGrid, prefer a trusted email delivery configuration.",
             )
         )
         return await SearchKnowledgeTool().run(
@@ -741,7 +741,7 @@ def test_search_knowledge_auto_filters_weak_semantic_neighbors_by_default() -> N
     assert result.structured is not None
     assert result.structured["query"]["mode"] == "auto"
     assert result.structured["min_score"] == 0.75
-    assert result.structured["filtered_hits"] == 1
+    assert result.structured["filtered_hits"] == 0
     assert [hit["entry_id"] for hit in result.structured["hits"]] == ["remote_git_credentials"]
     assert result.structured["hits"][0]["score_kind"] == "inmemory_hybrid"
 
@@ -824,6 +824,7 @@ def test_search_knowledge_auto_min_score_preserves_unscored_keyword_hits() -> No
     assert result.is_error is False
     assert result.structured is not None
     assert result.structured["min_score"] == 0.75
+    assert result.structured["min_score_applied"] is True
     hit_by_id = {hit["entry_id"]: hit for hit in result.structured["hits"]}
     assert set(hit_by_id) == {"remote_git_credentials", "runbook_keyword_hit"}
     assert hit_by_id["remote_git_credentials"]["score_normalized"] == 1.0
@@ -1581,6 +1582,68 @@ def test_remember_knowledge_dedupes_identical_text() -> None:
     assert second.structured["source_hash"] == first.structured["source_hash"]
     assert "already known" in second.content
     assert len(chunks) == 1
+
+
+def test_remember_knowledge_does_not_dedupe_archived_entry() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        ctx = ToolContext(session_id="session_1", knowledge_store=store)
+        args = {"text": "Always verify bank details before paying invoices."}
+        first = await RememberKnowledgeTool().run(ctx, args)
+        assert first.structured is not None
+        await store.update_entry_status(
+            first.structured["entry"]["entry_id"],
+            KnowledgeStatus.ARCHIVED,
+        )
+        second = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_2", knowledge_store=store),
+            args,
+        )
+        third = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_3", knowledge_store=store),
+            args,
+        )
+        assert second.structured is not None
+        await store.update_entry_status(
+            second.structured["entry"]["entry_id"],
+            KnowledgeStatus.ARCHIVED,
+        )
+        fourth = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_4", knowledge_store=store),
+            args,
+        )
+        fifth = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_5", knowledge_store=store),
+            args,
+        )
+        return first, second, third, fourth, fifth
+
+    first, second, third, fourth, fifth = asyncio.run(run())
+
+    assert first.is_error is False
+    assert second.is_error is False
+    assert third.is_error is False
+    assert fourth.is_error is False
+    assert fifth.is_error is False
+    assert first.structured is not None
+    assert second.structured is not None
+    assert third.structured is not None
+    assert fourth.structured is not None
+    assert fifth.structured is not None
+    assert second.structured["written"] is True
+    assert second.structured["already_known"] is False
+    assert second.structured["source_hash"] == first.structured["source_hash"]
+    assert second.structured["entry"]["entry_id"] != first.structured["entry"]["entry_id"]
+    assert third.structured["written"] is False
+    assert third.structured["already_known"] is True
+    assert third.structured["entry"]["entry_id"] == second.structured["entry"]["entry_id"]
+    assert fourth.structured["written"] is True
+    assert fourth.structured["already_known"] is False
+    assert fourth.structured["entry"]["entry_id"] != first.structured["entry"]["entry_id"]
+    assert fourth.structured["entry"]["entry_id"] != second.structured["entry"]["entry_id"]
+    assert fifth.structured["written"] is False
+    assert fifth.structured["already_known"] is True
+    assert fifth.structured["entry"]["entry_id"] == fourth.structured["entry"]["entry_id"]
 
 
 def test_remember_knowledge_distinct_kinds_are_not_deduped() -> None:

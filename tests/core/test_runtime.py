@@ -6734,6 +6734,49 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     ]
 
 
+def test_cayu_app_rejects_fork_to_agent_with_different_provider():
+    class OtherProvider(FakeProvider):
+        name = "other"
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("first answer"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_provider(OtherProvider([]))
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(AgentSpec(name="other-agent", model="other-model", provider_name="other"))
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_fork_provider_source",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="different provider"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_fork_provider_source",
+                    session_id="sess_fork_provider_child",
+                    agent_name="other-agent",
+                ),
+            )
+        )
+
+    assert asyncio.run(store.load("sess_fork_provider_child")) is None
+
+
 def test_session_query_validates_label_selector_requirements():
     query = SessionQuery(
         label_selectors=[
@@ -15271,6 +15314,23 @@ def test_observed_delta_context_estimator_counts_only_overhead_delta_after_ancho
 
 def test_observed_delta_context_estimator_uses_provider_specific_image_floor():
     estimator = ObservedDeltaContextEstimator(chars_per_token=5)
+    from cayu.core.messages import FilePart
+
+    user_image_message = Message(
+        role="user",
+        content=[
+            TextPart(text="look"),
+            FilePart(
+                attachment=file_attachment(
+                    artifact_id="img_user",
+                    kind="image",
+                    filename="user.png",
+                    content_type="image/png",
+                    size_bytes=68,
+                )
+            ),
+        ],
+    )
     image_message = Message.tool_result(
         tool_call_id="call_image",
         tool_name="image_tool",
@@ -15302,12 +15362,12 @@ def test_observed_delta_context_estimator_uses_provider_specific_image_floor():
 
     generic_tokens = estimator.estimate_full_request(
         usage=ContextUsageState(),
-        messages=[image_message, document_message],
+        messages=[user_image_message, image_message, document_message],
         overhead=ContextPressureOverhead(image_min_tokens=32),
     )
     anthropic_tokens = estimator.estimate_full_request(
         usage=ContextUsageState(),
-        messages=[image_message, document_message],
+        messages=[user_image_message, image_message, document_message],
         overhead=ContextPressureOverhead(
             image_min_tokens=100,
             document_min_tokens=1800,
@@ -15315,7 +15375,7 @@ def test_observed_delta_context_estimator_uses_provider_specific_image_floor():
     )
 
     assert generic_tokens.estimated_attachment_input_tokens < 200
-    assert anthropic_tokens.estimated_attachment_input_tokens >= 1900
+    assert anthropic_tokens.estimated_attachment_input_tokens >= 2000
     assert (
         anthropic_tokens.estimated_attachment_input_tokens
         > generic_tokens.estimated_attachment_input_tokens
