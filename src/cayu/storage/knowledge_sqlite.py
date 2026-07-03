@@ -75,7 +75,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     or not existing_chunks
                     or _has_only_default_chunk(existing_entry, existing_chunks)
                 ):
+                    # `_replace_chunks_unlocked` rebuilds the FTS rows itself, so the
+                    # single rebuild below covers the untouched-chunks branch only.
                     self._replace_chunks_unlocked(entry.id, [_default_chunk_for_entry(entry)])
+                else:
+                    self._refresh_entry_fts_unlocked(entry.id)
                 self._connection.commit()
                 return copy_knowledge_entry(entry)
             except Exception:
@@ -102,7 +106,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
             updated_at = max(datetime.now(UTC), entry.created_at, entry.updated_at)
             with self._connection:
-                self._connection.execute(
+                cursor = self._connection.execute(
                     """
                     UPDATE cayu_knowledge_entries
                     SET status = ?, updated_at = ?
@@ -114,6 +118,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         clean_id,
                     ),
                 )
+            # Guard the check-then-write: a concurrent hard delete between the load
+            # above and this UPDATE leaves nothing to update, so surface the removal
+            # instead of silently reloading a missing row.
+            if cursor.rowcount != 1:
+                raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
             loaded = self._load_entry_unlocked(clean_id)
             if loaded is None:
                 raise KeyError(f"Knowledge entry {clean_id!r} does not exist.")
@@ -333,10 +342,9 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 """,
                 [*params, knowledge_query.limit],
             ).fetchall()
+            entry_map = self._load_entries_unlocked([str(row["id"]) for row in rows])
             entries = [
-                entry
-                for row in rows
-                if (entry := self._load_entry_unlocked(str(row["id"]))) is not None
+                entry for row in rows if (entry := entry_map.get(str(row["id"]))) is not None
             ]
             facets, facets_truncated = self._list_facets_unlocked(
                 knowledge_query,
@@ -435,6 +443,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         query: KnowledgeQuery,
         terms: list[str],
     ) -> tuple[list[KnowledgeHit], bool]:
+        entries = self._load_entries_unlocked([str(row["entry_id"]) for row in rows])
+        chunks = self._load_chunks_by_ids_unlocked([str(row["chunk_id"]) for row in rows])
         hits: list[KnowledgeHit] = []
         remaining = query.max_bytes
         truncated = False
@@ -442,8 +452,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             if remaining <= 0:
                 truncated = True
                 break
-            entry = self._load_entry_unlocked(row["entry_id"])
-            chunk = self._load_chunk_unlocked(row["chunk_id"])
+            entry = entries.get(str(row["entry_id"]))
+            chunk = chunks.get(str(row["chunk_id"]))
             if entry is None or chunk is None:
                 continue
             reason, preview_text = _preview_for_match(entry, chunk, terms)
@@ -486,6 +496,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entries: list[KnowledgeEntry],
         query: KnowledgeListQuery,
     ) -> tuple[list[KnowledgeListItem], bool]:
+        chunk_counts = self._count_chunks_by_entry_unlocked([entry.id for entry in entries])
         items: list[KnowledgeListItem] = []
         remaining = query.max_bytes
         truncated = False
@@ -506,7 +517,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             items.append(
                 KnowledgeListItem(
                     entry=entry,
-                    chunk_count=len(self._load_chunks_unlocked(entry.id)),
+                    chunk_count=chunk_counts.get(entry.id, 0),
                     text_preview=preview,
                 )
             )
@@ -591,7 +602,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             _entry_row_values(entry),
         )
         self._replace_entry_lists_unlocked(entry)
-        self._refresh_entry_fts_unlocked(entry.id)
 
     def _replace_entry_lists_unlocked(self, entry: KnowledgeEntry) -> None:
         for table in (
@@ -690,15 +700,6 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             impact_targets=self._load_impact_targets_unlocked(entry_id),
         )
 
-    def _load_chunk_unlocked(self, chunk_id: str) -> KnowledgeChunk | None:
-        row = self._connection.execute(
-            "SELECT * FROM cayu_knowledge_chunks WHERE id = ?",
-            (chunk_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return _chunk_from_row(row)
-
     def _load_chunks_unlocked(self, entry_id: str) -> list[KnowledgeChunk]:
         rows = self._connection.execute(
             """
@@ -710,6 +711,118 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             (entry_id,),
         ).fetchall()
         return [_chunk_from_row(row) for row in rows]
+
+    def _load_entries_unlocked(self, entry_ids: list[str]) -> dict[str, KnowledgeEntry]:
+        unique_ids = list(dict.fromkeys(entry_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = self._connection.execute(
+            f"SELECT * FROM cayu_knowledge_entries WHERE id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+        labels = self._load_labels_for_entries_unlocked(unique_ids)
+        aspects = self._load_aspects_for_entries_unlocked(unique_ids)
+        impact_targets = self._load_impact_targets_for_entries_unlocked(unique_ids)
+        return {
+            row["id"]: _entry_from_row(
+                row,
+                labels=labels.get(row["id"], {}),
+                aspects=aspects.get(row["id"], []),
+                impact_targets=impact_targets.get(row["id"], []),
+            )
+            for row in rows
+        }
+
+    def _load_chunks_by_ids_unlocked(self, chunk_ids: list[str]) -> dict[str, KnowledgeChunk]:
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = self._connection.execute(
+            f"SELECT * FROM cayu_knowledge_chunks WHERE id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+        return {row["id"]: _chunk_from_row(row) for row in rows}
+
+    def _count_chunks_by_entry_unlocked(self, entry_ids: list[str]) -> dict[str, int]:
+        unique_ids = list(dict.fromkeys(entry_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT entry_id, COUNT(*) AS chunk_count
+            FROM cayu_knowledge_chunks
+            WHERE entry_id IN ({placeholders})
+            GROUP BY entry_id
+            """,
+            unique_ids,
+        ).fetchall()
+        return {row["entry_id"]: int(row["chunk_count"]) for row in rows}
+
+    def _load_labels_for_entries_unlocked(
+        self,
+        entry_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        if not entry_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in entry_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT entry_id, key, value
+            FROM cayu_knowledge_labels
+            WHERE entry_id IN ({placeholders})
+            ORDER BY entry_id ASC, key ASC
+            """,
+            entry_ids,
+        ).fetchall()
+        result: dict[str, dict[str, str]] = {}
+        for row in rows:
+            result.setdefault(row["entry_id"], {})[row["key"]] = row["value"]
+        return result
+
+    def _load_aspects_for_entries_unlocked(
+        self,
+        entry_ids: list[str],
+    ) -> dict[str, list[str]]:
+        if not entry_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in entry_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT entry_id, aspect
+            FROM cayu_knowledge_aspects
+            WHERE entry_id IN ({placeholders})
+            ORDER BY entry_id ASC, aspect ASC
+            """,
+            entry_ids,
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["entry_id"], []).append(row["aspect"])
+        return result
+
+    def _load_impact_targets_for_entries_unlocked(
+        self,
+        entry_ids: list[str],
+    ) -> dict[str, list[str]]:
+        if not entry_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in entry_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT entry_id, impact_target
+            FROM cayu_knowledge_impact_targets
+            WHERE entry_id IN ({placeholders})
+            ORDER BY entry_id ASC, impact_target ASC
+            """,
+            entry_ids,
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["entry_id"], []).append(row["impact_target"])
+        return result
 
     def _load_labels_unlocked(self, entry_id: str) -> dict[str, str]:
         rows = self._connection.execute(

@@ -688,8 +688,24 @@ def _generated_entry_id(request: KnowledgeIndexRequest, source_hash: str) -> str
                 request.source_id or "",
             ]
         )
-    else:
-        basis = "\0".join([request.namespace, request.kind, source_hash])
+        return f"knowledge_{sha256(basis.encode('utf-8')).hexdigest()[:32]}"
+    return content_knowledge_entry_id(
+        namespace=request.namespace,
+        kind=request.kind,
+        source_hash=source_hash,
+    )
+
+
+def knowledge_source_hash(text: str) -> str:
+    """Return the canonical source hash recorded for indexed knowledge text."""
+
+    return _hash_text(text)
+
+
+def content_knowledge_entry_id(*, namespace: str, kind: str, source_hash: str) -> str:
+    """Return the deterministic entry id derived from knowledge content."""
+
+    basis = "\0".join([namespace, kind, source_hash])
     return f"knowledge_{sha256(basis.encode('utf-8')).hexdigest()[:32]}"
 
 

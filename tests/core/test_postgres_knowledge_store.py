@@ -388,28 +388,14 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
         provider = KeywordEmbeddingProvider()
         store = _new_embedding_store(postgres_dsn, provider)
         try:
-            before = await store.search(
-                KnowledgeQuery(
-                    text="auth broker",
-                    namespace="ops",
-                    labels={"project": "cayu"},
-                    mode=KnowledgeSearchMode.SEMANTIC,
-                )
-            )
+            # Explicit bounded backfill embeds the missing chunks one page at a
+            # time; searches are exercised separately (they now lazily backfill).
             first_backfill = await store.backfill_embeddings(
                 KnowledgeListQuery(
                     namespace="ops",
                     labels={"project": "cayu"},
                 ),
                 limit=1,
-            )
-            after = await store.search(
-                KnowledgeQuery(
-                    text="auth broker",
-                    namespace="ops",
-                    labels={"project": "cayu"},
-                    mode=KnowledgeSearchMode.SEMANTIC,
-                )
             )
             second_backfill = await store.backfill_embeddings(
                 KnowledgeListQuery(
@@ -436,25 +422,18 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
         finally:
             await store.close()
         return (
-            before,
             first_backfill,
-            after,
             second_backfill,
             third_backfill,
             refresh,
             provider.calls,
         )
 
-    before, first_backfill, after, second_backfill, third_backfill, refresh, calls = asyncio.run(
-        ops()
-    )
+    first_backfill, second_backfill, third_backfill, refresh, calls = asyncio.run(ops())
 
-    assert before.hits == []
     assert first_backfill.scanned_chunks == 1
     assert first_backfill.embedded_chunks == 1
     assert first_backfill.skipped_current_chunks == 0
-    assert len(after.hits) == 1
-    assert after.hits[0].entry.id in {"git_policy", "invoice_policy"}
     assert second_backfill.scanned_chunks == 1
     assert second_backfill.embedded_chunks == 1
     assert second_backfill.skipped_current_chunks == 0
@@ -463,20 +442,115 @@ def test_postgres_embedding_knowledge_store_backfills_existing_chunks(
     assert third_backfill.skipped_current_chunks == 0
     assert refresh.scanned_chunks == 2
     assert refresh.embedded_chunks == 2
-    embed_calls = [call for call in calls if call != ["auth broker"]]
-    assert len(embed_calls) == 3
-    assert sorted(embed_calls[:2]) == sorted(
-        [
-            ["GitHub token pushes should use the broker."],
-            ["Use a credential broker for GitHub auth from remote sandboxes."],
-        ]
-    )
-    assert sorted(embed_calls[2]) == sorted(
-        [
-            "GitHub token pushes should use the broker.",
-            "Use a credential broker for GitHub auth from remote sandboxes.",
-        ]
-    )
+    cayu_texts = {
+        "GitHub token pushes should use the broker.",
+        "Use a credential broker for GitHub auth from remote sandboxes.",
+    }
+    single_calls = sorted(tuple(call) for call in calls if len(call) == 1)
+    assert single_calls == sorted((text,) for text in cayu_texts)
+    refresh_calls = [call for call in calls if len(call) == 2]
+    assert len(refresh_calls) == 1
+    assert set(refresh_calls[0]) == cayu_texts
+
+
+class FlakyEmbeddingProvider(TextEmbeddingProvider):
+    """Keyword provider that can be toggled to fail, simulating an outage."""
+
+    name = "flaky-test"
+
+    def __init__(self) -> None:
+        self.fail = False
+        self.calls: list[list[str]] = []
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        if self.fail:
+            raise RuntimeError("embedding provider is unavailable")
+        self.calls.append(list(request.texts))
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def test_postgres_embedding_store_flags_and_continues_then_lazily_backfills(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = FlakyEmbeddingProvider()
+        from cayu import PostgresEmbeddingKnowledgeStore
+
+        store = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.70,
+        )
+        try:
+            # Provider is down while the durable write happens: the entry must be
+            # stored and returned even though embedding fails (flag-and-continue).
+            provider.fail = True
+            stored = await store.put_entry(
+                KnowledgeEntry(
+                    id="git_policy",
+                    text="Use a credential broker for GitHub auth from remote sandboxes.",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    kind="procedure",
+                )
+            )
+            loaded = await store.get_entry("git_policy")
+            keyword_hit = await store.search(
+                KnowledgeQuery(
+                    text="broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.KEYWORD,
+                )
+            )
+            embedded_calls_during_outage = list(provider.calls)
+
+            # Provider recovers: a semantic search lazily backfills the missing
+            # embedding and then finds the previously-invisible entry.
+            provider.fail = False
+            semantic_hit = await store.search(
+                KnowledgeQuery(
+                    text="auth broker",
+                    namespace="ops",
+                    labels={"project": "cayu"},
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+        finally:
+            await store.close()
+        return (
+            stored,
+            loaded,
+            keyword_hit,
+            embedded_calls_during_outage,
+            semantic_hit,
+        )
+
+    stored, loaded, keyword_hit, outage_calls, semantic_hit = asyncio.run(ops())
+
+    # The write succeeded and returned the entry despite the embedding failure.
+    assert stored.id == "git_policy"
+    assert loaded is not None
+    # No embeddings were persisted during the outage.
+    assert outage_calls == []
+    # Keyword search still surfaces the durable entry with no embeddings present.
+    assert [hit.entry.id for hit in keyword_hit.hits] == ["git_policy"]
+    # After recovery the semantic search lazily backfilled and now finds it.
+    assert [hit.entry.id for hit in semantic_hit.hits] == ["git_policy"]
+    assert semantic_hit.hits[0].score_kind == "postgres_semantic"
 
 
 def test_postgres_knowledge_store_defaults_hide_inactive_and_expired(
@@ -1062,3 +1136,55 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
     assert revisions[-1] == (LATEST_REVISION, MIN_SUPPORTED_REVISION)
     assert knowledge_table == "cayu_knowledge_entries"
     assert chunks_table == "cayu_knowledge_chunks"
+
+
+def test_postgres_knowledge_store_batches_multi_entry_hit_hydration(postgres_dsn: str) -> None:
+    async def ops(store):
+        for index in range(3):
+            await store.put_entry(
+                KnowledgeEntry(
+                    id=f"entry_{index}",
+                    text=f"Shared deployment warning number {index}.",
+                    labels={"project": f"proj_{index}", "shared": "yes"},
+                    aspects=[f"aspect_{index}"],
+                    impact_targets=[f"target_{index}"],
+                )
+            )
+        return await store.search(KnowledgeQuery(text="deployment warning", limit=10))
+
+    result = _run(postgres_dsn, ops)
+
+    # Batched hydration must keep per-entry label/aspect/impact lists grouped by
+    # entry rather than cross-contaminating across hits.
+    by_entry = {hit.entry.id: hit for hit in result.hits}
+    assert set(by_entry) == {"entry_0", "entry_1", "entry_2"}
+    for index in range(3):
+        hit = by_entry[f"entry_{index}"]
+        assert hit.entry.labels == {"project": f"proj_{index}", "shared": "yes"}
+        assert hit.entry.aspects == [f"aspect_{index}"]
+        assert hit.entry.impact_targets == [f"target_{index}"]
+        assert hit.chunk is not None
+        assert hit.chunk.entry_id == f"entry_{index}"
+
+
+def test_postgres_knowledge_store_list_reports_multi_chunk_counts(postgres_dsn: str) -> None:
+    async def ops(store):
+        await store.put_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="multi", text="Multi chunk entry."),
+            [
+                KnowledgeChunk(
+                    id=f"multi:{index}",
+                    entry_id="multi",
+                    chunk_index=index,
+                    text=f"Body part {index}.",
+                )
+                for index in range(3)
+            ],
+        )
+        return await store.list_entries(KnowledgeListQuery(limit=10))
+
+    result = _run(postgres_dsn, ops)
+
+    counts = {item.entry.id: item.chunk_count for item in result.entries}
+    assert counts == {"single": 1, "multi": 3}

@@ -206,6 +206,23 @@ def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> No
     assert active.status is KnowledgeStatus.ACTIVE
 
 
+def test_sqlite_knowledge_store_update_entry_status_guards_concurrent_delete(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        # Simulate the check-then-write race: the entry is seen by the load but is
+        # gone by the time the UPDATE runs (e.g. a concurrent hard delete). The
+        # in-statement rowcount guard must surface this as a missing entry rather
+        # than silently succeeding.
+        stale = KnowledgeEntry(id="ghost", text="already deleted", status=KnowledgeStatus.PENDING)
+        store._load_entry_unlocked = lambda entry_id: stale  # type: ignore[assignment]
+        with pytest.raises(KeyError, match="ghost"):
+            await store.update_entry_status("ghost", KnowledgeStatus.ARCHIVED)
+        await _close(store)
+
+    asyncio.run(run())
+
+
 def test_sqlite_knowledge_store_preserves_custom_chunks_on_entry_update(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
 
@@ -611,6 +628,99 @@ def test_sqlite_knowledge_store_rejects_unsupported_search_modes(tmp_path) -> No
         await _close(store)
 
     asyncio.run(run())
+
+
+def test_sqlite_knowledge_store_batches_multi_entry_hit_hydration(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        for index in range(3):
+            await store.put_entry(
+                KnowledgeEntry(
+                    id=f"entry_{index}",
+                    text=f"Shared deployment warning number {index}.",
+                    labels={"project": f"proj_{index}", "shared": "yes"},
+                    aspects=[f"aspect_{index}"],
+                    impact_targets=[f"target_{index}"],
+                )
+            )
+        result = await store.search(KnowledgeQuery(text="deployment warning", limit=10))
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    # Every hit hydrates through the batched loaders, so per-entry label/aspect/
+    # impact-target lists must stay correctly grouped by entry (not cross-contaminated).
+    by_entry = {hit.entry.id: hit for hit in result.hits}
+    assert set(by_entry) == {"entry_0", "entry_1", "entry_2"}
+    for index in range(3):
+        hit = by_entry[f"entry_{index}"]
+        assert hit.entry.labels == {"project": f"proj_{index}", "shared": "yes"}
+        assert hit.entry.aspects == [f"aspect_{index}"]
+        assert hit.entry.impact_targets == [f"target_{index}"]
+        assert hit.chunk is not None
+        assert hit.chunk.entry_id == f"entry_{index}"
+
+
+def test_sqlite_knowledge_store_list_reports_multi_chunk_counts(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(KnowledgeEntry(id="single", text="Single chunk entry."))
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="multi", text="Multi chunk entry."),
+            [
+                KnowledgeChunk(
+                    id=f"multi:{index}",
+                    entry_id="multi",
+                    chunk_index=index,
+                    text=f"Body part {index}.",
+                )
+                for index in range(3)
+            ],
+        )
+        result = await store.list_entries(KnowledgeListQuery(limit=10))
+        await _close(store)
+        return result
+
+    result = asyncio.run(run())
+
+    counts = {item.entry.id: item.chunk_count for item in result.entries}
+    assert counts == {"single": 1, "multi": 3}
+
+
+def test_sqlite_knowledge_store_search_survives_entry_text_only_update(tmp_path) -> None:
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        # Custom chunk whose body differs from the entry text drives put_entry down
+        # the untouched-chunks branch, which now refreshes the FTS rows exactly once.
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="doc", title="Original title", text="Original entry summary."),
+            [
+                KnowledgeChunk(
+                    id="doc:0",
+                    entry_id="doc",
+                    chunk_index=0,
+                    text="Unrelated chunk body.",
+                )
+            ],
+        )
+        await store.put_entry(
+            KnowledgeEntry(id="doc", title="Revised heading", text="Revised entry summary.")
+        )
+        by_title = await store.search(KnowledgeQuery(text="revised heading"))
+        by_text = await store.search(KnowledgeQuery(text="revised summary"))
+        stale = await store.search(KnowledgeQuery(text="original title"))
+        await _close(store)
+        return by_title, by_text, stale
+
+    by_title, by_text, stale = asyncio.run(run())
+
+    assert [hit.entry.id for hit in by_title.hits] == ["doc"]
+    assert [hit.entry.id for hit in by_text.hits] == ["doc"]
+    assert stale.hits == []
 
 
 def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_path) -> None:

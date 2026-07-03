@@ -1406,3 +1406,198 @@ def test_read_knowledge_returns_tool_error_for_invalid_window() -> None:
     assert result.is_error is True
     assert result.structured == {"error": "invalid_arguments"}
     assert "around" in result.content
+
+
+class ReadOnlyKnowledgeStore:
+    """Minimal reader that only exposes the read-path store methods."""
+
+    def __init__(self) -> None:
+        self._store = InMemoryKnowledgeStore()
+
+    async def index(self, request: KnowledgeIndexRequest) -> None:
+        await KnowledgeIndexer(self._store).index_text(request)
+
+    async def search(self, query: KnowledgeQuery):
+        return await self._store.search(query)
+
+    async def list_entries(self, query):
+        return await self._store.list_entries(query)
+
+    async def read_chunks(self, entry_id: str, **kwargs):
+        return await self._store.read_chunks(entry_id, **kwargs)
+
+
+def test_read_tools_accept_read_only_knowledge_store() -> None:
+    async def run():
+        store = ReadOnlyKnowledgeStore()
+        await store.index(
+            KnowledgeIndexRequest(entry_id="policy", text="Always verify bank details.")
+        )
+        ctx = ToolContext(session_id="session_1", knowledge_store=store)
+        search_result = await SearchKnowledgeTool().run(ctx, {"query": "bank details"})
+        list_result = await ListKnowledgeTool().run(ctx, {})
+        read_result = await ReadKnowledgeTool().run(ctx, {"entry_id": "policy"})
+        return search_result, list_result, read_result
+
+    search_result, list_result, read_result = asyncio.run(run())
+
+    assert search_result.is_error is False
+    assert search_result.structured is not None
+    assert [hit["entry_id"] for hit in search_result.structured["hits"]] == ["policy"]
+    assert list_result.is_error is False
+    assert read_result.is_error is False
+
+
+def test_knowledge_tools_name_missing_store_methods() -> None:
+    class SearchOnlyStore:
+        async def search(self, query):
+            raise AssertionError("not reached")
+
+    ctx = ToolContext(session_id="session_1", knowledge_store=SearchOnlyStore())
+
+    with pytest.raises(TypeError, match=r"read_knowledge: read_chunks"):
+        asyncio.run(ReadKnowledgeTool().run(ctx, {"entry_id": "policy"}))
+    with pytest.raises(TypeError, match=r"list_knowledge: list_entries"):
+        asyncio.run(ListKnowledgeTool().run(ctx, {}))
+    with pytest.raises(
+        TypeError,
+        match=r"remember_knowledge: get_entry, put_entry_with_chunks, read_chunks, delete_entry",
+    ):
+        asyncio.run(RememberKnowledgeTool().run(ctx, {"text": "fact"}))
+
+
+def test_search_knowledge_forwards_min_score_in_store_query() -> None:
+    received: list[float | None] = []
+
+    class RecordingStore(InMemoryEmbeddingKnowledgeStore):
+        async def search(self, query: KnowledgeQuery):
+            received.append(query.min_score)
+            return await super().search(query)
+
+    async def run():
+        store = RecordingStore(
+            embedding_provider=WeightedEmbeddingProvider(),
+            embedding_model="test-embedding",
+            semantic_min_score=0.0,
+        )
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="remote_git_credentials",
+                namespace="ops",
+                text="GitHub remote sandbox auth should use a credential broker.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"query": "remote sandbox auth", "namespace": "ops"},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert received == [0.75]
+    assert result.structured["query"]["min_score"] == 0.75
+    assert result.structured["min_score"] == 0.75
+    assert result.structured["min_score_applied"] is True
+
+
+def test_search_knowledge_surfaces_threshold_not_applied() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="github",
+                text="GitHub push needs a credential broker.",
+            )
+        )
+        return await SearchKnowledgeTool(allow_score_override=True).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"query": "github credential", "min_score": 0.5},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["min_score"] == 0.5
+    assert result.structured["query"]["min_score"] == 0.5
+    assert result.structured["min_score_applied"] is False
+    assert "was not applied" in result.content
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == ["github"]
+
+
+def test_search_knowledge_keyword_auto_reports_no_threshold() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="github",
+                text="GitHub push needs a credential broker.",
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"query": "github credential"},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["min_score"] is None
+    assert result.structured["query"]["min_score"] is None
+    assert result.structured["min_score_applied"] is None
+    assert "was not applied" not in result.content
+
+
+def test_remember_knowledge_dedupes_identical_text() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        ctx = ToolContext(session_id="session_1", knowledge_store=store)
+        args = {"text": "Always verify bank details before paying invoices."}
+        first = await RememberKnowledgeTool().run(ctx, args)
+        second = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_2", knowledge_store=store),
+            args,
+        )
+        assert first.structured is not None
+        chunks = await store.read_chunks(
+            first.structured["entry"]["entry_id"], max_chunks=5, max_bytes=20_000
+        )
+        return first, second, chunks
+
+    first, second, chunks = asyncio.run(run())
+
+    assert first.is_error is False
+    assert first.structured is not None
+    assert first.structured["written"] is True
+    assert first.structured["already_known"] is False
+    assert second.is_error is False
+    assert second.structured is not None
+    assert second.structured["written"] is False
+    assert second.structured["already_known"] is True
+    assert second.structured["entry"]["entry_id"] == first.structured["entry"]["entry_id"]
+    assert second.structured["source_hash"] == first.structured["source_hash"]
+    assert "already known" in second.content
+    assert len(chunks) == 1
+
+
+def test_remember_knowledge_distinct_kinds_are_not_deduped() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        ctx = ToolContext(session_id="session_1", knowledge_store=store)
+        text = "Always verify bank details before paying invoices."
+        first = await RememberKnowledgeTool().run(ctx, {"text": text, "kind": "fact"})
+        second = await RememberKnowledgeTool().run(ctx, {"text": text, "kind": "warning"})
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first.is_error is False
+    assert second.is_error is False
+    assert first.structured is not None
+    assert second.structured is not None
+    assert second.structured["already_known"] is False
+    assert second.structured["written"] is True
+    assert second.structured["entry"]["entry_id"] != first.structured["entry"]["entry_id"]

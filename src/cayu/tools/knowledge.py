@@ -16,6 +16,8 @@ from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
+    content_knowledge_entry_id,
+    knowledge_source_hash,
 )
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
@@ -63,17 +65,16 @@ DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000
 MAX_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 32 * 1024
 DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 100
 MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 1_000
-_KNOWLEDGE_STORE_METHODS = (
-    "put_entry",
+# Each knowledge tool only requires the store methods it actually calls, so
+# read-only stores can back the read tools without implementing the write API.
+_SEARCH_KNOWLEDGE_STORE_METHODS = ("search",)
+_LIST_KNOWLEDGE_STORE_METHODS = ("list_entries",)
+_READ_KNOWLEDGE_STORE_METHODS = ("read_chunks",)
+_REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "get_entry",
-    "update_entry_status",
-    "transition_entry_status",
-    "delete_entry",
-    "replace_chunks",
     "put_entry_with_chunks",
     "read_chunks",
-    "search",
-    "list_entries",
+    "delete_entry",
 )
 
 
@@ -296,14 +297,29 @@ class SearchKnowledgeTool(Tool):
             self._validate_spec()
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        store = _require_knowledge_store(ctx)
+        store = _require_knowledge_store(
+            ctx,
+            methods=_SEARCH_KNOWLEDGE_STORE_METHODS,
+            tool_name=self.spec.name,
+        )
         if store is None:
             return _missing_knowledge_store_result()
+        search_modes = _knowledge_search_modes_payload(store)
         try:
             if "min_score" in args and not self._allow_score_override:
                 raise ValueError(
                     "Tool argument `min_score` is not enabled for this search_knowledge tool."
                 )
+            mode = _optional_search_mode(args, "mode")
+            min_score = (
+                _optional_unit_float(args, "min_score") if self._allow_score_override else None
+            )
+            effective_min_score = _effective_search_min_score(
+                mode=mode,
+                search_modes=search_modes,
+                min_score=min_score,
+                auto_min_score=self._auto_min_score,
+            )
             query = KnowledgeQuery(
                 text=_optional_nonblank_string(args, "query"),
                 any_terms=_optional_string_list(args, "any") or [],
@@ -319,7 +335,8 @@ class SearchKnowledgeTool(Tool):
                 source_type=_optional_arg_string(args, "source_type"),
                 source_id=_optional_arg_string(args, "source_id"),
                 include_expired=_optional_bool(args, "include_expired", default=False),
-                mode=_optional_search_mode(args, "mode"),
+                mode=mode,
+                min_score=effective_min_score,
                 limit=_optional_positive_int(
                     args,
                     "limit",
@@ -339,27 +356,23 @@ class SearchKnowledgeTool(Tool):
                 default=DEFAULT_SEARCH_KNOWLEDGE_PREVIEW_BYTES,
                 maximum=MAX_KNOWLEDGE_TOOL_PREVIEW_BYTES,
             )
-            min_score = (
-                _optional_unit_float(args, "min_score") if self._allow_score_override else None
-            )
         except (ValidationError, ValueError) as exc:
             return _invalid_knowledge_arguments_result(exc)
         result = await store.search(query)
-        search_modes = _knowledge_search_modes_payload(store)
-        effective_min_score = _effective_search_min_score(
-            query=query,
-            search_modes=search_modes,
-            min_score=min_score,
-            auto_min_score=self._auto_min_score,
-        )
         filtered_hits = _filter_search_hits(result.hits, min_score=effective_min_score)
         hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in filtered_hits]
         filtered_count = len(result.hits) - len(filtered_hits)
+        min_score_applied = _min_score_applied(result.hits, min_score=effective_min_score)
         content = (
             "No knowledge results found."
             if not hits
             else _format_search_hits(filtered_hits, preview_bytes=preview_bytes)
         )
+        if min_score_applied is False:
+            content += (
+                f"\nNote: min_score {effective_min_score} was not applied because the "
+                "store returned no normalized-scored hits."
+            )
         return ToolResult(
             content=content,
             structured={
@@ -372,6 +385,7 @@ class SearchKnowledgeTool(Tool):
                 "total_hits_known": result.total_hits_known,
                 "search_modes": search_modes,
                 "min_score": effective_min_score,
+                "min_score_applied": min_score_applied,
                 "filtered_hits": filtered_count,
             },
         )
@@ -386,7 +400,9 @@ class RememberKnowledgeTool(Tool):
             "that should be reusable beyond the current turn. Model-authored knowledge "
             "is policy-controlled and defaults to pending review unless the application "
             "explicitly allows active writes. This tool creates new entries only; it does "
-            "not edit, archive, or delete existing knowledge."
+            "not edit, archive, or delete existing knowledge. Remembering identical text "
+            "with the same kind again returns the existing entry instead of writing a "
+            "duplicate."
         ),
         input_schema={
             "type": "object",
@@ -474,7 +490,11 @@ class RememberKnowledgeTool(Tool):
         )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        store = _require_knowledge_store(ctx)
+        store = _require_knowledge_store(
+            ctx,
+            methods=_REMEMBER_KNOWLEDGE_STORE_METHODS,
+            tool_name=self.spec.name,
+        )
         if store is None:
             return _missing_knowledge_store_result()
         try:
@@ -484,9 +504,31 @@ class RememberKnowledgeTool(Tool):
             kind = _optional_arg_string(args, "kind") or self._policy.default_kind
             self._validate_kind(kind)
             metadata = _remember_metadata(ctx)
+        except (ValidationError, ValueError) as exc:
+            return _invalid_knowledge_arguments_result(exc)
+        source_hash = knowledge_source_hash(text)
+        entry_id = content_knowledge_entry_id(
+            namespace=self._policy.default_namespace,
+            kind=kind,
+            source_hash=source_hash,
+        )
+        try:
+            existing_entry = await store.get_entry(entry_id)
+        except Exception:
+            # Deduplication is best-effort; fall through to the normal write
+            # path, which has its own failure handling.
+            existing_entry = None
+        if existing_entry is not None:
+            if existing_entry.source_hash == source_hash:
+                return _remember_knowledge_already_known_result(existing_entry)
+            # A different payload occupies the content-derived id (for example a
+            # truncated-hash collision); write under a unique id instead of
+            # overwriting the existing entry.
+            entry_id = f"knowledge_{uuid4().hex}"
+        try:
             request = KnowledgeIndexRequest(
                 text=text,
-                entry_id=f"knowledge_{uuid4().hex}",
+                entry_id=entry_id,
                 namespace=self._policy.default_namespace,
                 labels=self._policy.require_labels,
                 kind=kind,
@@ -567,6 +609,7 @@ def _remember_knowledge_success_result(
         "entry": _remembered_entry_payload(entry),
         "chunk_count": result.chunk_count,
         "written": result.written,
+        "already_known": False,
         "source_hash": result.source_hash,
         "status": entry.status.value,
     }
@@ -575,6 +618,28 @@ def _remember_knowledge_success_result(
     return ToolResult(
         content=content,
         structured=structured,
+    )
+
+
+def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResult:
+    status_note = (
+        "It is active for normal retrieval."
+        if entry.status is KnowledgeStatus.ACTIVE
+        else f"Its status is {entry.status.value}."
+    )
+    content = (
+        f"Knowledge already known as {entry.status.value}: {entry.id}. "
+        f"{status_note} No new entry was written."
+    )
+    return ToolResult(
+        content=content,
+        structured={
+            "entry": _remembered_entry_payload(entry),
+            "written": False,
+            "already_known": True,
+            "source_hash": entry.source_hash,
+            "status": entry.status.value,
+        },
     )
 
 
@@ -765,7 +830,11 @@ class ListKnowledgeTool(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        store = _require_knowledge_store(ctx)
+        store = _require_knowledge_store(
+            ctx,
+            methods=_LIST_KNOWLEDGE_STORE_METHODS,
+            tool_name=self.spec.name,
+        )
         if store is None:
             return _missing_knowledge_store_result()
         try:
@@ -899,7 +968,11 @@ class ReadKnowledgeTool(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        store = _require_knowledge_store(ctx)
+        store = _require_knowledge_store(
+            ctx,
+            methods=_READ_KNOWLEDGE_STORE_METHODS,
+            tool_name=self.spec.name,
+        )
         if store is None:
             return _missing_knowledge_store_result()
         try:
@@ -950,18 +1023,25 @@ class ReadKnowledgeTool(Tool):
         )
 
 
-def _require_knowledge_store(ctx: ToolContext) -> Any:
+def _require_knowledge_store(
+    ctx: ToolContext,
+    *,
+    methods: tuple[str, ...],
+    tool_name: str,
+) -> Any:
     if ctx.knowledge_store is None:
         return None
-    if not _is_knowledge_store(ctx.knowledge_store):
-        raise TypeError("Tool context knowledge_store must implement KnowledgeStore.")
+    missing = [
+        method_name
+        for method_name in methods
+        if not callable(getattr(ctx.knowledge_store, method_name, None))
+    ]
+    if missing:
+        raise TypeError(
+            f"Tool context knowledge_store is missing methods required by "
+            f"{tool_name}: {', '.join(missing)}."
+        )
     return ctx.knowledge_store
-
-
-def _is_knowledge_store(value: Any) -> bool:
-    return all(
-        callable(getattr(value, method_name, None)) for method_name in _KNOWLEDGE_STORE_METHODS
-    )
 
 
 def _missing_knowledge_store_result() -> ToolResult:
@@ -1300,7 +1380,7 @@ def _knowledge_search_modes_payload(store: Any) -> list[str]:
 
 def _effective_search_min_score(
     *,
-    query: KnowledgeQuery,
+    mode: KnowledgeSearchMode,
     search_modes: list[str],
     min_score: float | None,
     auto_min_score: float | None,
@@ -1309,7 +1389,7 @@ def _effective_search_min_score(
         return min_score
     if auto_min_score is None:
         return None
-    if query.mode is not KnowledgeSearchMode.AUTO:
+    if mode is not KnowledgeSearchMode.AUTO:
         return None
     if (
         KnowledgeSearchMode.SEMANTIC.value not in search_modes
@@ -1317,6 +1397,19 @@ def _effective_search_min_score(
     ):
         return None
     return auto_min_score
+
+
+def _min_score_applied(hits: list[KnowledgeHit], *, min_score: float | None) -> bool | None:
+    """Whether the requested score threshold could actually take effect.
+
+    Returns None when no threshold was in force, False when a threshold was
+    requested but the store returned only unscored hits (so the threshold was
+    not applied), and True otherwise.
+    """
+
+    if min_score is None or min_score <= 0:
+        return None
+    return not hits or any(hit.score_normalized is not None for hit in hits)
 
 
 def _filter_search_hits(hits: list[KnowledgeHit], *, min_score: float | None) -> list[KnowledgeHit]:
@@ -1422,6 +1515,7 @@ def _search_query_payload(query: KnowledgeQuery) -> dict[str, Any]:
         "source_id": query.source_id,
         "include_expired": query.include_expired,
         "mode": query.mode.value,
+        "min_score": query.min_score,
         "limit": query.limit,
         "max_bytes": query.max_bytes,
     }
