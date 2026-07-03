@@ -30,10 +30,8 @@ from cayu.providers import (
     ModelStreamEventType,
     build_chat_completions_payload,
 )
-from cayu.providers.chat_completions import (
-    _aiter_sse_json_events,
-    chat_completions_stream_events,
-)
+from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers.chat_completions import chat_completions_stream_events
 
 
 class RecordingTransport:
@@ -724,6 +722,40 @@ async def test_provider_emits_nonblank_error_for_blank_exception() -> None:
     assert events[0].payload["error"].strip()
 
 
+@pytest.mark.anyio
+async def test_provider_stream_propagates_context_overflow() -> None:
+    overflow = ChatCompletionsContextOverflowError(
+        "Chat Completions model context overflow",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+
+    class OverflowTransport:
+        async def stream_chat_completions(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            payload: Mapping[str, Any],
+            timeout_s: float,
+            stream_idle_timeout_s: float,
+        ):
+            raise overflow
+            yield {}
+
+    provider = ChatCompletionsProvider(api_key="test-key", transport=OverflowTransport())
+    request = ModelRequest(model="gpt-test", messages=[Message.text("user", "Hi.")])
+
+    with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
+        [event async for event in provider.stream(request)]
+
+    # Overflow must escape as a typed exception (not an ERROR event) so
+    # runtime context-overflow recovery can shrink context and retry.
+    assert exc_info.value is overflow
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.retryable is False
+
+
 def test_provider_rejects_invalid_tool_names() -> None:
     provider = ChatCompletionsProvider(
         api_key="test-key", name="gemini", transport=RecordingTransport()
@@ -947,7 +979,7 @@ async def test_chat_completions_transport_classifies_gemini_context_too_long(
             return ResponseContext()
 
     monkeypatch.setattr(
-        "cayu.providers.chat_completions.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -1012,7 +1044,7 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
             return ResponseContext()
 
     monkeypatch.setattr(
-        "cayu.providers.chat_completions.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -1089,5 +1121,13 @@ async def test_sse_comment_heartbeats_refresh_idle_timer() -> None:
         yield 'data: {"ok": true}'
         yield ""
 
-    events = [event async for event in _aiter_sse_json_events(lines(), idle_timeout_s=0.1)]
+    events = [
+        event
+        async for event in aiter_sse_json_events(
+            lines(),
+            idle_timeout_s=0.1,
+            provider_label="Chat Completions",
+            protocol_error=ChatCompletionsProtocolError,
+        )
+    ]
     assert events == [{"ok": True}]

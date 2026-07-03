@@ -38,7 +38,12 @@ from cayu.core.messages import copy_message, copy_message_part
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
-from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProviderError,
+    ModelRequest,
+    ModelStreamEvent,
+)
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
 from cayu.runtime import (
     DispatchHandle,
@@ -88,7 +93,7 @@ def test_message_text_constructor():
     message = Message.text(MessageRole.USER, "hello")
 
     assert message.role == MessageRole.USER
-    assert message.content == [TextPart(text="hello")]
+    assert message.content == (TextPart(text="hello"),)
 
 
 def test_event_has_stable_contract_fields():
@@ -491,7 +496,10 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
     exec_artifacts = [{"nested": {"value": "original"}}]
     exec_result = ExecResult(artifacts=exec_artifacts)
 
-    messages[0].content[0].text = "mutated"
+    # Messages are frozen: mutating the shared instance is rejected outright,
+    # so the request's transcript cannot be corrupted through the caller list.
+    with pytest.raises(ValidationError):
+        messages[0].content[0].text = "mutated"  # type: ignore[misc]
     tools[0]["input_schema"]["nested"]["value"] = "mutated"
     options["nested"]["value"] = "mutated"
     stream_arguments["nested"]["value"] = "mutated"
@@ -794,6 +802,132 @@ def test_model_stream_error_rejects_invalid_helper_inputs():
 
     with pytest.raises(ValueError, match="string"):
         ModelStreamEvent.error(123)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Exception"):
+        ModelStreamEvent.error("boom", cause="not an exception")  # type: ignore[arg-type]
+
+
+def test_model_provider_error_carries_typed_classification_fields():
+    error = ModelProviderError(
+        "HTTP 429: rate limited",
+        provider="anthropic",
+        status_code=429,
+        error_type="rate_limit_error",
+        error_code="rate_limited",
+        request_id="req_1",
+        retryable=True,
+        retry_after_s=2,
+    )
+
+    assert error.provider == "anthropic"
+    assert error.retryable is True
+    assert error.retry_after_s == 2.0
+    assert type(error.retry_after_s) is float
+    assert error.error_payload_fields() == {
+        "provider": "anthropic",
+        "status_code": 429,
+        "provider_error_type": "rate_limit_error",
+        "provider_error_code": "rate_limited",
+        "request_id": "req_1",
+        "retryable": True,
+        "retry_after_s": 2.0,
+    }
+
+    unclassified = ModelProviderError("boom", provider="anthropic")
+    assert unclassified.retryable is None
+    assert unclassified.error_payload_fields() == {"provider": "anthropic"}
+
+
+def test_model_provider_error_rejects_invalid_classification_fields():
+    with pytest.raises(ValueError, match="retryable must be a boolean"):
+        ModelProviderError("boom", provider="p", retryable="yes")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="retry_after_s must be a non-negative number"):
+        ModelProviderError("boom", provider="p", retry_after_s=-1.0)
+
+    with pytest.raises(ValueError, match="retry_after_s must be a non-negative number"):
+        ModelProviderError("boom", provider="p", retry_after_s=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="status_code must be a valid HTTP status code"):
+        ModelProviderError("boom", provider="p", status_code=42)
+
+
+def test_model_context_overflow_error_is_typed_and_never_retryable():
+    error = ModelContextOverflowError(
+        "context too large",
+        provider="anthropic",
+        status_code=400,
+        error_type="invalid_request_error",
+        request_id="req_overflow",
+    )
+
+    assert isinstance(error, ModelProviderError)
+    assert error.retryable is False
+    assert error.retry_after_s is None
+    assert error.error_payload_fields() == {
+        "provider": "anthropic",
+        "status_code": 400,
+        "provider_error_type": "invalid_request_error",
+        "request_id": "req_overflow",
+        "retryable": False,
+    }
+
+
+def test_model_stream_error_event_preserves_typed_provider_fields():
+    cause = ModelProviderError(
+        "HTTP 429: rate limited",
+        provider="anthropic",
+        status_code=429,
+        error_type="rate_limit_error",
+        request_id="req_1",
+        retryable=True,
+        retry_after_s=1.5,
+    )
+
+    event = ModelStreamEvent.error("HTTP 429: rate limited", cause=cause)
+
+    assert event.payload == {
+        "error": "HTTP 429: rate limited",
+        "error_type": "ModelProviderError",
+        "provider": "anthropic",
+        "status_code": 429,
+        "provider_error_type": "rate_limit_error",
+        "request_id": "req_1",
+        "retryable": True,
+        "retry_after_s": 1.5,
+    }
+
+
+def test_model_stream_error_event_marks_context_overflow_cause():
+    cause = ModelContextOverflowError(
+        "context too large",
+        provider="openai",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+
+    event = ModelStreamEvent.error("context too large", cause=cause)
+
+    assert event.payload == {
+        "error": "context too large",
+        "error_type": "ModelContextOverflowError",
+        "provider": "openai",
+        "status_code": 400,
+        "provider_error_code": "context_length_exceeded",
+        "retryable": False,
+        "context_overflow": True,
+    }
+    # Non-overflow provider errors never carry the overflow marker.
+    plain = ModelStreamEvent.error("boom", cause=ModelProviderError("boom", provider="openai"))
+    assert "context_overflow" not in plain.payload
+
+
+def test_model_stream_error_event_keeps_plain_payload_without_provider_cause():
+    assert ModelStreamEvent.error("boom").payload == {"error": "boom"}
+    assert ModelStreamEvent.error("boom", cause=RuntimeError("boom")).payload == {
+        "error": "boom",
+        "error_type": "RuntimeError",
+    }
 
 
 def test_in_memory_event_sink_collects_events():
@@ -1871,15 +2005,21 @@ def test_tool_requires_explicit_spec():
         BrokenTool()
 
 
-def test_tool_spec_is_copied_from_class_level_definition():
+def test_tool_spec_is_shared_from_class_level_definition():
     first = EchoTool()
     second = EchoTool()
 
+    # ToolSpec is frozen and deeply immutable, so instances safely share the
+    # class-level spec instead of deep-copying it per instantiation.
     assert first.spec == second.spec
-    assert first.spec is not second.spec
+    assert first.spec is second.spec
 
     with pytest.raises(Exception):
         first.spec.name = "changed"  # type: ignore[misc]
+
+    # Materialized schemas remain isolated per access.
+    first.schema["properties"]["text"]["type"] = "number"
+    assert second.schema["properties"]["text"]["type"] == "string"
 
 
 def test_tool_schema_property_returns_copy():

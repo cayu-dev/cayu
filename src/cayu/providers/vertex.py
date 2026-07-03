@@ -2,39 +2,72 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import json
 from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol
-from urllib.parse import urlparse
-
-import certifi
-import httpx
+from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank
+from cayu.providers._http import (
+    exception_message,
+    json_error_text,
+    post_json,
+    safe_error_response_text,
+    truncate_error_text,
+    validate_base_url,
+    validate_url,
+)
 from cayu.providers.anthropic import (
     anthropic_response_events,
     build_anthropic_payload,
 )
 from cayu.providers.base import (
+    ModelContextOverflowError,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
 )
+
+if TYPE_CHECKING:
+    import httpx
 
 DEFAULT_VERTEX_REGION = "global"
 DEFAULT_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
 DEFAULT_VERTEX_MAX_TOKENS = 4096
 DEFAULT_VERTEX_TIMEOUT_SECONDS = 60.0
 VERTEX_OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
-MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 
 
 class VertexError(RuntimeError):
     """Base error for Vertex provider failures."""
 
 
-class VertexAPIError(VertexError):
+class VertexAPIError(VertexError, ModelProviderError):
     """Raised when the Vertex AI HTTP API returns an error response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        retryable: bool | None = None,
+        retry_after_s: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelProviderError.__init__(
+            self,
+            message,
+            provider="vertex",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            response_body=response_body,
+        )
 
 
 class VertexProtocolError(VertexError):
@@ -65,33 +98,17 @@ class HttpxVertexTransport:
         timeout_s: float,
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout_s,
-                verify=certifi.where(),
-            ) as client:
-                response = await client.post(
-                    url,
-                    headers=dict(headers),
-                    json=dict(payload),
-                )
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise VertexAPIError(
-                "Vertex AI request failed with HTTP "
-                f"{exc.response.status_code}: "
-                f"{_safe_error_response_text(exc.response)}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise VertexAPIError(f"Vertex AI request failed for {url}: {exc}") from exc
-
-        try:
-            decoded = response.json()
-        except ValueError as exc:
-            raise VertexProtocolError("Vertex response was not valid JSON.") from exc
-        if not isinstance(decoded, Mapping):
-            raise VertexProtocolError("Vertex response must be a JSON object.")
-        return decoded
+        return await post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            request_label="Vertex AI",
+            response_label="Vertex",
+            api_error=VertexAPIError,
+            protocol_error=VertexProtocolError,
+            error_response_text=_safe_error_response_text,
+        )
 
 
 class VertexProvider(ModelProvider):
@@ -173,8 +190,15 @@ class VertexProvider(ModelProvider):
             )
             for event in anthropic_response_events(response):
                 yield event
+        except ModelContextOverflowError:
+            # Overflow must reach runtime recovery as a typed exception; an
+            # error event would flatten it into unrecoverable message text.
+            raise
         except Exception as exc:
-            yield ModelStreamEvent.error(_exception_message(exc))
+            yield ModelStreamEvent.error(
+                exception_message(exc, provider_label="Vertex"),
+                cause=exc,
+            )
 
     def _endpoint(self, model: str) -> str:
         model = require_clean_nonblank(model, "model")
@@ -268,14 +292,7 @@ def _import_google(module_name: str) -> Any:
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            decoded = response.json()
-        except ValueError:
-            return _truncate_error_text(response.text)
-        return _safe_gcp_error(decoded)
-    return _truncate_error_text(response.text)
+    return safe_error_response_text(response, format_error_json=_safe_gcp_error)
 
 
 def _safe_gcp_error(decoded: Any) -> str:
@@ -294,41 +311,15 @@ def _safe_gcp_error(decoded: Any) -> str:
             if isinstance(status, str):
                 safe["status"] = status
             if isinstance(message, str):
-                safe["message"] = _truncate_error_text(message)
+                safe["message"] = truncate_error_text(message)
             if safe:
-                return _json_error_text(safe)
-    return _truncate_error_text(_json_error_text(decoded))
-
-
-def _json_error_text(value: Any) -> str:
-    try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        return str(value)
-
-
-def _truncate_error_text(value: str) -> str:
-    if len(value) <= MAX_PROVIDER_ERROR_BODY_CHARS:
-        return value
-    return value[:MAX_PROVIDER_ERROR_BODY_CHARS] + "... [truncated]"
+                return json_error_text(safe)
+    return truncate_error_text(json_error_text(decoded))
 
 
 def _validate_base_url(base_url: str) -> str:
-    return _validate_url(base_url, "base_url").rstrip("/")
+    return validate_base_url(base_url, provider_label="Vertex")
 
 
 def _validate_url(url: str, field_name: str) -> str:
-    value = require_clean_nonblank(url, field_name)
-    parsed = urlparse(value)
-    if parsed.scheme != "https":
-        raise ValueError(f"Vertex {field_name} must use https.")
-    if not parsed.netloc:
-        raise ValueError(f"Vertex {field_name} must include a host.")
-    return value
-
-
-def _exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: Vertex provider failed"
+    return validate_url(url, field_name, provider_label="Vertex")

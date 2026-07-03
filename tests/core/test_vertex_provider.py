@@ -17,6 +17,7 @@ from cayu import (
 )
 from cayu.providers import (
     HttpxVertexTransport,
+    ModelContextOverflowError,
     ModelRequest,
     ModelStreamEventType,
     VertexAPIError,
@@ -283,6 +284,32 @@ async def test_vertex_provider_wraps_api_error_as_single_event() -> None:
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
     assert "429" in events[0].payload["error"]
+    # Typed classification fields survive into the error event payload.
+    assert events[0].payload["error_type"] == "VertexAPIError"
+    assert events[0].payload["provider"] == "vertex"
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_stream_propagates_context_overflow() -> None:
+    overflow = ModelContextOverflowError(
+        "Vertex model context overflow",
+        provider="vertex",
+        status_code=400,
+    )
+
+    class OverflowTransport:
+        async def create_message(self, *, url, headers, payload, timeout_s) -> Mapping[str, Any]:
+            raise overflow
+
+    provider = _provider(OverflowTransport())
+
+    with pytest.raises(ModelContextOverflowError) as exc_info:
+        [event async for event in provider.stream(_request())]
+
+    # Overflow must escape as a typed exception (not an ERROR event) so
+    # runtime context-overflow recovery can shrink context and retry.
+    assert exc_info.value is overflow
+    assert exc_info.value.retryable is False
 
 
 def test_vertex_provider_rejects_multiple_credential_sources() -> None:
@@ -355,7 +382,7 @@ async def test_httpx_vertex_transport_wraps_gcp_error_envelope(
             json={"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "denied"}},
         )
 
-    monkeypatch.setattr("cayu.providers.vertex.httpx.AsyncClient", _mock_client_factory(handler))
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
     with pytest.raises(VertexAPIError, match="PERMISSION_DENIED"):
         await HttpxVertexTransport().create_message(
             url=_VERTEX_URL, headers={}, payload={"a": 1}, timeout_s=10.0
@@ -367,7 +394,7 @@ async def test_httpx_vertex_transport_rejects_non_json(monkeypatch: pytest.Monke
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="not json", headers={"content-type": "text/plain"})
 
-    monkeypatch.setattr("cayu.providers.vertex.httpx.AsyncClient", _mock_client_factory(handler))
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
     with pytest.raises(VertexProtocolError, match="valid JSON"):
         await HttpxVertexTransport().create_message(
             url=_VERTEX_URL, headers={}, payload={}, timeout_s=10.0
@@ -379,7 +406,7 @@ async def test_httpx_vertex_transport_rejects_non_object(monkeypatch: pytest.Mon
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[1, 2])
 
-    monkeypatch.setattr("cayu.providers.vertex.httpx.AsyncClient", _mock_client_factory(handler))
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
     with pytest.raises(VertexProtocolError, match="must be a JSON object"):
         await HttpxVertexTransport().create_message(
             url=_VERTEX_URL, headers={}, payload={}, timeout_s=10.0

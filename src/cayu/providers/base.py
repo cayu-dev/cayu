@@ -44,12 +44,79 @@ class InputTokenCountConfidence(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
-class ModelContextOverflowError(RuntimeError):
+class ModelProviderError(RuntimeError):
+    """Provider-neutral structured model provider failure.
+
+    Provider adapters should raise subclasses of this (or wrap SDK/HTTP failures
+    into it) instead of flattening failures to bare message strings. The typed
+    fields let runtime code classify retries (`status_code`, `retryable`,
+    `retry_after_s`) and let observability keep the provider's own error
+    identity (`error_type`, `error_code`, `request_id`) without re-parsing
+    message text. `retryable` is tri-state: ``None`` means the provider did not
+    classify the failure, leaving the decision to runtime retry policy.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        retryable: bool | None = None,
+        retry_after_s: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        super().__init__(require_nonblank(message, "message"))
+        self.provider = require_clean_nonblank(provider, "provider")
+        if status_code is not None and (type(status_code) is not int or status_code < 100):
+            raise ValueError("status_code must be a valid HTTP status code.")
+        self.status_code = status_code
+        self.error_type = _optional_clean_error_field(error_type, "error_type")
+        self.error_code = _optional_clean_error_field(error_code, "error_code")
+        self.request_id = _optional_clean_error_field(request_id, "request_id")
+        if retryable is not None and type(retryable) is not bool:
+            raise ValueError("retryable must be a boolean.")
+        self.retryable = retryable
+        if retry_after_s is not None:
+            if type(retry_after_s) not in {int, float} or retry_after_s < 0:
+                raise ValueError("retry_after_s must be a non-negative number.")
+            retry_after_s = float(retry_after_s)
+        self.retry_after_s = retry_after_s
+        self.response_body = response_body
+
+    def error_payload_fields(self) -> dict[str, Any]:
+        """JSON-safe structured fields for model stream error payloads.
+
+        Key naming mirrors runtime context-overflow event payloads: the
+        provider's own error identity uses the ``provider_error_*`` prefix so
+        it cannot collide with the Python-exception ``error_type`` key.
+        """
+        payload: dict[str, Any] = {"provider": self.provider}
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.error_type is not None:
+            payload["provider_error_type"] = self.error_type
+        if self.error_code is not None:
+            payload["provider_error_code"] = self.error_code
+        if self.request_id is not None:
+            payload["request_id"] = self.request_id
+        if self.retryable is not None:
+            payload["retryable"] = self.retryable
+        if self.retry_after_s is not None:
+            payload["retry_after_s"] = self.retry_after_s
+        return payload
+
+
+class ModelContextOverflowError(ModelProviderError):
     """Provider-neutral signal that a model request was too large for context.
 
     Provider adapters should raise this only for clear context-window or request-size
     overflow responses. Runtime recovery can then shrink model-facing context and
-    retry without depending on provider-specific exception classes.
+    retry without depending on provider-specific exception classes. Overflow is
+    never retryable as-is (`retryable=False`); recovery must shrink context first.
     """
 
     def __init__(
@@ -63,15 +130,17 @@ class ModelContextOverflowError(RuntimeError):
         request_id: str | None = None,
         response_body: str | None = None,
     ) -> None:
-        super().__init__(require_nonblank(message, "message"))
-        self.provider = require_clean_nonblank(provider, "provider")
-        if status_code is not None and (type(status_code) is not int or status_code < 100):
-            raise ValueError("status_code must be a valid HTTP status code.")
-        self.status_code = status_code
-        self.error_type = _optional_clean_error_field(error_type, "error_type")
-        self.error_code = _optional_clean_error_field(error_code, "error_code")
-        self.request_id = _optional_clean_error_field(request_id, "request_id")
-        self.response_body = response_body
+        ModelProviderError.__init__(
+            self,
+            message,
+            provider=provider,
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            retryable=False,
+            response_body=response_body,
+        )
 
 
 def _optional_clean_error_field(value: str | None, field_name: str) -> str | None:
@@ -308,10 +377,30 @@ class ModelStreamEvent(BaseModel):
         )
 
     @classmethod
-    def error(cls, message: str) -> ModelStreamEvent:
+    def error(cls, message: str, *, cause: Exception | None = None) -> ModelStreamEvent:
+        """An error event; `cause` preserves typed classification in the payload.
+
+        When `cause` is a `ModelProviderError`, its structured fields (provider,
+        status_code, provider_error_type/provider_error_code, request_id,
+        retryable, retry_after_s) join the payload so retry classification and
+        observability survive the event boundary instead of collapsing to text.
+        A `ModelContextOverflowError` cause additionally sets
+        ``context_overflow: True`` so runtime overflow recovery keeps its typed
+        signal even when a provider flattens the overflow into an error event
+        instead of raising it as `stream()` requires.
+        """
+        payload: dict[str, Any] = {"error": require_nonblank(message, "message")}
+        if cause is not None:
+            if not isinstance(cause, Exception):
+                raise ValueError("`cause` must be an Exception.")
+            payload["error_type"] = type(cause).__name__
+            if isinstance(cause, ModelProviderError):
+                payload.update(cause.error_payload_fields())
+            if isinstance(cause, ModelContextOverflowError):
+                payload["context_overflow"] = True
         return cls(
             type=ModelStreamEventType.ERROR,
-            payload={"error": require_nonblank(message, "message")},
+            payload=payload,
         )
 
 
@@ -463,4 +552,11 @@ class ModelProvider(ABC):
 
     @abstractmethod
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        """Stream model events for one request."""
+        """Stream model events for one request.
+
+        Error contract: `ModelContextOverflowError` must propagate as an
+        exception (never be flattened into an error event) so runtime
+        context-overflow recovery can shrink context and retry. Other failures
+        should surface as `ModelStreamEvent.error(message, cause=exc)` events
+        so typed classification fields survive into the runtime payload.
+        """

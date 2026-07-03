@@ -647,7 +647,7 @@ async def test_httpx_transport_includes_url_in_network_errors(monkeypatch) -> No
             )
 
     monkeypatch.setattr(
-        "cayu.providers.anthropic.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -702,7 +702,7 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
             )
 
     monkeypatch.setattr(
-        "cayu.providers.anthropic.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -764,7 +764,7 @@ async def test_httpx_anthropic_transport_classifies_request_too_large(monkeypatc
             )
 
     monkeypatch.setattr(
-        "cayu.providers.anthropic.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -824,7 +824,7 @@ async def test_httpx_anthropic_transport_classifies_prompt_too_long(monkeypatch)
             )
 
     monkeypatch.setattr(
-        "cayu.providers.anthropic.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -855,7 +855,94 @@ async def test_anthropic_provider_emits_nonblank_error_for_blank_exception() -> 
     events = [event async for event in provider.stream(request)]
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert events[0].payload == {"error": "RuntimeError: Anthropic provider failed"}
+    assert events[0].payload == {
+        "error": "RuntimeError: Anthropic provider failed",
+        "error_type": "RuntimeError",
+    }
+
+
+class ErrorRaisingTransport:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def count_message_tokens(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        raise AssertionError("count_message_tokens should not be called.")
+
+    async def create_message(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Mapping[str, Any]:
+        raise self.error
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_stream_propagates_context_overflow() -> None:
+    overflow = AnthropicContextOverflowError(
+        "Anthropic model context overflow",
+        status_code=413,
+        error_type="request_too_large",
+        request_id="req_overflow",
+    )
+    provider = AnthropicProvider(api_key="test-key", transport=ErrorRaisingTransport(overflow))
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("user", "hello")],
+    )
+
+    with pytest.raises(AnthropicContextOverflowError) as exc_info:
+        [event async for event in provider.stream(request)]
+
+    # Overflow must escape as a typed exception (not an ERROR event) so
+    # runtime context-overflow recovery can shrink context and retry.
+    assert exc_info.value is overflow
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None:
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=ErrorRaisingTransport(
+            AnthropicAPIError(
+                "Anthropic API request failed with HTTP 429: rate limited",
+                status_code=429,
+                error_type="rate_limit_error",
+                request_id="req_429",
+                retryable=True,
+                retry_after_s=1.5,
+            )
+        ),
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("user", "hello")],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload == {
+        "error": "Anthropic API request failed with HTTP 429: rate limited",
+        "error_type": "AnthropicAPIError",
+        "provider": "anthropic",
+        "status_code": 429,
+        "provider_error_type": "rate_limit_error",
+        "request_id": "req_429",
+        "retryable": True,
+        "retry_after_s": 1.5,
+    }
 
 
 _ALL_BREAKPOINTS = (

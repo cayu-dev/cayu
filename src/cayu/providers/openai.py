@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol, cast
-from urllib.parse import urlparse
-
-import certifi
-import httpx
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
@@ -34,6 +29,19 @@ from cayu.embeddings import (
     TextEmbeddingUsage,
     copy_text_embedding_request,
 )
+from cayu.providers._http import (
+    copy_headers,
+    exception_message,
+    optional_error_string,
+    post_json,
+    response_json_object,
+    safe_error_json,
+    safe_error_response_text,
+    stream_sse_json_events,
+    truncate_error_text,
+    validate_base_url,
+    validate_url,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -43,15 +51,18 @@ from cayu.providers.base import (
     ModelContextPressureProfile,
     ModelFinishReason,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
 )
 
+if TYPE_CHECKING:
+    import httpx
+
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
 DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
-MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN = 6
 
 _RESERVED_OPENAI_OPTIONS = {
@@ -90,8 +101,44 @@ class OpenAIError(RuntimeError):
     """Base error for OpenAI provider failures."""
 
 
-class OpenAIAPIError(OpenAIError):
-    """Raised when the OpenAI HTTP API returns an error response."""
+class OpenAIAPIError(OpenAIError, ModelProviderError):
+    """Raised when the OpenAI HTTP API returns an error response.
+
+    ``param`` carries the OpenAI error body's ``param`` field (the request
+    field the error refers to, e.g. ``"previous_response_id"``); it is
+    OpenAI-specific, so it lives here rather than on `ModelProviderError`.
+    """
+
+    param: str | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        param: str | None = None,
+        request_id: str | None = None,
+        retryable: bool | None = None,
+        retry_after_s: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelProviderError.__init__(
+            self,
+            message,
+            provider="openai",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            response_body=response_body,
+        )
+        if param is not None:
+            param = require_clean_nonblank(param, "param")
+        self.param = param
 
 
 class OpenAIContextOverflowError(OpenAIAPIError, ModelContextOverflowError):
@@ -158,37 +205,19 @@ class HttpxOpenAITransport:
         timeout_s: float,
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout_s,
-                verify=certifi.where(),
-            ) as client:
-                response = await client.post(
-                    url,
-                    headers=dict(headers),
-                    json=dict(payload),
-                )
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            try:
-                _raise_openai_context_overflow_if_applicable(exc.response)
-            except ModelContextOverflowError as overflow:
-                raise overflow from exc
-            raise OpenAIAPIError(
-                "OpenAI API request failed with HTTP "
-                f"{exc.response.status_code}: "
-                f"{_safe_error_response_text(exc.response)}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
-
-        try:
-            decoded = response.json()
-        except ValueError as exc:
-            raise OpenAIProtocolError("OpenAI response was not valid JSON.") from exc
-        if not isinstance(decoded, Mapping):
-            raise OpenAIProtocolError("OpenAI response must be a JSON object.")
-        return decoded
+        return await post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_openai_context_overflow_if_applicable,
+            api_error_from_response=_openai_api_error_from_response,
+        )
 
     async def stream_response_events(
         self,
@@ -200,39 +229,22 @@ class HttpxOpenAITransport:
         stream_idle_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
-        timeout = httpx.Timeout(timeout_s, read=None)
-        try:
-            async with (
-                httpx.AsyncClient(
-                    timeout=timeout,
-                    verify=certifi.where(),
-                ) as client,
-                client.stream(
-                    "POST",
-                    url,
-                    headers=dict(headers),
-                    json=dict(payload),
-                ) as response,
-            ):
-                if response.status_code >= 400:
-                    # Read the streamed error body while the response is still open.
-                    # Otherwise _safe_error_response_text touches an unread streaming
-                    # body and raises httpx.ResponseNotRead, masking the real API
-                    # error (e.g. HTTP 404 "item not found").
-                    await response.aread()
-                    _raise_openai_context_overflow_if_applicable(response)
-                    raise OpenAIAPIError(
-                        "OpenAI API request failed with HTTP "
-                        f"{response.status_code}: "
-                        f"{_safe_error_response_text(response)}"
-                    )
-                async for event in _aiter_sse_json_events(
-                    response.aiter_lines(),
-                    idle_timeout_s=stream_idle_timeout_s,
-                ):
-                    yield event
-        except httpx.RequestError as exc:
-            raise OpenAIAPIError(f"OpenAI API request failed for {url}: {exc}") from exc
+        events = stream_sse_json_events(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            stream_idle_timeout_s=stream_idle_timeout_s,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_openai_context_overflow_if_applicable,
+            api_error_from_response=_openai_api_error_from_response,
+        )
+        async for event in events:
+            yield event
 
 
 class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
@@ -307,8 +319,15 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             )
             async for event in self._consume(recovery_payload):
                 yield event
+        except ModelContextOverflowError:
+            # Overflow must reach runtime recovery as a typed exception; an
+            # error event would flatten it into unrecoverable message text.
+            raise
         except Exception as exc:
-            yield ModelStreamEvent.error(_exception_message(exc))
+            yield ModelStreamEvent.error(
+                exception_message(exc, provider_label="OpenAI"),
+                cause=exc,
+            )
 
     async def count_input_tokens(
         self,
@@ -1445,113 +1464,56 @@ def _optional_string(response: Mapping[str, Any], key: str) -> str | None:
 
 
 def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
-    if headers is None:
-        return {}
-    copied: dict[str, str] = {}
-    for key, value in headers.items():
-        header_name = require_clean_nonblank(key, "header name")
-        if header_name.lower() in _PROTECTED_HEADER_NAMES:
-            raise ValueError(f"extra_headers cannot override {header_name}.")
-        copied[header_name] = require_nonblank(
-            value,
-            f"header {key}",
-        )
-    return copied
+    return copy_headers(headers, protected=_PROTECTED_HEADER_NAMES)
 
 
 def _validate_base_url(base_url: str) -> str:
-    return _validate_url(base_url, "base_url").rstrip("/")
+    return validate_base_url(base_url, provider_label="OpenAI")
 
 
 def _validate_url(url: str, field_name: str) -> str:
-    value = require_clean_nonblank(url, field_name)
-    parsed = urlparse(value)
-    if parsed.scheme != "https":
-        raise ValueError(f"OpenAI {field_name} must use https.")
-    if not parsed.netloc:
-        raise ValueError(f"OpenAI {field_name} must include a host.")
-    return value
-
-
-async def _aiter_sse_json_events(
-    lines: AsyncIterator[str],
-    *,
-    idle_timeout_s: float,
-) -> AsyncIterator[Mapping[str, Any]]:
-    if idle_timeout_s <= 0:
-        raise ValueError("idle_timeout_s must be greater than zero.")
-    iterator = lines.__aiter__()
-    loop = asyncio.get_running_loop()
-    last_event_at = loop.time()
-    data_lines: list[str] = []
-
-    while True:
-        elapsed = loop.time() - last_event_at
-        remaining = idle_timeout_s - elapsed
-        if remaining <= 0:
-            raise TimeoutError(
-                f"OpenAI streaming response produced no SSE events for {idle_timeout_s:g} seconds."
-            )
-        try:
-            line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
-        except StopAsyncIteration:
-            break
-        except TimeoutError:
-            raise TimeoutError(
-                f"OpenAI streaming response produced no SSE events for {idle_timeout_s:g} seconds."
-            ) from None
-
-        if line.startswith(":"):
-            continue
-        if line == "":
-            if not data_lines:
-                continue
-            data = "\n".join(data_lines)
-            data_lines = []
-            if data == "[DONE]":
-                break
-            try:
-                decoded = json.loads(data)
-            except ValueError as exc:
-                raise OpenAIProtocolError("OpenAI SSE data was not valid JSON.") from exc
-            if not isinstance(decoded, Mapping):
-                raise OpenAIProtocolError("OpenAI SSE data must decode to a JSON object.")
-            last_event_at = loop.time()
-            yield decoded
-            continue
-        if line.startswith("data:"):
-            data = line[5:]
-            if data.startswith(" "):
-                data = data[1:]
-            data_lines.append(data)
-            continue
-
-    if data_lines:
-        data = "\n".join(data_lines)
-        if data != "[DONE]":
-            try:
-                decoded = json.loads(data)
-            except ValueError as exc:
-                raise OpenAIProtocolError("OpenAI SSE data was not valid JSON.") from exc
-            if not isinstance(decoded, Mapping):
-                raise OpenAIProtocolError("OpenAI SSE data must decode to a JSON object.")
-            yield decoded
+    return validate_url(url, field_name, provider_label="OpenAI")
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            decoded = response.json()
-        except ValueError:
-            return _truncate_error_text(response.text)
-        if isinstance(decoded, Mapping):
-            return _safe_error_json(decoded)
-    return _truncate_error_text(response.text)
+    return safe_error_response_text(response, format_error_json=_format_error_json)
+
+
+def _format_error_json(decoded: Any) -> str | None:
+    if not isinstance(decoded, Mapping):
+        return None
+    return _safe_error_json(decoded)
+
+
+def _openai_api_error_from_response(response: httpx.Response, message: str) -> OpenAIAPIError:
+    """Build a structured `OpenAIAPIError` from an HTTP error response.
+
+    Keeps the OpenAI error body's typed identity (status/type/code/param/
+    request_id) on the exception so callers classify failures — e.g. the
+    stale-chain recovery in `OpenAIProvider.stream` — without re-parsing
+    message text.
+    """
+    decoded = response_json_object(response)
+    error: Mapping[str, Any] = {}
+    request_id: str | None = None
+    if decoded is not None:
+        raw_error = decoded.get("error")
+        error = raw_error if isinstance(raw_error, Mapping) else decoded
+        raw_request_id = decoded.get("request_id")
+        request_id = raw_request_id if isinstance(raw_request_id, str) else None
+    return OpenAIAPIError(
+        message,
+        status_code=response.status_code,
+        error_type=optional_error_string(error.get("type")),
+        error_code=optional_error_string(error.get("code")),
+        param=optional_error_string(error.get("param")),
+        request_id=optional_error_string(request_id),
+        response_body=_safe_error_response_text(response),
+    )
 
 
 def _raise_openai_context_overflow_if_applicable(response: httpx.Response) -> None:
-    decoded = _response_json_object(response)
+    decoded = response_json_object(response)
     if decoded is None:
         return
     error = decoded.get("error")
@@ -1573,9 +1535,9 @@ def _raise_openai_context_overflow_from_error(
     request_id: str | None,
     response_body: str,
 ) -> None:
-    code = _optional_error_string(error.get("code"))
-    error_type = _optional_error_string(error.get("type"))
-    message = _optional_error_string(error.get("message"))
+    code = optional_error_string(error.get("code"))
+    error_type = optional_error_string(error.get("type"))
+    message = optional_error_string(error.get("message"))
     if not _is_openai_context_overflow(code=code, message=message):
         return
     raise OpenAIContextOverflowError(
@@ -1602,87 +1564,37 @@ def _is_openai_context_overflow(*, code: str | None, message: str | None) -> boo
     )
 
 
-def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" not in content_type:
-        return None
-    try:
-        decoded = response.json()
-    except ValueError:
-        return None
-    if not isinstance(decoded, Mapping):
-        return None
-    return decoded
-
-
-def _optional_error_string(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:
-    error = decoded.get("error")
-    request_id = decoded.get("request_id")
-    if isinstance(error, Mapping):
-        safe_error = _safe_flat_error_json(error)
-        if isinstance(request_id, str):
-            safe_error["request_id"] = request_id
-        if safe_error:
-            return _json_error_text(safe_error)
-    safe_error = _safe_flat_error_json(decoded)
-    if safe_error:
-        return _json_error_text(safe_error)
-    return _truncate_error_text(_json_error_text(dict(decoded)))
+    return safe_error_json(decoded, include_request_id=True)
 
 
 def _safe_error_value(value: Any) -> str:
     if isinstance(value, Mapping):
         return _safe_error_json(value)
     if isinstance(value, str):
-        return _truncate_error_text(value)
-    return _truncate_error_text(str(value))
+        return truncate_error_text(value)
+    return truncate_error_text(str(value))
 
 
-def _safe_flat_error_json(error: Mapping[str, Any]) -> dict[str, str]:
-    error_type = error.get("type")
-    message = error.get("message")
-    code = error.get("code")
-    safe_error: dict[str, str] = {}
-    if isinstance(error_type, str):
-        safe_error["type"] = error_type
-    if isinstance(code, str):
-        safe_error["code"] = code
-    if isinstance(message, str):
-        safe_error["message"] = _truncate_error_text(message)
-    return safe_error
-
-
-def _json_error_text(value: Mapping[str, Any]) -> str:
-    try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        return str(value)
-
-
-def _truncate_error_text(value: str) -> str:
-    if len(value) <= MAX_PROVIDER_ERROR_BODY_CHARS:
-        return value
-    return value[:MAX_PROVIDER_ERROR_BODY_CHARS] + "... [truncated]"
-
-
-def _exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: OpenAI provider failed"
+_STALE_CHAIN_ERROR_CODE = "previous_response_not_found"
+_STALE_CHAIN_PARAM = "previous_response_id"
 
 
 def _is_stale_chain_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    if "previous_response_id" in message and "not found" in message:
+    """Classify a stale server-side chain from typed error identity.
+
+    OpenAI reports a stale/expired ``previous_response_id`` as HTTP 404 with
+    ``code: "previous_response_not_found"`` (``param: "previous_response_id"``).
+    Classification reads only the structured fields captured on
+    `OpenAIAPIError` — never message text — so unrelated errors that merely
+    mention the field (e.g. a 400 for combining it with ``conversation``) are
+    not misclassified as recoverable.
+    """
+    if not isinstance(exc, OpenAIAPIError):
+        return False
+    if exc.error_code == _STALE_CHAIN_ERROR_CODE:
         return True
-    return "previous response with id" in message and "not found" in message
+    return exc.status_code == 404 and exc.param == _STALE_CHAIN_PARAM
 
 
 def _validate_reasoning_state(value: str) -> str:

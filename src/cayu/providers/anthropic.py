@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol, cast
-from urllib.parse import urlparse
-
-import certifi
-import httpx
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
@@ -25,6 +20,18 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.providers._http import (
+    copy_headers,
+    exception_message,
+    json_error_text,
+    optional_error_string,
+    post_json,
+    response_json_object,
+    safe_error_response_text,
+    truncate_error_text,
+    validate_base_url,
+    validate_url,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -32,6 +39,7 @@ from cayu.providers.base import (
     ModelContextOverflowError,
     ModelContextPressureProfile,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
 )
@@ -41,11 +49,13 @@ from cayu.providers.cache import (
     resolve_cache_policy,
 )
 
+if TYPE_CHECKING:
+    import httpx
+
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
-MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
 ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
 
@@ -68,8 +78,33 @@ class AnthropicError(RuntimeError):
     """Base error for Anthropic provider failures."""
 
 
-class AnthropicAPIError(AnthropicError):
+class AnthropicAPIError(AnthropicError, ModelProviderError):
     """Raised when the Anthropic HTTP API returns an error response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        retryable: bool | None = None,
+        retry_after_s: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelProviderError.__init__(
+            self,
+            message,
+            provider="anthropic",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            response_body=response_body,
+        )
 
 
 class AnthropicContextOverflowError(AnthropicAPIError, ModelContextOverflowError):
@@ -165,37 +200,18 @@ class HttpxAnthropicTransport:
         timeout_s: float,
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout_s,
-                verify=certifi.where(),
-            ) as client:
-                response = await client.post(
-                    url,
-                    headers=dict(headers),
-                    json=dict(payload),
-                )
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            try:
-                _raise_anthropic_context_overflow_if_applicable(exc.response)
-            except ModelContextOverflowError as overflow:
-                raise overflow from exc
-            raise AnthropicAPIError(
-                "Anthropic API request failed with HTTP "
-                f"{exc.response.status_code}: "
-                f"{_safe_error_response_text(exc.response)}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise AnthropicAPIError(f"Anthropic API request failed for {url}: {exc}") from exc
-
-        try:
-            decoded = response.json()
-        except ValueError as exc:
-            raise AnthropicProtocolError("Anthropic response was not valid JSON.") from exc
-        if not isinstance(decoded, Mapping):
-            raise AnthropicProtocolError("Anthropic response must be a JSON object.")
-        return decoded
+        return await post_json(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            request_label="Anthropic API",
+            response_label="Anthropic",
+            api_error=AnthropicAPIError,
+            protocol_error=AnthropicProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_anthropic_context_overflow_if_applicable,
+        )
 
 
 class AnthropicProvider(ModelProvider):
@@ -268,8 +284,15 @@ class AnthropicProvider(ModelProvider):
             )
             for event in anthropic_response_events(response):
                 yield event
+        except ModelContextOverflowError:
+            # Overflow must reach runtime recovery as a typed exception; an
+            # error event would flatten it into unrecoverable message text.
+            raise
         except Exception as exc:
-            yield ModelStreamEvent.error(_exception_message(exc))
+            yield ModelStreamEvent.error(
+                exception_message(exc, provider_label="Anthropic"),
+                cause=exc,
+            )
 
     async def count_input_tokens(
         self,
@@ -770,32 +793,15 @@ def _optional_string(response: Mapping[str, Any], key: str) -> str | None:
 
 
 def _copy_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
-    if headers is None:
-        return {}
-    copied: dict[str, str] = {}
-    for key, value in headers.items():
-        header_name = require_clean_nonblank(key, "header name")
-        if header_name.lower() in _PROTECTED_HEADER_NAMES:
-            raise ValueError(f"extra_headers cannot override {header_name}.")
-        copied[header_name] = require_nonblank(
-            value,
-            f"header {key}",
-        )
-    return copied
+    return copy_headers(headers, protected=_PROTECTED_HEADER_NAMES)
 
 
 def _validate_base_url(base_url: str) -> str:
-    return _validate_url(base_url, "base_url").rstrip("/")
+    return validate_base_url(base_url, provider_label="Anthropic")
 
 
 def _validate_url(url: str, field_name: str) -> str:
-    value = require_clean_nonblank(url, field_name)
-    parsed = urlparse(value)
-    if parsed.scheme != "https":
-        raise ValueError(f"Anthropic {field_name} must use https.")
-    if not parsed.netloc:
-        raise ValueError(f"Anthropic {field_name} must include a host.")
-    return value
+    return validate_url(url, field_name, provider_label="Anthropic")
 
 
 def _max_tokens(value: Any) -> int:
@@ -807,27 +813,25 @@ def _max_tokens(value: Any) -> int:
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            decoded = response.json()
-        except ValueError:
-            return _truncate_error_text(response.text)
-        if isinstance(decoded, Mapping):
-            return _safe_error_json(decoded)
-    return _truncate_error_text(response.text)
+    return safe_error_response_text(response, format_error_json=_format_error_json)
+
+
+def _format_error_json(decoded: Any) -> str | None:
+    if not isinstance(decoded, Mapping):
+        return None
+    return _safe_error_json(decoded)
 
 
 def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) -> None:
-    decoded = _response_json_object(response)
+    decoded = response_json_object(response)
     if decoded is None:
         return
     error = decoded.get("error")
     request_id = decoded.get("request_id")
     if not isinstance(error, Mapping):
         return
-    error_type = _optional_error_string(error.get("type"))
-    message = _optional_error_string(error.get("message"))
+    error_type = optional_error_string(error.get("type"))
+    message = optional_error_string(error.get("message"))
     if not _is_anthropic_context_overflow(
         status_code=response.status_code,
         error_type=error_type,
@@ -862,25 +866,6 @@ def _is_anthropic_context_overflow(
     )
 
 
-def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" not in content_type:
-        return None
-    try:
-        decoded = response.json()
-    except ValueError:
-        return None
-    if not isinstance(decoded, Mapping):
-        return None
-    return decoded
-
-
-def _optional_error_string(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:
     error = decoded.get("error")
     request_id = decoded.get("request_id")
@@ -891,29 +876,9 @@ def _safe_error_json(decoded: Mapping[str, Any]) -> str:
         if isinstance(error_type, str):
             safe_error["type"] = error_type
         if isinstance(message, str):
-            safe_error["message"] = _truncate_error_text(message)
+            safe_error["message"] = truncate_error_text(message)
         if isinstance(request_id, str):
             safe_error["request_id"] = request_id
         if safe_error:
-            return _json_error_text(safe_error)
-    return _truncate_error_text(_json_error_text(dict(decoded)))
-
-
-def _json_error_text(value: Mapping[str, Any]) -> str:
-    try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        return str(value)
-
-
-def _truncate_error_text(value: str) -> str:
-    if len(value) <= MAX_PROVIDER_ERROR_BODY_CHARS:
-        return value
-    return value[:MAX_PROVIDER_ERROR_BODY_CHARS] + "... [truncated]"
-
-
-def _exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: Anthropic provider failed"
+            return json_error_text(safe_error)
+    return truncate_error_text(json_error_text(dict(decoded)))

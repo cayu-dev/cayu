@@ -38,6 +38,7 @@ from cayu.providers import (
     openai_embedding_result,
     openai_response_events,
 )
+from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.openai import openai_stream_events
 
 
@@ -1610,7 +1611,7 @@ async def test_httpx_openai_transport_includes_url_in_network_errors(monkeypatch
             )
 
     monkeypatch.setattr(
-        "cayu.providers.openai.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -1665,7 +1666,7 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
             )
 
     monkeypatch.setattr(
-        "cayu.providers.openai.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -1727,7 +1728,7 @@ async def test_httpx_openai_transport_classifies_context_overflow(monkeypatch) -
             )
 
     monkeypatch.setattr(
-        "cayu.providers.openai.httpx.AsyncClient",
+        "cayu.providers._http.httpx.AsyncClient",
         FailingClient,
     )
 
@@ -1786,22 +1787,97 @@ async def test_openai_provider_emits_nonblank_error_for_blank_exception() -> Non
     events = [event async for event in provider.stream(request)]
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert events[0].payload == {"error": "RuntimeError: OpenAI provider failed"}
+    assert events[0].payload == {
+        "error": "RuntimeError: OpenAI provider failed",
+        "error_type": "RuntimeError",
+    }
 
 
 @pytest.mark.anyio
-async def test_openai_sse_parser_does_not_let_keepalives_reset_event_idle_timeout() -> None:
+async def test_openai_provider_stream_propagates_context_overflow() -> None:
+    overflow = OpenAIContextOverflowError(
+        "OpenAI model context overflow",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+
+    class OverflowTransport:
+        async def create_response(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            payload: Mapping[str, Any],
+            timeout_s: float,
+        ) -> Mapping[str, Any]:
+            raise AssertionError("create_response should not be called.")
+
+        async def stream_response_events(
+            self,
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            payload: Mapping[str, Any],
+            timeout_s: float,
+            stream_idle_timeout_s: float,
+        ):
+            raise overflow
+            yield {}
+
+    provider = OpenAIProvider(api_key="test-key", transport=OverflowTransport())
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "hello")],
+    )
+
+    with pytest.raises(OpenAIContextOverflowError) as exc_info:
+        [event async for event in provider.stream(request)]
+
+    # Overflow must escape as a typed exception (not an ERROR event) so
+    # runtime context-overflow recovery can shrink context and retry.
+    assert exc_info.value is overflow
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_openai_sse_parser_lets_keepalive_heartbeats_refresh_idle_timer() -> None:
+    # OpenAI streams parse through the shared SSE parser, so `:` keep-alive
+    # heartbeats count as stream activity (same semantics as Chat Completions;
+    # previously the two parsers had drifted apart on this).
     async def lines():
-        yield ": keepalive"
-        await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0.04)
+            yield ": keepalive"
+        yield 'data: {"ok": true}'
         yield ""
 
-    with pytest.raises(TimeoutError, match="no SSE events"):
+    events = [
+        event
+        async for event in aiter_sse_json_events(
+            lines(),
+            idle_timeout_s=0.1,
+            provider_label="OpenAI",
+            protocol_error=OpenAIProtocolError,
+        )
+    ]
+    assert events == [{"ok": True}]
+
+
+@pytest.mark.anyio
+async def test_openai_sse_parser_times_out_a_silent_stream() -> None:
+    async def lines():
+        await asyncio.sleep(0.05)
+        yield ""
+
+    with pytest.raises(TimeoutError, match="OpenAI streaming response produced no SSE events"):
         [
             event
-            async for event in openai_module._aiter_sse_json_events(
+            async for event in aiter_sse_json_events(
                 lines(),
                 idle_timeout_s=0.001,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
             )
         ]
 
@@ -1972,7 +2048,11 @@ class StaleChainRecoveryTransport:
         if self._calls == 1:
             raise OpenAIAPIError(
                 "OpenAI API request failed with HTTP 404: "
-                '{"message":"Previous response with id resp_prev not found.","type":"invalid_request_error"}'
+                '{"message":"Previous response with id resp_prev not found.","type":"invalid_request_error"}',
+                status_code=404,
+                error_type="invalid_request_error",
+                error_code="previous_response_not_found",
+                param="previous_response_id",
             )
             yield {}  # unreachable; makes this an async generator
         yield {
@@ -2004,7 +2084,10 @@ class NonStalePreviousResponseErrorTransport:
         raise OpenAIAPIError(
             "OpenAI API request failed with HTTP 400: "
             '{"message":"previous_response_id cannot be used with conversation.",'
-            '"type":"invalid_request_error"}'
+            '"type":"invalid_request_error"}',
+            status_code=400,
+            error_type="invalid_request_error",
+            param="previous_response_id",
         )
         yield {}  # unreachable; makes this an async generator
 
@@ -2059,6 +2142,69 @@ async def test_server_mode_does_not_recover_non_stale_previous_response_error() 
 
     assert len(transport.payloads) == 1
     assert any(e.type.name == "ERROR" for e in events)
+
+
+def test_is_stale_chain_error_uses_typed_identity_not_message_text() -> None:
+    assert openai_module._is_stale_chain_error(
+        OpenAIAPIError("chain gone", error_code="previous_response_not_found")
+    )
+    assert openai_module._is_stale_chain_error(
+        OpenAIAPIError("chain gone", status_code=404, param="previous_response_id")
+    )
+    # Message text alone no longer classifies: only structured identity does.
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError("Previous response with id resp_prev not found.")
+    )
+    # A different error about the same param (e.g. invalid combination) is not
+    # a stale chain even though its message names previous_response_id.
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError(
+            "previous_response_id resp_prev not found in conversation state.",
+            status_code=400,
+            error_type="invalid_request_error",
+            param="previous_response_id",
+        )
+    )
+    assert not openai_module._is_stale_chain_error(RuntimeError("previous response not found"))
+
+
+def test_openai_api_error_from_response_captures_typed_identity() -> None:
+    response = httpx.Response(
+        404,
+        headers={"content-type": "application/json"},
+        json={
+            "error": {
+                "message": "Previous response with id 'resp_prev' not found.",
+                "type": "invalid_request_error",
+                "param": "previous_response_id",
+                "code": "previous_response_not_found",
+            },
+            "request_id": "req_123",
+        },
+    )
+
+    error = openai_module._openai_api_error_from_response(response, "OpenAI API request failed")
+
+    assert isinstance(error, OpenAIAPIError)
+    assert str(error) == "OpenAI API request failed"
+    assert error.status_code == 404
+    assert error.error_type == "invalid_request_error"
+    assert error.error_code == "previous_response_not_found"
+    assert error.param == "previous_response_id"
+    assert error.request_id == "req_123"
+    assert openai_module._is_stale_chain_error(error)
+
+
+def test_openai_api_error_from_response_tolerates_non_json_body() -> None:
+    response = httpx.Response(502, headers={"content-type": "text/html"}, text="bad gateway")
+
+    error = openai_module._openai_api_error_from_response(response, "OpenAI API request failed")
+
+    assert error.status_code == 502
+    assert error.error_type is None
+    assert error.error_code is None
+    assert error.param is None
+    assert not openai_module._is_stale_chain_error(error)
 
 
 @pytest.mark.anyio

@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
-from collections.abc import AsyncIterator, Mapping
-from typing import Any, Protocol
-from urllib.parse import urlencode, urlparse
-
-import certifi
-import httpx
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import urlencode
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
@@ -26,12 +22,27 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.providers._http import (
+    copy_headers,
+    exception_message,
+    optional_error_string,
+    response_json_object,
+    safe_error_json,
+    safe_error_response_text,
+    stream_sse_json_events,
+    validate_base_url,
+    validate_url,
+)
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
 )
+
+if TYPE_CHECKING:
+    import httpx
 
 # base_url follows the OpenAI-SDK convention: it includes the version path, and
 # the endpoint appends only "/chat/completions". So OpenAI is ".../v1", Gemini is
@@ -43,7 +54,6 @@ DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV = "OPENAI_API_KEY"
 # OpenAI/Together use `Authorization: Bearer <key>`; Azure uses `api-key: <key>`.
 DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER = "Authorization"
 DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX = "Bearer "
-MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 
 _RESERVED_CHAT_COMPLETIONS_OPTIONS = {
     "model",
@@ -73,8 +83,33 @@ class ChatCompletionsError(RuntimeError):
     """Base error for Chat Completions provider failures."""
 
 
-class ChatCompletionsAPIError(ChatCompletionsError):
+class ChatCompletionsAPIError(ChatCompletionsError, ModelProviderError):
     """Raised when the Chat Completions HTTP API returns an error response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        retryable: bool | None = None,
+        retry_after_s: float | None = None,
+        response_body: str | None = None,
+    ) -> None:
+        ModelProviderError.__init__(
+            self,
+            message,
+            provider="chat_completions",
+            status_code=status_code,
+            error_type=error_type,
+            error_code=error_code,
+            request_id=request_id,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            response_body=response_body,
+        )
 
 
 class ChatCompletionsContextOverflowError(
@@ -140,41 +175,21 @@ class HttpxChatCompletionsTransport:
         stream_idle_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url", allow_http=self.allow_http)
-        timeout = httpx.Timeout(timeout_s, read=None)
-        try:
-            async with (
-                httpx.AsyncClient(
-                    timeout=timeout,
-                    verify=certifi.where(),
-                ) as client,
-                client.stream(
-                    "POST",
-                    url,
-                    headers=dict(headers),
-                    json=dict(payload),
-                ) as response,
-            ):
-                if response.status_code >= 400:
-                    # Read the streamed error body while the response is still open.
-                    # Otherwise _safe_error_response_text touches an unread streaming
-                    # body and raises httpx.ResponseNotRead, masking the real API
-                    # error (e.g. HTTP 404 from a wrong endpoint).
-                    await response.aread()
-                    _raise_chat_context_overflow_if_applicable(response)
-                    raise ChatCompletionsAPIError(
-                        "Chat Completions API request failed with HTTP "
-                        f"{response.status_code}: "
-                        f"{_safe_error_response_text(response)}"
-                    )
-                async for event in _aiter_sse_json_events(
-                    response.aiter_lines(),
-                    idle_timeout_s=stream_idle_timeout_s,
-                ):
-                    yield event
-        except httpx.RequestError as exc:
-            raise ChatCompletionsAPIError(
-                f"Chat Completions API request failed for {url}: {exc}"
-            ) from exc
+        events = stream_sse_json_events(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            stream_idle_timeout_s=stream_idle_timeout_s,
+            request_label="Chat Completions API",
+            response_label="Chat Completions",
+            api_error=ChatCompletionsAPIError,
+            protocol_error=ChatCompletionsProtocolError,
+            error_response_text=_safe_error_response_text,
+            raise_context_overflow=_raise_chat_context_overflow_if_applicable,
+        )
+        async for event in events:
+            yield event
 
 
 class ChatCompletionsProvider(ModelProvider):
@@ -252,7 +267,7 @@ class ChatCompletionsProvider(ModelProvider):
         )
         # Protect the headers we set (content-type + the chosen auth header) from
         # being clobbered by extra_headers.
-        self.extra_headers = _copy_headers(
+        self.extra_headers = copy_headers(
             extra_headers, protected={"content-type", self.auth_header.lower()}
         )
         if api_version is not None and not require_clean_nonblank(api_version, "api_version"):
@@ -288,8 +303,15 @@ class ChatCompletionsProvider(ModelProvider):
             )
             async for event in chat_completions_stream_events(raw_events):
                 yield event
+        except ModelContextOverflowError:
+            # Overflow must reach runtime recovery as a typed exception; an
+            # error event would flatten it into unrecoverable message text.
+            raise
         except Exception as exc:
-            yield ModelStreamEvent.error(_exception_message(exc))
+            yield ModelStreamEvent.error(
+                exception_message(exc, provider_label="Chat Completions"),
+                cause=exc,
+            )
 
     def _endpoint(self) -> str:
         # OpenAI-SDK convention: base_url already carries the version path, so
@@ -672,7 +694,7 @@ def _assistant_message(message: Message) -> dict[str, Any]:
 
 
 def _joined_text(
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
+    content: Sequence[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
 ) -> str:
     text_parts: list[str] = []
     for part in content:
@@ -810,18 +832,6 @@ def _optional_string(value: Mapping[str, Any], key: str) -> str | None:
     return raw_value
 
 
-def _copy_headers(headers: Mapping[str, str] | None, *, protected: set[str]) -> dict[str, str]:
-    if headers is None:
-        return {}
-    copied: dict[str, str] = {}
-    for key, value in headers.items():
-        header_name = require_clean_nonblank(key, "header name")
-        if header_name.lower() in protected:
-            raise ValueError(f"extra_headers cannot override {header_name}.")
-        copied[header_name] = require_nonblank(value, f"header {key}")
-    return copied
-
-
 def _validate_document_encoding(value: str) -> str:
     if value not in _VALID_DOCUMENT_ENCODINGS:
         raise ValueError(f"document_encoding must be one of {sorted(_VALID_DOCUMENT_ENCODINGS)}.")
@@ -829,125 +839,46 @@ def _validate_document_encoding(value: str) -> str:
 
 
 def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
-    return _validate_url(base_url, "base_url", allow_http=allow_http).rstrip("/")
+    return validate_base_url(
+        base_url,
+        provider_label="Chat Completions",
+        allow_http=allow_http,
+        allow_http_hint=True,
+    )
 
 
 def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:
-    value = require_clean_nonblank(url, field_name)
-    parsed = urlparse(value)
-    allowed_schemes = {"https", "http"} if allow_http else {"https"}
-    if parsed.scheme not in allowed_schemes:
-        suffix = " (set allow_http=True for local http servers)" if not allow_http else ""
-        raise ValueError(
-            f"Chat Completions {field_name} must use {' or '.join(sorted(allowed_schemes))}{suffix}."
-        )
-    if not parsed.netloc:
-        raise ValueError(f"Chat Completions {field_name} must include a host.")
-    return value
-
-
-async def _aiter_sse_json_events(
-    lines: AsyncIterator[str],
-    *,
-    idle_timeout_s: float,
-) -> AsyncIterator[Mapping[str, Any]]:
-    if idle_timeout_s <= 0:
-        raise ValueError("idle_timeout_s must be greater than zero.")
-    iterator = lines.__aiter__()
-    loop = asyncio.get_running_loop()
-    last_event_at = loop.time()
-    data_lines: list[str] = []
-
-    while True:
-        elapsed = loop.time() - last_event_at
-        remaining = idle_timeout_s - elapsed
-        if remaining <= 0:
-            raise TimeoutError(
-                "Chat Completions streaming response produced no SSE events "
-                f"for {idle_timeout_s:g} seconds."
-            )
-        try:
-            line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
-        except StopAsyncIteration:
-            break
-        except TimeoutError:
-            raise TimeoutError(
-                "Chat Completions streaming response produced no SSE events "
-                f"for {idle_timeout_s:g} seconds."
-            ) from None
-
-        if line.startswith(":"):
-            # SSE comment / keep-alive heartbeat: count it as stream activity so a
-            # slow-but-alive stream is not killed by the idle timeout.
-            last_event_at = loop.time()
-            continue
-        if line == "":
-            if not data_lines:
-                continue
-            data = "\n".join(data_lines)
-            data_lines = []
-            if data == "[DONE]":
-                break
-            try:
-                decoded = json.loads(data)
-            except ValueError as exc:
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions SSE data was not valid JSON."
-                ) from exc
-            if not isinstance(decoded, Mapping):
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions SSE data must decode to a JSON object."
-                )
-            last_event_at = loop.time()
-            yield decoded
-            continue
-        if line.startswith("data:"):
-            data = line[5:]
-            if data.startswith(" "):
-                data = data[1:]
-            data_lines.append(data)
-            continue
-
-    if data_lines:
-        data = "\n".join(data_lines)
-        if data != "[DONE]":
-            try:
-                decoded = json.loads(data)
-            except ValueError as exc:
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions SSE data was not valid JSON."
-                ) from exc
-            if not isinstance(decoded, Mapping):
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions SSE data must decode to a JSON object."
-                )
-            yield decoded
+    return validate_url(
+        url,
+        field_name,
+        provider_label="Chat Completions",
+        allow_http=allow_http,
+        allow_http_hint=True,
+    )
 
 
 def _safe_error_response_text(response: httpx.Response) -> str:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            decoded = response.json()
-        except ValueError:
-            return _truncate_error_text(response.text)
-        if isinstance(decoded, Mapping):
-            return _safe_error_json(decoded)
-    return _truncate_error_text(response.text)
+    return safe_error_response_text(response, format_error_json=_format_error_json)
+
+
+def _format_error_json(decoded: Any) -> str | None:
+    if not isinstance(decoded, Mapping):
+        return None
+    return safe_error_json(decoded)
 
 
 def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None:
-    decoded = _response_json_object(response)
+    decoded = response_json_object(response)
     if decoded is None:
         return
     error = decoded.get("error")
     if not isinstance(error, Mapping):
         error = decoded
-    error_type = _optional_error_string(error.get("type")) or _optional_error_string(
+    error_type = optional_error_string(error.get("type")) or optional_error_string(
         error.get("status")
     )
-    code = _optional_error_string(error.get("code"))
-    message = _optional_error_string(error.get("message"))
+    code = optional_error_string(error.get("code"))
+    message = optional_error_string(error.get("message"))
     if not _is_chat_context_overflow(
         status_code=response.status_code,
         error_type=error_type,
@@ -993,68 +924,3 @@ def _is_chat_context_overflow(
     ):
         return True
     return status_code in {400, 500, 504} and "context" in normalized and "too large" in normalized
-
-
-def _response_json_object(response: httpx.Response) -> Mapping[str, Any] | None:
-    content_type = response.headers.get("content-type", "")
-    if "application/json" not in content_type:
-        return None
-    try:
-        decoded = response.json()
-    except ValueError:
-        return None
-    if not isinstance(decoded, Mapping):
-        return None
-    return decoded
-
-
-def _optional_error_string(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _safe_error_json(decoded: Mapping[str, Any]) -> str:
-    error = decoded.get("error")
-    if isinstance(error, Mapping):
-        safe_error = _safe_flat_error_json(error)
-        if safe_error:
-            return _json_error_text(safe_error)
-    safe_error = _safe_flat_error_json(decoded)
-    if safe_error:
-        return _json_error_text(safe_error)
-    return _truncate_error_text(_json_error_text(dict(decoded)))
-
-
-def _safe_flat_error_json(error: Mapping[str, Any]) -> dict[str, str]:
-    error_type = error.get("type")
-    message = error.get("message")
-    code = error.get("code")
-    safe_error: dict[str, str] = {}
-    if isinstance(error_type, str):
-        safe_error["type"] = error_type
-    if isinstance(code, str):
-        safe_error["code"] = code
-    if isinstance(message, str):
-        safe_error["message"] = _truncate_error_text(message)
-    return safe_error
-
-
-def _json_error_text(value: Mapping[str, Any]) -> str:
-    try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        return str(value)
-
-
-def _truncate_error_text(value: str) -> str:
-    if len(value) <= MAX_PROVIDER_ERROR_BODY_CHARS:
-        return value
-    return value[:MAX_PROVIDER_ERROR_BODY_CHARS] + "... [truncated]"
-
-
-def _exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: Chat Completions provider failed"
