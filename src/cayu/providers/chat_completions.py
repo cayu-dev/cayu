@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode
 
@@ -14,6 +14,7 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -23,13 +24,17 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._http import (
+    SharedAsyncClient,
+    aclose_transport,
     copy_headers,
     exception_message,
+    json_error_text,
     optional_error_string,
     response_json_object,
     safe_error_json,
     safe_error_response_text,
     stream_sse_json_events,
+    truncate_error_text,
     validate_base_url,
     validate_url,
 )
@@ -158,12 +163,21 @@ class ChatCompletionsTransport(Protocol):
 
 
 class HttpxChatCompletionsTransport:
-    """HTTP transport with explicit certifi-backed TLS verification."""
+    """HTTP transport with explicit certifi-backed TLS verification.
+
+    Owns one shared httpx.AsyncClient (created lazily) that is reused across
+    requests so each model call does not pay for a fresh TLS handshake. Close it
+    with :meth:`aclose` when the transport is no longer needed.
+    """
 
     def __init__(self, *, allow_http: bool = False) -> None:
         if type(allow_http) is not bool:
             raise TypeError("allow_http must be a bool.")
         self.allow_http = allow_http
+        self._client = SharedAsyncClient()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def stream_chat_completions(
         self,
@@ -176,6 +190,7 @@ class HttpxChatCompletionsTransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url", allow_http=self.allow_http)
         events = stream_sse_json_events(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -280,6 +295,10 @@ class ChatCompletionsProvider(ModelProvider):
             raise TypeError("clean_schemas must be a bool.")
         self.clean_schemas = clean_schemas
         self.document_encoding = _validate_document_encoding(document_encoding)
+
+    async def aclose(self) -> None:
+        """Close the transport's shared HTTP client, if it owns one."""
+        await aclose_transport(self.transport)
 
     async def stream(
         self,
@@ -438,6 +457,15 @@ async def chat_completions_stream_events(
         if chunk_usage is not None:
             usage = chunk_usage
 
+        # Some OpenAI-compatible servers report a fault after the stream opens by
+        # emitting a data chunk carrying an ``error`` object instead of an HTTP
+        # error. Such a chunk has no ``choices``; surfacing it here avoids the
+        # misleading "ended before a finish_reason" protocol error it would
+        # otherwise trigger downstream.
+        error = event.get("error")
+        if error is not None:
+            raise _stream_error_chunk_exception(error)
+
         choices = event.get("choices")
         if choices is None:
             continue
@@ -496,6 +524,33 @@ async def chat_completions_stream_events(
             "usage": copy_json_value(usage, "usage"),
         }
     )
+
+
+def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
+    """Build the typed exception for a mid-stream ``{"error": ...}`` chunk.
+
+    The error is surfaced as a context-overflow error when its code/type/message
+    indicate one (so runtime recovery can see it), else as a plain API error.
+    """
+    error_mapping = error if isinstance(error, Mapping) else {}
+    error_type = optional_error_string(error_mapping.get("type"))
+    code = optional_error_string(error_mapping.get("code"))
+    message = optional_error_string(error_mapping.get("message"))
+    detail = message or json_error_text(error)
+    full_message = f"Chat Completions stream reported an error: {truncate_error_text(detail)}"
+    if _is_chat_context_overflow(status_code=0, error_type=error_type, code=code, message=message):
+        return ChatCompletionsContextOverflowError(
+            full_message, error_type=error_type, error_code=code
+        )
+    return ChatCompletionsAPIError(full_message, error_type=error_type, error_code=code)
+
+
+def _tool_call_names_function(tool_call: Mapping[str, Any]) -> bool:
+    """Whether a streamed tool-call fragment carries a ``function.name``."""
+    function = tool_call.get("function")
+    if not isinstance(function, Mapping):
+        return False
+    return _optional_string(function, "name") is not None
 
 
 class _PendingToolCall:
@@ -565,7 +620,12 @@ class _ToolCallAccumulator:
             key: Any = ("index", index)
         elif call_id is not None:
             key = ("id", call_id)
-        elif self._last_key is not None:
+        elif self._last_key is not None and not _tool_call_names_function(tool_call):
+            # A keyless fragment that names no function continues the most recent
+            # call (providers stream arguments across chunks that carry only the
+            # index-less function.arguments). One that *does* name a function is a
+            # distinct call, so fall through to a fresh slot instead of merging it
+            # into the previous call's arguments.
             return self._last_key
         else:
             key = ("sequence", self._next_sequence)
@@ -628,7 +688,7 @@ def _chat_completions_messages(
     if message.role == MessageRole.SYSTEM:
         return []
     if message.role == MessageRole.USER:
-        return [{"role": "user", "content": _joined_text(message.content)}]
+        return [_user_message(message.content, resolved_attachments, document_encoding)]
     if message.role == MessageRole.ASSISTANT:
         return [_assistant_message(message)]
     if message.role == MessageRole.TOOL:
@@ -693,15 +753,51 @@ def _assistant_message(message: Message) -> dict[str, Any]:
     return assistant
 
 
-def _joined_text(
-    content: Sequence[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
-) -> str:
-    text_parts: list[str] = []
+def _user_message(
+    content: tuple[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        ...,
+    ],
+    resolved_attachments: dict[str, dict[str, Any]],
+    document_encoding: str,
+) -> dict[str, Any]:
+    # Text-only turns keep the plain-string content shape for maximum vendor
+    # compatibility; file parts require the content-part list form.
+    if all(type(part) is TextPart for part in content):
+        return {
+            "role": "user",
+            "content": "\n".join(part.text for part in content if type(part) is TextPart),
+        }
+    parts: list[dict[str, Any]] = []
     for part in content:
-        if type(part) is not TextPart:
-            raise ChatCompletionsProtocolError("User messages can only contain text parts.")
-        text_parts.append(part.text)
-    return "\n".join(text_parts)
+        if type(part) is TextPart:
+            parts.append({"type": "text", "text": part.text})
+            continue
+        if type(part) is FilePart:
+            parts.append(
+                _file_attachment_part(
+                    _resolved_user_attachment(part, resolved_attachments),
+                    document_encoding,
+                )
+            )
+            continue
+        raise ChatCompletionsProtocolError("User messages can only contain text and file parts.")
+    return {"role": "user", "content": parts}
+
+
+def _resolved_user_attachment(
+    part: FilePart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    attachment = file_attachment_from_payload(part.attachment)
+    if attachment is None:
+        raise ChatCompletionsProtocolError("User file parts require a file attachment payload.")
+    resolved = resolved_attachments.get(attachment.artifact_id)
+    if resolved is None:
+        raise ChatCompletionsProtocolError(
+            f"Missing resolved file attachment: {attachment.artifact_id}"
+        )
+    return resolved
 
 
 def _file_attachment_parts(

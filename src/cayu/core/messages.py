@@ -14,6 +14,7 @@ from pydantic import (
 )
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts.attachments import FileAttachment
 
 
 class MessageRole(StrEnum):
@@ -130,8 +131,37 @@ class ThinkingPart(BaseModel):
         return self
 
 
+class FilePart(BaseModel):
+    """User-supplied file input (image or document) for a multimodal request.
+
+    `attachment` carries a JSON-safe `cayu.file_attachment.v1` payload
+    referencing a stored artifact — never file bytes. The runtime resolves the
+    artifact from the active ArtifactStore immediately before each provider
+    request, exactly like tool-result attachments.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["file"] = "file"
+    attachment: dict[str, Any]
+
+    @field_validator("attachment", mode="before")
+    @classmethod
+    def validate_attachment(cls, value):
+        copied = copy_json_value(value, "attachment")
+        if type(copied) is not dict:
+            raise ValueError("`attachment` must be a file attachment object.")
+        return FileAttachment.model_validate(copied).model_dump(mode="json")
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> FilePart:
+        return self
+
+
 class _ValidatedContent(
-    tuple[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart, ...]
+    tuple[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        ...,
+    ]
 ):
     """Marker type for content produced by full `Message` validation.
 
@@ -159,7 +189,8 @@ class Message(BaseModel):
 
     role: MessageRole
     content: tuple[
-        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart, ...
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+        ...,
     ] = ()
 
     @field_validator("content")
@@ -174,7 +205,9 @@ class Message(BaseModel):
     def validate_role_content(self) -> Message:
         if not self.content:
             raise ValueError("Message content cannot be empty.")
-        if self.role in {MessageRole.USER, MessageRole.SYSTEM}:
+        if self.role == MessageRole.USER:
+            _require_parts(self.role, self.content, TextPart, FilePart)
+        elif self.role == MessageRole.SYSTEM:
             _require_parts(self.role, self.content, TextPart)
         elif self.role == MessageRole.ASSISTANT:
             _require_parts(
@@ -202,7 +235,9 @@ class Message(BaseModel):
         arguments: dict[str, Any] | None = None,
         calls: list[ToolCallPart] | None = None,
     ) -> Message:
-        content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart]
+        content: list[
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        ]
         if calls is not None:
             if tool_call_id is not None or tool_name is not None or arguments is not None:
                 raise ValueError(
@@ -237,7 +272,7 @@ class Message(BaseModel):
         results: list[ToolResultPart] | None = None,
     ) -> Message:
         result_parts: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
         ]
         if not isinstance(content, str):
             raise ValueError("`content` must be a string.")
@@ -275,13 +310,16 @@ class Message(BaseModel):
 
 def _require_parts(
     role: MessageRole,
-    content: Sequence[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
+    content: Sequence[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+    ],
     *allowed_types: (
         type[TextPart]
         | type[ToolCallPart]
         | type[ToolResultPart]
         | type[ProviderStatePart]
         | type[ThinkingPart]
+        | type[FilePart]
     ),
 ) -> None:
     invalid_parts = [part.type for part in content if not isinstance(part, allowed_types)]
@@ -297,7 +335,14 @@ def _require_value(name: str, value: str | None) -> str:
     return _require_clean_nonblank(name, value)
 
 
-_MESSAGE_PART_TYPES = (TextPart, ToolCallPart, ToolResultPart, ProviderStatePart, ThinkingPart)
+_MESSAGE_PART_TYPES = (
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+    ProviderStatePart,
+    ThinkingPart,
+    FilePart,
+)
 
 
 def copy_message(message: Message) -> Message:
@@ -318,13 +363,14 @@ def copy_message(message: Message) -> Message:
 
 
 def copy_message_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
-) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart:
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart:
     """Return an owned copy of `part`.
 
     Parts are frozen, but the caller that constructed a part may still hold
     references to its mutable JSON payloads (`arguments`, `structured`,
-    `artifacts`, `state`, `provider_state`). Copying a part generically — a
+    `artifacts`, `state`, `provider_state`, `attachment`). Copying a part
+    generically — a
     dump/validate round-trip through the part's own validators — detaches
     those payloads and revalidates `model_construct`-bypassed parts without a
     per-field copier that can drift as fields are added.

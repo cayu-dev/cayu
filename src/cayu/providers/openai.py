@@ -13,6 +13,7 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -30,6 +31,8 @@ from cayu.embeddings import (
     copy_text_embedding_request,
 )
 from cayu.providers._http import (
+    SharedAsyncClient,
+    aclose_transport,
     copy_headers,
     exception_message,
     optional_error_string,
@@ -194,7 +197,18 @@ class OpenAITransport(Protocol):
 
 
 class HttpxOpenAITransport:
-    """HTTP transport with explicit certifi-backed TLS verification."""
+    """HTTP transport with explicit certifi-backed TLS verification.
+
+    Owns one shared httpx.AsyncClient (created lazily) that is reused across
+    requests so each model call does not pay for a fresh TLS handshake. Close it
+    with :meth:`aclose` when the transport is no longer needed.
+    """
+
+    def __init__(self) -> None:
+        self._client = SharedAsyncClient()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def create_response(
         self,
@@ -206,6 +220,7 @@ class HttpxOpenAITransport:
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
         return await post_json(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -230,6 +245,7 @@ class HttpxOpenAITransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -374,6 +390,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         )
         async for event in openai_stream_events(raw_events, reasoning_state=self.reasoning_state):
             yield event
+
+    async def aclose(self) -> None:
+        """Close the transport's shared HTTP client, if it owns one."""
+        await aclose_transport(self.transport)
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -1232,7 +1252,9 @@ def _openai_input_items(
         return [
             {
                 "role": "user",
-                "content": [_input_text_part(part) for part in message.content],
+                "content": [
+                    _user_input_part(part, resolved_attachments) for part in message.content
+                ],
             }
         ]
     if message.role == MessageRole.ASSISTANT:
@@ -1346,16 +1368,32 @@ def _openai_provider_state_items(
     return items
 
 
-def _input_text_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
-) -> dict[str, str]:
-    if type(part) is not TextPart:
-        raise OpenAIProtocolError("User messages can only contain text parts.")
-    return {"type": "input_text", "text": part.text}
+def _user_input_part(
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if type(part) is TextPart:
+        return {"type": "input_text", "text": part.text}
+    if type(part) is FilePart:
+        return _openai_file_attachment_part(_resolved_user_attachment(part, resolved_attachments))
+    raise OpenAIProtocolError("User messages can only contain text and file parts.")
+
+
+def _resolved_user_attachment(
+    part: FilePart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    attachment = file_attachment_from_payload(part.attachment)
+    if attachment is None:
+        raise OpenAIProtocolError("User file parts require a file attachment payload.")
+    resolved = resolved_attachments.get(attachment.artifact_id)
+    if resolved is None:
+        raise OpenAIProtocolError(f"Missing resolved file attachment: {attachment.artifact_id}")
+    return resolved
 
 
 def _output_text_part(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
 ) -> dict[str, str]:
     if type(part) is not TextPart:
         raise OpenAIProtocolError("Assistant text output requires a text part.")
@@ -1373,7 +1411,7 @@ def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
 
 
 def _function_call_output_item(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
 ) -> dict[str, Any]:
     if type(part) is not ToolResultPart:
         raise OpenAIProtocolError("Tool messages can only contain tool_result parts.")

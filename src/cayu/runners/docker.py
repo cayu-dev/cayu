@@ -198,10 +198,9 @@ class DockerRunner(Runner):
     convenience tier, **not** a security boundary. The host ``docker`` process
     inherits the host environment (the CLI needs it); the containerized command
     receives only the explicit per-call ``env`` plus declared ``secret_env``,
-    passed through a private ``--env-file`` so model-controlled values never
-    enter host-visible argv or the docker CLI's own process environment.
-    ``secret_env`` entries are resolved through ``secret_resolver`` at exec time
-    and redacted from captured output.
+    forwarded by name via ``-e`` with values carried in the CLI process env —
+    never in host-visible argv. ``secret_env`` entries are resolved through
+    ``secret_resolver`` at exec time and redacted from captured output.
     """
 
     isolation = "docker"

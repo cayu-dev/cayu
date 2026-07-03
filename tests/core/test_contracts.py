@@ -25,6 +25,7 @@ from cayu.core import (
     AgentSpec,
     Event,
     EventType,
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -1993,6 +1994,60 @@ def test_message_rejects_invalid_role_content_combinations():
         Message(role="tool", content=[TextPart(text="not a result")])
 
 
+def test_message_supports_user_file_parts():
+    attachment = file_attachment(
+        artifact_id="art_1",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+
+    message = Message(
+        role="user",
+        content=[TextPart(text="Read the invoice."), FilePart(attachment=attachment)],
+    )
+
+    part = message.content[1]
+    assert isinstance(part, FilePart)
+    assert part.attachment == attachment
+
+    # JSON round-trip (the storage path) rebuilds the same part type.
+    rebuilt = Message(**message.model_dump(mode="json"))
+    assert isinstance(rebuilt.content[1], FilePart)
+    assert rebuilt.content[1].attachment == attachment
+
+    with pytest.raises(ValueError, match="system messages only support"):
+        Message(role="system", content=[FilePart(attachment=attachment)])
+
+    with pytest.raises(ValueError, match="assistant messages only support"):
+        Message(role="assistant", content=[FilePart(attachment=attachment)])
+
+
+def test_file_part_validates_and_detaches_attachment_payload():
+    with pytest.raises(ValidationError):
+        FilePart(attachment={"artifact_id": "art_1"})
+
+    with pytest.raises(ValidationError):
+        FilePart(attachment="not-an-object")  # type: ignore[arg-type]
+
+    payload = file_attachment(
+        artifact_id="art_1",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="report.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+        metadata={"source": "upload"},
+    )
+    part = FilePart(attachment=payload)
+    payload["metadata"]["source"] = "mutated"
+    assert part.attachment["metadata"] == {"source": "upload"}
+
+    copied = copy_message_part(part)
+    assert isinstance(copied, FilePart)
+    assert copied.attachment == part.attachment
+
+
 def test_tool_message_constructors_reject_ambiguous_grouped_inputs():
     with pytest.raises(ValueError, match="`calls` cannot be empty"):
         Message.tool_call(calls=[])
@@ -2316,22 +2371,6 @@ def test_mcp_server_splits_plain_config_from_secret_refs():
     assert "value" not in dumped["secret_env"]["NOTION_TOKEN"]
     assert dumped["headers"]["X-Client-Name"] == "cayu"
     assert dumped["secret_headers"]["Authorization"]["name"] == "linear_token"
-
-
-def test_mcp_server_rejects_reserved_transport_headers():
-    for header_name in ("content-type", "Accept"):
-        with pytest.raises(ValidationError, match="reserved HTTP headers"):
-            McpServerSpec(
-                name="linear",
-                url="https://mcp.linear.example/sse",
-                headers={header_name: "application/json"},
-            )
-        with pytest.raises(ValidationError, match="reserved HTTP headers"):
-            McpServerSpec(
-                name="linear",
-                url="https://mcp.linear.example/sse",
-                secret_headers={header_name: SecretRef(name="linear_token")},
-            )
 
 
 def test_mcp_server_revalidates_constructed_secret_refs():

@@ -15,6 +15,7 @@ from cayu.artifacts import (
     resolved_file_attachments_from_options,
 )
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -24,6 +25,8 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._http import (
+    SharedAsyncClient,
+    aclose_transport,
     copy_headers,
     exception_message,
     json_error_text,
@@ -46,6 +49,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    UsageDialect,
 )
 from cayu.providers.cache import (
     CacheBreakpoint,
@@ -177,7 +181,18 @@ class AnthropicTransport(Protocol):
 
 
 class HttpxAnthropicTransport:
-    """HTTP transport with explicit certifi-backed TLS verification."""
+    """HTTP transport with explicit certifi-backed TLS verification.
+
+    Owns one shared httpx.AsyncClient (created lazily) that is reused across
+    requests so each model call does not pay for a fresh TLS handshake. Close it
+    with :meth:`aclose` when the transport is no longer needed.
+    """
+
+    def __init__(self) -> None:
+        self._client = SharedAsyncClient()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def count_message_tokens(
         self,
@@ -220,6 +235,7 @@ class HttpxAnthropicTransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -246,6 +262,7 @@ class HttpxAnthropicTransport:
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
         return await post_json(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -272,6 +289,7 @@ class AnthropicProvider(ModelProvider):
     """
 
     name = "anthropic"
+    usage_dialect = UsageDialect.ANTHROPIC
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
@@ -339,6 +357,10 @@ class AnthropicProvider(ModelProvider):
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
             raise TypeError("cache_policy must be a CachePolicy.")
         self.cache_policy = cache_policy
+
+    async def aclose(self) -> None:
+        """Close the transport's shared HTTP client, if it owns one."""
+        await aclose_transport(self.transport)
 
     async def stream(
         self,
@@ -991,7 +1013,10 @@ def _anthropic_message(
     if message.role == MessageRole.USER:
         return {
             "role": "user",
-            "content": [_text_block(part) for part in message.content],
+            "content": [
+                _user_block(part, resolved_attachments=resolved_attachments)
+                for part in message.content
+            ],
         }
     if message.role == MessageRole.ASSISTANT:
         # Thinking blocks must lead the assistant content and round-trip verbatim with
@@ -1024,16 +1049,35 @@ def _anthropic_message(
     raise AnthropicProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
-def _text_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
-) -> dict[str, str]:
-    if type(part) is not TextPart:
-        raise AnthropicProtocolError("User messages can only contain text blocks.")
-    return {"type": "text", "text": part.text}
+def _user_block(
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
+    *,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if type(part) is TextPart:
+        return {"type": "text", "text": part.text}
+    if type(part) is FilePart:
+        return _anthropic_file_attachment_block(
+            _resolved_user_attachment(part, resolved_attachments)
+        )
+    raise AnthropicProtocolError("User messages can only contain text and file blocks.")
+
+
+def _resolved_user_attachment(
+    part: FilePart,
+    resolved_attachments: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    attachment = file_attachment_from_payload(part.attachment)
+    if attachment is None:
+        raise AnthropicProtocolError("User file parts require a file attachment payload.")
+    resolved = resolved_attachments.get(attachment.artifact_id)
+    if resolved is None:
+        raise AnthropicProtocolError(f"Missing resolved file attachment: {attachment.artifact_id}")
+    return resolved
 
 
 def _assistant_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
 ) -> dict[str, Any]:
     if type(part) is TextPart:
         return {"type": "text", "text": part.text}
@@ -1068,7 +1112,7 @@ def _assistant_thinking_block(part: ThinkingPart) -> dict[str, Any] | None:
 
 
 def _tool_result_block(
-    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
+    part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:

@@ -20,7 +20,7 @@ from cayu.providers import (
     HttpxOpenAITransport,
     OpenAIProtocolError,
 )
-from cayu.providers._http import validate_base_url, validate_url
+from cayu.providers._http import SharedAsyncClient, validate_base_url, validate_url
 from cayu.providers._sse import aiter_sse_json_events
 
 
@@ -53,6 +53,8 @@ class _StreamContext:
 
 def _client_factory(response: _StreamingResponse) -> type:
     class FakeClient:
+        is_closed = False
+
         def __init__(self, **kwargs: Any) -> None:
             pass
 
@@ -69,6 +71,7 @@ def _client_factory(response: _StreamingResponse) -> type:
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> _StreamContext:
             return _StreamContext(response)
 
@@ -205,6 +208,111 @@ async def test_sse_parser_stops_at_done_marker() -> None:
         )
     ]
     assert events == [{"n": 1}]
+
+
+class _CountingClient:
+    """Records how many httpx clients a transport constructs and closes."""
+
+    constructed = 0
+    closed = 0
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).constructed += 1
+        self.is_closed = False
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+        timeout: Any = None,
+    ) -> _StreamContext:
+        return _StreamContext(_StreamingResponse(['data: {"ok": true}', "", "data: [DONE]", ""]))
+
+    async def aclose(self) -> None:
+        self.is_closed = True
+        type(self).closed += 1
+
+
+async def _drain_stream(transport: HttpxOpenAITransport) -> list[dict[str, Any]]:
+    return [
+        event
+        async for event in transport.stream_response_events(
+            url="https://api.openai.com/v1/responses",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_transport_reuses_one_client_across_requests(monkeypatch) -> None:
+    class Client(_CountingClient):
+        constructed = 0
+        closed = 0
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", Client)
+
+    transport = HttpxOpenAITransport()
+    assert await _drain_stream(transport) == [{"ok": True}]
+    assert await _drain_stream(transport) == [{"ok": True}]
+
+    # Two requests, one shared client: no fresh TLS handshake per request.
+    assert Client.constructed == 1
+    assert Client.closed == 0
+
+
+@pytest.mark.anyio
+async def test_transport_aclose_closes_shared_client_and_reopens(monkeypatch) -> None:
+    class Client(_CountingClient):
+        constructed = 0
+        closed = 0
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", Client)
+
+    transport = HttpxOpenAITransport()
+    await _drain_stream(transport)
+    await transport.aclose()
+    assert Client.closed == 1
+
+    # A request after aclose transparently recreates the client.
+    await _drain_stream(transport)
+    assert Client.constructed == 2
+
+    # aclose on an already-closed / never-used transport is a harmless no-op.
+    await transport.aclose()
+    fresh = HttpxOpenAITransport()
+    await fresh.aclose()
+
+
+@pytest.mark.anyio
+async def test_shared_async_client_is_lazy_and_recreates_after_close(monkeypatch) -> None:
+    class Client(_CountingClient):
+        constructed = 0
+        closed = 0
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", Client)
+
+    shared = SharedAsyncClient()
+    # Constructing the holder opens no sockets.
+    assert Client.constructed == 0
+
+    first = shared.get()
+    assert Client.constructed == 1
+    # Repeated get() reuses the same live client.
+    assert shared.get() is first
+    assert Client.constructed == 1
+
+    await shared.aclose()
+    assert Client.closed == 1
+    # After close, get() builds a fresh client rather than handing back a dead one.
+    second = shared.get()
+    assert second is not first
+    assert Client.constructed == 2
 
 
 async def _iter_lines(lines: list[str]):

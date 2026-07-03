@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank
 from cayu.providers._http import (
+    SharedAsyncClient,
+    aclose_transport,
     exception_message,
     json_error_text,
     optional_error_string,
@@ -33,6 +35,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    UsageDialect,
 )
 
 if TYPE_CHECKING:
@@ -142,7 +145,18 @@ class VertexTransport(Protocol):
 
 
 class HttpxVertexTransport:
-    """HTTP transport with explicit certifi-backed TLS verification."""
+    """HTTP transport with explicit certifi-backed TLS verification.
+
+    Owns one shared httpx.AsyncClient (created lazily) that is reused across
+    requests so each model call does not pay for a fresh TLS handshake. Close it
+    with :meth:`aclose` when the transport is no longer needed.
+    """
+
+    def __init__(self) -> None:
+        self._client = SharedAsyncClient()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def count_message_tokens(
         self,
@@ -185,6 +199,7 @@ class HttpxVertexTransport:
     ) -> AsyncIterator[Mapping[str, Any]]:
         url = _validate_url(url, "url")
         events = stream_sse_json_events(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -211,6 +226,7 @@ class HttpxVertexTransport:
     ) -> Mapping[str, Any]:
         url = _validate_url(url, "url")
         return await post_json(
+            client=self._client.get(),
             url=url,
             headers=headers,
             payload=payload,
@@ -234,14 +250,15 @@ class VertexProvider(ModelProvider):
     ``anthropic_version`` instead.
 
     Notes:
-        - Usage/cache accounting keys on the provider name, so keep the default
-          ``name="vertex"``; a custom name loses the Anthropic-shaped cache-token
-          folding in ``normalize_usage_metrics``.
+        - Usage/cache accounting is Anthropic-shaped; this adapter declares
+          ``usage_dialect = UsageDialect.ANTHROPIC`` so cache-token folding in
+          ``normalize_usage_metrics`` survives a custom ``name``.
         - For budget enforcement, register pricing rows under provider ``"vertex"``
           (Vertex Claude rates differ from the direct Anthropic API).
     """
 
     name = "vertex"
+    usage_dialect = UsageDialect.ANTHROPIC
 
     def __init__(
         self,
@@ -286,6 +303,10 @@ class VertexProvider(ModelProvider):
         )
         self.transport = transport if transport is not None else HttpxVertexTransport()
         self._refresh_lock = asyncio.Lock()
+
+    async def aclose(self) -> None:
+        """Close the transport's shared HTTP client, if it owns one."""
+        await aclose_transport(self.transport)
 
     async def stream(
         self,

@@ -17,7 +17,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import MessageRole, TextPart, ToolCallPart
+from cayu.core.messages import FilePart, MessageRole, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     ChatCompletionsAPIError,
@@ -412,6 +412,104 @@ def test_build_chat_completions_payload_emits_pdf_as_image_url_when_configured()
     }
 
 
+def test_build_chat_completions_payload_translates_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_image",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    document = file_attachment(
+        artifact_id="art_pdf",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="contract.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+    )
+    request = ModelRequest(
+        model="gemini-test",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    TextPart(text="Read the invoice and the contract."),
+                    FilePart(attachment=image),
+                    FilePart(attachment=document),
+                ],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_image": {
+                    "artifact_id": "art_image",
+                    "kind": "image",
+                    "filename": "invoice.png",
+                    "content_type": "image/png",
+                    "data_base64": "aGVsbG8=",
+                    "metadata": {},
+                },
+                "art_pdf": {
+                    "artifact_id": "art_pdf",
+                    "kind": "document",
+                    "filename": "contract.pdf",
+                    "content_type": "application/pdf",
+                    "data_base64": "JVBERi0xLjQ=",
+                    "metadata": {},
+                },
+            }
+        },
+    )
+
+    payload = build_chat_completions_payload(request)
+
+    assert payload["messages"][0] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Read the invoice and the contract."},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+            },
+            {
+                "type": "file",
+                "file": {
+                    "filename": "contract.pdf",
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
+                },
+            },
+        ],
+    }
+
+    # Text-only user turns keep the plain-string content shape.
+    text_only = build_chat_completions_payload(
+        ModelRequest(model="gemini-test", messages=[Message.text("user", "Hi.")])
+    )
+    assert text_only["messages"][0] == {"role": "user", "content": "Hi."}
+
+
+def test_build_chat_completions_payload_requires_resolved_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_missing",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="gemini-test",
+        messages=[
+            Message(
+                role="user",
+                content=[TextPart(text="Read it."), FilePart(attachment=image)],
+            ),
+        ],
+    )
+
+    with pytest.raises(ChatCompletionsProtocolError, match="Missing resolved file attachment"):
+        build_chat_completions_payload(request)
+
+
 def test_provider_rejects_invalid_document_encoding() -> None:
     with pytest.raises(ValueError, match="document_encoding"):
         ChatCompletionsProvider(api_key="test-key", name="gemini", document_encoding="bogus")
@@ -709,6 +807,121 @@ async def test_chat_completions_stream_events_requires_finish_reason() -> None:
 
 
 @pytest.mark.anyio
+async def test_chat_completions_stream_events_raises_on_mid_stream_error_chunk() -> None:
+    # A fault reported after the stream opens arrives as a chunk carrying an
+    # ``error`` object with no ``choices``; it must surface as the real API error,
+    # not the misleading "ended before a finish_reason" protocol error.
+    async def raw_events():
+        yield _text_chunk("partial")
+        yield {
+            "error": {
+                "message": "upstream connection reset",
+                "type": "server_error",
+                "code": "internal_error",
+            }
+        }
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert "upstream connection reset" in str(exc_info.value)
+    assert exc_info.value.error_type == "server_error"
+    assert exc_info.value.error_code == "internal_error"
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_mid_stream_error_context_overflow() -> None:
+    async def raw_events():
+        yield {
+            "error": {
+                "message": "This model's maximum context length is 8192 tokens.",
+                "code": "context_length_exceeded",
+            }
+        }
+
+    with pytest.raises(ChatCompletionsContextOverflowError):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_keyless_named_calls_do_not_merge() -> None:
+    # Two keyless fragments (no ``index``, no ``id``) that each name a function
+    # are distinct calls and must not collapse into one accumulator slot.
+    async def raw_events():
+        yield {
+            "id": "chatcmpl-1",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"id": "call_a", "function": {"name": "alpha", "arguments": "{}"}}
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"id": "call_b", "function": {"name": "beta", "arguments": "{}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload["name"] == "alpha"
+    assert events[1].payload["name"] == "beta"
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_keyless_argument_continuation_merges() -> None:
+    # A keyless fragment that names no function continues the most recent call,
+    # so streamed argument chunks still accumulate into a single tool call.
+    async def raw_events():
+        yield {
+            "id": "chatcmpl-1",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"id": "call_a", "function": {"name": "echo", "arguments": '{"te'}}
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield {
+            "choices": [
+                {
+                    "delta": {"tool_calls": [{"function": {"arguments": 'xt":"hi"}'}}]},
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload == {"id": "call_a", "name": "echo", "arguments": {"text": "hi"}}
+
+
+@pytest.mark.anyio
 async def test_provider_emits_nonblank_error_for_blank_exception() -> None:
     provider = ChatCompletionsProvider(
         api_key="test-key", name="gemini", transport=BlankFailingTransport()
@@ -975,6 +1188,7 @@ async def test_chat_completions_transport_classifies_gemini_context_too_long(
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> ResponseContext:
             return ResponseContext()
 
@@ -1040,6 +1254,7 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> ResponseContext:
             return ResponseContext()
 

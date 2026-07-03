@@ -18,6 +18,9 @@ class AgentSpec(BaseModel):
 
     name: str
     model: str
+    # Registered provider this agent should run on. Falls back to the app's
+    # default provider when unset; a RunRequest.provider_name overrides both.
+    provider_name: str | None = None
     system_prompt: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     provider_options: dict[str, Any] = Field(default_factory=dict)
@@ -31,6 +34,13 @@ class AgentSpec(BaseModel):
     @field_validator("name", "model")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("provider_name")
+    @classmethod
+    def validate_optional_provider_name(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return require_clean_nonblank(value, info.field_name)
 
 

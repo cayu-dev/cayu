@@ -18,7 +18,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, ToolCallPart
+from cayu.core.messages import FilePart, MessageRole, ProviderStatePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.embeddings import TextEmbeddingRequest
 from cayu.providers import (
@@ -378,6 +378,96 @@ def test_build_openai_payload_translates_file_attachments() -> None:
             },
         ],
     }
+
+
+def test_build_openai_payload_translates_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_image",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    document = file_attachment(
+        artifact_id="art_pdf",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="contract.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    TextPart(text="Read the invoice and the contract."),
+                    FilePart(attachment=image),
+                    FilePart(attachment=document),
+                ],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_image": {
+                    "artifact_id": "art_image",
+                    "kind": "image",
+                    "filename": "invoice.png",
+                    "content_type": "image/png",
+                    "data_base64": "aGVsbG8=",
+                    "metadata": {},
+                },
+                "art_pdf": {
+                    "artifact_id": "art_pdf",
+                    "kind": "document",
+                    "filename": "contract.pdf",
+                    "content_type": "application/pdf",
+                    "data_base64": "JVBERi0xLjQ=",
+                    "metadata": {},
+                },
+            }
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["input"][0] == {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Read the invoice and the contract."},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8=",
+            },
+            {
+                "type": "input_file",
+                "filename": "contract.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
+            },
+        ],
+    }
+
+
+def test_build_openai_payload_requires_resolved_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_missing",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message(
+                role="user",
+                content=[TextPart(text="Read it."), FilePart(attachment=image)],
+            ),
+        ],
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="Missing resolved file attachment"):
+        build_openai_payload(request)
 
 
 @pytest.mark.anyio
@@ -1603,6 +1693,7 @@ async def test_httpx_openai_transport_includes_url_in_network_errors(monkeypatch
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             raise httpx.ConnectError(
@@ -1642,6 +1733,7 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(
@@ -1706,6 +1798,7 @@ async def test_httpx_openai_transport_classifies_context_overflow(monkeypatch) -
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(

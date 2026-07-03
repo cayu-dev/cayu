@@ -23,8 +23,59 @@ from cayu.providers.base import ModelContextOverflowError
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 
 
+def new_async_client() -> httpx.AsyncClient:
+    """Build an httpx.AsyncClient with explicit certifi-backed TLS verification.
+
+    Per-request timeouts are passed at call time (see :func:`post_json` and
+    :func:`stream_sse_json_events`), so the client itself carries no fixed
+    timeout and can be reused across both blocking and streaming requests.
+    """
+    return httpx.AsyncClient(verify=certifi.where())
+
+
+class SharedAsyncClient:
+    """One lazily-created httpx.AsyncClient reused across a transport's requests.
+
+    Constructing a fresh ``httpx.AsyncClient`` per model request performs a full
+    TLS handshake and throws away the connection pool every time. A provider
+    transport keeps one ``SharedAsyncClient`` for its lifetime instead, so
+    keep-alive connections are reused across requests, and closes it via
+    :meth:`aclose`. The client is created lazily on first use, so constructing a
+    provider never opens sockets; a client closed out from under the transport
+    (e.g. after ``aclose``) is transparently recreated on the next request.
+    """
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+
+    def get(self) -> httpx.AsyncClient:
+        client = self._client
+        if client is None or client.is_closed:
+            client = new_async_client()
+            self._client = client
+        return client
+
+    async def aclose(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
+
+
+async def aclose_transport(transport: object) -> None:
+    """Close a provider transport's shared HTTP client if it exposes ``aclose``.
+
+    Injected custom transports need not own an httpx client, so a transport
+    without an ``aclose`` method is a no-op rather than an error.
+    """
+    aclose = getattr(transport, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 async def post_json(
     *,
+    client: httpx.AsyncClient,
     url: str,
     headers: Mapping[str, str],
     payload: Mapping[str, Any],
@@ -39,24 +90,23 @@ async def post_json(
 ) -> Mapping[str, Any]:
     """POST a JSON payload and return the decoded JSON object response.
 
-    HTTP failures raise ``api_error`` (after ``raise_context_overflow`` gets a
-    chance to classify them); non-object response bodies raise
-    ``protocol_error``. ``request_label``/``response_label`` prefix messages
-    (e.g. ``"OpenAI API"`` / ``"OpenAI"``). ``api_error_from_response`` lets an
-    adapter build a structured error (typed status/code fields) from the HTTP
-    error response instead of the flat ``api_error(message)``.
+    The caller-owned ``client`` is reused (its connection pool is kept warm)
+    rather than opening a fresh TLS connection per request. HTTP failures raise
+    ``api_error`` (after ``raise_context_overflow`` gets a chance to classify
+    them); non-object response bodies raise ``protocol_error``.
+    ``request_label``/``response_label`` prefix messages (e.g. ``"OpenAI API"``
+    / ``"OpenAI"``). ``api_error_from_response`` lets an adapter build a
+    structured error (typed status/code fields) from the HTTP error response
+    instead of the flat ``api_error(message)``.
     """
     try:
-        async with httpx.AsyncClient(
+        response = await client.post(
+            url,
+            headers=dict(headers),
+            json=dict(payload),
             timeout=timeout_s,
-            verify=certifi.where(),
-        ) as client:
-            response = await client.post(
-                url,
-                headers=dict(headers),
-                json=dict(payload),
-            )
-            response.raise_for_status()
+        )
+        response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         if raise_context_overflow is not None:
             try:
@@ -85,6 +135,7 @@ async def post_json(
 
 async def stream_sse_json_events(
     *,
+    client: httpx.AsyncClient,
     url: str,
     headers: Mapping[str, str],
     payload: Mapping[str, Any],
@@ -100,23 +151,20 @@ async def stream_sse_json_events(
 ) -> AsyncIterator[Mapping[str, Any]]:
     """POST a streaming JSON payload and yield decoded SSE data objects.
 
-    ``api_error_from_response`` mirrors :func:`post_json`: adapters can build a
-    structured error (typed status/code fields) from the HTTP error response.
+    The caller-owned ``client`` is reused across requests; only the streaming
+    response is opened and closed per call. ``api_error_from_response`` mirrors
+    :func:`post_json`: adapters can build a structured error (typed status/code
+    fields) from the HTTP error response.
     """
     timeout = httpx.Timeout(timeout_s, read=None)
     try:
-        async with (
-            httpx.AsyncClient(
-                timeout=timeout,
-                verify=certifi.where(),
-            ) as client,
-            client.stream(
-                "POST",
-                url,
-                headers=dict(headers),
-                json=dict(payload),
-            ) as response,
-        ):
+        async with client.stream(
+            "POST",
+            url,
+            headers=dict(headers),
+            json=dict(payload),
+            timeout=timeout,
+        ) as response:
             if response.status_code >= 400:
                 # Read the streamed error body while the response is still open.
                 # Otherwise error_response_text touches an unread streaming body
@@ -297,9 +345,12 @@ def exception_message(exc: Exception, *, provider_label: str) -> str:
 
 __all__ = [
     "MAX_PROVIDER_ERROR_BODY_CHARS",
+    "SharedAsyncClient",
+    "aclose_transport",
     "copy_headers",
     "exception_message",
     "json_error_text",
+    "new_async_client",
     "optional_error_string",
     "post_json",
     "response_json_object",

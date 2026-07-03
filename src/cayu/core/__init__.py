@@ -3,6 +3,7 @@
 from cayu.core.agents import Agent, AgentSpec
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
+    FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
@@ -20,6 +21,7 @@ __all__ = [
     "AgentSpec",
     "Event",
     "EventType",
+    "FilePart",
     "Message",
     "MessageRole",
     "ProviderStatePart",

@@ -187,12 +187,11 @@ class SbxRunner(Runner):
 
     Requires the ``sbx`` CLI (https://docs.docker.com/ai/sandboxes/). The runner
     does not inherit the trusted host environment into the sandbox; pass explicit
-    ``env`` per call. Env entries are passed through a private ``--env-file`` so
-    model-controlled values never enter host-visible argv or the sbx CLI's own
-    process environment. Declared ``secret_env`` entries are resolved through
-    ``secret_resolver`` at exec time and redacted from captured output. File I/O
-    is expected via RunnerWorkspace (exec-based), so the sandbox guest needs
-    python3.
+    ``env`` per call. Env entries are forwarded by name via ``-e`` with values
+    carried in the CLI process env — never in host-visible argv. Declared
+    ``secret_env`` entries are resolved through ``secret_resolver`` at exec time
+    and redacted from captured output. File I/O is expected via RunnerWorkspace
+    (exec-based), so the sandbox guest needs python3.
     """
 
     isolation = "sbx"

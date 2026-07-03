@@ -44,6 +44,25 @@ class InputTokenCountConfidence(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class UsageDialect(StrEnum):
+    """How a provider's raw usage payload encodes token counters.
+
+    The runtime's usage normalizer folds cache tokens differently per dialect
+    (Anthropic reports cache read/write tokens in separate fields excluded from
+    ``input_tokens``; OpenAI nests cached input in ``*_tokens_details``). A
+    provider whose registered ``name`` is not one of the built-in aliases —
+    Claude reached through Bedrock, a gateway, or a renamed adapter — must
+    declare its dialect here so the normalizer folds cache tokens correctly
+    instead of silently undercounting (and under-billing) them. ``AUTO`` (the
+    default) lets the normalizer infer the dialect from the payload shape.
+    """
+
+    AUTO = "auto"
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+    GENERIC = "generic"
+
+
 class ModelProviderError(RuntimeError):
     """Provider-neutral structured model provider failure.
 
@@ -531,6 +550,13 @@ class ModelProvider(ABC):
     """Normalizes provider-specific model streams."""
 
     name: str
+    usage_dialect: UsageDialect = UsageDialect.AUTO
+    """Usage payload dialect for cache-token normalization; see ``UsageDialect``.
+
+    Defaults to ``AUTO`` (infer from payload shape). Adapters that emit a fixed
+    dialect regardless of their registered ``name`` should override this so
+    renamed or gateway-routed deployments still fold cache tokens correctly.
+    """
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:

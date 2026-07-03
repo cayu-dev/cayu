@@ -18,7 +18,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import TextPart, ToolCallPart
+from cayu.core.messages import FilePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     AnthropicAPIError,
@@ -338,6 +338,103 @@ def test_build_anthropic_payload_translates_pdf_attachments_without_filename() -
     assert "filename" not in document_block
 
 
+def test_build_anthropic_payload_translates_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_image",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    document = file_attachment(
+        artifact_id="art_pdf",
+        kind=FileAttachmentKind.DOCUMENT,
+        filename="contract.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    TextPart(text="Read the invoice and the contract."),
+                    FilePart(attachment=image),
+                    FilePart(attachment=document),
+                ],
+            ),
+        ],
+        options={
+            RESOLVED_FILE_ATTACHMENTS_OPTION: {
+                "art_image": {
+                    "artifact_id": "art_image",
+                    "kind": "image",
+                    "filename": "invoice.png",
+                    "content_type": "image/png",
+                    "data_base64": "aGVsbG8=",
+                    "metadata": {},
+                },
+                "art_pdf": {
+                    "artifact_id": "art_pdf",
+                    "kind": "document",
+                    "filename": "contract.pdf",
+                    "content_type": "application/pdf",
+                    "data_base64": "JVBERi0xLjQ=",
+                    "metadata": {},
+                },
+            }
+        },
+    )
+
+    payload = build_anthropic_payload(request)
+
+    assert payload["messages"][0] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Read the invoice and the contract."},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8=",
+                },
+            },
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0xLjQ=",
+                },
+            },
+        ],
+    }
+
+
+def test_build_anthropic_payload_requires_resolved_user_file_parts() -> None:
+    image = file_attachment(
+        artifact_id="art_missing",
+        kind=FileAttachmentKind.IMAGE,
+        filename="invoice.png",
+        content_type="image/png",
+        size_bytes=5,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message(
+                role="user",
+                content=[TextPart(text="Read it."), FilePart(attachment=image)],
+            ),
+        ],
+    )
+
+    with pytest.raises(AnthropicProtocolError, match="Missing resolved file attachment"):
+        build_anthropic_payload(request)
+
+
 @pytest.mark.anyio
 async def test_anthropic_provider_emits_text_and_completed_events() -> None:
     transport = RecordingTransport(
@@ -642,6 +739,7 @@ async def test_httpx_transport_includes_url_in_network_errors(monkeypatch) -> No
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             raise httpx.ConnectError(
@@ -681,6 +779,7 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(
@@ -745,6 +844,7 @@ async def test_httpx_anthropic_transport_populates_typed_retry_fields(monkeypatc
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(
@@ -813,6 +913,7 @@ async def test_httpx_anthropic_transport_classifies_request_too_large(monkeypatc
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(
@@ -874,6 +975,7 @@ async def test_httpx_anthropic_transport_classifies_prompt_too_long(monkeypatch)
             *,
             headers: dict[str, str],
             json: dict[str, Any],
+            timeout: Any = None,
         ) -> httpx.Response:
             request = httpx.Request("POST", url)
             response = httpx.Response(
