@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -38,8 +39,10 @@ from cayu import (
     mcp_tool_manifest_identity,
     mcp_tool_manifest_tools,
 )
+from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import InMemorySessionStore
+from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "fixtures" / "fake_mcp_server.py"
 
@@ -186,6 +189,45 @@ def test_mcp_tool_adapter_includes_structured_content_in_model_text() -> None:
 
     assert result.content == 'Structured MCP content:\n{\n  "echoed": "structured"\n}'
     assert result.structured["mcp_structured_content"] == {"echoed": "structured"}
+
+
+def test_mcp_tool_adapter_redacts_injected_secrets_echoed_by_server() -> None:
+    # N3: a hostile/buggy MCP server can echo an injected secret (secret_env/
+    # secret_headers) back through tool content/structured output. The toolset must
+    # scrub it before it reaches model-visible context.
+    secret = "sk-super-secret-mcp-value"
+
+    class RedactingSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(McpToolDefinition(name="echo", input_schema={"type": "object"}),)
+            )
+            self._secret_redactor = SecretRedactor((secret,))
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            return McpToolResult(
+                content=[{"type": "text", "text": f"here is your token: {secret}"}],
+                structured_content={"token": secret, "nested": {"also": secret}},
+            )
+
+    session = RedactingSession()
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+    result = asyncio.run(
+        toolset.tools[0].run(ToolContext(session_id="sess_1", agent_name="assistant"), {})
+    )
+
+    # Rendered model text is scrubbed.
+    assert secret not in result.content
+    assert REDACTED_SECRET in result.content
+    # The raw content/structured echoes are scrubbed recursively too.
+    assert secret not in json.dumps(result.structured)
+    assert result.structured["mcp_content"][0]["text"] == f"here is your token: {REDACTED_SECRET}"
+    assert result.structured["mcp_structured_content"]["token"] == REDACTED_SECRET
+    assert result.structured["mcp_structured_content"]["nested"]["also"] == REDACTED_SECRET
 
 
 def test_mcp_tool_manifest_hash_is_stable_for_equivalent_json_order() -> None:
@@ -1489,6 +1531,41 @@ def test_stdio_mcp_client_rejects_unresolved_secret_env() -> None:
         asyncio.run(StdioMcpClient().connect(spec))
 
 
+def test_stdio_mcp_client_injects_secret_env_into_child_process() -> None:
+    # The fake server echoes CAYU_FAKE_MCP_PROTOCOL_VERSION back as the
+    # negotiated protocol version, so a vault-resolved value proves the secret
+    # was injected into the child env (it never appears in argv).
+    spec = McpServerSpec(
+        name="secret-mcp",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        secret_env={"CAYU_FAKE_MCP_PROTOCOL_VERSION": SecretRef(name="protocol")},
+    )
+    vault = StaticVault({"protocol": "1999-01-01"})
+
+    with pytest.raises(McpProtocolError, match="1999-01-01"):
+        asyncio.run(StdioMcpClient(secret_resolver=vault).connect(spec))
+    assert not any("1999-01-01" in item for item in spec.command)
+
+
+def test_stdio_mcp_client_connects_with_resolved_secret_env() -> None:
+    async def run():
+        spec = McpServerSpec(
+            name="secret-mcp",
+            command=[sys.executable, str(_FAKE_SERVER)],
+            secret_env={"CAYU_FAKE_MCP_PROTOCOL_VERSION": SecretRef(name="protocol")},
+        )
+        vault = StaticVault({"protocol": MCP_PROTOCOL_VERSION})
+        session = await StdioMcpClient(secret_resolver=vault).connect(spec)
+        try:
+            return session.initialize_result
+        finally:
+            await session.close()
+
+    initialize_result = asyncio.run(run())
+
+    assert initialize_result.protocol_version == MCP_PROTOCOL_VERSION
+
+
 async def _collect_events(events):
     return [event async for event in events]
 
@@ -1564,3 +1641,21 @@ def _fake_server_spec() -> McpServerSpec:
         name="local-mcp",
         command=[sys.executable, str(_FAKE_SERVER)],
     )
+
+
+def test_mcp_server_spec_rejects_secret_config_collisions() -> None:
+    with pytest.raises(ValueError, match="env and secret_env"):
+        McpServerSpec(
+            name="secret-mcp",
+            command=["server"],
+            env={"TOKEN": "plain"},
+            secret_env={"TOKEN": SecretRef(name="token")},
+        )
+
+    with pytest.raises(ValueError, match="headers and secret_headers"):
+        McpServerSpec(
+            name="secret-mcp",
+            url="https://mcp.example/rpc",
+            headers={"Authorization": "Bearer plain"},
+            secret_headers={"authorization": SecretRef(name="token")},
+        )

@@ -5,11 +5,15 @@ from cayu.vaults.base import (
     SecretEnv,
     SecretNotFound,
     SecretRef,
+    SecretResolver,
     Vault,
     VaultError,
     copy_resolved_secret,
     copy_secret_env,
     copy_secret_ref,
+    resolve_secret_env,
+    secret_env_refs,
+    validate_secret_resolver,
 )
 from cayu.vaults.composite import ChainVault, RoutedVault
 from cayu.vaults.local_env import LocalEnvVault
@@ -26,10 +30,14 @@ __all__ = [
     "SecretNotFound",
     "SecretRedactor",
     "SecretRef",
+    "SecretResolver",
     "StaticVault",
     "Vault",
     "VaultError",
     "copy_resolved_secret",
     "copy_secret_env",
     "copy_secret_ref",
+    "resolve_secret_env",
+    "secret_env_refs",
+    "validate_secret_resolver",
 ]

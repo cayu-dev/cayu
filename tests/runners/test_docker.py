@@ -13,6 +13,7 @@ from cayu.runners.docker import (
     _build_docker_exec_argv,
     _require_docker,
 )
+from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRef, StaticVault
 
 
 def test_require_docker_uses_explicit_path():
@@ -57,7 +58,7 @@ def test_build_exec_argv_process():
         "a1",
         ExecCommand.process("whois", "x.ai"),
         cwd="/workspace",
-        env=None,
+        env_file=None,
         has_stdin=False,
         pid_file="/tmp/cayu-docker-commands/cmd.pid",
     )
@@ -76,21 +77,23 @@ def test_build_exec_argv_shell_env_stdin():
         "a1",
         ExecCommand.bash("echo hi"),
         cwd="/workspace",
-        env={"K": "v"},
+        env_file="/tmp/cayu-runner-env-abc",
         has_stdin=True,
         pid_file="/tmp/cayu-docker-commands/cmd.pid",
     )
+    # Env is passed via --env-file; values never appear in argv.
     assert argv[:9] == [
         "/usr/bin/docker",
         "exec",
         "-i",
         "-w",
         "/workspace",
-        "-e",
-        "K=v",
+        "--env-file",
+        "/tmp/cayu-runner-env-abc",
         "a1",
         "sh",
     ]
+    assert not any("K=v" in item for item in argv)
     assert argv[9] == "-c"
     assert "setsid" in argv[10]
     assert "/tmp/cayu-docker-commands/cmd.pid" in argv[10]
@@ -510,3 +513,62 @@ def test_create_quotes_default_cwd(monkeypatch):
     ]
     assert len(mkdir_cmds) == 1
     assert mkdir_cmds[0][-1] == "mkdir -p '/work space'"
+
+
+def test_exec_injects_declared_secret_env_without_argv_exposure(monkeypatch):
+    calls = {}
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls["argv"] = command.argv
+        calls["kwargs"] = kwargs
+        return ExecResult(stdout="token is sk-super-secret-token", stderr="sk-super-secret-token")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    vault = StaticVault({"api_token": "sk-super-secret-token"})
+    r = DockerRunner(
+        "a1",
+        docker_path="/usr/bin/docker",
+        secret_env=[SecretEnv(name="API_TOKEN", ref=SecretRef(name="api_token"))],
+        secret_resolver=vault,
+    )
+
+    result = asyncio.run(r.exec(ExecCommand.process("env"), env={"PLAIN": "x"}))
+
+    # Container env is passed via --env-file; neither values nor names appear in argv.
+    assert "--env-file" in calls["argv"]
+    assert not any("sk-super-secret-token" in item for item in calls["argv"])
+    assert not any("API_TOKEN" in item for item in calls["argv"])
+    assert not any("PLAIN" in item for item in calls["argv"])
+    # SECURITY (V4): the docker CLI's OWN process env is pristine — model-controlled env
+    # (PLAIN) and secrets (API_TOKEN) are NOT merged into it, so a prompt-injected agent
+    # cannot hijack the host CLI (e.g. by setting DOCKER_HOST to an attacker daemon).
+    assert "API_TOKEN" not in calls["kwargs"]["env"]
+    assert "PLAIN" not in calls["kwargs"]["env"]
+    # Captured output is scrubbed before reaching model-visible context.
+    assert result.stdout == f"token is {REDACTED_SECRET}"
+    assert result.stderr == REDACTED_SECRET
+
+
+def test_exec_rejects_env_key_colliding_with_secret_env(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        raise AssertionError("run_subprocess should not be called")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    r = DockerRunner(
+        "a1",
+        docker_path="/usr/bin/docker",
+        secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        secret_resolver=StaticVault({"api_token": "sk-super-secret-token"}),
+    )
+
+    with pytest.raises(ValueError, match="collides with declared secret_env"):
+        asyncio.run(r.exec(ExecCommand.process("env"), env={"API_TOKEN": "override"}))
+
+
+def test_runner_secret_env_requires_resolver():
+    with pytest.raises(ValueError, match="secret_resolver"):
+        DockerRunner(
+            "a1",
+            docker_path="/usr/bin/docker",
+            secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        )

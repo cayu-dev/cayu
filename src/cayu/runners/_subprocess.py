@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
+import subprocess
 from pathlib import Path
 
 from cayu.runners.base import ExecResult
+
+# Wall-clock bound for draining captured stdout/stderr after the child has been
+# killed. A daemonizing grandchild can inherit the pipe write ends and keep them
+# open indefinitely, so the post-kill read tasks would otherwise never see EOF
+# and hang forever, defeating the timeout guarantee.
+_DRAIN_AFTER_KILL_S = 2.0
 
 
 class SubprocessCommand:
@@ -118,9 +126,11 @@ async def run_subprocess(
         )
 
     input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
+    stdout = _CapturedOutput()
+    stderr = _CapturedOutput()
     stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
-    stdout_task = asyncio.create_task(_read_limited(process.stdout, output_limit))
-    stderr_task = asyncio.create_task(_read_limited(process.stderr, output_limit))
+    stdout_task = asyncio.create_task(_read_limited(process.stdout, output_limit, stdout))
+    stderr_task = asyncio.create_task(_read_limited(process.stderr, output_limit, stderr))
     wait_task = asyncio.create_task(process.wait())
     try:
         await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
@@ -129,9 +139,12 @@ async def run_subprocess(
         timed_out = True
         _kill_process(process, process_group=use_new_session)
         try:
+            # Bounded (see _await_process_exit): process.wait() only resolves
+            # once the captured pipes reach EOF, so a pipe-holding descendant
+            # would otherwise hang this await past the wall-clock limit.
             await _await_process_exit(wait_task)
         except asyncio.CancelledError:
-            await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task)
+            await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task, wait_task)
             raise
     except asyncio.CancelledError:
         _kill_process(process, process_group=use_new_session)
@@ -143,7 +156,15 @@ async def run_subprocess(
     finally:
         await _cleanup_io_tasks(stdin_task)
 
-    stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+    if timed_out:
+        # The child was killed and its exit already awaited (bounded); bound the
+        # output drain too so a daemonizing grandchild that inherited the pipes
+        # cannot hold the read tasks open past the wall-clock limit.
+        await _bounded_drain(
+            process, stdout_task, stderr_task, wait_task, captures=(stdout, stderr)
+        )
+    else:
+        await asyncio.gather(stdout_task, stderr_task)
     return ExecResult(
         stdout=stdout.content.decode("utf-8", errors="replace"),
         stderr=stderr.content.decode("utf-8", errors="replace"),
@@ -217,14 +238,92 @@ def _kill_process(process: asyncio.subprocess.Process, *, process_group: bool) -
             return
         except ProcessLookupError:
             return
+    if os.name == "nt" and _taskkill_tree(process.pid):
+        return
     process.kill()
 
 
-async def _await_process_exit(wait_task: asyncio.Task[int]) -> None:
+def _taskkill_tree(pid: int) -> bool:
+    """Kill a Windows process together with its child tree via ``taskkill /T``.
+
+    ``Process.kill`` maps to ``TerminateProcess``, which only reaps the direct
+    child, so a spawned grandchild could keep the captured pipes open. Returns
+    True when the tree kill was issued successfully.
+    """
     try:
-        await asyncio.shield(wait_task)
+        completed = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return False
+    return completed.returncode == 0
+
+
+async def _bounded_drain(
+    process: asyncio.subprocess.Process,
+    stdout_task: asyncio.Task[None],
+    stderr_task: asyncio.Task[None],
+    wait_task: asyncio.Task[int],
+    *,
+    captures: tuple[_CapturedOutput, ...],
+) -> None:
+    """Await the post-kill exit + read tasks under a wall-clock bound.
+
+    Shielded so the read tasks keep accumulating into their captures until the
+    deadline; on timeout the captures are marked truncated and every task is
+    cancelled so a pipe-holding grandchild cannot block the caller forever.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.shield(stdout_task),
+                asyncio.shield(stderr_task),
+                asyncio.shield(wait_task),
+            ),
+            timeout=_DRAIN_AFTER_KILL_S,
+        )
+    except TimeoutError:
+        for capture in captures:
+            capture.truncated = True
+        await _cleanup_io_tasks(stdout_task, stderr_task, wait_task)
+        _detach_process(process)
     except asyncio.CancelledError:
-        await asyncio.shield(wait_task)
+        await _cleanup_io_tasks(stdout_task, stderr_task, wait_task)
+        _detach_process(process)
+        raise
+
+
+def _detach_process(process: asyncio.subprocess.Process) -> None:
+    """Close the subprocess transport after abandoning a pipe-holding child.
+
+    The direct child is already killed; closing the transport releases our pipe
+    ends while the loop is still running, avoiding an "event loop is closed"
+    teardown warning if a leaked descendant keeps the write ends open.
+    """
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    with contextlib.suppress(Exception):
+        transport.close()
+
+
+async def _await_process_exit(wait_task: asyncio.Task[int]) -> None:
+    """Wait for the killed process to exit, capped by the wall-clock bound.
+
+    asyncio resolves ``process.wait()`` only once every captured pipe reaches
+    EOF, so a daemonizing descendant that inherited the write ends would keep it
+    pending forever. The bound lets us abandon that wait (leaving ``wait_task``
+    to be cancelled by the caller) instead of hanging.
+    """
+    try:
+        await asyncio.wait_for(asyncio.shield(wait_task), timeout=_DRAIN_AFTER_KILL_S)
+    except TimeoutError:
+        return
+    except asyncio.CancelledError:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=_DRAIN_AFTER_KILL_S)
         raise
 
 
@@ -252,31 +351,43 @@ async def _write_stdin(
 
 
 class _CapturedOutput:
-    def __init__(self, content: bytes, *, truncated: bool) -> None:
-        self.content = content
-        self.truncated = truncated
+    """Mutable sink for a captured stream.
+
+    Reads accumulate here in place so that a partially-drained capture remains
+    available to the caller even when its read task is cancelled by the bounded
+    post-kill drain.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+        self._captured = 0
+        self.truncated = False
+
+    @property
+    def content(self) -> bytes:
+        return b"".join(self._chunks)
+
+    def append(self, chunk: bytes, *, limit: int | None) -> None:
+        if limit is None:
+            self._chunks.append(chunk)
+            return
+        remaining = limit - self._captured
+        if remaining > 0:
+            self._chunks.append(chunk[:remaining])
+            self._captured += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            self.truncated = True
 
 
 async def _read_limited(
     stream: asyncio.StreamReader | None,
     limit: int | None,
-) -> _CapturedOutput:
+    out: _CapturedOutput,
+) -> None:
     if stream is None:
-        return _CapturedOutput(b"", truncated=False)
-    chunks: list[bytes] = []
-    captured = 0
-    truncated = False
+        return
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
-        if limit is None:
-            chunks.append(chunk)
-            continue
-        remaining = limit - captured
-        if remaining > 0:
-            chunks.append(chunk[:remaining])
-            captured += min(len(chunk), remaining)
-        if len(chunk) > remaining:
-            truncated = True
-    return _CapturedOutput(b"".join(chunks), truncated=truncated)
+        out.append(chunk, limit=limit)

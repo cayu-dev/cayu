@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_nonblank
+from cayu.runners._secrets import (
+    merge_secret_env_values,
+    normalize_runner_secret_env,
+    redact_exec_result,
+)
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
@@ -15,6 +22,27 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
 )
+from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+
+# Non-secret operational host variables forwarded when inherit_env is False so
+# commands still resolve binaries and locale without seeing arbitrary host
+# secrets (API keys, tokens, cloud credentials).
+SAFE_LOCAL_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TZ",
+    # Windows equivalents.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+)
 
 
 class LocalRunner(Runner):
@@ -22,11 +50,25 @@ class LocalRunner(Runner):
 
     This is not a sandbox. Commands still run with the permissions of the
     current OS user and can access absolute paths allowed by the OS.
+
+    Host environment inheritance is fail-closed: by default commands see only
+    a minimal operational base env (``SAFE_LOCAL_ENV_KEYS``) plus explicit
+    per-call ``env``, so host secrets are not leaked into agent commands.
+    Pass ``inherit_env=True`` to opt in to the full host environment.
+    Declared ``secret_env`` entries are resolved through ``secret_resolver``
+    at exec time and their values are redacted from captured output.
     """
 
     isolation = "local"
 
-    def __init__(self, root: str | Path, *, inherit_env: bool = True) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        inherit_env: bool = False,
+        secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
+        secret_resolver: SecretResolver | None = None,
+    ) -> None:
         if not isinstance(root, str | PathLike):
             raise TypeError("LocalRunner root must be a string or Path.")
         if not isinstance(inherit_env, bool):
@@ -38,6 +80,9 @@ class LocalRunner(Runner):
             raise NotADirectoryError(f"Runner root is not a directory: {root_path}")
         self.root = root_path
         self.inherit_env = inherit_env
+        self.secret_env, self.secret_resolver = normalize_runner_secret_env(
+            secret_env, secret_resolver
+        )
 
     async def exec(
         self,
@@ -53,8 +98,16 @@ class LocalRunner(Runner):
             raise TypeError("LocalRunner command must be an ExecCommand.")
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=self.inherit_env)
+        if not self.inherit_env:
+            environment = {**_safe_host_env(), **environment}
+        resolved_secrets = (
+            await resolve_secret_env(self.secret_env, self.secret_resolver)
+            if self.secret_env and self.secret_resolver is not None
+            else {}
+        )
+        environment = merge_secret_env_values(environment, resolved_secrets)
         subprocess_command = _subprocess_command(command)
-        return await run_subprocess(
+        result = await run_subprocess(
             subprocess_command,
             cwd=working_dir,
             env=environment,
@@ -62,6 +115,7 @@ class LocalRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
+        return redact_exec_result(result, resolved_secrets)
 
     def resolve_cwd(self, cwd: str | None = None) -> Path:
         if cwd is None:
@@ -80,6 +134,10 @@ class LocalRunner(Runner):
         if not resolved.is_dir():
             raise NotADirectoryError(f"Runner cwd is not a directory: {cwd}")
         return resolved
+
+
+def _safe_host_env() -> dict[str, str]:
+    return {key: os.environ[key] for key in SAFE_LOCAL_ENV_KEYS if key in os.environ}
 
 
 def _subprocess_command(command: ExecCommand) -> SubprocessCommand:

@@ -19,8 +19,6 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("version", help="Print the Cayu version.")
-    subparsers.add_parser("validate", help="Validate an agent project.")
-    subparsers.add_parser("serve", help="Start the agent runtime server.")
 
     from cayu.cli.evals import add_eval_parser, run_eval_command
     from cayu.cli.storage import add_storage_parser, run_storage
@@ -39,9 +37,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval":
         return run_eval_command(args)
-
-    if args.command in {"validate", "serve"}:
-        parser.error(f"'{args.command}' is not implemented yet")
 
     parser.print_help()
     return 0

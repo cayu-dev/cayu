@@ -5,6 +5,7 @@ import posixpath
 import shlex
 import shutil
 import tempfile
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -18,6 +19,12 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._secrets import (
+    merge_secret_env_values,
+    normalize_runner_secret_env,
+    redact_exec_result,
+    runner_env_file,
+)
 from cayu.runners._subprocess import SubprocessCommand, copy_runner_env, run_subprocess
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -26,6 +33,7 @@ from cayu.runners.base import (
     Runner,
     RunnerCancelledError,
 )
+from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
 
 DEFAULT_SBX_AGENT = "shell"
 DEFAULT_SBX_CWD = "/workspace"
@@ -69,7 +77,7 @@ def _build_sbx_exec_argv(
     command: ExecCommand,
     *,
     cwd: str,
-    env: dict[str, str] | None,
+    env_file: str | None,
     has_stdin: bool,
     pid_file: str,
 ) -> list[str]:
@@ -77,9 +85,11 @@ def _build_sbx_exec_argv(
     if has_stdin:
         argv.append("-i")
     argv += ["-w", cwd]
-    if env:
-        for key, value in env.items():
-            argv += ["-e", f"{key}={value}"]
+    if env_file is not None:
+        # --env-file passes sandbox env values from a private file, keeping them out of
+        # host-visible argv AND out of the sbx CLI's own process environment (which a
+        # model-controlled env could otherwise use to hijack the CLI).
+        argv += ["--env-file", env_file]
     argv.append(name)
     if command.kind == "process":
         if command.argv is None:
@@ -177,8 +187,12 @@ class SbxRunner(Runner):
 
     Requires the ``sbx`` CLI (https://docs.docker.com/ai/sandboxes/). The runner
     does not inherit the trusted host environment into the sandbox; pass explicit
-    ``env`` per call. File I/O is expected via RunnerWorkspace (exec-based), so the
-    sandbox guest needs python3.
+    ``env`` per call. Env entries are passed through a private ``--env-file`` so
+    model-controlled values never enter host-visible argv or the sbx CLI's own
+    process environment. Declared ``secret_env`` entries are resolved through
+    ``secret_resolver`` at exec time and redacted from captured output. File I/O
+    is expected via RunnerWorkspace (exec-based), so the sandbox guest needs
+    python3.
     """
 
     isolation = "sbx"
@@ -195,6 +209,8 @@ class SbxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.mount_path = require_clean_nonblank(mount_path, "mount_path")
@@ -206,6 +222,9 @@ class SbxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.secret_env, self.secret_resolver = normalize_runner_secret_env(
+            secret_env, secret_resolver
+        )
         self._owns_mount = owns_mount
         self._closed = False
         self._exec_closed = False
@@ -225,6 +244,8 @@ class SbxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
+        secret_resolver: SecretResolver | None = None,
     ) -> SbxRunner:
         """Create a sandbox via the sbx CLI and return a runner bound to it.
 
@@ -289,6 +310,8 @@ class SbxRunner(Runner):
             cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            secret_env=secret_env,
+            secret_resolver=secret_resolver,
         )
 
     async def exec(
@@ -309,39 +332,47 @@ class SbxRunner(Runner):
             reason = self._exec_closed_reason or "runner exec path is closed"
             raise RuntimeError(f"SbxRunner is closed: {reason}")
         environment = copy_runner_env(env, inherit_env=False)
+        resolved_secrets = (
+            await resolve_secret_env(self.secret_env, self.secret_resolver)
+            if self.secret_env and self.secret_resolver is not None
+            else {}
+        )
+        environment = merge_secret_env_values(environment, resolved_secrets)
         command_id = uuid4().hex
         pid_file = f"{SBX_COMMAND_STATE_DIR}/{command_id}.pid"
         handle = _SbxCommandHandle(sbx_path=self.sbx_path, name=self.name, pid_file=pid_file)
-        argv = _build_sbx_exec_argv(
-            self.sbx_path,
-            self.name,
-            command,
-            cwd=self.resolve_cwd(cwd),
-            env=environment,
-            has_stdin=stdin is not None,
-            pid_file=pid_file,
-        )
-        # The host sbx process inherits the host env (the CLI needs PATH/HOME/
-        # docker config); the sandbox command's env is passed via -e only.
-        host_env = copy_runner_env(None, inherit_env=True)
-        try:
-            result = await run_subprocess(
-                SubprocessCommand(argv=argv),
-                env=host_env,
-                timeout_s=timeout_s,
-                stdin=stdin,
-                output_limit_bytes=output_limit_bytes,
+        with runner_env_file(environment) as env_file:
+            argv = _build_sbx_exec_argv(
+                self.sbx_path,
+                self.name,
+                command,
+                cwd=self.resolve_cwd(cwd),
+                env_file=env_file,
+                has_stdin=stdin is not None,
+                pid_file=pid_file,
             )
-        except asyncio.CancelledError as exc:
-            cleanup = await cleanup_runner_command_with_diagnostic(
-                self,
-                handle=handle,
-                adapter="sbx",
-                timeout_s=self.cancel_timeout_s,
-                policy=self.cancellation_cleanup,
-            )
-            self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
-            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
+            # The host sbx process runs with a pristine inherited env (PATH/HOME/config
+            # only). Sandbox env values ride in --env-file, never in the CLI's own
+            # environment, so a model-controlled env cannot hijack the host CLI.
+            host_env = copy_runner_env(None, inherit_env=True)
+            try:
+                result = await run_subprocess(
+                    SubprocessCommand(argv=argv),
+                    env=host_env,
+                    timeout_s=timeout_s,
+                    stdin=stdin,
+                    output_limit_bytes=output_limit_bytes,
+                )
+            except asyncio.CancelledError as exc:
+                cleanup = await cleanup_runner_command_with_diagnostic(
+                    self,
+                    handle=handle,
+                    adapter="sbx",
+                    timeout_s=self.cancel_timeout_s,
+                    policy=self.cancellation_cleanup,
+                )
+                self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
+                raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
         if result.timed_out:
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self,
@@ -352,7 +383,7 @@ class SbxRunner(Runner):
             )
             self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
             result = result.model_copy(update={"artifacts": [*result.artifacts, cleanup.artifact]})
-        return result
+        return redact_exec_result(result, resolved_secrets)
 
     async def close(self) -> None:
         if self._closed:

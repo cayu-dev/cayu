@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -617,10 +617,26 @@ def create_router(
     knowledge_store=None,
     knowledge_review_namespace: str | None = None,
     knowledge_review_labels: dict[str, str] | None = None,
+    auth: Callable[..., Any] | None = None,
 ) -> APIRouter:
-    """Create an APIRouter with standard cayu endpoints."""
+    """Create an APIRouter with standard cayu endpoints.
+
+    Args:
+        auth: Optional FastAPI dependency guarding every state-mutating route
+            (run/resume, session interrupt/delete/label/metadata mutation, task
+            lifecycle actions, tool-approval resolution/recovery, and knowledge
+            review decisions). It is resolved like any FastAPI dependency (it may
+            declare ``Request``/header parameters) and must raise
+            ``HTTPException`` (401/403) to deny a request; its return value is
+            ignored. Read-only routes and ``/health`` stay open so dashboards
+            keep working. ``None`` (default) leaves all routes unguarded.
+    """
 
     router = APIRouter(prefix="/api")
+
+    # Shared dependency list for sensitive (state-mutating) routes. FastAPI treats
+    # an empty sequence like no dependencies, so `auth=None` keeps current behavior.
+    protected: list[Any] = [Depends(auth)] if auth is not None else []
 
     async def _marker_sequence(session_id: str, event_id: str) -> int | None:
         """Sequence of the persisted event named by a ``Last-Event-ID`` marker.
@@ -690,7 +706,7 @@ def create_router(
 
         return EventSourceResponse(replay())
 
-    @router.post("/run")
+    @router.post("/run", dependencies=protected)
     async def run_agent(
         body: RunBody,
         http_request: Request,
@@ -732,7 +748,7 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.run(request))
 
-    @router.post("/resume")
+    @router.post("/resume", dependencies=protected)
     async def resume_agent(
         body: ResumeBody,
         http_request: Request,
@@ -762,7 +778,7 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.resume(request))
 
-    @router.post("/sessions/{session_id}/interrupt")
+    @router.post("/sessions/{session_id}/interrupt", dependencies=protected)
     async def interrupt_session(
         session_id: NonBlankString,
         body: InterruptSessionBody | None = None,
@@ -814,7 +830,7 @@ def create_router(
 
         return EventSourceResponse(generate())
 
-    @router.post("/tool-approvals/resolve")
+    @router.post("/tool-approvals/resolve", dependencies=protected)
     async def resolve_tool_approval(body: ToolApprovalBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -839,7 +855,7 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.resolve_tool_approval(request))
 
-    @router.post("/tool-approvals/recover")
+    @router.post("/tool-approvals/recover", dependencies=protected)
     async def recover_tool_approval(body: ToolApprovalRecoveryBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -1381,7 +1397,7 @@ def create_router(
             ],
         }
 
-    @router.delete("/sessions/{session_id}", status_code=204)
+    @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):
         try:
             await session_store.delete_session(session_id)
@@ -1389,7 +1405,7 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None
 
-    @router.patch("/sessions/{session_id}/labels")
+    @router.patch("/sessions/{session_id}/labels", dependencies=protected)
     async def update_session_labels(
         session_id: NonBlankString,
         body: UpdateSessionLabelsBody,
@@ -1402,7 +1418,7 @@ def create_router(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(session)
 
-    @router.patch("/sessions/{session_id}/metadata")
+    @router.patch("/sessions/{session_id}/metadata", dependencies=protected)
     async def update_session_metadata(
         session_id: NonBlankString,
         body: UpdateSessionMetadataBody,
@@ -1456,7 +1472,7 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _serialize_task_detail(task)
 
-    @router.post("/tasks/{task_id}/pause")
+    @router.post("/tasks/{task_id}/pause", dependencies=protected)
     async def pause_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
         store = await _require_task_store()
         request_body = body or TaskHoldBody()
@@ -1469,7 +1485,7 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/block")
+    @router.post("/tasks/{task_id}/block", dependencies=protected)
     async def block_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
         store = await _require_task_store()
         request_body = body or TaskHoldBody()
@@ -1482,7 +1498,7 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/needs-attention")
+    @router.post("/tasks/{task_id}/needs-attention", dependencies=protected)
     async def mark_task_needs_attention(
         task_id: NonBlankString,
         body: TaskHoldBody | None = None,
@@ -1498,7 +1514,7 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/resume")
+    @router.post("/tasks/{task_id}/resume", dependencies=protected)
     async def resume_task(task_id: NonBlankString):
         store = await _require_task_store()
         return await _apply_task_action(store.resume_task, task_id)
@@ -1596,12 +1612,12 @@ def create_router(
             "chunk_max_bytes": max_bytes,
         }
 
-    @router.post("/knowledge/{entry_id}/approve")
+    @router.post("/knowledge/{entry_id}/approve", dependencies=protected)
     async def approve_knowledge(entry_id: NonBlankString):
         workflow = _knowledge_review_workflow()
         return await _apply_knowledge_review_action(workflow.approve, entry_id)
 
-    @router.post("/knowledge/{entry_id}/reject")
+    @router.post("/knowledge/{entry_id}/reject", dependencies=protected)
     async def reject_knowledge(entry_id: NonBlankString):
         workflow = _knowledge_review_workflow()
         return await _apply_knowledge_review_action(workflow.reject, entry_id)

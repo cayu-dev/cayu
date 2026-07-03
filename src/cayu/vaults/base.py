@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
@@ -148,3 +150,80 @@ class Vault(ABC):
         scope: dict[str, Any] | None = None,
     ) -> ResolvedSecret:
         """Resolve a secret reference to a masked value for runtime injection."""
+
+
+@runtime_checkable
+class SecretResolver(Protocol):
+    """Async credential source shared by ``Vault`` and ``CredentialProxy``.
+
+    Anything with an async ``resolve(ref, *, scope=None) -> ResolvedSecret``
+    method satisfies this seam, so runners, MCP clients, and providers can
+    consume secrets from a vault directly or through a credential proxy.
+    """
+
+    async def resolve(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> ResolvedSecret: ...
+
+
+def validate_secret_resolver(resolver: object, field_name: str = "secret_resolver") -> None:
+    """Reject objects that cannot asynchronously resolve secret references."""
+
+    resolve = getattr(resolver, "resolve", None)
+    if resolve is None or not callable(resolve):
+        raise TypeError(f"{field_name} must provide an async resolve(ref, *, scope=) method.")
+    if not inspect.iscoroutinefunction(resolve):
+        raise TypeError(f"{field_name} resolve() must be an async method.")
+
+
+def secret_env_refs(
+    secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef],
+) -> dict[str, SecretRef]:
+    """Normalize declared secret environment entries to name -> SecretRef.
+
+    Accepts either a sequence of ``SecretEnv`` entries or a plain
+    ``{env_var_name: SecretRef}`` mapping. Duplicate environment variable
+    names are rejected because injection would silently drop one secret.
+    """
+
+    refs: dict[str, SecretRef] = {}
+    if isinstance(secret_env, Mapping):
+        for name, ref in cast("Mapping[str, SecretRef]", secret_env).items():
+            env_name = require_clean_nonblank(name, "secret_env name")
+            refs[env_name] = copy_secret_ref(ref)
+        return refs
+    if not isinstance(secret_env, Sequence) or isinstance(secret_env, str | bytes):
+        raise TypeError("secret_env must be a sequence of SecretEnv or a name->SecretRef mapping.")
+    for entry in secret_env:
+        if type(entry) is not SecretEnv:
+            raise TypeError("secret_env entries must be SecretEnv instances.")
+        if entry.name in refs:
+            raise ValueError(f"secret_env declares duplicate environment variable: {entry.name}")
+        refs[entry.name] = copy_secret_ref(entry.ref)
+    return refs
+
+
+async def resolve_secret_env(
+    secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef],
+    resolver: SecretResolver,
+    *,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, ResolvedSecret]:
+    """Resolve declared secret environment entries to injection-ready values.
+
+    The returned values stay wrapped in ``ResolvedSecret`` (SecretStr) so
+    callers unwrap them only at the last moment before injection and can feed
+    the same values into a ``SecretRedactor`` for output scrubbing.
+    """
+
+    validate_secret_resolver(resolver, "resolver")
+    resolved: dict[str, ResolvedSecret] = {}
+    for name, ref in secret_env_refs(secret_env).items():
+        secret = await resolver.resolve(ref, scope=scope)
+        if type(secret) is not ResolvedSecret:
+            raise TypeError("Secret resolvers must return ResolvedSecret instances.")
+        resolved[name] = secret
+    return resolved

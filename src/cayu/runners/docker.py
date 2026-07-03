@@ -4,6 +4,7 @@ import asyncio
 import posixpath
 import shlex
 import shutil
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -17,6 +18,12 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._secrets import (
+    merge_secret_env_values,
+    normalize_runner_secret_env,
+    redact_exec_result,
+    runner_env_file,
+)
 from cayu.runners._subprocess import SubprocessCommand, copy_runner_env, run_subprocess
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -25,6 +32,7 @@ from cayu.runners.base import (
     Runner,
     RunnerCancelledError,
 )
+from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
 
 DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"
@@ -74,7 +82,7 @@ def _build_docker_exec_argv(
     command: ExecCommand,
     *,
     cwd: str,
-    env: dict[str, str] | None,
+    env_file: str | None,
     has_stdin: bool,
     pid_file: str,
 ) -> list[str]:
@@ -82,9 +90,11 @@ def _build_docker_exec_argv(
     if has_stdin:
         argv.append("-i")
     argv += ["-w", cwd]
-    if env:
-        for key, value in env.items():
-            argv += ["-e", f"{key}={value}"]
+    if env_file is not None:
+        # --env-file passes container env values from a private file, keeping them out of
+        # host-visible argv AND out of the docker CLI's own process environment (which a
+        # model-controlled env could otherwise use to hijack the CLI, e.g. DOCKER_HOST).
+        argv += ["--env-file", env_file]
     argv.append(name)
     if command.kind == "process":
         if command.argv is None:
@@ -187,7 +197,11 @@ class DockerRunner(Runner):
     (microVM) to ``create`` for a hardened boundary; the default (``runc``) is a
     convenience tier, **not** a security boundary. The host ``docker`` process
     inherits the host environment (the CLI needs it); the containerized command
-    receives only the explicit per-call ``env`` via ``-e``.
+    receives only the explicit per-call ``env`` plus declared ``secret_env``,
+    passed through a private ``--env-file`` so model-controlled values never
+    enter host-visible argv or the docker CLI's own process environment.
+    ``secret_env`` entries are resolved through ``secret_resolver`` at exec time
+    and redacted from captured output.
     """
 
     isolation = "docker"
@@ -202,11 +216,16 @@ class DockerRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
+        self.secret_env, self.secret_resolver = normalize_runner_secret_env(
+            secret_env, secret_resolver
+        )
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
@@ -232,6 +251,8 @@ class DockerRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
+        secret_resolver: SecretResolver | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -305,6 +326,8 @@ class DockerRunner(Runner):
             cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            secret_env=secret_env,
+            secret_resolver=secret_resolver,
         )
 
     async def exec(
@@ -325,6 +348,12 @@ class DockerRunner(Runner):
             reason = self._exec_closed_reason or "runner exec path is closed"
             raise RuntimeError(f"DockerRunner is closed: {reason}")
         environment = copy_runner_env(env, inherit_env=False)
+        resolved_secrets = (
+            await resolve_secret_env(self.secret_env, self.secret_resolver)
+            if self.secret_env and self.secret_resolver is not None
+            else {}
+        )
+        environment = merge_secret_env_values(environment, resolved_secrets)
         command_id = uuid4().hex
         pid_file = f"{DOCKER_COMMAND_STATE_DIR}/{command_id}.pid"
         handle = _DockerCommandHandle(
@@ -332,36 +361,39 @@ class DockerRunner(Runner):
             name=self.name,
             pid_file=pid_file,
         )
-        argv = _build_docker_exec_argv(
-            self.docker_path,
-            self.name,
-            command,
-            cwd=self.resolve_cwd(cwd),
-            env=environment,
-            has_stdin=stdin is not None,
-            pid_file=pid_file,
-        )
-        # The host docker process inherits the host env (the CLI needs PATH/HOME/
-        # DOCKER_HOST/docker config); the container command's env is via -e only.
-        host_env = copy_runner_env(None, inherit_env=True)
-        try:
-            result = await run_subprocess(
-                SubprocessCommand(argv=argv),
-                env=host_env,
-                timeout_s=timeout_s,
-                stdin=stdin,
-                output_limit_bytes=output_limit_bytes,
+        with runner_env_file(environment) as env_file:
+            argv = _build_docker_exec_argv(
+                self.docker_path,
+                self.name,
+                command,
+                cwd=self.resolve_cwd(cwd),
+                env_file=env_file,
+                has_stdin=stdin is not None,
+                pid_file=pid_file,
             )
-        except asyncio.CancelledError as exc:
-            cleanup = await cleanup_runner_command_with_diagnostic(
-                self,
-                handle=handle,
-                adapter="docker",
-                timeout_s=self.cancel_timeout_s,
-                policy=self.cancellation_cleanup,
-            )
-            self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
-            raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
+            # The host docker process runs with a pristine inherited env (PATH/HOME/
+            # DOCKER_HOST/docker config only). Container env values ride in --env-file,
+            # never in the CLI's own environment, so a model-controlled env cannot hijack
+            # the host CLI (e.g. by setting DOCKER_HOST to an attacker daemon).
+            host_env = copy_runner_env(None, inherit_env=True)
+            try:
+                result = await run_subprocess(
+                    SubprocessCommand(argv=argv),
+                    env=host_env,
+                    timeout_s=timeout_s,
+                    stdin=stdin,
+                    output_limit_bytes=output_limit_bytes,
+                )
+            except asyncio.CancelledError as exc:
+                cleanup = await cleanup_runner_command_with_diagnostic(
+                    self,
+                    handle=handle,
+                    adapter="docker",
+                    timeout_s=self.cancel_timeout_s,
+                    policy=self.cancellation_cleanup,
+                )
+                self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
+                raise RunnerCancelledError(artifacts=[cleanup.artifact]) from exc
         if result.timed_out:
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self,
@@ -372,7 +404,7 @@ class DockerRunner(Runner):
             )
             self._apply_cleanup_result(cleanup.artifact, close_runner=cleanup.close_runner)
             result = result.model_copy(update={"artifacts": [*result.artifacts, cleanup.artifact]})
-        return result
+        return redact_exec_result(result, resolved_secrets)
 
     async def close(self) -> None:
         if self._closed:

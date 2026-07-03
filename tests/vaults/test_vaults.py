@@ -11,6 +11,7 @@ from cayu import (
     Environment,
     EnvironmentSpec,
     LocalEnvVault,
+    PassthroughProxy,
     ResolvedSecret,
     RoutedVault,
     SecretEnv,
@@ -22,6 +23,9 @@ from cayu import (
     VaultError,
     copy_resolved_secret,
     copy_secret_env,
+    resolve_secret_env,
+    secret_env_refs,
+    validate_secret_resolver,
 )
 
 
@@ -478,3 +482,72 @@ def test_composites_nest() -> None:
 
     assert gmail.value.get_secret_value() == "oauth"
     assert openai.value.get_secret_value() == "sk-static"
+
+
+def test_resolve_secret_env_resolves_entries_and_mappings() -> None:
+    vault = StaticVault({"github_token": "gh-secret", "db_password": "db-secret"})
+    entries = [
+        SecretEnv(name="GITHUB_TOKEN", ref=SecretRef(name="github_token")),
+        SecretEnv(name="DB_PASSWORD", ref=SecretRef(name="db_password")),
+    ]
+
+    from_entries = asyncio.run(resolve_secret_env(entries, vault))
+    from_mapping = asyncio.run(
+        resolve_secret_env({"GITHUB_TOKEN": SecretRef(name="github_token")}, vault)
+    )
+
+    assert from_entries["GITHUB_TOKEN"].value.get_secret_value() == "gh-secret"
+    assert from_entries["DB_PASSWORD"].value.get_secret_value() == "db-secret"
+    assert from_mapping["GITHUB_TOKEN"].value.get_secret_value() == "gh-secret"
+
+
+def test_resolve_secret_env_passes_scope_and_supports_proxies() -> None:
+    proxy = PassthroughProxy(StaticVault({"github_token": "gh-secret"}))
+
+    resolved = asyncio.run(
+        resolve_secret_env(
+            [SecretEnv(name="GITHUB_TOKEN", ref=SecretRef(name="github_token"))],
+            proxy,
+            scope={"session_id": "sess_1"},
+        )
+    )
+
+    assert resolved["GITHUB_TOKEN"].metadata["scope"] == {"session_id": "sess_1"}
+
+
+def test_secret_env_refs_rejects_duplicates_and_bad_shapes() -> None:
+    ref = SecretRef(name="github_token")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        secret_env_refs(
+            [
+                SecretEnv(name="GITHUB_TOKEN", ref=ref),
+                SecretEnv(name="GITHUB_TOKEN", ref=ref),
+            ]
+        )
+
+    with pytest.raises(TypeError, match="SecretEnv"):
+        secret_env_refs(["not-a-secret-env"])  # type: ignore[list-item]
+
+    with pytest.raises(TypeError, match="secret_env"):
+        secret_env_refs("GITHUB_TOKEN")  # type: ignore[arg-type]
+
+
+def test_validate_secret_resolver_requires_async_resolve() -> None:
+    class SyncResolver:
+        def resolve(self, ref, *, scope=None):
+            return None
+
+    validate_secret_resolver(StaticVault({"token": "x"}))
+    validate_secret_resolver(PassthroughProxy(StaticVault({"token": "x"})))
+
+    with pytest.raises(TypeError, match="async"):
+        validate_secret_resolver(SyncResolver())
+
+    with pytest.raises(TypeError, match="resolve"):
+        validate_secret_resolver(object())
+
+    with pytest.raises(TypeError, match="resolve"):
+        asyncio.run(
+            resolve_secret_env({"GITHUB_TOKEN": SecretRef(name="token")}, object())  # type: ignore[arg-type]
+        )

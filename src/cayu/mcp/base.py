@@ -11,7 +11,9 @@ from cayu._validation import (
     require_clean_nonblank_keys,
     require_nonblank,
 )
-from cayu.vaults import SecretRef, copy_secret_ref
+from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
+
+_RESERVED_HTTP_HEADER_NAMES = frozenset({"accept", "content-type"})
 
 
 class McpServerSpec(BaseModel):
@@ -71,6 +73,39 @@ class McpServerSpec(BaseModel):
     def validate_transport(self) -> McpServerSpec:
         if bool(self.command) == bool(self.url):
             raise ValueError("MCP server must define exactly one of command or url.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_secret_config_collisions(self) -> McpServerSpec:
+        env_collisions = sorted(set(self.env) & set(self.secret_env))
+        if env_collisions:
+            raise ValueError(
+                f"MCP server env and secret_env declare the same variables: {env_collisions}"
+            )
+        header_names = {name.lower() for name in self.headers}
+        header_collisions = sorted(
+            name for name in self.secret_headers if name.lower() in header_names
+        )
+        if header_collisions:
+            raise ValueError(
+                f"MCP server headers and secret_headers declare the same headers: "
+                f"{header_collisions}"
+            )
+        reserved_headers = sorted(
+            name for name in self.headers if name.lower() in _RESERVED_HTTP_HEADER_NAMES
+        )
+        if reserved_headers:
+            raise ValueError(
+                f"MCP server headers cannot override reserved HTTP headers: {reserved_headers}"
+            )
+        reserved_secret_headers = sorted(
+            name for name in self.secret_headers if name.lower() in _RESERVED_HTTP_HEADER_NAMES
+        )
+        if reserved_secret_headers:
+            raise ValueError(
+                "MCP server secret_headers cannot override reserved HTTP headers: "
+                f"{reserved_secret_headers}"
+            )
         return self
 
 
@@ -190,6 +225,21 @@ class McpResourceResult(BaseModel):
 
 class McpSession(ABC):
     """Initialized connection to one MCP server."""
+
+    # Default: no injected secrets, so nothing to redact. Concrete sessions that inject
+    # secret_env/secret_headers set an instance-level redactor built from the resolved
+    # values (see StdioMcpSession/HttpMcpSession).
+    _secret_redactor: SecretRedactor = SecretRedactor()
+
+    @property
+    def secret_redactor(self) -> SecretRedactor:
+        """Redactor for secrets injected into this session (empty if none).
+
+        A hostile or buggy MCP server can echo injected secrets back through tool
+        content, structured output, stderr, or protocol errors, so the toolset scrubs
+        results with this before they reach model-visible context.
+        """
+        return self._secret_redactor
 
     @property
     @abstractmethod

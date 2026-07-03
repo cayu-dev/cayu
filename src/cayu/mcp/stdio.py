@@ -34,6 +34,12 @@ from cayu.mcp.base import (
     McpToolDefinition,
     McpToolResult,
 )
+from cayu.vaults import (
+    SecretRedactor,
+    SecretResolver,
+    resolve_secret_env,
+    validate_secret_resolver,
+)
 
 DEFAULT_MCP_WRITE_TIMEOUT_S = 5.0
 DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S = 2.0
@@ -53,6 +59,7 @@ class StdioMcpClient(McpClient):
         client_name: str = DEFAULT_MCP_CLIENT_NAME,
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
         inherit_env: bool = False,
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.request_timeout_s = validate_positive_number(
             request_timeout_s,
@@ -75,6 +82,9 @@ class StdioMcpClient(McpClient):
         if type(inherit_env) is not bool:
             raise TypeError("inherit_env must be a bool.")
         self.inherit_env = inherit_env
+        if secret_resolver is not None:
+            validate_secret_resolver(secret_resolver)
+        self.secret_resolver = secret_resolver
 
     async def connect(self, server: McpServerSpec) -> McpSession:
         if type(server) is not McpServerSpec:
@@ -83,15 +93,28 @@ class StdioMcpClient(McpClient):
             raise ValueError("StdioMcpClient requires an MCP server command.")
         if server.url is not None:
             raise ValueError("StdioMcpClient does not support URL MCP servers.")
-        if server.secret_env:
+        if server.secret_env and self.secret_resolver is None:
             raise ValueError(
-                "StdioMcpClient cannot resolve MCP secret_env values yet. "
-                "Resolve secrets before constructing the server spec."
+                "StdioMcpClient cannot resolve MCP secret_env without a secret_resolver. "
+                "Pass secret_resolver= (a Vault or CredentialProxy) to the client."
             )
         if server.secret_headers:
             raise ValueError("StdioMcpClient does not support MCP secret_headers.")
         child_env = dict(os.environ) if self.inherit_env else {}
         child_env.update(server.env)
+        secret_redactor = SecretRedactor()
+        if server.secret_env and self.secret_resolver is not None:
+            # Secret values go straight into the child process env — never into
+            # argv — and stay wrapped until this final injection point.
+            resolved = await resolve_secret_env(
+                server.secret_env,
+                self.secret_resolver,
+                scope={"mcp_server": server.name},
+            )
+            for name, secret in resolved.items():
+                child_env[name] = secret.value.get_secret_value()
+            # A hostile server can echo these values back through tool output; scrub them.
+            secret_redactor = SecretRedactor(tuple(resolved.values()))
         process = await asyncio.create_subprocess_exec(
             *server.command,
             stdin=asyncio.subprocess.PIPE,
@@ -108,6 +131,7 @@ class StdioMcpClient(McpClient):
             cancellation_notification_timeout_s=self.cancellation_notification_timeout_s,
             client_name=self.client_name,
             client_version=self.client_version,
+            secret_redactor=secret_redactor,
         )
         try:
             await session.initialize()
@@ -132,9 +156,11 @@ class StdioMcpSession(McpSession):
         cancellation_notification_timeout_s: float,
         client_name: str,
         client_version: str,
+        secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self.server = server
         self.process = process
+        self._secret_redactor = secret_redactor or SecretRedactor()
         self.request_timeout_s = request_timeout_s
         self.write_timeout_s = write_timeout_s
         self.graceful_shutdown_timeout_s = graceful_shutdown_timeout_s

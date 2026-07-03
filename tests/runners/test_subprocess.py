@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 
 import pytest
 
@@ -175,3 +176,36 @@ def test_run_subprocess_times_out_and_returns_partial_output(tmp_path) -> None:
     assert result.stdout == "before\n"
     assert result.timed_out is True
     assert result.exit_code != 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix session semantics")
+def test_run_subprocess_bounded_drain_when_child_leaks_pipe(tmp_path) -> None:
+    # The child spawns a detached (own-session) grandchild that inherits the
+    # captured stdout pipe and outlives the kill, so the stdout read would never
+    # see EOF. The bounded post-kill drain must still return promptly.
+    child = (
+        "import sys, subprocess, time\n"
+        "subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        "print('parent', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    started = time.monotonic()
+    result = asyncio.run(
+        run_subprocess(
+            SubprocessCommand(argv=[sys.executable, "-c", child]),
+            cwd=tmp_path,
+            env={},
+            timeout_s=1,
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.timed_out is True
+    assert "parent" in result.stdout
+    # The grandchild sleeps 30s; without the bounded drain the gather would hang
+    # that long. Timeout (1s) + drain bound (2s) plus margin must be well under.
+    assert elapsed < 10
+    assert result.stdout_truncated is True

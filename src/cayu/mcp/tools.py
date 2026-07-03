@@ -19,6 +19,7 @@ from cayu.mcp.base import (
 )
 from cayu.mcp.http import HttpMcpClient
 from cayu.mcp.stdio import StdioMcpClient
+from cayu.vaults import SecretRedactor
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _UNSAFE_TOOL_NAME_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -64,17 +65,28 @@ class McpToolAdapter(Tool):
         if type(arguments) is not dict:
             raise TypeError("MCP tool arguments must be an object.")
         result = await self.toolset.call_tool(self.definition.name, arguments)
+        content = _mcp_tool_result_text(
+            result.content,
+            structured_content=result.structured_content,
+        )
+        mcp_content = result.content
+        mcp_structured_content = result.structured_content
+        redactor = self.toolset.secret_redactor
+        if redactor.has_values:
+            # A hostile MCP server can echo injected secrets (secret_env/secret_headers)
+            # back through its result; scrub the rendered text AND the raw content/
+            # structured echoes before they reach model-visible context.
+            content = redactor.redact_text(content)
+            mcp_content = redactor.redact_json(result.content)
+            mcp_structured_content = redactor.redact_json(result.structured_content)
         return ToolResult(
-            content=_mcp_tool_result_text(
-                result.content,
-                structured_content=result.structured_content,
-            ),
+            content=content,
             structured={
                 "mcp_server": self.server.name,
                 "mcp_tool": self.definition.name,
                 "mcp_manifest_hash": self.mcp_manifest_hash,
-                "mcp_content": result.content,
-                "mcp_structured_content": result.structured_content,
+                "mcp_content": mcp_content,
+                "mcp_structured_content": mcp_structured_content,
             },
             is_error=result.is_error,
         )
@@ -143,6 +155,11 @@ class McpToolset:
     @property
     def initialize_result(self) -> McpInitializeResult:
         return self.session.initialize_result
+
+    @property
+    def secret_redactor(self) -> SecretRedactor:
+        """Redactor for secrets injected into this server's session (empty if none)."""
+        return self.session.secret_redactor
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         return await self.session.call_tool(name, arguments)

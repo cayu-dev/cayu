@@ -310,7 +310,19 @@ def _export(args: argparse.Namespace) -> int:
         print(f"exported {count} {noun}", file=sys.stderr)
         return 0
 
-    return asyncio.run(run())
+    if args.postgres is None:
+        return asyncio.run(run())
+    # A Postgres connection/auth failure can embed the DSN password in its
+    # message; route it through the same redaction as status/migrate so the
+    # secret never reaches stderr. Schema errors carry no DSN and propagate to
+    # the top-level handler unchanged.
+    try:
+        return asyncio.run(run())
+    except schema.SchemaError:
+        raise
+    except Exception as exc:
+        print(f"error: {_sanitize(str(exc), args.postgres)}", file=sys.stderr)
+        return 1
 
 
 async def _ensure_store_ready_for_export(store: Any) -> None:

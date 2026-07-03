@@ -15,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ def create_server(
     title: str = "Cayu",
     cors_origins: list[str] | None = None,
     dashboard_dir: str | Path | None = None,
+    auth: Callable[..., Any] | None = None,
     **fastapi_kwargs: Any,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -47,6 +49,11 @@ def create_server(
         title: FastAPI app title.
         cors_origins: Allowed CORS origins. Defaults to localhost:5173 (Vite dev).
         dashboard_dir: Path to pre-built dashboard static files. Served at ``/``.
+        auth: Optional FastAPI dependency guarding every state-mutating API
+            route (run/resume, session interrupt/delete/mutation, task
+            lifecycle actions, tool-approval resolution/recovery, knowledge
+            review decisions). Raise ``fastapi.HTTPException`` (401/403) inside
+            it to reject a request; read-only routes and ``/health`` stay open.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
     """
     from fastapi import FastAPI
@@ -73,6 +80,7 @@ def create_server(
         knowledge_store=knowledge_store,
         knowledge_review_namespace=app.knowledge_review_namespace,
         knowledge_review_labels=app.knowledge_review_labels,
+        auth=auth,
     )
     server.include_router(router)
 

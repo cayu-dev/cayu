@@ -70,7 +70,14 @@ from cayu.runtime import (
 )
 from cayu.storage import KnowledgeEntry, KnowledgeHit
 from cayu.storage.memory import copy_knowledge_entry
-from cayu.vaults import ResolvedSecret, SecretRef, copy_secret_ref
+from cayu.vaults import (
+    REDACTED_SECRET,
+    ResolvedSecret,
+    SecretEnv,
+    SecretRef,
+    StaticVault,
+    copy_secret_ref,
+)
 from cayu.workspaces import LocalWorkspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -1116,6 +1123,85 @@ def test_retry_policy_does_not_treat_unlabeled_numbers_as_status_codes():
 
     assert decision.retry is False
     assert decision.status_code is None
+
+
+def test_retry_policy_prefers_typed_status_code_over_message_text():
+    # The message carries no HTTP token, but the typed status code is retryable.
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2, retry_on_status_codes=(429, 529)),
+        attempt=1,
+        error="Anthropic API request failed: overloaded_error",
+        status_code=529,
+    )
+
+    assert decision.retry is True
+    assert decision.reason == RetryReason.HTTP_STATUS
+    assert decision.status_code == 529
+
+
+def test_retry_policy_typed_retryable_false_is_terminal():
+    # Message text looks like a transient timeout, but the provider classified
+    # the failure as non-retryable; the typed verdict wins.
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=3),
+        attempt=1,
+        error="request timed out",
+        retryable=False,
+    )
+
+    assert decision.retry is False
+    assert decision.reason is None
+
+
+def test_retry_policy_typed_retryable_true_is_honored_without_pattern_match():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2),
+        attempt=1,
+        error="provider failed for an unrecognized reason",
+        status_code=418,
+        retryable=True,
+    )
+
+    assert decision.retry is True
+    assert decision.reason == RetryReason.CONNECTION
+    assert decision.status_code == 418
+
+
+def test_retry_policy_honors_retry_after_directive_capped_by_max_delay():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2, max_delay_s=10.0),
+        attempt=1,
+        error="HTTP 429: rate limited",
+        status_code=429,
+        retry_after_s=45.0,
+    )
+
+    assert decision.retry is True
+    # Retry-After (45s) is honored but bounded by max_delay_s (10s).
+    assert decision.delay_seconds == 10.0
+
+
+def test_retry_policy_uses_retry_after_below_max_delay_verbatim():
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2, max_delay_s=30.0, initial_delay_s=0.5),
+        attempt=1,
+        error="HTTP 503: service unavailable",
+        status_code=503,
+        retry_after_s=7.0,
+    )
+
+    assert decision.retry is True
+    assert decision.delay_seconds == 7.0
+
+
+def test_retry_policy_rejects_negative_retry_after():
+    with pytest.raises(ValueError):
+        retry_decision(
+            policy=RetryPolicy(max_attempts=2),
+            attempt=1,
+            error="HTTP 503",
+            retry_after_s=-1.0,
+        )
 
 
 def test_retry_policy_jitter_does_not_exceed_max_delay():
@@ -2232,6 +2318,22 @@ def test_mcp_server_splits_plain_config_from_secret_refs():
     assert dumped["secret_headers"]["Authorization"]["name"] == "linear_token"
 
 
+def test_mcp_server_rejects_reserved_transport_headers():
+    for header_name in ("content-type", "Accept"):
+        with pytest.raises(ValidationError, match="reserved HTTP headers"):
+            McpServerSpec(
+                name="linear",
+                url="https://mcp.linear.example/sse",
+                headers={header_name: "application/json"},
+            )
+        with pytest.raises(ValidationError, match="reserved HTTP headers"):
+            McpServerSpec(
+                name="linear",
+                url="https://mcp.linear.example/sse",
+                secret_headers={header_name: SecretRef(name="linear_token")},
+            )
+
+
 def test_mcp_server_revalidates_constructed_secret_refs():
     class BadMetadata(dict):
         def items(self):
@@ -3039,30 +3141,70 @@ def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypa
     assert not marker.exists()
 
 
-def test_local_runner_can_disable_parent_environment_inheritance(tmp_path, monkeypatch):
+def test_local_runner_is_fail_closed_on_host_env_inheritance(tmp_path, monkeypatch):
     monkeypatch.setenv("CAYU_LOCAL_RUNNER_SECRET", "secret")
 
-    inherited = asyncio.run(
-        LocalRunner(tmp_path).exec(
-            ExecCommand.process(
-                sys.executable,
-                "-c",
-                "import os; print(os.environ.get('CAYU_LOCAL_RUNNER_SECRET', ''))",
-            )
-        )
+    probe = ExecCommand.process(
+        sys.executable,
+        "-c",
+        (
+            "import os; "
+            "print(os.environ.get('CAYU_LOCAL_RUNNER_SECRET', '')); "
+            "print(bool(os.environ.get('PATH')))"
+        ),
     )
-    isolated = asyncio.run(
-        LocalRunner(tmp_path, inherit_env=False).exec(
+    default = asyncio.run(LocalRunner(tmp_path).exec(probe))
+    inherited = asyncio.run(LocalRunner(tmp_path, inherit_env=True).exec(probe))
+    isolated = asyncio.run(LocalRunner(tmp_path, inherit_env=False).exec(probe))
+
+    # Default is fail-closed: host secrets are absent, but the minimal safe
+    # base env (PATH etc.) is forwarded so commands still resolve binaries.
+    assert default.stdout.splitlines() == ["", "True"]
+    assert inherited.stdout.splitlines() == ["secret", "True"]
+    assert isolated.stdout.splitlines() == ["", "True"]
+
+
+def test_local_runner_injects_and_redacts_declared_secret_env(tmp_path):
+    runner = LocalRunner(
+        tmp_path,
+        secret_env=[SecretEnv(name="API_TOKEN", ref=SecretRef(name="api_token"))],
+        secret_resolver=StaticVault({"api_token": "sk-local-secret-1"}),
+    )
+
+    result = asyncio.run(
+        runner.exec(
             ExecCommand.process(
                 sys.executable,
                 "-c",
-                "import os; print(os.environ.get('CAYU_LOCAL_RUNNER_SECRET', ''))",
+                (
+                    "import os,sys; "
+                    "print('token:', os.environ['API_TOKEN']); "
+                    "print(os.environ['API_TOKEN'], file=sys.stderr)"
+                ),
             )
         )
     )
 
-    assert inherited.stdout.strip() == "secret"
-    assert isolated.stdout.strip() == ""
+    assert result.exit_code == 0
+    # The secret reached the child process env but is scrubbed from output.
+    assert result.stdout.strip() == f"token: {REDACTED_SECRET}"
+    assert result.stderr.strip() == REDACTED_SECRET
+
+
+def test_local_runner_rejects_env_key_colliding_with_secret_env(tmp_path):
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        secret_resolver=StaticVault({"api_token": "sk-local-secret-1"}),
+    )
+
+    with pytest.raises(ValueError, match="collides with declared secret_env"):
+        asyncio.run(
+            runner.exec(ExecCommand.process("env"), env={"API_TOKEN": "override"}),
+        )
+
+    with pytest.raises(ValueError, match="secret_resolver"):
+        LocalRunner(tmp_path, secret_env={"API_TOKEN": SecretRef(name="api_token")})
 
 
 def test_local_runner_rejects_invalid_inputs(tmp_path):

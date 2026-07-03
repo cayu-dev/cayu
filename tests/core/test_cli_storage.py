@@ -124,3 +124,12 @@ def test_storage_status_connection_error_does_not_leak_dsn(capsys):
     err = capsys.readouterr().err
     assert "error:" in err
     assert "s3cr3t" not in err
+
+
+def test_storage_export_connection_error_does_not_leak_dsn(capsys):
+    # Export must redact the DSN password on a Postgres connection failure too.
+    dsn = "postgresql://admin:s3cr3t@127.0.0.1:1/nope"
+    assert main(["storage", "export", "--postgres", dsn]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "s3cr3t" not in err

@@ -56,6 +56,12 @@ from cayu.mcp.base import (
     McpToolDefinition,
     McpToolResult,
 )
+from cayu.vaults import (
+    SecretRedactor,
+    SecretResolver,
+    resolve_secret_env,
+    validate_secret_resolver,
+)
 
 # Remote tool calls can be slow, so the HTTP default is generous (the stdio default
 # is 30s). Both are overridable per-server via McpServerSpec.metadata["timeout"].
@@ -82,6 +88,7 @@ class HttpMcpClient(McpClient):
         client_name: str = DEFAULT_MCP_CLIENT_NAME,
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
         transport: httpx.AsyncBaseTransport | None = None,
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.timeout_s = validate_positive_number(timeout_s, "timeout_s")
         self.connect_timeout_s = validate_positive_number(connect_timeout_s, "connect_timeout_s")
@@ -95,6 +102,9 @@ class HttpMcpClient(McpClient):
         self.client_name = require_clean_nonblank(client_name, "client_name")
         self.client_version = require_clean_nonblank(client_version, "client_version")
         self._transport = transport
+        if secret_resolver is not None:
+            validate_secret_resolver(secret_resolver)
+        self.secret_resolver = secret_resolver
 
     async def connect(self, server: McpServerSpec) -> McpSession:
         if type(server) is not McpServerSpec:
@@ -105,13 +115,13 @@ class HttpMcpClient(McpClient):
             raise ValueError("HttpMcpClient does not support command MCP servers.")
         if server.secret_env:
             raise ValueError(
-                "HttpMcpClient cannot resolve MCP secret_env values yet. "
-                "Resolve secrets before constructing the server spec."
+                "HttpMcpClient does not support MCP secret_env; a remote server's "
+                "process environment cannot be set by the client."
             )
-        if server.secret_headers:
+        if server.secret_headers and self.secret_resolver is None:
             raise ValueError(
-                "HttpMcpClient cannot resolve MCP secret_headers values yet. "
-                "Resolve secrets before constructing the server spec."
+                "HttpMcpClient cannot resolve MCP secret_headers without a secret_resolver. "
+                "Pass secret_resolver= (a Vault or CredentialProxy) to the client."
             )
         timeout_s, connect_timeout_s, proxy = self._resolve_transport_config(server)
         headers = {
@@ -119,6 +129,19 @@ class HttpMcpClient(McpClient):
             "accept": _ACCEPT_HEADER,
             **server.headers,
         }
+        secret_redactor = SecretRedactor()
+        if server.secret_headers and self.secret_resolver is not None:
+            # Secret header values are resolved at connect time and injected
+            # directly into the HTTP client, never into model-visible config.
+            resolved = await resolve_secret_env(
+                server.secret_headers,
+                self.secret_resolver,
+                scope={"mcp_server": server.name, "destination": server.url},
+            )
+            for name, secret in resolved.items():
+                headers[name] = secret.value.get_secret_value()
+            # A hostile server can echo these values back through tool output; scrub them.
+            secret_redactor = SecretRedactor(tuple(resolved.values()))
         client_kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": httpx.Timeout(timeout_s, connect=connect_timeout_s),
@@ -137,6 +160,7 @@ class HttpMcpClient(McpClient):
             url=server.url,
             client_name=self.client_name,
             client_version=self.client_version,
+            secret_redactor=secret_redactor,
         )
         try:
             await session.initialize()
@@ -165,8 +189,10 @@ class HttpMcpSession(McpSession):
         url: str,
         client_name: str,
         client_version: str,
+        secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self.server = server
+        self._secret_redactor = secret_redactor or SecretRedactor()
         self.client_name = client_name
         self.client_version = client_version
         self._http = http_client

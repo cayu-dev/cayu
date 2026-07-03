@@ -19,7 +19,7 @@ from cayu import (
 from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
 from cayu.mcp.http import MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, HttpMcpSession
 from cayu.mcp.tools import _default_client_for
-from cayu.vaults import SecretRef
+from cayu.vaults import SecretRef, StaticVault
 
 _DEFAULT_TOOLS = [
     {"name": "search", "description": "Search the web.", "inputSchema": {"type": "object"}},
@@ -307,6 +307,31 @@ def test_http_forwards_custom_headers() -> None:
 
     asyncio.run(run())
     assert server.headers_for("initialize")["authorization"] == "Bearer T"
+
+
+def test_http_resolves_secret_headers_through_secret_resolver() -> None:
+    server = FakeMcpHttpServer()
+    vault = StaticVault({"mcp_token": "Bearer sk-mcp-secret"})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="mcp_token")}))
+        await session.close()
+
+    asyncio.run(run())
+    assert server.headers_for("initialize")["authorization"] == "Bearer sk-mcp-secret"
+
+
+def test_http_rejects_secret_env() -> None:
+    async def run():
+        await HttpMcpClient(secret_resolver=StaticVault({"token": "x"})).connect(
+            _server_spec(secret_env={"TOKEN": SecretRef(name="token")})
+        )
+
+    with pytest.raises(ValueError, match="secret_env"):
+        asyncio.run(run())
 
 
 def test_http_404_raises_session_expired() -> None:
