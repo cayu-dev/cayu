@@ -6,7 +6,7 @@ JSON-RPC framing and the JSON->model parsing stay identical across transports.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
@@ -17,7 +17,19 @@ from cayu.mcp.base import (
     McpToolResult,
 )
 
+# The protocol version cayu advertises in the initialize request (its preferred,
+# latest-known revision).
 MCP_PROTOCOL_VERSION = "2025-06-18"
+# Every protocol revision cayu can speak. A server negotiates by echoing one of
+# these in its initialize response; anything outside the set is rejected. Older
+# servers that pin an earlier revision are accepted rather than refused outright.
+SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset(
+    {
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+    }
+)
 DEFAULT_MCP_REQUEST_TIMEOUT_S = 30.0
 DEFAULT_MCP_CLIENT_NAME = "cayu"
 DEFAULT_MCP_CLIENT_VERSION = "0.1.0"
@@ -73,6 +85,49 @@ def result_from_jsonrpc_response(response: dict[str, Any], method: str) -> Any:
     if "result" not in response:
         raise McpProtocolError(f"MCP {method} response missing result.")
     return copy_json_value(response["result"], "result")
+
+
+def validate_negotiated_protocol_version(version: str) -> None:
+    """Raise if the server negotiated a protocol revision cayu cannot speak."""
+    if version not in SUPPORTED_MCP_PROTOCOL_VERSIONS:
+        raise McpProtocolError(f"MCP server negotiated unsupported protocol version {version!r}.")
+
+
+async def collect_paginated(
+    request: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    method: str,
+    item_key: str,
+) -> list[Any]:
+    """Drain a paginated list request, following ``nextCursor`` across pages.
+
+    A server may return a page of items plus an opaque ``nextCursor``; the next
+    page is fetched by echoing that cursor. Without this the first page would be
+    silently treated as the complete list — truncating tool/resource manifests
+    (and their hashes) into a stable-looking but incomplete view.
+    """
+    items: list[Any] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
+        result = await request(method, params)
+        if type(result) is not dict:
+            raise McpProtocolError(f"MCP {method} result must be an object.")
+        page = result.get(item_key, [])
+        if not isinstance(page, list):
+            raise McpProtocolError(f"MCP {method} result {item_key} must be a list.")
+        items.extend(page)
+        next_cursor = result.get("nextCursor")
+        if next_cursor is None:
+            return items
+        if not isinstance(next_cursor, str):
+            raise McpProtocolError(f"MCP {method} nextCursor must be a string.")
+        cursor = require_nonblank(next_cursor, "nextCursor")
+        if cursor in seen_cursors:
+            raise McpProtocolError(
+                f"MCP {method} repeated pagination cursor {cursor!r}; refusing to loop."
+            )
+        seen_cursors.add(cursor)
 
 
 def initialize_result_from_payload(payload: dict[str, Any]) -> McpInitializeResult:

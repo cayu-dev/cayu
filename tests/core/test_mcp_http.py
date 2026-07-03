@@ -45,8 +45,10 @@ class FakeMcpHttpServer:
         empty_sse_on: str | None = None,
         bad_jsonrpc_on: str | None = None,
         fold_sse: bool = False,
+        paginate: bool = False,
     ) -> None:
         self.sse = sse
+        self.paginate = paginate
         self.sse_content_type = sse_content_type
         self.fold_sse = fold_sse
         self.session_id = session_id
@@ -89,9 +91,11 @@ class FakeMcpHttpServer:
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"")
         if self.bad_jsonrpc_on is not None and method == self.bad_jsonrpc_on:
             return self._respond(request_id, method, result=self._result_for(method), jsonrpc="1.0")
-        return self._respond(request_id, method, result=self._result_for(method))
+        params = body.get("params", {})
+        return self._respond(request_id, method, result=self._result_for(method, params))
 
-    def _result_for(self, method: str) -> dict[str, Any]:
+    def _result_for(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        params = params or {}
         if method == "initialize":
             return {
                 "protocolVersion": self.protocol_version,
@@ -99,6 +103,10 @@ class FakeMcpHttpServer:
                 "serverInfo": {"name": "fake", "version": "1.0"},
             }
         if method == "tools/list":
+            if self.paginate and params.get("cursor") is None:
+                return {"tools": self.tools, "nextCursor": "tools-page-2"}
+            if self.paginate:
+                return {"tools": [{**self.tools[0], "name": "search_page_2"}]}
             return {"tools": self.tools}
         if method == "tools/call":
             return {"content": [{"type": "text", "text": "ok"}], "isError": False}
@@ -430,6 +438,42 @@ def test_http_protocol_version_mismatch_raises() -> None:
 
     with pytest.raises(McpProtocolError, match="unsupported protocol version"):
         asyncio.run(run())
+
+
+def test_http_accepts_older_supported_protocol_version() -> None:
+    # A server that pins an earlier-but-supported revision is accepted rather than
+    # refused, and the negotiated version (not cayu's preferred one) is echoed on
+    # every subsequent request per the spec.
+    server = FakeMcpHttpServer(protocol_version="2025-03-26")
+
+    async def run():
+        session = await HttpMcpClient(transport=server.transport).connect(_server_spec())
+        try:
+            await session.list_tools()
+            return session.initialize_result
+        finally:
+            await session.close()
+
+    init = asyncio.run(run())
+    assert init.protocol_version == "2025-03-26"
+    assert server.headers_for("tools/list")[MCP_PROTOCOL_VERSION_HEADER] == "2025-03-26"
+
+
+def test_http_list_tools_follows_next_cursor() -> None:
+    server = FakeMcpHttpServer(paginate=True)
+
+    async def run():
+        session = await HttpMcpClient(transport=server.transport).connect(_server_spec())
+        try:
+            return await session.list_tools()
+        finally:
+            await session.close()
+
+    tools = asyncio.run(run())
+    assert [tool.name for tool in tools] == ["search", "search_page_2"]
+    # The second tools/list request echoed the server's cursor.
+    list_calls = [headers for method, headers in server.calls if method == "tools/list"]
+    assert len(list_calls) == 2
 
 
 def test_http_close_sends_delete_and_is_idempotent() -> None:

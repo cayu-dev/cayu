@@ -5,6 +5,7 @@ from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_VERSION,
     DEFAULT_MCP_REQUEST_TIMEOUT_S,
     MCP_PROTOCOL_VERSION,
+    SUPPORTED_MCP_PROTOCOL_VERSIONS,
     McpProtocolError,
 )
 from cayu.mcp.base import (
@@ -51,6 +52,7 @@ __all__ = [
     "DEFAULT_MCP_REQUEST_TIMEOUT_S",
     "DEFAULT_MCP_WRITE_TIMEOUT_S",
     "MCP_PROTOCOL_VERSION",
+    "SUPPORTED_MCP_PROTOCOL_VERSIONS",
     "HttpMcpClient",
     "HttpMcpSession",
     "McpClient",

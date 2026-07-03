@@ -34,8 +34,8 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
-    MCP_PROTOCOL_VERSION,
     McpProtocolError,
+    collect_paginated,
     initialize_params,
     initialize_result_from_payload,
     jsonrpc_notification_payload,
@@ -44,6 +44,7 @@ from cayu.mcp._jsonrpc import (
     result_from_jsonrpc_response,
     tool_definition_from_payload,
     tool_result_from_payload,
+    validate_negotiated_protocol_version,
     validate_positive_number,
 )
 from cayu.mcp.base import (
@@ -217,20 +218,11 @@ class HttpMcpSession(McpSession):
         if type(result) is not dict:
             raise McpProtocolError("MCP initialize result must be an object.")
         self._initialize_result = initialize_result_from_payload(result)
-        if self._initialize_result.protocol_version != MCP_PROTOCOL_VERSION:
-            raise McpProtocolError(
-                "MCP server negotiated unsupported protocol version "
-                f"{self._initialize_result.protocol_version!r}."
-            )
+        validate_negotiated_protocol_version(self._initialize_result.protocol_version)
         await self._notify("notifications/initialized", {})
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
-        result = await self._request("tools/list", {})
-        if type(result) is not dict:
-            raise McpProtocolError("MCP tools/list result must be an object.")
-        tools = result.get("tools", [])
-        if not isinstance(tools, list):
-            raise McpProtocolError("MCP tools/list result tools must be a list.")
+        tools = await collect_paginated(self._request, "tools/list", "tools")
         return tuple(tool_definition_from_payload(tool, self.server.name) for tool in tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
@@ -247,12 +239,7 @@ class HttpMcpSession(McpSession):
         return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
-        result = await self._request("resources/list", {})
-        if type(result) is not dict:
-            raise McpProtocolError("MCP resources/list result must be an object.")
-        resources = result.get("resources", [])
-        if not isinstance(resources, list):
-            raise McpProtocolError("MCP resources/list result resources must be a list.")
+        resources = await collect_paginated(self._request, "resources/list", "resources")
         return tuple(
             resource_definition_from_payload(resource, self.server.name) for resource in resources
         )
@@ -361,7 +348,7 @@ class HttpMcpSession(McpSession):
         # (the negotiated version); sending it on the initialize request itself can
         # make a server 400 before version negotiation, so omit it until initialized.
         if self._initialize_result is not None:
-            headers[MCP_PROTOCOL_VERSION_HEADER] = MCP_PROTOCOL_VERSION
+            headers[MCP_PROTOCOL_VERSION_HEADER] = self._initialize_result.protocol_version
         if self._session_id is not None:
             headers[MCP_SESSION_ID_HEADER] = self._session_id
         return headers

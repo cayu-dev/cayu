@@ -12,8 +12,8 @@ from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_VERSION,
     DEFAULT_MCP_REQUEST_TIMEOUT_S,
     JSONRPC_METHOD_NOT_FOUND,
-    MCP_PROTOCOL_VERSION,
     McpProtocolError,
+    collect_paginated,
     initialize_params,
     initialize_result_from_payload,
     jsonrpc_notification_payload,
@@ -22,6 +22,7 @@ from cayu.mcp._jsonrpc import (
     result_from_jsonrpc_response,
     tool_definition_from_payload,
     tool_result_from_payload,
+    validate_negotiated_protocol_version,
     validate_positive_number,
 )
 from cayu.mcp.base import (
@@ -44,6 +45,46 @@ from cayu.vaults import (
 DEFAULT_MCP_WRITE_TIMEOUT_S = 5.0
 DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S = 2.0
 DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S = 1.0
+
+# When we do not inherit the full parent environment, npx/uvx and other stdio
+# launchers still need a handful of variables (a PATH to find the binary, a HOME
+# for their package caches, and a locale) or they fail to start at all. Copy only
+# this minimal safelist through so the child stays isolated from the rest of the
+# parent env while remaining launchable.
+_MINIMAL_ENV_SAFELIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "APPDATA",
+    "USERPROFILE",
+)
+
+# Retain at most this many bytes of the child's most recent stderr output so a
+# startup crash surfaces in the resulting protocol error instead of being lost.
+DEFAULT_MCP_STDERR_CAPTURE_BYTES = 8192
+# Best-effort grace period to let the stderr drain finish (and reach EOF) after
+# the child closes stdout, so a crash message lands in the captured tail.
+DEFAULT_MCP_STDERR_DRAIN_GRACE_S = 0.2
+
+
+def _base_child_env(inherit_env: bool) -> dict[str, str]:
+    """Build the base child environment before per-server overrides.
+
+    Inherits the full parent env when requested; otherwise copies only the
+    minimal safelist so launchers such as npx/uvx can still be found and run.
+    """
+    if inherit_env:
+        return dict(os.environ)
+    env: dict[str, str] = {}
+    for name in _MINIMAL_ENV_SAFELIST:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+    return env
 
 
 class StdioMcpClient(McpClient):
@@ -100,7 +141,7 @@ class StdioMcpClient(McpClient):
             )
         if server.secret_headers:
             raise ValueError("StdioMcpClient does not support MCP secret_headers.")
-        child_env = dict(os.environ) if self.inherit_env else {}
+        child_env = _base_child_env(self.inherit_env)
         child_env.update(server.env)
         secret_redactor = SecretRedactor()
         if server.secret_env and self.secret_resolver is not None:
@@ -172,6 +213,7 @@ class StdioMcpSession(McpSession):
         self._closed = False
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._write_lock = asyncio.Lock()
+        self._stderr_tail = bytearray()
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._close_task: asyncio.Task[None] | None = None
@@ -190,20 +232,11 @@ class StdioMcpSession(McpSession):
         if type(result) is not dict:
             raise McpProtocolError("MCP initialize result must be an object.")
         self._initialize_result = initialize_result_from_payload(result)
-        if self._initialize_result.protocol_version != MCP_PROTOCOL_VERSION:
-            raise McpProtocolError(
-                "MCP server negotiated unsupported protocol version "
-                f"{self._initialize_result.protocol_version!r}."
-            )
+        validate_negotiated_protocol_version(self._initialize_result.protocol_version)
         await self._notify("notifications/initialized", {})
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
-        result = await self._request("tools/list", {})
-        if type(result) is not dict:
-            raise McpProtocolError("MCP tools/list result must be an object.")
-        tools = result.get("tools", [])
-        if not isinstance(tools, list):
-            raise McpProtocolError("MCP tools/list result tools must be a list.")
+        tools = await collect_paginated(self._request, "tools/list", "tools")
         return tuple(tool_definition_from_payload(tool, self.server.name) for tool in tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
@@ -223,12 +256,7 @@ class StdioMcpSession(McpSession):
         return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
-        result = await self._request("resources/list", {})
-        if type(result) is not dict:
-            raise McpProtocolError("MCP resources/list result must be an object.")
-        resources = result.get("resources", [])
-        if not isinstance(resources, list):
-            raise McpProtocolError("MCP resources/list result resources must be a list.")
+        resources = await collect_paginated(self._request, "resources/list", "resources")
         return tuple(
             resource_definition_from_payload(resource, self.server.name) for resource in resources
         )
@@ -420,6 +448,11 @@ class StdioMcpSession(McpSession):
         except Exception as exc:
             error = exc
         finally:
+            # The reader loop only exits once the transport is dead. Latch the
+            # session closed so subsequent requests fast-fail immediately instead
+            # of blocking for the full request timeout on a future no reader will
+            # ever resolve.
+            self._closed = True
             self._fail_pending(
                 error if error is not None else McpProtocolError("MCP stdio reader stopped."),
             )
@@ -467,11 +500,15 @@ class StdioMcpSession(McpSession):
             raise McpProtocolError("MCP stdio process stdout is unavailable.")
         line = await self.process.stdout.readline()
         if not line:
-            raise McpProtocolError("MCP stdio process closed stdout.")
+            # A closed stdout usually means the child crashed on startup. Give
+            # the stderr drain a moment to finish so the crash detail lands in
+            # the captured tail, then attach it to the error.
+            await self._await_stderr_drain()
+            raise self._protocol_error("MCP stdio process closed stdout.")
         try:
             payload = json.loads(line.decode("utf-8"))
         except ValueError as exc:
-            raise McpProtocolError("MCP stdio process wrote invalid JSON.") from exc
+            raise self._protocol_error("MCP stdio process wrote invalid JSON.") from exc
         if type(payload) is not dict:
             raise McpProtocolError("MCP JSON-RPC message must be an object.")
         if payload.get("jsonrpc") != "2.0":
@@ -479,12 +516,42 @@ class StdioMcpSession(McpSession):
         return payload
 
     async def _drain_stderr(self) -> None:
-        if self.process.stderr is None:
+        stderr = self.process.stderr
+        if stderr is None:
             return
         while True:
-            line = await self.process.stderr.readline()
-            if not line:
+            chunk = await stderr.read(4096)
+            if not chunk:
                 return
+            self._append_stderr(chunk)
+
+    def _append_stderr(self, chunk: bytes) -> None:
+        buffer = self._stderr_tail
+        buffer.extend(chunk)
+        overflow = len(buffer) - DEFAULT_MCP_STDERR_CAPTURE_BYTES
+        if overflow > 0:
+            del buffer[:overflow]
+
+    def _stderr_snapshot(self) -> str:
+        if not self._stderr_tail:
+            return ""
+        return bytes(self._stderr_tail).decode("utf-8", "replace").strip()
+
+    def _protocol_error(self, message: str) -> McpProtocolError:
+        tail = self._stderr_snapshot()
+        if not tail:
+            return McpProtocolError(message)
+        return McpProtocolError(f"{message} MCP server stderr (tail): {tail}")
+
+    async def _await_stderr_drain(self) -> None:
+        task = self._stderr_task
+        if task is None or task.done():
+            return
+        with suppress(Exception):
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=DEFAULT_MCP_STDERR_DRAIN_GRACE_S,
+            )
 
 
 def _consume_task_result(task: asyncio.Task) -> None:

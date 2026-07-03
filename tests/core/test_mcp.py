@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -1280,11 +1281,68 @@ def test_stdio_mcp_client_rejects_unsupported_negotiated_protocol_version() -> N
     spec = McpServerSpec(
         name="local-mcp",
         command=[sys.executable, str(_FAKE_SERVER)],
-        env={"CAYU_FAKE_MCP_PROTOCOL_VERSION": "2024-11-05"},
+        env={"CAYU_FAKE_MCP_PROTOCOL_VERSION": "1999-01-01"},
     )
 
     with pytest.raises(McpProtocolError, match="unsupported protocol version"):
         asyncio.run(StdioMcpClient().connect(spec))
+
+
+def test_stdio_mcp_client_accepts_older_supported_protocol_version() -> None:
+    spec = McpServerSpec(
+        name="local-mcp",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_PROTOCOL_VERSION": "2025-03-26"},
+    )
+
+    async def run():
+        session = await StdioMcpClient().connect(spec)
+        try:
+            return session.initialize_result
+        finally:
+            await session.close()
+
+    initialize_result = asyncio.run(run())
+    assert initialize_result.protocol_version == "2025-03-26"
+
+
+def test_stdio_mcp_client_list_tools_follows_next_cursor() -> None:
+    spec = McpServerSpec(
+        name="local-mcp",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_PAGINATE": "1"},
+    )
+
+    async def run():
+        session = await StdioMcpClient().connect(spec)
+        try:
+            return await session.list_tools()
+        finally:
+            await session.close()
+
+    tools = asyncio.run(run())
+    assert [tool.name for tool in tools] == ["echo", "echo_page_2"]
+
+
+def test_collect_paginated_rejects_repeated_cursor() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    async def request(method, params):
+        # Always hand back the same cursor -> would loop forever without a guard.
+        return {"tools": [{"name": params.get("cursor", "first")}], "nextCursor": "stuck"}
+
+    with pytest.raises(McpProtocolError, match="repeated pagination cursor"):
+        asyncio.run(collect_paginated(request, "tools/list", "tools"))
+
+
+def test_collect_paginated_rejects_non_string_cursor() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    async def request(method, params):
+        return {"tools": [], "nextCursor": 42}
+
+    with pytest.raises(McpProtocolError, match="nextCursor must be a string"):
+        asyncio.run(collect_paginated(request, "tools/list", "tools"))
 
 
 def test_stdio_mcp_client_times_out_blocked_initialized_notification_write() -> None:
@@ -1641,6 +1699,73 @@ def _fake_server_spec() -> McpServerSpec:
         name="local-mcp",
         command=[sys.executable, str(_FAKE_SERVER)],
     )
+
+
+def test_base_child_env_uses_minimal_safelist_when_not_inheriting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.mcp.stdio import _MINIMAL_ENV_SAFELIST, _base_child_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/agent")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("CAYU_SECRET_TOKEN", "do-not-leak")
+
+    env = _base_child_env(False)
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/agent"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "CAYU_SECRET_TOKEN" not in env
+    assert set(env).issubset(set(_MINIMAL_ENV_SAFELIST))
+
+
+def test_base_child_env_inherits_full_environment_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.mcp.stdio import _base_child_env
+
+    monkeypatch.setenv("CAYU_SECRET_TOKEN", "inherited")
+
+    env = _base_child_env(True)
+
+    assert env["CAYU_SECRET_TOKEN"] == "inherited"
+
+
+def test_stdio_mcp_client_surfaces_stderr_tail_on_startup_crash() -> None:
+    async def run():
+        script = (
+            "import sys; sys.stderr.write('fatal: missing config value\\n'); sys.stderr.flush()"
+        )
+        spec = McpServerSpec(name="crash-mcp", command=[sys.executable, "-c", script])
+        with pytest.raises(McpProtocolError) as excinfo:
+            await StdioMcpClient().connect(spec)
+        return str(excinfo.value)
+
+    message = asyncio.run(run())
+
+    assert "closed stdout" in message
+    assert "fatal: missing config value" in message
+
+
+def test_stdio_mcp_session_fast_fails_after_reader_stops() -> None:
+    async def run():
+        client = StdioMcpClient()
+        session = await client.connect(_fake_server_spec())
+        assert isinstance(session, StdioMcpSession)
+        session.process.kill()
+        await session.process.wait()
+        # Let the reader observe the closed stdout and latch the session.
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(session._reader_task), timeout=2.0)
+        assert session._closed is True
+        try:
+            with pytest.raises(McpProtocolError, match="session is closed"):
+                await asyncio.wait_for(session.list_tools(), timeout=1.0)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
 
 
 def test_mcp_server_spec_rejects_secret_config_collisions() -> None:

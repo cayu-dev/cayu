@@ -36,25 +36,26 @@ def main() -> None:
                 }
             )
         elif method == "tools/list":
-            _write(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "tools": [
-                            {
-                                "name": "echo",
-                                "description": "Echo text.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {"text": {"type": "string"}},
-                                    "required": ["text"],
-                                },
-                            }
-                        ]
-                    },
-                }
-            )
+            echo_tool = {
+                "name": "echo",
+                "description": "Echo text.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+            if os.environ.get("CAYU_FAKE_MCP_PAGINATE") == "1":
+                cursor = message.get("params", {}).get("cursor")
+                if cursor is None:
+                    result = {"tools": [echo_tool], "nextCursor": "tools-page-2"}
+                else:
+                    result = {
+                        "tools": [{**echo_tool, "name": "echo_page_2"}],
+                    }
+            else:
+                result = {"tools": [echo_tool]}
+            _write({"jsonrpc": "2.0", "id": request_id, "result": result})
         elif method == "tools/call":
             params = message.get("params", {})
             name = params.get("name")

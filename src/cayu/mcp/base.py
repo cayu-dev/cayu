@@ -13,8 +13,6 @@ from cayu._validation import (
 )
 from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
 
-_RESERVED_HTTP_HEADER_NAMES = frozenset({"accept", "content-type"})
-
 
 class McpServerSpec(BaseModel):
     """Configuration for an external MCP server."""
@@ -90,21 +88,6 @@ class McpServerSpec(BaseModel):
             raise ValueError(
                 f"MCP server headers and secret_headers declare the same headers: "
                 f"{header_collisions}"
-            )
-        reserved_headers = sorted(
-            name for name in self.headers if name.lower() in _RESERVED_HTTP_HEADER_NAMES
-        )
-        if reserved_headers:
-            raise ValueError(
-                f"MCP server headers cannot override reserved HTTP headers: {reserved_headers}"
-            )
-        reserved_secret_headers = sorted(
-            name for name in self.secret_headers if name.lower() in _RESERVED_HTTP_HEADER_NAMES
-        )
-        if reserved_secret_headers:
-            raise ValueError(
-                "MCP server secret_headers cannot override reserved HTTP headers: "
-                f"{reserved_secret_headers}"
             )
         return self
 
