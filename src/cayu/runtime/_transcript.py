@@ -66,7 +66,7 @@ def assistant_message(
     content.extend(provider_state_parts)
     if not content:
         return None
-    return Message(role=MessageRole.ASSISTANT, content=content)
+    return Message(role=MessageRole.ASSISTANT, content=tuple(content))
 
 
 def _materialize_thinking(part: AssistantThinkingPart) -> ThinkingPart | None:

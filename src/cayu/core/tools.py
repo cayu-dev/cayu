@@ -123,6 +123,10 @@ class ToolSpec(BaseModel):
             data.update(update)
         return type(self)(**data)
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ToolSpec:
+        # ToolSpec is frozen and stores its schema immutably; sharing is safe.
+        return self
+
     @classmethod
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
         schema = super().model_json_schema(*args, **kwargs)
@@ -143,9 +147,12 @@ class ToolResult(BaseModel):
 
     `content` is the model-facing summary. `structured` and `artifacts` are
     for dashboards, workflows, storage, and downstream tools.
+
+    Frozen: results own their payloads (copied at construction) and are
+    treated as read-only once returned from a tool.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     content: str = ""
     structured: dict[str, Any] | None = None
@@ -159,7 +166,7 @@ class ToolResult(BaseModel):
 
 
 class ToolContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     session_id: str
     agent_name: str | None = None
@@ -227,7 +234,9 @@ class Tool(ABC):
         else:
             class_spec = getattr(type(self), "spec", None)
             if type(class_spec) is ToolSpec:
-                self.spec = class_spec.model_copy(deep=True)
+                # ToolSpec is frozen and deeply immutable; instances can share
+                # the class-level spec without copying.
+                self.spec = class_spec
         self._validate_spec()
 
     @property
@@ -240,7 +249,9 @@ class Tool(ABC):
 
     @property
     def schema(self) -> dict[str, Any]:
-        return _mutable_value(self.spec.input_schema)
+        # `input_schema` already materializes a fresh mutable dict from the
+        # frozen storage; wrapping it in another copy would be redundant.
+        return self.spec.input_schema
 
     def _validate_spec(self) -> None:
         spec = getattr(self, "spec", None)

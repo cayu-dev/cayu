@@ -13,6 +13,7 @@ import base64
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
@@ -815,7 +816,10 @@ def test_postgres_session_store_append_and_load_transcript_messages(postgres_dsn
         )
 
         await store.append_transcript_messages("sess_transcript", [user_message, assistant_message])
-        user_message.content[0].text = "mutated"
+        # Messages are frozen: stored transcripts cannot be corrupted through
+        # references the caller still holds.
+        with pytest.raises(ValidationError):
+            user_message.content[0].text = "mutated"  # type: ignore[misc]
         await store.append_transcript_messages("sess_transcript", [tool_message])
 
         transcript = await store.load_transcript("sess_transcript")

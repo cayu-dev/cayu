@@ -902,7 +902,10 @@ def test_session_stores_append_and_load_transcript_messages(
             "sess_transcript",
             [user_message, assistant_message],
         )
-        user_message.content[0].text = "mutated"
+        # Messages are frozen: stored transcripts cannot be corrupted through
+        # references the caller still holds.
+        with pytest.raises(ValidationError):
+            user_message.content[0].text = "mutated"  # type: ignore[misc]
         await store.append_transcript_messages("sess_transcript", [tool_message])
 
         transcript = await store.load_transcript("sess_transcript")
@@ -915,7 +918,8 @@ def test_session_stores_append_and_load_transcript_messages(
         assert transcript[1].content[0].tool_name == "read_file"
         assert transcript[2].content[0].structured == {"bytes": 8}
 
-        transcript[0].content[0].text = "changed after load"
+        with pytest.raises(ValidationError):
+            transcript[0].content[0].text = "changed after load"  # type: ignore[misc]
         loaded_again = await store.load_transcript("sess_transcript")
         assert loaded_again[0].content[0].text == "build"
 
@@ -941,7 +945,8 @@ def test_session_stores_append_and_load_transcript_messages(
         assert [record.index for record in user_page.records] == [0]
         assert user_page.records[0].message.content[0].text == "build"
 
-        user_page.records[0].message.content[0].text = "changed after query"
+        with pytest.raises(ValidationError):
+            user_page.records[0].message.content[0].text = "changed"  # type: ignore[misc]
         user_page_again = await store.query_transcript(
             TranscriptQuery(session_id="sess_transcript", role="user")
         )

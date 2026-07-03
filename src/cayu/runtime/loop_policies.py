@@ -162,14 +162,15 @@ class LoopPolicy:
 
 
 def copy_before_stop_decision(decision: BeforeStopDecision) -> BeforeStopDecision:
+    """Return an owned copy of a policy-provided decision.
+
+    `BeforeStopDecision` is frozen and `Message` owns its payloads, so the only
+    live reference the policy can still mutate is the `metadata` dict — copy
+    just that at this trust boundary instead of rebuilding every field.
+    """
     if type(decision) is not BeforeStopDecision:
         raise TypeError("Loop policies must return BeforeStopDecision instances.")
-    return BeforeStopDecision(
-        action=decision.action,
-        reason=decision.reason,
-        message=copy_message(decision.message) if decision.message is not None else None,
-        metadata=copy_json_value(decision.metadata, "metadata"),
-    )
+    return decision.model_copy(update={"metadata": copy_json_value(decision.metadata, "metadata")})
 
 
 def validate_loop_policies(

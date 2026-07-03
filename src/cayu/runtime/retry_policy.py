@@ -63,9 +63,12 @@ class RetryPolicy(BaseModel):
 
     `max_attempts` includes the initial attempt. The default of 1 means retries
     are disabled.
+
+    Frozen: policies are immutable value objects, so they can be shared across
+    attempts and sessions without per-attempt defensive copies.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_attempts: StrictInt = Field(default=1, ge=1, le=10)
     initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
@@ -91,7 +94,7 @@ class RetryPolicy(BaseModel):
 
 
 class RetryDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     retry: StrictBool
     reason: RetryReason | None = None
@@ -103,21 +106,17 @@ class RetryDecision(BaseModel):
 
 
 def copy_retry_policy(policy: RetryPolicy | None) -> RetryPolicy:
+    """Validate `policy` and return it unchanged (default policy for `None`).
+
+    `RetryPolicy` is frozen with immutable field values, so sharing the
+    instance is safe — the previous per-attempt field-by-field rebuild was a
+    drift-prone no-op.
+    """
     if policy is None:
         return RetryPolicy()
     if type(policy) is not RetryPolicy:
         raise TypeError("Retry policy must be a RetryPolicy instance.")
-    return RetryPolicy(
-        max_attempts=policy.max_attempts,
-        initial_delay_s=policy.initial_delay_s,
-        max_delay_s=policy.max_delay_s,
-        backoff_multiplier=policy.backoff_multiplier,
-        jitter_s=policy.jitter_s,
-        retry_on_status_codes=tuple(policy.retry_on_status_codes),
-        retry_on_timeout=policy.retry_on_timeout,
-        retry_on_connection_error=policy.retry_on_connection_error,
-        retry_on_rate_limit=policy.retry_on_rate_limit,
-    )
+    return policy
 
 
 def retry_decision(

@@ -792,7 +792,7 @@ def _without_thinking_parts(message: Message) -> Message | None:
     kept = [part for part in message.content if type(part) is not ThinkingPart]
     if not kept:
         return None
-    return Message(role=message.role, content=kept)
+    return Message(role=message.role, content=tuple(kept))
 
 
 def filter_transcript_records(

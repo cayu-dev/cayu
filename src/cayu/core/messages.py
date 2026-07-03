@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -23,7 +24,7 @@ class MessageRole(StrEnum):
 
 
 class TextPart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["text"] = "text"
     text: str
@@ -33,9 +34,12 @@ class TextPart(BaseModel):
     def validate_text(cls, value: str) -> str:
         return _require_nonblank("text", value)
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> TextPart:
+        return self
+
 
 class ToolCallPart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["tool_call"] = "tool_call"
     tool_call_id: str
@@ -52,9 +56,12 @@ class ToolCallPart(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ToolCallPart:
+        return self
+
 
 class ToolResultPart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["tool_result"] = "tool_result"
     tool_call_id: str
@@ -74,9 +81,12 @@ class ToolResultPart(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ToolResultPart:
+        return self
+
 
 class ProviderStatePart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["provider_state"] = "provider_state"
     provider: str
@@ -92,6 +102,9 @@ class ProviderStatePart(BaseModel):
     def copy_state(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "state")
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ProviderStatePart:
+        return self
+
 
 class ThinkingPart(BaseModel):
     """Model reasoning/thinking content from a single reasoning block.
@@ -102,7 +115,7 @@ class ThinkingPart(BaseModel):
     needed to send the block back to the provider on a later turn.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["thinking"] = "thinking"
     text: str = ""
@@ -113,19 +126,49 @@ class ThinkingPart(BaseModel):
     def copy_provider_state(cls, value):
         return copy_json_value(value, "provider_state")
 
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ThinkingPart:
+        return self
+
+
+class _ValidatedContent(
+    tuple[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart, ...]
+):
+    """Marker type for content produced by full `Message` validation.
+
+    Pydantic runs after-model-validators even when an existing instance passes
+    through a model-typed field unrevalidated, so an instance flag set in a
+    validator cannot distinguish a validated Message from a `model_construct`
+    bypass. The content tuple type can: only the `copy_content` field
+    validator — which runs exclusively during full validation — produces it.
+    """
+
+    __slots__ = ()
+
 
 class Message(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """Frozen transcript message.
+
+    Messages and their parts are immutable once constructed: attribute
+    assignment is rejected, `content` is a tuple, and every part entering the
+    message is copied so the message exclusively owns its JSON payloads. This
+    makes construction the single copy-at-trust-boundary; sharing a stored
+    `Message` afterwards is safe, and hot-path "copies" are no-ops.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     role: MessageRole
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart] = (
-        Field(default_factory=list)
-    )
+    content: tuple[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart, ...
+    ] = ()
 
     @field_validator("content")
     @classmethod
     def copy_content(cls, value):
-        return [copy_message_part(part) for part in value]
+        return _ValidatedContent(copy_message_part(part) for part in value)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Message:
+        return self
 
     @model_validator(mode="after")
     def validate_role_content(self) -> Message:
@@ -148,7 +191,7 @@ class Message(BaseModel):
 
     @classmethod
     def text(cls, role: MessageRole | str, text: str) -> Message:
-        return cls(role=MessageRole(role), content=[TextPart(text=text)])
+        return cls(role=MessageRole(role), content=(TextPart(text=text),))
 
     @classmethod
     def tool_call(
@@ -178,7 +221,7 @@ class Message(BaseModel):
             ]
         return cls(
             role=MessageRole.ASSISTANT,
-            content=content,
+            content=tuple(content),
         )
 
     @classmethod
@@ -226,13 +269,13 @@ class Message(BaseModel):
             ]
         return cls(
             role=MessageRole.TOOL,
-            content=result_parts,
+            content=tuple(result_parts),
         )
 
 
 def _require_parts(
     role: MessageRole,
-    content: list[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
+    content: Sequence[TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart],
     *allowed_types: (
         type[TextPart]
         | type[ToolCallPart]
@@ -254,49 +297,44 @@ def _require_value(name: str, value: str | None) -> str:
     return _require_clean_nonblank(name, value)
 
 
+_MESSAGE_PART_TYPES = (TextPart, ToolCallPart, ToolResultPart, ProviderStatePart, ThinkingPart)
+
+
 def copy_message(message: Message) -> Message:
+    """Validate `message` and return it unchanged.
+
+    `Message` is frozen and copied every part (with its JSON payloads) at
+    construction, so a validated instance can be shared safely: this "copy" is
+    a no-op. Copying happens once, at the construction trust boundary —
+    callers must treat nested payload dicts on returned messages as read-only.
+    Instances that bypassed validation (`model_construct`) are rebuilt through
+    full validation instead.
+    """
     if type(message) is not Message:
         raise TypeError("Messages must be Message instances.")
-    content = getattr(message, "content", None)
-    if type(content) is not list:
-        raise ValueError("Message content must be a list.")
-    return Message(
-        role=message.role,
-        content=[copy_message_part(part) for part in content],
-    )
+    if type(message.content) is _ValidatedContent:
+        return message
+    return Message(role=message.role, content=message.content)
 
 
 def copy_message_part(
     part: TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart,
 ) -> TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart:
-    if type(part) is TextPart:
-        return TextPart(text=part.text)
-    if type(part) is ToolCallPart:
-        return ToolCallPart(
-            tool_call_id=part.tool_call_id,
-            tool_name=part.tool_name,
-            arguments=copy_json_value(part.arguments, "arguments"),
-        )
-    if type(part) is ToolResultPart:
-        return ToolResultPart(
-            tool_call_id=part.tool_call_id,
-            tool_name=part.tool_name,
-            content=part.content,
-            structured=copy_json_value(part.structured, "structured"),
-            artifacts=copy_json_value(part.artifacts, "artifacts"),
-            is_error=part.is_error,
-        )
-    if type(part) is ProviderStatePart:
-        return ProviderStatePart(
-            provider=part.provider,
-            state=copy_json_value(part.state, "state"),
-        )
-    if type(part) is ThinkingPart:
-        return ThinkingPart(
-            text=part.text,
-            provider_state=copy_json_value(part.provider_state, "provider_state"),
-        )
-    raise TypeError("Message content must contain supported message parts.")
+    """Return an owned copy of `part`.
+
+    Parts are frozen, but the caller that constructed a part may still hold
+    references to its mutable JSON payloads (`arguments`, `structured`,
+    `artifacts`, `state`, `provider_state`). Copying a part generically — a
+    dump/validate round-trip through the part's own validators — detaches
+    those payloads and revalidates `model_construct`-bypassed parts without a
+    per-field copier that can drift as fields are added.
+    """
+    part_type = type(part)
+    if part_type not in _MESSAGE_PART_TYPES:
+        raise TypeError("Message content must contain supported message parts.")
+    # warnings=False: dumps of `model_construct`-bypassed parts may hold
+    # ill-typed values; validation below reports them properly.
+    return part_type.model_validate(part.model_dump(warnings=False))
 
 
 def _require_nonblank(name: str, value: str) -> str:
