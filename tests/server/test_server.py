@@ -556,6 +556,7 @@ def test_server_exposes_session_usage_summary() -> None:
             "output_tokens": 2,
             "total_tokens": 12,
             "reasoning_output_tokens": 0,
+            "requested_model": None,
             "cache": {
                 "read_tokens": 0,
                 "write_tokens": 0,
@@ -1168,6 +1169,7 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "model_step": 1,
                 "provider_name": "fake",
                 "model": "fake-model",
+                "requested_model": "fake-model",
                 "pricing_provider_name": "fake",
                 "pricing_model": "fake-model",
                 "pricing_match": "exact",
@@ -1253,6 +1255,7 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
             "output_tokens": 4,
             "total_tokens": 24,
             "reasoning_output_tokens": 0,
+            "requested_model": None,
             "cache": {
                 "read_tokens": 0,
                 "write_tokens": 0,
@@ -1274,6 +1277,7 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
                     "output_tokens": 2,
                     "total_tokens": 12,
                     "reasoning_output_tokens": 0,
+                    "requested_model": None,
                     "cache": {
                         "read_tokens": 0,
                         "write_tokens": 0,
@@ -1295,6 +1299,7 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
                     "output_tokens": 2,
                     "total_tokens": 12,
                     "reasoning_output_tokens": 0,
+                    "requested_model": None,
                     "cache": {
                         "read_tokens": 0,
                         "write_tokens": 0,
@@ -1490,6 +1495,7 @@ def test_server_exposes_session_summary() -> None:
             "output_tokens": 2,
             "total_tokens": 12,
             "reasoning_output_tokens": 0,
+            "requested_model": None,
             "cache": {
                 "read_tokens": 0,
                 "write_tokens": 0,
