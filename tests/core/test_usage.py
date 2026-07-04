@@ -1941,6 +1941,53 @@ def test_estimate_session_cost_prices_each_model_step() -> None:
     assert summary.total_cost == Decimal("0.00684")
 
 
+def test_estimate_session_cost_falls_back_to_requested_model() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "openai",
+                    "requested_model": "gpt-5.4-mini",
+                    "model": "gpt-5.4-mini-2026-06-01",
+                    "input_tokens": 1000,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "reasoning_output_tokens": 0,
+                    "cache": {
+                        "read_tokens": 0,
+                        "write_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "uncached_input_tokens": 1000,
+                    },
+                }
+            },
+        )
+    ]
+    pricing = PricingCatalog(
+        prices=(
+            ModelPricing(
+                provider_name="openai",
+                model="gpt-5.4-mini",
+                match="exact",
+                input_per_million=Decimal("0.25"),
+                output_per_million=Decimal("2.00"),
+            ),
+        )
+    )
+
+    summary = estimate_session_cost(session_id="session_1", events=events, pricing=pricing)
+
+    assert summary.priced_model_steps == 1
+    assert summary.unpriced_model_steps == 0
+    assert summary.line_items[0].model == "gpt-5.4-mini-2026-06-01"
+    assert summary.line_items[0].requested_model == "gpt-5.4-mini"
+    assert summary.line_items[0].pricing_model == "gpt-5.4-mini"
+    assert summary.line_items[0].pricing_match == "exact"
+    assert summary.total_cost == Decimal("0.00045")
+
+
 def test_estimate_causal_budget_cost_prices_related_sessions() -> None:
     events = [
         Event(

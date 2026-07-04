@@ -9658,6 +9658,8 @@ def _model_stream_event_to_runtime_event(
         )
     if stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
+        resolved_model = _payload_model(payload, fallback=session.model)
+        payload["requested_model"] = session.model
         completion = _stream_event_completion(stream_event)
         payload["completion"] = {
             "finish_reason": completion.finish_reason.value,
@@ -9669,7 +9671,8 @@ def _model_stream_event_to_runtime_event(
         usage_metrics = usage_metrics_payload(
             normalize_usage_metrics(
                 provider_name=provider_name,
-                model=_payload_model(payload, fallback=session.model),
+                model=resolved_model,
+                requested_model=session.model,
                 raw_usage=payload.get("usage"),
                 usage_dialect=usage_dialect,
             )

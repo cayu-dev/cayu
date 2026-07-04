@@ -14805,10 +14805,12 @@ def test_model_compactor_reports_model_completed_payload_with_usage_metrics():
             "model": "summary-model-2026-01-01",
             "usage": {"input_tokens": 40, "output_tokens": 8},
             "provider_name": "fake",
+            "requested_model": "summary-model",
             "purpose": "context_compaction",
             "compactor": "ModelCompactor",
             "usage_metrics": {
                 "provider_name": "fake",
+                "requested_model": "summary-model",
                 "model": "summary-model-2026-01-01",
                 "input_tokens": 40,
                 "output_tokens": 8,
@@ -15035,6 +15037,7 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
     }
     assert completed.payload["usage_metrics"] == {
         "provider_name": "fake",
+        "requested_model": "fake-model",
         "model": "fake-model-version",
         "input_tokens": 12,
         "output_tokens": 3,
@@ -17218,6 +17221,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "finish_reason": "stop",
         "model": "summary-model",
         "provider_name": "fake",
+        "requested_model": "summary-model",
         "purpose": "context_compaction",
         "compactor": "ModelCompactor",
     }
@@ -17321,6 +17325,7 @@ def test_cayu_app_counts_compaction_model_spend_in_session_usage():
     assert len(compaction_completed) == 1
     assert compaction_completed[0].payload["usage_metrics"]["input_tokens"] == 40
     assert compaction_completed[0].payload["usage_metrics"]["model"] == "summary-model"
+    assert compaction_completed[0].payload["usage_metrics"]["requested_model"] == "summary-model"
 
     summary = asyncio.run(app.get_session_usage("sess_compaction_usage"))
     assert summary.model_steps == 2

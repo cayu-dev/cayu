@@ -153,6 +153,8 @@ def _summarize_event(
         _append(parts, "limit", payload.get("limit"), redactor=redactor)
         _append(parts, "actual", payload.get("actual"), redactor=redactor)
         _append(parts, "maximum", payload.get("maximum"), redactor=redactor)
+        _append(parts, "message", payload.get("message"), redactor=redactor)
+        _append_cost_diagnostics(parts, payload.get("cost_summary"), redactor=redactor)
     elif event_type in {
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
@@ -238,6 +240,42 @@ def _append_usage(parts: list[str], usage: Any, *, redactor: SecretRedactor) -> 
     input_details = usage.get("input_tokens_details")
     if type(input_details) is dict:
         _append(parts, "cached_tokens", input_details.get("cached_tokens"), redactor=redactor)
+
+
+def _append_cost_diagnostics(
+    parts: list[str],
+    cost_summary: Any,
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    if type(cost_summary) is not dict:
+        return
+    _append(
+        parts,
+        "unpriced_model_steps",
+        cost_summary.get("unpriced_model_steps"),
+        redactor=redactor,
+    )
+    line_items = cost_summary.get("line_items")
+    if type(line_items) is not list:
+        return
+    unpriced_models: list[str] = []
+    for item in line_items:
+        if type(item) is not dict or item.get("priced") is not False:
+            continue
+        provider = item.get("provider_name")
+        model = item.get("model")
+        if type(provider) is not str or type(model) is not str:
+            continue
+        model_label = f"{provider}/{model}"
+        requested_model = item.get("requested_model")
+        if type(requested_model) is str and requested_model != model:
+            model_label = f"{model_label} requested={requested_model}"
+        unpriced_models.append(model_label)
+        if len(unpriced_models) >= 3:
+            break
+    if unpriced_models:
+        parts.append("unpriced_models=" + _clean(",".join(unpriced_models), redactor=redactor))
 
 
 def _append_error(

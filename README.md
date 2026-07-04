@@ -851,14 +851,14 @@ print(cost.total_cost)
 print(cost.unpriced_model_steps)
 ```
 
-Cost estimation walks each durable `model.completed` event, matches its
-provider/model against the pricing catalog, and returns line items. A pricing
-entry can match an exact model name or a provider model-name prefix so callers
-can handle provider snapshot suffixes. Missing pricing is reported as unpriced
-line items instead of being silently treated as free. If cache read/write prices
-are omitted, Cayu falls back to the normal input-token price for those counters;
-provide explicit cache prices when your provider or account charges them
-differently.
+Cost estimation walks each durable `model.completed` event, matches the
+provider-returned model against the pricing catalog, and falls back to the
+requested model recorded on the step when the provider returns a resolved or
+snapshot model name. A pricing entry can match an exact model name or a provider
+model-name prefix. Missing pricing is reported as unpriced line items instead of
+being silently treated as free. If cache read/write prices are omitted, Cayu
+falls back to the normal input-token price for those counters; provide explicit
+cache prices when your provider or account charges them differently.
 
 The optional server exposes the same estimate at
 `POST /api/sessions/{session_id}/cost`. The request body supplies the pricing
@@ -1046,8 +1046,8 @@ the month. Rolling and calendar windows can be used together as separate
 `BudgetLimit` entries when an app needs both spend-velocity protection and
 daily/monthly accounting.
 Before each model step and after each completed model step, Cayu evaluates the
-matching budget limits, verifies that the current provider/model has pricing
-unless `allow_unpriced=True`, and emits `budget.checked`. If an interrupt budget
+matching budget limits, verifies that the current requested provider/model has
+pricing unless `allow_unpriced=True`, and emits `budget.checked`. If an interrupt budget
 is reached, Cayu stops with `budget.limit_reached` plus the normal
 `session.limit_reached` / `session.interrupted` events. If a notify budget is
 reached, Cayu emits `budget.limit_reached` with `action="notify"` and continues.

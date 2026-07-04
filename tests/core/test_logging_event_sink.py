@@ -160,6 +160,49 @@ def test_logging_event_sink_summarizes_normalized_usage_metrics(
     assert "cached_input_tokens=60" in message
 
 
+def test_logging_event_sink_summarizes_unpriced_limit_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("cayu.test.limit")
+    sink = LoggingEventSink(logger=logger)
+    event = Event(
+        type=EventType.SESSION_LIMIT_REACHED,
+        session_id="sess_limit",
+        payload={
+            "limit": "estimated_cost",
+            "actual": "0",
+            "maximum": "0.50",
+            "message": (
+                "Estimated cost budget cannot be verified because "
+                "1 model step(s) have no matching pricing."
+            ),
+            "cost_summary": {
+                "unpriced_model_steps": 1,
+                "line_items": [
+                    {
+                        "provider_name": "openai",
+                        "requested_model": "gpt-5.4-mini",
+                        "model": "gpt-5.4-mini-2026-06-01",
+                        "priced": False,
+                    }
+                ],
+            },
+        },
+    )
+
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    asyncio.run(sink.emit(event))
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].message
+    assert "limit=estimated_cost" in message
+    assert "actual=0" in message
+    assert "maximum=0.50" in message
+    assert "message=Estimated cost budget cannot be verified" in message
+    assert "unpriced_model_steps=1" in message
+    assert "unpriced_models=openai/gpt-5.4-mini-2026-06-01 requested=gpt-5.4-mini" in message
+
+
 def test_logging_event_sink_does_not_dump_raw_tool_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

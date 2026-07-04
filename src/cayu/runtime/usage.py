@@ -25,6 +25,7 @@ class UsageMetrics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider_name: str | None = None
+    requested_model: str | None = None
     model: str | None = None
     input_tokens: StrictInt = Field(default=0, ge=0)
     output_tokens: StrictInt = Field(default=0, ge=0)
@@ -32,7 +33,7 @@ class UsageMetrics(BaseModel):
     reasoning_output_tokens: StrictInt = Field(default=0, ge=0)
     cache: CacheUsageMetrics = Field(default_factory=CacheUsageMetrics)
 
-    @field_validator("provider_name", "model")
+    @field_validator("provider_name", "requested_model", "model")
     @classmethod
     def validate_optional_nonblank(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -126,6 +127,7 @@ def normalize_usage_metrics(
     model: str | None,
     raw_usage: Any,
     usage_dialect: str | None = None,
+    requested_model: str | None = None,
 ) -> UsageMetrics | None:
     """Normalize provider usage payloads without hiding the original raw usage.
 
@@ -198,6 +200,7 @@ def normalize_usage_metrics(
 
     return UsageMetrics(
         provider_name=provider_name,
+        requested_model=requested_model,
         model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -289,6 +292,7 @@ def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | 
     return normalize_usage_metrics(
         provider_name=_optional_string(payload.get("provider_name")),
         model=_optional_string(payload.get("model")),
+        requested_model=_optional_string(payload.get("requested_model")),
         raw_usage=payload.get("usage"),
     )
 

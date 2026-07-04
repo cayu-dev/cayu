@@ -532,12 +532,14 @@ are included. The optional server exposes this grouped view at
 `PricingCatalog` and `ModelPricing` estimate session cost from durable
 `model.completed` events. Pricing is caller supplied; Cayu does not hardcode
 provider prices. `CayuApp.get_session_cost(session_id, pricing)` walks each
-model step, matches provider/model to exact or prefix pricing entries, and
-returns a `SessionCostSummary` with per-step `CostLineItem` records. Missing
-usage or missing pricing is reported as unpriced line items so dashboards and
-operators can see estimation gaps instead of silently treating them as free. If
-cache read/write prices are omitted, the estimator falls back to the configured
-input-token price for those counters.
+model step, matches the provider-returned model to exact or prefix pricing
+entries, then falls back to the requested model recorded on the step when the
+provider returned a resolved/snapshot name. It returns a `SessionCostSummary`
+with per-step `CostLineItem` records. Missing usage or missing pricing is
+reported as unpriced line items so dashboards and operators can see estimation
+gaps instead of silently treating them as free. If cache read/write prices are
+omitted, the estimator falls back to the configured input-token price for those
+counters.
 
 The optional FastAPI server exposes the same estimator at
 `POST /api/sessions/{session_id}/cost`. The request body supplies a
@@ -688,7 +690,7 @@ budget id, so parent and child sessions can share a single work-item budget.
 
 The runtime checks matching app-policy budget limits before every model step and
 again after each completed model step. A pre-model check also verifies that the
-current provider/model has matching pricing unless `allow_unpriced=True`. Each
+current requested provider/model has matching pricing unless `allow_unpriced=True`. Each
 app-policy check emits `budget.checked`. If an interrupt budget is reached, the
 runtime emits `budget.limit_reached` and then follows the controlled stop path:
 `session.limit_reached`, `session.interrupted`, and a resumable interrupted

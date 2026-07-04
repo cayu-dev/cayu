@@ -103,6 +103,7 @@ class CostLineItem(BaseModel):
 
     model_step: StrictInt = Field(ge=1)
     provider_name: str | None = None
+    requested_model: str | None = None
     model: str | None = None
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
@@ -123,6 +124,7 @@ class CostLineItem(BaseModel):
 
     @field_validator(
         "provider_name",
+        "requested_model",
         "model",
         "pricing_provider_name",
         "pricing_model",
@@ -215,6 +217,7 @@ def estimate_session_cost(
                 _unpriced_line_item(
                     model_step=model_step,
                     provider_name=_optional_nonblank(event.payload.get("provider_name")),
+                    requested_model=_optional_nonblank(event.payload.get("requested_model")),
                     model=_optional_nonblank(event.payload.get("model")),
                     currency=currency,
                     reason="model.completed event has no token usage metrics",
@@ -293,10 +296,16 @@ def _cost_line_item(
     currency: str,
 ) -> CostLineItem:
     price = pricing.match_price(provider_name=metrics.provider_name, model=metrics.model)
+    if price is None and metrics.requested_model != metrics.model:
+        price = pricing.match_price(
+            provider_name=metrics.provider_name,
+            model=metrics.requested_model,
+        )
     if price is None:
         return _unpriced_line_item(
             model_step=model_step,
             provider_name=metrics.provider_name,
+            requested_model=metrics.requested_model,
             model=metrics.model,
             currency=currency,
             reason="no matching model pricing",
@@ -307,6 +316,7 @@ def _cost_line_item(
         return _unpriced_line_item(
             model_step=model_step,
             provider_name=metrics.provider_name,
+            requested_model=metrics.requested_model,
             model=metrics.model,
             currency=currency,
             reason=f"pricing currency {price.currency} does not match requested {currency}",
@@ -342,6 +352,7 @@ def _cost_line_item(
     return CostLineItem(
         model_step=model_step,
         provider_name=metrics.provider_name,
+        requested_model=metrics.requested_model,
         model=metrics.model,
         pricing_provider_name=price.provider_name,
         pricing_model=price.model,
@@ -369,10 +380,12 @@ def _unpriced_line_item(
     currency: str,
     reason: str,
     metrics: UsageMetrics | None = None,
+    requested_model: str | None = None,
 ) -> CostLineItem:
     return CostLineItem(
         model_step=model_step,
         provider_name=provider_name,
+        requested_model=requested_model,
         model=model,
         priced=False,
         currency=currency.upper(),

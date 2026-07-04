@@ -2575,12 +2575,14 @@ def _compaction_model_completed_payload(
         resolved_model = fallback_model
         payload["model"] = fallback_model
     payload["provider_name"] = provider_name
+    payload["requested_model"] = fallback_model
     payload["purpose"] = "context_compaction"
     payload["compactor"] = compactor
     usage_metrics = usage_metrics_payload(
         normalize_usage_metrics(
             provider_name=provider_name,
             model=resolved_model,
+            requested_model=fallback_model,
             raw_usage=payload.get("usage"),
             usage_dialect=usage_dialect,
         )
