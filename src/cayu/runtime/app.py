@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import mimetypes
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
@@ -26,9 +28,14 @@ from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
     RESOLVED_FILE_ATTACHMENTS_OPTION,
+    ArtifactScope,
     FileAttachment,
+    FileAttachmentKind,
+    file_attachment,
     file_attachment_from_payload,
     resolved_file_attachment,
+    validate_file_attachment_bytes,
+    validate_file_attachment_content_type,
 )
 from cayu.core.agents import AgentSpec
 from cayu.core.events import Event, EventType
@@ -130,6 +137,7 @@ from cayu.runtime.context import (
     copy_context_messages,
     estimate_context_pressure,
     estimate_model_request_context_pressure,
+    noteify_unresolvable_prompt_files,
 )
 from cayu.runtime.context_counting import (
     ContextCountingConfig,
@@ -382,6 +390,9 @@ class _EnvironmentFactoryResolutionResult:
 class _EnvironmentBindingFinalizeResult:
     event: Event
     events: list[Event]
+
+
+logger = logging.getLogger(__name__)
 
 
 _RESUMABLE_SESSION_STATUSES = {
@@ -1559,6 +1570,92 @@ class CayuApp:
                 f"Environment is not factory-backed: {registered_environment.spec.name}"
             )
         return registered_environment.factory
+
+    async def attach_file(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+        kind: FileAttachmentKind | str,
+        content_type: str | None = None,
+        environment_name: str | None = None,
+        scope: ArtifactScope = ArtifactScope.SESSION,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> FilePart:
+        """Save a file to the artifact store and return a user-prompt `FilePart` referencing it.
+
+        Attach the returned part to a user `Message` alongside text; the runtime inlines the file
+        into the provider request on the turn it is attached (and re-enforces the per-file/per-request
+        limits). `kind` is `"image"` (jpeg/png/gif/webp) or `"document"` (pdf). For a session-scoped
+        attachment, pass the same `session_id` you will use in the `RunRequest`.
+
+        The bytes are parsed to confirm they are a valid image/PDF whose detected format matches the
+        declared/inferred content type before being stored, which requires the optional file
+        dependencies (`cayu[files]`); without them this raises. The
+        (default or named) environment must expose a statically-registered artifact store.
+        Factory-backed environments create their store per session at run time, which does not exist
+        yet when you call `attach_file`, so this raises for them — register the artifact store on the
+        environment directly if you need to attach prompt files.
+        """
+        if type(content) is not bytes:
+            raise TypeError("attach_file content must be bytes.")
+        if not content:
+            raise ValueError("attach_file content cannot be empty.")
+        if len(content) > self._max_file_attachment_bytes:
+            raise ValueError(
+                "File exceeds the prompt attachment byte limit: "
+                f"{len(content)} > {self._max_file_attachment_bytes}"
+            )
+        resolved_kind = FileAttachmentKind(kind)
+        if content_type is None:
+            guessed_type, guessed_encoding = mimetypes.guess_type(filename)
+            if guessed_encoding is not None:
+                raise ValueError(
+                    f"Cannot infer a content type for {filename!r} (encoding {guessed_encoding!r}); "
+                    "pass content_type explicitly."
+                )
+            content_type = guessed_type
+        if content_type is None:
+            raise ValueError(
+                f"Could not infer a content type for {filename!r}; pass content_type explicitly."
+            )
+        resolved_content_type = require_clean_nonblank(content_type, "content_type")
+        validate_file_attachment_content_type(
+            kind=resolved_kind,
+            content_type=resolved_content_type,
+        )
+        validate_file_attachment_bytes(
+            kind=resolved_kind, content=content, content_type=resolved_content_type
+        )
+        registered_environment = self._get_registered_environment(environment_name)
+        artifact_store = _artifact_store(registered_environment)
+        if artifact_store is None:
+            raise RuntimeError(
+                "attach_file requires an environment with a statically-registered artifact store; "
+                "factory-backed environments create their store per session at run time."
+            )
+        artifact = await artifact_store.put_bytes(
+            content,
+            filename=filename,
+            content_type=resolved_content_type,
+            scope=scope,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=_environment_name(registered_environment),
+            metadata=metadata,
+        )
+        return FilePart(
+            attachment=file_attachment(
+                artifact_id=artifact.id,
+                kind=resolved_kind,
+                filename=artifact.filename,
+                content_type=artifact.content_type,
+                size_bytes=artifact.size_bytes,
+                metadata=artifact.metadata,
+            )
+        )
 
     def _get_registered_provider(
         self, name: str | None = None
@@ -4768,6 +4865,27 @@ class CayuApp:
                 structured_output,
             )
 
+        resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
+            messages=model_messages,
+            session=session,
+            registered_environment=registered_environment,
+            max_file_attachment_bytes=self._max_file_attachment_bytes,
+            max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
+            max_file_attachments_per_request=self._max_file_attachments_per_request,
+        )
+        if unresolvable_prompt_ids:
+            # Fail open: a live prompt file that cannot be resolved is projected to a text note so
+            # the run proceeds instead of failing forever, but the misconfiguration stays visible.
+            model_messages = noteify_unresolvable_prompt_files(
+                model_messages, unresolvable_prompt_ids
+            )
+            logger.warning(
+                "Prompt file attachment(s) could not be resolved and were omitted from the "
+                "provider request (check the session_id used at attach time, or whether the "
+                "artifact still exists): %s",
+                ", ".join(sorted(unresolvable_prompt_ids)),
+            )
+
         request_options: dict[str, Any] = {
             **copy_json_value(
                 registered_agent.spec.provider_options,
@@ -4785,14 +4903,7 @@ class CayuApp:
                 if structured_output is not None
                 else None
             ),
-            RESOLVED_FILE_ATTACHMENTS_OPTION: await _resolved_file_attachments(
-                messages=context_messages,
-                session=session,
-                registered_environment=registered_environment,
-                max_file_attachment_bytes=self._max_file_attachment_bytes,
-                max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
-                max_file_attachments_per_request=self._max_file_attachments_per_request,
-            ),
+            RESOLVED_FILE_ATTACHMENTS_OPTION: resolved_attachments,
         }
         if thinking is not None:
             request_options["thinking"] = thinking_config_payload(thinking)
@@ -10175,6 +10286,10 @@ def _artifact_store(registered_environment: runtime_records.RegisteredEnvironmen
     return registered_environment.environment.artifact_store
 
 
+class _FileAttachmentUnavailable(RuntimeError):
+    """A file attachment reference cannot be resolved to bytes (missing / wrong scope / drifted)."""
+
+
 async def _resolved_file_attachments(
     *,
     messages: list[Message],
@@ -10183,10 +10298,18 @@ async def _resolved_file_attachments(
     max_file_attachment_bytes: int,
     max_total_file_attachment_bytes: int,
     max_file_attachments_per_request: int,
-) -> dict[str, dict[str, Any]]:
-    attachment_refs = _file_attachment_refs(messages)
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    # Returns (resolved, unresolvable_prompt_ids). A prompt file part that cannot be resolved (wrong
+    # session_id at attach time, a since-deleted artifact, a malformed/corrupt reference) fails open:
+    # it is reported back so the caller can project it to a text note instead of failing the run
+    # forever. Tool-result attachments stay fail-closed — a tool that produced an artifact must
+    # resolve it — and an id referenced by BOTH a prompt file and a tool result stays fail-closed too
+    # (the tool-result path would otherwise brick on a missing resolved entry).
+    attachment_refs, prompt_file_artifact_ids, tool_result_artifact_ids = _file_attachment_refs(
+        messages
+    )
     if not attachment_refs:
-        return {}
+        return {}, set()
     if len(attachment_refs) > max_file_attachments_per_request:
         raise RuntimeError(
             "File attachment count exceeds the runtime attachment limit: "
@@ -10198,6 +10321,7 @@ async def _resolved_file_attachments(
 
     environment_name = _environment_name(registered_environment)
     resolved: dict[str, dict[str, Any]] = {}
+    unresolvable_prompt_ids: set[str] = set()
     total_attachment_bytes = 0
     for attachment in attachment_refs:
         if attachment.size_bytes > max_file_attachment_bytes:
@@ -10208,40 +10332,74 @@ async def _resolved_file_attachments(
         total_attachment_bytes += attachment.size_bytes
         if total_attachment_bytes > max_total_file_attachment_bytes:
             raise RuntimeError("File attachments exceed the runtime total attachment byte limit.")
-        if attachment.artifact_id in resolved:
+        if attachment.artifact_id in resolved or attachment.artifact_id in unresolvable_prompt_ids:
             continue
-        result = await artifact_store.read_bytes(
-            attachment.artifact_id,
-            max_bytes=attachment.size_bytes,
-        )
-        artifact = result.metadata
-        if artifact.scope.value == "session" and artifact.session_id != session.id:
-            raise RuntimeError("File attachment is not available in this session.")
-        if artifact.scope.value == "environment" and artifact.environment_name != environment_name:
-            raise RuntimeError("File attachment is not available in this environment.")
-        if artifact.content_type != attachment.content_type:
-            raise RuntimeError("File attachment content type changed before provider request.")
-        if artifact.size_bytes != attachment.size_bytes:
-            raise RuntimeError("File attachment size changed before provider request.")
+        try:
+            result = await artifact_store.read_bytes(
+                attachment.artifact_id,
+                max_bytes=attachment.size_bytes,
+            )
+            artifact = result.metadata
+            if artifact.scope.value == "session" and artifact.session_id != session.id:
+                raise _FileAttachmentUnavailable(
+                    "File attachment is not available in this session."
+                )
+            if (
+                artifact.scope.value == "environment"
+                and artifact.environment_name != environment_name
+            ):
+                raise _FileAttachmentUnavailable(
+                    "File attachment is not available in this environment."
+                )
+            if artifact.content_type != attachment.content_type:
+                raise _FileAttachmentUnavailable(
+                    "File attachment content type changed before provider request."
+                )
+            if artifact.size_bytes != attachment.size_bytes:
+                raise _FileAttachmentUnavailable(
+                    "File attachment size changed before provider request."
+                )
+        except (OSError, ValueError, _FileAttachmentUnavailable):
+            # Fail open only for files that are EXCLUSIVELY prompt attachments. A tool-result
+            # reference (including an id shared with a prompt file) stays fail-closed, because the
+            # provider builder raises on a tool-result part whose artifact is not resolved.
+            is_exclusively_prompt = (
+                attachment.artifact_id in prompt_file_artifact_ids
+                and attachment.artifact_id not in tool_result_artifact_ids
+            )
+            if not is_exclusively_prompt:
+                raise
+            unresolvable_prompt_ids.add(attachment.artifact_id)
+            continue
         resolved[attachment.artifact_id] = resolved_file_attachment(attachment, result)
-    return resolved
+    return resolved, unresolvable_prompt_ids
 
 
-def _file_attachment_refs(messages: list[Message]) -> tuple[FileAttachment, ...]:
+def _file_attachment_refs(
+    messages: list[Message],
+) -> tuple[tuple[FileAttachment, ...], set[str], set[str]]:
+    # Single pass over the messages, returning (ordered refs, prompt-file artifact ids, tool-result
+    # artifact ids). The two id sets carry provenance so resolution can fail open only for files that
+    # are exclusively prompt attachments.
     refs: dict[str, FileAttachment] = {}
     ordered_refs: list[FileAttachment] = []
+    prompt_artifact_ids: set[str] = set()
+    tool_result_artifact_ids: set[str] = set()
     for message in messages:
         for part in message.content:
             if type(part) is ToolResultPart:
                 payloads: list[dict[str, Any]] = part.artifacts
+                origin_ids = tool_result_artifact_ids
             elif type(part) is FilePart:
                 payloads = [part.attachment]
+                origin_ids = prompt_artifact_ids
             else:
                 continue
             for payload in payloads:
                 attachment = file_attachment_from_payload(payload)
                 if attachment is None:
                     continue
+                origin_ids.add(attachment.artifact_id)
                 existing = refs.get(attachment.artifact_id)
                 if existing is not None and not _same_file_attachment_ref(existing, attachment):
                     raise RuntimeError(
@@ -10250,7 +10408,7 @@ def _file_attachment_refs(messages: list[Message]) -> tuple[FileAttachment, ...]
                     )
                 refs[attachment.artifact_id] = attachment
                 ordered_refs.append(attachment)
-    return tuple(ordered_refs)
+    return tuple(ordered_refs), prompt_artifact_ids, tool_result_artifact_ids
 
 
 def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bool:

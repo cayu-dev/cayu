@@ -13,8 +13,13 @@ import pytest
 from pydantic import ValidationError
 
 import cayu.runtime.app as runtime_app_module
-from cayu.artifacts import file_attachment
+from cayu.artifacts import (
+    RESOLVED_FILE_ATTACHMENTS_OPTION,
+    LocalArtifactStore,
+    file_attachment,
+)
 from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart, ToolResultPart
+from cayu.core.messages import FilePart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
@@ -18004,9 +18009,11 @@ def test_file_attachment_refs_include_user_file_parts():
         ),
     ]
 
-    refs = _file_attachment_refs(messages)
+    refs, prompt_ids, tool_ids = _file_attachment_refs(messages)
 
     assert [ref.artifact_id for ref in refs] == ["art_user", "art_tool"]
+    assert prompt_ids == {"art_user"}
+    assert tool_ids == {"art_tool"}
 
     conflicting = file_attachment(
         artifact_id="art_user",
@@ -18022,6 +18029,498 @@ def test_file_attachment_refs_include_user_file_parts():
                 Message(role="user", content=[FilePart(attachment=conflicting)]),
             ]
         )
+
+
+def _app_with_artifact_store(tmp_path, **app_kwargs) -> tuple[CayuApp, LocalArtifactStore]:
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    app = CayuApp(enable_logging=False, **app_kwargs)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), artifact_store=store),
+        default=True,
+    )
+    return app, store
+
+
+def _valid_png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _valid_jpeg_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), "white").save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _valid_pdf_bytes() -> bytes:
+    import io
+
+    import pypdf
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_attach_file_saves_reference_and_persists_bytes(tmp_path):
+    app, store = _app_with_artifact_store(tmp_path)
+    png = _valid_png_bytes()
+
+    part = asyncio.run(
+        app.attach_file(png, filename="pic.png", kind="image", session_id="sess_attach")
+    )
+
+    assert isinstance(part, FilePart)
+    attachment = part.attachment
+    assert attachment["kind"] == "image"
+    assert attachment["filename"] == "pic.png"
+    assert attachment["content_type"] == "image/png"
+    assert attachment["size_bytes"] == len(png)
+
+    read = asyncio.run(store.read_bytes(attachment["artifact_id"]))
+    assert read.content == png
+
+
+def test_attach_file_infers_content_type_from_filename(tmp_path):
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    part = asyncio.run(
+        app.attach_file(
+            _valid_pdf_bytes(), filename="invoice.pdf", kind="document", session_id="sess_attach"
+        )
+    )
+
+    assert part.attachment["content_type"] == "application/pdf"
+
+
+def test_attach_file_rejects_bytes_over_limit(tmp_path):
+    app, _ = _app_with_artifact_store(tmp_path, max_file_attachment_bytes=4)
+
+    with pytest.raises(ValueError, match="prompt attachment byte limit"):
+        asyncio.run(app.attach_file(b"hello", filename="pic.png", kind="image"))
+
+
+def test_attach_file_rejects_kind_content_type_mismatch(tmp_path):
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError):
+        asyncio.run(app.attach_file(_valid_pdf_bytes(), filename="invoice.pdf", kind="image"))
+
+
+def test_attach_file_rejects_invalid_image_bytes(tmp_path):
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError, match="not a valid image"):
+        asyncio.run(
+            app.attach_file(b"not an image", filename="pic.png", kind="image", session_id="s")
+        )
+
+
+def test_attach_file_rejects_image_bytes_content_type_mismatch(tmp_path):
+    # JPEG bytes declared as image/png (via the .png filename) must be rejected before storing.
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError, match="image/jpeg but the declared content type is image/png"):
+        asyncio.run(
+            app.attach_file(_valid_jpeg_bytes(), filename="wrong.png", kind="image", session_id="s")
+        )
+
+    # The correctly-labeled JPEG (via .jpg) is accepted.
+    part = asyncio.run(
+        app.attach_file(_valid_jpeg_bytes(), filename="ok.jpg", kind="image", session_id="s")
+    )
+    assert part.attachment["content_type"] == "image/jpeg"
+
+
+def test_attach_file_requires_artifact_store(tmp_path):
+    app = CayuApp(enable_logging=False)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+
+    with pytest.raises(RuntimeError, match="statically-registered artifact store"):
+        asyncio.run(app.attach_file(_valid_png_bytes(), filename="pic.png", kind="image"))
+
+
+def _user_image_part(artifact_id: str, filename: str) -> FilePart:
+    return FilePart(
+        attachment=file_attachment(
+            artifact_id=artifact_id,
+            kind="image",
+            filename=filename,
+            content_type="image/png",
+            size_bytes=5,
+        )
+    )
+
+
+def test_strip_old_prompt_files_keeps_latest_attach_turn():
+    # Turn 1 attaches a file; turn 2 attaches another. The earlier prompt file is projected to a
+    # text note; the latest attach turn keeps its FilePart. Durable transcript stays intact.
+    messages = [
+        Message(role="user", content=[TextPart(text="turn1"), _user_image_part("art_a", "a.png")]),
+        Message.text("assistant", "ok"),
+        Message(role="user", content=[TextPart(text="turn2"), _user_image_part("art_c", "c.png")]),
+    ]
+
+    projected = strip_old_file_attachments(messages)
+
+    assert [type(part).__name__ for part in projected[0].content] == ["TextPart", "TextPart"]
+    note = projected[0].content[1].text
+    assert "omitted from this provider request" in note
+    assert "artifact_id=art_a" in note
+    assert [type(part).__name__ for part in projected[2].content] == ["TextPart", "FilePart"]
+    # Durable transcript input is untouched (projection only).
+    assert type(messages[0].content[1]) is FilePart
+
+
+def test_strip_old_prompt_files_keeps_multi_file_prompt_intact_on_its_turn():
+    messages = [
+        Message(
+            role="user",
+            content=[
+                TextPart(text="describe both"),
+                _user_image_part("art_a", "a.png"),
+                _user_image_part("art_b", "b.png"),
+            ],
+        )
+    ]
+
+    projected = strip_old_file_attachments(messages)
+
+    kept = [type(part).__name__ for part in projected[0].content]
+    assert kept.count("FilePart") == 2
+
+
+def test_strip_old_prompt_files_projects_after_a_later_text_turn():
+    # Once the attach turn has been answered and a new (text-only) user turn begins, the earlier
+    # prompt file is projected to a note so its bytes are not re-sent on every later request.
+    messages = [
+        Message(role="user", content=[TextPart(text="turn1"), _user_image_part("art_a", "a.png")]),
+        Message.text("assistant", "ok"),
+        Message.text("user", "plain follow-up"),
+    ]
+
+    projected = strip_old_file_attachments(messages)
+
+    assert not any(type(part) is FilePart for part in projected[0].content)
+    note = next(
+        part.text
+        for part in projected[0].content
+        if type(part) is TextPart and "omitted" in part.text
+    )
+    assert "art_a" in note
+
+
+def test_strip_old_prompt_files_keeps_file_live_through_its_tool_loop():
+    # A prompt file must survive its OWN run's tool loop: an assistant/tool response after the file
+    # with no NEWER user turn is still the current attach turn, so the file stays provider-resolvable.
+    messages = [
+        Message(
+            role="user", content=[TextPart(text="summarize"), _user_image_part("art_a", "a.png")]
+        ),
+        Message.tool_call(tool_call_id="call_1", tool_name="read_file"),
+        Message.tool_result(tool_call_id="call_1", tool_name="read_file", content="page text"),
+    ]
+
+    projected = strip_old_file_attachments(messages)
+
+    assert any(type(part) is FilePart for part in projected[0].content)
+
+
+def test_strip_old_file_attachments_strips_old_tool_and_prompt_files_together():
+    # Both stripping mechanisms fire in one call: an over-budget tool-result attachment AND an
+    # earlier prompt file. Each keeps only its latest occurrence; the two are independent.
+    old_tool = file_attachment(
+        artifact_id="tool_old",
+        kind="image",
+        filename="told.png",
+        content_type="image/png",
+        size_bytes=3,
+    )
+    new_tool = file_attachment(
+        artifact_id="tool_new",
+        kind="image",
+        filename="tnew.png",
+        content_type="image/png",
+        size_bytes=7,
+    )
+    messages = [
+        Message(
+            role="user", content=[TextPart(text="turn1"), _user_image_part("file_old", "old.png")]
+        ),
+        Message.tool_call(tool_call_id="call_old", tool_name="read_file"),
+        Message.tool_result(
+            tool_call_id="call_old", tool_name="read_file", content="old", artifacts=[old_tool]
+        ),
+        Message(
+            role="user", content=[TextPart(text="turn2"), _user_image_part("file_new", "new.png")]
+        ),
+        Message.tool_call(tool_call_id="call_new", tool_name="read_file"),
+        Message.tool_result(
+            tool_call_id="call_new", tool_name="read_file", content="new", artifacts=[new_tool]
+        ),
+    ]
+
+    projected = strip_old_file_attachments(messages, max_attachment_results=1)
+
+    # Old prompt file -> note; latest prompt file kept.
+    assert not any(type(part) is FilePart for part in projected[0].content)
+    assert any(type(part) is FilePart for part in projected[3].content)
+    # Old tool-result attachment stripped; latest tool-result attachment kept.
+    assert projected[2].content[0].artifacts == []
+    assert projected[5].content[0].artifacts == [new_tool]
+
+
+def test_strip_old_prompt_files_keeps_all_files_from_the_same_turn():
+    # Two file-bearing user messages in ONE turn (no assistant response between them) must both
+    # reach the model; only a prior turn's files (separated by an assistant response) are stripped.
+    same_turn = strip_old_file_attachments(
+        [
+            Message(role="user", content=[_user_image_part("art_a", "a.png")]),
+            Message(role="user", content=[_user_image_part("art_b", "b.png")]),
+        ]
+    )
+    assert any(type(part) is FilePart for part in same_turn[0].content)
+    assert any(type(part) is FilePart for part in same_turn[1].content)
+
+    across_turns = strip_old_file_attachments(
+        [
+            Message(role="user", content=[_user_image_part("art_a", "a.png")]),
+            Message.text("assistant", "ok"),
+            Message(role="user", content=[_user_image_part("art_b", "b.png")]),
+        ]
+    )
+    assert not any(type(part) is FilePart for part in across_turns[0].content)
+    assert any(type(part) is FilePart for part in across_turns[2].content)
+
+
+def test_attach_file_rejects_inference_for_encoded_suffix(tmp_path):
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError, match="encoding"):
+        asyncio.run(app.attach_file(b"gzipped", filename="invoice.pdf.gz", kind="document"))
+
+
+def test_noteify_unresolvable_prompt_files_replaces_only_targeted_parts():
+    messages = [
+        Message(
+            role="user",
+            content=[
+                TextPart(text="look"),
+                _user_image_part("art_bad", "bad.png"),
+                _user_image_part("art_ok", "ok.png"),
+            ],
+        )
+    ]
+
+    projected = runtime_app_module.noteify_unresolvable_prompt_files(messages, {"art_bad"})
+
+    kept = projected[0].content
+    assert [type(part).__name__ for part in kept] == ["TextPart", "FilePart", "TextPart"]
+    assert kept[1].attachment["artifact_id"] == "art_ok"
+    assert "could not be resolved" in kept[2].text
+    assert "art_bad" in kept[2].text
+
+
+def test_resolved_file_attachments_fail_open_only_for_prompt_files(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), artifact_store=store),
+        default=True,
+    )
+    registered_env = app._environments["local"]
+    session = Session(
+        id="sess_resolve",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        causal_budget_id="sess_resolve",
+    )
+
+    def missing(artifact_id):
+        return file_attachment(
+            artifact_id=artifact_id,
+            kind="image",
+            filename="ghost.png",
+            content_type="image/png",
+            size_bytes=5,
+        )
+
+    async def resolve(messages):
+        return await runtime_app_module._resolved_file_attachments(
+            messages=messages,
+            session=session,
+            registered_environment=registered_env,
+            max_file_attachment_bytes=8_000_000,
+            max_total_file_attachment_bytes=32_000_000,
+            max_file_attachments_per_request=20,
+        )
+
+    # Prompt file with a missing artifact: fails open into the unresolvable set (no raise).
+    prompt_only = [Message(role="user", content=[FilePart(attachment=missing("art_ghost"))])]
+    resolved, unresolvable = asyncio.run(resolve(prompt_only))
+    assert resolved == {}
+    assert unresolvable == {"art_ghost"}
+
+    # A malformed artifact id (not an 'art_' id) raises ValueError on read but still fails open.
+    bad_id = [Message(role="user", content=[FilePart(attachment=missing("nope"))])]
+    resolved, unresolvable = asyncio.run(resolve(bad_id))
+    assert unresolvable == {"nope"}
+
+    # Tool-result attachment with a missing artifact stays fail-closed.
+    tool_only = [
+        Message.tool_call(tool_call_id="c1", tool_name="read_file"),
+        Message.tool_result(
+            tool_call_id="c1",
+            tool_name="read_file",
+            content="x",
+            artifacts=[missing("art_toolghost")],
+        ),
+    ]
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(resolve(tool_only))
+
+    # An id referenced by BOTH a prompt file and a tool result stays fail-closed (the tool-result
+    # provider path would brick on a missing resolved entry).
+    shared = [
+        Message(role="user", content=[FilePart(attachment=missing("art_shared"))]),
+        Message.tool_call(tool_call_id="c2", tool_name="read_file"),
+        Message.tool_result(
+            tool_call_id="c2",
+            tool_name="read_file",
+            content="x",
+            artifacts=[missing("art_shared")],
+        ),
+    ]
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(resolve(shared))
+
+
+def test_run_fails_open_on_unresolvable_prompt_file(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("ok"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), artifact_store=store),
+        default=True,
+    )
+
+    async def flow() -> FilePart:
+        # Attach under one session but run under another -> the live prompt file is unresolvable.
+        part = await app.attach_file(
+            _valid_png_bytes(), filename="pic.png", kind="image", session_id="sess_other"
+        )
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_run",
+                messages=[Message(role="user", content=[TextPart(text="describe"), part])],
+            )
+        ):
+            pass
+        return part
+
+    part = asyncio.run(flow())
+    request = provider.requests[-1]
+
+    # The run reached the provider (did not brick) with the file projected to a note, no bytes.
+    assert part.attachment["artifact_id"] not in request.options[RESOLVED_FILE_ATTACHMENTS_OPTION]
+    user_message = next(message for message in request.messages if message.role == "user")
+    assert not any(type(part_) is FilePart for part_ in user_message.content)
+    assert any(
+        type(part_) is TextPart and "could not be resolved" in part_.text
+        for part_ in user_message.content
+    )
+
+
+def test_multi_turn_resume_ships_prompt_file_only_on_its_attach_turn(tmp_path):
+    # End-to-end run -> resume through the real runtime: turn 1 attaches a file, turn 2 resumes and
+    # attaches another. The turn-2 model request must carry the new file's bytes only; the old prompt
+    # file must be projected to a text note and never re-resolved to bytes.
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("turn1"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("turn2"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), artifact_store=store),
+        default=True,
+    )
+
+    async def flow() -> tuple[FilePart, FilePart]:
+        sid = "sess_multiturn_strip"
+        old_part = await app.attach_file(
+            _valid_png_bytes(), filename="old.png", kind="image", session_id=sid
+        )
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=sid,
+                messages=[Message(role="user", content=[TextPart(text="turn1"), old_part])],
+            )
+        ):
+            pass
+        new_part = await app.attach_file(
+            _valid_png_bytes(), filename="new.png", kind="image", session_id=sid
+        )
+        async for _ in app.resume(
+            ResumeRequest(
+                session_id=sid,
+                messages=[Message(role="user", content=[TextPart(text="turn2"), new_part])],
+            )
+        ):
+            pass
+        return old_part, new_part
+
+    old_part, new_part = asyncio.run(flow())
+    old_id = old_part.attachment["artifact_id"]
+    new_id = new_part.attachment["artifact_id"]
+
+    turn2_request = provider.requests[-1]
+
+    # Only the latest attach turn's file is resolved to bytes for the provider.
+    resolved = turn2_request.options[RESOLVED_FILE_ATTACHMENTS_OPTION]
+    assert set(resolved) == {new_id}
+
+    user_messages = [message for message in turn2_request.messages if message.role == "user"]
+    old_turn, new_turn = user_messages[0], user_messages[1]
+    # Old prompt file projected to a text note; new prompt file kept as a FilePart.
+    assert not any(type(part) is FilePart for part in old_turn.content)
+    assert any(type(part) is FilePart for part in new_turn.content)
+    old_note = " ".join(part.text for part in old_turn.content if type(part) is TextPart)
+    assert "omitted from this provider request" in old_note
+    assert old_id in old_note
 
 
 def test_cayu_app_sends_agent_system_prompt_as_first_message():

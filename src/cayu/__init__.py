@@ -22,6 +22,8 @@ from cayu.artifacts import (
     copy_workspace_file_to_artifact,
     file_attachment,
     file_attachment_from_payload,
+    validate_file_attachment_bytes,
+    validate_file_attachment_content_type,
 )
 from cayu.core.agents import Agent, AgentSpec
 from cayu.core.events import Event, EventType
@@ -944,6 +946,8 @@ __all__ = [
     "trim_context_messages",
     "trim_context_turns",
     "usage_metrics_from_event_payload",
+    "validate_file_attachment_bytes",
+    "validate_file_attachment_content_type",
     "validate_secret_resolver",
     "write_eval_run_json",
     "write_html_report",

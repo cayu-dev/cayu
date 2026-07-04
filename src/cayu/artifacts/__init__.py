@@ -15,6 +15,8 @@ from cayu.artifacts.attachments import (
     file_attachment_from_payload,
     resolved_file_attachment,
     resolved_file_attachments_from_options,
+    validate_file_attachment_bytes,
+    validate_file_attachment_content_type,
 )
 from cayu.artifacts.base import (
     ArtifactListResult,
@@ -58,4 +60,6 @@ __all__ = [
     "file_attachment_from_payload",
     "resolved_file_attachment",
     "resolved_file_attachments_from_options",
+    "validate_file_attachment_bytes",
+    "validate_file_attachment_content_type",
 ]

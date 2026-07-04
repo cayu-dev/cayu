@@ -24,6 +24,12 @@ FILE_ATTACHMENT_IMAGE_CONTENT_TYPES = frozenset(
     }
 )
 FILE_ATTACHMENT_DOCUMENT_CONTENT_TYPES = frozenset({"application/pdf"})
+_IMAGE_FORMAT_CONTENT_TYPES = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
 
 
 class FileAttachmentKind(StrEnum):
@@ -82,7 +88,7 @@ class FileAttachment(BaseModel):
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> FileAttachment:
-        _validate_file_attachment_content_type(
+        validate_file_attachment_content_type(
             kind=self.kind,
             content_type=self.content_type,
         )
@@ -118,7 +124,7 @@ class ResolvedFileAttachment(BaseModel):
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> ResolvedFileAttachment:
-        _validate_file_attachment_content_type(
+        validate_file_attachment_content_type(
             kind=self.kind,
             content_type=self.content_type,
         )
@@ -187,7 +193,7 @@ def resolved_file_attachments_from_options(options: dict[str, Any]) -> dict[str,
     return resolved
 
 
-def _validate_file_attachment_content_type(
+def validate_file_attachment_content_type(
     *,
     kind: FileAttachmentKind,
     content_type: str,
@@ -205,5 +211,64 @@ def _validate_file_attachment_content_type(
                 "Document file attachments require one of these content types: "
                 f"{', '.join(sorted(FILE_ATTACHMENT_DOCUMENT_CONTENT_TYPES))}."
             )
+        return
+    raise ValueError(f"Unsupported file attachment kind: {kind!r}.")
+
+
+def validate_file_attachment_bytes(
+    *,
+    kind: FileAttachmentKind,
+    content: bytes,
+    content_type: str | None = None,
+) -> None:
+    """Validate that `content` is a parseable image/PDF for `kind`, raising `ValueError` if not.
+
+    Parses the bytes with the optional file dependencies (`cayu[files]`): Pillow for images, pypdf
+    for documents. Raises a clear `ValueError` when the bytes are not a valid image/PDF, or when the
+    dependencies are not installed — so a caller cannot store a prompt attachment whose bytes a
+    provider would later fail to serialize. When `content_type` is given for an image, the format
+    detected from the bytes must match it (rejecting e.g. JPEG bytes labeled `image/png`).
+    """
+    from importlib import import_module
+    from io import BytesIO
+
+    if kind == FileAttachmentKind.IMAGE:
+        try:
+            image_module = import_module("PIL.Image")
+        except ImportError as exc:
+            raise ValueError(
+                "Validating image file attachment bytes requires the optional file dependencies. "
+                "Install cayu[files]."
+            ) from exc
+        try:
+            with image_module.open(BytesIO(content)) as image:
+                detected_format = image.format
+                image.verify()
+        except Exception as exc:
+            raise ValueError(f"File attachment bytes are not a valid image: {exc}") from exc
+        detected_content_type = _IMAGE_FORMAT_CONTENT_TYPES.get(str(detected_format).upper())
+        if detected_content_type is None:
+            raise ValueError(f"Unsupported image file attachment format: {detected_format}.")
+        if content_type is not None and detected_content_type != content_type:
+            raise ValueError(
+                f"File attachment bytes are {detected_content_type} but the declared content type "
+                f"is {content_type}."
+            )
+        return
+    if kind == FileAttachmentKind.DOCUMENT:
+        try:
+            pypdf = import_module("pypdf")
+        except ImportError as exc:
+            raise ValueError(
+                "Validating document file attachment bytes requires the optional file dependencies. "
+                "Install cayu[files]."
+            ) from exc
+        try:
+            reader = pypdf.PdfReader(BytesIO(content))
+            page_count = len(reader.pages)
+        except Exception as exc:
+            raise ValueError(f"File attachment bytes are not a valid PDF: {exc}") from exc
+        if page_count == 0:
+            raise ValueError("File attachment PDF has no pages.")
         return
     raise ValueError(f"Unsupported file attachment kind: {kind!r}.")

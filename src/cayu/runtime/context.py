@@ -2046,6 +2046,7 @@ def strip_old_file_attachments(
     copied_messages = [copy_message(message) for message in messages]
     validate_context_messages(copied_messages)
 
+    # Tool-result attachments: keep only the latest `max_attachment_results` positions.
     attachment_positions: list[tuple[int, int]] = []
     for message_index, message in enumerate(copied_messages):
         if message.role != MessageRole.TOOL:
@@ -2056,29 +2057,54 @@ def strip_old_file_attachments(
             if _file_attachments_in_part(part):
                 attachment_positions.append((message_index, part_index))
 
-    if len(attachment_positions) <= max_attachment_results:
+    tool_stripping_needed = len(attachment_positions) > max_attachment_results
+
+    # Prompt file parts: keep files provider-resolvable only on the current attach turn. A
+    # file-bearing user message is projected to a text note once its turn has been answered AND a
+    # newer user turn has begun — i.e. an assistant/tool response sits between it and the latest user
+    # message. This keeps every file from the same run live (multiple file messages with no response
+    # between them) and keeps a file live through its own run's tool loop (no newer user message yet),
+    # while stopping the bytes from being re-resolved and re-sent on every later turn. Independent of
+    # the tool-result budget above.
+    user_file_message_indices = [
+        message_index
+        for message_index, message in enumerate(copied_messages)
+        if message.role == MessageRole.USER
+        and any(type(part) is FilePart for part in message.content)
+    ]
+    last_user_index = max(
+        (i for i, message in enumerate(copied_messages) if message.role == MessageRole.USER),
+        default=-1,
+    )
+    strip_user_file_indices = {
+        message_index
+        for message_index in user_file_message_indices
+        if any(
+            copied_messages[j].role in (MessageRole.ASSISTANT, MessageRole.TOOL)
+            for j in range(message_index + 1, last_user_index)
+        )
+    }
+
+    if not tool_stripping_needed and not strip_user_file_indices:
         return [copy_message(message) for message in copied_messages]
 
-    keep_positions = (
-        set()
-        if max_attachment_results == 0
-        else set(attachment_positions[-max_attachment_results:])
-    )
+    if not tool_stripping_needed:
+        keep_positions = set(attachment_positions)
+    elif max_attachment_results == 0:
+        keep_positions = set()
+    else:
+        keep_positions = set(attachment_positions[-max_attachment_results:])
+
     projected_messages: list[Message] = []
     for message_index, message in enumerate(copied_messages):
-        if message.role != MessageRole.TOOL:
+        if message.role == MessageRole.TOOL:
+            projected_messages.append(
+                _strip_old_tool_result_attachments(message, keep_positions, message_index)
+            )
+        elif message_index in strip_user_file_indices:
+            projected_messages.append(_strip_file_parts_from_user_message(message))
+        else:
             projected_messages.append(copy_message(message))
-            continue
-
-        projected_parts: list[
-            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
-        ] = []
-        for part_index, part in enumerate(message.content):
-            if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
-                projected_parts.append(copy_message_part(part))
-                continue
-            projected_parts.append(_strip_file_attachments_from_tool_result(part))
-        projected_messages.append(Message(role=message.role, content=tuple(projected_parts)))
 
     validate_context_messages(projected_messages)
     return [copy_message(message) for message in projected_messages]
@@ -2177,19 +2203,36 @@ def _strip_file_attachments_from_tool_result(part: ToolResultPart) -> ToolResult
     )
 
 
+def _strip_old_tool_result_attachments(
+    message: Message,
+    keep_positions: set[tuple[int, int]],
+    message_index: int,
+) -> Message:
+    projected_parts: list[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+    ] = []
+    for part_index, part in enumerate(message.content):
+        if type(part) is not ToolResultPart or (message_index, part_index) in keep_positions:
+            projected_parts.append(copy_message_part(part))
+            continue
+        projected_parts.append(_strip_file_attachments_from_tool_result(part))
+    return Message(role=message.role, content=tuple(projected_parts))
+
+
+def _format_stripped_attachment_lines(attachments: list[FileAttachment]) -> str:
+    return "\n".join(
+        f"- {attachment.filename} ({attachment.content_type}, "
+        f"{attachment.size_bytes} bytes, artifact_id={attachment.artifact_id})"
+        for attachment in attachments
+    )
+
+
 def _content_with_stripped_file_attachment_note(
     content: str,
     attachments: list[FileAttachment],
 ) -> str:
-    lines = [
-        (
-            f"- {attachment.filename} ({attachment.content_type}, "
-            f"{attachment.size_bytes} bytes, artifact_id={attachment.artifact_id})"
-        )
-        for attachment in attachments
-    ]
     note = "File attachments from this older tool result were omitted from this provider request:\n"
-    note += "\n".join(lines)
+    note += _format_stripped_attachment_lines(attachments)
     if content:
         return f"{content}\n\n{note}"
     return note
@@ -2202,6 +2245,73 @@ def _file_attachments_in_part(part: ToolResultPart) -> tuple[FileAttachment, ...
         if attachment is not None:
             attachments.append(attachment)
     return tuple(attachments)
+
+
+def _strip_file_parts_from_user_message(message: Message) -> Message:
+    kept_parts: list[
+        TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+    ] = []
+    stripped_attachments: list[FileAttachment] = []
+    for part in message.content:
+        if type(part) is FilePart:
+            attachment = file_attachment_from_payload(part.attachment)
+            if attachment is not None:
+                stripped_attachments.append(attachment)
+                continue
+        kept_parts.append(copy_message_part(part))
+
+    if stripped_attachments:
+        kept_parts.append(TextPart(text=_prompt_file_stripped_note(stripped_attachments)))
+    return Message(role=message.role, content=tuple(kept_parts))
+
+
+def _prompt_file_stripped_note(attachments: list[FileAttachment]) -> str:
+    note = "Files attached to this earlier prompt were omitted from this provider request:\n"
+    return note + _format_stripped_attachment_lines(attachments)
+
+
+def noteify_unresolvable_prompt_files(
+    messages: list[Message],
+    artifact_ids: set[str],
+) -> list[Message]:
+    """Project user-prompt `FilePart`s whose artifacts can't be resolved down to a text note.
+
+    Model-facing projection only (the durable transcript keeps the original `FilePart`). Lets the
+    runtime proceed with a note instead of failing a request forever when a live prompt file is
+    unresolvable (wrong session at attach time, or a deleted artifact).
+    """
+    if not artifact_ids:
+        return messages
+    projected: list[Message] = []
+    for message in messages:
+        if message.role != MessageRole.USER:
+            projected.append(message)
+            continue
+        kept_parts: list[
+            TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
+        ] = []
+        removed_attachments: list[FileAttachment] = []
+        for part in message.content:
+            if type(part) is FilePart:
+                attachment = file_attachment_from_payload(part.attachment)
+                if attachment is not None and attachment.artifact_id in artifact_ids:
+                    removed_attachments.append(attachment)
+                    continue
+            kept_parts.append(copy_message_part(part))
+        if not removed_attachments:
+            projected.append(message)
+            continue
+        kept_parts.append(TextPart(text=_unresolvable_prompt_file_note(removed_attachments)))
+        projected.append(Message(role=message.role, content=tuple(kept_parts)))
+    return projected
+
+
+def _unresolvable_prompt_file_note(attachments: list[FileAttachment]) -> str:
+    note = (
+        "Files attached to this prompt could not be resolved (check the session_id used at attach "
+        "time, or whether the artifact still exists) and were omitted from this provider request:\n"
+    )
+    return note + _format_stripped_attachment_lines(attachments)
 
 
 def _validate_positive_int(value: int, field_name: str) -> int:

@@ -28,7 +28,7 @@ Estimated triggers can optionally verify with the active provider's `count_input
 
 Context output must preserve complete tool rounds: assistant tool calls must be followed by matching tool results, and tool results cannot appear without their preceding assistant tool calls. Policies that trim recent history should use `trim_context_turns(...)` for user-turn based history or `trim_context_messages(...)` for message-count based history instead of slicing blindly. Both helpers preserve leading system messages by default.
 
-Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `KnowledgeInjectionPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
+Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `KnowledgeInjectionPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. The same helper keeps user-prompt `FilePart`s provider-resolvable only on the current attach turn — once a file's turn has been answered and a newer user turn begins, its bytes are projected to a short text note (see "Files in prompts" under ArtifactStore). Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
@@ -1054,6 +1054,29 @@ Immediately before a provider request, the runtime scans model-facing tool resul
 - OpenAI Responses: the text `function_call_output` plus a following user input item containing `input_image` or `input_file`.
 
 This keeps Cayu's durable transcript provider-neutral and avoids dumping base64 into event/session storage. The built-in `read_file` supports text artifacts, provider-native image attachments, and provider-native PDF attachments. Image/PDF inspection requires the optional file dependencies installed with `cayu[files]`; with them, oversized images can be resized and PDF page ranges can be extracted. Without them, the tool returns a clear error instead of emitting an unvalidated native attachment.
+
+### Files in prompts
+
+Tool-result attachments require the model to first choose to read a file. To put a file in front of the model on the first turn — an uploaded screenshot, a "summarize this PDF" request — attach it directly to a user message with a `FilePart`. `CayuApp.attach_file(...)` saves the bytes to the environment's `ArtifactStore` and returns a ready-to-use `FilePart` (which carries a `cayu.file_attachment.v1` reference — artifact id, kind, filename, content type, size — never bytes):
+
+```python
+part = await app.attach_file(
+    pdf_bytes,
+    filename="invoice.pdf",
+    kind="document",  # "image" (jpeg/png/gif/webp) or "document" (pdf)
+    session_id=session_id,
+)
+
+request = RunRequest(
+    agent_name="invoice-agent",
+    session_id=session_id,
+    messages=[Message(role="user", content=[TextPart(text="Summarize this."), part])],
+)
+```
+
+`attach_file` infers `content_type` from the filename when omitted, validates kind↔content-type consistency, parses the bytes to confirm they are a valid image/PDF whose detected format matches the declared content type (rejecting e.g. JPEG bytes labeled `image/png`; this requires the optional `cayu[files]` dependencies), and rejects content larger than `max_file_attachment_bytes` (the same 8 MB default per-file cap, configurable on `CayuApp`). Pass the same `session_id` you will use in the `RunRequest` for a session-scoped attachment, since the resolver re-checks scope. `FilePart` is allowed only in user messages. The runtime collects prompt `FilePart`s alongside tool-result attachments and resolves them through the exact same path described above — scope re-check, per-file/total/count limit enforcement, provider-native translation, and conservative token counting toward context pressure — so a prompt-attached file inlines into the user turn as an Anthropic `image`/`document` block, an OpenAI Responses `input_image`/`input_file` item, or a Chat Completions `image_url`/`file` part.
+
+To avoid re-uploading the same file bytes on every later turn, built-in context policies keep prompt files provider-resolvable only on the **current attach turn**. A `FilePart` is projected to a short text note (`Files attached to this earlier prompt were omitted…`) once its turn has been answered and a **newer user turn begins** — i.e. an assistant/tool response sits between it and the latest user message. Files submitted together in one run stay live (no response between them), and a file stays live through its own run's tool loop (no newer user turn yet); only once the conversation moves on does its projection kick in, via `strip_old_file_attachments(...)`. This is projection-only: the durable transcript keeps the original `FilePart` and the artifact always stays in the store, so a reduced model-facing prompt never loses the underlying file. Prompt-file projection is independent of the tool-result `max_attachment_results` budget.
 
 `ReadFileTool` is extensible through artifact readers. Workspace text reads remain built in. Workspace image/PDF path reads are captured as artifacts and then use the same artifact-reader chain. The common extension path is additive: pass `extra_artifact_readers` to run app-owned readers before Cayu's defaults, while keeping the built-in text, image, and PDF readers available as fallbacks.
 
