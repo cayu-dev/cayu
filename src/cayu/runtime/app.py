@@ -3892,11 +3892,13 @@ class CayuApp:
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
-        return await self.task_store.start_task(
-            task_id,
-            session_id=session.id,
-            worker_id=worker_id,
-        )
+        if worker_id is not None:
+            return await self.task_store.attach_task(
+                task_id,
+                session_id=session.id,
+                worker_id=worker_id,
+            )
+        return await self.task_store.start_task(task_id, session_id=session.id)
 
     async def _complete_task(
         self,

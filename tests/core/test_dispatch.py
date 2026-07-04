@@ -427,7 +427,7 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
         assert handle.metadata.get("reclaimed") is True
         reloaded = await h.tasks.load_task(task.id)
         assert reloaded is not None
-        assert reloaded.status == TaskStatus.RUNNING  # not clobbered to COMPLETED
+        assert reloaded.status == TaskStatus.CLAIMED  # not clobbered to COMPLETED
         assert reloaded.worker_id == "worker_b"  # still the reclaimer's
 
 

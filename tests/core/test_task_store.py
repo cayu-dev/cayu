@@ -291,10 +291,10 @@ def test_task_stores_claim_heartbeat_and_release_task(
         )
         assert first is not None
         assert first.id == "task_a"
-        assert first.status == TaskStatus.RUNNING
+        assert first.status == TaskStatus.CLAIMED
         assert first.worker_id == "worker_a"
         assert first.lease_expires_at is not None
-        assert first.started_at is not None
+        assert first.started_at is None
 
         second = await store.claim_task(
             "worker_b",
@@ -338,14 +338,14 @@ def test_task_stores_claim_heartbeat_and_release_task(
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
-def test_task_stores_start_task_attaches_claimed_task(store_factory: StoreFactory, tmp_path):
+def test_task_stores_attach_task_starts_claimed_task(store_factory: StoreFactory, tmp_path):
     store = _make_store(store_factory, tmp_path)
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_claimed", type="review"))
 
         with pytest.raises(ValueError, match="not claimed by worker worker_a"):
-            await store.start_task(
+            await store.attach_task(
                 "task_claimed",
                 session_id="sess_unclaimed",
                 worker_id="worker_a",
@@ -357,23 +357,23 @@ def test_task_stores_start_task_attaches_claimed_task(store_factory: StoreFactor
 
         claimed = await store.claim_task("worker_a", lease_seconds=300)
         assert claimed is not None
-        assert claimed.status == TaskStatus.RUNNING
+        assert claimed.status == TaskStatus.CLAIMED
         assert claimed.worker_id == "worker_a"
         assert claimed.session_id is None
         assert claimed.lease_expires_at is not None
 
-        with pytest.raises(ValueError, match="worker handoff requires session_id"):
-            await store.start_task("task_claimed", worker_id="worker_a")
-        with pytest.raises(ValueError, match="does not own"):
+        with pytest.raises(ValueError, match="session_id"):
+            await store.attach_task("task_claimed", session_id="", worker_id="worker_a")
+        with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_claimed", session_id="sess_wrong")
         with pytest.raises(ValueError, match="does not own"):
-            await store.start_task(
+            await store.attach_task(
                 "task_claimed",
                 session_id="sess_wrong",
                 worker_id="worker_b",
             )
 
-        started = await store.start_task(
+        started = await store.attach_task(
             "task_claimed",
             session_id="sess_claimed",
             worker_id="worker_a",
@@ -399,7 +399,7 @@ def test_task_stores_reject_expired_claim_handoff(store_factory: StoreFactory, t
         assert claimed is not None
 
         await asyncio.sleep(1.05)
-        with pytest.raises(ValueError, match="cannot transition to running from running"):
+        with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
         with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
             await store.heartbeat("task_expired_handoff", "worker_a")
@@ -421,7 +421,7 @@ def test_task_stores_reject_release_after_session_attachment(
 
         claimed = await store.claim_task("worker_a", lease_seconds=300)
         assert claimed is not None
-        await store.start_task(
+        await store.attach_task(
             "task_attached_release",
             session_id="sess_attached",
             worker_id="worker_a",
@@ -453,7 +453,7 @@ def test_task_stores_do_not_reclaim_attached_expired_leases(
 
         claimed = await store.claim_task("worker_a", lease_seconds=1)
         assert claimed is not None
-        await store.start_task(
+        await store.attach_task(
             "task_attached_expired",
             session_id="sess_attached_expired",
             worker_id="worker_a",

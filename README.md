@@ -1347,7 +1347,9 @@ async for event in app.run(request):
 ```
 
 For queue-style workers, claim an unattached pending task before starting the
-agent run, then pass both the task id and worker id to the run request:
+agent run. The task is `claimed` while the worker owns the lease, then Cayu
+attaches it to the new session and marks it `running` when the run starts. Pass
+both the task id and worker id to the run request:
 
 ```python
 task = await tasks.claim_task(

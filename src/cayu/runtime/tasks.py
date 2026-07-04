@@ -15,6 +15,7 @@ from cayu._validation import copy_json_object, require_clean_nonblank, require_n
 
 class TaskStatus(StrEnum):
     PENDING = "pending"
+    CLAIMED = "claimed"
     RUNNING = "running"
     PAUSED = "paused"
     BLOCKED = "blocked"
@@ -194,9 +195,18 @@ class TaskStore(ABC):
         task_id: str,
         *,
         session_id: str | None = None,
-        worker_id: str | None = None,
     ) -> Task:
-        """Mark a pending task as running, or attach a live claimed task owned by ``worker_id``."""
+        """Mark a pending task as running, optionally attached to a session."""
+
+    @abstractmethod
+    async def attach_task(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        worker_id: str,
+    ) -> Task:
+        """Attach a live worker-claimed task to a session and mark it running."""
 
     @abstractmethod
     async def complete_task(
@@ -279,11 +289,11 @@ class TaskStore(ABC):
         *,
         extend_seconds: int = 300,
     ) -> Task:
-        """Extend the active lease for a running task owned by ``worker_id``."""
+        """Extend the active lease for a claimed or running task owned by ``worker_id``."""
 
     @abstractmethod
     async def release_task(self, task_id: str, worker_id: str) -> Task:
-        """Release a running task back to pending and clear worker ownership."""
+        """Release a claimed task back to pending and clear worker ownership."""
 
     @abstractmethod
     async def reclaim_expired(
@@ -292,7 +302,7 @@ class TaskStore(ABC):
         query: TaskQuery | None = None,
         max_reclaims: int = 100,
     ) -> list[Task]:
-        """Return expired running task leases to pending."""
+        """Return expired claimed task leases to pending."""
 
 
 class InMemoryTaskStore(TaskStore):
@@ -332,36 +342,44 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
-        worker_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
-        if worker_id is not None:
-            worker_id = require_clean_nonblank(worker_id, "worker_id")
-            if session_id is None:
-                raise ValueError("Task worker handoff requires session_id.")
         async with self._lock:
             task = self._require_task(task_id)
             now = datetime.now(UTC)
-            if _can_attach_claimed_task(task, now=now):
-                if task.worker_id != worker_id:
-                    raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
-                updated = task.model_copy(
-                    update={
-                        "session_id": (session_id if session_id is not None else task.session_id),
-                        "updated_at": now,
-                    }
-                )
-                self._tasks[task_id] = updated
-                return updated.model_copy(deep=True)
-            if worker_id is not None:
-                _raise_task_worker_start_error(task, worker_id, now=now)
             _ensure_can_transition(task, TaskStatus.RUNNING)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
                     "session_id": (session_id if session_id is not None else task.session_id),
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def attach_task(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        worker_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        async with self._lock:
+            task = self._require_task(task_id)
+            now = datetime.now(UTC)
+            if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
+                _raise_task_claim_attach_error(task, worker_id, now=now)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "session_id": session_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -502,10 +520,9 @@ class InMemoryTaskStore(TaskStore):
             now = datetime.now(UTC)
             updated = task.model_copy(
                 update={
-                    "status": TaskStatus.RUNNING,
+                    "status": TaskStatus.CLAIMED,
                     "worker_id": worker_id,
                     "lease_expires_at": now + timedelta(seconds=lease_seconds),
-                    "started_at": task.started_at or now,
                     "updated_at": now,
                 }
             )
@@ -523,7 +540,7 @@ class InMemoryTaskStore(TaskStore):
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
-            task = self._require_owned_running_task(task_id, worker_id)
+            task = self._require_owned_leased_task(task_id, worker_id)
             now = datetime.now(UTC)
             _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
@@ -539,11 +556,13 @@ class InMemoryTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         async with self._lock:
-            task = self._require_owned_running_task(task_id, worker_id)
+            task = self._require_owned_leased_task(task_id, worker_id)
             if task.session_id is not None:
                 raise ValueError(
                     f"Task {task.id} is already attached to session {task.session_id}."
                 )
+            if task.status is not TaskStatus.CLAIMED:
+                raise ValueError(f"Task {task.id} is not claimed.")
             now = datetime.now(UTC)
             _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
@@ -566,14 +585,14 @@ class InMemoryTaskStore(TaskStore):
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         max_reclaims = _validate_positive_int(max_reclaims, "max_reclaims")
-        if query.status is not None and query.status is not TaskStatus.RUNNING:
+        if query.status is not None and query.status is not TaskStatus.CLAIMED:
             return []
         async with self._lock:
             now = datetime.now(UTC)
             expired = [
                 task
                 for task in self._tasks.values()
-                if task.status is TaskStatus.RUNNING
+                if task.status is TaskStatus.CLAIMED
                 and task.session_id is None
                 and task.lease_expires_at is not None
                 and task.lease_expires_at <= now
@@ -600,10 +619,10 @@ class InMemoryTaskStore(TaskStore):
             raise KeyError(f"Task not found: {task_id}")
         return task
 
-    def _require_owned_running_task(self, task_id: str, worker_id: str) -> Task:
+    def _require_owned_leased_task(self, task_id: str, worker_id: str) -> Task:
         task = self._require_task(task_id)
-        if task.status is not TaskStatus.RUNNING:
-            raise ValueError(f"Task {task.id} is not running.")
+        if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+            raise ValueError(f"Task {task.id} is not claimed or running.")
         if task.worker_id != worker_id:
             raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
         return task
@@ -769,7 +788,12 @@ def _ensure_can_hold_task(task: Task, next_status: TaskStatus) -> None:
     _ensure_not_terminal(task)
     if task.status is TaskStatus.RUNNING and task.session_id is not None:
         raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
-    if task.status not in {TaskStatus.PENDING, TaskStatus.RUNNING, *_HELD_TASK_STATUSES}:
+    if task.status not in {
+        TaskStatus.PENDING,
+        TaskStatus.CLAIMED,
+        TaskStatus.RUNNING,
+        *_HELD_TASK_STATUSES,
+    }:
         raise ValueError(f"Task {task.id} cannot transition to {next_status} from {task.status}")
 
 
@@ -784,11 +808,16 @@ def _ensure_not_terminal(task: Task) -> None:
         raise ValueError(f"Task {task.id} is already terminal: {task.status}")
 
 
-def _can_attach_claimed_task(task: Task, *, now: datetime | None = None) -> bool:
+def _can_attach_claimed_task(
+    task: Task,
+    *,
+    worker_id: str,
+    now: datetime | None = None,
+) -> bool:
     now = datetime.now(UTC) if now is None else now
     return (
-        task.status is TaskStatus.RUNNING
-        and task.worker_id is not None
+        task.status is TaskStatus.CLAIMED
+        and task.worker_id == worker_id
         and task.session_id is None
         and task.lease_expires_at is not None
         and task.lease_expires_at > now
@@ -803,7 +832,7 @@ def _ensure_active_task_lease(task: Task, worker_id: str, *, now: datetime | Non
         raise ValueError(f"Task {task.id} lease for worker {worker_id} has expired.")
 
 
-def _raise_task_worker_start_error(
+def _raise_task_claim_attach_error(
     task: Task,
     worker_id: str,
     *,
@@ -812,11 +841,15 @@ def _raise_task_worker_start_error(
     if task.status is TaskStatus.RUNNING:
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+        raise ValueError(f"Task {task.id} is already running.")
+    if task.status is TaskStatus.CLAIMED:
+        if task.session_id is not None:
+            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.worker_id != worker_id:
             raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
         _ensure_active_task_lease(task, worker_id, now=now)
-        raise ValueError(f"Task {task.id} is already running.")
-    _ensure_can_transition(task, TaskStatus.RUNNING)
+        raise ValueError(f"Task {task.id} is already claimed.")
+    _ensure_not_terminal(task)
     raise ValueError(f"Task {task.id} is not claimed by worker {worker_id}.")
 
 

@@ -272,10 +272,10 @@ def test_postgres_task_store_claim_heartbeat_and_release_task(postgres_dsn):
         )
         assert first is not None
         assert first.id == "task_a"
-        assert first.status == TaskStatus.RUNNING
+        assert first.status == TaskStatus.CLAIMED
         assert first.worker_id == "worker_a"
         assert first.lease_expires_at is not None
-        assert first.started_at is not None
+        assert first.started_at is None
 
         second = await store.claim_task(
             "worker_b",
@@ -317,12 +317,12 @@ def test_postgres_task_store_claim_heartbeat_and_release_task(postgres_dsn):
     _run(postgres_dsn, ops)
 
 
-def test_postgres_task_store_start_task_attaches_claimed_task(postgres_dsn):
+def test_postgres_task_store_attach_task_starts_claimed_task(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_claimed", type="review"))
 
         with pytest.raises(ValueError, match="not claimed by worker worker_a"):
-            await store.start_task(
+            await store.attach_task(
                 "task_claimed",
                 session_id="sess_unclaimed",
                 worker_id="worker_a",
@@ -334,23 +334,23 @@ def test_postgres_task_store_start_task_attaches_claimed_task(postgres_dsn):
 
         claimed = await store.claim_task("worker_a", lease_seconds=300)
         assert claimed is not None
-        assert claimed.status == TaskStatus.RUNNING
+        assert claimed.status == TaskStatus.CLAIMED
         assert claimed.worker_id == "worker_a"
         assert claimed.session_id is None
         assert claimed.lease_expires_at is not None
 
-        with pytest.raises(ValueError, match="worker handoff requires session_id"):
-            await store.start_task("task_claimed", worker_id="worker_a")
-        with pytest.raises(ValueError, match="does not own"):
+        with pytest.raises(ValueError, match="session_id"):
+            await store.attach_task("task_claimed", session_id="", worker_id="worker_a")
+        with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_claimed", session_id="sess_wrong")
         with pytest.raises(ValueError, match="does not own"):
-            await store.start_task(
+            await store.attach_task(
                 "task_claimed",
                 session_id="sess_wrong",
                 worker_id="worker_b",
             )
 
-        started = await store.start_task(
+        started = await store.attach_task(
             "task_claimed",
             session_id="sess_claimed",
             worker_id="worker_a",
@@ -371,7 +371,7 @@ def test_postgres_task_store_rejects_expired_claim_handoff(postgres_dsn):
         assert claimed is not None
 
         await asyncio.sleep(1.05)
-        with pytest.raises(ValueError, match="cannot transition to running from running"):
+        with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
         with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
             await store.heartbeat("task_expired_handoff", "worker_a")
@@ -385,7 +385,7 @@ def test_postgres_task_store_rejects_release_after_session_attachment(postgres_d
 
         claimed = await store.claim_task("worker_a", lease_seconds=300)
         assert claimed is not None
-        await store.start_task(
+        await store.attach_task(
             "task_attached_release",
             session_id="sess_attached",
             worker_id="worker_a",
@@ -409,7 +409,7 @@ def test_postgres_task_store_does_not_reclaim_attached_expired_leases(postgres_d
 
         claimed = await store.claim_task("worker_a", lease_seconds=1)
         assert claimed is not None
-        await store.start_task(
+        await store.attach_task(
             "task_attached_expired",
             session_id="sess_attached_expired",
             worker_id="worker_a",

@@ -86,17 +86,17 @@ from cayu.runtime.sessions import (
 from cayu.runtime.tasks import (
     Task,
     TaskCreate,
+    TaskOrder,
     TaskQuery,
     TaskStatus,
     TaskStore,
-    _can_attach_claimed_task,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
-    _raise_task_worker_start_error,
+    _ensure_not_terminal,
     _task_from_create,
     copy_task_create,
     copy_task_query,
@@ -4168,78 +4168,85 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         task_id: str,
         *,
         session_id: str | None = None,
-        worker_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         if session_id is not None:
             session_id = require_clean_nonblank(session_id, "session_id")
-        if worker_id is not None:
-            worker_id = require_clean_nonblank(worker_id, "worker_id")
-            if session_id is None:
-                raise ValueError("Task worker handoff requires session_id.")
         await self._ensure_ready()
         now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
-            if worker_id is None:
-                await cur.execute(
-                    """
-                    UPDATE cayu_tasks
-                    SET status = %s,
-                        session_id = COALESCE(%s, session_id),
-                        started_at = COALESCE(started_at, %s),
-                        updated_at = %s
-                    WHERE id = %s AND status = %s
-                    """,
-                    (
-                        str(TaskStatus.RUNNING),
-                        session_id,
-                        now,
-                        now,
-                        task_id,
-                        str(TaskStatus.PENDING),
-                    ),
-                )
-                if cur.rowcount == 1:
-                    updated = await self._require_task(cur, task_id)
-                    await conn.commit()
-                    return updated.model_copy(deep=True)
-            task = await self._require_task(cur, task_id)
-            if _can_attach_claimed_task(task, now=now):
-                if task.worker_id != worker_id:
-                    raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
-                await cur.execute(
-                    f"""
-                    UPDATE cayu_tasks
-                    SET session_id = COALESCE(%s, session_id),
-                        updated_at = %s
-                    WHERE id = %s
-                      AND status = %s
-                      AND worker_id = %s
-                      AND session_id IS NULL
-                      AND lease_expires_at IS NOT NULL
-                      AND lease_expires_at > %s
-                    RETURNING {pg_support.TASK_COLUMNS}
-                    """,
-                    (
-                        session_id,
-                        now,
-                        task_id,
-                        str(TaskStatus.RUNNING),
-                        worker_id,
-                        now,
-                    ),
-                )
-                row = await cur.fetchone()
-                if row is None:
-                    await self._raise_task_claim_attach_error(cur, task_id, worker_id)
-                assert row is not None
-                updated = pg_support.task_from_row(row)
+            await cur.execute(
+                """
+                UPDATE cayu_tasks
+                SET status = %s,
+                    session_id = COALESCE(%s, session_id),
+                    started_at = COALESCE(started_at, %s),
+                    updated_at = %s
+                WHERE id = %s AND status = %s
+                """,
+                (
+                    str(TaskStatus.RUNNING),
+                    session_id,
+                    now,
+                    now,
+                    task_id,
+                    str(TaskStatus.PENDING),
+                ),
+            )
+            if cur.rowcount == 1:
+                updated = await self._require_task(cur, task_id)
                 await conn.commit()
                 return updated.model_copy(deep=True)
-            if worker_id is not None:
-                _raise_task_worker_start_error(task, worker_id, now=now)
+            task = await self._require_task(cur, task_id)
             _ensure_can_transition(task, TaskStatus.RUNNING)
             raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+
+    async def attach_task(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        worker_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE cayu_tasks
+                SET status = %s,
+                    session_id = %s,
+                    started_at = COALESCE(started_at, %s),
+                    updated_at = %s
+                WHERE id = %s
+                  AND status = %s
+                  AND worker_id = %s
+                  AND session_id IS NULL
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > %s
+                RETURNING {pg_support.TASK_COLUMNS}
+                """,
+                (
+                    str(TaskStatus.RUNNING),
+                    session_id,
+                    now,
+                    now,
+                    task_id,
+                    str(TaskStatus.CLAIMED),
+                    worker_id,
+                    now,
+                ),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await self._raise_task_claim_attach_error(cur, task_id, worker_id)
+            assert row is not None
+            updated = pg_support.task_from_row(row)
+            await conn.commit()
+            return updated.model_copy(deep=True)
 
     async def complete_task(
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
@@ -4364,7 +4371,9 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             return None
         clauses, params = self._task_filter_clauses(query)
         where_sql = " AND ".join(["status = %s", "session_id IS NULL", *clauses])
-        order_sql = pg_support.task_order_sql(query.order_by)
+        # Claiming is always FIFO by creation time, independent of the query's
+        # display ordering, so the oldest pending task is dispatched first.
+        order_sql = pg_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
         now = datetime.now(UTC)
         lease_expires_at = now + timedelta(seconds=lease_seconds)
 
@@ -4387,7 +4396,6 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         SET status = %s,
                             worker_id = %s,
                             lease_expires_at = %s,
-                            started_at = COALESCE(task.started_at, %s),
                             updated_at = %s
                         FROM candidate
                         WHERE task.id = candidate.id
@@ -4397,10 +4405,9 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     [
                         str(TaskStatus.PENDING),
                         *params,
-                        str(TaskStatus.RUNNING),
+                        str(TaskStatus.CLAIMED),
                         worker_id,
                         lease_expires_at,
-                        now,
                         now,
                     ],
                 )
@@ -4431,7 +4438,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     UPDATE cayu_tasks
                     SET lease_expires_at = %s,
                         updated_at = %s
-                    WHERE id = %s AND worker_id = %s AND status = %s
+                    WHERE id = %s AND worker_id = %s AND status IN (%s, %s)
                       AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
@@ -4440,6 +4447,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         now,
                         task_id,
                         worker_id,
+                        str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         now,
                     ),
@@ -4477,7 +4485,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         now,
                         task_id,
                         worker_id,
-                        str(TaskStatus.RUNNING),
+                        str(TaskStatus.CLAIMED),
                         now,
                     ),
                 )
@@ -4498,7 +4506,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         max_reclaims = _validate_task_positive_int(max_reclaims, "max_reclaims")
-        if query.status is not None and query.status is not TaskStatus.RUNNING:
+        if query.status is not None and query.status is not TaskStatus.CLAIMED:
             return []
         clauses, params = self._task_filter_clauses(query)
         where_sql = " AND ".join(
@@ -4538,7 +4546,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         """,
                     ),
                     [
-                        str(TaskStatus.RUNNING),
+                        str(TaskStatus.CLAIMED),
                         now,
                         *params,
                         max_reclaims,
@@ -4582,6 +4590,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         OR status = %s
                         OR status = %s
                         OR status = %s
+                        OR status = %s
                         OR (status = %s AND session_id IS NULL)
                       )
                     RETURNING {pg_support.TASK_COLUMNS}
@@ -4593,6 +4602,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         now,
                         task_id,
                         str(TaskStatus.PENDING),
+                        str(TaskStatus.CLAIMED),
                         str(TaskStatus.PAUSED),
                         str(TaskStatus.BLOCKED),
                         str(TaskStatus.NEEDS_ATTENTION),
@@ -4711,8 +4721,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        if task.status is not TaskStatus.RUNNING:
-            raise ValueError(f"Task {task.id} is not running.")
+        if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+            raise ValueError(f"Task {task.id} is not claimed or running.")
         now = datetime.now(UTC)
         if task.lease_expires_at is None:
             raise ValueError(f"Task {task.id} has no active lease.")
@@ -4727,26 +4737,33 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        if task.status is not TaskStatus.RUNNING:
-            raise ValueError(f"Task {task.id} is not running.")
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+        if task.status is not TaskStatus.CLAIMED:
+            raise ValueError(f"Task {task.id} is not claimed.")
         await self._raise_task_active_lease_error(cur, task_id, worker_id)
 
     async def _raise_task_claim_attach_error(
         self,
         cur: Any,
         task_id: str,
-        worker_id: str | None,
+        worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        if task.status is not TaskStatus.RUNNING:
-            raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+        if task.status is TaskStatus.RUNNING:
+            if task.session_id is not None:
+                raise ValueError(
+                    f"Task {task.id} is already attached to session {task.session_id}."
+                )
+            raise ValueError(f"Task {task.id} is already running.")
+        if task.status is not TaskStatus.CLAIMED:
+            _ensure_not_terminal(task)
+            raise ValueError(f"Task {task.id} is not claimed by worker {worker_id}.")
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.worker_id != worker_id:
             raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
-        await self._raise_task_active_lease_error(cur, task_id, worker_id or "")
+        await self._raise_task_active_lease_error(cur, task_id, worker_id)
 
 
 def _new_id() -> str:

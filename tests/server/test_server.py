@@ -333,7 +333,7 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
     assert tasks[0]["id"] == "leased_task"
     assert tasks[0]["type"] == "review"
     assert tasks[0]["title"] is None
-    assert tasks[0]["status"] == "running"
+    assert tasks[0]["status"] == "claimed"
     assert tasks[0]["status_reason"] is None
     assert tasks[0]["status_payload"] is None
     assert tasks[0]["session_id"] is None

@@ -223,6 +223,7 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=...)`
+- `attach_task(task_id, session_id=..., worker_id=...)`
 - `pause_task(task_id, reason=..., payload=...)`
 - `block_task(task_id, reason=..., payload=...)`
 - `mark_task_needs_attention(task_id, reason=..., payload=...)`
@@ -239,11 +240,16 @@ Valid task lifecycle is intentionally small for the foundation:
 
 ```text
 pending -> running
+pending -> claimed
 pending -> paused | blocked | needs_attention
+claimed -> running
+claimed -> pending
+claimed -> paused | blocked | needs_attention
 running (unattached) -> paused | blocked | needs_attention
 paused | blocked | needs_attention -> paused | blocked | needs_attention
 paused | blocked | needs_attention -> pending
 pending -> completed | failed | cancelled
+claimed -> completed | failed | cancelled
 running -> completed | failed | cancelled
 paused | blocked | needs_attention -> completed | failed | cancelled
 terminal statuses do not transition
@@ -256,7 +262,7 @@ terminal statuses do not transition
 There are two supported task execution modes:
 
 1. **Direct task/session link.** `CayuApp(task_store=...)` can link an agent run to an existing pending task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Use this when app code already decided exactly which task and session should run.
-2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `running`, records `worker_id`, and sets `lease_expires_at`. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu only attaches the session when the live lease proves that worker owns the task. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached leases to `pending`.
+2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `claimed`, records `worker_id`, and sets `lease_expires_at`; it does not attach a session or mark the task started. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu then calls `attach_task(...)` to move the live owned claim to `running` with the created session id. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached claims to `pending`.
 
 Claim queries intentionally do not support `session_id`, `limit`, or `offset`. Queue claims always pick one unattached pending task; tasks already linked to a session are no longer free queue work. `reclaim_expired(...)` also ignores attached tasks, even if their lease timestamp has passed, because the associated session may still be running or recoverable through session recovery. Once a claimed task is attached to a session, runtime completion/failure owns the task terminal update; the app should observe the session/task events instead of releasing that task back to the queue.
 
