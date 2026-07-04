@@ -23,6 +23,7 @@ class EventType(StrEnum):
     SESSION_CHECKPOINTED = "session.checkpointed"
     SESSION_FORKED = "session.forked"
     SESSION_LIMIT_REACHED = "session.limit_reached"
+    TURN_COMPLETED = "turn.completed"
 
     BUDGET_CHECKED = "budget.checked"
     BUDGET_LIMIT_REACHED = "budget.limit_reached"
@@ -51,6 +52,7 @@ class EventType(StrEnum):
     MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
+    STRUCTURED_OUTPUT_VALIDATING = "structured_output.validating"
     STRUCTURED_OUTPUT_FAILED = "structured_output.failed"
     STRUCTURED_OUTPUT_RETRY = "structured_output.retry"
 

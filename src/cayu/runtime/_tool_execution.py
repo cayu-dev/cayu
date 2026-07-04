@@ -61,10 +61,12 @@ def blocked_tool_result(policy_result: ToolPolicyResult, *, reason: str) -> Tool
 
 def context_metadata(
     *,
+    request_metadata: dict[str, Any] | None = None,
     tool_call_id: str,
     approval_id: str | None,
-) -> dict[str, str]:
-    metadata = {"tool_call_id": tool_call_id}
+) -> dict[str, Any]:
+    metadata = copy_json_value(request_metadata or {}, "request_metadata")
+    metadata["tool_call_id"] = tool_call_id
     if approval_id is not None:
         metadata["approval_id"] = approval_id
     return metadata

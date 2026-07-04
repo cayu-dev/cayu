@@ -700,9 +700,11 @@ class SideEffectTool(Tool):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[dict] = []
+        self.contexts: list[ToolContext] = []
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         self.calls.append(args)
+        self.contexts.append(ctx)
         return ToolResult(content="recorded")
 
 
@@ -854,6 +856,149 @@ def test_context_counting_is_off_by_default() -> None:
     assert provider.count_requests == []
     assert EventType.CONTEXT_COUNTED not in {event.type for event in events}
     assert EventType.CONTEXT_COUNT_RECONCILED not in {event.type for event in events}
+
+
+def test_cayu_app_emits_turn_completed_with_aggregated_usage() -> None:
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 4,
+                            "total_tokens": 14,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 3,
+                            "total_tokens": 15,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_turn_completed",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    turn_index = event_types.index(EventType.TURN_COMPLETED)
+    assert turn_index < event_types.index(EventType.SESSION_COMPLETED)
+    turn = events[turn_index]
+    assert turn.payload["status"] == "completed"
+    assert turn.payload["step_count"] == 2
+    assert turn.payload["tool_call_count"] == 1
+    assert turn.payload["token_usage"]["input_tokens"] == 22
+    assert turn.payload["token_usage"]["output_tokens"] == 7
+    assert turn.payload["token_usage"]["total_tokens"] == 29
+    assert turn.payload["models"] == ["fake-model"]
+    assert turn.payload["provider_names"] == ["fake"]
+    assert isinstance(turn.payload["duration_ms"], int)
+
+
+def test_cayu_app_turn_completed_on_resume_excludes_prior_turn_usage() -> None:
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 4,
+                            "total_tokens": 14,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 3,
+                            "total_tokens": 15,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> tuple[list[Event], list[Event]]:
+        first_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_turn_completed_resume",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+        resumed_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_turn_completed_resume",
+                messages=[Message.text("user", "second")],
+            ),
+        )
+        return first_events, resumed_events
+
+    first_events, resumed_events = asyncio.run(run())
+
+    first_turn = next(event for event in first_events if event.type == EventType.TURN_COMPLETED)
+    resumed_turn = next(event for event in resumed_events if event.type == EventType.TURN_COMPLETED)
+
+    assert first_turn.payload["step_count"] == 1
+    assert first_turn.payload["tool_call_count"] == 0
+    assert first_turn.payload["token_usage"]["input_tokens"] == 10
+    assert first_turn.payload["token_usage"]["output_tokens"] == 4
+    assert first_turn.payload["token_usage"]["total_tokens"] == 14
+
+    assert resumed_turn.payload["step_count"] == 1
+    assert resumed_turn.payload["tool_call_count"] == 0
+    assert resumed_turn.payload["token_usage"]["input_tokens"] == 12
+    assert resumed_turn.payload["token_usage"]["output_tokens"] == 3
+    assert resumed_turn.payload["token_usage"]["total_tokens"] == 15
 
 
 def test_context_pressure_estimate_reconciles_against_actual_input_usage() -> None:
@@ -1476,6 +1621,7 @@ def test_cayu_app_knowledge_injection_fails_closed_by_default_and_emits_failure_
         EventType.SESSION_STARTED,
         EventType.KNOWLEDGE_SEARCH_STARTED,
         EventType.KNOWLEDGE_SEARCH_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     failed_event = next(
@@ -1547,6 +1693,7 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
         EventType.KNOWLEDGE_SEARCH_STARTED,
         EventType.KNOWLEDGE_SEARCH_FAILED,
         EventType.SESSION_CHECKPOINTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[5].payload == {
@@ -3543,12 +3690,13 @@ def test_cayu_app_binding_failure_fails_session_before_start_event():
     assert [event.type for event in events] == [
         EventType.ENVIRONMENT_BINDING_STARTED,
         EventType.ENVIRONMENT_BINDING_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[1].payload["error"] == "bind failed"
     assert events[1].payload["error_type"] == "RuntimeError"
-    assert events[2].payload["error"] == "bind failed"
-    assert events[2].payload["error_type"] == "RuntimeError"
+    assert events[3].payload["error"] == "bind failed"
+    assert events[3].payload["error_type"] == "RuntimeError"
     assert len(binding.bind_calls) == 1
     assert binding.finalize_calls == []
     assert provider.requests == []
@@ -4230,6 +4378,7 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[2].payload == {"delta": "hello"}
@@ -4296,13 +4445,14 @@ def test_cayu_app_stops_on_token_limit_before_tool_side_effects():
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[3].payload["limit"] == "total_tokens"
     assert events[3].payload["actual"] == 11
     assert events[3].payload["maximum"] == 10
     assert events[4].payload["reason"] == "limit_reached"
-    assert events[5].payload["interruption_type"] == "limit_reached"
+    assert events[6].payload["interruption_type"] == "limit_reached"
     assert tool.calls == []
 
     transcript = asyncio.run(store.load_transcript("sess_token_limit"))
@@ -4351,10 +4501,11 @@ def test_cayu_app_stops_on_token_limit_after_final_model_answer():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[4].payload["limit"] == "total_tokens"
-    assert events[5].payload["interruption_type"] == "limit_reached"
+    assert events[6].payload["interruption_type"] == "limit_reached"
 
     transcript = asyncio.run(store.load_transcript("sess_final_token_limit"))
     assert [message.role for message in transcript] == ["user", "assistant"]
@@ -4402,13 +4553,14 @@ def test_cayu_app_stops_on_estimated_cost_limit_after_final_model_answer():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[4].payload["limit"] == "estimated_cost"
     assert events[4].payload["maximum"] == "0.002"
     assert events[4].payload["actual"] == "0.002"
     assert events[4].payload["cost_summary"]["total_cost"] == "0.002"
-    assert events[5].payload["interruption_type"] == "limit_reached"
+    assert events[6].payload["interruption_type"] == "limit_reached"
 
     session = asyncio.run(store.load("sess_cost_limit"))
     assert session is not None
@@ -4455,6 +4607,7 @@ def test_cayu_app_request_notify_budget_emits_event_without_stopping_session():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.BUDGET_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[4].payload["action"] == "notify"
@@ -4606,6 +4759,7 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert session is not None
@@ -4842,6 +4996,7 @@ def test_cayu_app_budget_limit_stops_before_tool_side_effects():
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[3].payload["limit"] == "estimated_cost"
@@ -4914,6 +5069,7 @@ def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool()
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert tool.calls == [{"step": 1}]
@@ -4991,6 +5147,7 @@ def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
         EventType.TOOL_CALL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert tool.calls == [{"step": 1}]
@@ -5060,6 +5217,7 @@ def test_cayu_app_elapsed_limit_stops_after_policy_before_approval(monkeypatch):
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
@@ -5117,6 +5275,7 @@ def test_cayu_app_resume_stops_before_model_when_persisted_budget_is_reached():
     assert [event.type for event in events] == [
         EventType.SESSION_RESUMED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert len(provider.requests) == 1
@@ -5193,6 +5352,7 @@ def test_cayu_app_run_scoped_resume_ignores_prior_session_usage():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -5264,6 +5424,7 @@ def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -5314,6 +5475,7 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
     assert [event.type for event in events] == [
         EventType.SESSION_RESUMED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[1].payload["limit"] == "elapsed_seconds"
@@ -5370,6 +5532,7 @@ def test_cayu_app_budget_limit_fails_closed_when_model_step_is_unpriced():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert len(provider.requests) == 0
@@ -5430,6 +5593,7 @@ def test_cayu_app_budget_limit_allows_unpriced_steps_when_explicitly_configured(
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
 
@@ -5512,6 +5676,7 @@ def test_cayu_app_app_budget_applies_across_sessions():
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert [event.type for event in second_events] == [
@@ -5519,6 +5684,7 @@ def test_cayu_app_app_budget_applies_across_sessions():
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert second_events[1].payload["scope"] == "app"
@@ -5582,6 +5748,7 @@ def test_cayu_app_notify_budget_emits_event_without_stopping_session():
         EventType.MODEL_COMPLETED,
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[6].payload["action"] == "notify"
@@ -5687,6 +5854,7 @@ def test_cayu_app_policy_can_notify_before_stricter_interrupt_budget():
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert second_events[8].payload["action"] == "interrupt"
@@ -5756,6 +5924,7 @@ def test_cayu_app_request_app_budget_limit_applies_across_sessions():
     assert [event.type for event in second_events] == [
         EventType.SESSION_STARTED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert second_events[1].payload["limit"] == "estimated_cost"
@@ -5819,6 +5988,7 @@ def test_cayu_app_budget_reservation_reconciles_model_step():
         EventType.MODEL_COMPLETED,
         EventType.BUDGET_RECONCILED,
         EventType.BUDGET_CHECKED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     reserved = next(event for event in events if event.type == EventType.BUDGET_RESERVED)
@@ -5892,6 +6062,7 @@ def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unav
         EventType.BUDGET_RESERVATION_FAILED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     failed = next(
@@ -6095,6 +6266,7 @@ def test_cayu_app_causal_budget_is_shared_by_forked_sessions():
         EventType.BUDGET_RESERVATION_FAILED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     failed = next(
@@ -6171,6 +6343,7 @@ def test_cayu_app_request_causal_budget_limit_applies_to_matching_causal_history
     assert [event.type for event in second_events] == [
         EventType.SESSION_STARTED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert second_events[1].payload["actual"] == "1"
@@ -6379,6 +6552,7 @@ def test_cayu_app_request_agent_budget_limit_applies_to_matching_agent_history()
     assert [event.type for event in second_events] == [
         EventType.SESSION_STARTED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert second_events[1].payload["actual"] == "1"
@@ -6452,6 +6626,7 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert "no matching pricing" in first_events[2].payload["message"]
@@ -6461,6 +6636,7 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert "no matching pricing" in second_events[2].payload["message"]
@@ -6531,6 +6707,7 @@ def test_cayu_app_run_scoped_budget_limit_ignores_prior_session_cost():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -6636,6 +6813,7 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[0].payload == {
@@ -6841,6 +7019,7 @@ def test_cayu_app_dispatches_existing_session_inline():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert dispatch_events[0].payload["dispatch_id"] == "dispatch_1"
@@ -7996,7 +8175,7 @@ def test_cayu_app_dispatch_returns_inline_handle():
         session_id="sess_dispatch_handle",
         backend="inline",
         status=DispatchStatus.COMPLETED,
-        metadata={"events": 5},
+        metadata={"events": 6},
     )
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",
@@ -8076,6 +8255,7 @@ def test_cayu_app_dispatches_forked_session_with_task_linkage():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.TASK_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert dispatch_events[0].payload == {
@@ -8321,6 +8501,7 @@ def test_cayu_app_runtime_hook_can_fork_and_dispatch_followup_work():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
         EventType.HOOK_STARTED,
         EventType.HOOK_COMPLETED,
@@ -10182,6 +10363,7 @@ def test_cayu_app_resume_continues_tool_rounds():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert provider.requests[2].messages[-1].role == "tool"
@@ -10240,6 +10422,7 @@ def test_cayu_app_links_successful_run_to_task():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.TASK_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert task is not None
@@ -10305,6 +10488,7 @@ def test_cayu_app_links_claimed_task_to_successful_run():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
         EventType.TASK_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert task is not None
@@ -10347,6 +10531,7 @@ def test_cayu_app_fails_task_when_run_fails():
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
         EventType.TASK_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert task is not None
@@ -10425,6 +10610,7 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 3
@@ -10472,6 +10658,7 @@ def test_cayu_app_does_not_retry_without_retry_policy():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert len(provider.requests) == 1
@@ -10504,6 +10691,7 @@ def test_cayu_app_does_not_retry_non_retryable_model_error():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert len(provider.requests) == 1
@@ -10554,6 +10742,7 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -10605,6 +10794,7 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[2].payload == {
@@ -10668,6 +10858,7 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         EventType.MODEL_ATTEMPT_DISCARDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert len(provider.requests) == 2
@@ -10798,6 +10989,7 @@ def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure()
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
 
@@ -10829,6 +11021,7 @@ def test_cayu_app_fails_session_clearly_when_task_store_is_missing():
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload == {
@@ -10876,6 +11069,7 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert task is not None
@@ -10945,6 +11139,7 @@ def test_cayu_app_records_sink_failures_without_failing_session():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert session is not None
@@ -11034,6 +11229,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -11962,6 +12158,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert tool.calls == []
@@ -12091,6 +12288,7 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
         EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert tool.calls == []
@@ -12180,6 +12378,7 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert tool.calls == [{"value": "secret"}]
@@ -12270,10 +12469,12 @@ def test_cayu_app_preserves_structured_output_across_tool_approval():
         EventType.SESSION_CHECKPOINTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[7].payload["output"] == {"answer": "approved"}
+    assert events[8].payload["output"] == {"answer": "approved"}
     assert provider.requests[1].options["structured_output"]["name"] == "approval_answer"
 
 
@@ -12495,6 +12696,7 @@ def test_cayu_app_approval_limit_counts_only_executable_pending_tools():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert EventType.SESSION_LIMIT_REACHED not in [event.type for event in events]
@@ -12583,6 +12785,7 @@ def test_cayu_app_resolves_approved_multi_tool_round_in_order():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert side_effect.calls == [{"value": "second"}]
@@ -12657,6 +12860,7 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert tool.calls == []
@@ -12817,6 +13021,7 @@ def test_cayu_app_denied_multi_tool_round_marks_skipped_calls_explicitly():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert side_effect.calls == []
@@ -13008,6 +13213,7 @@ def test_cayu_app_retries_approval_close_without_rerunning_completed_tool():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert tool.calls == [{"value": "secret"}]
@@ -13255,6 +13461,7 @@ def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[2].payload["approval_id"] == approval_id
@@ -13363,6 +13570,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert recovery_events[1].payload["approval_id"] == approval_id
@@ -14098,6 +14306,11 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"tenant": {"id": "mutated"}}
+    assert tool.contexts[0].metadata == {
+        "tenant": {"id": "tenant_1"},
+        "tool_call_id": "call_1",
+    }
+    tool.contexts[0].metadata["tenant"]["id"] = "tool-mutated"
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
     assert session is not None
     assert session.metadata == {"tenant": {"id": "tenant_1"}}
@@ -14221,6 +14434,7 @@ def test_cayu_app_taint_policy_applies_within_same_tool_round():
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
         EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     approval_event = next(
@@ -14298,6 +14512,11 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"resume": {"id": "mutated"}}
+    assert tool.contexts[0].metadata == {
+        "resume": {"id": "resume_1"},
+        "tool_call_id": "call_1",
+    }
+    tool.contexts[0].metadata["resume"]["id"] = "tool-mutated"
     session = asyncio.run(store.load("sess_policy_resume_metadata"))
     assert session is not None
     assert session.metadata == {"original": {"id": "run"}}
@@ -14390,6 +14609,7 @@ def test_cayu_app_fails_session_when_tool_policy_raises_before_execution():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert tool.calls == []
@@ -14605,6 +14825,7 @@ def test_cayu_app_fails_cleanly_when_context_policy_returns_invalid_output():
     assert provider.requests == []
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert (
@@ -14663,6 +14884,7 @@ def test_cayu_app_rejects_context_policy_that_cuts_through_tool_round():
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert "tool results without preceding assistant tool calls" in events[-1].payload["error"]
@@ -17087,6 +17309,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[1].payload == {
@@ -17208,6 +17431,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(compactor_provider.requests) == 1
@@ -17379,6 +17603,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[2].payload == {
@@ -17391,7 +17616,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         "error": "compaction unavailable",
         "error_type": "RuntimeError",
     }
-    assert events[3].payload == {
+    assert events[4].payload == {
         "error": "compaction unavailable",
         "error_type": "RuntimeError",
     }
@@ -17451,6 +17676,7 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[3].payload == {
@@ -17470,7 +17696,7 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
             "completed": {"finish_reason": "stop"},
         },
     }
-    assert events[4].payload == {
+    assert events[5].payload == {
         "error": "checkpoint unavailable",
         "error_type": "RuntimeError",
     }
@@ -17551,6 +17777,7 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert [message.content[0].text for message in compactor.requests[0].messages] == [
@@ -17641,6 +17868,7 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert [message.content[0].text for message in compactor.requests[0].messages] == [
@@ -17716,6 +17944,7 @@ def test_cayu_app_resume_uses_checkpointed_compaction_summary():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(compactor.requests) == 2
@@ -18819,6 +19048,7 @@ def test_cayu_app_returns_tool_failure_to_model():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
@@ -19020,6 +19250,7 @@ def test_cayu_app_returns_clear_tool_failure_for_invalid_constructed_result():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[4].payload["result"]["is_error"] is True
@@ -19084,6 +19315,7 @@ def test_cayu_app_keeps_text_and_tool_calls_in_one_assistant_turn():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
 
@@ -19393,6 +19625,7 @@ def test_cayu_app_groups_multiple_tool_calls_and_results_in_history():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
 
@@ -19456,6 +19689,7 @@ def test_cayu_app_fails_session_when_max_steps_exceeded():
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == "Maximum model steps exceeded: 1"
@@ -19495,6 +19729,7 @@ def test_cayu_app_records_failed_session_for_invalid_tool_call_payload():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "ValueError"
@@ -19537,6 +19772,7 @@ def test_cayu_app_rejects_custom_tool_call_argument_containers():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "ValueError"
@@ -19589,6 +19825,7 @@ def test_cayu_app_validates_provider_stream_events_at_runtime_boundary(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == error_type
@@ -19627,6 +19864,7 @@ def test_cayu_app_validates_provider_stream_event_payload_container():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "ValueError"
@@ -19667,6 +19905,7 @@ def test_cayu_app_rejects_provider_stream_event_subclasses_before_attribute_acce
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error_type"] == "TypeError"
@@ -19755,6 +19994,7 @@ def test_cayu_app_records_failed_session_for_blank_tool_call_name():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -19796,6 +20036,7 @@ def test_cayu_app_records_failed_session_for_invalid_tool_call_id(tool_call_id):
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -19826,6 +20067,7 @@ def test_cayu_app_records_failed_session_for_provider_error_event():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == "provider failed"
@@ -19869,6 +20111,7 @@ def test_cayu_app_does_not_execute_tool_when_provider_errors_after_tool_call():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert tool.calls == []
@@ -19904,6 +20147,7 @@ def test_cayu_app_fails_when_provider_emits_text_after_completed():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -19949,6 +20193,7 @@ def test_cayu_app_fails_without_tool_execution_when_provider_emits_tool_after_co
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -19982,6 +20227,7 @@ def test_cayu_app_fails_session_when_provider_stream_ends_without_completion():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == ("Model provider stream ended without a completed event.")
@@ -20020,6 +20266,7 @@ def test_cayu_app_ignores_blank_text_deltas():
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert events[4].payload["completion"] == {
@@ -20115,11 +20362,13 @@ def test_cayu_app_requires_structured_output_final_tool_call():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[4].payload["valid"] is False
-    assert events[4].payload["errors"][0]["message"] == (
+    assert events[5].payload["valid"] is False
+    assert events[5].payload["errors"][0]["message"] == (
         f"Final structured output must be submitted with the `{STRUCTURED_OUTPUT_TOOL_NAME}` tool."
     )
     assert events[-1].payload["error"] == (
@@ -20174,10 +20423,12 @@ def test_cayu_app_accepts_structured_output_final_tool_call():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[3].payload["output"] == {"answer": "ok"}
+    assert events[4].payload["output"] == {"answer": "ok"}
     assert provider.requests[0].tools == [
         {
             "name": STRUCTURED_OUTPUT_TOOL_NAME,
@@ -20256,8 +20507,9 @@ def test_cayu_app_redacts_structured_output_tool_result_before_transcript():
     )
     transcript = asyncio.run(store.load_transcript("sess_structured_output_tool_redacted"))
 
-    assert events[3].type == EventType.STRUCTURED_OUTPUT_VALIDATED
-    assert events[3].payload["output"] == {"answer": REDACTED_SECRET}
+    assert events[3].type == EventType.STRUCTURED_OUTPUT_VALIDATING
+    assert events[4].type == EventType.STRUCTURED_OUTPUT_VALIDATED
+    assert events[4].payload["output"] == {"answer": REDACTED_SECRET}
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
     tool_part = transcript[-1].content[0]
     assert isinstance(tool_part, ToolResultPart)
@@ -20316,16 +20568,19 @@ def test_cayu_app_retries_invalid_structured_output_final_tool_call():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
         EventType.STRUCTURED_OUTPUT_RETRY,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[3].payload["errors"][0]["path"] == "$"
-    assert events[4].payload["attempt"] == 1
-    assert events[7].payload["output"] == {"answer": "fixed"}
+    assert events[4].payload["errors"][0]["path"] == "$"
+    assert events[5].payload["attempt"] == 1
+    assert events[9].payload["output"] == {"answer": "fixed"}
     assert [message.role for message in transcript] == [
         "user",
         "assistant",
@@ -20397,8 +20652,8 @@ def test_cayu_app_redacts_structured_output_tool_validation_errors():
     )
     transcript = asyncio.run(store.load_transcript("sess_structured_output_tool_error_redaction"))
 
-    failed_event = events[3]
-    retry_event = events[4]
+    failed_event = events[4]
+    retry_event = events[5]
     assert failed_event.type == EventType.STRUCTURED_OUTPUT_FAILED
     assert retry_event.type == EventType.STRUCTURED_OUTPUT_RETRY
     assert secret_value not in str(failed_event.payload)
@@ -20530,14 +20785,17 @@ def test_cayu_app_rejects_mixed_structured_output_tool_round_without_side_effect
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
         EventType.STRUCTURED_OUTPUT_RETRY,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[3].payload["errors"][0]["message"] == (
+    assert events[4].payload["errors"][0]["message"] == (
         "Call the structured-output tool by itself, not in the same tool round as other tools."
     )
     mixed_tool_results = transcript[2].content
@@ -20605,10 +20863,12 @@ def test_cayu_app_does_not_count_structured_output_tool_against_tool_call_limit(
         EventType.TOOL_CALL_COMPLETED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[7].payload["output"] == {"answer": "done"}
+    assert events[8].payload["output"] == {"answer": "done"}
 
 
 def test_cayu_app_validates_native_structured_output_final_text():
@@ -20650,10 +20910,12 @@ def test_cayu_app_validates_native_structured_output_final_text():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[4].payload["output"] == {"answer": "ok"}
+    assert events[5].payload["output"] == {"answer": "ok"}
     assert provider.requests[0].options["structured_output"]["strategy"] == "native"
     assert provider.requests[0].tools == []
     assert [message.role for message in provider.requests[0].messages] == ["user"]
@@ -20705,16 +20967,19 @@ def test_cayu_app_retries_invalid_native_structured_output_final_text():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
         EventType.STRUCTURED_OUTPUT_RETRY,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[4].payload["errors"][0]["path"] == "$"
-    assert events[9].payload["output"] == {"answer": "fixed"}
+    assert events[5].payload["errors"][0]["path"] == "$"
+    assert events[11].payload["output"] == {"answer": "fixed"}
     repair_message = transcript[2].content[0].text
     assert "Return only valid JSON" in repair_message
     assert STRUCTURED_OUTPUT_TOOL_NAME not in repair_message
@@ -20767,8 +21032,8 @@ def test_cayu_app_redacts_native_structured_output_repair_prompt_errors():
     )
     transcript = asyncio.run(store.load_transcript("sess_native_structured_output_error_redaction"))
 
-    failed_event = events[4]
-    retry_event = events[5]
+    failed_event = events[5]
+    retry_event = events[6]
     assert failed_event.type == EventType.STRUCTURED_OUTPUT_FAILED
     assert retry_event.type == EventType.STRUCTURED_OUTPUT_RETRY
     assert secret_value not in str(failed_event.payload)
@@ -20816,6 +21081,7 @@ def test_cayu_app_rejects_native_structured_output_for_unsupported_provider():
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -20874,18 +21140,21 @@ def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
         EventType.STRUCTURED_OUTPUT_RETRY,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[4].payload["errors"][0]["message"] == (
+    assert events[5].payload["errors"][0]["message"] == (
         f"Final structured output must be submitted with the `{STRUCTURED_OUTPUT_TOOL_NAME}` tool."
     )
-    assert events[5].payload["attempt"] == 1
-    assert events[8].payload["attempt"] == 2
+    assert events[6].payload["attempt"] == 1
+    assert events[10].payload["attempt"] == 2
     assert len(provider.requests) == 2
     assert [message.role for message in transcript] == [
         "user",
@@ -20939,7 +21208,9 @@ def test_cayu_app_fails_structured_output_after_retries_exhausted():
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert events[-1].payload["error"] == (
@@ -20987,7 +21258,9 @@ def test_cayu_app_does_not_write_structured_output_repair_without_remaining_step
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_FAILED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert EventType.STRUCTURED_OUTPUT_RETRY not in [event.type for event in events]
@@ -21054,11 +21327,13 @@ def test_cayu_app_validates_structured_output_only_after_tool_round_finishes():
         EventType.TOOL_CALL_COMPLETED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
-    assert events[7].payload["output"] == {"answer": "from tool"}
+    assert events[8].payload["output"] == {"answer": "from tool"}
 
 
 def test_cayu_app_validates_native_structured_output_only_after_tool_round_finishes():
@@ -21114,13 +21389,15 @@ def test_cayu_app_validates_native_structured_output_only_after_tool_round_finis
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.STRUCTURED_OUTPUT_VALIDATING,
         EventType.STRUCTURED_OUTPUT_VALIDATED,
+        EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
     assert len(provider.requests) == 2
     assert provider.requests[0].options["structured_output"]["strategy"] == "native"
     assert provider.requests[1].options["structured_output"]["strategy"] == "native"
-    assert events[8].payload["output"] == {"answer": "from tool"}
+    assert events[9].payload["output"] == {"answer": "from tool"}
 
 
 def test_in_memory_session_store_rejects_duplicate_session_ids():
@@ -22542,9 +22819,18 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
     ]
     assert len(stored_interrupt_events) == 1
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
-    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in run_events[-2:]] == [
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert run_events[-2].payload["status"] == "interrupted"
     assert run_events[-1].id == interrupt_events[0].id == stored_interrupt_events[0].id
     assert stored_interrupt_events[0].payload["reason"] == "external interrupt"
+    stored_event_types = [event.type for event in stored_events]
+    assert stored_event_types.count(EventType.TURN_COMPLETED) == 1
+    assert stored_event_types.index(EventType.TURN_COMPLETED) < stored_event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
 
 
 def test_interrupt_session_stops_in_flight_provider_stream():
@@ -23003,10 +23289,18 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     assert interrupt_events[0].payload["reason"] == "operator stop"
     assert EventType.SESSION_INTERRUPTED not in [event.type for event in events_before_release]
-    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in run_events[-2:]] == [
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert run_events[-2].payload["status"] == "interrupted"
     assert run_events[-1].id == interrupt_events[0].id
-    assert [event.type for event in events_after_release].count(EventType.SESSION_INTERRUPTED) == 1
-    assert EventType.MODEL_COMPLETED not in [event.type for event in events_after_release]
+    event_types_after_release = [event.type for event in events_after_release]
+    assert event_types_after_release.count(EventType.SESSION_INTERRUPTED) == 1
+    assert event_types_after_release.count(EventType.TURN_COMPLETED) == 1
+    assert EventType.MODEL_COMPLETED not in event_types_after_release
+    assert event_types_after_release[-2] == EventType.TURN_COMPLETED
+    assert event_types_after_release[-1] == EventType.SESSION_INTERRUPTED
 
 
 def test_interrupt_session_does_not_finalize_unowned_running_session(monkeypatch):
@@ -23811,12 +24105,18 @@ def test_interrupt_session_suppresses_late_tool_events_while_finalizing(monkeypa
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     assert EventType.SESSION_INTERRUPTED not in [event.type for event in events_before_release]
-    assert run_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in run_events[-2:]] == [
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert run_events[-2].payload["status"] == "interrupted"
     assert run_events[-1].id == interrupt_events[0].id
     event_types_after_release = [event.type for event in events_after_release]
     assert event_types_after_release.count(EventType.SESSION_INTERRUPTED) == 1
+    assert event_types_after_release.count(EventType.TURN_COMPLETED) == 1
     assert EventType.TOOL_CALL_COMPLETED not in event_types_after_release
     assert event_types_after_release.count(EventType.TOOL_CALL_FAILED) == 1
+    assert event_types_after_release[-2] == EventType.TURN_COMPLETED
     assert event_types_after_release[-1] == EventType.SESSION_INTERRUPTED
     validate_context_messages(transcript)
     assert transcript[-1].role == "tool"

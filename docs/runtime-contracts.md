@@ -97,7 +97,7 @@ The built-in `ask_user` tool (`UserInputTool`, opt-in — register it only on ag
 
 Ordinary tool rounds are also crash-recoverable. When a model step produces normal executable tool calls, Cayu atomically appends the assistant tool-call message and a private `pending_tool_round` checkpoint before executing tools. Tool events for that round include a `tool_round_id`; terminal `tool.call.completed`, `tool.call.failed`, and `tool.call.blocked` events with the matching `tool_round_id` and `tool_call_id` are the execution ledger. When the grouped tool-result transcript message is appended, Cayu clears `pending_tool_round` in the same atomic `append_transcript_messages_and_checkpoint(...)` update. If the process dies before that close, the next run or resume repairs the transcript before adding new messages or building provider context: recorded terminal outcomes are converted into matching `tool_result` parts; tool calls with no recorded start event become explicit not-executed error results; tool calls that started but have no terminal event become explicit unknown-outcome error results. Cayu never re-executes an ordinary tool call during crash recovery.
 
-Policy requests receive copied session, agent, tool-call, argument, environment, workspace, and metadata values. Mutating a policy request does not mutate the tool arguments that may later reach the tool.
+Policy requests receive copied session, agent, tool-call, argument, environment, workspace, and metadata values. Mutating a policy request does not mutate the tool arguments that may later reach the tool. Runtime tools receive copied request metadata through `ToolContext.metadata`, plus framework-owned call identity keys such as `tool_call_id` and `approval_id`; framework-owned keys win on collision.
 
 ## Event
 
@@ -112,6 +112,10 @@ Events power:
 - session replay
 - hosted platform adapters
 - tests and debugging
+
+Every run/resume turn emits `turn.completed` before the terminal session event when the runtime reaches a normal completed, failed, interrupted, or limit-interrupted outcome. The payload is derived from durable usage-bearing events in that invocation: `status`, `duration_ms`, `step_count`, `tool_call_count`, `token_usage`, `provider_names`, and `models`. Consumers can use this instead of independently summing `model.completed` and `tool.call.started` events for common turn metrics. Detailed usage/cost APIs still derive from durable model/tool events and remain the source for historical reports.
+
+Streaming consumers should buffer assistant text deltas when structured output is active. Cayu emits `structured_output.validating` immediately before each validation attempt, then exactly one of `structured_output.validated` or `structured_output.failed` for that attempt. A failed attempt may be followed by `structured_output.retry`, after which consumers should keep buffering until a later validation succeeds or the session reaches a terminal failure. `model.completed` remains the usage/finish-reason event for the provider step; `turn.completed` summarizes the whole turn before `session.completed`, `session.failed`, or `session.interrupted`.
 
 ## SessionStore
 
@@ -438,9 +442,10 @@ plumbing: it is not registered by the app, does not execute user code, does not
 go through tool approval, and does not count against user tool-call limits.
 
 If the model calls the final-output tool by itself with a valid value, Cayu
-appends a tool result to the durable transcript, emits
-`structured_output.validated` with parsed JSON output, and completes the
-session. If the submitted value is invalid, Cayu appends an error tool result,
+emits `structured_output.validating`, validates the submitted value, appends a
+tool result to the durable transcript, emits `structured_output.validated` with
+parsed JSON output, and completes the session. If the submitted value is
+invalid, Cayu emits `structured_output.validating`, appends an error tool result,
 emits `structured_output.failed`, emits `structured_output.retry` when retries
 and model steps remain, and calls the model again with the provider-valid tool
 result in context. Cayu writes those tool results before completing, retrying,
@@ -453,9 +458,10 @@ in a later round.
 
 If the model ignores the final-output tool and returns plain final text, Cayu
 treats that as a structured-output failure even when the text happens to be
-valid JSON. If retries remain, it appends a synthetic user repair message to the
-durable provider-neutral transcript, emits `structured_output.retry`, and calls
-the model again. Cayu writes that repair message only when another model step is
+valid JSON. Cayu emits `structured_output.validating` before this check. If
+retries remain, it appends a synthetic user repair message to the durable
+provider-neutral transcript, emits `structured_output.retry`, and calls the
+model again. Cayu writes that repair message only when another model step is
 available. If retries are exhausted, or no model step remains for repair, the
 session fails with `session.failed`.
 

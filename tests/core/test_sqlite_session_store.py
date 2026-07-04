@@ -1126,6 +1126,7 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
         assert persisted_events == events
@@ -1184,6 +1185,7 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
         assert [message.content[0].text for message in provider.requests[1].messages] == [
@@ -1202,11 +1204,13 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
             EventType.SESSION_RESUMED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
         assert session is not None

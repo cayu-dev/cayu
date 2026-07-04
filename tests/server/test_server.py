@@ -1466,13 +1466,14 @@ def test_server_exposes_session_summary() -> None:
     assert body["session"]["provider_name"] == "fake"
     assert body["session"]["model"] == "fake-model"
     assert body["session"]["environment_name"] is None
-    assert body["events"]["total_events"] == 5
+    assert body["events"]["total_events"] == 6
     assert body["events"]["counts_by_type"] == {
         "model.completed": 1,
         "model.started": 1,
         "model.text.delta": 1,
         "session.completed": 1,
         "session.started": 1,
+        "turn.completed": 1,
     }
     assert body["events"]["latest_event"]["type"] == "session.completed"
     assert body["transcript"] == {"total_messages": 2}

@@ -69,6 +69,16 @@ def _abandoned_terminal_event(events: list[Event]) -> Event:
     return interrupted[0]
 
 
+def _assert_turn_completed_before_abandoned_terminal(events: list[Event]) -> None:
+    event_types = [event.type for event in events]
+    assert event_types.count(EventType.TURN_COMPLETED) == 1
+    assert event_types.index(EventType.TURN_COMPLETED) < event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
+    turn = next(event for event in events if event.type == EventType.TURN_COMPLETED)
+    assert turn.payload["status"] == "interrupted"
+
+
 def test_abandoned_run_stream_finalizes_running_session() -> None:
     # The first provider batch is consumed by the post-abandon resume, proving the
     # abandoned run never reached the model and the session stayed resumable.
@@ -94,6 +104,7 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
     session = asyncio.run(h.store.load("sess_abandoned_run"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+    _assert_turn_completed_before_abandoned_terminal(events)
     terminal = _abandoned_terminal_event(events)
     assert terminal.payload == {
         "interruption_type": "runtime_interrupted",
@@ -146,6 +157,10 @@ def test_abandoned_resume_stream_finalizes_running_session() -> None:
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
     events = asyncio.run(h.store.load_events("sess_abandoned_resume"))
+    event_types = [event.type for event in events]
+    assert event_types.count(EventType.TURN_COMPLETED) == 2
+    assert event_types[-2:] == [EventType.TURN_COMPLETED, EventType.SESSION_INTERRUPTED]
+    assert events[-2].payload["status"] == "interrupted"
     terminal = _abandoned_terminal_event(events)
     assert terminal.payload["reason"] == "event_stream_closed"
     assert terminal.payload["abandoned"] is True

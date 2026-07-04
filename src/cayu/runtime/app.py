@@ -7,7 +7,7 @@ import mimetypes
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
@@ -346,6 +346,12 @@ class _ActiveSessionRun:
     task_id: str | None
     task_started: bool
     task_finished: bool
+    turn_registered_agent: runtime_records.RegisteredAgentState | None = None
+    turn_environment_name: str | None = None
+    turn_started_at: float | None = None
+    turn_usage_tracker: _SessionUsageTracker | None = None
+    turn_completed_event: Event | None = None
+    turn_completed_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(frozen=True)
@@ -454,7 +460,7 @@ class _SessionUsageTracker:
         self._after_sequence: int | None = None
         self._events: list[Event] = []
 
-    async def usage_events(self) -> list[Event]:
+    async def _new_usage_records(self) -> list[EventRecord]:
         new_records: list[EventRecord] = []
         for event_type in self._EVENT_TYPES:
             new_records.extend(
@@ -466,8 +472,19 @@ class _SessionUsageTracker:
                     )
                 )
             )
+        new_records.sort(key=lambda record: record.sequence)
+        return new_records
+
+    async def mark_current_position(self) -> None:
+        """Move the cursor to the current event tail without counting history."""
+
+        new_records = await self._new_usage_records()
         if new_records:
-            new_records.sort(key=lambda record: record.sequence)
+            self._after_sequence = new_records[-1].sequence
+
+    async def usage_events(self) -> list[Event]:
+        new_records = await self._new_usage_records()
+        if new_records:
             self._events.extend(record.event for record in new_records)
             self._after_sequence = new_records[-1].sequence
         return self._events
@@ -528,6 +545,8 @@ class _LimitGate:
         run_baseline: SessionUsageSummary | None,
         budget_baseline_events: list[Event],
         budget_notify_events: list[Event],
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> None:
         self._app = app
         self._session = session
@@ -540,6 +559,8 @@ class _LimitGate:
         self._run_baseline = run_baseline
         self._budget_baseline_events = budget_baseline_events
         self._budget_notify_events = budget_notify_events
+        self._turn_usage_tracker = turn_usage_tracker
+        self._active_run = active_run
         self._usage_tracker = _SessionUsageTracker(app, session_id=session.id)
         self.tripped = False
 
@@ -590,6 +611,9 @@ class _LimitGate:
                 completed_tool_outcomes if completed_tool_outcomes is not None else []
             ),
             tool_round_id=tool_round_id,
+            run_started_at=self._run_started_at,
+            turn_usage_tracker=self._turn_usage_tracker,
+            active_run=self._active_run,
         ):
             yield event
 
@@ -622,6 +646,9 @@ class _LimitGate:
             tool_calls=tool_calls if tool_calls is not None else [],
             completed_tool_outcomes=[],
             tool_round_id=tool_round_id,
+            run_started_at=self._run_started_at,
+            turn_usage_tracker=self._turn_usage_tracker,
+            active_run=self._active_run,
         ):
             yield event
 
@@ -2047,6 +2074,10 @@ class CayuApp:
                 )
                 yield existing_interrupt_event
                 return
+            await self._emit_active_turn_completed_if_needed(
+                session=session,
+                status=SessionStatus.INTERRUPTED,
+            )
             terminal_event_stream = self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -3968,6 +3999,8 @@ class CayuApp:
         )
         structured_output_retries = 0
         run_baseline: SessionUsageSummary | None = None
+        turn_usage_tracker = _SessionUsageTracker(self, session_id=session.id)
+        await turn_usage_tracker.mark_current_position()
         if (limits.scope == "run" and has_run_limits(limits)) or _has_run_budget_limit(
             budget_limits
         ):
@@ -3988,6 +4021,10 @@ class CayuApp:
                 task_id=task_id,
                 task_started=task_started,
                 task_finished=task_finished,
+                turn_registered_agent=registered_agent,
+                turn_environment_name=environment_name,
+                turn_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
             )
         try:
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
@@ -3997,6 +4034,8 @@ class CayuApp:
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
+            if active_run is not None:
+                active_run.turn_environment_name = environment_name
             for event in factory_resolution.events:
                 yield event
             if factory_resolution.error is not None:
@@ -4008,6 +4047,8 @@ class CayuApp:
             )
             registered_environment = binding_result.registered_environment
             environment_name = _environment_name(registered_environment)
+            if active_run is not None:
+                active_run.turn_environment_name = environment_name
             for event in binding_result.events:
                 yield event
             if binding_result.error is not None:
@@ -4082,6 +4123,8 @@ class CayuApp:
                 run_baseline=run_baseline,
                 budget_baseline_events=baseline_events,
                 budget_notify_events=request_budget_notify_events,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
             )
             interrupt_guard = _InterruptGuard(
                 self,
@@ -4262,6 +4305,9 @@ class CayuApp:
                         environment_name=environment_name,
                         result=reservation_failure,
                         messages=messages,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
                     ):
                         yield event
                     return
@@ -4396,6 +4442,16 @@ class CayuApp:
                     and structured_output.strategy == StructuredOutputStrategy.TOOL
                     and _has_structured_output_tool_call(tool_calls)
                 ):
+                    yield await self._emit(
+                        _structured_output_validating_event(
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            spec=structured_output,
+                            step=step,
+                            attempt=structured_output_retries + 1,
+                        )
+                    )
                     validation = _validate_structured_output_tool_round(
                         tool_calls=tool_calls,
                         spec=structured_output,
@@ -4474,6 +4530,16 @@ class CayuApp:
 
                 if not tool_calls:
                     if structured_output is not None:
+                        yield await self._emit(
+                            _structured_output_validating_event(
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                spec=structured_output,
+                                step=step,
+                                attempt=structured_output_retries + 1,
+                            )
+                        )
                         if structured_output.strategy == StructuredOutputStrategy.NATIVE:
                             if assistant_step_result is None:
                                 raise RuntimeError(
@@ -4595,6 +4661,15 @@ class CayuApp:
                                 session.id,
                                 SessionStatus.INTERRUPTED,
                             )
+                            yield await self._emit_turn_completed_once(
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                status=SessionStatus.INTERRUPTED,
+                                run_started_at=run_started_at,
+                                usage_tracker=turn_usage_tracker,
+                                active_run=active_run,
+                            )
                             async for event in self._emit_terminal_event_with_hooks(
                                 event=Event(
                                     type=EventType.SESSION_INTERRUPTED,
@@ -4657,6 +4732,15 @@ class CayuApp:
                     )
                 )
             session = await self.session_store.update_status(session.id, SessionStatus.COMPLETED)
+            yield await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.COMPLETED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_COMPLETED,
@@ -4672,6 +4756,15 @@ class CayuApp:
                 yield event
         except _SessionInterrupted as exc:
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            yield await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -4691,6 +4784,15 @@ class CayuApp:
                 yield event
         except _UserInputInterrupt as exc:
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            yield await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -4714,6 +4816,9 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
             ):
                 yield event
             return
@@ -4724,6 +4829,9 @@ class CayuApp:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
                 ):
                     yield event
                 return
@@ -4739,6 +4847,9 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
             )
             raise
         except Exception as exc:
@@ -4780,6 +4891,15 @@ class CayuApp:
             if task_failure_error is not None:
                 payload["task_update_error"] = str(task_failure_error)
                 payload["task_update_error_type"] = type(task_failure_error).__name__
+            yield await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.FAILED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_FAILED,
@@ -4798,6 +4918,101 @@ class CayuApp:
             self._discard_session_interrupt_signal(session.id)
             if current_task is not None:
                 self._unregister_active_session_task(session.id, current_task)
+
+    async def _emit_turn_completed(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        status: SessionStatus,
+        run_started_at: float,
+        usage_tracker: _SessionUsageTracker,
+    ) -> Event:
+        usage_events = await usage_tracker.usage_events()
+        summary = session_usage_summary(session.id, usage_events)
+        duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
+        return await self._emit(
+            Event(
+                type=EventType.TURN_COMPLETED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "status": status.value,
+                    "duration_ms": duration_ms,
+                    "step_count": summary.model_steps,
+                    "tool_call_count": summary.tool_calls,
+                    "token_usage": summary.usage.model_dump(),
+                    "provider_names": summary.provider_names,
+                    "models": summary.models,
+                },
+            )
+        )
+
+    async def _emit_turn_completed_once(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        status: SessionStatus,
+        run_started_at: float,
+        usage_tracker: _SessionUsageTracker,
+        active_run: _ActiveSessionRun | None,
+    ) -> Event:
+        if active_run is None:
+            return await self._emit_turn_completed(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=status,
+                run_started_at=run_started_at,
+                usage_tracker=usage_tracker,
+            )
+        async with active_run.turn_completed_lock:
+            if active_run.turn_completed_event is not None:
+                return active_run.turn_completed_event
+            event = await self._emit_turn_completed(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=status,
+                run_started_at=run_started_at,
+                usage_tracker=usage_tracker,
+            )
+            active_run.turn_completed_event = event
+            return event
+
+    async def _emit_active_turn_completed_if_needed(
+        self,
+        *,
+        session: Session,
+        status: SessionStatus,
+    ) -> Event | None:
+        for active_run in self._active_session_run_records(session.id):
+            if (
+                active_run.turn_registered_agent is None
+                or active_run.turn_started_at is None
+                or active_run.turn_usage_tracker is None
+            ):
+                continue
+            return await self._emit_turn_completed_once(
+                session=session,
+                registered_agent=active_run.turn_registered_agent,
+                environment_name=active_run.turn_environment_name,
+                status=status,
+                run_started_at=active_run.turn_started_at,
+                usage_tracker=active_run.turn_usage_tracker,
+                active_run=active_run,
+            )
+        return None
+
+    def _active_turn_completed_event(self, session_id: str) -> Event | None:
+        for active_run in self._active_session_run_records(session_id):
+            if active_run.turn_completed_event is not None:
+                return active_run.turn_completed_event
+        return None
 
     async def _start_task(
         self,
@@ -6084,6 +6299,9 @@ class CayuApp:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         pending_approval_to_clear: PendingToolApproval | None = None,
         tool_round_id: str | None = None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         limit_payload = _limit_reached_payload(
             decision=decision,
@@ -6121,6 +6339,16 @@ class CayuApp:
             "interruption_type": _INTERRUPTION_TYPE_LIMIT_REACHED,
             **limit_payload,
         }
+        if run_started_at is not None and turn_usage_tracker is not None:
+            yield await self._emit_turn_completed_once(
+                session=interrupted_session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=run_started_at,
+                usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
         async for event in self._emit_terminal_event_with_hooks(
             event=Event(
                 type=EventType.SESSION_INTERRUPTED,
@@ -6145,6 +6373,9 @@ class CayuApp:
         environment_name: str | None,
         result: BudgetReservationResult,
         messages: list[Message],
+        run_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         payload = budget_reservation_payload(result)
         yield await self._emit(
@@ -6175,6 +6406,9 @@ class CayuApp:
             messages=messages,
             tool_calls=[],
             completed_tool_outcomes=[],
+            run_started_at=run_started_at,
+            turn_usage_tracker=turn_usage_tracker,
+            active_run=active_run,
         ):
             yield event
 
@@ -6190,6 +6424,9 @@ class CayuApp:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         tool_round_id: str | None = None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         payload = _budget_limit_reached_payload(check)
         yield await self._emit(
@@ -6221,6 +6458,9 @@ class CayuApp:
             tool_calls=tool_calls,
             completed_tool_outcomes=completed_tool_outcomes,
             tool_round_id=tool_round_id,
+            run_started_at=run_started_at,
+            turn_usage_tracker=turn_usage_tracker,
+            active_run=active_run,
         ):
             yield event
 
@@ -6729,6 +6969,7 @@ class CayuApp:
                     knowledge_store=_knowledge_store(registered_environment),
                     mcp_servers=_mcp_servers(registered_environment),
                     metadata=tool_execution.context_metadata(
+                        request_metadata=request_metadata,
                         tool_call_id=tool_call.id,
                         approval_id=approval_id,
                     ),
@@ -7412,6 +7653,9 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> None:
         """Finalize a session whose event-stream consumer went away mid-run.
 
@@ -7433,6 +7677,17 @@ class CayuApp:
         except (KeyError, ValueError):
             # Already terminal (or gone): nothing to finalize.
             return
+        if run_started_at is not None and turn_usage_tracker is not None:
+            with contextlib.suppress(Exception):
+                await self._emit_turn_completed_once(
+                    session=finalized,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    status=SessionStatus.INTERRUPTED,
+                    run_started_at=run_started_at,
+                    usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                )
         with contextlib.suppress(Exception):
             async for _ in self._emit_terminal_event_with_hooks(
                 event=Event(
@@ -7505,6 +7760,9 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
+        run_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
+        active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         _clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -7523,10 +7781,27 @@ class CayuApp:
             existing_interrupt_event = await self._wait_for_session_interrupted_event(session.id)
             if existing_interrupt_event is not None:
                 await self._clear_pending_session_interrupt(session.id)
+                turn_completed_event = (
+                    active_run.turn_completed_event
+                    if active_run is not None and active_run.turn_completed_event is not None
+                    else self._active_turn_completed_event(session.id)
+                )
+                if turn_completed_event is not None:
+                    yield turn_completed_event
                 yield existing_interrupt_event
                 return
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
             payload.setdefault("interruption_type", _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED)
+            if run_started_at is not None and turn_usage_tracker is not None:
+                yield await self._emit_turn_completed_once(
+                    session=loaded_interrupted,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    status=SessionStatus.INTERRUPTED,
+                    run_started_at=run_started_at,
+                    usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                )
             terminal_event_stream = self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -7833,6 +8108,10 @@ class CayuApp:
         task_id: str | None,
         task_started: bool,
         task_finished: bool,
+        turn_registered_agent: runtime_records.RegisteredAgentState | None = None,
+        turn_environment_name: str | None = None,
+        turn_started_at: float | None = None,
+        turn_usage_tracker: _SessionUsageTracker | None = None,
     ) -> _ActiveSessionRun:
         session_id = require_clean_nonblank(session_id, "session_id")
         active_run = _ActiveSessionRun(
@@ -7840,6 +8119,10 @@ class CayuApp:
             task_id=task_id,
             task_started=task_started,
             task_finished=task_finished,
+            turn_registered_agent=turn_registered_agent,
+            turn_environment_name=turn_environment_name,
+            turn_started_at=turn_started_at,
+            turn_usage_tracker=turn_usage_tracker,
         )
         self._active_session_runs.setdefault(session_id, {})[task] = active_run
         return active_run
@@ -11098,6 +11381,32 @@ def _structured_output_event(
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
         payload=payload,
+    )
+
+
+def _structured_output_validating_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    spec: StructuredOutputSpec,
+    step: int,
+    attempt: int,
+) -> Event:
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    return Event(
+        type=EventType.STRUCTURED_OUTPUT_VALIDATING,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "name": spec.name,
+            "strategy": spec.strategy.value,
+            "step": step,
+            "attempt": attempt,
+            "max_retries": spec.max_retries,
+        },
     )
 
 
