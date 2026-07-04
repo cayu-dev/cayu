@@ -64,8 +64,12 @@ class RunRequest(BaseModel):
     task_id: str | None = None
     task_worker_id: str | None = None
     # Per-run provider override. Resolution order for new sessions:
-    # request.provider_name -> agent spec provider_name -> app default provider.
+    # request.provider_name -> agent spec provider_name -> model-pattern route ->
+    # app default provider.
     provider_name: str | None = None
+    # Per-run model override for new sessions. Resume keeps the stored session
+    # model unless ResumeRequest.model is set.
+    model: str | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -125,6 +129,7 @@ class RunRequest(BaseModel):
         "task_id",
         "task_worker_id",
         "provider_name",
+        "model",
         "environment_name",
     )
     @classmethod
@@ -1709,6 +1714,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
         provider_name=request.provider_name,
+        model=request.model,
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),

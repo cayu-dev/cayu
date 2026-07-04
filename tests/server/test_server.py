@@ -611,10 +611,12 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     captured: list[int] = []
+    captured_models: list[str | None] = []
     original_run = app.run
 
     def spy_run(request: RunRequest):
         captured.append(request.max_steps)
+        captured_models.append(request.model)
         return original_run(request)
 
     app.run = spy_run  # type: ignore[method-assign]
@@ -623,11 +625,16 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
         list(response.iter_lines())
-    with client.stream("POST", "/api/run", json={"prompt": "hello", "max_steps": 7}) as response:
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello", "max_steps": 7, "model": "request-model"},
+    ) as response:
         assert response.status_code == 200
         list(response.iter_lines())
 
     assert captured == [20, 7]
+    assert captured_models == [None, "request-model"]
 
 
 def test_server_resume_overrides_max_steps() -> None:

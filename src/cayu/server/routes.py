@@ -146,6 +146,7 @@ def _detached_event_stream_response(event_stream: AsyncIterator[Event]) -> Event
 class RunBody(BaseModel):
     prompt: NonBlankString
     agent: NonBlankString = "assistant"
+    model: NonBlankString | None = None
     causal_budget_id: NonBlankString | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
@@ -822,6 +823,7 @@ def create_router(
         request = RunRequest(
             agent_name=body.agent,
             session_id=session_id,
+            model=body.model,
             causal_budget_id=body.causal_budget_id,
             task_id=task_id,
             labels=body.labels,

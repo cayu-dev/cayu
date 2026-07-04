@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from fnmatch import fnmatchcase
 from importlib.metadata import PackageNotFoundError, version
 from math import isfinite
 from types import MappingProxyType
@@ -1488,11 +1489,13 @@ class CayuApp:
         provider: ModelProvider,
         *,
         default: bool = False,
+        model_patterns: Iterable[str] | None = None,
     ) -> ModelProvider:
         if not isinstance(provider, ModelProvider):
             raise TypeError("Provider registration requires a ModelProvider.")
         if not isinstance(default, bool):
             raise TypeError("Provider default flag must be a bool.")
+        stored_model_patterns = _validate_provider_model_patterns(model_patterns)
         require_clean_nonblank(provider.name, "provider.name")
         if provider.name in self._providers:
             raise ValueError(f"Provider already registered: {provider.name}")
@@ -1500,6 +1503,7 @@ class CayuApp:
         self._providers[provider.name] = runtime_records.RegisteredProvider(
             name=provider.name,
             provider=provider,
+            model_patterns=stored_model_patterns,
         )
         if default or self._default_provider_name is None:
             self._default_provider_name = provider.name
@@ -1698,6 +1702,25 @@ class CayuApp:
         except KeyError as exc:
             raise KeyError(f"Provider not registered: {provider_name}") from exc
 
+    def _route_registered_provider_for_model(
+        self,
+        *,
+        model: str,
+    ) -> runtime_records.RegisteredProvider | None:
+        model = require_clean_nonblank(model, "model")
+        matches: list[runtime_records.RegisteredProvider] = []
+        for registered_provider in self._providers.values():
+            if any(fnmatchcase(model, pattern) for pattern in registered_provider.model_patterns):
+                matches.append(registered_provider)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            match_names = ", ".join(provider.name for provider in matches)
+            raise ValueError(
+                f"Model matches multiple registered providers: {model} -> {match_names}"
+            )
+        return matches[0]
+
     def _get_registered_environment(
         self,
         name: str | None = None,
@@ -1732,11 +1755,19 @@ class CayuApp:
         request = _validate_run_request(request)
         registered_agent = self._get_registered_agent(request.agent_name)
         # Provider resolution for new sessions: per-run override, then the
-        # agent's pinned provider, then the app default. Resume/fork keep
-        # honoring the provider recorded on the session.
-        registered_provider = self._get_registered_provider(
-            request.provider_name or registered_agent.spec.provider_name
-        )
+        # agent's pinned provider, then model-pattern routing, then the app
+        # default. Resume/fork keep honoring the provider recorded on the
+        # session.
+        model = request.model or registered_agent.spec.model
+        if request.provider_name is not None or registered_agent.spec.provider_name is not None:
+            registered_provider = self._get_registered_provider(
+                request.provider_name or registered_agent.spec.provider_name
+            )
+        else:
+            registered_provider = (
+                self._route_registered_provider_for_model(model=model)
+                or self._get_registered_provider()
+            )
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
@@ -1749,7 +1780,7 @@ class CayuApp:
             request,
             identity=_session_identity(
                 provider_name=registered_provider.name,
-                model=registered_agent.spec.model,
+                model=model,
             ),
         )
         try:
@@ -9225,6 +9256,21 @@ def _validate_optional_positive_seconds(value: float | None, field_name: str) ->
     return float(value)
 
 
+def _validate_provider_model_patterns(value: Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes):
+        raise TypeError("Provider model_patterns must be an iterable of strings.")
+    try:
+        patterns = tuple(value)
+    except TypeError as exc:
+        raise TypeError("Provider model_patterns must be an iterable of strings.") from exc
+    return tuple(
+        require_clean_nonblank(pattern, f"model_patterns[{index}]")
+        for index, pattern in enumerate(patterns)
+    )
+
+
 def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
@@ -9753,6 +9799,8 @@ def _with_environment_name(request: RunRequest, environment_name: str) -> RunReq
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
+        provider_name=request.provider_name,
+        model=request.model,
         environment_name=environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_json_value(request.metadata, "metadata"),

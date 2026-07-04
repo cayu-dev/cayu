@@ -396,6 +396,31 @@ Per-vendor knobs: `auth_header`/`auth_value_prefix` for non-Bearer auth (Azure u
 Ollama/vLLM on `http://localhost`, `endpoint_url` to override the request URL outright, and
 `stream_include_usage=False` for servers that reject `stream_options`.
 
+When an app registers multiple providers, it can route new sessions by model name without making
+the caller pass a provider explicitly:
+
+```python
+from cayu import AgentSpec, AnthropicProvider, CayuApp, Message, OpenAIProvider, RunRequest
+
+app = CayuApp()
+app.register_provider(OpenAIProvider(), default=True, model_patterns=["gpt-*", "o*"])
+app.register_provider(AnthropicProvider(), model_patterns=["claude-*"])
+app.register_agent(AgentSpec(name="assistant", model="gpt-5.5"))
+
+async for event in app.run(
+    RunRequest(
+        agent_name="assistant",
+        model="claude-sonnet-4-6",
+        messages=[Message.text("user", "hello")],
+    )
+):
+    print(event.type)
+```
+
+Explicit `RunRequest.provider_name` and `AgentSpec.provider_name` still win. Ambiguous pattern
+matches fail before the session is created, and resume/fork paths keep the provider recorded on
+the stored session.
+
 To run Anthropic Claude models hosted on **Google Cloud Vertex AI** (enterprises mandated to
 GCP), use `VertexProvider` (install the optional `cayu[vertex]` extra). It sends the Anthropic
 Messages body to the regional `:rawPredict` endpoint with an OAuth bearer token, so tool calls

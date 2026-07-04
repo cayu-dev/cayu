@@ -45,6 +45,7 @@ class RegisteredTool:
 class RegisteredProvider:
     name: str
     provider: ModelProvider
+    model_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
