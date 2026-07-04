@@ -204,6 +204,11 @@ from cayu.runtime.usage import (
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
+from cayu.runtime.user_input import (
+    PendingUserInput,
+    UserInputRecoveryRequest,
+    UserInputResponse,
+)
 
 __all__ = [
     "ANY_TAINT_LABEL",
@@ -299,6 +304,7 @@ __all__ = [
     "ParameterRule",
     "PendingToolApproval",
     "PendingToolCallApproval",
+    "PendingUserInput",
     "PricingCatalog",
     "RecentTurnsContextPolicy",
     "RegisteredAgent",
@@ -355,6 +361,8 @@ __all__ = [
     "TranscriptRecord",
     "UsageMetrics",
     "UsageTriggeredContextPolicy",
+    "UserInputRecoveryRequest",
+    "UserInputResponse",
     "causal_budget_usage_summary",
     "classify_retryable_error",
     "copy_context_counting_config",

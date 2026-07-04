@@ -88,6 +88,7 @@ from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.approvals import (
     PendingToolApproval,
     ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_pending_tool_approval,
@@ -274,6 +275,16 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
     usage_metrics_payload,
 )
+from cayu.runtime.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    PendingUserInput,
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    copy_pending_user_input,
+    copy_user_input_recovery_request,
+    copy_user_input_response,
+    pending_user_input_from_checkpoint,
+)
 from cayu.storage.memory import KnowledgeStore
 from cayu.vaults import (
     ResolvedSecret,
@@ -291,6 +302,12 @@ class _SessionInterrupted(Exception):
     def __init__(self, approval: PendingToolApproval) -> None:
         super().__init__(f"Tool call requires approval: {approval.tool_name}")
         self.approval = copy_pending_tool_approval(approval)
+
+
+class _UserInputInterrupt(Exception):
+    def __init__(self, pending: PendingUserInput) -> None:
+        super().__init__(f"Tool call awaits user input: {pending.tool_name}")
+        self.pending = copy_pending_user_input(pending)
 
 
 class _SessionInterruptedByRequest(Exception):
@@ -391,6 +408,7 @@ _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
+_INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 _ABANDONED_RUN_REASON = "event_stream_closed"
 # Fallback for approvals checkpointed before the original run config was
@@ -632,6 +650,7 @@ class _InterruptGuard:
         clear_pending_approval: bool = False,
     ) -> AsyncIterator[Event]:
         cancellation_artifacts: list[dict[str, Any]] | None = None
+        cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
         if isinstance(exc, _SessionInterruptedByRequest):
             pass
         elif isinstance(exc, asyncio.CancelledError):
@@ -639,6 +658,13 @@ class _InterruptGuard:
                 return
             _clear_current_task_cancellation()
             cancellation_artifacts = _cancellation_artifacts(exc)
+            # A parallel round records which call produced the artifacts, so attach them to that
+            # call rather than the first unfinished one. Sequential cancellation carries no id and
+            # keeps the first-unfinished fallback (its only in-flight call is that call).
+            producer_id = _cancellation_tool_call_id(exc)
+            if producer_id is not None and cancellation_artifacts:
+                cancellation_artifacts_by_id = {producer_id: cancellation_artifacts}
+                cancellation_artifacts = None
         else:
             raise TypeError(f"Unsupported interrupt exception: {type(exc).__name__}")
         if clear_pending_approval:
@@ -655,6 +681,7 @@ class _InterruptGuard:
             tool_outcomes=tool_outcomes,
             tool_round_id=tool_round_id,
             cancellation_artifacts=cancellation_artifacts,
+            cancellation_artifacts_by_id=cancellation_artifacts_by_id,
         ):
             yield event
 
@@ -795,26 +822,79 @@ class _ToolRoundRunner:
             raise _SessionInterrupted(approval)
 
         policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_plan.outcomes}
-        if len(tool_calls) > 1 and app._max_parallel_tool_calls > 1:
-            call_stream = self._run_tool_calls_parallel(
+        # ask_user pauses the whole round before any tool runs (like approval), so a round
+        # mixing ask_user with other tools loses no outcomes: nothing executes until the caller
+        # resumes with the answer. Approval takes precedence: if the round also needs approval,
+        # the approval pause above wins and, on approval resume, the ask_user call runs as an
+        # ordinary tool and returns an error (v1 limitation — the question is not asked that round).
+        # A DENY'd ask_user is skipped (enforced by normal execution) so a second, allowed ask_user
+        # in the same round can still pause.
+        user_input_pause = _first_user_input_tool_call(
+            self._registered_agent, tool_calls, policy_results_by_id
+        )
+        if user_input_pause is not None:
+            user_input_call, question, options = user_input_pause
+            pending_input, checkpoint_event = await app._checkpoint_pending_user_input(
+                session=session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                tool_call=user_input_call,
                 tool_calls=tool_calls,
-                tool_outcomes=tool_outcomes,
-                policy_results_by_id=policy_results_by_id,
-                tool_round_id=tool_round_id,
+                policy_outcomes=policy_plan.outcomes,
+                task_id=self._task_id,
+                structured_output=self._structured_output,
+                thinking=self._thinking,
+                max_steps=self._max_steps,
+                limits=self._limits,
+                budget_limits=self._budget_limits,
+                retry_policy=self._retry_policy,
+                question=question,
+                options=options,
             )
-        else:
-            call_stream = self._run_tool_calls_sequential(
-                messages=messages,
-                tool_calls=tool_calls,
-                tool_outcomes=tool_outcomes,
-                policy_results_by_id=policy_results_by_id,
-                tool_round_id=tool_round_id,
+            yield await app._emit(checkpoint_event)
+            yield await app._emit(
+                Event(
+                    type=EventType.SESSION_AWAITING_USER_INPUT,
+                    session_id=session.id,
+                    agent_name=self._registered_agent.spec.name,
+                    environment_name=self._environment_name,
+                    tool_name=user_input_call.name,
+                    payload={
+                        "input_id": pending_input.input_id,
+                        "tool_call_id": pending_input.tool_call_id,
+                        "question": pending_input.question,
+                        "options": list(pending_input.options),
+                    },
+                )
             )
+            raise _UserInputInterrupt(pending_input)
+
+        segments = self._tool_round_segments(tool_calls)
+        any_parallel = any(run_parallel for run_parallel, _ in segments)
         try:
-            async for event, outcome in call_stream:
-                yield event
-                if outcome is not None:
-                    tool_outcomes.append(outcome)
+            for run_parallel, segment_calls in segments:
+                if run_parallel:
+                    call_stream = self._run_tool_calls_parallel(
+                        tool_calls=segment_calls,
+                        tool_outcomes=tool_outcomes,
+                        policy_results_by_id=policy_results_by_id,
+                        tool_round_id=tool_round_id,
+                    )
+                else:
+                    call_stream = self._run_tool_calls_sequential(
+                        messages=messages,
+                        tool_calls=segment_calls,
+                        round_tool_calls=tool_calls,
+                        tool_outcomes=tool_outcomes,
+                        policy_results_by_id=policy_results_by_id,
+                        tool_round_id=tool_round_id,
+                    )
+                async for event, outcome in call_stream:
+                    yield event
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+                if self.stopped_for_limit:
+                    break
             if self.stopped_for_limit:
                 return
         except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
@@ -828,7 +908,13 @@ class _ToolRoundRunner:
                 yield event
             raise
 
-        tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        # Segments already execute in model order, so tool_outcomes is model-ordered; the ordering
+        # pass is a stable safety net.
+        tool_result_messages = _ordered_tool_result_messages(
+            tool_calls,
+            tool_outcomes,
+            parallel=any_parallel,
+        )
         messages.extend(tool_result_messages)
         cleared_checkpoint = await app._checkpoint_without_pending_tool_round(session.id)
         try:
@@ -847,6 +933,35 @@ class _ToolRoundRunner:
                 )
             raise
 
+    def _tool_round_segments(
+        self,
+        tool_calls: list[runtime_records.ToolCallRequest],
+    ) -> list[tuple[bool, list[runtime_records.ToolCallRequest]]]:
+        """Split a round into ordered execution segments preserving the model's tool-call order.
+
+        Concurrency must not reorder side effects: a contiguous run of ``parallel_safe`` calls
+        executes concurrently, but a ``parallel_safe=False`` call is an ordering BARRIER — it runs
+        alone in its position, after everything before it and before everything after it. So
+        ``[safe A, safe B, unsafe C, safe D]`` runs as parallel ``A/B`` → ``C`` → ``D`` (never
+        ``A/B/D`` before ``C``, which would read-after-write). Each returned segment is
+        ``(run_parallel, calls)``; a lone safe call runs sequentially (no concurrency to gain).
+        """
+        if self._app._max_parallel_tool_calls <= 1:
+            return [(False, tool_calls)]
+        segments: list[tuple[bool, list[runtime_records.ToolCallRequest]]] = []
+        safe_run: list[runtime_records.ToolCallRequest] = []
+        for tool_call in tool_calls:
+            if _tool_call_is_parallel_safe(self._registered_agent, tool_call):
+                safe_run.append(tool_call)
+                continue
+            if safe_run:
+                segments.append((len(safe_run) >= 2, safe_run))
+                safe_run = []
+            segments.append((False, [tool_call]))
+        if safe_run:
+            segments.append((len(safe_run) >= 2, safe_run))
+        return segments
+
     async def _run_tool_calls_sequential(
         self,
         *,
@@ -855,20 +970,28 @@ class _ToolRoundRunner:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_id: str | None,
+        round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         """Execute tool calls one at a time with per-call limit re-evaluation.
 
         ``tool_outcomes`` is the caller-owned accumulator; the caller appends
         yielded outcomes to it, so mid-round limit checks observe completed
         calls. Sets ``stopped_for_limit`` and returns when a limit trips.
+
+        ``tool_calls`` is the segment to execute; ``round_tool_calls`` is the whole
+        round (defaults to ``tool_calls``). A limit trip closes the round against
+        ``round_tool_calls``, so every un-run call — including later segments — gets a
+        limit-reached result rather than being stranded without a ``tool_result``.
         """
         app = self._app
         session = self._session
+        if round_tool_calls is None:
+            round_tool_calls = tool_calls
         for tool_call in tool_calls:
             await app._raise_if_session_interrupted(session.id)
             async for event in self._limit_gate.evaluate_limits(
                 messages=messages,
-                tool_calls=tool_calls,
+                tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
                 pending_tool_calls=1,
                 tool_round_id=tool_round_id,
@@ -952,13 +1075,69 @@ class _ToolRoundRunner:
             raise _parallel_tool_round_exception(exc_group) from exc_group
         except asyncio.CancelledError:
             flush_completed_outcomes()
-            for child_exc in child_cancellations:
+            for index, child_exc in enumerate(child_cancellations):
                 if child_exc is not None and _cancellation_artifacts(child_exc):
+                    _set_cancellation_tool_call_id(child_exc, tool_calls[index].id)
                     raise child_exc from None
             raise
+        # The TaskGroup completed. A child task that raised CancelledError (e.g. a leaked cancel
+        # scope from an SDK) is absorbed by the TaskGroup as a normal task cancellation — it does
+        # NOT surface as an exception here and does not cancel this run — so its call produced no
+        # terminal outcome. Synthesize an error result for any such un-terminated call so the round
+        # is never left half-open (a dangling assistant tool-call with no matching tool_result
+        # bricks every later step/resume on context validation).
+        for index, tool_call in enumerate(tool_calls):
+            if all(outcome is None for _, outcome in buffers[index]):
+                buffers[index].append(
+                    self._abnormal_tool_termination_item(
+                        tool_call=tool_call, tool_round_id=tool_round_id
+                    )
+                )
         for buffer in buffers:
             for item in buffer:
                 yield item
+
+    def _abnormal_tool_termination_item(
+        self,
+        *,
+        tool_call: runtime_records.ToolCallRequest,
+        tool_round_id: str | None,
+    ) -> tuple[Event, runtime_records.ToolCallOutcome]:
+        """Build an error (event, outcome) for a parallel call that never produced a terminal result
+        (its task terminated abnormally while this run was not being cancelled).
+
+        Synchronous by design: it runs after the TaskGroup exits normally, before the buffered
+        outcomes are yielded, so it must not add a suspension point ahead of that flush-safe yield —
+        an external cancellation landing on an ``await`` here would drop the still-un-yielded
+        completed sibling outcomes. The event is streamed like any other buffered parallel event
+        (buffered events are forwarded, not persisted here); the durable record is the ``tool_result``
+        message the caller builds from the returned outcome.
+        """
+        result = ToolResult(
+            content="Tool call did not complete: the parallel task terminated abnormally.",
+            structured={
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                "abnormal_termination": True,
+            },
+            is_error=True,
+        )
+        payload: dict[str, Any] = {
+            "tool_call_id": tool_call.id,
+            "abnormal_termination": True,
+            "result": result.model_dump(),
+        }
+        if tool_round_id is not None:
+            payload["tool_round_id"] = tool_round_id
+        event = Event(
+            type=EventType.TOOL_CALL_FAILED,
+            session_id=self._session.id,
+            agent_name=self._registered_agent.spec.name,
+            environment_name=self._environment_name,
+            tool_name=tool_call.name,
+            payload=payload,
+        )
+        return event, runtime_records.ToolCallOutcome(call=tool_call, result=result)
 
 
 def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
@@ -984,6 +1163,81 @@ def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
         if not isinstance(exc, asyncio.CancelledError):
             return exc
     return flattened[0]
+
+
+def _tool_call_is_parallel_safe(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_call: runtime_records.ToolCallRequest,
+) -> bool:
+    # An unregistered tool call short-circuits to a failed result with no side effects, so it
+    # is safe to run alongside the concurrent batch.
+    registered_tool = registered_agent.tools.get(tool_call.name)
+    if registered_tool is None:
+        return True
+    return registered_tool.tool.spec.parallel_safe
+
+
+def _ordered_tool_result_messages(
+    tool_calls: list[runtime_records.ToolCallRequest],
+    outcomes: list[runtime_records.ToolCallOutcome],
+    *,
+    parallel: bool,
+) -> list[Message]:
+    """Build the tool_result message, ordering the parts by the model's tool-call order.
+
+    Execution runs the round in model order (parallel segments and barriers in place), so
+    ``outcomes`` is already model-ordered and this sort is a stable safety net; on close paths a
+    concurrent segment's completed and interrupted outcomes can still be interleaved, so sorting by
+    the original tool-call index keeps the tool_result parts aligned with the assistant message's
+    tool_call parts. The fallback index keeps any outcome whose call is outside this round stably at
+    the end.
+    """
+    if parallel:
+        order = {tool_call.id: index for index, tool_call in enumerate(tool_calls)}
+        outcomes = sorted(outcomes, key=lambda outcome: order.get(outcome.call.id, len(order)))
+    return transcript_helpers.tool_result_messages(outcomes)
+
+
+def _first_user_input_tool_call(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    policy_results_by_id: dict[str, ToolPolicyResult | None],
+) -> tuple[runtime_records.ToolCallRequest, str, list[str]] | None:
+    # Recognize a pausing tool (ask_user) by a decoupled marker so the runtime does not
+    # import the tool class (cayu.tools depends on cayu.runtime, not the reverse). Only a
+    # call with a usable question triggers the pause; a malformed call falls through to
+    # normal execution and produces an ordinary error result. Returns the parsed
+    # (question, options) with the call so the caller need not re-parse.
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.tools.get(tool_call.name)
+        if registered_tool is None:
+            continue
+        if not getattr(registered_tool.tool, "pauses_session", False):
+            continue
+        # A DENY'd pausing tool is enforced by normal execution (blocked), not by pausing — skip
+        # it so a later, allowed ask_user in the same round can still pause.
+        policy_result = policy_results_by_id.get(tool_call.id)
+        if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
+            continue
+        question, options = _user_input_prompt(tool_call)
+        if question:
+            return tool_call, question, options
+    return None
+
+
+def _user_input_prompt(
+    tool_call: runtime_records.ToolCallRequest,
+) -> tuple[str, list[str]]:
+    arguments = tool_call.arguments
+    raw_question = arguments.get("question")
+    question = raw_question.strip() if isinstance(raw_question, str) else ""
+    raw_options = arguments.get("options")
+    options: list[str] = []
+    if isinstance(raw_options, list):
+        options = [
+            option.strip() for option in raw_options if isinstance(option, str) and option.strip()
+        ]
+    return question, options
 
 
 class CayuApp:
@@ -2200,6 +2454,11 @@ class CayuApp:
                 "Session has a pending tool approval. Resolve it with "
                 "resolve_tool_approval(...) before resuming with new messages."
             )
+        if pending_user_input_from_checkpoint(checkpoint) is not None:
+            raise RuntimeError(
+                "Session is awaiting user input. Answer it with "
+                "resolve_user_input(...) before resuming with new messages."
+            )
         session = await self.session_store.transition_status(
             loaded_session.id,
             from_statuses=_RESUMABLE_SESSION_STATUSES,
@@ -2309,6 +2568,11 @@ class CayuApp:
                     raise RuntimeError(
                         "Interrupted session cannot be forked because checkpoint state is missing."
                     )
+                if pending_user_input_from_checkpoint(source_checkpoint) is not None:
+                    raise RuntimeError(
+                        "Session awaiting user input cannot be forked; answer it with "
+                        "resolve_user_input(...) first."
+                    )
                 return approval_support.checkpoint_for_fork(
                     checkpoint=source_checkpoint,
                     agent_name=agent_name,
@@ -2356,6 +2620,542 @@ class CayuApp:
                 },
             )
         )
+
+    async def resolve_user_input(
+        self,
+        response: UserInputResponse,
+    ) -> AsyncIterator[Event]:
+        """Resume a session paused by ``ask_user`` with the user's answer.
+
+        The answer becomes the ``ask_user`` tool result; any other tool calls in the same
+        round (none ran before the pause) execute now, and the session continues.
+        """
+        if type(response) is not UserInputResponse:
+            raise TypeError("Runtime user input resolution requires a UserInputResponse.")
+        response = copy_user_input_response(response)
+        loaded_session = await self.session_store.load(response.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {response.session_id}")
+
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        pending = pending_user_input_from_checkpoint(checkpoint)
+        if pending is None:
+            raise RuntimeError("Session has no pending user input.")
+        if pending.input_id != response.input_id:
+            raise ValueError(f"User input id does not match pending input: {response.input_id}")
+        # The output-schema contract is fixed by the paused run's provider history; a resolver
+        # cannot swap it (a spec matching or absent is fine; a differing one is rejected). Checked
+        # before the status transition so it surfaces to the caller rather than being caught by the
+        # resume's failure handler. (thinking is a safe override.)
+        _effective_user_input_structured_output(
+            structured_output=response.structured_output,
+            pending=pending,
+        )
+
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+        )
+
+        try:
+            async for event in self._continue_user_input_resolution(
+                response=response,
+                session=session,
+                pending=pending,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+            ):
+                yield event
+        except GeneratorExit:
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
+
+    async def _continue_user_input_resolution(
+        self,
+        *,
+        response: UserInputResponse,
+        session: Session,
+        pending: PendingUserInput,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        emit_resume_event: bool = True,
+    ) -> AsyncIterator[Event]:
+        environment_name = _environment_name(registered_environment)
+        pending_cleared = False
+        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        # Restore the original run's config persisted on the pending input; explicit overrides
+        # on the resolution request win. Pending states written before this existed fall back to
+        # the historical defaults.
+        effective_max_steps = _effective_user_input_max_steps(
+            max_steps=response.max_steps,
+            pending=pending,
+        )
+        effective_limits = _effective_user_input_run_limits(
+            limits=response.limits,
+            pending=pending,
+        )
+        effective_budget_limits = _effective_user_input_budget_limits(
+            budget_limits=response.budget_limits,
+            pending=pending,
+        )
+        effective_retry_policy = self._effective_retry_policy(
+            _effective_user_input_retry_policy(
+                retry_policy=response.retry_policy,
+                pending=pending,
+            )
+        )
+        try:
+            transcript = await self.session_store.load_transcript(session.id)
+            resume_events = await self.session_store.load_events(session.id)
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                raise factory_resolution.error
+            if emit_resume_event:
+                yield await self._emit(
+                    Event(
+                        type=EventType.SESSION_RESUMED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "input_id": pending.input_id,
+                            "tool_call_id": pending.tool_call_id,
+                        },
+                    )
+                )
+            binding_result = await self._bind_registered_environment_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = binding_result.registered_environment
+            for event in binding_result.events:
+                yield event
+            if binding_result.error is not None:
+                raise binding_result.error
+
+            round_tool_calls = [
+                runtime_records.ToolCallRequest(
+                    id=pending_call.tool_call_id,
+                    name=pending_call.tool_name,
+                    arguments=copy_json_value(pending_call.arguments, "arguments"),
+                )
+                for pending_call in pending.tool_calls
+            ]
+            # Reuse any outcomes already recorded for this round — e.g. a prior resume attempt
+            # that ran some tools before a mid-resume failure — so a retry never re-executes a
+            # side-effecting tool. The round was already projected against limits at pause time;
+            # its remaining tools run on resume without a fresh budget projection (so the user's
+            # answer is never discarded by a limit check here).
+            recorded_outcomes = approval_support.recorded_round_tool_outcomes(
+                events=resume_events,
+                pending_calls=pending.tool_calls,
+                input_id=pending.input_id,
+            )
+            pending_by_id = {call.tool_call_id: call for call in pending.tool_calls}
+
+            # Build the round's outcomes in model order: a call already recorded (retry) is
+            # reused; the answered ask_user call gets the injected answer; every other allowed
+            # call executes now (none ran before the pause); a denied call is blocked.
+            for tool_call in round_tool_calls:
+                recorded_outcome = recorded_outcomes.get(tool_call.id)
+                if recorded_outcome is not None:
+                    tool_outcomes.append(recorded_outcome)
+                    continue
+
+                if tool_call.id == pending.tool_call_id:
+                    result = ToolResult(
+                        content=response.answer,
+                        structured=response.structured,
+                        artifacts=response.artifacts,
+                        is_error=False,
+                    )
+                    yield await self._emit(
+                        Event(
+                            type=EventType.TOOL_CALL_STARTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "tool_call_id": tool_call.id,
+                                "arguments": deepcopy(tool_call.arguments),
+                                "input_id": pending.input_id,
+                            },
+                        )
+                    )
+                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                        event=Event(
+                            type=EventType.TOOL_CALL_COMPLETED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "tool_call_id": tool_call.id,
+                                "input_id": pending.input_id,
+                                "result": result.model_dump(),
+                            },
+                        ),
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        result=result,
+                        task_id=pending.task_id,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
+                    continue
+
+                pending_call = pending_by_id[tool_call.id]
+                policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
+                # `_execute_tool_call(check_policy=False)` does NOT re-enforce the decision, so a
+                # DENY must be blocked here explicitly (mirroring the approval resume) — otherwise
+                # a policy-denied sibling would execute. REQUIRE_APPROVAL cannot occur: it would
+                # have preempted the ask_user pause with an approval pause.
+                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
+                    reason = tool_execution.policy_denial_reason(policy_result)
+                    blocked_result = tool_execution.blocked_tool_result(
+                        policy_result, reason=reason
+                    )
+                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                        event=Event(
+                            type=EventType.TOOL_CALL_BLOCKED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.name,
+                            payload={
+                                "tool_call_id": tool_call.id,
+                                "decision": policy_result.decision.value,
+                                "reason": reason,
+                                "metadata": policy_result.metadata,
+                                "result": blocked_result.model_dump(),
+                            },
+                        ),
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        result=blocked_result,
+                        task_id=pending.task_id,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
+                    continue
+
+                async for event, outcome in self._execute_tool_call(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=tool_call,
+                    request_metadata=response.metadata,
+                    task_id=pending.task_id,
+                    check_policy=False,
+                    policy_result=policy_result,
+                ):
+                    yield event
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+
+            # The resume executes the round's tools sequentially in model order, so the outcome
+            # list already lines up with the assistant tool-call parts.
+            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+            transcript.extend(tool_result_messages)
+            cleared_checkpoint = await self._checkpoint_without_pending_user_input(session.id)
+            await self.session_store.append_transcript_messages_and_checkpoint(
+                session.id,
+                tool_result_messages,
+                cleared_checkpoint,
+            )
+            pending_cleared = True
+
+            async for event in self._run_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                messages=transcript,
+                messages_to_append=[],
+                max_steps=effective_max_steps,
+                limits=effective_limits,
+                budget_limits=effective_budget_limits,
+                retry_policy=effective_retry_policy,
+                structured_output=_effective_user_input_structured_output(
+                    structured_output=response.structured_output,
+                    pending=pending,
+                ),
+                thinking=response.thinking or pending.thinking,
+                request_loop_policies=response.loop_policies,
+                request_metadata=response.metadata,
+                task_id=pending.task_id,
+                task_worker_id=None,
+                start_event_type=None,
+                start_event_payload={},
+                start_task_on_enter=False,
+            ):
+                yield event
+        except Exception as exc:
+            if not pending_cleared:
+                # The pending_user_input checkpoint is still present, so restore the resumable
+                # INTERRUPTED state and emit a terminal event for closure (a SESSION_RESUMED was
+                # already emitted). The caller can retry resolve_user_input; recorded outcomes
+                # prevent re-running a tool that already completed. A tool that started with no
+                # terminal (a crash mid-tool) cannot be re-run safely — flag it as needing manual
+                # recovery so the retry is not a silent double-execution.
+                # Carry the failure so a caller can distinguish "your answer failed, retry" from a
+                # fresh pause (whose interrupted event has no error fields).
+                payload: dict[str, Any] = {
+                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                    "user_input": pending.model_dump(mode="json"),
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+                if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
+                    payload["manual_recovery_required"] = True
+                    payload["tool_call_id"] = exc.tool_call_id
+                    payload["tool_name"] = exc.tool_name
+                session = await self.session_store.update_status(
+                    session.id, SessionStatus.INTERRUPTED
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=payload,
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
+            raise
+
+    async def _checkpoint_without_pending_user_input(
+        self,
+        session_id: str,
+    ) -> dict[str, Any]:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY, None)
+        return checkpoint
+
+    async def recover_user_input(
+        self,
+        request: UserInputRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        """Recover a user-input round stuck on `manual_recovery_required`.
+
+        A tool in the paused round started on a prior resume but recorded no terminal event
+        (a crash mid-tool), so it cannot be re-run automatically. The caller supplies the
+        externally verified outcome for that `tool_call_id`; Cayu persists it as the tool's
+        terminal result and continues the round (re-supplying `answer` in case the `ask_user`
+        result was not recorded before the crash). Cayu does not infer the outcome itself.
+        """
+        if type(request) is not UserInputRecoveryRequest:
+            raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
+        request = copy_user_input_recovery_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        pending = pending_user_input_from_checkpoint(checkpoint)
+        if pending is None:
+            raise RuntimeError("Session has no pending user input.")
+        if pending.input_id != request.input_id:
+            raise ValueError(f"User input id does not match pending input: {request.input_id}")
+        _effective_user_input_structured_output(
+            structured_output=request.structured_output,
+            pending=pending,
+        )
+
+        pending_tool_call = approval_support.round_tool_call_for_recovery(
+            pending_calls=pending.tool_calls,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+        )
+        recovered_result = ToolResult(
+            content=request.message,
+            structured=request.structured,
+            artifacts=request.artifacts,
+            is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
+        )
+        event_type = (
+            EventType.TOOL_CALL_FAILED
+            if recovered_result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        )
+
+        try:
+            events = await self.session_store.load_events(session.id)
+            approval_support.validate_round_recovery_target(
+                events=events,
+                pending_calls=pending.tool_calls,
+                tool_call_id=request.tool_call_id,
+                input_id=pending.input_id,
+            )
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                session = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "user_input": pending.model_dump(mode="json"),
+                            "error": str(factory_resolution.error),
+                            "error_type": type(factory_resolution.error).__name__,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
+            recovery_tool_event, recovered_result = _redact_tool_result_event(
+                event=Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=pending_tool_call.tool_name,
+                    payload={
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "input_id": pending.input_id,
+                        "manual_recovery": True,
+                        "reason": request.reason,
+                        "metadata": request.metadata,
+                        "result": recovered_result.model_dump(),
+                    },
+                ),
+                result=recovered_result,
+                redactor=self._secret_redactor,
+            )
+            recovery_events = [
+                Event(
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                        "input_id": pending.input_id,
+                        "tool_call_id": pending.tool_call_id,
+                    },
+                ),
+                recovery_tool_event,
+            ]
+            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            for event in emitted_recovery_events:
+                yield event
+            tool_call = runtime_records.ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            tool_event = emitted_recovery_events[-1]
+            # Manual recovery persists the operator-supplied result before hooks run, so
+            # after_tool_call is observe-only here (v1): the threaded modification is ignored.
+            async for event, _modified in self._run_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=recovered_result,
+                task_id=pending.task_id,
+                redactor=self._secret_redactor,
+                allow_modification=False,
+            ):
+                yield event
+        except GeneratorExit:
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
+        except Exception:
+            await self.session_store.update_status(session.id, loaded_session.status)
+            raise
+
+        response = UserInputResponse(
+            session_id=request.session_id,
+            input_id=request.input_id,
+            answer=request.answer,
+            structured=request.structured,
+            artifacts=request.artifacts,
+            metadata=request.metadata,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            loop_policies=request.loop_policies,
+        )
+        try:
+            async for event in self._continue_user_input_resolution(
+                response=response,
+                session=session,
+                pending=pending,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                emit_resume_event=False,
+            ):
+                yield event
+        except GeneratorExit:
+            # Abandonment while continuing the round: finalize to INTERRUPTED instead of
+            # leaking a RUNNING session (mirrors resolve_user_input's continuation guard).
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
 
     async def resolve_tool_approval(
         self,
@@ -3784,6 +4584,25 @@ class CayuApp:
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                         "approval": exc.approval.model_dump(mode="json"),
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
+        except _UserInputInterrupt as exc:
+            session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                        "user_input": exc.pending.model_dump(mode="json"),
                     },
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
@@ -5351,8 +6170,10 @@ class CayuApp:
                     tool_round_id=tool_round_id,
                 )
             )
-        tool_result_messages = transcript_helpers.tool_result_messages(
-            [*completed_tool_outcomes, *skipped_outcomes]
+        tool_result_messages = _ordered_tool_result_messages(
+            tool_calls,
+            [*completed_tool_outcomes, *skipped_outcomes],
+            parallel=True,
         )
         messages.extend(tool_result_messages)
         if pending_approval_to_clear is not None:
@@ -6104,6 +6925,74 @@ class CayuApp:
             ),
         )
 
+    async def _checkpoint_pending_user_input(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+        task_id: str | None,
+        structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+        max_steps: int | None,
+        limits: RunLimits | None,
+        budget_limits: tuple[BudgetLimit, ...] | None,
+        retry_policy: RetryPolicy | None,
+        question: str,
+        options: list[str],
+    ) -> tuple[PendingUserInput, Event]:
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+            raise RuntimeError("Session already has a pending tool approval.")
+        if pending_user_input_from_checkpoint(checkpoint) is not None:
+            raise RuntimeError("Session already has a pending user input.")
+        checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
+
+        pending = PendingUserInput(
+            input_id=str(uuid4()),
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            question=question,
+            options=list(options),
+            arguments=copy_json_value(tool_call.arguments, "arguments"),
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            workspace_id=_workspace_id(registered_environment),
+            task_id=task_id,
+            tool_calls=approval_support.pending_tool_call_approvals(
+                tool_calls=tool_calls,
+                policy_outcomes=policy_outcomes,
+            ),
+            structured_output=copy_structured_output_spec(structured_output),
+            thinking=thinking,
+            max_steps=max_steps,
+            limits=copy_run_limits(limits) if limits is not None else None,
+            budget_limits=(
+                copy_request_budget_limits(budget_limits) if budget_limits is not None else None
+            ),
+            retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
+        )
+        checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending.model_dump(mode="json")
+        await self.session_store.checkpoint(session.id, checkpoint)
+        return (
+            pending,
+            Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=_environment_name(registered_environment),
+                payload={
+                    "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
+                    "input_id": pending.input_id,
+                    "tool_call_id": pending.tool_call_id,
+                },
+            ),
+        )
+
     async def _checkpoint_with_pending_tool_round(
         self,
         *,
@@ -6206,6 +7095,28 @@ class CayuApp:
             raise KeyError(f"Session not found: {session_id}") from None
         return loaded
 
+    async def _finalize_interrupting_for_recovery(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        events: list[Event],
+    ) -> Session:
+        """Finalize an INTERRUPTING session during recovery: drain its terminal events into
+        ``events`` and return the reloaded session (a no-op once past INTERRUPTING)."""
+        if session.status == SessionStatus.INTERRUPTING:
+            async for event in self._handle_session_interrupted(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+            ):
+                events.append(event)
+            session = await self._require_session(session.id)
+        return session
+
     async def _recover_incomplete_session(
         self,
         *,
@@ -6231,10 +7142,12 @@ class CayuApp:
 
         checkpoint = await self.session_store.load_checkpoint(session.id)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         if (
             session.status in _RESUMABLE_SESSION_STATUSES
             and pending_approval is None
+            and pending_user_input is None
             and pending_tool_round is None
         ):
             return IncompleteSessionRecoveryResult(
@@ -6257,6 +7170,14 @@ class CayuApp:
                 interrupt_payload = {
                     "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                     "approval": pending_approval.model_dump(mode="json"),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            elif pending_user_input is not None:
+                interrupt_payload = {
+                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                    "user_input": pending_user_input.model_dump(mode="json"),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,
@@ -6308,15 +7229,13 @@ class CayuApp:
 
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         if pending_approval is not None:
-            if session.status == SessionStatus.INTERRUPTING:
-                async for event in self._handle_session_interrupted(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                ):
-                    events.append(event)
-                session = await self._require_session(session.id)
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+            )
             actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
@@ -6328,15 +7247,34 @@ class CayuApp:
                 message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
             )
 
-        if session.status == SessionStatus.INTERRUPTING:
-            async for event in self._handle_session_interrupted(
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        if pending_user_input is not None:
+            session = await self._finalize_interrupting_for_recovery(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
-            ):
-                events.append(event)
-            session = await self._require_session(session.id)
+                events=events,
+            )
+            actions.append(IncompleteSessionRecoveryAction.PENDING_USER_INPUT)
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=tuple(actions),
+                events=tuple(events),
+                pending_user_input_id=pending_user_input.input_id,
+                message="Session is awaiting user input; answer it with UserInputResponse.",
+            )
+
+        if session.status == SessionStatus.INTERRUPTING:
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+            )
             if previous_status == SessionStatus.INTERRUPTING:
                 actions.append(IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT)
             else:
@@ -6514,6 +7452,7 @@ class CayuApp:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         tool_round_id: str | None = None,
         cancellation_artifacts: list[dict[str, Any]] | None = None,
+        cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None,
     ) -> AsyncIterator[Event]:
         if await self._tool_round_has_result_messages(session.id, tool_calls):
             return
@@ -6523,6 +7462,7 @@ class CayuApp:
             completed_outcomes=tool_outcomes,
             tool_round_id=tool_round_id,
             cancellation_artifacts=cancellation_artifacts,
+            cancellation_artifacts_by_id=cancellation_artifacts_by_id,
         )
         tool_outcomes = _redact_tool_call_outcomes(tool_outcomes, self._secret_redactor)
         interrupted_results = _redact_tool_call_outcomes(
@@ -6543,7 +7483,12 @@ class CayuApp:
                     )
                 )
         tool_outcomes.extend(interrupted_results)
-        interrupted_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        # Restore the model's tool-call order: a parallel/mixed round's completed outcomes can be
+        # in completion order, and the interrupted ones are appended after — sort back to the
+        # assistant tool-call order (a no-op for an already-ordered sequential round).
+        interrupted_messages = _ordered_tool_result_messages(
+            tool_calls, tool_outcomes, parallel=True
+        )
         messages.extend(interrupted_messages)
         cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
         await self.session_store.append_transcript_messages_and_checkpoint(
@@ -7897,6 +8842,7 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         name=name,
         description=spec.description,
         input_schema=copy_json_value(spec.input_schema, "input_schema"),
+        parallel_safe=spec.parallel_safe,
     )
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
@@ -7947,6 +8893,83 @@ def _validate_tool_approval_recovery_request(
     request: ToolApprovalRecoveryRequest,
 ) -> ToolApprovalRecoveryRequest:
     return copy_tool_approval_recovery_request(request)
+
+
+def _effective_user_input_max_steps(
+    *,
+    max_steps: int | None,
+    pending: PendingUserInput,
+) -> int:
+    # Restore the original run's max_steps on a user-input continuation; an explicit override
+    # on the resolution request wins. Pending states written before run config was checkpointed
+    # fall back to the historical request default.
+    if type(pending) is not PendingUserInput:
+        raise TypeError("Pending user input must be a PendingUserInput.")
+    if max_steps is not None:
+        return max_steps
+    if pending.max_steps is not None:
+        return pending.max_steps
+    return _DEFAULT_APPROVAL_MAX_STEPS
+
+
+def _effective_user_input_run_limits(
+    *,
+    limits: RunLimits | None,
+    pending: PendingUserInput,
+) -> RunLimits:
+    if type(pending) is not PendingUserInput:
+        raise TypeError("Pending user input must be a PendingUserInput.")
+    if limits is not None:
+        return copy_run_limits(limits)
+    if pending.limits is not None:
+        return copy_run_limits(pending.limits)
+    return RunLimits()
+
+
+def _effective_user_input_budget_limits(
+    *,
+    budget_limits: tuple[BudgetLimit, ...] | None,
+    pending: PendingUserInput,
+) -> tuple[BudgetLimit, ...]:
+    if type(pending) is not PendingUserInput:
+        raise TypeError("Pending user input must be a PendingUserInput.")
+    if budget_limits is not None:
+        return copy_request_budget_limits(budget_limits)
+    if pending.budget_limits is not None:
+        return copy_request_budget_limits(pending.budget_limits)
+    return ()
+
+
+def _effective_user_input_retry_policy(
+    *,
+    retry_policy: RetryPolicy | None,
+    pending: PendingUserInput,
+) -> RetryPolicy | None:
+    # RetryPolicy is frozen, so the persisted reference is safe to reuse.
+    if type(pending) is not PendingUserInput:
+        raise TypeError("Pending user input must be a PendingUserInput.")
+    if retry_policy is not None:
+        return retry_policy
+    return pending.retry_policy
+
+
+def _effective_user_input_structured_output(
+    *,
+    structured_output: StructuredOutputSpec | None,
+    pending: PendingUserInput,
+) -> StructuredOutputSpec | None:
+    # Mirror _effective_approval_structured_output: inherit the paused run's spec when the resolver
+    # supplies none; adopt the resolver's spec when the run had none; a differing spec is a swap of
+    # the contract fixed by the provider history and is rejected.
+    if type(pending) is not PendingUserInput:
+        raise TypeError("Pending user input must be a PendingUserInput.")
+    if structured_output is None:
+        return copy_structured_output_spec(pending.structured_output)
+    if pending.structured_output is None:
+        return copy_structured_output_spec(structured_output)
+    if not _structured_output_specs_equal(structured_output, pending.structured_output):
+        raise ValueError("structured_output does not match the paused run contract.")
+    return copy_structured_output_spec(pending.structured_output)
 
 
 def _effective_approval_thinking(
@@ -8653,8 +9676,12 @@ def _interrupted_tool_round_results(
     completed_outcomes: list[runtime_records.ToolCallOutcome],
     tool_round_id: str | None = None,
     cancellation_artifacts: list[dict[str, Any]] | None = None,
+    cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[runtime_records.ToolCallOutcome]:
     completed_ids = {outcome.call.id for outcome in completed_outcomes}
+    # Prefer per-call attribution (a parallel round records the producing tool_call_id); otherwise
+    # fall back to attaching a bare artifact list to the first unfinished call (sequential: its only
+    # in-flight call).
     artifacts_for_interrupted_tool = (
         [] if cancellation_artifacts is None else cancellation_artifacts
     )
@@ -8662,8 +9689,11 @@ def _interrupted_tool_round_results(
     for tool_call in tool_calls:
         if tool_call.id in completed_ids:
             continue
-        result_artifacts = artifacts_for_interrupted_tool
-        artifacts_for_interrupted_tool = []
+        if cancellation_artifacts_by_id is not None:
+            result_artifacts = cancellation_artifacts_by_id.get(tool_call.id, [])
+        else:
+            result_artifacts = artifacts_for_interrupted_tool
+            artifacts_for_interrupted_tool = []
         structured = {
             "interrupted": True,
             "tool_call_id": tool_call.id,
@@ -8925,6 +9955,21 @@ def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]
     if artifacts is not None:
         return copy_json_value(artifacts, "artifacts")
     return []
+
+
+_CANCELLATION_TOOL_CALL_ID_ATTR = "_cayu_cancellation_tool_call_id"
+
+
+def _set_cancellation_tool_call_id(exc: asyncio.CancelledError, tool_call_id: str) -> None:
+    # Record which parallel call produced a cancellation's cleanup artifacts (attached out-of-band,
+    # like runner artifacts) so the interrupt guard attaches them to the matching interrupted
+    # outcome instead of the first-unfinished call in model order.
+    setattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, tool_call_id)
+
+
+def _cancellation_tool_call_id(exc: asyncio.CancelledError) -> str | None:
+    value = getattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, None)
+    return value if isinstance(value, str) else None
 
 
 def _interrupted_tool_call_event(

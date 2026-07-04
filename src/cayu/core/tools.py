@@ -78,6 +78,7 @@ class _ToolSpecInput(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    parallel_safe: StrictBool = True
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -95,11 +96,16 @@ class ToolSpec(BaseModel):
 
     name: str
     description: str = ""
+    parallel_safe: StrictBool = True
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
         parsed = _ToolSpecInput.model_validate(data)
-        super().__init__(name=parsed.name, description=parsed.description)
+        super().__init__(
+            name=parsed.name,
+            description=parsed.description,
+            parallel_safe=parsed.parallel_safe,
+        )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 
     @computed_field

@@ -31,6 +31,16 @@ class ToolApprovalManualRecoveryRequired(RuntimeError):
         self.tool_name = tool_name
 
 
+class RoundToolManualRecoveryRequired(RuntimeError):
+    def __init__(self, *, tool_call_id: str, tool_name: str) -> None:
+        super().__init__(
+            "A paused round cannot be resumed automatically because a tool call started "
+            f"without a terminal result: {tool_call_id} ({tool_name})."
+        )
+        self.tool_call_id = tool_call_id
+        self.tool_name = tool_name
+
+
 def resumed_event(
     *,
     session: Session,
@@ -144,6 +154,81 @@ def approval_denied_tool_result(
         },
         is_error=True,
     )
+
+
+def user_input_resume_events(events: list[Event], input_id: str) -> list[Event]:
+    """Return only the events belonging to a user-input pause's resume attempts.
+
+    User-input round terminal events carry no ``approval_id``, and tool-call ids are only unique
+    within one assistant message — not per session — so a round's events cannot be identified by
+    id alone. The round runs no tools before it pauses, so every ``started``/terminal event for
+    the round is emitted AFTER the pause boundary; events before it — prior rounds that may reuse
+    the same ids — are excluded.
+
+    The boundary is the FIRST event that marks this pause: either ``session.awaiting_user_input``
+    (payload ``input_id``) or a ``session.interrupted`` carrying ``user_input.input_id`` for it.
+    Both are needed: ``pending_user_input`` is checkpointed BEFORE the awaiting event is appended,
+    so a worker that crashed in between has no awaiting event, but recovery finalizes the pause
+    with a durable ``session.interrupted``. Anchoring on that too keeps the retry ledger scoped
+    (rather than empty, which would re-run an already-completed sibling).
+    """
+    for index, event in enumerate(events):
+        if _event_marks_user_input_pause(event, input_id):
+            return events[index + 1 :]
+    return []
+
+
+def _event_marks_user_input_pause(event: Event, input_id: str) -> bool:
+    if event.type == EventType.SESSION_AWAITING_USER_INPUT:
+        return event.payload.get("input_id") == input_id
+    if event.type == EventType.SESSION_INTERRUPTED:
+        user_input = event.payload.get("user_input")
+        return isinstance(user_input, dict) and user_input.get("input_id") == input_id
+    return False
+
+
+def recorded_round_tool_outcomes(
+    *,
+    events: list[Event],
+    pending_calls: list[PendingToolCallApproval],
+    input_id: str,
+) -> dict[str, runtime_records.ToolCallOutcome]:
+    """Reconstruct already-recorded terminal outcomes for a paused user-input round, keyed by
+    ``tool_call_id``, scoped to the pause's resume window (see ``user_input_resume_events``).
+
+    Lets a retried resume skip re-executing a tool that already completed before a mid-resume
+    failure, without colliding with a prior round that reused the same ids.
+    """
+    pending_by_id = {call.tool_call_id: call for call in pending_calls}
+    terminal_event_types = {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+    }
+    started_ids: set[str] = set()
+    outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
+    for event in user_input_resume_events(events, input_id):
+        tool_call_id = event.payload.get("tool_call_id")
+        if type(tool_call_id) is not str or tool_call_id not in pending_by_id:
+            continue
+        if event.type == EventType.TOOL_CALL_STARTED:
+            started_ids.add(tool_call_id)
+            continue
+        if event.type in terminal_event_types:
+            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
+                event=event,
+                pending_tool_call=pending_by_id[tool_call_id],
+            )
+    # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
+    # cannot be safely re-run — fail loudly instead of silently double-executing a side effect.
+    for tool_call_id in started_ids:
+        if tool_call_id not in outcomes:
+            pending_call = pending_by_id[tool_call_id]
+            raise RoundToolManualRecoveryRequired(
+                tool_call_id=tool_call_id,
+                tool_name=pending_call.tool_name,
+            )
+    return outcomes
 
 
 def recorded_tool_outcomes(
@@ -266,6 +351,54 @@ def validate_recovery_target(
     if not started:
         raise RuntimeError(
             f"Tool approval recovery requires a recorded tool.call.started event: {tool_call_id}"
+        )
+
+
+def round_tool_call_for_recovery(
+    *,
+    pending_calls: list[PendingToolCallApproval],
+    tool_call_id: str,
+) -> PendingToolCallApproval:
+    for pending_tool_call in pending_calls:
+        if pending_tool_call.tool_call_id == tool_call_id:
+            return PendingToolCallApproval(**pending_tool_call.model_dump())
+    raise ValueError(f"Tool call is not part of the paused round: {tool_call_id}")
+
+
+def validate_round_recovery_target(
+    *,
+    events: list[Event],
+    pending_calls: list[PendingToolCallApproval],
+    tool_call_id: str,
+    input_id: str,
+) -> None:
+    # Round terminal events carry no approval_id (user-input rounds) and tool-call ids are not
+    # unique across the session, so scope to the pause's resume window (matching
+    # recorded_round_tool_outcomes) — a prior round reusing this id must not be seen here.
+    if tool_call_id not in {call.tool_call_id for call in pending_calls}:
+        raise ValueError(f"Tool call is not part of the paused round: {tool_call_id}")
+    started = False
+    terminal = False
+    terminal_event_types = {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+    }
+    for event in user_input_resume_events(events, input_id):
+        if event.payload.get("tool_call_id") != tool_call_id:
+            continue
+        if event.type == EventType.TOOL_CALL_STARTED:
+            started = True
+        elif event.type in terminal_event_types:
+            terminal = True
+
+    if terminal:
+        raise RuntimeError(
+            f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
+        )
+    if not started:
+        raise RuntimeError(
+            f"User input recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
 
 

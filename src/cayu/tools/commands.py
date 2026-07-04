@@ -71,6 +71,8 @@ class CommandPolicy(ABC):
 class ExecCommandTool(Tool):
     spec = ToolSpec(
         name="exec_command",
+        # Runs commands with side effects; never overlaps other tools in a round.
+        parallel_safe=False,
         description="Execute a process or explicit shell command with the active runner.",
         input_schema={
             "type": "object",

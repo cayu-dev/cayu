@@ -36,6 +36,7 @@ from cayu.tools.subagents import (
     SubagentTool,
     default_background_subagent_registry,
 )
+from cayu.tools.user_input import UserInputTool
 
 __all__ = [
     "ArtifactReadRequest",
@@ -63,6 +64,7 @@ __all__ = [
     "SubagentSpec",
     "SubagentTool",
     "TextArtifactReader",
+    "UserInputTool",
     "WriteFileTool",
     "default_artifact_readers",
     "default_background_subagent_registry",

@@ -26,6 +26,7 @@ from cayu import (
     TaskStatus,
     TextPart,
     ThinkingPart,
+    UserInputTool,
 )
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -2654,3 +2655,79 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
         "error": "run exploded before streaming",
         "error_type": "RuntimeError",
     }
+
+
+class AskUserProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests += 1
+        if self.requests == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_1", name="ask_user", arguments={"question": "which env?"}
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+        else:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def _sse_events(client: TestClient, path: str, body: dict) -> list[dict]:
+    with client.stream("POST", path, json=body) as response:
+        assert response.status_code == 200
+        return [frame["data"] for frame in _sse_frames(response) if "data" in frame]
+
+
+def _ask_user_client() -> TestClient:
+    app = CayuApp()
+    app.register_provider(AskUserProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()])
+    return TestClient(create_server(app))
+
+
+def test_server_resolve_user_input_resumes_paused_session() -> None:
+    client = _ask_user_client()
+    run_events = _sse_events(client, "/api/run", {"prompt": "deploy"})
+    awaiting = next(e for e in run_events if e["type"] == "session.awaiting_user_input")
+    session_id = awaiting["session_id"]
+    input_id = awaiting["payload"]["input_id"]
+
+    resolved = _sse_events(
+        client,
+        "/api/user-input/resolve",
+        {"session_id": session_id, "input_id": input_id, "answer": "staging"},
+    )
+    assert resolved[-1]["type"] == "session.completed"
+    tool_completed = next(
+        e for e in resolved if e["type"] == "tool.call.completed" and e["tool_name"] == "ask_user"
+    )
+    assert tool_completed["payload"]["result"]["content"] == "staging"
+
+
+def test_server_resolve_user_input_unknown_session_returns_404() -> None:
+    client = _ask_user_client()
+    response = client.post(
+        "/api/user-input/resolve",
+        json={"session_id": "missing", "input_id": "x", "answer": "y"},
+    )
+    assert response.status_code == 404
+
+
+def test_server_recover_user_input_route_is_registered() -> None:
+    client = _ask_user_client()
+    # Unknown session → 404 (route exists and validates the session before streaming).
+    response = client.post(
+        "/api/user-input/recover",
+        json={
+            "session_id": "missing",
+            "input_id": "x",
+            "answer": "y",
+            "tool_call_id": "call_1",
+            "outcome": "completed",
+            "message": "recovered",
+        },
+    )
+    assert response.status_code == 404

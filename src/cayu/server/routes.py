@@ -60,6 +60,7 @@ from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import causal_budget_usage_summary
+from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server.sse import (
     error_to_sse_message,
     event_to_sse_message,
@@ -253,6 +254,66 @@ class ToolApprovalRecoveryBody(BaseModel):
 
     session_id: NonBlankString
     approval_id: NonBlankString
+    tool_call_id: NonBlankString
+    outcome: ToolApprovalRecoveryOutcome
+    message: NonBlankString
+    structured: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    reason: NonBlankString | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_request_budget_limits(value)
+
+
+class UserInputResolveBody(BaseModel):
+    """Body for answering a session paused by ``ask_user``.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
+    resumed run inherits the original run's configuration persisted on the pending user input.
+    """
+
+    session_id: NonBlankString
+    input_id: NonBlankString
+    answer: NonBlankString
+    structured: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_request_budget_limits(value)
+
+
+class UserInputRecoveryBody(BaseModel):
+    """Body for recovering a user-input round stuck on ``manual_recovery_required``.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
+    resumed run inherits the original run's configuration persisted on the pending user input.
+    """
+
+    session_id: NonBlankString
+    input_id: NonBlankString
+    answer: NonBlankString
     tool_call_id: NonBlankString
     outcome: ToolApprovalRecoveryOutcome
     message: NonBlankString
@@ -911,6 +972,62 @@ def create_router(
         )
 
         return _detached_event_stream_response(cayu_app.recover_tool_approval(request))
+
+    @router.post("/user-input/resolve", dependencies=protected)
+    async def resolve_user_input(body: UserInputResolveBody):
+        session = await session_store.load(body.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+
+        response = UserInputResponse(
+            session_id=body.session_id,
+            input_id=body.input_id,
+            answer=body.answer,
+            structured=body.structured,
+            artifacts=body.artifacts,
+            metadata=body.metadata,
+            max_steps=body.max_steps,
+            limits=body.limits,
+            budget_limits=body.budget_limits,
+            retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
+            thinking=body.thinking,
+        )
+
+        return _detached_event_stream_response(cayu_app.resolve_user_input(response))
+
+    @router.post("/user-input/recover", dependencies=protected)
+    async def recover_user_input(body: UserInputRecoveryBody):
+        session = await session_store.load(body.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+
+        request = UserInputRecoveryRequest(
+            session_id=body.session_id,
+            input_id=body.input_id,
+            answer=body.answer,
+            tool_call_id=body.tool_call_id,
+            outcome=body.outcome,
+            message=body.message,
+            structured=body.structured,
+            artifacts=body.artifacts,
+            reason=body.reason,
+            metadata=body.metadata,
+            max_steps=body.max_steps,
+            limits=body.limits,
+            budget_limits=body.budget_limits,
+            retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
+            thinking=body.thinking,
+        )
+
+        return _detached_event_stream_response(cayu_app.recover_user_input(request))
 
     @router.get("/sessions")
     async def list_sessions(

@@ -19,6 +19,7 @@ class EventType(StrEnum):
     SESSION_COMPLETED = "session.completed"
     SESSION_FAILED = "session.failed"
     SESSION_INTERRUPTED = "session.interrupted"
+    SESSION_AWAITING_USER_INPUT = "session.awaiting_user_input"
     SESSION_CHECKPOINTED = "session.checkpointed"
     SESSION_FORKED = "session.forked"
     SESSION_LIMIT_REACHED = "session.limit_reached"

@@ -400,6 +400,8 @@ class SearchKnowledgeTool(Tool):
 class RememberKnowledgeTool(Tool):
     spec = ToolSpec(
         name="remember_knowledge",
+        # Writes to the knowledge store; never overlaps other tools in a round.
+        parallel_safe=False,
         description=(
             "Propose new durable knowledge for the active knowledge store. Use this only "
             "for stable facts, preferences, procedures, warnings, decisions, or lessons "

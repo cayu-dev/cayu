@@ -950,6 +950,8 @@ def _validate_artifact_readers(
 class WriteFileTool(Tool):
     spec = ToolSpec(
         name="write_file",
+        # Mutates the workspace; never overlaps other tools in a round.
+        parallel_safe=False,
         description="Write UTF-8 text to a file in the active workspace.",
         input_schema={
             "type": "object",

@@ -565,6 +565,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     SKIPPED_ACTIVE = "skipped_active"
     SKIPPED_TERMINAL = "skipped_terminal"
     PENDING_APPROVAL = "pending_approval"
+    PENDING_USER_INPUT = "pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     FINALIZED_INTERRUPT = "finalized_interrupt"
@@ -645,6 +646,7 @@ class IncompleteSessionRecoveryResult(BaseModel):
     actions: tuple[IncompleteSessionRecoveryAction, ...]
     events: tuple[Event, ...] = Field(default_factory=tuple)
     pending_approval_id: str | None = None
+    pending_user_input_id: str | None = None
     message: str
 
     @field_validator("session_id", "message")

@@ -55,6 +55,7 @@ class McpToolAdapter(Tool):
                 name=tool_name,
                 description=_tool_description(toolset, definition),
                 input_schema=definition.input_schema,
+                parallel_safe=_mcp_tool_parallel_safe(definition),
             )
         )
 
@@ -376,6 +377,16 @@ def _tool_description(toolset: McpToolset, definition: McpToolDefinition) -> str
     if description:
         return f"{prefix} {description}"
     return prefix
+
+
+def _mcp_tool_parallel_safe(definition: McpToolDefinition) -> bool:
+    """Only a server-declared read-only MCP tool may run concurrently with siblings.
+
+    A write tool, an un-annotated tool, or a non-bool ``readOnlyHint`` from a hostile server
+    is treated as an ordering barrier (``parallel_safe=False``). ``is True`` is deliberate:
+    a truthy non-bool value must not be read as read-only.
+    """
+    return definition.annotations.get("readOnlyHint") is True
 
 
 def _bounded_text(value: str, max_chars: int) -> str:

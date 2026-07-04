@@ -188,6 +188,7 @@ _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
     IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,
     IncompleteSessionRecoveryAction.PENDING_APPROVAL,
+    IncompleteSessionRecoveryAction.PENDING_USER_INPUT,
 }
 
 

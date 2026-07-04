@@ -255,6 +255,8 @@ class SubagentTool(Tool):
         super().__init__(
             ToolSpec(
                 name=require_clean_nonblank(name, "name"),
+                # Spawns nested sessions; never overlaps other tools in a round.
+                parallel_safe=False,
                 description=tool_description,
                 input_schema={
                     "type": "object",

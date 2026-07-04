@@ -231,6 +231,30 @@ def test_mcp_tool_adapter_redacts_injected_secrets_echoed_by_server() -> None:
     assert result.structured["mcp_structured_content"]["nested"]["also"] == REDACTED_SECRET
 
 
+def test_mcp_tool_adapter_derives_parallel_safe_from_read_only_hint() -> None:
+    # MCP tools must feed the per-tool safety gate: only a server-declared read-only
+    # tool may run concurrently. A write, un-annotated, or non-bool-hinted tool is a
+    # barrier (parallel_safe=False) so it never races a sibling in a parallel round.
+    definitions = (
+        McpToolDefinition(name="read", input_schema={}, annotations={"readOnlyHint": True}),
+        McpToolDefinition(name="unknown", input_schema={}),
+        McpToolDefinition(name="write", input_schema={}, annotations={"readOnlyHint": False}),
+        McpToolDefinition(name="spoof", input_schema={}, annotations={"readOnlyHint": "true"}),
+    )
+    session = FakeMcpSession(definitions=definitions)
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=definitions,
+    )
+    parallel_safe = {tool.definition.name: tool.spec.parallel_safe for tool in toolset.tools}
+
+    assert parallel_safe["read"] is True
+    assert parallel_safe["unknown"] is False
+    assert parallel_safe["write"] is False
+    assert parallel_safe["spoof"] is False
+
+
 def test_mcp_tool_manifest_hash_is_stable_for_equivalent_json_order() -> None:
     server = _fake_server_spec()
     initialize_result = McpInitializeResult(
