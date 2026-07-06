@@ -198,6 +198,53 @@ def test_git_repository_binding_clones_local_origin_and_reports_snapshots(tmp_pa
     assert final_snapshot.metadata["git_repository"]["outcome"] == "completed"
 
 
+def test_git_repository_binding_fetches_and_checks_out_pull_request_ref(tmp_path) -> None:
+    origin, base_commit = _create_bare_origin(tmp_path)
+    seed = tmp_path / "seed"
+    # Publish a PR-head commit under refs/pull/1/head, like GitHub does. The
+    # default clone/fetch refspec (refs/heads/*) does not cover it.
+    (seed / "feature.txt").write_text("pr change\n", encoding="utf-8")
+    _git(seed, "add", "feature.txt")
+    _git(seed, "commit", "-m", "pr head")
+    pr_head = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "origin", "HEAD:refs/pull/1/head")
+    _git(seed, "reset", "--hard", base_commit)
+
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    workspace = LocalWorkspace(target_root, workspace_id="pr-workspace")
+
+    async def run() -> BoundWorkspace:
+        binding = GitRepositoryBinding(
+            repo_url=str(origin),
+            ref="pr-1",
+            fetch_refspecs=["+refs/pull/1/head:refs/heads/pr-1"],
+        )
+        return await binding.bind(workspace, None, session_id="sess_pr")
+
+    bound = asyncio.run(run())
+
+    assert pr_head != base_commit
+    assert bound.metadata["git_repository"]["commit"] == pr_head
+    assert bound.metadata["git_repository"]["ref"] == "pr-1"
+    assert bound.metadata["git_repository"]["fetch_refspecs"] == [
+        "+refs/pull/1/head:refs/heads/pr-1"
+    ]
+    assert (target_root / "feature.txt").read_text(encoding="utf-8") == "pr change\n"
+
+
+def test_git_repository_binding_rejects_refspecs_when_fetch_disabled(tmp_path) -> None:
+    origin, _commit = _create_bare_origin(tmp_path)
+
+    with pytest.raises(ValueError, match="fetch_refspecs requires fetch=True"):
+        GitRepositoryBinding(
+            repo_url=str(origin),
+            ref="pr-1",
+            fetch=False,
+            fetch_refspecs=["+refs/pull/1/head:refs/heads/pr-1"],
+        )
+
+
 def test_git_repository_binding_uses_runner_workspace(tmp_path) -> None:
     origin, commit = _create_bare_origin(tmp_path)
     runner_root = tmp_path / "runner"
@@ -887,6 +934,7 @@ def test_sync_binding_prunes_expired_states_on_bind(tmp_path) -> None:
             created_at=time.monotonic() - 120.0,
         )
         fresh = await binding.bind(source, None, session_id="sess_fresh")
+        assert fresh.state_key is not None
         assert set(binding._states) == {fresh.state_key}
         assert binding._states[fresh.state_key].session_id == "sess_fresh"
 

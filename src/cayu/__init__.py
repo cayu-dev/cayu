@@ -384,6 +384,7 @@ from cayu.runtime import (
     metadata_with_taint_labels,
     normalize_usage_metrics,
     retry_decision,
+    run_task_worker,
     session_usage_summary,
     strip_old_file_attachments,
     taint_labels_from_metadata,
@@ -477,6 +478,11 @@ from cayu.vaults import (
     resolve_secret_env,
     secret_env_refs,
     validate_secret_resolver,
+)
+from cayu.webhooks import (
+    WebhookSignatureError,
+    verify_webhook_signature,
+    webhook_task_id,
 )
 from cayu.workspaces import (
     DEFAULT_E2B_WORKSPACE_LIST_DEPTH,
@@ -897,6 +903,7 @@ __all__ = [
     "VaultError",
     "VaultHandle",
     "VertexProvider",
+    "WebhookSignatureError",
     "Workflow",
     "WorkflowSpec",
     "Workspace",
@@ -958,6 +965,7 @@ __all__ = [
     "run_eval_case",
     "run_eval_plan",
     "run_eval_suite",
+    "run_task_worker",
     "secret_env_refs",
     "session_usage_summary",
     "strip_old_file_attachments",
@@ -969,6 +977,8 @@ __all__ = [
     "validate_file_attachment_bytes",
     "validate_file_attachment_content_type",
     "validate_secret_resolver",
+    "verify_webhook_signature",
+    "webhook_task_id",
     "write_eval_run_json",
     "write_html_report",
     "write_trajectory_json",

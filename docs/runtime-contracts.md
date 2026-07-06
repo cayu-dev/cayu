@@ -151,7 +151,10 @@ separate runtime. It creates a new child `RunRequest` with `parent_session_id`
 set to the calling session and `causal_budget_id` inherited from the caller,
 then runs the configured child agent through the normal Cayu loop. The child
 agent has its own `AgentSpec`, tools, policies, model, context policy, and
-durable events. Foreground subagents wait for the child terminal event; the
+durable events, but inherits the parent's `environment_name` (it is not
+configurable per subagent). To shape a child's environment differently, branch a
+single `EnvironmentFactory` on `EnvironmentFactoryRequest.agent_name`. Foreground
+subagents wait for the child terminal event; the
 parent receives only a bounded `ToolResult` containing the child session id,
 status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
 text copied into the parent transcript. Background subagents return after the

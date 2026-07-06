@@ -166,6 +166,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputStrategy,
     StructuredOutputValidation,
 )
+from cayu.runtime.task_worker import run_task_worker
 from cayu.runtime.tasks import (
     InMemoryTaskStore,
     Task,
@@ -381,6 +382,7 @@ __all__ = [
     "metadata_with_taint_labels",
     "normalize_usage_metrics",
     "retry_decision",
+    "run_task_worker",
     "session_usage_summary",
     "strip_old_file_attachments",
     "taint_labels_from_metadata",

@@ -39,21 +39,22 @@ payload into a `Task`.
 
 ```python
 task = await task_store.create_task(TaskCreate(
-    task_id=_github_delivery_task_id(delivery_id),
+    task_id=webhook_task_id("github", delivery_id),
     type="review_pr",
     assigned_agent_name="pr-reviewer",
     input={"owner": ..., "repo": ..., "pr_number": ..., "repo_url": ...,
-           "head_ref": ..., "head_sha": ..., "base_ref": ...},
+           "head_ref": ..., "head_sha": ..., "base_ref": ...,
+           "fetch_refspecs": [...]},
     metadata={"github_delivery_id": delivery_id},
 ))
 ```
 
-Use the webhook delivery id as a deterministic `task_id` to make redelivery
-idempotent (`TaskStore` implementations reject duplicate task ids). The endpoint
-returns immediately; the review happens later on a worker. The bundled webhook
-helper hashes `X-GitHub-Delivery` into `task_id` and returns the already-created
-task when GitHub redelivers the same event — that decoupling is what makes it
-"cloud".
+Verify the signature with `cayu.webhooks.verify_webhook_signature` (constant-time
+HMAC), and derive the `task_id` from the delivery id with
+`cayu.webhooks.webhook_task_id("github", delivery_id)` — a redelivered webhook then
+maps to a duplicate id the task store rejects, so retries are idempotent for free.
+The endpoint returns immediately; the review happens later on a worker — that
+decoupling is what makes it "cloud".
 
 ## 2. A worker claims the Task and starts a session
 
@@ -72,7 +73,8 @@ request = RunRequest(
               "repo_url": task.input["repo_url"],
               "head_ref": task.input["head_ref"],
               "head_sha": task.input.get("head_sha"),
-              "base_ref": task.input["base_ref"]},
+              "base_ref": task.input["base_ref"],
+              "fetch_refspecs": task.input.get("fetch_refspecs", [])},
     messages=[Message.text("user", f"Review pull request #{pr} in {owner}/{repo}.")],
     limits=RunLimits(max_tool_calls=20, max_elapsed_seconds=600),
 )
@@ -89,9 +91,9 @@ Two things worth calling out:
   tool calls and wall-clock. (Limits are enforced per run; see
   [runtime-contracts](../runtime-contracts.md).)
 
-For production, don't hand-roll the claim loop: `TaskStoreDispatcher.run_worker`
-ships the durable claim → heartbeat → lease-reclaim → backoff loop
-(see `examples/task_worker_loop.py`).
+For production, don't hand-roll the claim loop: `run_task_worker`
+ships the durable claim → heartbeat → lease-reclaim → backoff loop. See
+[Triggering runs](../triggering-runs.md) for the worker-loop decision guide.
 
 ## 3. A fresh sandbox per PR
 
@@ -106,16 +108,20 @@ class PRSandboxFactory(EnvironmentFactory):
             EnvironmentSpec(name=request.environment_name),
             workspace=LocalWorkspace(root, workspace_id=request.session_id),
             runner=LocalRunner(root),
-            binding=GitRepositoryBinding(repo_url=request.metadata["repo_url"],
-                                         ref=request.metadata["head_ref"]),
+            binding=GitRepositoryBinding(
+                repo_url=request.metadata["repo_url"],
+                ref=request.metadata["head_ref"],
+                fetch_refspecs=request.metadata.get("fetch_refspecs") or None,
+            ),
             vault=vault, proxy=proxy,
         ))
 ```
 
-- **Same-repo PRs** check out by branch name (`head_ref`) directly. Fork PRs use
-  the PR head repository clone URL plus that repository's head branch. If your
-  deployment must clone only the base repo, fetch `refs/pull/N/head` explicitly
-  before binding and then check out the fetched local ref.
+- **PR refs** should be fetched explicitly when the normal branch ref may not be
+  available in the base repository. For GitHub, set
+  `fetch_refspecs=[f"+refs/pull/{pr_number}/head:refs/heads/pr-{pr_number}"]`
+  and `head_ref=f"pr-{pr_number}"`. The binding fetches that PR head ref from the
+  base repo, then checks out the local `pr-N` ref.
 - **Private checkouts** need host-side Git credentials, SSH agent setup, or a
   brokered checkout tool. `GITHUB_TOKEN` in this example is resolved by trusted
   GitHub API tools; it is not injected into `GitRepositoryBinding` clone URLs.
@@ -206,7 +212,7 @@ with `final_output_text(transcript)` rather than expecting an exception.
 - **Durability:** back the app with `PostgresSessionStore` / `PostgresTaskStore`
   (`pip install "cayu[postgres]"`) so many workers can claim safely.
 - **Isolation:** `E2BRunner` / `E2BWorkspace` for the sandbox.
-- **Worker loop:** `TaskStoreDispatcher.run_worker` instead of a hand-rolled claim
+- **Worker loop:** `run_task_worker` instead of a hand-rolled claim
   loop.
 - **Scale:** run N identical workers; the task store's `FOR UPDATE SKIP LOCKED`
   claiming keeps them from colliding.

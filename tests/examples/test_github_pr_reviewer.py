@@ -363,7 +363,7 @@ def test_terminalize_claimed_task_respects_worker_lease(tmp_path: Path) -> None:
     asyncio.run(run_case())
 
 
-def test_checkout_source_uses_head_repo_for_fork_prs() -> None:
+def test_checkout_source_uses_base_repo_pull_ref() -> None:
     payload = {
         "repository": {
             "full_name": "base/repo",
@@ -382,12 +382,13 @@ def test_checkout_source_uses_head_repo_for_fork_prs() -> None:
     }
 
     assert mod._checkout_source_from_pr_payload(pr, payload) == (
-        "https://github.com/fork/repo.git",
-        "contributor-branch",
+        "https://github.com/base/repo.git",
+        "pr-12",
+        ["+refs/pull/12/head:refs/heads/pr-12"],
     )
 
 
-def test_checkout_source_rejects_missing_head_repo() -> None:
+def test_checkout_source_works_when_head_repo_is_unavailable() -> None:
     payload = {
         "repository": {
             "full_name": "base/repo",
@@ -402,8 +403,11 @@ def test_checkout_source_rejects_missing_head_repo() -> None:
         },
     }
 
-    with pytest.raises(ValueError, match="head repository is unavailable"):
-        mod._checkout_source_from_pr_payload(pr, payload)
+    assert mod._checkout_source_from_pr_payload(pr, payload) == (
+        "https://github.com/base/repo.git",
+        "pr-12",
+        ["+refs/pull/12/head:refs/heads/pr-12"],
+    )
 
 
 def test_checkout_source_rejects_malformed_head_payload() -> None:
@@ -412,19 +416,18 @@ def test_checkout_source_rejects_malformed_head_payload() -> None:
     with pytest.raises(ValueError, match="head payload must be a JSON object"):
         mod._checkout_source_from_pr_payload({"number": 12, "head": "bad"}, payload)
 
-    with pytest.raises(ValueError, match="head repository is unavailable"):
+    with pytest.raises(ValueError, match="repository clone URL is unavailable"):
         mod._checkout_source_from_pr_payload(
             {"number": 12, "head": {"ref": "feature", "repo": "bad"}},
             payload,
         )
 
-    with pytest.raises(ValueError, match="head ref is missing"):
+    with pytest.raises(ValueError, match="PR number is missing"):
         mod._checkout_source_from_pr_payload(
             {
-                "number": 12,
                 "head": {"repo": {"clone_url": "https://github.com/fork/repo.git"}},
             },
-            payload,
+            {"repository": {"clone_url": "https://github.com/base/repo.git"}},
         )
 
 
@@ -539,9 +542,10 @@ def test_webhook_enqueues_idempotent_review_task(tmp_path: Path) -> None:
     assert task.input["repo"] == "repo"
     assert task.input["pr_number"] == 12
     assert task.input["repo_url"] == "https://github.com/octo/repo.git"
-    assert task.input["head_ref"] == "feature"
+    assert task.input["head_ref"] == "pr-12"
     assert task.input["head_sha"] == "abc123"
     assert task.input["base_ref"] == "main"
+    assert task.input["fetch_refspecs"] == ["+refs/pull/12/head:refs/heads/pr-12"]
     assert task.metadata["github_delivery_id"] == "delivery-123"
 
 
@@ -586,8 +590,8 @@ def test_webhook_accepts_valid_signature(tmp_path: Path) -> None:
     assert response.json() == {"task_id": mod._github_delivery_task_id("delivery-123")}
 
 
-def test_webhook_rejects_unavailable_head_repo(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
+def test_webhook_accepts_unavailable_head_repo_via_pull_ref(tmp_path: Path) -> None:
+    store, client = _webhook_client(tmp_path)
     response = client.post(
         "/webhooks/github",
         headers={
@@ -596,9 +600,13 @@ def test_webhook_rejects_unavailable_head_repo(tmp_path: Path) -> None:
         },
         content=json.dumps(_pull_request_payload(head_repo=None)).encode(),
     )
+    task = asyncio.run(store.load_task(mod._github_delivery_task_id("delivery-123")))
 
-    assert response.status_code == 422
-    assert "head repository is unavailable" in response.json()["detail"]
+    assert response.status_code == 200
+    assert task is not None
+    assert task.input["repo_url"] == "https://github.com/octo/repo.git"
+    assert task.input["head_ref"] == "pr-12"
+    assert task.input["fetch_refspecs"] == ["+refs/pull/12/head:refs/heads/pr-12"]
 
 
 def test_get_pr_diff_fetches_all_file_pages(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -74,6 +74,7 @@ with `PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py`.
 User guides:
 
 - [PR-reviewer recipe](docs/recipes/pr-reviewer.md) — the featured end-to-end example.
+- [Triggering runs](docs/triggering-runs.md) — which start verb (run / dispatch / task worker / subagent / event watcher) fits your trigger.
 - [Environment factories](docs/environment-factories.md) — per-session workspaces, runners, and bindings.
 - [Build a runner](docs/build-a-runner.md) — run commands on your own platform.
 - [Evals](docs/evals.md) — assertions, trajectories, and reports.
@@ -1670,6 +1671,10 @@ async for event in app.dispatch_inline(
 
 For model-facing delegation, register a `SubagentTool`. A subagent call creates
 a normal child session with `parent_session_id` and the same `causal_budget_id`.
+A subagent runs against the parent's `environment_name`; to give it a
+differently-shaped environment (say, a checkout for a QA child but none for the
+orchestrator), branch a single `EnvironmentFactory` on `request.agent_name` — see
+[`examples/environments/per_agent_environment.py`](examples/environments/per_agent_environment.py).
 Foreground subagents run to completion and return the child result as a tool
 result to the parent. Background subagents start the child session, return the
 `child_session_id` immediately, and keep running in the active runtime process.

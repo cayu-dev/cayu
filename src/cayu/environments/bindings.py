@@ -308,6 +308,12 @@ class GitRepositoryBinding(WorkspaceBinding):
     The binding creates or updates the repository before the model sees the
     workspace. It records commit/dirty metadata, but it never commits, pushes,
     or creates pull requests; those remain explicit app/tool workflows.
+
+    ``fetch_refspecs`` fetches refs the default clone/fetch does not — most
+    commonly a pull-request head, which lives under ``refs/pull/N/head`` and is
+    not covered by the default ``refs/heads/*`` refspec. To review PR #123, pass
+    ``fetch_refspecs=["+refs/pull/123/head:refs/heads/pr-123"]`` together with
+    ``ref="pr-123"``.
     """
 
     def __init__(
@@ -319,6 +325,7 @@ class GitRepositoryBinding(WorkspaceBinding):
         path: str | None = None,
         git_executable: str = "git",
         fetch: bool = True,
+        fetch_refspecs: list[str] | None = None,
         require_clean: bool = True,
         verify_remote_url: bool = True,
         timeout_s: int | None = 120,
@@ -336,6 +343,15 @@ class GitRepositoryBinding(WorkspaceBinding):
         if type(verify_remote_url) is not bool:
             raise TypeError("GitRepositoryBinding verify_remote_url must be a bool.")
         self.fetch = fetch
+        if fetch_refspecs is not None and not isinstance(fetch_refspecs, list):
+            raise TypeError("GitRepositoryBinding fetch_refspecs must be a list of strings.")
+        if fetch_refspecs and not fetch:
+            raise ValueError("GitRepositoryBinding fetch_refspecs requires fetch=True.")
+        self.fetch_refspecs = (
+            [_validate_git_value(spec, "fetch_refspecs") for spec in fetch_refspecs]
+            if fetch_refspecs is not None
+            else None
+        )
         self.require_clean = require_clean
         self.verify_remote_url = verify_remote_url
         self.timeout_s = _validate_optional_timeout(timeout_s, "timeout_s")
@@ -384,6 +400,7 @@ class GitRepositoryBinding(WorkspaceBinding):
             )
             await executor.run("clone", self.repo_url, ".")
 
+        await self._fetch_extra_refspecs(executor)
         if self.ref is not None:
             await self._checkout_configured_ref(executor)
         commit = await executor.stdout("rev-parse", "HEAD")
@@ -397,6 +414,7 @@ class GitRepositoryBinding(WorkspaceBinding):
             "branch": branch,
             "dirty": dirty,
             "fetch": self.fetch,
+            "fetch_refspecs": self.fetch_refspecs,
             "require_clean": self.require_clean,
             "verify_remote_url": self.verify_remote_url,
         }
@@ -474,6 +492,11 @@ class GitRepositoryBinding(WorkspaceBinding):
             raise ValueError("GitRepositoryBinding refuses to bind a dirty repository.")
         if self.fetch:
             await executor.run("fetch", "--prune", self.remote_name)
+
+    async def _fetch_extra_refspecs(self, executor: _GitWorkspaceExecutor) -> None:
+        if not self.fetch or not self.fetch_refspecs:
+            return
+        await executor.run("fetch", self.remote_name, *self.fetch_refspecs)
 
     async def _checkout_configured_ref(self, executor: _GitWorkspaceExecutor) -> None:
         if self.ref is None:

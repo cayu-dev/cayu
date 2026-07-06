@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import json
 import os
 import sys
@@ -90,6 +89,8 @@ from cayu import (
     ToolContext,
     ToolResult,
     ToolSpec,
+    verify_webhook_signature,
+    webhook_task_id,
 )
 from cayu.providers import ModelStreamEvent
 from cayu.vaults import SecretRef
@@ -366,7 +367,7 @@ _shared_proxy = PassthroughProxy(_shared_vault)
 
 
 class PRSandboxFactory(EnvironmentFactory):
-    """One fresh clone per review session, checked out at the PR's head branch."""
+    """One fresh clone per review session, checked out at the PR's head ref."""
 
     def __init__(self, base_root: Path, *, with_credentials: bool = True) -> None:
         self._base_root = base_root
@@ -375,18 +376,25 @@ class PRSandboxFactory(EnvironmentFactory):
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         repo_url = request.metadata.get("repo_url")
         ref = request.metadata.get("head_ref")
+        fetch_refspecs = request.metadata.get("fetch_refspecs") or None
         if not repo_url or not ref:
             raise ValueError(
                 "PRSandboxFactory requires 'repo_url' and 'head_ref' in RunRequest.metadata; "
                 "got: " + json.dumps(request.metadata)
             )
+        if fetch_refspecs is not None and not isinstance(fetch_refspecs, list):
+            raise ValueError("PRSandboxFactory 'fetch_refspecs' metadata must be a list.")
         root = self._base_root / request.session_id
         root.mkdir(parents=True, exist_ok=True)
         environment = Environment(
             EnvironmentSpec(name=request.environment_name),
             workspace=LocalWorkspace(root, workspace_id=request.session_id),
             runner=LocalRunner(root),
-            binding=GitRepositoryBinding(repo_url=repo_url, ref=ref),
+            binding=GitRepositoryBinding(
+                repo_url=repo_url,
+                ref=ref,
+                fetch_refspecs=fetch_refspecs,
+            ),
             vault=_shared_vault if self._with_credentials else None,
             proxy=_shared_proxy if self._with_credentials else None,
         )
@@ -465,6 +473,7 @@ async def enqueue_pr_review(
     task_id: str | None = None,
     github_delivery_id: str | None = None,
     head_sha: str | None = None,
+    fetch_refspecs: list[str] | None = None,
 ) -> Task:
     create = TaskCreate(
         task_id=task_id,
@@ -479,6 +488,7 @@ async def enqueue_pr_review(
             "head_ref": head_ref,
             "head_sha": head_sha,
             "base_ref": base_ref,
+            "fetch_refspecs": fetch_refspecs or [],
         },
         metadata=(
             {"github_delivery_id": github_delivery_id} if github_delivery_id is not None else {}
@@ -537,6 +547,7 @@ async def claim_and_run_one(
             "head_ref": task.input["head_ref"],
             "head_sha": task.input.get("head_sha"),
             "base_ref": task.input["base_ref"],
+            "fetch_refspecs": task.input.get("fetch_refspecs", []),
         },
         messages=[
             Message.text(
@@ -595,7 +606,12 @@ async def _terminalize_claimed_task_if_needed(
 
 
 def build_webhook_app(task_store: TaskStore, *, webhook_secret: str | None):
-    """A tiny GitHub webhook receiver that enqueues review_pr tasks."""
+    """A tiny GitHub webhook receiver that enqueues review_pr tasks.
+
+    Signatures are verified with ``cayu.webhooks.verify_webhook_signature``, and the
+    task id is derived from the delivery id with ``webhook_task_id`` so a redelivered
+    webhook is a no-op (the task store rejects the duplicate id).
+    """
     if not _HAS_FASTAPI:
         raise RuntimeError("pip install fastapi (or cayu[server]) to use the webhook app.")
     if webhook_secret == "":
@@ -605,11 +621,10 @@ def build_webhook_app(task_store: TaskStore, *, webhook_secret: str | None):
     @api.post("/webhooks/github")
     async def github_webhook(request: Request) -> dict:
         raw = await request.body()
-        if webhook_secret:
-            signature = request.headers.get("X-Hub-Signature-256", "")
-            digest = "sha256=" + hmac.new(webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, digest):
-                raise HTTPException(status_code=401, detail="bad signature")
+        if webhook_secret and not verify_webhook_signature(
+            webhook_secret, raw, request.headers.get("X-Hub-Signature-256")
+        ):
+            raise HTTPException(status_code=401, detail="bad signature")
         if request.headers.get("X-GitHub-Event") != "pull_request":
             return {"ignored": True}
         try:
@@ -640,7 +655,7 @@ def build_webhook_app(task_store: TaskStore, *, webhook_secret: str | None):
             raise HTTPException(status_code=400, detail="missing X-GitHub-Delivery header")
         task_id = _github_delivery_task_id(delivery_id)
         try:
-            repo_url, checkout_ref = _checkout_source_from_pr_payload(pr, payload)
+            repo_url, checkout_ref, fetch_refspecs = _checkout_source_from_pr_payload(pr, payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
@@ -655,6 +670,7 @@ def build_webhook_app(task_store: TaskStore, *, webhook_secret: str | None):
                 base_ref=base_ref,
                 task_id=task_id,
                 github_delivery_id=delivery_id,
+                fetch_refspecs=fetch_refspecs,
             )
         except DeliveryTaskConflictError as exc:
             raise HTTPException(
@@ -667,31 +683,25 @@ def build_webhook_app(task_store: TaskStore, *, webhook_secret: str | None):
 
 
 def _github_delivery_task_id(delivery_id: str) -> str:
-    digest = hashlib.sha256(delivery_id.encode("utf-8")).hexdigest()[:32]
-    return f"github-delivery-{digest}"
+    return webhook_task_id("github", delivery_id)
 
 
-def _checkout_source_from_pr_payload(pr: dict, payload: dict) -> tuple[str, str]:
+def _checkout_source_from_pr_payload(pr: dict, payload: dict) -> tuple[str, str, list[str]]:
     head = pr["head"]
     if not isinstance(head, dict):
         raise ValueError("GitHub PR head payload must be a JSON object.")
-    head_repo = head.get("repo")
-    if not isinstance(head_repo, dict) or not head_repo.get("clone_url"):
-        repository = payload.get("repository")
-        full_name = (
-            repository.get("full_name", "<unknown>")
-            if isinstance(repository, dict)
-            else "<unknown>"
-        )
-        raise ValueError(
-            "GitHub PR head repository is unavailable for "
-            f"{full_name}#{pr.get('number', '<unknown>')}; fetch refs/pull/N/head "
-            "from the base repository before binding if deleted-fork PRs must be reviewed."
-        )
-    head_ref = head.get("ref")
-    if not head_ref:
-        raise ValueError("GitHub PR head ref is missing.")
-    return head_repo["clone_url"], head_ref
+    repository = payload.get("repository")
+    if not isinstance(repository, dict) or not repository.get("clone_url"):
+        raise ValueError("GitHub repository clone URL is unavailable.")
+    pr_number = pr.get("number")
+    if not isinstance(pr_number, int):
+        raise ValueError("GitHub PR number is missing.")
+    checkout_ref = f"pr-{pr_number}"
+    return (
+        repository["clone_url"],
+        checkout_ref,
+        [f"+refs/pull/{pr_number}/head:refs/heads/{checkout_ref}"],
+    )
 
 
 def _review_session_id(
@@ -732,7 +742,7 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> None:
             f"GitHub API error {pr_resp.status_code} fetching PR: {pr_resp.text[:500]}"
         )
     pr = pr_resp.json()
-    repo_url, checkout_ref = _checkout_source_from_pr_payload(
+    repo_url, checkout_ref, fetch_refspecs = _checkout_source_from_pr_payload(
         pr, {"repository": pr["base"]["repo"]}
     )
     scratch = Path(tempfile.mkdtemp(prefix="cayu_pr_reviewer_"))
@@ -748,6 +758,7 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> None:
         head_ref=checkout_ref,
         head_sha=pr["head"]["sha"],
         base_ref=pr["base"]["ref"],
+        fetch_refspecs=fetch_refspecs,
     )
     finished = await claim_and_run_one(app, task_store, worker_id="live-worker")
     assert finished is not None  # we just enqueued exactly one task for this worker
