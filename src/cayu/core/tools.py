@@ -271,6 +271,7 @@ class ToolContext(BaseModel):
     causal_budget_id: str | None = None
     workspace_id: str | None = None
     artifact_store_id: str | None = None
+    idempotency_key: str | None = None
     workspace: WorkspaceHandle | None = Field(default=None, exclude=True)
     artifact_store: ArtifactStoreHandle | None = Field(default=None, exclude=True)
     runner: RunnerHandle | None = Field(default=None, exclude=True)
@@ -296,6 +297,7 @@ class ToolContext(BaseModel):
         "causal_budget_id",
         "workspace_id",
         "artifact_store_id",
+        "idempotency_key",
     )
     @classmethod
     def validate_optional_nonblank_ids(

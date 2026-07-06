@@ -1,12 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from typing import Any
 
 from cayu._validation import copy_json_value
 from cayu.core.tools import Tool, ToolContext, ToolResult
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_policy import ToolPolicyResult
+
+
+def tool_idempotency_key(
+    *,
+    session_id: str,
+    tool_call_id: str,
+    tool_round_id: str | None = None,
+    approval_id: str | None = None,
+    pause_id: str | None = None,
+) -> str:
+    """Stable, bounded key for one runtime-owned tool execution identity."""
+
+    components = (
+        "cayu-tool-idempotency-v1",
+        session_id,
+        tool_round_id or "",
+        approval_id or "",
+        pause_id or "",
+        tool_call_id,
+    )
+    material = json.dumps(components, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return "cayu-tool:v1:" + hashlib.sha256(material).hexdigest()
 
 
 async def run_tool(
@@ -64,11 +88,17 @@ def context_metadata(
     request_metadata: dict[str, Any] | None = None,
     tool_call_id: str,
     approval_id: str | None,
+    idempotency_key: str | None = None,
+    input_id: str | None = None,
 ) -> dict[str, Any]:
     metadata = copy_json_value(request_metadata or {}, "request_metadata")
     metadata["tool_call_id"] = tool_call_id
+    if idempotency_key is not None:
+        metadata["idempotency_key"] = idempotency_key
     if approval_id is not None:
         metadata["approval_id"] = approval_id
+    if input_id is not None:
+        metadata["input_id"] = input_id
     return metadata
 
 

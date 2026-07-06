@@ -32,6 +32,7 @@ from cayu.runtime import (
     UserInputRecoveryRequest,
     UserInputResponse,
 )
+from cayu.runtime import _tool_execution as tool_execution
 from cayu.tools.user_input import UserInputTool
 
 
@@ -67,7 +68,12 @@ class _EchoTool(Tool):
         },
     )
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.metadata_by_text: dict[str, dict] = {}
+
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        self.metadata_by_text[args["text"]] = ctx.metadata
         return ToolResult(content=args["text"])
 
 
@@ -142,6 +148,17 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     )
 
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    completed = next(
+        event
+        for event in resume_events
+        if event.type == EventType.TOOL_CALL_COMPLETED
+        and event.payload.get("tool_call_id") == "call_1"
+    )
+    assert completed.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="s_resume",
+        tool_call_id="call_1",
+        pause_id=input_id,
+    )
     assert asyncio.run(store.load("s_resume")).status == SessionStatus.COMPLETED
     parts = _tool_result_parts(asyncio.run(store.load_transcript("s_resume")))
     ask_part = next(part for part in parts if part.tool_call_id == "call_1")
@@ -153,13 +170,14 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
 def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
     # Model emits [echo, ask_user, echo] in one step. Nothing runs before the pause; on
     # resume the echoes execute and the ask_user answer is injected, all in model order.
+    echo = _EchoTool()
     app, store = _build(
         [
             ("call_1", "echo", {"text": "first"}),
             ("call_2", "ask_user", {"question": "continue?"}),
             ("call_3", "echo", {"text": "third"}),
         ],
-        tools=[UserInputTool(), _EchoTool()],
+        tools=[UserInputTool(), echo],
     )
     pause_events = asyncio.run(
         _collect(
@@ -183,6 +201,23 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
         )
     )
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    sibling_events = [
+        event
+        for event in resume_events
+        if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
+        and event.payload.get("tool_call_id") in {"call_1", "call_3"}
+    ]
+    assert sibling_events
+    for event in sibling_events:
+        call_id = event.payload["tool_call_id"]
+        assert event.payload["input_id"] == input_id
+        assert event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+            session_id="s_mixed",
+            tool_call_id=call_id,
+            pause_id=input_id,
+        )
+    assert echo.metadata_by_text["first"]["input_id"] == input_id
+    assert echo.metadata_by_text["third"]["input_id"] == input_id
 
     parts = _tool_result_parts(asyncio.run(store.load_transcript("s_mixed")))
     assert [part.tool_call_id for part in parts] == ["call_1", "call_2", "call_3"]
@@ -708,6 +743,17 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
                 )
             )
         )
+    )
+    recovered_tool_event = next(
+        event
+        for event in recovered
+        if event.type == EventType.TOOL_CALL_COMPLETED
+        and event.payload.get("manual_recovery") is True
+    )
+    assert recovered_tool_event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="s_rec",
+        tool_call_id="call_1",
+        pause_id=input_id,
     )
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert counting.calls == 0  # the recovered tool was never re-executed

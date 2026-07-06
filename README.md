@@ -269,7 +269,7 @@ Cayu treats payloads, metadata, tool arguments, tool results, model options, che
 
 Runtime objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
-Runtime-native tools receive services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
+Runtime-native tools receive services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data. Runtime-executed tool calls also receive a stable `ToolContext.idempotency_key` that side-effecting tools can pass to downstream idempotent APIs.
 
 Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue. This `tool.call.blocked` contract covers the app-level `ToolPolicy` gate; a tool's *own* internal policy — such as an `ExecCommandTool(policy=...)` `CommandPolicy` denial — instead surfaces as `tool.call.failed` with a structured error, so observability that watches only `tool.call.blocked` will miss command denials.
 

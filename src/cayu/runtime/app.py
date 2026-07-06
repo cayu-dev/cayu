@@ -1163,6 +1163,11 @@ class _ToolRoundRunner:
         )
         payload: dict[str, Any] = {
             "tool_call_id": tool_call.id,
+            "idempotency_key": tool_execution.tool_idempotency_key(
+                session_id=self._session.id,
+                tool_call_id=tool_call.id,
+                tool_round_id=tool_round_id,
+            ),
             "abnormal_termination": True,
             "result": result.model_dump(),
         }
@@ -2952,6 +2957,11 @@ class CayuApp:
                     continue
 
                 if tool_call.id == pending.tool_call_id:
+                    idempotency_key = tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_call_id=tool_call.id,
+                        pause_id=pending.input_id,
+                    )
                     result = ToolResult(
                         content=response.answer,
                         structured=response.structured,
@@ -2967,6 +2977,7 @@ class CayuApp:
                             tool_name=tool_call.name,
                             payload={
                                 "tool_call_id": tool_call.id,
+                                "idempotency_key": idempotency_key,
                                 "arguments": deepcopy(tool_call.arguments),
                                 "input_id": pending.input_id,
                             },
@@ -2981,6 +2992,7 @@ class CayuApp:
                             tool_name=tool_call.name,
                             payload={
                                 "tool_call_id": tool_call.id,
+                                "idempotency_key": idempotency_key,
                                 "input_id": pending.input_id,
                                 "result": result.model_dump(),
                             },
@@ -3008,6 +3020,11 @@ class CayuApp:
                     blocked_result = tool_execution.blocked_tool_result(
                         policy_result, reason=reason
                     )
+                    idempotency_key = tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_call_id=tool_call.id,
+                        pause_id=pending.input_id,
+                    )
                     async for event, outcome in self._emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
@@ -3017,6 +3034,7 @@ class CayuApp:
                             tool_name=tool_call.name,
                             payload={
                                 "tool_call_id": tool_call.id,
+                                "idempotency_key": idempotency_key,
                                 "decision": policy_result.decision.value,
                                 "reason": reason,
                                 "metadata": policy_result.metadata,
@@ -3044,6 +3062,7 @@ class CayuApp:
                     task_id=pending.task_id,
                     check_policy=False,
                     policy_result=policy_result,
+                    input_id=pending.input_id,
                 ):
                     yield event
                     if outcome is not None:
@@ -3242,6 +3261,11 @@ class CayuApp:
                     tool_name=pending_tool_call.tool_name,
                     payload={
                         "tool_call_id": pending_tool_call.tool_call_id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_call_id=pending_tool_call.tool_call_id,
+                            pause_id=pending.input_id,
+                        ),
                         "input_id": pending.input_id,
                         "manual_recovery": True,
                         "reason": request.reason,
@@ -3557,6 +3581,11 @@ class CayuApp:
                 if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
                     reason = tool_execution.policy_denial_reason(policy_result)
                     result = tool_execution.blocked_tool_result(policy_result, reason=reason)
+                    idempotency_key = tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_call_id=tool_call.id,
+                        approval_id=pending_approval.approval_id,
+                    )
                     async for event, outcome in self._emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
@@ -3567,6 +3596,7 @@ class CayuApp:
                             payload={
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
+                                "idempotency_key": idempotency_key,
                                 "decision": policy_result.decision.value,
                                 "reason": reason,
                                 "metadata": policy_result.metadata,
@@ -3617,6 +3647,11 @@ class CayuApp:
                         tool_call=tool_call,
                         approval_required=approval_required,
                     )
+                    idempotency_key = tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_call_id=tool_call.id,
+                        approval_id=pending_approval.approval_id,
+                    )
                     async for event, outcome in self._emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
@@ -3627,6 +3662,7 @@ class CayuApp:
                             payload={
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
+                                "idempotency_key": idempotency_key,
                                 "approval_required": approval_required,
                                 "reason": request.reason,
                                 "metadata": request.metadata,
@@ -3915,6 +3951,11 @@ class CayuApp:
                     payload={
                         "approval_id": pending_approval.approval_id,
                         "tool_call_id": pending_tool_call.tool_call_id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_call_id=pending_tool_call.tool_call_id,
+                            approval_id=pending_approval.approval_id,
+                        ),
                         "manual_recovery": True,
                         "reason": request.reason,
                         "metadata": request.metadata,
@@ -6720,18 +6761,29 @@ class CayuApp:
         policy_result: ToolPolicyResult | None = None,
         approval_id: str | None = None,
         tool_round_id: str | None = None,
+        input_id: str | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         started_event: Event | None = None
+        idempotency_key = tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_call_id=tool_call.id,
+            tool_round_id=tool_round_id,
+            approval_id=approval_id,
+            pause_id=input_id,
+        )
         if emit_started:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
                 "arguments": deepcopy(tool_call.arguments),
             }
             if tool_round_id is not None:
                 payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
             started_event = await self._emit(
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
@@ -6752,12 +6804,15 @@ class CayuApp:
             )
             payload = {
                 "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
                 "result": result.model_dump(),
             }
             if tool_round_id is not None:
                 payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
             async for event in self._emit_tool_call_result_with_hooks(
                 event=Event(
                     type=EventType.TOOL_CALL_FAILED,
@@ -6793,6 +6848,7 @@ class CayuApp:
                 result = tool_execution.blocked_tool_result(resolved_policy_result, reason=reason)
                 payload = {
                     "tool_call_id": tool_call.id,
+                    "idempotency_key": idempotency_key,
                     "decision": resolved_policy_result.decision.value,
                     "reason": reason,
                     "metadata": resolved_policy_result.metadata,
@@ -6802,6 +6858,8 @@ class CayuApp:
                     payload["tool_round_id"] = tool_round_id
                 if approval_id is not None:
                     payload["approval_id"] = approval_id
+                if input_id is not None:
+                    payload["input_id"] = input_id
                 async for event in self._emit_tool_call_result_with_hooks(
                     event=Event(
                         type=EventType.TOOL_CALL_BLOCKED,
@@ -6905,11 +6963,13 @@ class CayuApp:
                 extra_payload={
                     "reason": before_resolution.block_reason,
                     "blocked_by": "before_tool_call_hook",
+                    "idempotency_key": idempotency_key,
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
                 tool_round_id=tool_round_id,
                 approval_id=approval_id,
+                input_id=input_id,
                 allow_modification=False,
             ):
                 yield event
@@ -6930,11 +6990,13 @@ class CayuApp:
                 result=short_result,
                 extra_payload={
                     "short_circuited_by": "before_tool_call_hook",
+                    "idempotency_key": idempotency_key,
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
                 tool_round_id=tool_round_id,
                 approval_id=approval_id,
+                input_id=input_id,
                 allow_modification=True,
             ):
                 yield event
@@ -6978,11 +7040,13 @@ class CayuApp:
                         "reason": reason,
                         "decision": reauthorization.decision.value,
                         "blocked_by": "tool_policy_reauthorization",
+                        "idempotency_key": idempotency_key,
                         **effective_arguments_payload,
                     },
                     task_id=task_id,
                     tool_round_id=tool_round_id,
                     approval_id=approval_id,
+                    input_id=input_id,
                     allow_modification=False,
                 ):
                     yield event
@@ -7000,6 +7064,7 @@ class CayuApp:
                     causal_budget_id=session.causal_budget_id,
                     workspace_id=_workspace_id(registered_environment),
                     artifact_store_id=_artifact_store_id(registered_environment),
+                    idempotency_key=idempotency_key,
                     workspace=_workspace(registered_environment),
                     artifact_store=_artifact_store(registered_environment),
                     runner=_runner(registered_environment),
@@ -7015,6 +7080,8 @@ class CayuApp:
                         request_metadata=request_metadata,
                         tool_call_id=tool_call.id,
                         approval_id=approval_id,
+                        idempotency_key=idempotency_key,
+                        input_id=input_id,
                     ),
                 ),
                 # effective_tool_call.arguments is the (re-authorized) private copy to execute.
@@ -7036,6 +7103,8 @@ class CayuApp:
                     records=proxy_authorizations,
                     tool_round_id=tool_round_id,
                     approval_id=approval_id,
+                    input_id=input_id,
+                    idempotency_key=idempotency_key,
                     redactor=redactor,
                 ):
                     yield event, None
@@ -7052,6 +7121,8 @@ class CayuApp:
             records=proxy_authorizations,
             tool_round_id=tool_round_id,
             approval_id=approval_id,
+            input_id=input_id,
+            idempotency_key=idempotency_key,
             redactor=redactor,
         ):
             yield event, None
@@ -7068,6 +7139,7 @@ class CayuApp:
         )
         payload = {
             "tool_call_id": tool_call.id,
+            "idempotency_key": idempotency_key,
             "result": result.model_dump(),
             # A before_tool_call hook may have rewritten the args; record what actually executed so
             # audit / replay can reconstruct the effective call (TOOL_CALL_STARTED still shows the
@@ -7078,6 +7150,8 @@ class CayuApp:
             payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
+        if input_id is not None:
+            payload["input_id"] = input_id
         async for event in self._emit_tool_call_result_with_hooks(
             event=Event(
                 type=event_type,
@@ -7215,7 +7289,9 @@ class CayuApp:
         records: list[_ProxyAuthorizationRecord],
         tool_round_id: str | None,
         approval_id: str | None,
+        input_id: str | None,
         redactor: SecretRedactor,
+        idempotency_key: str | None = None,
     ) -> AsyncIterator[Event]:
         for record in records:
             payload: dict[str, Any] = {
@@ -7231,10 +7307,14 @@ class CayuApp:
                     "result_metadata",
                 ),
             }
+            if idempotency_key is not None:
+                payload["idempotency_key"] = idempotency_key
             if tool_round_id is not None:
                 payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
             if redactor.has_values:
                 redacted_payload = redactor.redact_json(payload)
                 if type(redacted_payload) is not dict:
@@ -8000,6 +8080,11 @@ class CayuApp:
                     payload={
                         "tool_round_id": pending_round.round_id,
                         "tool_call_id": tool_call.id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_round_id=pending_round.round_id,
+                            tool_call_id=tool_call.id,
+                        ),
                         "recovered": True,
                         "result": result.model_dump(),
                     },
@@ -8681,6 +8766,7 @@ class CayuApp:
         task_id: str | None,
         tool_round_id: str | None,
         approval_id: str | None,
+        input_id: str | None,
         allow_modification: bool,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         # Shared emission for the before-hook block / short-circuit terminal results.
@@ -8693,6 +8779,8 @@ class CayuApp:
             payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
+        if input_id is not None:
+            payload["input_id"] = input_id
         async for event in self._emit_tool_call_result_with_hooks(
             event=Event(
                 type=event_type,
@@ -10436,6 +10524,11 @@ def _interrupted_tool_call_event(
 ) -> Event:
     payload = {
         "tool_call_id": tool_call_outcome.call.id,
+        "idempotency_key": tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_outcome.call.id,
+        ),
         "result": tool_call_outcome.result.model_dump(),
     }
     if tool_round_id is not None:
@@ -10461,6 +10554,11 @@ def _limit_reached_tool_call_event(
 ) -> Event:
     payload = {
         "tool_call_id": tool_call_outcome.call.id,
+        "idempotency_key": tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_outcome.call.id,
+        ),
         "reason": "limit_reached",
         "limit": decision.limit.value,
         "result": tool_call_outcome.result.model_dump(),

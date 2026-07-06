@@ -12,6 +12,7 @@ from cayu.runtime import (
     RunLimits,
     RunRequest,
 )
+from cayu.runtime import _tool_execution as tool_execution
 from cayu.tools.commands import ExecCommandTool
 from cayu.tools.files import WriteFileTool
 from cayu.tools.knowledge import RememberKnowledgeTool
@@ -52,6 +53,8 @@ class _Recorder:
         self.max_active = 0
         self.order: list[str] = []
         self.completed: list[str] = []
+        self.context_idempotency_keys: list[str | None] = []
+        self.metadata_idempotency_keys: list[str | None] = []
 
 
 class _RecordingTool(Tool):
@@ -80,6 +83,8 @@ class _RecordingTool(Tool):
         rec.active += 1
         rec.max_active = max(rec.max_active, rec.active)
         rec.order.append(f"start:{tag}")
+        rec.context_idempotency_keys.append(ctx.idempotency_key)
+        rec.metadata_idempotency_keys.append(ctx.metadata.get("idempotency_key"))
         try:
             await asyncio.sleep(args.get("delay", 0.05))
         finally:
@@ -117,6 +122,21 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
     assert RememberKnowledgeTool.spec.parallel_safe is False
 
 
+def test_tool_idempotency_key_preserves_component_boundaries() -> None:
+    first = tool_execution.tool_idempotency_key(
+        session_id="session\x00round",
+        tool_call_id="call",
+        tool_round_id="approval",
+    )
+    second = tool_execution.tool_idempotency_key(
+        session_id="session",
+        tool_call_id="call",
+        tool_round_id="round\x00approval",
+    )
+
+    assert first != second
+
+
 def test_parallel_safe_tools_run_concurrently() -> None:
     recorder = _Recorder()
     app = _build(
@@ -139,6 +159,43 @@ def test_parallel_safe_tools_run_concurrently() -> None:
     assert events[-1].type == EventType.SESSION_COMPLETED
     # The two parallel-safe calls overlapped in time.
     assert recorder.max_active == 2
+
+
+def test_tool_context_receives_stable_idempotency_key_from_round_identity() -> None:
+    recorder = _Recorder()
+    app = _build(
+        tools=[_RecordingTool(recorder, name="identity_tool")],
+        tool_calls=[("call_1", "identity_tool", {"tag": "a"})],
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_identity",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+
+    started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
+    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+
+    key = started.payload["idempotency_key"]
+    assert key.startswith("cayu-tool:v1:")
+    assert len(key) == len("cayu-tool:v1:") + 64
+    assert recorder.context_idempotency_keys == [key]
+    assert recorder.metadata_idempotency_keys == [key]
+
+    expected_key = tool_execution.tool_idempotency_key(
+        session_id="s_identity",
+        tool_round_id=started.payload["tool_round_id"],
+        tool_call_id="call_1",
+    )
+    assert key == expected_key
+    assert completed.payload["tool_round_id"] == started.payload["tool_round_id"]
+    assert completed.payload["idempotency_key"] == key
 
 
 def test_parallel_safe_false_does_not_overlap_and_runs_after_the_batch() -> None:
@@ -318,6 +375,17 @@ def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
     results = {p.tool_call_id: p for p in tool_message.content if isinstance(p, ToolResultPart)}
     assert set(results) == {"call_1", "call_2"}  # complete round — every call has a result
     assert results["call_1"].is_error is True  # synthesized abnormal-termination error
+    abnormal_event = next(
+        event
+        for event in events
+        if event.type == EventType.TOOL_CALL_FAILED
+        and event.payload.get("abnormal_termination") is True
+    )
+    assert abnormal_event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="s_cancel",
+        tool_round_id=abnormal_event.payload["tool_round_id"],
+        tool_call_id="call_1",
+    )
 
 
 def test_max_parallel_one_runs_sequentially() -> None:

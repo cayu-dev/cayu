@@ -128,6 +128,7 @@ from cayu.runtime import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime.context import (
     ContextBuildResult,
     RuntimeManagedContextPolicy,
@@ -5076,6 +5077,11 @@ def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool()
     assert events[7].payload["limit"] == "tool_calls"
     assert events[7].payload["actual"] == 2
     assert events[8].payload["tool_call_id"] == "call_2"
+    assert events[8].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_tool_limit",
+        tool_round_id=events[8].payload["tool_round_id"],
+        tool_call_id="call_2",
+    )
 
     transcript = asyncio.run(store.load_transcript("sess_tool_limit"))
     assert [message.role for message in transcript] == [
@@ -11243,6 +11249,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert events[3].tool_name == "echo"
     assert events[3].payload == {
         "tool_call_id": "call_1",
+        "idempotency_key": events[3].payload["idempotency_key"],
         "arguments": {"text": "from tool"},
         "tool_round_id": events[3].payload["tool_round_id"],
     }
@@ -11428,6 +11435,11 @@ def test_cayu_app_recovers_pending_tool_round_before_tool_started():
         if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
     ]
     assert len(recovered_failures) == 1
+    assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_tool_round_recover_not_started",
+        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_call_id="call_1",
+    )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_not_started",
@@ -11513,6 +11525,11 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
         if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
     ]
     assert len(recovered_failures) == 1
+    assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_tool_round_recover_unknown",
+        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_call_id="call_1",
+    )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_missing_terminal_event",
@@ -11612,6 +11629,11 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
     assert (
         recovered_failures[0].payload["tool_round_id"]
         == checkpoint["pending_tool_round"]["round_id"]
+    )
+    assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_tool_round_recover_reused_id",
+        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_call_id="call_1",
     )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
@@ -12167,6 +12189,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert blocked_event.payload["tool_round_id"] == events[3].payload["tool_round_id"]
     assert blocked_event.payload == {
         "tool_call_id": "call_1",
+        "idempotency_key": blocked_event.payload["idempotency_key"],
         "tool_round_id": blocked_event.payload["tool_round_id"],
         "decision": "deny",
         "reason": "Tool denied by policy: side_effect",
@@ -12863,6 +12886,11 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
+    assert events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_tool_approval_deny",
+        tool_call_id="call_1",
+        approval_id=approval_id,
+    )
     assert tool.calls == []
     assert provider.requests[1].messages[-1].role == "tool"
     tool_result = provider.requests[1].messages[-1].content[0]
@@ -13574,6 +13602,11 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
         EventType.SESSION_COMPLETED,
     ]
     assert recovery_events[1].payload["approval_id"] == approval_id
+    assert recovery_events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_approval_started_without_terminal",
+        tool_call_id="call_1",
+        approval_id=approval_id,
+    )
     assert recovery_events[1].payload["manual_recovery"] is True
     assert recovery_events[1].payload["result"]["content"] == ("side effect completed externally")
     assert tool.calls == [{"value": "secret"}]
@@ -14306,9 +14339,15 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"tenant": {"id": "mutated"}}
+    assert tool.contexts[0].metadata["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_policy_run_metadata",
+        tool_round_id=events[3].payload["tool_round_id"],
+        tool_call_id="call_1",
+    )
     assert tool.contexts[0].metadata == {
         "tenant": {"id": "tenant_1"},
         "tool_call_id": "call_1",
+        "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
     }
     tool.contexts[0].metadata["tenant"]["id"] = "tool-mutated"
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
@@ -14512,9 +14551,15 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"resume": {"id": "mutated"}}
+    assert tool.contexts[0].metadata["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_policy_resume_metadata",
+        tool_round_id=events[3].payload["tool_round_id"],
+        tool_call_id="call_1",
+    )
     assert tool.contexts[0].metadata == {
         "resume": {"id": "resume_1"},
         "tool_call_id": "call_1",
+        "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
     }
     tool.contexts[0].metadata["resume"]["id"] = "tool-mutated"
     session = asyncio.run(store.load("sess_policy_resume_metadata"))
@@ -23496,6 +23541,11 @@ def test_interrupt_session_stops_in_flight_tool_call():
     ]
     assert len(failed_tool_events) == 1
     assert failed_tool_events[0].payload["tool_call_id"] == "call_1"
+    assert failed_tool_events[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+        session_id="sess_interrupt_tool_call",
+        tool_round_id=failed_tool_events[0].payload["tool_round_id"],
+        tool_call_id="call_1",
+    )
     assert failed_tool_events[0].payload["result"]["is_error"] is True
     assert failed_tool_events[0].payload["result"]["structured"] == {
         "interrupted": True,
