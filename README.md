@@ -1,6 +1,133 @@
 # Cayu
 
-Cayu is an open-source Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
+Cayu is an open-source runtime for production AI agents.
+
+Cayu is built for agents that need to survive real work: long-running sessions,
+tool calls, human approval, context limits, retries, budget enforcement, durable
+state, evals, and recovery.
+
+Cayu is not a prompt-chain DSL or an orchestration framework. It is the runtime
+layer you build on directly: sessions, tools, storage, context management,
+provider routing, observability, and human-in-the-loop control.
+
+You do not need LangChain, LangGraph, CrewAI, or another agent framework to build
+production agents with Cayu. Cayu owns the loop those frameworks usually hide:
+model calls, tool execution, transcript state, approvals, budgets, context
+projection, recovery, and events.
+
+## Why Cayu
+
+Most agent frameworks help you assemble prompts, tools, and graphs. Production
+agent systems usually fail somewhere else:
+
+- The model calls the right tool with the wrong authority.
+- A tool needs human approval halfway through a run.
+- A process crashes after a side effect but before the transcript is updated.
+- Context grows until the provider rejects the request.
+- A team cannot explain why one task spent too much money.
+- Memory becomes unreviewed model-written state.
+- Eval coverage lives outside the runtime and misses real behavior.
+
+Cayu treats those as runtime problems, not application afterthoughts.
+
+Frameworks are useful for getting a prototype moving. Cayu is for the point
+where the agent starts doing consequential work and you need to own the runtime
+instead of debugging through framework abstractions.
+
+## What Cayu Provides
+
+| Problem | Cayu primitive |
+| --- | --- |
+| Long-running work | Durable sessions, transcripts, events, resume, fork |
+| Tool safety | Tool policies, approvals, taint-aware controls |
+| Human-in-the-loop | `ask_user`, approval checkpoints, recovery APIs |
+| Context pressure | Counting, estimation, compaction, overflow recovery |
+| Knowledge | Reviewed memory, indexing, recall tools, pgvector support |
+| Cost control | Usage events, budget policies, causal budget summaries |
+| Provider flexibility | OpenAI, Anthropic, Vertex, OpenAI-compatible providers |
+| Evals | Runtime trajectories, assertions, replay, LLM judges |
+
+## Environments Are The Execution Boundary
+
+In Cayu, an agent is separated from the environment it runs in.
+
+`AgentSpec` describes who the agent is: model, instructions, defaults, and
+runtime policies.
+
+`Environment` describes what the agent can touch: workspace, artifact store,
+runner, vault, credential proxy, knowledge store, MCP servers, and workspace
+binding.
+
+That split lets the same agent run locally, in Docker, in a microVM sandbox, in
+E2B, or behind your own hosted infrastructure without rewriting the agent.
+
+```text
+AgentSpec
+  -> identity, model, instructions, policies
+
+Environment
+  -> workspace, runner, artifacts, vault, proxy, knowledge, MCP
+
+Session
+  -> durable transcript, events, provider/model identity, checkpoints
+
+ToolContext
+  -> runtime services exposed to a tool for one run
+```
+
+This is why Cayu treats tools as runtime work, not just model schemas. A command
+tool needs a runner. A file tool needs a workspace. A document tool may need an
+artifact store. A production tool may need scoped secrets, approval, proxying,
+and durable recovery.
+
+Those services come from the active environment, not from global process state.
+
+```python
+from pathlib import Path
+
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    Environment,
+    EnvironmentSpec,
+    LocalArtifactStore,
+    LocalRunner,
+    LocalWorkspace,
+)
+
+app = CayuApp()
+root = Path("./workspace")
+root.mkdir(parents=True, exist_ok=True)
+
+app.register_environment(
+    Environment(
+        EnvironmentSpec(name="local-dev"),
+        workspace=LocalWorkspace(root, workspace_id="local"),
+        artifact_store=LocalArtifactStore("./.cayu/artifacts"),
+        runner=LocalRunner(root),
+    ),
+    default=True,
+)
+
+app.register_agent(
+    AgentSpec(
+        name="builder",
+        model="gpt-5.5",
+        system_prompt="You are a careful coding agent.",
+    )
+)
+```
+
+### Fresh Environments Per Session
+
+Static environments work for local development and trusted single-process apps.
+For production, Cayu can register an `EnvironmentFactory` that creates or
+reattaches the concrete environment for each session.
+
+Factories receive durable session context and can return reconnect metadata,
+such as a sandbox id, region, image, or attach handle. On resume, approval
+continuation, or recovery, Cayu passes that metadata back so the runtime can
+reattach instead of guessing.
 
 ## Contents
 
@@ -113,17 +240,36 @@ Reference and design docs (deeper, maintainer-facing):
 
 ## Scope
 
-Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio and Streamable HTTP MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory, SQLite, and Postgres session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory, SQLite, and Postgres task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
+Cayu's runtime core was extracted from a production agent system used at multiple
+mid-size and enterprise companies. The public package includes core contracts,
+environment registration, local workspace/runner/artifact-store implementations,
+runtime-native file, artifact, command, knowledge recall, and stdio and
+Streamable HTTP MCP tool adapters, first-class tool policies for scoped
+authority and durable tool approvals, in-memory, SQLite, and Postgres
+session/event/transcript stores, explicit session resume, resumable session
+interruption, session-level usage/cache summaries, hard token/tool/time run
+limits, and session fork with persisted provider/model identity, in-memory,
+SQLite, and Postgres task stores, in-memory/SQLite/Postgres knowledge stores,
+deterministic knowledge indexing, event sinks and structured runtime logging,
+model-provider contracts, model-facing context policies, checkpoint-backed
+context compaction, Anthropic Messages API and OpenAI Responses API providers
+with certifi-backed TLS verification, structured message/tool-call handling,
+tool execution, tool-result feedback to the model, max-step protection,
+validation for runtime boundary data, and an optional FastAPI server with a
+packaged dashboard for inspecting runs, sessions, tasks, transcripts, events,
+and pending knowledge review.
 
-The current public scope is the runtime and integration layer. Hosted deployment adapters, durable production vector indexes, and higher-level task orchestration are expected to live in companion packages or application code.
+The current public scope is the runtime and integration layer. Hosted deployment
+adapters, durable production vector indexes, and higher-level task orchestration
+are expected to live in companion packages or application code.
 
 ## Contract Rules
 
 Cayu treats payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data as JSON data. These fields must contain JSON-compatible values: objects, arrays, strings, integers, finite floats, booleans, and null. Tuples, arbitrary Python objects, non-string object keys, circular references, NaN, and Infinity are rejected. Task input, result, error, and metadata fields are top-level JSON objects with JSON-compatible nested values.
 
-Framework objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
+Runtime objects are copied at runtime boundaries. Mutating an agent, environment, or tool object after registration is not part of the public contract. To change a registered declaration, register a new configuration or use an explicit update API once one exists.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
+Runtime-native tools receive services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
 
 Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue. This `tool.call.blocked` contract covers the app-level `ToolPolicy` gate; a tool's *own* internal policy — such as an `ExecCommandTool(policy=...)` `CommandPolicy` denial — instead surfaces as `tool.call.failed` with a structured error, so observability that watches only `tool.call.blocked` will miss command denials.
 
@@ -131,7 +277,7 @@ Tool policies authorize registered tool calls before execution. Denied calls emi
 
 ```text
 src/cayu/
-  core/        framework primitives: events, messages, agents, tools, workflows
+  core/        runtime primitives: events, messages, agents, tools, workflows
   artifacts/   uploaded/generated file storage contracts
   environments/ execution context contracts
   runtime/     app runtime, sessions, event sinks
@@ -728,7 +874,7 @@ app = CayuApp(loop_policies=[EmptyAnswerRepairPolicy()])
 ```
 
 Policies can also interrupt or fail the session. Cayu records durable
-`custom.loop.before_stop.*` events for configured policies. The framework does
+`custom.loop.before_stop.*` events for configured policies. The runtime does
 not ship a built-in goal judge or task gate; those should be app code built on
 this seam. Runs with `StructuredOutputSpec` use the structured-output retry and
 completion path instead of generic before-stop policies.
@@ -939,7 +1085,7 @@ app.register_agent(
 )
 ```
 
-Cayu blocks provider options that would replace framework-owned fields such as
+Cayu blocks provider options that would replace runtime-owned fields such as
 messages, tools, `store`, or `previous_response_id`, but it preserves
 provider-specific cache controls as request options. OpenAI prompt caching is
 mostly automatic and can use `prompt_cache_key` / `prompt_cache_retention`.
@@ -954,7 +1100,7 @@ request for that agent. Provider-backed compaction can use the existing
 
 Estimate session cost from the same durable usage events by passing your own
 pricing table. Cayu does not ship hardcoded provider prices because those change
-outside the framework:
+outside the runtime:
 
 ```python
 from decimal import Decimal
