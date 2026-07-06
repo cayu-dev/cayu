@@ -11,8 +11,14 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any, LiteralString, cast
 
-from psycopg.errors import ForeignKeyViolation, UniqueViolation
-from psycopg_pool import AsyncConnectionPool
+try:
+    from psycopg.errors import ForeignKeyViolation, UniqueViolation
+    from psycopg_pool import AsyncConnectionPool
+except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without the extra
+    raise RuntimeError(
+        "Cayu's Postgres stores require the optional psycopg packages. "
+        'Install them with `pip install "cayu[postgres]"`.'
+    ) from exc
 
 from cayu._validation import (
     copy_json_object,

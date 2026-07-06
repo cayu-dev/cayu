@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -326,10 +326,18 @@ class AnthropicProvider(ModelProvider):
         else:
             if credential_proxy is not None:
                 raise ValueError("credential_proxy requires api_key_ref.")
-            self.api_key = require_nonblank(
-                api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", ""),
-                "api_key",
+            if api_key is not None and type(api_key) is not str:
+                raise TypeError("api_key must be a string.")
+            resolved_api_key = (
+                api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
             )
+            if not resolved_api_key.strip():
+                raise ValueError(
+                    "AnthropicProvider requires an API key: set the ANTHROPIC_API_KEY "
+                    "environment variable, pass api_key=..., or pass api_key_ref=SecretRef(...) "
+                    "with a credential_proxy for deferred resolution."
+                )
+            self.api_key = resolved_api_key
         self.api_key_ref = api_key_ref
         self.credential_proxy = credential_proxy
         self.base_url = _validate_base_url(base_url)

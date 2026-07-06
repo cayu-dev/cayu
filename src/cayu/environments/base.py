@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import ArtifactStore
@@ -41,6 +41,21 @@ class EnvironmentSpec(BaseModel):
 
     name: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_live_object_kwargs(cls, data: Any) -> Any:
+        # workspace/runner/binding/vault/proxy are live objects passed to
+        # Environment(spec, workspace=..., ...), not fields of EnvironmentSpec.
+        if isinstance(data, dict):
+            misplaced = sorted({"workspace", "runner", "binding", "vault", "proxy"} & set(data))
+            if misplaced:
+                names = ", ".join(misplaced)
+                raise ValueError(
+                    f"EnvironmentSpec does not accept {names}; pass it to "
+                    f"Environment(spec, {misplaced[0]}=...), not EnvironmentSpec(...)."
+                )
+        return data
 
     @field_validator("metadata", mode="before")
     @classmethod

@@ -136,6 +136,28 @@ class StaticToolPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class AlwaysRequireApprovalToolPolicy(ToolPolicy):
+    """Require caller approval for specific tools (or for every tool).
+
+    When ``tools`` is given, only those tool names require approval and the rest
+    are allowed; when omitted, every tool call requires approval. Use this to gate
+    side-effecting tools (post a PR comment, send an email) behind
+    ``resolve_tool_approval`` without hand-writing a policy — instead of abusing a
+    deny-everything rule.
+    """
+
+    def __init__(self, *, tools: Iterable[str] | None = None) -> None:
+        self.tools = _copy_tool_name_set(tools, "tools") if tools is not None else None
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        if self.tools is None or request.tool_name in self.tools:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Tool requires caller approval by policy: {request.tool_name}",
+            )
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
 class ParameterRule(ABC):
     """Validates one argument path in a tool call.
 

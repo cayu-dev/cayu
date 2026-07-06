@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -288,10 +288,15 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         reasoning_state: str = "inline",
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
-        self.api_key = require_nonblank(
-            api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", ""),
-            "api_key",
-        )
+        if api_key is not None and type(api_key) is not str:
+            raise TypeError("api_key must be a string.")
+        resolved_api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
+        if not resolved_api_key.strip():
+            raise ValueError(
+                "OpenAIProvider requires an API key: set the OPENAI_API_KEY environment "
+                "variable or pass api_key=... to OpenAIProvider(...)."
+            )
+        self.api_key = resolved_api_key
         self.base_url = _validate_base_url(base_url)
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")

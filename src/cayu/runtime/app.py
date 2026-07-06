@@ -1568,6 +1568,18 @@ class CayuApp:
             },
         )
 
+    def list_agents(self) -> tuple[str, ...]:
+        """Return the names of all registered agents, sorted."""
+        return tuple(sorted(self._agents))
+
+    def list_providers(self) -> tuple[str, ...]:
+        """Return the names of all registered providers, sorted."""
+        return tuple(sorted(self._providers))
+
+    def list_environments(self) -> tuple[str, ...]:
+        """Return the names of all registered environments (concrete or factory), sorted."""
+        return tuple(sorted(self._environments))
+
     def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
         agent_name = require_clean_nonblank(name, "agent.name")
         try:

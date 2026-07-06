@@ -59,6 +59,27 @@ provider plus a custom tool). To add tools, a filesystem workspace, and command
 execution, register an `Environment` — see
 [`examples/local_environment_runtime.py`](examples/local_environment_runtime.py).
 
+## Getting the result and handling failure
+
+`app.run(...)` returns an event stream and never raises on a model or tool failure —
+a failed run ends in a terminal `session.failed` event. To run to completion and get
+the answer (or the error) without hand-inspecting events, use `run_to_completion`:
+
+```python
+from cayu import run_to_completion
+
+outcome = await run_to_completion(app, request)
+if outcome.ok:
+    print(outcome.final_text)             # the agent's final answer
+else:
+    print("run failed:", outcome.error)   # status == "failed"
+```
+
+`RunOutcome` carries `status` (`"completed"` / `"failed"` / `"interrupted"`),
+`final_text`, `error`, and the full `events` tuple. If you already hold a loaded
+transcript, `final_output_text(transcript)` returns the last persisted assistant
+text in that transcript.
+
 ## Featured example: cloud PR reviewer
 
 For the full long-running-agent shape — durable triggers, a per-task sandbox, tool
@@ -83,10 +104,11 @@ Reference and design docs (deeper, maintainer-facing):
 
 - [Runtime contracts](docs/runtime-contracts.md) — the exhaustive contract reference.
 - [Architecture](docs/architecture.md) and [project layout](docs/project-layout.md).
+- [Glossary](docs/glossary.md) — naming notes and disambiguations (`Task` vs `asyncio.Task`, `Runner`, the `*Spec` convention…).
 
 ## Scope
 
-Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio and Streamable HTTP MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
+Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio and Streamable HTTP MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory, SQLite, and Postgres session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory, SQLite, and Postgres task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
 
 The current public scope is the runtime and integration layer. Hosted deployment adapters, durable production vector indexes, and higher-level task orchestration are expected to live in companion packages or application code.
 
@@ -98,7 +120,7 @@ Framework objects are copied at runtime boundaries. Mutating an agent, environme
 
 Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data.
 
-Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue.
+Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue. This `tool.call.blocked` contract covers the app-level `ToolPolicy` gate; a tool's *own* internal policy — such as an `ExecCommandTool(policy=...)` `CommandPolicy` denial — instead surfaces as `tool.call.failed` with a structured error, so observability that watches only `tool.call.blocked` will miss command denials.
 
 ## Repository Layout
 
@@ -122,7 +144,9 @@ src/cayu/
 behind the optional `cayu[microsandbox]` extra for local microVM-backed command
 execution. `E2BRunner` and `E2BWorkspace` are available behind the optional
 `cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
-access.
+access. `PostgresSessionStore` and `PostgresTaskStore` are production-grade,
+multi-worker durable stores behind the optional `cayu[postgres]` extra
+(`pip install "cayu[postgres]"`); pass them to `CayuApp(session_store=..., task_store=...)`.
 
 To run commands on your own platform, implement a custom `Runner`: see the
 [Build a Runner guide](docs/build-a-runner.md) and the worked
@@ -1987,19 +2011,49 @@ from configured source tools as untrusted by origin. Cayu derives prior taint
 from durable tool events and also handles a single model round such as
 `read_email` followed by `send_email` before either tool runs.
 
+An `ExecCommandTool` can also carry its own `CommandPolicy` to restrict *which*
+commands the model may run — the guardrail for a QA agent that runs a project's
+tests:
+
+```python
+from cayu import CommandPolicy, CommandPolicyDecision, CommandPolicyResult, ExecCommandTool
+
+class QaCommandPolicy(CommandPolicy):
+    async def evaluate(self, ctx, request):
+        if request.command.kind == "shell":  # no raw shell strings
+            return CommandPolicyResult(
+                decision=CommandPolicyDecision.DENY, reason="use kind='process' with argv"
+            )
+        if not request.command.argv or request.command.argv[0] not in {"pytest", "python3", "npm"}:
+            return CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason="not allowed")
+        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+
+tool = ExecCommandTool(policy=QaCommandPolicy())
+```
+
+A `CommandPolicy` denial surfaces as a `tool.call.failed` event (see the note in
+Contract Rules on blocked-vs-failed). To gate a whole tool behind human approval,
+pass `AlwaysRequireApprovalToolPolicy(tools=["post_pr_comment"])` as the agent's
+`tool_policy` instead of hand-rolling a deny-everything rule.
+
 Custom policies can also require caller approval before a tool round runs. The runtime checkpoints the pending approval, emits `tool.call.approval_requested`, marks the session `interrupted`, and waits for `resolve_tool_approval(...)`:
 
 ```python
-from cayu import ToolApprovalDecision, ToolApprovalRequest
+from cayu import PendingToolApproval, ToolApprovalDecision, ToolApprovalRequest
 
-async for event in app.resolve_tool_approval(
+# `event` is the tool.call.approval_requested event from the run's event stream.
+# The approval is nested under event.payload["approval"]; from_event reads it
+# (event.payload["approval_id"] would be None).
+pending = PendingToolApproval.from_event(event)
+
+async for resolved in app.resolve_tool_approval(
     ToolApprovalRequest(
-        session_id="sess_123",
-        approval_id="approval_123",
+        session_id=event.session_id,
+        approval_id=pending.approval_id,
         decision=ToolApprovalDecision.APPROVE,
     )
 ):
-    print(event.type)
+    print(resolved.type)
 ```
 
 While a tool approval is pending, `app.resume(...)` rejects normal message resume. Approving or denying the pending approval writes the required tool results and clears the pending checkpoint atomically, then the model loop continues with valid provider-neutral history. If approval close is retried, Cayu reuses durable terminal tool events instead of running completed tools again. If a side-effecting tool started but Cayu cannot prove whether it completed, record the known external outcome and continue without re-running the tool:
@@ -2009,9 +2063,9 @@ from cayu import ToolApprovalRecoveryOutcome, ToolApprovalRecoveryRequest
 
 async for event in app.recover_tool_approval(
     ToolApprovalRecoveryRequest(
-        session_id="sess_123",
-        approval_id="approval_123",
-        tool_call_id="call_123",
+        session_id=event.session_id,
+        approval_id=pending.approval_id,
+        tool_call_id=pending.tool_call_id,
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="Confirmed in email provider logs: the email was sent.",
         structured={"sent": True},

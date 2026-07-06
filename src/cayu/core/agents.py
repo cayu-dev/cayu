@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event
@@ -25,6 +25,20 @@ class AgentSpec(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     provider_options: dict[str, Any] = Field(default_factory=dict)
     thinking: ThinkingConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_registration_kwargs(cls, data: Any) -> Any:
+        # tools/tool_policy belong to CayuApp.register_agent, not AgentSpec.
+        if isinstance(data, dict):
+            misplaced = sorted({"tools", "tool_policy"} & set(data))
+            if misplaced:
+                names = ", ".join(misplaced)
+                raise ValueError(
+                    f"AgentSpec does not accept {names}; pass it to "
+                    f"register_agent(spec, {misplaced[0]}=...), not AgentSpec(...)."
+                )
+        return data
 
     @field_validator("metadata", "provider_options", mode="before")
     @classmethod

@@ -77,9 +77,11 @@ This requires both deterministic orchestration and LLM orchestrator agents.
 
 Cayu follows an agent/environment/session separation:
 
-- `Agent`: model, system prompt, tool declarations, and metadata.
+- `Agent`: an `AgentSpec` — model, system prompt, and metadata. Tools and tool policy are attached separately at `register_agent(spec, tools=..., tool_policy=...)`.
 - `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `Session`: one run of an agent in an environment, with messages, status, events, and checkpoints.
+
+The `*Spec` types (`AgentSpec`, `EnvironmentSpec`, …) are the portable, serializable core of a declaration; live objects — tools, workspaces, runners, providers — are attached at construction or registration, not stored on the spec.
 
 - `Workspace`: active filesystem an agent can work with, such as a target repo or working directory.
 - `ArtifactStore`: uploaded/generated durable file references scoped to a session or environment.

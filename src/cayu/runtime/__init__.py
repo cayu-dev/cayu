@@ -114,6 +114,7 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicyError,
     copy_mcp_manifest_policy,
 )
+from cayu.runtime.outcomes import RunOutcome, run_to_completion
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -182,6 +183,7 @@ from cayu.runtime.tool_policy import (
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
     AllowlistRule,
+    AlwaysRequireApprovalToolPolicy,
     DenyPatternRule,
     ParameterConstrainedToolPolicy,
     ParameterRule,
@@ -218,6 +220,7 @@ __all__ = [
     "AfterToolCallDecision",
     "AllowAllToolPolicy",
     "AllowlistRule",
+    "AlwaysRequireApprovalToolPolicy",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",
@@ -316,6 +319,7 @@ __all__ = [
     "RetryPolicy",
     "RetryReason",
     "RunLimits",
+    "RunOutcome",
     "RunRequest",
     "RuntimeHook",
     "RuntimeHookContext",
@@ -383,6 +387,7 @@ __all__ = [
     "normalize_usage_metrics",
     "retry_decision",
     "run_task_worker",
+    "run_to_completion",
     "session_usage_summary",
     "strip_old_file_attachments",
     "taint_labels_from_metadata",

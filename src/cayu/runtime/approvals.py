@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -249,6 +250,28 @@ class PendingToolApproval(BaseModel):
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
+
+    @classmethod
+    def from_event(cls, event: Event) -> PendingToolApproval:
+        """Build a ``PendingToolApproval`` from a ``tool.call.approval_requested`` event.
+
+        The event payload nests the approval under an ``"approval"`` key, so
+        ``event.payload["approval_id"]`` is ``None``. Use this accessor instead of
+        guessing the shape. Raises ``ValueError`` on the wrong event type or a
+        missing approval payload.
+        """
+        if event.type is not EventType.TOOL_CALL_APPROVAL_REQUESTED:
+            raise ValueError(
+                "PendingToolApproval.from_event expects a "
+                f"{EventType.TOOL_CALL_APPROVAL_REQUESTED.value} event, got {str(event.type)!r}."
+            )
+        approval = (event.payload or {}).get("approval")
+        if not isinstance(approval, dict):
+            raise ValueError(
+                "Event payload has no 'approval' object; expected a "
+                "tool.call.approval_requested event payload."
+            )
+        return cls.model_validate(approval)
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod

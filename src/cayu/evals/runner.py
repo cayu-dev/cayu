@@ -750,6 +750,15 @@ def _session_failure_reason(events: Iterable[Event]) -> str:
 
 
 def final_output_text(transcript: Iterable[Message]) -> str:
+    """Return the text of the last assistant message in ``transcript``.
+
+    Walks the transcript backwards and returns the concatenated text of the most
+    recent assistant message that produced any text (``""`` if none did — e.g. the
+    run ended on a tool call). Use this to pull an agent's final answer out of a
+    loaded session transcript. ``run_to_completion`` instead reports the last
+    completed model turn observed in the live event stream, which can be empty
+    even when an earlier assistant transcript message had text.
+    """
     for message in reversed(tuple(transcript)):
         if message.role != MessageRole.ASSISTANT:
             continue
