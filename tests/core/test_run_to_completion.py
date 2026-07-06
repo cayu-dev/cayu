@@ -14,6 +14,7 @@ from cayu import (
     RunOutcome,
     RunRequest,
     ScriptedModelProvider,
+    SessionStatus,
     Tool,
     ToolContext,
     ToolResult,
@@ -49,6 +50,7 @@ def test_run_to_completion_returns_final_text_and_ok() -> None:
 
     assert isinstance(outcome, RunOutcome)
     assert outcome.ok
+    assert outcome.status is SessionStatus.COMPLETED
     assert outcome.status == "completed"
     assert outcome.final_text == "Hello world"
     assert outcome.error is None
@@ -136,5 +138,16 @@ def test_run_to_completion_reports_failure_without_raising() -> None:
     outcome = asyncio.run(run_to_completion(app, _request()))
 
     assert not outcome.ok
-    assert outcome.status == "failed"
+    assert outcome.status is SessionStatus.FAILED
     assert outcome.error is not None
+
+
+def test_run_to_completion_reports_setup_failure_without_raising() -> None:
+    app = CayuApp()
+
+    outcome = asyncio.run(run_to_completion(app, _request()))
+
+    assert not outcome.ok
+    assert outcome.status is SessionStatus.FAILED
+    assert outcome.error is not None
+    assert "not registered" in outcome.error

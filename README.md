@@ -29,6 +29,9 @@ agent uses tools that touch a workspace, runner, or sandbox.
 pip install cayu
 ```
 
+Scaffold a ready-to-edit project with `cayu new myagent` (an agent, a custom tool,
+and SQLite stores), or wire one up by hand:
+
 ```python
 import asyncio
 
@@ -75,17 +78,19 @@ else:
     print("run failed:", outcome.error)   # status == "failed"
 ```
 
-`RunOutcome` carries `status` (`"completed"` / `"failed"` / `"interrupted"`),
-`final_text`, `error`, and the full `events` tuple. If you already hold a loaded
-transcript, `final_output_text(transcript)` returns the last persisted assistant
-text in that transcript.
+`RunOutcome` carries `status` (a `SessionStatus` with values like
+`"completed"` / `"failed"` / `"interrupted"`), `final_text`, `error`, and the
+full `events` tuple. If you already hold a loaded transcript,
+`final_output_text(transcript)` returns the last persisted assistant text in
+that transcript.
 
 ## Featured example: cloud PR reviewer
 
-For the full long-running-agent shape — durable triggers, a per-task sandbox, tool
-egress, and QA — the [**cloud PR-reviewer recipe**](docs/recipes/pr-reviewer.md)
-composes it end-to-end: a pull request triggers a durable task, a worker checks the
-PR out into a fresh sandbox, the agent QAs the change by running the test suite, and
+For the full long-running-agent shape — durable triggers, a per-task review
+workspace, tool egress, and QA — the
+[**cloud PR-reviewer recipe**](docs/recipes/pr-reviewer.md) composes it
+end-to-end: a pull request triggers a durable task, a worker checks the PR out
+into a fresh workspace, the agent QAs the change by running the test suite, and
 it posts one review comment back. Runnable code lives in
 [`examples/github_pr_reviewer/`](examples/github_pr_reviewer/); run the no-key demo
 with `PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py`.
@@ -1288,13 +1293,12 @@ Run a deterministic stdio MCP example:
 PYTHONPATH=src python examples/stdio_mcp_runtime.py
 ```
 
-A remote (Streamable HTTP) MCP server is the same call with a `url` instead of a
-`command`; `connect_mcp_toolset` auto-selects the HTTP transport, and credentials
-flow through the vault as `secret_headers` (never inlined):
+A remote (Streamable HTTP) MCP server uses a `url` instead of a `command`.
+Credentials flow through `secret_headers` (never inlined); pass an HTTP client
+with a secret resolver so those headers can be resolved:
 
 ```python
-from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, connect_mcp_toolset
-from cayu.vaults import SecretRef
+from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, SecretRef, connect_mcp_toolset
 
 vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
 toolset = await connect_mcp_toolset(

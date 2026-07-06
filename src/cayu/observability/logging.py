@@ -167,6 +167,8 @@ def _summarize_event(
         _append(parts, "tool", event.tool_name, redactor=redactor)
         _append(parts, "call", payload.get("tool_call_id"), redactor=redactor)
         _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
+        if event_type == EventType.TOOL_CALL_FAILED:
+            _append_tool_result_reason(parts, payload, limit=error_summary_limit, redactor=redactor)
     elif event_type in {
         EventType.SESSION_FAILED,
         EventType.MODEL_ERROR,
@@ -276,6 +278,23 @@ def _append_cost_diagnostics(
             break
     if unpriced_models:
         parts.append("unpriced_models=" + _clean(",".join(unpriced_models), redactor=redactor))
+
+
+def _append_tool_result_reason(
+    parts: list[str],
+    payload: dict[str, Any],
+    *,
+    limit: int,
+    redactor: SecretRedactor,
+) -> None:
+    # A tool failure's message lives in the ToolResult content (payload["result"]),
+    # not a top-level "error" key, so the default ERROR line would otherwise carry
+    # no reason. Surface it (bounded and redacted).
+    result = payload.get("result")
+    if type(result) is dict:
+        content = result.get("content")
+        if type(content) is str and content:
+            parts.append(f"reason={_truncate(_clean(content, redactor=redactor), limit)}")
 
 
 def _append_error(

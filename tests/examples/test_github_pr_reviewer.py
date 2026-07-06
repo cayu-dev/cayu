@@ -9,16 +9,21 @@ this test instead of silently breaking the featured example.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
+import importlib
 import importlib.util
-import json
+import shutil
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from cayu import Event, EventType, ScriptedModelProvider, SQLiteTaskStore, TaskStatus
+from cayu import (
+    EnvironmentFactoryRequest,
+    PassthroughProxy,
+    ScriptedModelProvider,
+    Task,
+    ToolContext,
+)
+from cayu.vaults import StaticVault
 
 _EXAMPLE_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "github_pr_reviewer" / "pr_reviewer.py"
@@ -34,52 +39,54 @@ def _load_example():
 
 
 mod = _load_example()
+demo_mod = importlib.import_module("examples.github_pr_reviewer.demo")
+github_tools_mod = importlib.import_module("examples.github_pr_reviewer.github_tools")
+worker_mod = importlib.import_module("examples.github_pr_reviewer.worker")
 
 _EXPECTED_TOOLS = {"get_pr_diff", "post_pr_comment", "read_file", "list_files", "exec_command"}
-_DEFAULT_HEAD_REPO = object()
 
 
-def _webhook_client(tmp_path: Path, *, webhook_secret: str | None = None):
-    try:
-        from fastapi.testclient import TestClient
-    except ImportError:
-        pytest.skip("fastapi test client is not installed")
+class _GitHubResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
 
-    store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-    return store, TestClient(mod.build_webhook_app(store, webhook_secret=webhook_secret))
+    def json(self):
+        return self._payload
 
 
-def _pull_request_payload(
+def _pr_payload(
     *,
-    action: str = "opened",
-    head_repo: dict | None | object = _DEFAULT_HEAD_REPO,
+    title: str = "PR",
+    changed_files: int = 1,
+    head_ref: str = "feature",
+    head_sha: str = "sha",
+    base_ref: str = "main",
 ) -> dict:
-    if head_repo is _DEFAULT_HEAD_REPO:
-        head_repo = {"clone_url": "https://github.com/octo/repo.git"}
     return {
-        "action": action,
-        "repository": {
-            "name": "repo",
-            "full_name": "octo/repo",
-            "owner": {"login": "octo"},
-            "clone_url": "https://github.com/octo/repo.git",
-        },
-        "pull_request": {
-            "number": 12,
-            "head": {
-                "ref": "feature",
-                "sha": "abc123",
-                "repo": head_repo,
-            },
-            "base": {"ref": "main"},
-        },
+        "title": title,
+        "body": None,
+        "changed_files": changed_files,
+        "head": {"ref": head_ref, "sha": head_sha},
+        "base": {"ref": base_ref},
+    }
+
+
+def _file_payload(index: int | str = 0, patch: str = "+ok\n") -> dict:
+    return {
+        "filename": f"file_{index}.py" if type(index) is int else index,
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+        "patch": patch,
     }
 
 
 def test_build_app_composes_the_reviewer(tmp_path: Path) -> None:
     app, _task_store = mod.build_app(
         tmp_path / "tasks.sqlite",
-        tmp_path / "sandboxes",
+        tmp_path / "workspaces",
         provider=ScriptedModelProvider([]),
         model="scripted-model",
     )
@@ -95,579 +102,546 @@ def test_build_provider_requires_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
         mod.build_provider()
 
 
-def test_qa_policy_denies_raw_shell_but_allows_allowlisted() -> None:
-    # Pure-logic guard on the safety rail that lets the agent "QA end-to-end".
-    assert "python3" in mod._ALLOWED_QA_COMMANDS
-    assert "rm" in mod._DENYLISTED_TOKENS
+def test_pr_workspace_fetches_github_pull_ref(tmp_path: Path) -> None:
+    factory = mod.PRReviewWorkspaceFactory(tmp_path, with_credentials=False)
 
-
-def test_enqueue_pr_review_is_idempotent_with_delivery_task_id(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        task_id = mod._github_delivery_task_id("delivery-123")
-        first = await mod.enqueue_pr_review(
-            store,
-            owner="octo",
-            repo="repo",
-            pr_number=12,
-            repo_url="https://github.com/octo/repo.git",
-            head_ref="feature",
-            head_sha="abc123",
-            base_ref="main",
-            task_id=task_id,
-            github_delivery_id="delivery-123",
-        )
-        second = await mod.enqueue_pr_review(
-            store,
-            owner="octo",
-            repo="repo",
-            pr_number=12,
-            repo_url="https://github.com/octo/repo.git",
-            head_ref="feature",
-            head_sha="abc123",
-            base_ref="main",
-            task_id=task_id,
-            github_delivery_id="delivery-123",
-        )
-
-        assert first.id == second.id == task_id
-        assert second.metadata["github_delivery_id"] == "delivery-123"
-
-    asyncio.run(run_case())
-
-
-def test_enqueue_pr_review_rejects_conflicting_duplicate_task_id(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        task_id = mod._github_delivery_task_id("delivery-123")
-        await mod.enqueue_pr_review(
-            store,
-            owner="octo",
-            repo="repo",
-            pr_number=12,
-            repo_url="https://github.com/octo/repo.git",
-            head_ref="feature",
-            head_sha="abc123",
-            base_ref="main",
-            task_id=task_id,
-            github_delivery_id="delivery-123",
-        )
-
-        with pytest.raises(
-            mod.DeliveryTaskConflictError,
-            match="GitHub delivery id already exists with different task data",
-        ):
-            await mod.enqueue_pr_review(
-                store,
-                owner="octo",
-                repo="repo",
-                pr_number=12,
-                repo_url="https://github.com/octo/repo.git",
-                head_ref="different-feature",
-                head_sha="def456",
-                base_ref="main",
-                task_id=task_id,
-                github_delivery_id="delivery-123",
+    result = asyncio.run(
+        factory.create(
+            EnvironmentFactoryRequest(
+                session_id="review-42",
+                agent_name="pr-reviewer",
+                environment_name="pr-workspace",
+                metadata={
+                    "repo_url": "https://github.com/acme/app.git",
+                    "head_ref": "feature-from-fork",
+                    "base_ref": "main",
+                    "pr_number": 42,
+                    "head_sha": "abc123def456",
+                },
             )
+        )
+    )
 
-    asyncio.run(run_case())
+    binding = result.environment.binding
+    assert binding is not None
+    assert binding.ref == "abc123def456"
+    assert binding.fetch_refspecs == ["+refs/pull/42/head:refs/cayu/pr-42"]
 
 
-def test_enqueue_pr_review_preserves_non_duplicate_store_errors() -> None:
-    class FailingStore:
-        async def create_task(self, request):
-            raise ValueError("backend unavailable")
-
-        async def load_task(self, task_id: str):
-            return None
-
-    async def run_case() -> None:
-        with pytest.raises(ValueError, match="backend unavailable"):
-            await mod.enqueue_pr_review(
-                FailingStore(),
-                owner="octo",
-                repo="repo",
-                pr_number=12,
-                repo_url="https://github.com/octo/repo.git",
-                head_ref="feature",
-                head_sha="abc123",
-                base_ref="main",
-                task_id=mod._github_delivery_task_id("delivery-123"),
-                github_delivery_id="delivery-123",
+def test_pr_workspace_can_rebind_same_pull_ref(tmp_path: Path) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required for this example")
+    origin, pr_head = demo_mod._create_demo_origin(tmp_path)
+    factory = mod.PRReviewWorkspaceFactory(tmp_path / "workspaces", with_credentials=False)
+    result = asyncio.run(
+        factory.create(
+            EnvironmentFactoryRequest(
+                session_id="review-1",
+                agent_name="pr-reviewer",
+                environment_name="pr-workspace",
+                metadata={
+                    "repo_url": str(origin),
+                    "head_ref": "fixture-pr",
+                    "base_ref": "main",
+                    "pr_number": 1,
+                    "head_sha": pr_head,
+                },
             )
-
-    asyncio.run(run_case())
-
-
-def test_review_session_id_is_stable_per_delivery_and_distinct_per_update() -> None:
-    first = mod._review_session_id(
-        owner="octo",
-        repo="repo",
-        pr_number=12,
-        task_id="task-a",
-        head_sha="aaaaaaaaaaaabbbb",
-    )
-    duplicate_delivery = mod._review_session_id(
-        owner="octo",
-        repo="repo",
-        pr_number=12,
-        task_id="task-a",
-        head_sha="aaaaaaaaaaaabbbb",
-    )
-    same_sha_new_delivery = mod._review_session_id(
-        owner="octo",
-        repo="repo",
-        pr_number=12,
-        task_id="task-c",
-        head_sha="aaaaaaaaaaaabbbb",
-    )
-    updated_pr = mod._review_session_id(
-        owner="octo",
-        repo="repo",
-        pr_number=12,
-        task_id="task-b",
-        head_sha="bbbbbbbbbbbbcccc",
-    )
-
-    assert first == duplicate_delivery
-    assert first != same_sha_new_delivery
-    assert first != updated_pr
-
-
-def test_terminalize_claimed_task_marks_unstarted_failed_session_failed(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        task = await store.create_task(mod.TaskCreate(task_id="task-a", type="review"))
-        task = await store.claim_task("worker-a")
-        assert task is not None
-        assert task.status == TaskStatus.CLAIMED
-
-        finished = await mod._terminalize_claimed_task_if_needed(
-            store,
-            task_id="task-a",
-            worker_id="worker-a",
-            terminal_event=Event(
-                type=EventType.SESSION_FAILED,
-                session_id="sess-a",
-                agent_name="pr-reviewer",
-                payload={"error": "checkout failed", "error_type": "RuntimeError"},
-            ),
         )
+    )
+    environment = result.environment
+    assert environment.binding is not None
+    assert environment.binding.ref == pr_head
+    assert environment.workspace is not None
+    assert environment.runner is not None
 
-        assert finished is not None
-        assert finished.status == TaskStatus.FAILED
-        assert finished.error == {
-            "status": "failed",
-            "error": "checkout failed",
-            "error_type": "RuntimeError",
-        }
-
-    asyncio.run(run_case())
-
-
-def test_terminalize_claimed_task_keeps_already_terminal_task(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        await store.create_task(mod.TaskCreate(task_id="task-a", type="review"))
-        await store.claim_task("worker-a")
-        await store.complete_task("task-a", {"ok": True}, worker_id="worker-a")
-
-        finished = await mod._terminalize_claimed_task_if_needed(
-            store,
-            task_id="task-a",
-            worker_id="worker-a",
-            terminal_event=Event(
-                type=EventType.SESSION_FAILED,
-                session_id="sess-a",
-                agent_name="pr-reviewer",
-                payload={"error": "late failure", "error_type": "RuntimeError"},
-            ),
+    asyncio.run(
+        environment.binding.bind(
+            environment.workspace,
+            environment.runner,
+            session_id="review-1",
+            agent_name="pr-reviewer",
+            environment_name="pr-workspace",
         )
-
-        assert finished is not None
-        assert finished.status == TaskStatus.COMPLETED
-        assert finished.result == {"ok": True}
-
-    asyncio.run(run_case())
-
-
-def test_terminalize_claimed_task_records_completed_session_result(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        await store.create_task(mod.TaskCreate(task_id="task-a", type="review"))
-        await store.claim_task("worker-a")
-
-        finished = await mod._terminalize_claimed_task_if_needed(
-            store,
-            task_id="task-a",
-            worker_id="worker-a",
-            terminal_event=Event(
-                type=EventType.SESSION_COMPLETED,
-                session_id="sess-a",
-                agent_name="pr-reviewer",
-                payload={},
-            ),
+    )
+    asyncio.run(
+        environment.binding.bind(
+            environment.workspace,
+            environment.runner,
+            session_id="review-1",
+            agent_name="pr-reviewer",
+            environment_name="pr-workspace",
         )
-
-        assert finished is not None
-        assert finished.status == TaskStatus.COMPLETED
-        assert finished.result == {"status": "completed"}
-
-    asyncio.run(run_case())
+    )
 
 
-def test_terminalize_claimed_task_records_interrupted_session_result(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        await store.create_task(mod.TaskCreate(task_id="task-a", type="review"))
-        await store.claim_task("worker-a")
+def test_worker_once_uses_generic_task_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
 
-        finished = await mod._terminalize_claimed_task_if_needed(
-            store,
-            task_id="task-a",
-            worker_id="worker-a",
-            terminal_event=Event(
-                type=EventType.SESSION_INTERRUPTED,
-                session_id="sess-a",
-                agent_name="pr-reviewer",
-                payload={},
-            ),
-        )
+    async def fake_run_task_worker(app, task_store, handler, **kwargs):
+        captured.update({"app": app, "task_store": task_store, "handler": handler, **kwargs})
+        return 1
 
-        assert finished is not None
-        assert finished.status == TaskStatus.COMPLETED
-        assert finished.result == {"status": "interrupted"}
+    monkeypatch.setattr(worker_mod, "run_task_worker", fake_run_task_worker)
 
-    asyncio.run(run_case())
+    app = object()
+    task_store = object()
+    handled = asyncio.run(mod.run_pr_review_worker_once(app, task_store, worker_id="worker-9"))
+
+    assert handled == 1
+    assert captured["app"] is app
+    assert captured["task_store"] is task_store
+    assert captured["handler"] is mod._handle_pr_review_task
+    assert captured["worker_id"] == "worker-9"
+    assert captured["query"].type == "review_pr"
+    assert captured["query"].assigned_agent_name == "pr-reviewer"
+    assert captured["max_tasks"] == 1
 
 
-def test_terminalize_claimed_task_respects_worker_lease(tmp_path: Path) -> None:
-    async def run_case() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-        await store.create_task(mod.TaskCreate(task_id="task-a", type="review"))
-        await store.claim_task("worker-a")
+def test_pr_review_session_identity_includes_head_sha() -> None:
+    captured = {}
 
-        with pytest.raises(ValueError, match="does not own task"):
-            await mod._terminalize_claimed_task_if_needed(
-                store,
-                task_id="task-a",
-                worker_id="worker-b",
-                terminal_event=Event(
-                    type=EventType.SESSION_COMPLETED,
-                    session_id="sess-a",
-                    agent_name="pr-reviewer",
-                    payload={},
-                ),
-            )
+    class FakeApp:
+        async def run(self, request):
+            captured["request"] = request
+            if False:
+                yield None
 
-    asyncio.run(run_case())
-
-
-def test_checkout_source_uses_base_repo_pull_ref() -> None:
-    payload = {
-        "repository": {
-            "full_name": "base/repo",
-            "clone_url": "https://github.com/base/repo.git",
-        }
-    }
-    pr = {
-        "number": 12,
-        "head": {
-            "ref": "contributor-branch",
-            "repo": {
-                "full_name": "fork/repo",
-                "clone_url": "https://github.com/fork/repo.git",
-            },
+    task = Task(
+        id="task-1",
+        type="review_pr",
+        assigned_agent_name="pr-reviewer",
+        input={
+            "owner": "acme",
+            "repo": "app",
+            "pr_number": 7,
+            "repo_url": "https://github.com/acme/app.git",
+            "head_ref": "feature",
+            "head_sha": "abcdef1234567890",
+            "base_ref": "main",
         },
-    }
-
-    assert mod._checkout_source_from_pr_payload(pr, payload) == (
-        "https://github.com/base/repo.git",
-        "pr-12",
-        ["+refs/pull/12/head:refs/heads/pr-12"],
     )
 
+    asyncio.run(mod._handle_pr_review_task(FakeApp(), task, "worker-1"))
 
-def test_checkout_source_works_when_head_repo_is_unavailable() -> None:
-    payload = {
-        "repository": {
-            "full_name": "base/repo",
-            "clone_url": "https://github.com/base/repo.git",
-        }
-    }
-    pr = {
-        "number": 12,
-        "head": {
-            "ref": "deleted-fork-branch",
-            "repo": None,
-        },
-    }
-
-    assert mod._checkout_source_from_pr_payload(pr, payload) == (
-        "https://github.com/base/repo.git",
-        "pr-12",
-        ["+refs/pull/12/head:refs/heads/pr-12"],
-    )
+    request = captured["request"]
+    assert request.session_id == "pr-review-acme-app-7-abcdef123456"
+    assert request.metadata["head_sha"] == "abcdef1234567890"
+    assert "abcdef123456" in request.messages[0].content[0].text
 
 
-def test_checkout_source_rejects_malformed_head_payload() -> None:
-    payload = {"repository": {"full_name": "base/repo"}}
-
-    with pytest.raises(ValueError, match="head payload must be a JSON object"):
-        mod._checkout_source_from_pr_payload({"number": 12, "head": "bad"}, payload)
-
-    with pytest.raises(ValueError, match="repository clone URL is unavailable"):
-        mod._checkout_source_from_pr_payload(
-            {"number": 12, "head": {"ref": "feature", "repo": "bad"}},
-            payload,
-        )
-
-    with pytest.raises(ValueError, match="PR number is missing"):
-        mod._checkout_source_from_pr_payload(
-            {
-                "head": {"repo": {"clone_url": "https://github.com/fork/repo.git"}},
-            },
-            {"repository": {"clone_url": "https://github.com/base/repo.git"}},
-        )
-
-
-def test_webhook_rejects_empty_secret(tmp_path: Path) -> None:
-    store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-
-    with pytest.raises(ValueError, match="webhook_secret must be non-empty"):
-        mod.build_webhook_app(store, webhook_secret="")
-
-
-def test_webhook_rejects_missing_delivery_header(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    response = client.post(
-        "/webhooks/github",
-        headers={"X-GitHub-Event": "pull_request"},
-        content=json.dumps(_pull_request_payload()).encode(),
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "missing X-GitHub-Delivery header"
-
-
-def test_webhook_rejects_bad_signature(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path, webhook_secret="secret")
-    response = client.post(
-        "/webhooks/github",
-        headers={
-            "X-GitHub-Event": "pull_request",
-            "X-Hub-Signature-256": "sha256=bad",
-        },
-        content=b"{}",
-    )
-
-    assert response.status_code == 401
-    assert response.json()["detail"] == "bad signature"
-
-
-def test_webhook_rejects_invalid_json_payload(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    response = client.post(
-        "/webhooks/github",
-        headers={"X-GitHub-Event": "pull_request"},
-        content=b"{not-json",
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "invalid JSON webhook payload"
-
-
-def test_webhook_rejects_non_object_json_payload(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    response = client.post(
-        "/webhooks/github",
-        headers={"X-GitHub-Event": "pull_request"},
-        content=b"[]",
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "webhook payload must be a JSON object"
-
-
-def test_webhook_rejects_incomplete_pull_request_payload(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    response = client.post(
-        "/webhooks/github",
-        headers={
-            "X-GitHub-Event": "pull_request",
-            "X-GitHub-Delivery": "delivery-123",
-        },
-        content=json.dumps({"action": "opened", "repository": {"name": "repo"}}).encode(),
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == "invalid pull_request webhook payload"
-
-
-def test_webhook_rejects_malformed_head_payload(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    payload = _pull_request_payload()
-    payload["pull_request"]["head"] = "bad"
-    response = client.post(
-        "/webhooks/github",
-        headers={
-            "X-GitHub-Event": "pull_request",
-            "X-GitHub-Delivery": "delivery-123",
-        },
-        content=json.dumps(payload).encode(),
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == "invalid pull_request webhook payload"
-
-
-def test_webhook_enqueues_idempotent_review_task(tmp_path: Path) -> None:
-    store, client = _webhook_client(tmp_path)
-    payload = _pull_request_payload()
-    headers = {
-        "X-GitHub-Event": "pull_request",
-        "X-GitHub-Delivery": "delivery-123",
-    }
-
-    first = client.post("/webhooks/github", headers=headers, content=json.dumps(payload).encode())
-    second = client.post("/webhooks/github", headers=headers, content=json.dumps(payload).encode())
-    task_id = mod._github_delivery_task_id("delivery-123")
-    task = asyncio.run(store.load_task(task_id))
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json() == second.json() == {"task_id": task_id}
-    assert task is not None
-    assert task.input["owner"] == "octo"
-    assert task.input["repo"] == "repo"
-    assert task.input["pr_number"] == 12
-    assert task.input["repo_url"] == "https://github.com/octo/repo.git"
-    assert task.input["head_ref"] == "pr-12"
-    assert task.input["head_sha"] == "abc123"
-    assert task.input["base_ref"] == "main"
-    assert task.input["fetch_refspecs"] == ["+refs/pull/12/head:refs/heads/pr-12"]
-    assert task.metadata["github_delivery_id"] == "delivery-123"
-
-
-def test_webhook_rejects_conflicting_delivery_payload(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path)
-    first_payload = _pull_request_payload()
-    second_payload = _pull_request_payload()
-    second_payload["pull_request"]["head"]["sha"] = "def456"
-    headers = {
-        "X-GitHub-Event": "pull_request",
-        "X-GitHub-Delivery": "delivery-123",
-    }
-
-    first = client.post(
-        "/webhooks/github", headers=headers, content=json.dumps(first_payload).encode()
-    )
-    second = client.post(
-        "/webhooks/github", headers=headers, content=json.dumps(second_payload).encode()
-    )
-
-    assert first.status_code == 200
-    assert second.status_code == 409
-    assert second.json()["detail"] == ("GitHub delivery id already exists with different task data")
-
-
-def test_webhook_accepts_valid_signature(tmp_path: Path) -> None:
-    _store, client = _webhook_client(tmp_path, webhook_secret="secret")
-    body = json.dumps(_pull_request_payload()).encode()
-    signature = "sha256=" + hmac.new(b"secret", body, hashlib.sha256).hexdigest()
-
-    response = client.post(
-        "/webhooks/github",
-        headers={
-            "X-GitHub-Event": "pull_request",
-            "X-GitHub-Delivery": "delivery-123",
-            "X-Hub-Signature-256": signature,
-        },
-        content=body,
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"task_id": mod._github_delivery_task_id("delivery-123")}
-
-
-def test_webhook_accepts_unavailable_head_repo_via_pull_ref(tmp_path: Path) -> None:
-    store, client = _webhook_client(tmp_path)
-    response = client.post(
-        "/webhooks/github",
-        headers={
-            "X-GitHub-Event": "pull_request",
-            "X-GitHub-Delivery": "delivery-123",
-        },
-        content=json.dumps(_pull_request_payload(head_repo=None)).encode(),
-    )
-    task = asyncio.run(store.load_task(mod._github_delivery_task_id("delivery-123")))
-
-    assert response.status_code == 200
-    assert task is not None
-    assert task.input["repo_url"] == "https://github.com/octo/repo.git"
-    assert task.input["head_ref"] == "pr-12"
-    assert task.input["fetch_refspecs"] == ["+refs/pull/12/head:refs/heads/pr-12"]
-
-
-def test_get_pr_diff_fetches_all_file_pages(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeResponse:
-        def __init__(self, payload: object, status_code: int = 200) -> None:
-            self._payload = payload
-            self.status_code = status_code
-            self.text = "ok"
-
-        def json(self) -> object:
-            return self._payload
-
-    class FakeAsyncClient:
+def test_get_pr_diff_rejects_stale_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeGitHubClient:
         def __init__(self, *args, **kwargs) -> None:
-            self.calls: list[dict] = []
+            pass
 
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, exc_type, exc, tb) -> None:
+        async def __aexit__(self, *args) -> None:
             return None
 
-        async def get(self, url: str, *, headers: dict, params: dict | None = None):
-            self.calls.append({"url": url, "params": params})
-            if url.endswith("/files"):
+        async def get(self, url, *, headers=None, params=None):
+            if url.endswith("/pulls/3"):
+                return _GitHubResponse(200, _pr_payload(title="Moved PR", head_sha="current-sha"))
+            raise AssertionError("stale-head guard should not fetch PR files")
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-3",
+        metadata={
+            "repo_owner": "acme",
+            "repo_name": "app",
+            "pr_number": 3,
+            "head_sha": "queued-sha",
+        },
+    )
+
+    result = asyncio.run(mod.GetPRDiffTool().run(ctx, {}))
+
+    assert result.is_error
+    assert "PR head changed before review" in result.content
+    assert result.structured == {
+        "expected_head_sha": "queued-sha",
+        "current_head_sha": "current-sha",
+    }
+
+
+def test_get_pr_diff_rechecks_head_after_fetching_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._pr_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append(url)
+            if url.endswith("/pulls/3"):
+                self._pr_calls += 1
+                return _GitHubResponse(
+                    200,
+                    _pr_payload(
+                        title="Moved PR",
+                        head_sha="queued-sha" if self._pr_calls == 1 else "new-sha",
+                    ),
+                )
+            if url.endswith("/pulls/3/files"):
+                return _GitHubResponse(200, [_file_payload("file.py")])
+            return _GitHubResponse(404, {"message": "not found"})
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-3",
+        metadata={
+            "repo_owner": "acme",
+            "repo_name": "app",
+            "pr_number": 3,
+            "head_sha": "queued-sha",
+        },
+    )
+
+    result = asyncio.run(mod.GetPRDiffTool().run(ctx, {}))
+
+    assert result.is_error
+    assert calls == [
+        "https://api.github.com/repos/acme/app/pulls/3",
+        "https://api.github.com/repos/acme/app/pulls/3/files",
+        "https://api.github.com/repos/acme/app/pulls/3",
+    ]
+    assert result.structured == {
+        "expected_head_sha": "queued-sha",
+        "current_head_sha": "new-sha",
+    }
+
+
+def test_get_pr_diff_returns_results_when_queued_head_stays_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append(url)
+            if url.endswith("/pulls/3"):
+                return _GitHubResponse(200, _pr_payload(title="Stable PR", head_sha="queued-sha"))
+            if url.endswith("/pulls/3/files"):
+                return _GitHubResponse(200, [_file_payload("stable.py")])
+            return _GitHubResponse(404, {"message": "not found"})
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-3",
+        metadata={
+            "repo_owner": "acme",
+            "repo_name": "app",
+            "pr_number": 3,
+            "head_sha": "queued-sha",
+        },
+    )
+
+    result = asyncio.run(mod.GetPRDiffTool().run(ctx, {}))
+
+    assert not result.is_error
+    assert result.structured["head_sha"] == "queued-sha"
+    assert result.structured["files"][0]["path"] == "stable.py"
+    assert calls == [
+        "https://api.github.com/repos/acme/app/pulls/3",
+        "https://api.github.com/repos/acme/app/pulls/3/files",
+        "https://api.github.com/repos/acme/app/pulls/3",
+    ]
+
+
+def test_get_pr_diff_does_not_apply_session_head_sha_to_explicit_other_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append(url)
+            if url.endswith("/pulls/99"):
+                return _GitHubResponse(
+                    200, _pr_payload(title="Other PR", head_ref="other", head_sha="other-sha")
+                )
+            if url.endswith("/pulls/99/files"):
+                return _GitHubResponse(200, [_file_payload("other.py")])
+            return _GitHubResponse(404, {"message": "not found"})
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-3",
+        metadata={
+            "repo_owner": "acme",
+            "repo_name": "app",
+            "pr_number": 3,
+            "head_sha": "queued-sha",
+        },
+    )
+
+    result = asyncio.run(
+        mod.GetPRDiffTool().run(ctx, {"owner": "acme", "repo": "app", "pr_number": 99})
+    )
+
+    assert not result.is_error
+    assert result.structured["head_sha"] == "other-sha"
+    assert calls == [
+        "https://api.github.com/repos/acme/app/pulls/99",
+        "https://api.github.com/repos/acme/app/pulls/99/files",
+    ]
+
+
+def test_demo_runs_without_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable is required for the PR-reviewer demo")
+
+    class NoNetworkClient:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("demo must not open an HTTP client")
+
+    monkeypatch.setattr(demo_mod.httpx, "AsyncClient", NoNetworkClient)
+
+    asyncio.run(mod.demo())
+
+
+def test_get_pr_diff_paginates_files_and_bounds_patch_previews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class Response:
+        def __init__(self, status_code: int, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    def file_payload(index: int, patch: str = "+ok\n") -> dict:
+        return {
+            "filename": f"file_{index}.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "patch": patch,
+        }
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append((url, params))
+            if url.endswith("/pulls/3"):
+                return Response(
+                    200,
+                    {
+                        "title": "Large PR",
+                        "body": None,
+                        "changed_files": 101,
+                        "head": {"ref": "feature", "sha": "abc123"},
+                        "base": {"ref": "main"},
+                    },
+                )
+            if url.endswith("/pulls/3/files"):
                 assert params is not None
                 page = params["page"]
-                count = mod.GITHUB_PAGE_SIZE if page == 1 else 1
-                return FakeResponse(
+                if page == 1:
+                    return Response(200, [file_payload(i) for i in range(100)])
+                if page == 2:
+                    return Response(200, [file_payload(100, patch="+" + "x" * 5000)])
+            return Response(404, {"message": "not found"})
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-3",
+        metadata={"repo_owner": "acme", "repo_name": "app", "pr_number": 3},
+    )
+
+    result = asyncio.run(mod.GetPRDiffTool().run(ctx, {}))
+
+    assert not result.is_error
+    assert [call[1] for call in calls if call[0].endswith("/files")] == [
+        {"per_page": 100, "page": 1},
+        {"per_page": 100, "page": 2},
+    ]
+    assert result.structured["total_files"] == 101
+    assert result.structured["files_returned"] == 101
+    assert result.structured["files_truncated"] is False
+    assert result.structured["patches_truncated"] is True
+    assert result.structured["files"][-1]["patch_preview"] == "+" + "x" * 1199
+    assert result.structured["files"][-1]["patch_preview_truncated"] is True
+    assert "Output truncated" in result.content
+
+
+def test_get_pr_diff_caps_returned_file_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Response:
+        def __init__(self, status_code: int, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            if url.endswith("/pulls/4"):
+                return Response(
+                    200,
+                    {
+                        "title": "Huge PR",
+                        "body": None,
+                        "changed_files": 250,
+                        "head": {"ref": "feature", "sha": "def456"},
+                        "base": {"ref": "main"},
+                    },
+                )
+            if url.endswith("/pulls/4/files"):
+                assert params is not None
+                page = params["page"]
+                start = (page - 1) * 100
+                return Response(
+                    200,
                     [
                         {
-                            "filename": f"file-{page}-{index}.py",
+                            "filename": f"file_{index}.py",
                             "status": "modified",
                             "additions": 1,
                             "deletions": 0,
-                            "patch": "diff",
+                            "patch": "+ok\n",
                         }
-                        for index in range(count)
-                    ]
+                        for index in range(start, start + 100)
+                    ],
                 )
-            return FakeResponse(
-                {
-                    "title": "Example",
-                    "body": None,
-                    "head": {"ref": "feature", "sha": "abc"},
-                    "base": {"ref": "main"},
-                }
-            )
+            return Response(404, {"message": "not found"})
 
-    async def run_case() -> None:
-        monkeypatch.setattr(mod.httpx, "AsyncClient", FakeAsyncClient)
-        result = await mod.GetPRDiffTool().run(
-            SimpleNamespace(
-                metadata={"repo_owner": "octo", "repo_name": "repo", "pr_number": 12},
-                proxy=None,
-                session_id="session",
-            ),
-            {},
-        )
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    ctx = ToolContext(
+        session_id="review-4",
+        metadata={"repo_owner": "acme", "repo_name": "app", "pr_number": 4},
+    )
 
-        assert result.is_error is False
-        assert len(result.structured["files"]) == mod.GITHUB_PAGE_SIZE + 1
+    result = asyncio.run(mod.GetPRDiffTool().run(ctx, {}))
 
-    asyncio.run(run_case())
+    assert not result.is_error
+    assert result.structured["total_files"] == 250
+    assert result.structured["files_returned"] == 200
+    assert result.structured["files_truncated"] is True
+    assert len(result.structured["files"]) == 200
+    assert "Showing 200 of 250 changed files" in result.content
+
+
+def test_post_pr_comment_updates_existing_marked_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    comments = []
+
+    class Response:
+        def __init__(self, status_code: int, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    class FakeGitHubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, url, *, headers=None, params=None):
+            calls.append(("GET", url, params))
+            return Response(200, list(comments))
+
+        async def post(self, url, *, headers=None, json=None):
+            assert json is not None
+            calls.append(("POST", url, json))
+            comment = {
+                "id": 101,
+                "url": "https://api.github.com/repos/acme/app/issues/comments/101",
+                "html_url": "https://github.com/acme/app/pull/1#issuecomment-101",
+                "body": json["body"],
+            }
+            comments.append(comment)
+            return Response(201, comment)
+
+        async def patch(self, url, *, headers=None, json=None):
+            assert json is not None
+            calls.append(("PATCH", url, json))
+            comments[0] = {**comments[0], "body": json["body"]}
+            return Response(200, comments[0])
+
+    monkeypatch.setattr(github_tools_mod.httpx, "AsyncClient", FakeGitHubClient)
+    proxy = PassthroughProxy(StaticVault({"github_token": "ghp_test"}))
+    ctx = ToolContext(
+        session_id="pr-review-acme-app-1",
+        proxy=proxy,
+        metadata={"repo_owner": "acme", "repo_name": "app", "pr_number": 1},
+    )
+    tool = mod.PostPRCommentTool()
+
+    first = asyncio.run(tool.run(ctx, {"body": "Initial review"}))
+    second = asyncio.run(tool.run(ctx, {"body": "Updated review"}))
+
+    assert first.structured["operation"] == "posted"
+    assert second.structured["operation"] == "updated"
+    assert [call[0] for call in calls] == ["GET", "POST", "GET", "PATCH"]
+    assert len(comments) == 1
+    assert "Initial review" not in comments[0]["body"]
+    assert "Updated review" in comments[0]["body"]
+    assert "<!-- cayu-pr-reviewer:pr-review-acme-app-1 -->" in comments[0]["body"]
+
+
+def test_qa_policy_denies_raw_shell_but_allows_allowlisted() -> None:
+    # Pure-logic guard on the safety rail that lets the agent "QA end-to-end".
+    assert "python3" in mod._ALLOWED_QA_COMMANDS
+    assert "rm" in mod._DENYLISTED_TOKENS

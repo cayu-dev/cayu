@@ -86,7 +86,7 @@ async def _handle_with_heartbeat(
     lease_seconds: int,
 ) -> None:
     stop_heartbeat = asyncio.Event()
-    beat = asyncio.create_task(
+    heartbeat_task = asyncio.create_task(
         _heartbeat_until(task_store, task.id, worker_id, lease_seconds, stop_heartbeat)
     )
     handler_error: Exception | None = None
@@ -96,7 +96,7 @@ async def _handle_with_heartbeat(
         handler_error = exc
     finally:
         stop_heartbeat.set()
-        await beat
+        await heartbeat_task
     if handler_error is not None:
         await _safe_fail(task_store, task.id, worker_id, handler_error)
     else:

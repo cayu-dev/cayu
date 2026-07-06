@@ -21,9 +21,11 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("version", help="Print the Cayu version.")
 
     from cayu.cli.evals import add_eval_parser, run_eval_command
+    from cayu.cli.scaffold import add_new_parser, run_new
     from cayu.cli.storage import add_storage_parser, run_storage
 
     add_eval_parser(subparsers)
+    add_new_parser(subparsers)
     add_storage_parser(subparsers)
 
     args = parser.parse_args(argv)
@@ -31,6 +33,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "version":
         print(f"cayu {_version()}")
         return 0
+
+    if args.command == "new":
+        return run_new(args)
 
     if args.command == "storage":
         return run_storage(args)

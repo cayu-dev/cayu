@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
@@ -23,6 +22,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
@@ -244,15 +244,15 @@ class ChatCompletionsProvider(ModelProvider):
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key_env = require_clean_nonblank(api_key_env, "api_key_env")
-        if api_key is not None and type(api_key) is not str:
-            raise TypeError("api_key must be a string.")
-        resolved_api_key = api_key if api_key is not None else os.environ.get(self.api_key_env, "")
-        if not resolved_api_key.strip():
-            raise ValueError(
-                f"ChatCompletionsProvider requires an API key: set the {self.api_key_env} "
-                "environment variable or pass api_key=... to ChatCompletionsProvider(...)."
-            )
-        self.api_key = resolved_api_key
+        self.api_key = resolve_api_key(
+            api_key=api_key,
+            env_var=self.api_key_env,
+            provider_name="ChatCompletionsProvider",
+            missing_hint=(
+                f"set the {self.api_key_env} environment variable or pass api_key=... "
+                "to ChatCompletionsProvider(...)."
+            ),
+        )
         # Auth header is configurable: OpenAI/Together use Authorization: Bearer,
         # Azure uses an `api-key` header (empty prefix).
         self.auth_header = require_clean_nonblank(auth_header, "auth_header")

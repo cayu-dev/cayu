@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
@@ -24,6 +23,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
@@ -326,18 +326,16 @@ class AnthropicProvider(ModelProvider):
         else:
             if credential_proxy is not None:
                 raise ValueError("credential_proxy requires api_key_ref.")
-            if api_key is not None and type(api_key) is not str:
-                raise TypeError("api_key must be a string.")
-            resolved_api_key = (
-                api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
+            self.api_key = resolve_api_key(
+                api_key=api_key,
+                env_var="ANTHROPIC_API_KEY",
+                provider_name="AnthropicProvider",
+                missing_hint=(
+                    "set the ANTHROPIC_API_KEY environment variable, pass api_key=..., "
+                    "or pass api_key_ref=SecretRef(...) with a credential_proxy for "
+                    "deferred resolution."
+                ),
             )
-            if not resolved_api_key.strip():
-                raise ValueError(
-                    "AnthropicProvider requires an API key: set the ANTHROPIC_API_KEY "
-                    "environment variable, pass api_key=..., or pass api_key_ref=SecretRef(...) "
-                    "with a credential_proxy for deferred resolution."
-                )
-            self.api_key = resolved_api_key
         self.api_key_ref = api_key_ref
         self.credential_proxy = credential_proxy
         self.base_url = _validate_base_url(base_url)

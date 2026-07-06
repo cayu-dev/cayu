@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -30,6 +29,7 @@ from cayu.embeddings import (
     TextEmbeddingUsage,
     copy_text_embedding_request,
 )
+from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
@@ -288,15 +288,15 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         reasoning_state: str = "inline",
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
-        if api_key is not None and type(api_key) is not str:
-            raise TypeError("api_key must be a string.")
-        resolved_api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
-        if not resolved_api_key.strip():
-            raise ValueError(
-                "OpenAIProvider requires an API key: set the OPENAI_API_KEY environment "
-                "variable or pass api_key=... to OpenAIProvider(...)."
-            )
-        self.api_key = resolved_api_key
+        self.api_key = resolve_api_key(
+            api_key=api_key,
+            env_var="OPENAI_API_KEY",
+            provider_name="OpenAIProvider",
+            missing_hint=(
+                "set the OPENAI_API_KEY environment variable or pass api_key=... "
+                "to OpenAIProvider(...)."
+            ),
+        )
         self.base_url = _validate_base_url(base_url)
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")

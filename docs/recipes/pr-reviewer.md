@@ -1,8 +1,9 @@
 # Recipe: a cloud PR-review agent
 
-**Goal:** build an agent that, when a pull request opens, checks the code out into
-a fresh sandbox, QAs the change by running the project's tests, and posts one
-review comment back — durably, on a worker pool, not as a synchronous chat reply.
+**Goal:** build an agent that, when a pull request opens, checks the queued head
+SHA out into a fresh review workspace, QAs the change by running the project's
+tests, and posts one review comment back — durably, on a worker pool, not as a
+synchronous chat reply.
 
 Every ingredient below is a first-class cayu primitive. The point of this recipe
 is how they *compose*. The complete, runnable code is in
@@ -13,14 +14,19 @@ no-key demo with:
 PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py
 ```
 
+The example is split the way a real agent app tends to grow: `reviewer_app.py`
+assembles Cayu primitives, `github_tools.py` owns GitHub egress, `workspace.py`
+owns checkout setup, `worker.py` owns durable task handling, `webhook.py` owns
+external ingress, and `demo.py` owns the deterministic no-key fixture.
+
 ## The shape
 
 ```
-GitHub webhook (pull_request)  ─▶ HMAC-verify in production ─▶ durable Task
+GitHub webhook (pull_request)  ─▶ HMAC-verify ─▶ durable Task (SQLiteTaskStore)
         │                                                     │
   build_webhook_app()                            a worker claims the Task
                                                               ▼
-                                          fresh git checkout of the PR head
+                                          fresh git checkout of the queued PR head SHA
                                               (EnvironmentFactory + binding)
                                                               ▼
                           get_pr_diff ▶ read changed code ▶ run QA commands
@@ -33,19 +39,15 @@ Each numbered step maps to one decision.
 
 An agent that "looks at PRs" is *triggered by* PRs. cayu's `EventWatcher` watches
 cayu's **own** durable event log (budget alerts, session completion); it is not an
-inbound-webhook receiver. So the ingress is ordinary app code: a small endpoint
-that verifies GitHub HMAC signatures in production and translates the GitHub
-payload into a `Task`.
+inbound-webhook receiver. So the ingress is ordinary app code: a small HMAC-verified
+endpoint that translates the GitHub payload into a `Task`.
 
 ```python
 task = await task_store.create_task(TaskCreate(
-    task_id=webhook_task_id("github", delivery_id),
     type="review_pr",
     assigned_agent_name="pr-reviewer",
     input={"owner": ..., "repo": ..., "pr_number": ..., "repo_url": ...,
-           "head_ref": ..., "head_sha": ..., "base_ref": ...,
-           "fetch_refspecs": [...]},
-    metadata={"github_delivery_id": delivery_id},
+           "head_ref": ..., "head_sha": ..., "base_ref": ...},
 ))
 ```
 
@@ -58,28 +60,40 @@ decoupling is what makes it "cloud".
 
 ## 2. A worker claims the Task and starts a session
 
-A worker leases one pending task and starts an agent run bound to it:
+Use `run_task_worker(...)` for this shape: it leases matching tasks, keeps the
+lease heartbeated while the handler runs, reclaims expired leases, and keeps the
+worker alive if one task fails. The handler only has to turn the claimed task
+into a fresh `RunRequest`:
 
 ```python
-task = await task_store.claim_task(worker_id,
-    TaskQuery(type="review_pr", assigned_agent_name="pr-reviewer"), lease_seconds=900)
-request = RunRequest(
-    agent_name="pr-reviewer",
-    session_id=_review_session_id(owner=owner, repo=repo, pr_number=pr,
-                                  task_id=task.id,
-                                  head_sha=task.input.get("head_sha")),
-    task_id=task.id, task_worker_id=worker_id, environment_name="pr-sandbox",
-    metadata={"repo_owner": owner, "repo_name": repo, "pr_number": pr,
-              "repo_url": task.input["repo_url"],
-              "head_ref": task.input["head_ref"],
-              "head_sha": task.input.get("head_sha"),
-              "base_ref": task.input["base_ref"],
-              "fetch_refspecs": task.input.get("fetch_refspecs", [])},
-    messages=[Message.text("user", f"Review pull request #{pr} in {owner}/{repo}.")],
-    limits=RunLimits(max_tool_calls=20, max_elapsed_seconds=600),
+async def handle_pr_review_task(app, task, worker_id):
+    owner, repo, pr = task.input["owner"], task.input["repo"], task.input["pr_number"]
+    short_head_sha = task.input["head_sha"][:12]
+    request = RunRequest(
+        agent_name="pr-reviewer",
+        session_id=f"pr-review-{owner}-{repo}-{pr}-{short_head_sha}",
+        task_id=task.id,
+        task_worker_id=worker_id,
+        environment_name="pr-workspace",
+        metadata={"repo_owner": owner, "repo_name": repo, "pr_number": pr,
+                  "repo_url": task.input["repo_url"],
+                  "head_ref": task.input["head_ref"],
+                  "head_sha": task.input["head_sha"],
+                  "base_ref": task.input["base_ref"]},
+        messages=[Message.text("user", f"Review pull request #{pr} in {owner}/{repo}.")],
+        limits=RunLimits(max_tool_calls=20, max_elapsed_seconds=600),
+    )
+    async for event in app.run(request):
+        ...
+
+await run_task_worker(
+    app,
+    task_store,
+    handle_pr_review_task,
+    worker_id="worker-1",
+    query=TaskQuery(type="review_pr", assigned_agent_name="pr-reviewer"),
+    lease_seconds=900,
 )
-async for event in app.run(request):
-    ...
 ```
 
 Two things worth calling out:
@@ -91,42 +105,39 @@ Two things worth calling out:
   tool calls and wall-clock. (Limits are enforced per run; see
   [runtime-contracts](../runtime-contracts.md).)
 
-For production, don't hand-roll the claim loop: `run_task_worker`
-ships the durable claim → heartbeat → lease-reclaim → backoff loop. See
-[Triggering runs](../triggering-runs.md) for the worker-loop decision guide.
-
-## 3. A fresh sandbox per PR
+## 3. A fresh review workspace per PR
 
 Register an `EnvironmentFactory` (not a static `Environment`) so every review gets
 its own workspace + runner + git checkout, driven by the request metadata:
 
 ```python
-class PRSandboxFactory(EnvironmentFactory):
+class PRReviewWorkspaceFactory(EnvironmentFactory):
     async def create(self, request):
         root = self._base_root / request.session_id
+        pr_number = request.metadata["pr_number"]
+        head_sha = request.metadata["head_sha"]
+        checkout_ref = f"refs/cayu/pr-{pr_number}"
         return EnvironmentFactoryResult(environment=Environment(
             EnvironmentSpec(name=request.environment_name),
             workspace=LocalWorkspace(root, workspace_id=request.session_id),
             runner=LocalRunner(root),
             binding=GitRepositoryBinding(
                 repo_url=request.metadata["repo_url"],
-                ref=request.metadata["head_ref"],
-                fetch_refspecs=request.metadata.get("fetch_refspecs") or None,
+                ref=head_sha,
+                fetch_refspecs=[f"+refs/pull/{pr_number}/head:{checkout_ref}"],
             ),
             vault=vault, proxy=proxy,
         ))
 ```
 
-- **PR refs** should be fetched explicitly when the normal branch ref may not be
-  available in the base repository. For GitHub, set
-  `fetch_refspecs=[f"+refs/pull/{pr_number}/head:refs/heads/pr-{pr_number}"]`
-  and `head_ref=f"pr-{pr_number}"`. The binding fetches that PR head ref from the
-  base repo, then checks out the local `pr-N` ref.
-- **Private checkouts** need host-side Git credentials, SSH agent setup, or a
-  brokered checkout tool. `GITHUB_TOKEN` in this example is resolved by trusted
-  GitHub API tools; it is not injected into `GitRepositoryBinding` clone URLs.
+- **Same-repo and fork PRs** use the same GitHub pull-ref path:
+  fetch `refs/pull/N/head` into a local review ref, then bind `ref=head_sha`.
+  This makes the queued commit exact while still supporting fork PR refs.
+- **Head movement guard:** `get_pr_diff` validates that GitHub still reports the
+  queued `head_sha` before returning diff metadata. If the PR moved, enqueue a new
+  review for the new head.
 - **Reviewer/QA split:** if you want an orchestrator agent with no checkout and a
-  separate QA agent with a sandbox, branch the *same* factory on
+  separate QA agent with a checkout, branch the *same* factory on
   `request.agent_name` — it is a per-session field — returning `NoWorkspaceBinding`
   for one and a `GitRepositoryBinding` for the other.
 - **Go cloud:** swap `LocalRunner`/`LocalWorkspace` for `E2BRunner`/`E2BWorkspace`
@@ -151,8 +162,7 @@ If no proxy is configured the tool **fails closed** — it never reaches the net
 **b) The GitHub MCP server** — zero custom tool code:
 
 ```python
-from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, connect_mcp_toolset
-from cayu.vaults import SecretRef
+from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, SecretRef, connect_mcp_toolset
 
 vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
 toolset = await connect_mcp_toolset(
@@ -166,10 +176,8 @@ toolset = await connect_mcp_toolset(
 # toolset.tools -> register on the agent; await toolset.close() when done.
 ```
 
-`connect_mcp_toolset` auto-selects the HTTP transport when a `url` is set;
-`secret_headers` require an HTTP client with a `secret_resolver` so the headers
-can be resolved through the vault at MCP connection setup. For a self-hosted
-alternative, point stdio at
+`secret_headers` are resolved through the HTTP client's secret resolver. For a
+self-hosted alternative, point stdio at
 [`github/github-mcp-server`](https://github.com/github/github-mcp-server).
 
 ## 5. QA safety: constrain `exec_command`
@@ -203,6 +211,10 @@ app.register_agent(
 ```
 
 The system prompt tells the agent the sequence (diff → read → QA → comment once).
+`get_pr_diff` is intentionally bounded: it paginates GitHub's changed-file list,
+returns explicit `total_files` / truncation flags, and includes only patch previews
+under a fixed character budget. The checkout is the source of truth; when a file
+needs exact inspection, the agent should use `read_file` against the workspace.
 `app.run()` never raises on a model/tool failure — a failed run ends in a terminal
 `session.failed` event, so branch on `EventType.SESSION_FAILED` and read the answer
 with `final_output_text(transcript)` rather than expecting an exception.
@@ -212,7 +224,6 @@ with `final_output_text(transcript)` rather than expecting an exception.
 - **Durability:** back the app with `PostgresSessionStore` / `PostgresTaskStore`
   (`pip install "cayu[postgres]"`) so many workers can claim safely.
 - **Isolation:** `E2BRunner` / `E2BWorkspace` for the sandbox.
-- **Worker loop:** `run_task_worker` instead of a hand-rolled claim
-  loop.
+- **Worker loop:** `run_task_worker(...)` instead of a hand-rolled claim loop.
 - **Scale:** run N identical workers; the task store's `FOR UPDATE SKIP LOCKED`
   claiming keeps them from colliding.

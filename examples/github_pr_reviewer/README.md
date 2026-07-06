@@ -1,21 +1,38 @@
 # GitHub PR reviewer
 
 A cloud PR-review agent composed end-to-end on cayu: it is triggered by a pull
-request, checks the PR out into a fresh sandbox, QAs the change by running the
-project's tests, and posts one review comment back — durably, on a worker pool.
+request, checks the queued PR head SHA out into a fresh review workspace, QAs the
+change by running the project's tests, and posts one review comment back —
+durably, on a worker pool. The bundled runnable version uses the trusted local
+runner; swap in E2B or another sandbox runner for isolation.
 
 This is the worked example behind [`docs/recipes/pr-reviewer.md`](../../docs/recipes/pr-reviewer.md).
 Read that recipe for the narrative; this directory is the runnable code.
 
+## Structure
+
+The entrypoint stays small so the agent shape is visible:
+
+| File | Purpose |
+| --- | --- |
+| `pr_reviewer.py` | Runnable CLI map for the demo/live review. |
+| `reviewer_app.py` | Assembles the `CayuApp`, agent, provider, tools, and environment factory. |
+| `github_tools.py` | GitHub REST tools and credential-proxy egress. |
+| `qa_policy.py` | QA command allowlist for `exec_command`. |
+| `workspace.py` | Per-review checkout and runner/workspace construction. |
+| `worker.py` | Durable task enqueueing and `run_task_worker` handling. |
+| `webhook.py` | GitHub webhook verification and task creation. |
+| `demo.py` | Deterministic no-key fixture plus live-review runner. |
+
 ## Pipeline
 
 ```
-GitHub webhook (pull_request)  ─▶ HMAC-verify in production ─▶ durable Task
+GitHub webhook (pull_request)  ─▶ HMAC-verify ─▶ durable Task (SQLiteTaskStore)
         │                                                     │
         │                                          worker claims the Task
         ▼                                                     ▼
-  build_webhook_app()                          fresh git checkout of the PR head
-                                                    (PRSandboxFactory)
+  build_webhook_app()                          fresh git checkout of the queued PR head SHA
+                                                (PRReviewWorkspaceFactory)
                                                           │
                                                           ▼
                           get_pr_diff ▶ read changed code ▶ run QA commands
@@ -25,7 +42,7 @@ GitHub webhook (pull_request)  ─▶ HMAC-verify in production ─▶ durable T
 ## Run it
 
 ```bash
-# 1) Deterministic demo — no model key needed. Reads a public PR read-only and
+# 1) Deterministic demo — no model key needed. Uses a local fixture repo and
 #    drives the real runtime with a scripted provider. Shows the QA allowlist
 #    denying a raw-shell attempt and the post path failing closed with no token.
 PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py
@@ -40,16 +57,16 @@ Set `CAYU_MODEL` to override the model (defaults: `gpt-5.4-mini` for OpenAI,
 
 To run the webhook trigger instead of a one-shot review, serve
 `build_webhook_app(task_store, webhook_secret=...)` with any ASGI server and run
-a worker loop that calls `claim_and_run_one(...)` (see
-[`../task_worker_loop.py`](../task_worker_loop.py) for the durable
-claim/heartbeat/reclaim pattern).
+a worker loop that calls `run_task_worker(...)`. The example's
+`run_pr_review_worker_once(...)` helper uses that same durable
+claim/heartbeat/reclaim path with `max_tasks=1`.
 
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Provider key (auto-selected). |
-| `GITHUB_TOKEN` | Resolved via the vault as the `github_token` secret; used for GitHub API reads and posting comments. Private Git checkout still requires host-side Git credentials, SSH agent setup, or a brokered checkout tool; the token is not injected into `GitRepositoryBinding` clone URLs. |
+| `GITHUB_TOKEN` | Resolved via the vault as the `github_token` secret; used to read private PRs and to post comments. |
 | `CAYU_MODEL` | Optional model override. |
 
 ## Two ways to reach GitHub
@@ -65,7 +82,7 @@ layer, not the only tool model). You have two composable options:
 
 ## Making it genuinely cloud
 
-Swap `LocalRunner`/`LocalWorkspace` in `PRSandboxFactory` for
+Swap `LocalRunner`/`LocalWorkspace` in `PRReviewWorkspaceFactory` for
 `E2BRunner`/`E2BWorkspace` (the `cayu[e2b]` extra) to run the checkout and QA
 commands in an isolated cloud sandbox instead of the trusted local-dev runner,
 and back the app with `PostgresSessionStore`/`PostgresTaskStore` for multi-worker
