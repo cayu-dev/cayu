@@ -2,6 +2,14 @@
 
 Cayu is an open-source Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
 
+## Contents
+
+- [Quickstart](#quickstart)
+- [Featured example: cloud PR reviewer](#featured-example-cloud-pr-reviewer)
+- [Further reading](#further-reading)
+- [Design goals](#design-goals) · [Scope](#scope) · [Contract rules](#contract-rules) · [Repository layout](#repository-layout)
+- [Development](#development) · [Usage and cache metrics](#usage-and-cache-metrics) · [Thinking and reasoning](#thinking-and-reasoning) · [Examples](#example)
+
 ## Design Goals
 
 - Build real agent applications, not just hosted prompt/config definitions.
@@ -11,9 +19,73 @@ Cayu is an open-source Python framework for building long-running agents, multi-
 - Run locally, in containers, on hosted infrastructure, or behind an application server.
 - Make MCP an interoperability layer, not the only custom tool model.
 
+## Quickstart
+
+The minimal ceremony is four calls — create an app, register a provider, register
+an agent, and run it. An `Environment` is optional; you only need one when your
+agent uses tools that touch a workspace, runner, or sandbox.
+
+```bash
+pip install cayu
+```
+
+```python
+import asyncio
+
+from cayu import AgentSpec, CayuApp, Message, OpenAIProvider, RunRequest
+
+app = CayuApp()
+app.register_provider(OpenAIProvider(), default=True)  # reads OPENAI_API_KEY
+app.register_agent(AgentSpec(name="assistant", model="gpt-5.4-mini"))
+
+
+async def main() -> None:
+    async for event in app.run(
+        RunRequest(
+            agent_name="assistant",
+            session_id="demo",
+            messages=[Message.text("user", "Say hello in one sentence.")],
+        )
+    ):
+        print(event.type, event.payload)
+
+
+asyncio.run(main())
+```
+
+For a version that runs with **no API key**, see
+[`examples/echo_tool_runtime.py`](examples/echo_tool_runtime.py) (a scripted
+provider plus a custom tool). To add tools, a filesystem workspace, and command
+execution, register an `Environment` — see
+[`examples/local_environment_runtime.py`](examples/local_environment_runtime.py).
+
+## Featured example: cloud PR reviewer
+
+For the full long-running-agent shape — durable triggers, a per-task sandbox, tool
+egress, and QA — the [**cloud PR-reviewer recipe**](docs/recipes/pr-reviewer.md)
+composes it end-to-end: a pull request triggers a durable task, a worker checks the
+PR out into a fresh sandbox, the agent QAs the change by running the test suite, and
+it posts one review comment back. Runnable code lives in
+[`examples/github_pr_reviewer/`](examples/github_pr_reviewer/); run the no-key demo
+with `PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py`.
+
+## Further reading
+
+User guides:
+
+- [PR-reviewer recipe](docs/recipes/pr-reviewer.md) — the featured end-to-end example.
+- [Environment factories](docs/environment-factories.md) — per-session workspaces, runners, and bindings.
+- [Build a runner](docs/build-a-runner.md) — run commands on your own platform.
+- [Evals](docs/evals.md) — assertions, trajectories, and reports.
+
+Reference and design docs (deeper, maintainer-facing):
+
+- [Runtime contracts](docs/runtime-contracts.md) — the exhaustive contract reference.
+- [Architecture](docs/architecture.md) and [project layout](docs/project-layout.md).
+
 ## Scope
 
-Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
+Cayu's runtime core was extracted from a production agent system used at multiple mid-size and enterprise companies. The public package includes core contracts, environment registration, local workspace/runner/artifact-store implementations, framework-native file, artifact, command, knowledge recall, and stdio and Streamable HTTP MCP tool adapters, first-class tool policies for scoped authority and durable tool approvals, in-memory and SQLite session/event/transcript stores, explicit session resume, resumable session interruption, session-level usage/cache summaries, hard token/tool/time run limits, and session fork with persisted provider/model identity, in-memory and SQLite task stores, in-memory/SQLite/Postgres knowledge stores, deterministic knowledge indexing, event sinks and structured runtime logging, model-provider contracts, model-facing context policies, checkpoint-backed context compaction, Anthropic Messages API and OpenAI Responses API providers with certifi-backed TLS verification, structured message/tool-call handling, tool execution, tool-result feedback to the model, max-step protection, validation for framework boundary data, and an optional FastAPI server with a packaged dashboard for inspecting runs, sessions, tasks, transcripts, events, and pending knowledge review.
 
 The current public scope is the runtime and integration layer. Hosted deployment adapters, durable production vector indexes, and higher-level task orchestration are expected to live in companion packages or application code.
 
@@ -134,6 +206,7 @@ reusable context:
 ```python
 from cayu import (
     AgentSpec,
+    CayuApp,
     Environment,
     EnvironmentSpec,
     ListKnowledgeTool,
@@ -142,6 +215,7 @@ from cayu import (
     SearchKnowledgeTool,
 )
 
+app = CayuApp()
 knowledge_store = SQLiteKnowledgeStore("knowledge.sqlite")
 environment = Environment(
     EnvironmentSpec(name="local"),
@@ -1169,6 +1243,8 @@ are not retried even when a provider reports them with HTTP 429.
 
 ## Example
 
+### Running the bundled examples
+
 Run the deterministic echo-tool runtime example:
 
 ```bash
@@ -1186,6 +1262,30 @@ Run a deterministic stdio MCP example:
 ```bash
 PYTHONPATH=src python examples/stdio_mcp_runtime.py
 ```
+
+A remote (Streamable HTTP) MCP server is the same call with a `url` instead of a
+`command`; `connect_mcp_toolset` auto-selects the HTTP transport, and credentials
+flow through the vault as `secret_headers` (never inlined):
+
+```python
+from cayu import HttpMcpClient, LocalEnvVault, McpServerSpec, connect_mcp_toolset
+from cayu.vaults import SecretRef
+
+vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
+toolset = await connect_mcp_toolset(
+    McpServerSpec(
+        name="github",
+        url="https://api.githubcopilot.com/mcp/",
+        secret_headers={"Authorization": SecretRef(name="github_token")},
+    ),
+    client=HttpMcpClient(secret_resolver=vault),
+)
+# toolset.tools -> pass to register_agent(...); await toolset.close() when done.
+```
+
+This is how an agent gets GitHub (or any HTTP MCP server) tools with no custom
+`Tool` code. See the [PR-reviewer recipe](docs/recipes/pr-reviewer.md) for an
+end-to-end example.
 
 `connect_mcp_toolset(...)` fingerprints the discovered MCP tool contract as
 `toolset.manifest_hash`. The same value is exposed on each `McpToolAdapter` as
@@ -1331,6 +1431,8 @@ budget_alerts = EventWatcher(
 await app.run_event_watchers([budget_alerts])
 ```
 
+### Event watchers
+
 Event watchers are not model-facing tools. They are trusted app code that pulls
 from the durable event log, records cursor/attempt state, retries failures, and
 dead-letters events after the configured attempt ceiling.
@@ -1401,6 +1503,8 @@ run. Use `claim_task(...)` when multiple workers compete for pending work.
 Claiming only applies to unattached pending tasks; once a task is attached to a
 session, session recovery and terminal runtime events own the outcome.
 
+### Resuming a session
+
 Resume an existing completed, failed, or interrupted session by appending new messages to its durable transcript:
 
 ```python
@@ -1424,6 +1528,8 @@ resume_request = ResumeRequest(
     model="gpt-5.5",
 )
 ```
+
+### Interrupting a session
 
 Interrupt a pending or running session through the runtime. Interruption is
 durable and resumable after finalization: Cayu first marks the session
@@ -1506,6 +1612,8 @@ async for event in app.interrupt_session(
 ):
     print(event.type)
 ```
+
+### Forking a session
 
 Fork a completed, failed, or interrupted session to create a new branch without mutating the source session:
 

@@ -1283,13 +1283,24 @@ The first MCP implementation supports stdio servers:
 - Cayu tool names are prefixed with the MCP server namespace, such as
   `mcp__local-mcp__echo`, to make provenance visible and avoid collisions.
 
-This first stdio client does not resolve `secret_env` itself. Secret resolution belongs
-at the environment/vault boundary before the subprocess is started. Streamable HTTP MCP,
-OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are future
-layers. MCP resources should remain explicit and policy-controlled instead of being
-dumped into model context automatically. MCP manifest hashes are audit/debug
-fingerprints, not signatures; tool policy still controls whether an allowed MCP
-tool call may execute.
+Cayu ships two MCP client transports, and `connect_mcp_toolset(server)` selects
+between them from the `McpServerSpec`: a spec with a `command` connects over stdio
+(`StdioMcpClient`); a spec with a `url` connects over Streamable HTTP
+(`HttpMcpClient`). Exactly one of `command` or `url` must be set. Neither client
+stores raw secrets in the spec. For stdio, `secret_env` is resolved and injected
+into the subprocess environment before it starts. For HTTP, `secret_headers`
+(for example `{"Authorization": SecretRef(name="github_token")}`) require an
+HTTP client constructed with a secret resolver, such as
+`HttpMcpClient(secret_resolver=vault)`, so header values can be resolved and
+injected into request headers at connect time. Each `SecretRef` is resolved
+through the supplied vault/proxy and is never inlined into the spec; plain,
+non-secret values go in `env` (stdio) or `headers` (HTTP).
+
+OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are
+future layers. MCP resources should remain explicit and policy-controlled instead
+of being dumped into model context automatically. MCP manifest hashes are
+audit/debug fingerprints, not signatures; tool policy still controls whether an
+allowed MCP tool call may execute.
 
 ## KnowledgeStore
 
