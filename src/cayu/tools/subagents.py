@@ -10,7 +10,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    _RESERVED_LABEL_PREFIX,
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -25,6 +30,7 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
+from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
 from cayu.tools._errors import structured_invalid_arguments
 
 logger = logging.getLogger(__name__)
@@ -289,6 +295,15 @@ class SubagentTool(Tool):
         task = _string_argument(args, "task", clean=False)
         raw_metadata = args.get("metadata", {})
         metadata = copy_json_value({} if raw_metadata is None else raw_metadata, "metadata")
+        # Never let the model seed cayu-reserved metadata via its own tool arguments (e.g. taint
+        # labels supplied authoritatively by the runtime through ctx.metadata below). Leaving a
+        # reserved key in model-controlled metadata would let an injected parent forge child state
+        # (or crash the child's policy read with a malformed value).
+        metadata = {
+            key: value
+            for key, value in metadata.items()
+            if not key.startswith(_RESERVED_LABEL_PREFIX)
+        }
         spec = self._agents.get(agent_alias)
         if spec is None:
             return ToolResult(
@@ -311,6 +326,26 @@ class SubagentTool(Tool):
 
         child_session_id = f"{ctx.session_id}_subagent_{uuid4().hex[:8]}"
         causal_budget_id = ctx.causal_budget_id or ctx.session_id
+        child_metadata: dict[str, Any] = {
+            **copy_json_value(spec.metadata, "metadata"),
+            **metadata,
+            "subagent": {
+                "agent": agent_alias,
+                "agent_name": spec.agent_name,
+                "context_mode": spec.context_mode.value,
+                "mode": spec.mode.value,
+                "parent_session_id": ctx.session_id,
+            },
+        }
+        # Propagate the parent session's taint across the subagent boundary so the child's
+        # TaintAwareToolPolicy gates protected tools it would otherwise run untainted. Merge with
+        # any labels the child metadata already carries rather than clobbering them.
+        parent_taint_labels = taint_labels_from_metadata(ctx.metadata)
+        if parent_taint_labels:
+            child_metadata = metadata_with_taint_labels(
+                child_metadata,
+                parent_taint_labels | taint_labels_from_metadata(child_metadata),
+            )
         request = RunRequest(
             agent_name=spec.agent_name,
             session_id=child_session_id,
@@ -318,17 +353,7 @@ class SubagentTool(Tool):
             causal_budget_id=causal_budget_id,
             environment_name=ctx.environment_name,
             messages=[Message.text("user", task)],
-            metadata={
-                **copy_json_value(spec.metadata, "metadata"),
-                **metadata,
-                "subagent": {
-                    "agent": agent_alias,
-                    "agent_name": spec.agent_name,
-                    "context_mode": spec.context_mode.value,
-                    "mode": spec.mode.value,
-                    "parent_session_id": ctx.session_id,
-                },
-            },
+            metadata=child_metadata,
             max_steps=spec.max_steps,
             limits=spec.limits,
         )

@@ -194,11 +194,23 @@ class PendingToolCallApproval(BaseModel):
     policy_decision: str | None = None
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Taint labels active for this call when the round paused, so the resumed tool sees the same
+    # taint the policy gated it with (a run-request seed would otherwise not survive the checkpoint).
+    active_taint_labels: list[str] = Field(default_factory=list)
 
     @field_validator("tool_call_id", "tool_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("active_taint_labels", mode="before")
+    @classmethod
+    def validate_active_taint_labels(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypeError("active_taint_labels must be a list of strings.")
+        return [require_clean_nonblank(item, "active_taint_labels") for item in value]
 
     @field_validator("policy_decision", "reason")
     @classmethod
@@ -429,4 +441,5 @@ def copy_pending_tool_call_approval(
         policy_decision=call.policy_decision,
         reason=call.reason,
         metadata=copy_json_value(call.metadata, "metadata"),
+        active_taint_labels=list(call.active_taint_labels),
     )

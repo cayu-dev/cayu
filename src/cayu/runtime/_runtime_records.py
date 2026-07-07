@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
@@ -90,3 +90,7 @@ class PendingToolApprovalPlan:
 class ToolRoundPolicyPlan:
     outcomes: list[ToolCallPolicyOutcome]
     pending_approval: PendingToolApprovalPlan | None
+    # Active taint labels PER tool call (keyed by tool_call_id), captured at that call's authorize
+    # point so it includes earlier same-round source labels. Tool execution and pause/resume reuse
+    # the exact set the policy gated the call with, instead of rescanning or a pre-round snapshot.
+    active_taint_labels: Mapping[str, frozenset[str]] = field(default_factory=dict)

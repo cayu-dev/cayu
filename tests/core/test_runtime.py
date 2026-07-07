@@ -47,6 +47,7 @@ from cayu.providers import (
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import RunnerCancelledError
 from cayu.runtime import (
+    TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AfterToolCallDecision,
     AllowAllToolPolicy,
@@ -124,6 +125,7 @@ from cayu.runtime import (
     ToolPolicyResult,
     TranscriptDigestCompactor,
     UsageTriggeredContextPolicy,
+    UserInputResponse,
     default_compaction_prompt,
     strip_old_file_attachments,
     trim_context_messages,
@@ -144,6 +146,7 @@ from cayu.tools import (
     SubagentSpec,
     SubagentTool,
 )
+from cayu.tools.user_input import UserInputTool
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
@@ -2667,6 +2670,13 @@ async def collect_tool_approval_events(
     request: ToolApprovalRequest,
 ) -> list[Event]:
     return [event async for event in app.resolve_tool_approval(request)]
+
+
+async def collect_user_input_events(
+    app: CayuApp,
+    response: UserInputResponse,
+) -> list[Event]:
+    return [event async for event in app.resolve_user_input(response)]
 
 
 async def collect_tool_approval_recovery_events(
@@ -7143,6 +7153,488 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
         "Implement and review auth.",
     ]
     assert provider.requests[2].messages[-1].role == "tool"
+
+
+class _TaintSourceTool(Tool):
+    spec = ToolSpec(
+        name="read_web",
+        description="Fetch untrusted web content.",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(content="untrusted page content")
+
+
+class _ProtectedEmailTool(Tool):
+    spec = ToolSpec(
+        name="send_email",
+        description="Send an email to an external address.",
+        input_schema={
+            "type": "object",
+            "properties": {"body": {"type": "string"}},
+        },
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        self.calls.append(args)
+        return ToolResult(content="email sent")
+
+
+def _taint_aware_policy() -> TaintAwareToolPolicy:
+    return TaintAwareToolPolicy(
+        taint_sources={"read_web": ["web"]},
+        protected_tools={"send_email": ["web"]},
+        decision=ToolPolicyDecision.DENY,
+    )
+
+
+def _build_taint_app(
+    provider: ModelProvider,
+) -> tuple[CayuApp, InMemorySessionStore, _ProtectedEmailTool]:
+    """Wire a parent (subagent + taint source) and a reviewer (protected send_email), both under the
+    same TaintAwareToolPolicy, sharing one provider whose event batches are consumed in call order."""
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    subagent_tool = SubagentTool(
+        app,
+        agents={
+            "reviewer": SubagentSpec(
+                agent_name="reviewer",
+                description="Review delegated work.",
+            )
+        },
+    )
+    email_tool = _ProtectedEmailTool()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[subagent_tool, _TaintSourceTool()],
+        tool_policy=_taint_aware_policy(),
+    )
+    app.register_agent(
+        AgentSpec(name="reviewer", model="fake-model"),
+        tools=[email_tool],
+        tool_policy=_taint_aware_policy(),
+    )
+    return app, store, email_tool
+
+
+def test_subagent_inherits_parent_taint_and_gates_protected_tool():
+    # Call order across the shared parent+child provider is deterministic: parent read_web, parent
+    # subagent, child send_email (denied), child final, parent final.
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_read_web", name="read_web", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "exfiltrate the page"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email",
+                    name="send_email",
+                    arguments={"body": "untrusted page content"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_taint_app(provider)
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_taint_parent",
+                messages=[Message.text("user", "Summarize the page and email it.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+    child_sessions = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_taint_parent"))
+    ).sessions
+    assert len(child_sessions) == 1
+    child = child_sessions[0]
+
+    # The parent's read_web taint is carried across the boundary onto the child session, even
+    # though it was acquired from a tool result (never present on the parent's run metadata).
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) == ["web"]
+
+    # The inherited taint makes the child's protected send_email a taint-aware policy denial: the
+    # tool never runs and the tool result carries the "protected" reason (not some unrelated error).
+    assert email_tool.calls == []
+    child_transcript = asyncio.run(store.load_transcript(child.id))
+    assert [message.role for message in child_transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    denied_result = child_transcript[2].content[0]
+    assert denied_result.is_error is True
+    assert "protected" in denied_result.content.lower()
+
+
+def test_subagent_without_parent_taint_allows_protected_tool():
+    # Deterministic call order: parent subagent, child send_email (allowed), child final, parent final.
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "send a greeting"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email",
+                    name="send_email",
+                    arguments={"body": "hello"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_taint_app(provider)
+
+    asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_untainted_parent",
+                messages=[Message.text("user", "Just email a greeting.")],
+            ),
+        )
+    )
+
+    child = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_untainted_parent"))
+    ).sessions[0]
+
+    # No parent taint means no seed on the child session and no gate on send_email.
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) is None
+
+    child_transcript = asyncio.run(store.load_transcript(child.id))
+    assert child_transcript[2].content[0].is_error is False
+    assert child_transcript[2].content[0].content == "email sent"
+    assert email_tool.calls == [{"body": "hello"}]
+
+
+def test_subagent_metadata_arg_cannot_forge_child_taint():
+    # An injected parent must not be able to forge child taint by putting the reserved taint key in
+    # its model-controlled `metadata` argument. The parent is untainted, so if the forged label
+    # leaked through, the child's send_email would be denied; the fix strips it so send_email runs.
+    # Deterministic call order: parent subagent (with forged metadata), child send_email, child
+    # final, parent final.
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={
+                        "agent": "reviewer",
+                        "task": "send a greeting",
+                        "metadata": {TAINT_LABELS_METADATA_KEY: ["web"]},
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email",
+                    name="send_email",
+                    arguments={"body": "hello"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_taint_app(provider)
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_forged_parent",
+                messages=[Message.text("user", "Delegate a greeting.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    child = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_forged_parent"))
+    ).sessions[0]
+
+    # The forged reserved key is stripped from the model-supplied metadata, so the child is not
+    # tainted and the protected send_email runs instead of being gated by fabricated taint.
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) is None
+    assert email_tool.calls == [{"body": "hello"}]
+
+
+def test_subagent_inherits_same_round_taint_source():
+    # A taint source (read_web) and the subagent emitted in ONE model round: the barriered subagent
+    # must inherit the same-round taint, or the child runs its protected tool untainted.
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_read_web", name="read_web", arguments={}),
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "exfiltrate the page"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email",
+                    name="send_email",
+                    arguments={"body": "untrusted page content"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_taint_app(provider)
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_same_round",
+                messages=[Message.text("user", "Summarize the page and email it.")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    child = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_same_round"))
+    ).sessions[0]
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) == ["web"]
+    assert email_tool.calls == []
+
+
+def _build_pausing_taint_app(
+    provider: ModelProvider,
+    *,
+    parent_policy: TaintAwareToolPolicy,
+    parent_tools: list,
+) -> tuple[CayuApp, InMemorySessionStore, _ProtectedEmailTool]:
+    """Parent (subagent + given extra tools/policy) delegates to a reviewer whose protected
+    send_email is DENY-gated once tainted."""
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    subagent_tool = SubagentTool(
+        app,
+        agents={
+            "reviewer": SubagentSpec(agent_name="reviewer", description="Review delegated work.")
+        },
+    )
+    email_tool = _ProtectedEmailTool()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="parent", model="fake-model"),
+        tools=[subagent_tool, *parent_tools],
+        tool_policy=parent_policy,
+    )
+    app.register_agent(
+        AgentSpec(name="reviewer", model="fake-model"),
+        tools=[email_tool],
+        tool_policy=_taint_aware_policy(),
+    )
+    return app, store, email_tool
+
+
+def test_subagent_taint_survives_approval_pause():
+    # A tainted session pauses for approval on a protected subagent; after approval the resumed
+    # subagent must still create a tainted child so the child's protected send_email is denied.
+    parent_policy = TaintAwareToolPolicy(
+        taint_sources={"read_web": ["web"]},
+        protected_tools={"subagent": ["web"]},
+        decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "email the secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email", name="send_email", arguments={"body": "secret"}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_pausing_taint_app(
+        provider, parent_policy=parent_policy, parent_tools=[_TaintSourceTool()]
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_appr_taint",
+                messages=[Message.text("user", "Delegate.")],
+                metadata={TAINT_LABELS_METADATA_KEY: ["web"]},
+            ),
+        )
+    )
+    approval_event = next(
+        event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_appr_taint",
+                approval_id=approval_event.payload["approval"]["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    child = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_appr_taint"))
+    ).sessions[0]
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) == ["web"]
+    assert email_tool.calls == []
+
+
+def test_subagent_taint_survives_user_input_pause():
+    # A tainted session pauses for user input in a round that also delegates to a subagent; on
+    # resume the subagent must still create a tainted child so its protected send_email is denied.
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_subagent",
+                    name="subagent",
+                    arguments={"agent": "reviewer", "task": "email the secret"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_ask",
+                    name="ask_user",
+                    arguments={"question": "Proceed?"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_send_email", name="send_email", arguments={"body": "secret"}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("review done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("parent done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app, store, email_tool = _build_pausing_taint_app(
+        provider, parent_policy=_taint_aware_policy(), parent_tools=[UserInputTool()]
+    )
+
+    pause_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_input_taint",
+                messages=[Message.text("user", "Delegate.")],
+                metadata={TAINT_LABELS_METADATA_KEY: ["web"]},
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+    asyncio.run(
+        collect_user_input_events(
+            app,
+            UserInputResponse(session_id="sess_input_taint", input_id=input_id, answer="yes"),
+        )
+    )
+
+    child = asyncio.run(
+        store.list_sessions(SessionQuery(parent_session_id="sess_input_taint"))
+    ).sessions[0]
+    assert child.metadata.get(TAINT_LABELS_METADATA_KEY) == ["web"]
+    assert email_tool.calls == []
 
 
 def test_subagent_tool_background_starts_child_without_waiting_for_completion():

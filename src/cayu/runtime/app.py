@@ -266,6 +266,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
 from cayu.runtime.tool_policy import (
+    TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
     TaintAwareToolPolicy,
@@ -274,6 +275,7 @@ from cayu.runtime.tool_policy import (
     ToolPolicyRequest,
     ToolPolicyResult,
     metadata_with_taint_labels,
+    taint_labels_from_metadata,
 )
 from cayu.runtime.usage import (
     CausalBudgetUsageSummary,
@@ -826,6 +828,7 @@ class _ToolRoundRunner:
                     tool_call=approval_plan.call,
                     tool_calls=approval_plan.calls,
                     policy_outcomes=approval_plan.policy_outcomes,
+                    active_taint_by_id=policy_plan.active_taint_labels,
                     task_id=self._task_id,
                     policy_result=approval_plan.policy_result,
                     structured_output=self._structured_output,
@@ -881,6 +884,7 @@ class _ToolRoundRunner:
                 tool_call=user_input_call,
                 tool_calls=tool_calls,
                 policy_outcomes=policy_plan.outcomes,
+                active_taint_by_id=policy_plan.active_taint_labels,
                 task_id=self._task_id,
                 structured_output=self._structured_output,
                 thinking=self._thinking,
@@ -919,6 +923,7 @@ class _ToolRoundRunner:
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         tool_round_id=tool_round_id,
+                        taint_labels_by_id=policy_plan.active_taint_labels,
                     )
                 else:
                     call_stream = self._run_tool_calls_sequential(
@@ -928,6 +933,7 @@ class _ToolRoundRunner:
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
                         tool_round_id=tool_round_id,
+                        taint_labels_by_id=policy_plan.active_taint_labels,
                     )
                 async for event, outcome in call_stream:
                     yield event
@@ -1011,6 +1017,7 @@ class _ToolRoundRunner:
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_id: str | None,
         round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
+        taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         """Execute tool calls one at a time with per-call limit re-evaluation.
 
@@ -1049,6 +1056,7 @@ class _ToolRoundRunner:
                 task_id=self._task_id,
                 policy_result=policy_results_by_id.get(tool_call.id),
                 tool_round_id=tool_round_id,
+                taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
             ):
                 yield event, outcome
             await app._raise_if_session_interrupted(session.id)
@@ -1060,6 +1068,7 @@ class _ToolRoundRunner:
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_id: str | None,
+        taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         """Execute a multi-call tool round concurrently, capped by a semaphore.
 
@@ -1094,6 +1103,7 @@ class _ToolRoundRunner:
                         task_id=self._task_id,
                         policy_result=policy_results_by_id.get(tool_call.id),
                         tool_round_id=tool_round_id,
+                        taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
                     ):
                         buffers[index].append(item)
                 except asyncio.CancelledError as exc:
@@ -3073,6 +3083,9 @@ class CayuApp:
 
                 pending_call = pending_by_id[tool_call.id]
                 policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
+                call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
+                    pending_call
+                )
                 # `_execute_tool_call(check_policy=False)` does NOT re-enforce the decision, so a
                 # DENY must be blocked here explicitly (mirroring the approval resume) — otherwise
                 # a policy-denied sibling would execute. REQUIRE_APPROVAL cannot occur: it would
@@ -3125,6 +3138,7 @@ class CayuApp:
                     check_policy=False,
                     policy_result=policy_result,
                     input_id=pending.input_id,
+                    taint_labels=call_taint_labels,
                 ):
                     yield event
                     if outcome is not None:
@@ -3641,6 +3655,9 @@ class CayuApp:
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
+                call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
+                    pending_tool_call
+                )
                 recorded_outcome = recorded_outcomes.get(tool_call.id)
                 if recorded_outcome is not None:
                     tool_outcomes.append(recorded_outcome)
@@ -3759,6 +3776,7 @@ class CayuApp:
                     check_policy=False,
                     emit_started=True,
                     approval_id=pending_approval.approval_id,
+                    taint_labels=call_taint_labels,
                 ):
                     yield event
                     if outcome is not None:
@@ -6716,8 +6734,14 @@ class CayuApp:
         taint_labels = await self._prior_taint_labels_for_policy(
             session_id=session.id,
             policy=registered_agent.tool_policy,
+            request_metadata=request_metadata,
         )
+        # Capture the taint active for each call at its authorize point (prior + earlier same-round
+        # source labels, before this call folds in its own). Tool execution and pause/resume reuse
+        # this exact per-call set so the value surfaced to the tool matches the value the gate used.
+        active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
+            active_taint_labels[tool_call.id] = frozenset(taint_labels)
             if tool_call.name not in registered_agent.tools:
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(call=tool_call, result=None)
@@ -6751,11 +6775,14 @@ class CayuApp:
 
         if approval_policy_result is None or approval_tool_call is None:
             return runtime_records.ToolRoundPolicyPlan(
-                outcomes=policy_outcomes, pending_approval=None
+                outcomes=policy_outcomes,
+                pending_approval=None,
+                active_taint_labels=active_taint_labels,
             )
 
         return runtime_records.ToolRoundPolicyPlan(
             outcomes=policy_outcomes,
+            active_taint_labels=active_taint_labels,
             pending_approval=runtime_records.PendingToolApprovalPlan(
                 call=approval_tool_call,
                 calls=[outcome.call for outcome in policy_outcomes],
@@ -6797,10 +6824,13 @@ class CayuApp:
         *,
         session_id: str,
         policy: ToolPolicy,
+        request_metadata: dict[str, Any],
     ) -> set[str]:
         if not isinstance(policy, TaintAwareToolPolicy):
             return set()
-        labels: set[str] = set()
+        # Seed with any taint labels carried on the run request so a subagent inherits its
+        # parent session's taint (propagated at spawn); union the child session's own labels.
+        labels: set[str] = set(taint_labels_from_metadata(request_metadata))
         for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
             records = await self._query_all_event_records(
                 EventQuery(
@@ -6830,10 +6860,22 @@ class CayuApp:
         approval_id: str | None = None,
         tool_round_id: str | None = None,
         input_id: str | None = None,
+        taint_labels: frozenset[str] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         started_event: Event | None = None
         registered_tool = registered_agent.tools.get(tool_call.name)
+        # Resolve the per-call active taint once so re-authorization, approval checkpointing, and the
+        # ctx.metadata injection below all use the same set. Normal execution and pause/resume pass
+        # the exact labels the policy gated this call with; other callers pass None and we recompute.
+        if taint_labels is None:
+            taint_labels = frozenset(
+                await self._prior_taint_labels_for_policy(
+                    session_id=session.id,
+                    policy=registered_agent.tool_policy,
+                    request_metadata=request_metadata,
+                )
+            )
         idempotency_key = tool_execution.tool_idempotency_key(
             session_id=session.id,
             tool_call_id=tool_call.id,
@@ -6910,6 +6952,7 @@ class CayuApp:
                     registered_environment=registered_environment,
                     tool_call=tool_call,
                     request_metadata=request_metadata,
+                    taint_labels=taint_labels,
                 )
             else:
                 resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
@@ -6956,6 +6999,7 @@ class CayuApp:
                     tool_call=tool_call,
                     tool_calls=[tool_call],
                     policy_outcomes=None,
+                    active_taint_by_id={tool_call.id: taint_labels},
                     task_id=task_id,
                     policy_result=resolved_policy_result,
                     structured_output=None,
@@ -7086,6 +7130,7 @@ class CayuApp:
                     **request_metadata,
                     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
                 },
+                taint_labels=taint_labels,
             )
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
                 # Fail-safe: DENY or REQUIRE_APPROVAL on hook-modified arguments blocks the call.
@@ -7124,6 +7169,21 @@ class CayuApp:
 
         resolved_proxy_secrets: list[ResolvedSecret] = []
         proxy_authorizations: list[_ProxyAuthorizationRecord] = []
+        ctx_metadata = tool_execution.context_metadata(
+            request_metadata=request_metadata,
+            tool_call_id=tool_call.id,
+            approval_id=approval_id,
+            idempotency_key=idempotency_key,
+            tool_effect=registered_tool.effect,
+            input_id=input_id,
+        )
+        # Surface the call's active taint labels to the executing tool so taint-aware tools (e.g.
+        # subagent spawns) can propagate them across session boundaries. taint_labels was resolved
+        # at the top of this method (per-call value from planning, or restored on pause/resume).
+        if taint_labels:
+            # ctx_metadata is a freshly copied dict and taint_labels is already validated, so set
+            # the key directly instead of re-deep-copying the whole payload via the helper.
+            ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
         try:
             result = await tool_execution.run_tool(
                 tool=registered_tool.tool,
@@ -7146,14 +7206,7 @@ class CayuApp:
                     ),
                     knowledge_store=_knowledge_store(registered_environment),
                     mcp_servers=_mcp_servers(registered_environment),
-                    metadata=tool_execution.context_metadata(
-                        request_metadata=request_metadata,
-                        tool_call_id=tool_call.id,
-                        approval_id=approval_id,
-                        idempotency_key=idempotency_key,
-                        tool_effect=registered_tool.effect,
-                        input_id=input_id,
-                    ),
+                    metadata=ctx_metadata,
                 ),
                 # effective_tool_call.arguments is the (re-authorized) private copy to execute.
                 arguments=effective_tool_call.arguments,
@@ -7413,6 +7466,7 @@ class CayuApp:
         tool_call: runtime_records.ToolCallRequest,
         tool_calls: list[runtime_records.ToolCallRequest],
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+        active_taint_by_id: Mapping[str, frozenset[str]],
         task_id: str | None,
         policy_result: ToolPolicyResult,
         structured_output: StructuredOutputSpec | None,
@@ -7442,6 +7496,7 @@ class CayuApp:
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
+                active_taint_by_id=active_taint_by_id,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
@@ -7480,6 +7535,7 @@ class CayuApp:
         tool_call: runtime_records.ToolCallRequest,
         tool_calls: list[runtime_records.ToolCallRequest],
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+        active_taint_by_id: Mapping[str, frozenset[str]],
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
@@ -7512,6 +7568,7 @@ class CayuApp:
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
+                active_taint_by_id=active_taint_by_id,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,

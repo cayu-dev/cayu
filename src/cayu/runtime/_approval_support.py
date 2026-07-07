@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from cayu._validation import copy_json_value
@@ -437,6 +439,7 @@ def pending_tool_call_approvals(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+    active_taint_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
 ) -> list[PendingToolCallApproval]:
     policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
     if policy_outcomes is not None:
@@ -456,6 +459,7 @@ def pending_tool_call_approvals(
                     if policy_result is not None
                     else {}
                 ),
+                active_taint_labels=sorted(active_taint_by_id.get(tool_call.id, frozenset())),
             )
         )
     return pending_approvals
@@ -477,6 +481,14 @@ def policy_result_from_pending_tool_call(
         reason=pending_tool_call.reason,
         metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
     )
+
+
+def taint_labels_from_pending_tool_call(
+    pending_tool_call: PendingToolCallApproval,
+) -> frozenset[str]:
+    """Active taint labels persisted for this call, restored so the resumed tool is gated with the
+    same taint the policy used before the pause."""
+    return frozenset(pending_tool_call.active_taint_labels)
 
 
 def _tool_call_outcome_from_terminal_event(
