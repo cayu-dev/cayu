@@ -9,6 +9,7 @@ from typing import Any
 from cayu import (
     AgentSpec,
     CayuApp,
+    Event,
     Message,
     ModelStreamEvent,
     RunOutcome,
@@ -151,3 +152,29 @@ def test_run_to_completion_reports_setup_failure_without_raising() -> None:
     assert outcome.status is SessionStatus.FAILED
     assert outcome.error is not None
     assert "not registered" in outcome.error
+
+
+class _PlainStrFailureApp:
+    """Stand-in whose ``run`` replays a failure event exactly as a non-model JSON channel
+    (webhook / SSE / JSONL) hands it back — ``.type`` is a plain ``str``, not the validator-
+    coerced enum member. ``run_to_completion`` must still classify the run as FAILED.
+    """
+
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        # model_construct bypasses the Event validator, so `.type` stays a plain str.
+        yield Event.model_construct(
+            type="session.failed",
+            session_id=request.session_id or "s1",
+            payload={"error": "boom"},
+        )
+
+
+def test_run_to_completion_detects_failure_when_event_type_is_plain_str() -> None:
+    # #125 footgun 1: `is` would silently miss a plain-str `.type` and leave the run stuck at the
+    # default INTERRUPTED (the "document hung in processing forever" symptom); `==` detects FAILED.
+    outcome = asyncio.run(run_to_completion(_PlainStrFailureApp(), _request()))  # type: ignore[arg-type]
+
+    assert not outcome.ok
+    assert outcome.status is SessionStatus.FAILED
+    assert outcome.status == "failed"
+    assert outcome.error == "boom"

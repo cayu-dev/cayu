@@ -65,22 +65,23 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
             events.append(event)
             session_id = event.session_id
             payload = event.payload or {}
-            if event.type is EventType.MODEL_STARTED:
+            # EventType is a StrEnum — compare with == never `is` (see the note on Event.type).
+            if event.type == EventType.MODEL_STARTED:
                 current_turn_text = []
                 final_text = ""
-            elif event.type is EventType.MODEL_TEXT_DELTA:
+            elif event.type == EventType.MODEL_TEXT_DELTA:
                 delta = payload.get("delta")
                 if isinstance(delta, str):
                     current_turn_text.append(delta)
-            elif event.type is EventType.MODEL_COMPLETED:
+            elif event.type == EventType.MODEL_COMPLETED:
                 final_text = "".join(current_turn_text)
-            elif event.type is EventType.SESSION_COMPLETED:
+            elif event.type == EventType.SESSION_COMPLETED:
                 status = SessionStatus.COMPLETED
-            elif event.type is EventType.SESSION_FAILED:
+            elif event.type == EventType.SESSION_FAILED:
                 status = SessionStatus.FAILED
                 failure = payload.get("error")
                 error = failure if isinstance(failure, str) else None
-            elif event.type is EventType.SESSION_INTERRUPTED:
+            elif event.type == EventType.SESSION_INTERRUPTED:
                 status = SessionStatus.INTERRUPTED
     except Exception as exc:
         status = SessionStatus.FAILED

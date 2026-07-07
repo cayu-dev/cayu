@@ -84,6 +84,6 @@ def test_tool_uses_runner_and_workspace(tmp_path: Path) -> None:
     )
 
     assert outcome.ok
-    completed = [e for e in outcome.events if e.type is EventType.TOOL_CALL_COMPLETED]
+    completed = [e for e in outcome.events if e.type == EventType.TOOL_CALL_COMPLETED]
     assert completed
     assert completed[0].payload["result"]["structured"]["exit_code"] == 0

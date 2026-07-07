@@ -19,7 +19,10 @@ MAX_TIMEOUT_SECONDS = 600
 class CommandPolicyDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
-    REQUIRE_APPROVAL = "require_approval"
+    # Refuses the command inline from ExecCommandTool's own seam (an error ToolResult). This does NOT
+    # create a durable approval checkpoint — for real pause/resume HITL use
+    # `ToolPolicyDecision.REQUIRE_APPROVAL`. Named/valued distinctly so neither surface collides.
+    REQUIRE_COMMAND_APPROVAL = "require_command_approval"
 
 
 class CommandRequest(BaseModel):

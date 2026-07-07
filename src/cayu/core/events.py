@@ -116,6 +116,10 @@ class Event(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # `EventType` is a StrEnum. A known type validates back to the enum member here, but an event
+    # deserialized from JSON elsewhere (webhook / SSE / JSONL, or `payload["type"]`) carries a plain
+    # str — so ALWAYS compare event types with `==`, never `is` (identity fails on the str form).
+    # (`| str` also admits `custom.*` types, which stay plain strings.)
     type: EventType | str
     session_id: str
     id: str = Field(default_factory=lambda: str(uuid4()))

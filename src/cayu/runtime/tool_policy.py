@@ -18,6 +18,9 @@ from cayu.runtime.sessions import Session
 class ToolPolicyDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
+    # Creates a durable PendingToolApproval checkpoint and interrupts the session for real
+    # pause/resume human-in-the-loop approval. (Not the same as
+    # CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL, which only refuses a command inline without pausing.)
     REQUIRE_APPROVAL = "require_approval"
 
 

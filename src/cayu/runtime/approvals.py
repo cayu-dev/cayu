@@ -260,7 +260,7 @@ class PendingToolApproval(BaseModel):
         guessing the shape. Raises ``ValueError`` on the wrong event type or a
         missing approval payload.
         """
-        if event.type is not EventType.TOOL_CALL_APPROVAL_REQUESTED:
+        if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
             raise ValueError(
                 "PendingToolApproval.from_event expects a "
                 f"{EventType.TOOL_CALL_APPROVAL_REQUESTED.value} event, got {str(event.type)!r}."

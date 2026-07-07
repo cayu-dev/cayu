@@ -67,6 +67,6 @@ def _require_complete_batch(batch: tuple[ModelStreamEvent, ...]) -> tuple[ModelS
     # reject a script that would otherwise fail the run in a confusing way.
     if not batch:
         raise ValueError("ScriptedModelProvider batch must not be empty.")
-    if batch[-1].type is not ModelStreamEventType.COMPLETED:
+    if batch[-1].type != ModelStreamEventType.COMPLETED:
         raise ValueError("ScriptedModelProvider batch must end with a COMPLETED event.")
     return batch

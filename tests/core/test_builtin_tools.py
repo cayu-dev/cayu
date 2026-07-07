@@ -1539,7 +1539,7 @@ def test_exec_command_tool_policy_deny_blocks_runner():
 def test_exec_command_tool_policy_require_approval_blocks_runner():
     runner = RecordingRunner()
     policy = _StaticCommandPolicy(
-        CommandPolicyResult(decision=CommandPolicyDecision.REQUIRE_APPROVAL)
+        CommandPolicyResult(decision=CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL)
     )
 
     result = asyncio.run(
@@ -1553,10 +1553,21 @@ def test_exec_command_tool_policy_require_approval_blocks_runner():
     assert result.content == "Command requires approval before it can run."
     assert result.structured == {
         "error": "command_approval_required",
-        "decision": "require_approval",
+        "decision": "require_command_approval",
         "reason": None,
     }
     assert runner.command is None
+
+
+def test_command_approval_member_is_distinct_from_tool_policy():
+    # #125 footgun 2: the command-policy approval member must NOT share a name OR a bare string with
+    # the tool-policy one. The tool-policy member creates a durable pause/resume checkpoint; the
+    # command-policy one only refuses the command inline (no session pause).
+    from cayu.runtime import ToolPolicyDecision
+
+    assert CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL != ToolPolicyDecision.REQUIRE_APPROVAL
+    assert str(CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL) == "require_command_approval"
+    assert str(ToolPolicyDecision.REQUIRE_APPROVAL) == "require_approval"
 
 
 def test_exec_command_tool_rejects_invalid_policy_wiring():
