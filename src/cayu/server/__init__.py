@@ -20,9 +20,27 @@ from pathlib import Path
 from typing import Any
 
 from cayu.runtime.app import CayuApp
-from cayu.server.routes import create_router
-from cayu.server.sse import event_to_sse_data
-from cayu.server.static import DashboardStaticFiles
+
+try:
+    from cayu.server.routes import create_router
+    from cayu.server.sse import event_to_sse_data
+    from cayu.server.static import DashboardStaticFiles
+except ModuleNotFoundError as exc:
+    # Only remap to the optional-dependency hint when one of the server extra's
+    # packages is absent. A deeper/unrelated missing module (a corrupt install,
+    # a missing transitive dep) must surface as its own error instead of being
+    # masked.
+    if (exc.name or "").partition(".")[0] not in {
+        "fastapi",
+        "starlette",
+        "sse_starlette",
+        "uvicorn",
+    }:
+        raise
+    raise RuntimeError(
+        "Cayu's server requires the optional server packages. "
+        'Install them with `pip install "cayu[server]"`.'
+    ) from exc
 
 __all__ = [
     "create_server",

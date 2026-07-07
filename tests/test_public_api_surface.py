@@ -11,7 +11,13 @@ pins them to the top level so that gap cannot silently reopen.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import cayu
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", re.DOTALL)
 
 # The session vocabulary the README's crash-recovery snippet depends on, plus
 # the four runtime base ABCs a builder subclasses to extend the framework.
@@ -48,3 +54,32 @@ def test_readme_recovery_snippet_imports_and_constructs() -> None:
 
     request = IncompleteSessionsRecoveryRequest(statuses={SessionStatus.INTERRUPTING})
     assert SessionStatus.INTERRUPTING in request.statuses
+
+
+def test_every_documented_root_import_is_exported() -> None:
+    # Audit the export surface as a set: every `from cayu import X` a reader can
+    # copy out of the README, docs, or examples must resolve against
+    # ``cayu.__all__`` — a doc that documents a missing name is the exact
+    # papercut external consumers keep reporting one name at a time.
+    documented: dict[str, Path] = {}
+    paths = [_REPO_ROOT / "README.md"]
+    for root in ("docs", "examples"):
+        paths.extend(sorted((_REPO_ROOT / root).rglob("*")))
+    for path in paths:
+        if not path.is_file() or path.suffix not in {".md", ".py"}:
+            continue
+        for match in _ROOT_IMPORT_PATTERN.finditer(path.read_text(errors="ignore")):
+            blob = match.group(2) or match.group(3) or ""
+            for name in blob.split(","):
+                name = name.split("#")[0].strip()
+                if name.isidentifier():
+                    documented.setdefault(name, path)
+
+    assert documented, "doc scan found no root imports — the scanner is broken"
+    exported = set(cayu.__all__)
+    missing = {
+        name: str(path.relative_to(_REPO_ROOT))
+        for name, path in sorted(documented.items())
+        if name not in exported
+    }
+    assert not missing, f"documented but not in cayu.__all__: {missing}"
