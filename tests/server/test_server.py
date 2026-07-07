@@ -1181,6 +1181,7 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "pricing_provider_name": "fake",
                 "pricing_model": "fake-model",
                 "pricing_match": "exact",
+                "pricing_tier_max_input_tokens": None,
                 "priced": True,
                 "currency": "USD",
                 "input_tokens": 10,
