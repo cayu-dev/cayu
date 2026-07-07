@@ -1,78 +1,4249 @@
 {
-  "components": [
-    "AggregateCostSummary",
-    "AggregateUsageSummary",
-    "ApiEventRecord",
-    "ApiEventSummary",
-    "ApiKnowledgeChunk",
-    "ApiKnowledgeListItem",
-    "ApiReviewedKnowledgeEntry",
-    "ApiSession",
-    "ApiSessionBase",
-    "ApiSessionDetailEvent",
-    "ApiSessionDetailTranscriptMessage",
-    "ApiSessionOutcome",
-    "ApiSessionSummaryItem",
-    "ApiTaskDetail",
-    "ApiTaskListItem",
-    "ApiTranscriptMessage",
-    "BudgetLimit",
-    "BudgetReservation",
-    "BudgetWindow",
-    "CacheUsageMetrics",
-    "CausalBudgetCostSummary",
-    "CausalBudgetSummaryResponse",
-    "CausalBudgetUsageSummary",
-    "ClientGenerationContract",
-    "CostLineItem",
-    "HTTPValidationError",
-    "HealthResponse",
-    "InterruptSessionBody",
-    "KnowledgeVisibility",
-    "ListSessionEventsResponse",
-    "ListSessionsResponse",
-    "MessageRole",
-    "ModelPricing",
-    "PendingKnowledgeDetailResponse",
-    "PendingKnowledgeListResponse",
-    "PricingCatalog",
-    "ResumeBody",
-    "RetryPolicy",
-    "RunBody",
-    "RunLimits",
-    "ServerContractResponse",
-    "SessionCostBody",
-    "SessionCostSummary",
-    "SessionDetailResponse",
-    "SessionOrder",
-    "SessionStatus",
-    "SessionSummaryResponse",
-    "SessionTranscriptResponse",
-    "SessionUsageSummary",
-    "SessionsSummaryBody",
-    "SessionsSummaryResponse",
-    "SseContract",
-    "SseErrorEnvelope",
-    "SseEventEnvelope",
-    "SseFrameExamples",
-    "StructuredOutputSpec",
-    "StructuredOutputStrategy",
-    "TaskHoldBody",
-    "TaskStatus",
-    "ThinkingConfig",
-    "ToolApprovalBody",
-    "ToolApprovalDecision",
-    "ToolApprovalRecoveryBody",
-    "ToolApprovalRecoveryOutcome",
-    "TranscriptSummary",
-    "UpdateSessionLabelsBody",
-    "UpdateSessionMetadataBody",
-    "UsageMetrics",
-    "UserInputRecoveryBody",
-    "UserInputResolveBody",
-    "ValidationError",
-    "VersioningContract"
-  ],
+  "components": {
+    "AggregateCostSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "line_items": {
+          "items": {
+            "$ref": "#/components/schemas/CostLineItem"
+          },
+          "title": "Line Items",
+          "type": "array"
+        },
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "priced_model_steps": {
+          "minimum": 0.0,
+          "title": "Priced Model Steps",
+          "type": "integer"
+        },
+        "session_costs": {
+          "items": {
+            "$ref": "#/components/schemas/SessionCostSummary"
+          },
+          "title": "Session Costs",
+          "type": "array"
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Session Ids",
+          "type": "array"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        },
+        "unpriced_model_steps": {
+          "minimum": 0.0,
+          "title": "Unpriced Model Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_ids",
+        "session_count",
+        "currency",
+        "model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps",
+        "total_cost",
+        "line_items",
+        "session_costs"
+      ],
+      "title": "AggregateCostSummary",
+      "type": "object"
+    },
+    "AggregateUsageSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        },
+        "provider_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Names",
+          "type": "array"
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Session Ids",
+          "type": "array"
+        },
+        "session_summaries": {
+          "items": {
+            "$ref": "#/components/schemas/SessionUsageSummary"
+          },
+          "title": "Session Summaries",
+          "type": "array"
+        },
+        "tool_calls": {
+          "minimum": 0.0,
+          "title": "Tool Calls",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/UsageMetrics"
+        }
+      },
+      "required": [
+        "session_ids",
+        "session_count",
+        "model_steps",
+        "tool_calls",
+        "provider_names",
+        "models",
+        "usage",
+        "session_summaries"
+      ],
+      "title": "AggregateUsageSummary",
+      "type": "object"
+    },
+    "ApiEventRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "sequence": {
+          "minimum": 0.0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "workflow_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workflow Name"
+        }
+      },
+      "required": [
+        "sequence",
+        "id",
+        "type",
+        "session_id",
+        "agent_name",
+        "environment_name",
+        "workflow_name",
+        "tool_name",
+        "payload",
+        "timestamp"
+      ],
+      "title": "ApiEventRecord",
+      "type": "object"
+    },
+    "ApiEventSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "counts_by_type": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Counts By Type",
+          "type": "object"
+        },
+        "latest_event": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiEventRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total_events": {
+          "minimum": 0.0,
+          "title": "Total Events",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total_events",
+        "counts_by_type",
+        "latest_event"
+      ],
+      "title": "ApiEventSummary",
+      "type": "object"
+    },
+    "ApiKnowledgeChunk": {
+      "additionalProperties": false,
+      "properties": {
+        "chunk_id": {
+          "title": "Chunk Id",
+          "type": "string"
+        },
+        "chunk_index": {
+          "minimum": 0.0,
+          "title": "Chunk Index",
+          "type": "integer"
+        },
+        "content_hash": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Content Hash"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "chunk_id",
+        "entry_id",
+        "chunk_index",
+        "text",
+        "content_hash",
+        "source_uri",
+        "metadata"
+      ],
+      "title": "ApiKnowledgeChunk",
+      "type": "object"
+    },
+    "ApiKnowledgeListItem": {
+      "additionalProperties": false,
+      "properties": {
+        "aspects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aspects",
+          "type": "array"
+        },
+        "chunk_count": {
+          "minimum": 0.0,
+          "title": "Chunk Count",
+          "type": "integer"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created By"
+        },
+        "created_by_type": {
+          "title": "Created By Type",
+          "type": "string"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "impact_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Impact Targets",
+          "type": "array"
+        },
+        "importance": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance"
+        },
+        "importance_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance Source"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Type"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text_preview": {
+          "title": "Text Preview",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "namespace",
+        "kind",
+        "visibility",
+        "status",
+        "title",
+        "labels",
+        "aspects",
+        "impact_targets",
+        "source_type",
+        "source_uri",
+        "source_id",
+        "created_by_type",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "importance",
+        "importance_source",
+        "confidence",
+        "chunk_count",
+        "text_preview"
+      ],
+      "title": "ApiKnowledgeListItem",
+      "type": "object"
+    },
+    "ApiReviewedKnowledgeEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "aspects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aspects",
+          "type": "array"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created By"
+        },
+        "created_by_type": {
+          "title": "Created By Type",
+          "type": "string"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "impact_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Impact Targets",
+          "type": "array"
+        },
+        "importance": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance"
+        },
+        "importance_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance Source"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Type"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text_preview": {
+          "title": "Text Preview",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "namespace",
+        "kind",
+        "visibility",
+        "status",
+        "title",
+        "labels",
+        "aspects",
+        "impact_targets",
+        "source_type",
+        "source_uri",
+        "source_id",
+        "created_by_type",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "importance",
+        "importance_source",
+        "confidence",
+        "text_preview"
+      ],
+      "title": "ApiReviewedKnowledgeEntry",
+      "type": "object"
+    },
+    "ApiSession": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "causal_budget_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Causal Budget Id"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Session Id"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "runtime_name": {
+          "title": "Runtime Name",
+          "type": "string"
+        },
+        "runtime_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Runtime Version"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "agent_name",
+        "provider_name",
+        "model",
+        "parent_session_id",
+        "causal_budget_id",
+        "runtime_name",
+        "runtime_version",
+        "environment_name",
+        "created_at",
+        "updated_at",
+        "labels",
+        "metadata"
+      ],
+      "title": "ApiSession",
+      "type": "object"
+    },
+    "ApiSessionBase": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "causal_budget_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Causal Budget Id"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Session Id"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "runtime_name": {
+          "title": "Runtime Name",
+          "type": "string"
+        },
+        "runtime_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Runtime Version"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "agent_name",
+        "provider_name",
+        "model",
+        "parent_session_id",
+        "causal_budget_id",
+        "runtime_name",
+        "runtime_version",
+        "environment_name",
+        "created_at",
+        "updated_at",
+        "labels"
+      ],
+      "title": "ApiSessionBase",
+      "type": "object"
+    },
+    "ApiSessionDetailEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "workflow_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workflow Name"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "agent_name",
+        "tool_name",
+        "payload",
+        "timestamp"
+      ],
+      "title": "ApiSessionDetailEvent",
+      "type": "object"
+    },
+    "ApiSessionDetailTranscriptMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Content",
+          "type": "array"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "content"
+      ],
+      "title": "ApiSessionDetailTranscriptMessage",
+      "type": "object"
+    },
+    "ApiSessionOutcome": {
+      "additionalProperties": false,
+      "properties": {
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        },
+        "latest_retry_event": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiEventRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retry"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "terminal_event": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ApiEventRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "status",
+        "reason",
+        "details",
+        "retry",
+        "terminal_event",
+        "latest_retry_event"
+      ],
+      "title": "ApiSessionOutcome",
+      "type": "object"
+    },
+    "ApiSessionSummaryItem": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "$ref": "#/components/schemas/ApiEventSummary"
+        },
+        "outcome": {
+          "$ref": "#/components/schemas/ApiSessionOutcome"
+        },
+        "session": {
+          "$ref": "#/components/schemas/ApiSession"
+        }
+      },
+      "required": [
+        "session",
+        "outcome",
+        "events"
+      ],
+      "title": "ApiSessionSummaryItem",
+      "type": "object"
+    },
+    "ApiTaskDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "assigned_agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assigned Agent Name"
+        },
+        "completed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Completed At"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "input": {
+          "additionalProperties": true,
+          "title": "Input",
+          "type": "object"
+        },
+        "lease_expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lease Expires At"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "parent_task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Task Id"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Started At"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "status_payload": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status Payload"
+        },
+        "status_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status Reason"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "worker_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Worker Id"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "title",
+        "status",
+        "status_reason",
+        "status_payload",
+        "session_id",
+        "worker_id",
+        "lease_expires_at",
+        "created_at",
+        "completed_at",
+        "description",
+        "parent_task_id",
+        "assigned_agent_name",
+        "input",
+        "result",
+        "error",
+        "metadata",
+        "updated_at",
+        "started_at"
+      ],
+      "title": "ApiTaskDetail",
+      "type": "object"
+    },
+    "ApiTaskListItem": {
+      "additionalProperties": false,
+      "properties": {
+        "completed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Completed At"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "lease_expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lease Expires At"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "status_payload": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status Payload"
+        },
+        "status_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status Reason"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "worker_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Worker Id"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "title",
+        "status",
+        "status_reason",
+        "status_payload",
+        "session_id",
+        "worker_id",
+        "lease_expires_at",
+        "created_at",
+        "completed_at"
+      ],
+      "title": "ApiTaskListItem",
+      "type": "object"
+    },
+    "ApiTranscriptMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Content",
+          "type": "array"
+        },
+        "index": {
+          "minimum": 0.0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "role",
+        "content"
+      ],
+      "title": "ApiTranscriptMessage",
+      "type": "object"
+    },
+    "BudgetLimit": {
+      "additionalProperties": false,
+      "description": "Estimated-cost budget that applies across one durable runtime scope.",
+      "properties": {
+        "action": {
+          "default": "interrupt",
+          "enum": [
+            "interrupt",
+            "notify"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "allow_unpriced": {
+          "default": false,
+          "title": "Allow Unpriced",
+          "type": "boolean"
+        },
+        "currency": {
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Key"
+        },
+        "max_estimated_cost": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Max Estimated Cost"
+        },
+        "pricing": {
+          "$ref": "#/components/schemas/PricingCatalog"
+        },
+        "reservation": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/BudgetReservation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "default": "session",
+          "enum": [
+            "app",
+            "agent",
+            "causal",
+            "session",
+            "run"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/components/schemas/BudgetWindow"
+        }
+      },
+      "required": [
+        "max_estimated_cost",
+        "pricing"
+      ],
+      "title": "BudgetLimit",
+      "type": "object"
+    },
+    "BudgetReservation": {
+      "additionalProperties": false,
+      "description": "Conservative per-model-step reservation configured by the app.",
+      "properties": {
+        "max_cache_read_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Max Cache Read Input Tokens",
+          "type": "integer"
+        },
+        "max_cache_write_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Max Cache Write Input Tokens",
+          "type": "integer"
+        },
+        "max_input_tokens": {
+          "minimum": 0.0,
+          "title": "Max Input Tokens",
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "minimum": 0.0,
+          "title": "Max Output Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_input_tokens",
+        "max_output_tokens"
+      ],
+      "title": "BudgetReservation",
+      "type": "object"
+    },
+    "BudgetWindow": {
+      "additionalProperties": false,
+      "description": "Time window used when selecting events for budget accounting.",
+      "properties": {
+        "duration_seconds": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Duration Seconds"
+        },
+        "kind": {
+          "default": "all_time",
+          "enum": [
+            "all_time",
+            "rolling",
+            "calendar"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "period": {
+          "anyOf": [
+            {
+              "enum": [
+                "day",
+                "week",
+                "month"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Period"
+        },
+        "timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Timezone"
+        }
+      },
+      "title": "BudgetWindow",
+      "type": "object"
+    },
+    "CacheUsageMetrics": {
+      "additionalProperties": false,
+      "description": "Provider-neutral cache token counters for one model step.",
+      "properties": {
+        "cached_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Cached Input Tokens",
+          "type": "integer"
+        },
+        "read_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Read Tokens",
+          "type": "integer"
+        },
+        "uncached_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Uncached Input Tokens",
+          "type": "integer"
+        },
+        "write_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Write Tokens",
+          "type": "integer"
+        }
+      },
+      "title": "CacheUsageMetrics",
+      "type": "object"
+    },
+    "CausalBudgetCostSummary": {
+      "additionalProperties": false,
+      "description": "Estimated cost for all sessions sharing one causal budget id.",
+      "properties": {
+        "causal_budget_id": {
+          "title": "Causal Budget Id",
+          "type": "string"
+        },
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "line_items": {
+          "items": {
+            "$ref": "#/components/schemas/CostLineItem"
+          },
+          "title": "Line Items",
+          "type": "array"
+        },
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "priced_model_steps": {
+          "minimum": 0.0,
+          "title": "Priced Model Steps",
+          "type": "integer"
+        },
+        "session_costs": {
+          "items": {
+            "$ref": "#/components/schemas/SessionCostSummary"
+          },
+          "title": "Session Costs",
+          "type": "array"
+        },
+        "session_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Session Ids",
+          "type": "array"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        },
+        "unpriced_model_steps": {
+          "minimum": 0.0,
+          "title": "Unpriced Model Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "causal_budget_id",
+        "currency",
+        "model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps",
+        "total_cost"
+      ],
+      "title": "CausalBudgetCostSummary",
+      "type": "object"
+    },
+    "CausalBudgetSummaryResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "causal_budget_id": {
+          "title": "Causal Budget Id",
+          "type": "string"
+        },
+        "cost": {
+          "$ref": "#/components/schemas/CausalBudgetCostSummary"
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionSummaryItem"
+          },
+          "title": "Sessions",
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/CausalBudgetUsageSummary"
+        }
+      },
+      "required": [
+        "causal_budget_id",
+        "session_count",
+        "sessions",
+        "usage",
+        "cost"
+      ],
+      "title": "CausalBudgetSummaryResponse",
+      "type": "object"
+    },
+    "CausalBudgetUsageSummary": {
+      "additionalProperties": false,
+      "description": "Usage totals for all sessions sharing one causal budget id.",
+      "properties": {
+        "causal_budget_id": {
+          "title": "Causal Budget Id",
+          "type": "string"
+        },
+        "model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        },
+        "provider_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Names",
+          "type": "array"
+        },
+        "session_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Session Ids",
+          "type": "array"
+        },
+        "session_summaries": {
+          "items": {
+            "$ref": "#/components/schemas/SessionUsageSummary"
+          },
+          "title": "Session Summaries",
+          "type": "array"
+        },
+        "tool_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Calls",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/UsageMetrics"
+        }
+      },
+      "required": [
+        "causal_budget_id"
+      ],
+      "title": "CausalBudgetUsageSummary",
+      "type": "object"
+    },
+    "ClientGenerationContract": {
+      "additionalProperties": false,
+      "properties": {
+        "openapi_url": {
+          "const": "/openapi.json",
+          "default": "/openapi.json",
+          "title": "Openapi Url",
+          "type": "string"
+        },
+        "source_of_truth": {
+          "const": "openapi",
+          "default": "openapi",
+          "title": "Source Of Truth",
+          "type": "string"
+        },
+        "supported_targets": {
+          "default": [
+            "typescript",
+            "python"
+          ],
+          "items": {
+            "enum": [
+              "typescript",
+              "python"
+            ],
+            "type": "string"
+          },
+          "title": "Supported Targets",
+          "type": "array"
+        }
+      },
+      "title": "ClientGenerationContract",
+      "type": "object"
+    },
+    "CostLineItem": {
+      "additionalProperties": false,
+      "description": "Estimated cost for one model.completed event.",
+      "properties": {
+        "cache_read_input_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Cache Read Input Cost",
+          "type": "string"
+        },
+        "cache_read_input_tokens": {
+          "minimum": 0.0,
+          "title": "Cache Read Input Tokens",
+          "type": "integer"
+        },
+        "cache_write_input_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Cache Write Input Cost",
+          "type": "string"
+        },
+        "cache_write_input_tokens": {
+          "minimum": 0.0,
+          "title": "Cache Write Input Tokens",
+          "type": "integer"
+        },
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "input_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Input Cost",
+          "type": "string"
+        },
+        "input_tokens": {
+          "minimum": 0.0,
+          "title": "Input Tokens",
+          "type": "integer"
+        },
+        "missing_pricing_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Missing Pricing Reason"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "model_step": {
+          "minimum": 1.0,
+          "title": "Model Step",
+          "type": "integer"
+        },
+        "output_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Output Cost",
+          "type": "string"
+        },
+        "output_tokens": {
+          "minimum": 0.0,
+          "title": "Output Tokens",
+          "type": "integer"
+        },
+        "priced": {
+          "title": "Priced",
+          "type": "boolean"
+        },
+        "pricing_match": {
+          "anyOf": [
+            {
+              "enum": [
+                "exact",
+                "prefix"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Match"
+        },
+        "pricing_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Model"
+        },
+        "pricing_provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Provider Name"
+        },
+        "pricing_tier_max_input_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Tier Max Input Tokens"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "requested_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Requested Model"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        },
+        "uncached_input_tokens": {
+          "minimum": 0.0,
+          "title": "Uncached Input Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model_step",
+        "priced",
+        "currency",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "uncached_input_tokens",
+        "input_cost",
+        "output_cost",
+        "cache_read_input_cost",
+        "cache_write_input_cost",
+        "total_cost"
+      ],
+      "title": "CostLineItem",
+      "type": "object"
+    },
+    "HTTPValidationError": {
+      "properties": {
+        "detail": {
+          "items": {
+            "$ref": "#/components/schemas/ValidationError"
+          },
+          "title": "Detail",
+          "type": "array"
+        }
+      },
+      "title": "HTTPValidationError",
+      "type": "object"
+    },
+    "HealthResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "title": "Ok",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "title": "HealthResponse",
+      "type": "object"
+    },
+    "InterruptSessionBody": {
+      "properties": {
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "title": "InterruptSessionBody",
+      "type": "object"
+    },
+    "KnowledgeVisibility": {
+      "enum": [
+        "global",
+        "organization",
+        "project",
+        "workspace",
+        "user",
+        "session",
+        "task"
+      ],
+      "title": "KnowledgeVisibility",
+      "type": "string"
+    },
+    "ListSessionEventsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/components/schemas/ApiEventRecord"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Sequence"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "events",
+        "has_more"
+      ],
+      "title": "ListSessionEventsResponse",
+      "type": "object"
+    },
+    "ListSessionsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionBase"
+          },
+          "title": "Sessions",
+          "type": "array"
+        },
+        "total_count": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Total Count"
+        }
+      },
+      "required": [
+        "sessions",
+        "next_cursor"
+      ],
+      "title": "ListSessionsResponse",
+      "type": "object"
+    },
+    "MessageRole": {
+      "enum": [
+        "user",
+        "assistant",
+        "system",
+        "tool"
+      ],
+      "title": "MessageRole",
+      "type": "string"
+    },
+    "ModelPricing": {
+      "additionalProperties": false,
+      "description": "User-supplied model pricing expressed as currency units per 1M tokens.",
+      "properties": {
+        "cache_read_input_per_million": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cache Read Input Per Million"
+        },
+        "cache_write_input_per_million": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cache Write Input Per Million"
+        },
+        "currency": {
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "input_per_million": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Input Per Million"
+        },
+        "match": {
+          "default": "exact",
+          "enum": [
+            "exact",
+            "prefix"
+          ],
+          "title": "Match",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "output_per_million": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Output Per Million"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "model",
+        "input_per_million",
+        "output_per_million"
+      ],
+      "title": "ModelPricing",
+      "type": "object"
+    },
+    "PendingKnowledgeDetailResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "aspects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aspects",
+          "type": "array"
+        },
+        "chunk_limit": {
+          "minimum": 1.0,
+          "title": "Chunk Limit",
+          "type": "integer"
+        },
+        "chunk_max_bytes": {
+          "minimum": 1.0,
+          "title": "Chunk Max Bytes",
+          "type": "integer"
+        },
+        "chunks": {
+          "items": {
+            "$ref": "#/components/schemas/ApiKnowledgeChunk"
+          },
+          "title": "Chunks",
+          "type": "array"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created By"
+        },
+        "created_by_type": {
+          "title": "Created By Type",
+          "type": "string"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "impact_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Impact Targets",
+          "type": "array"
+        },
+        "importance": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance"
+        },
+        "importance_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance Source"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Type"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "namespace",
+        "kind",
+        "visibility",
+        "status",
+        "title",
+        "labels",
+        "aspects",
+        "impact_targets",
+        "source_type",
+        "source_uri",
+        "source_id",
+        "created_by_type",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "importance",
+        "importance_source",
+        "confidence",
+        "text",
+        "metadata",
+        "expires_at",
+        "chunks",
+        "chunk_limit",
+        "chunk_max_bytes"
+      ],
+      "title": "PendingKnowledgeDetailResponse",
+      "type": "object"
+    },
+    "PendingKnowledgeListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/components/schemas/ApiKnowledgeListItem"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "limit": {
+          "minimum": 1.0,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "minimum": 1.0,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "total_entries_known": {
+          "minimum": 0.0,
+          "title": "Total Entries Known",
+          "type": "integer"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "entries",
+        "truncated",
+        "limit",
+        "max_bytes",
+        "total_entries_known"
+      ],
+      "title": "PendingKnowledgeListResponse",
+      "type": "object"
+    },
+    "PricingCatalog": {
+      "additionalProperties": false,
+      "description": "Collection of user-supplied model prices used for cost estimation.",
+      "properties": {
+        "prices": {
+          "items": {
+            "$ref": "#/components/schemas/ModelPricing"
+          },
+          "minItems": 1,
+          "title": "Prices",
+          "type": "array"
+        }
+      },
+      "required": [
+        "prices"
+      ],
+      "title": "PricingCatalog",
+      "type": "object"
+    },
+    "ResumeBody": {
+      "properties": {
+        "budget_limits": {
+          "items": {
+            "$ref": "#/components/schemas/BudgetLimit"
+          },
+          "title": "Budget Limits",
+          "type": "array"
+        },
+        "limits": {
+          "$ref": "#/components/schemas/RunLimits"
+        },
+        "max_steps": {
+          "default": 20,
+          "maximum": 256.0,
+          "minimum": 1.0,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "prompt": {
+          "minLength": 1,
+          "title": "Prompt",
+          "type": "string"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "prompt"
+      ],
+      "title": "ResumeBody",
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "additionalProperties": false,
+      "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default of 1 means retries\nare disabled.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
+      "properties": {
+        "backoff_multiplier": {
+          "default": 2.0,
+          "maximum": 10.0,
+          "minimum": 1.0,
+          "title": "Backoff Multiplier",
+          "type": "number"
+        },
+        "initial_delay_s": {
+          "default": 0.5,
+          "maximum": 60.0,
+          "minimum": 0.0,
+          "title": "Initial Delay S",
+          "type": "number"
+        },
+        "jitter_s": {
+          "default": 0.0,
+          "maximum": 60.0,
+          "minimum": 0.0,
+          "title": "Jitter S",
+          "type": "number"
+        },
+        "max_attempts": {
+          "default": 1,
+          "maximum": 10.0,
+          "minimum": 1.0,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "max_delay_s": {
+          "default": 10.0,
+          "maximum": 300.0,
+          "minimum": 0.0,
+          "title": "Max Delay S",
+          "type": "number"
+        },
+        "retry_on_connection_error": {
+          "default": true,
+          "title": "Retry On Connection Error",
+          "type": "boolean"
+        },
+        "retry_on_rate_limit": {
+          "default": true,
+          "title": "Retry On Rate Limit",
+          "type": "boolean"
+        },
+        "retry_on_status_codes": {
+          "default": [
+            429,
+            500,
+            502,
+            503,
+            504,
+            529
+          ],
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 32,
+          "minItems": 0,
+          "title": "Retry On Status Codes",
+          "type": "array"
+        },
+        "retry_on_timeout": {
+          "default": true,
+          "title": "Retry On Timeout",
+          "type": "boolean"
+        }
+      },
+      "title": "RetryPolicy",
+      "type": "object"
+    },
+    "RunBody": {
+      "properties": {
+        "agent": {
+          "default": "assistant",
+          "minLength": 1,
+          "title": "Agent",
+          "type": "string"
+        },
+        "budget_limits": {
+          "items": {
+            "$ref": "#/components/schemas/BudgetLimit"
+          },
+          "title": "Budget Limits",
+          "type": "array"
+        },
+        "causal_budget_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Causal Budget Id"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "limits": {
+          "$ref": "#/components/schemas/RunLimits"
+        },
+        "max_steps": {
+          "default": 20,
+          "maximum": 256.0,
+          "minimum": 1.0,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "prompt": {
+          "minLength": 1,
+          "title": "Prompt",
+          "type": "string"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "title": "RunBody",
+      "type": "object"
+    },
+    "RunLimits": {
+      "additionalProperties": false,
+      "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation \u2014 usage deltas since\n  the run entered and wall time since the run started.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session \u2014 cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
+      "properties": {
+        "max_elapsed_seconds": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Elapsed Seconds"
+        },
+        "max_input_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Input Tokens"
+        },
+        "max_output_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Output Tokens"
+        },
+        "max_tool_calls": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Tool Calls"
+        },
+        "max_total_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Total Tokens"
+        },
+        "scope": {
+          "default": "run",
+          "enum": [
+            "session",
+            "run"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "title": "RunLimits",
+      "type": "object"
+    },
+    "ServerContractResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "api_prefix": {
+          "const": "/api",
+          "default": "/api",
+          "title": "Api Prefix",
+          "type": "string"
+        },
+        "client_generation": {
+          "$ref": "#/components/schemas/ClientGenerationContract"
+        },
+        "contract_version": {
+          "default": "1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "sse": {
+          "$ref": "#/components/schemas/SseContract"
+        },
+        "versioning": {
+          "$ref": "#/components/schemas/VersioningContract"
+        }
+      },
+      "title": "ServerContractResponse",
+      "type": "object"
+    },
+    "SessionCostBody": {
+      "properties": {
+        "currency": {
+          "default": "USD",
+          "minLength": 1,
+          "title": "Currency",
+          "type": "string"
+        },
+        "pricing": {
+          "$ref": "#/components/schemas/PricingCatalog"
+        }
+      },
+      "required": [
+        "pricing"
+      ],
+      "title": "SessionCostBody",
+      "type": "object"
+    },
+    "SessionCostSummary": {
+      "additionalProperties": false,
+      "description": "Estimated session cost derived from durable model.completed events.",
+      "properties": {
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "line_items": {
+          "items": {
+            "$ref": "#/components/schemas/CostLineItem"
+          },
+          "title": "Line Items",
+          "type": "array"
+        },
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "priced_model_steps": {
+          "minimum": 0.0,
+          "title": "Priced Model Steps",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        },
+        "unpriced_model_steps": {
+          "minimum": 0.0,
+          "title": "Unpriced Model Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "currency",
+        "model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps",
+        "total_cost"
+      ],
+      "title": "SessionCostSummary",
+      "type": "object"
+    },
+    "SessionDetailResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionDetailEvent"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "session": {
+          "$ref": "#/components/schemas/ApiSession"
+        },
+        "transcript": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionDetailTranscriptMessage"
+          },
+          "title": "Transcript",
+          "type": "array"
+        }
+      },
+      "required": [
+        "session",
+        "events",
+        "transcript"
+      ],
+      "title": "SessionDetailResponse",
+      "type": "object"
+    },
+    "SessionOrder": {
+      "enum": [
+        "created_at_asc",
+        "created_at_desc",
+        "updated_at_asc",
+        "updated_at_desc"
+      ],
+      "title": "SessionOrder",
+      "type": "string"
+    },
+    "SessionStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "interrupting",
+        "completed",
+        "failed",
+        "interrupted"
+      ],
+      "title": "SessionStatus",
+      "type": "string"
+    },
+    "SessionSummaryResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "$ref": "#/components/schemas/ApiEventSummary"
+        },
+        "outcome": {
+          "$ref": "#/components/schemas/ApiSessionOutcome"
+        },
+        "session": {
+          "$ref": "#/components/schemas/ApiSession"
+        },
+        "transcript": {
+          "$ref": "#/components/schemas/TranscriptSummary"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/SessionUsageSummary"
+        }
+      },
+      "required": [
+        "session",
+        "events",
+        "transcript",
+        "outcome",
+        "usage"
+      ],
+      "title": "SessionSummaryResponse",
+      "type": "object"
+    },
+    "SessionTranscriptResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTranscriptMessage"
+          },
+          "title": "Messages",
+          "type": "array"
+        },
+        "next_offset": {
+          "minimum": 0.0,
+          "title": "Next Offset",
+          "type": "integer"
+        },
+        "offset": {
+          "minimum": 0.0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "total_messages": {
+          "minimum": 0.0,
+          "title": "Total Messages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "messages",
+        "offset",
+        "next_offset",
+        "has_more",
+        "total_messages"
+      ],
+      "title": "SessionTranscriptResponse",
+      "type": "object"
+    },
+    "SessionUsageSummary": {
+      "additionalProperties": false,
+      "description": "Usage totals derived from durable session events.",
+      "properties": {
+        "model_steps": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        },
+        "provider_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Names",
+          "type": "array"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "tool_calls": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Calls",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/UsageMetrics"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "title": "SessionUsageSummary",
+      "type": "object"
+    },
+    "SessionsSummaryBody": {
+      "properties": {
+        "currency": {
+          "default": "USD",
+          "minLength": 1,
+          "title": "Currency",
+          "type": "string"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PricingCatalog"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "title": "SessionsSummaryBody",
+      "type": "object"
+    },
+    "SessionsSummaryResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/AggregateCostSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionSummaryItem"
+          },
+          "title": "Sessions",
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/AggregateUsageSummary"
+        }
+      },
+      "required": [
+        "session_count",
+        "sessions",
+        "usage",
+        "cost"
+      ],
+      "title": "SessionsSummaryResponse",
+      "type": "object"
+    },
+    "SseContract": {
+      "additionalProperties": false,
+      "properties": {
+        "content_type": {
+          "const": "text/event-stream",
+          "default": "text/event-stream",
+          "title": "Content Type",
+          "type": "string"
+        },
+        "error_data_schema": {
+          "const": "SseErrorEnvelope",
+          "default": "SseErrorEnvelope",
+          "title": "Error Data Schema",
+          "type": "string"
+        },
+        "error_event_name": {
+          "const": "error",
+          "default": "error",
+          "title": "Error Event Name",
+          "type": "string"
+        },
+        "event_data_schema": {
+          "const": "SseEventEnvelope",
+          "default": "SseEventEnvelope",
+          "title": "Event Data Schema",
+          "type": "string"
+        },
+        "event_id_format": {
+          "const": "session_id:event_id",
+          "default": "session_id:event_id",
+          "title": "Event Id Format",
+          "type": "string"
+        },
+        "examples": {
+          "$ref": "#/components/schemas/SseFrameExamples"
+        },
+        "replay_header": {
+          "const": "Last-Event-ID",
+          "default": "Last-Event-ID",
+          "title": "Replay Header",
+          "type": "string"
+        }
+      },
+      "title": "SseContract",
+      "type": "object"
+    },
+    "SseErrorEnvelope": {
+      "additionalProperties": false,
+      "description": "JSON payload in terminal SSE ``event: error`` frames.",
+      "properties": {
+        "error": {
+          "title": "Error",
+          "type": "string"
+        },
+        "error_type": {
+          "title": "Error Type",
+          "type": "string"
+        },
+        "type": {
+          "const": "stream.error",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "error",
+        "error_type"
+      ],
+      "title": "SseErrorEnvelope",
+      "type": "object"
+    },
+    "SseEventEnvelope": {
+      "additionalProperties": false,
+      "description": "JSON payload in each runtime event SSE ``data:`` frame.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "workflow_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workflow Name"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "session_id",
+        "agent_name",
+        "tool_name",
+        "payload",
+        "timestamp"
+      ],
+      "title": "SseEventEnvelope",
+      "type": "object"
+    },
+    "SseFrameExamples": {
+      "additionalProperties": false,
+      "properties": {
+        "error_data": {
+          "$ref": "#/components/schemas/SseErrorEnvelope"
+        },
+        "event_data": {
+          "$ref": "#/components/schemas/SseEventEnvelope"
+        }
+      },
+      "title": "SseFrameExamples",
+      "type": "object"
+    },
+    "StructuredOutputSpec": {
+      "additionalProperties": false,
+      "description": "Provider-neutral JSON structured output requirement.",
+      "properties": {
+        "json_schema": {
+          "additionalProperties": true,
+          "title": "Json Schema",
+          "type": "object"
+        },
+        "max_retries": {
+          "default": 2,
+          "maximum": 8.0,
+          "minimum": 0.0,
+          "title": "Max Retries",
+          "type": "integer"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        },
+        "repair_prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Repair Prompt"
+        },
+        "strategy": {
+          "$ref": "#/components/schemas/StructuredOutputStrategy",
+          "default": "tool"
+        }
+      },
+      "required": [
+        "json_schema"
+      ],
+      "title": "StructuredOutputSpec",
+      "type": "object"
+    },
+    "StructuredOutputStrategy": {
+      "enum": [
+        "tool",
+        "native"
+      ],
+      "title": "StructuredOutputStrategy",
+      "type": "string"
+    },
+    "TaskHoldBody": {
+      "properties": {
+        "payload": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Payload"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "title": "TaskHoldBody",
+      "type": "object"
+    },
+    "TaskStatus": {
+      "enum": [
+        "pending",
+        "claimed",
+        "running",
+        "paused",
+        "blocked",
+        "needs_attention",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "title": "TaskStatus",
+      "type": "string"
+    },
+    "ThinkingConfig": {
+      "additionalProperties": false,
+      "description": "Provider-neutral thinking/reasoning configuration.\n\nThe runtime carries this as a neutral ``options[\"thinking\"]`` payload and each\nprovider maps it to its own request shape (field-driven, no model lookup):\n\n- ``effort`` set -> adaptive thinking (Anthropic ``thinking={\"type\": \"adaptive\"}``\n  + ``output_config={\"effort\": ...}``; OpenAI ``reasoning={\"effort\": ...}``). This\n  is the path the current Claude and OpenAI reasoning models use.\n- ``max_tokens`` set (and no ``effort``) -> legacy budgeted thinking (Anthropic\n  ``thinking={\"type\": \"enabled\", \"budget_tokens\": ...}``). Only the older Claude\n  models accept a token budget; OpenAI has no budget knob and ignores it.\n- neither set, ``enabled=True`` -> adaptive thinking with provider defaults (on the\n  Chat Completions path this is a no-op: the model reasons by its own default).\n- ``enabled=False`` is best-effort and provider-dependent: Anthropic disables\n  (``thinking={\"type\": \"disabled\"}``); OpenAI reasoning models cannot be disabled, so\n  it is a no-op (the model still reasons); the generic Chat Completions adapter also\n  no-ops (disabling isn't portable \u2014 pass a raw ``reasoning_effort`` via\n  ``provider_options`` to target a backend like Gemini that accepts ``\"none\"``).\n\nChoose the field appropriate to your model; a mismatch surfaces as a clear\nprovider 400 rather than being silently corrected.",
+      "properties": {
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effort"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "include_in_transcript": {
+          "default": true,
+          "title": "Include In Transcript",
+          "type": "boolean"
+        },
+        "max_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Tokens"
+        }
+      },
+      "title": "ThinkingConfig",
+      "type": "object"
+    },
+    "ToolApprovalBody": {
+      "description": "Body for resolving a pending tool approval.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values override it.",
+      "properties": {
+        "approval_id": {
+          "minLength": 1,
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "budget_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/BudgetLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Budget Limits"
+        },
+        "decision": {
+          "$ref": "#/components/schemas/ToolApprovalDecision"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_steps": {
+          "anyOf": [
+            {
+              "maximum": 256.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Steps"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "approval_id",
+        "decision"
+      ],
+      "title": "ToolApprovalBody",
+      "type": "object"
+    },
+    "ToolApprovalDecision": {
+      "enum": [
+        "approve",
+        "deny"
+      ],
+      "title": "ToolApprovalDecision",
+      "type": "string"
+    },
+    "ToolApprovalRecoveryBody": {
+      "description": "Body for recovering an approved tool call with an unknown result.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run inherits the original run's configuration\npersisted on the pending approval. Explicit values override it.",
+      "properties": {
+        "approval_id": {
+          "minLength": 1,
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "artifacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "budget_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/BudgetLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Budget Limits"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_steps": {
+          "anyOf": [
+            {
+              "maximum": 256.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Steps"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "outcome": {
+          "$ref": "#/components/schemas/ToolApprovalRecoveryOutcome"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Structured"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "approval_id",
+        "tool_call_id",
+        "outcome",
+        "message"
+      ],
+      "title": "ToolApprovalRecoveryBody",
+      "type": "object"
+    },
+    "ToolApprovalRecoveryOutcome": {
+      "enum": [
+        "completed",
+        "failed"
+      ],
+      "title": "ToolApprovalRecoveryOutcome",
+      "type": "string"
+    },
+    "TranscriptSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "total_messages": {
+          "minimum": 0.0,
+          "title": "Total Messages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total_messages"
+      ],
+      "title": "TranscriptSummary",
+      "type": "object"
+    },
+    "UpdateSessionLabelsBody": {
+      "additionalProperties": false,
+      "properties": {
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        }
+      },
+      "required": [
+        "labels"
+      ],
+      "title": "UpdateSessionLabelsBody",
+      "type": "object"
+    },
+    "UpdateSessionMetadataBody": {
+      "additionalProperties": false,
+      "properties": {
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        }
+      },
+      "required": [
+        "metadata"
+      ],
+      "title": "UpdateSessionMetadataBody",
+      "type": "object"
+    },
+    "UsageMetrics": {
+      "additionalProperties": false,
+      "description": "Provider-neutral token counters for one model step.",
+      "properties": {
+        "cache": {
+          "$ref": "#/components/schemas/CacheUsageMetrics"
+        },
+        "input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Input Tokens",
+          "type": "integer"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "output_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Output Tokens",
+          "type": "integer"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "reasoning_output_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Reasoning Output Tokens",
+          "type": "integer"
+        },
+        "requested_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Requested Model"
+        },
+        "total_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Total Tokens",
+          "type": "integer"
+        }
+      },
+      "title": "UsageMetrics",
+      "type": "object"
+    },
+    "UserInputRecoveryBody": {
+      "description": "Body for recovering a user-input round stuck on ``manual_recovery_required``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.",
+      "properties": {
+        "answer": {
+          "minLength": 1,
+          "title": "Answer",
+          "type": "string"
+        },
+        "artifacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "budget_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/BudgetLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Budget Limits"
+        },
+        "input_id": {
+          "minLength": 1,
+          "title": "Input Id",
+          "type": "string"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_steps": {
+          "anyOf": [
+            {
+              "maximum": 256.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Steps"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "outcome": {
+          "$ref": "#/components/schemas/ToolApprovalRecoveryOutcome"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Structured"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "input_id",
+        "answer",
+        "tool_call_id",
+        "outcome",
+        "message"
+      ],
+      "title": "UserInputRecoveryBody",
+      "type": "object"
+    },
+    "UserInputResolveBody": {
+      "description": "Body for answering a session paused by ``ask_user``.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the\nresumed run inherits the original run's configuration persisted on the pending user input.",
+      "properties": {
+        "answer": {
+          "minLength": 1,
+          "title": "Answer",
+          "type": "string"
+        },
+        "artifacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "budget_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/BudgetLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Budget Limits"
+        },
+        "input_id": {
+          "minLength": 1,
+          "title": "Input Id",
+          "type": "string"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_steps": {
+          "anyOf": [
+            {
+              "maximum": 256.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Steps"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Structured"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "input_id",
+        "answer"
+      ],
+      "title": "UserInputResolveBody",
+      "type": "object"
+    },
+    "ValidationError": {
+      "properties": {
+        "ctx": {
+          "title": "Context",
+          "type": "object"
+        },
+        "input": {
+          "title": "Input"
+        },
+        "loc": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "title": "Location",
+          "type": "array"
+        },
+        "msg": {
+          "title": "Message",
+          "type": "string"
+        },
+        "type": {
+          "title": "Error Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "loc",
+        "msg",
+        "type"
+      ],
+      "title": "ValidationError",
+      "type": "object"
+    },
+    "VersioningContract": {
+      "additionalProperties": false,
+      "properties": {
+        "breaking_change_requires": {
+          "default": [
+            "openapi_snapshot_update",
+            "client_regeneration",
+            "migration_note"
+          ],
+          "items": {
+            "enum": [
+              "openapi_snapshot_update",
+              "client_regeneration",
+              "migration_note"
+            ],
+            "type": "string"
+          },
+          "title": "Breaking Change Requires",
+          "type": "array"
+        },
+        "compatibility": {
+          "const": "additive-with-explicit-breaking-review",
+          "default": "additive-with-explicit-breaking-review",
+          "title": "Compatibility",
+          "type": "string"
+        },
+        "contract_version": {
+          "default": "1",
+          "title": "Contract Version",
+          "type": "string"
+        }
+      },
+      "title": "VersioningContract",
+      "type": "object"
+    }
+  },
   "info": {
     "title": "Cayu",
     "version": "0.1.0"
@@ -81,470 +4252,1871 @@
     "/api/causal-budgets/{causal_budget_id}/cost": {
       "post": {
         "operation_id": "estimate_causal_budget_cost_api_causal_budgets__causal_budget_id__cost_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "causal_budget_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Causal Budget Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionCostBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/CausalBudgetCostSummary"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/causal-budgets/{causal_budget_id}/summary": {
       "post": {
         "operation_id": "get_causal_budget_summary_api_causal_budgets__causal_budget_id__summary_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "causal_budget_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Causal Budget Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionCostBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/CausalBudgetSummaryResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/causal-budgets/{causal_budget_id}/usage": {
       "get": {
         "operation_id": "get_causal_budget_usage_api_causal_budgets__causal_budget_id__usage_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "causal_budget_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Causal Budget Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/CausalBudgetUsageSummary"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/contract": {
       "get": {
         "operation_id": "get_contract_api_contract_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ServerContractResponse"
+              }
+            }
+          }
         }
       }
     },
     "/api/health": {
       "get": {
         "operation_id": "health_api_health_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HealthResponse"
+              }
+            }
+          }
         }
       }
     },
     "/api/knowledge/pending": {
       "get": {
         "operation_id": "list_pending_knowledge_api_knowledge_pending_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "query",
+            "name": "aspect",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Aspect"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "default": 20000,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/KnowledgeVisibility"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Visibility"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/PendingKnowledgeListResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/knowledge/pending/{entry_id}": {
       "get": {
         "operation_id": "get_pending_knowledge_api_knowledge_pending__entry_id__get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Entry Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "default": 128000,
+              "maximum": 128000,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_chunks",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Max Chunks",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/PendingKnowledgeDetailResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/knowledge/{entry_id}/approve": {
       "post": {
         "operation_id": "approve_knowledge_api_knowledge__entry_id__approve_post",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Entry Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiReviewedKnowledgeEntry"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/knowledge/{entry_id}/reject": {
       "post": {
         "operation_id": "reject_knowledge_api_knowledge__entry_id__reject_post",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Entry Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiReviewedKnowledgeEntry"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/resume": {
       "post": {
         "operation_id": "resume_agent_api_resume_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ResumeBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/run": {
       "post": {
         "operation_id": "run_agent_api_run_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/RunBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions": {
       "get": {
         "operation_id": "list_sessions_api_sessions_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "causal_budget_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Causal Budget Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label_selector",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label Selector"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SessionOrder",
+              "default": "updated_at_desc"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ListSessionsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/summary": {
       "post": {
         "operation_id": "get_sessions_summary_api_sessions_summary_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "causal_budget_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Causal Budget Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label_selector",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label Selector"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SessionOrder",
+              "default": "updated_at_desc"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionsSummaryBody"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Body"
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionsSummaryResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}": {
       "delete": {
         "operation_id": "delete_session_api_sessions__session_id__delete",
-        "request_content": [],
-        "response_content": {
-          "204": [],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "204": {
+            "content": {}
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       },
       "get": {
         "operation_id": "get_session_api_sessions__session_id__get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionDetailResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/cost": {
       "post": {
         "operation_id": "estimate_session_cost_api_sessions__session_id__cost_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionCostBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionCostSummary"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/events": {
       "get": {
         "operation_id": "list_session_events_api_sessions__session_id__events_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tool_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workflow_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workflow Name"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ListSessionEventsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/interrupt": {
       "post": {
         "operation_id": "interrupt_session_api_sessions__session_id__interrupt_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/InterruptSessionBody"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Body"
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/labels": {
       "patch": {
         "operation_id": "update_session_labels_api_sessions__session_id__labels_patch",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UpdateSessionLabelsBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiSession"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/metadata": {
       "patch": {
         "operation_id": "update_session_metadata_api_sessions__session_id__metadata_patch",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UpdateSessionMetadataBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiSession"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/summary": {
       "get": {
         "operation_id": "get_session_summary_api_sessions__session_id__summary_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionSummaryResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/transcript": {
       "get": {
         "operation_id": "get_session_transcript_api_sessions__session_id__transcript_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_thinking",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Thinking",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/MessageRole"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Role"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionTranscriptResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/sessions/{session_id}/usage": {
       "get": {
         "operation_id": "get_session_usage_api_sessions__session_id__usage_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionUsageSummary"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tasks": {
       "get": {
         "operation_id": "list_tasks_api_tasks_get",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "query",
+            "name": "assigned_agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assigned Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parent_task_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parent Task Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "items": {
+                  "$ref": "#/components/schemas/ApiTaskListItem"
+                },
+                "title": "Response List Tasks Api Tasks Get",
+                "type": "array"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tasks/{task_id}/block": {
       "post": {
         "operation_id": "block_task_api_tasks__task_id__block_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskHoldBody"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Body"
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tasks/{task_id}/needs-attention": {
       "post": {
         "operation_id": "mark_task_needs_attention_api_tasks__task_id__needs_attention_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskHoldBody"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Body"
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tasks/{task_id}/pause": {
       "post": {
         "operation_id": "pause_task_api_tasks__task_id__pause_post",
-        "request_content": [
-          "application/json"
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
         ],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "request_body": {
+          "content": {
+            "application/json": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskHoldBody"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Body"
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tasks/{task_id}/resume": {
       "post": {
         "operation_id": "resume_task_api_tasks__task_id__resume_post",
-        "request_content": [],
-        "response_content": {
-          "200": [
-            "application/json"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tool-approvals/recover": {
       "post": {
         "operation_id": "recover_tool_approval_api_tool_approvals_recover_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ToolApprovalRecoveryBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/tool-approvals/resolve": {
       "post": {
         "operation_id": "resolve_tool_approval_api_tool_approvals_resolve_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ToolApprovalBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/user-input/recover": {
       "post": {
         "operation_id": "recover_user_input_api_user_input_recover_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UserInputRecoveryBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     },
     "/api/user-input/resolve": {
       "post": {
         "operation_id": "resolve_user_input_api_user_input_resolve_post",
-        "request_content": [
-          "application/json"
-        ],
-        "response_content": {
-          "200": [
-            "text/event-stream"
-          ],
-          "422": [
-            "application/json"
-          ]
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UserInputResolveBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
         }
       }
     }

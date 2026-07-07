@@ -33,11 +33,59 @@ def _client() -> TestClient:
     return TestClient(create_server(CayuApp()))
 
 
+def _normalize_schema_node(value):
+    if isinstance(value, dict):
+        return {key: _normalize_schema_node(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_normalize_schema_node(item) for item in value]
+    return value
+
+
+def _openapi_content_contract(content: dict) -> dict:
+    return {
+        media_type: _normalize_schema_node(media.get("schema", {}))
+        for media_type, media in sorted(content.items())
+    }
+
+
+def _openapi_request_contract(request_body: dict) -> dict:
+    result = {
+        "content": _openapi_content_contract(request_body.get("content", {})),
+    }
+    if "required" in request_body:
+        result["required"] = request_body["required"]
+    return result
+
+
+def _openapi_response_contract(responses: dict) -> dict:
+    return {
+        status: {
+            "content": _openapi_content_contract(response.get("content", {})),
+        }
+        for status, response in sorted(responses.items())
+    }
+
+
+def _openapi_parameter_contract(parameters: list[dict]) -> list[dict]:
+    return [
+        {
+            "name": parameter.get("name"),
+            "in": parameter.get("in"),
+            "required": parameter.get("required", False),
+            "schema": _normalize_schema_node(parameter.get("schema", {})),
+        }
+        for parameter in sorted(
+            parameters,
+            key=lambda parameter: (parameter.get("in", ""), parameter.get("name", "")),
+        )
+    ]
+
+
 def _openapi_contract_summary(schema: dict) -> dict:
     summary = {
         "info": schema["info"],
         "paths": {},
-        "components": sorted(schema.get("components", {}).get("schemas", {}).keys()),
+        "components": _normalize_schema_node(schema.get("components", {}).get("schemas", {})),
     }
     for path, path_item in schema["paths"].items():
         summary["paths"][path] = {}
@@ -46,13 +94,9 @@ def _openapi_contract_summary(schema: dict) -> dict:
                 continue
             summary["paths"][path][method] = {
                 "operation_id": operation.get("operationId"),
-                "request_content": sorted(
-                    operation.get("requestBody", {}).get("content", {}).keys()
-                ),
-                "response_content": {
-                    status: sorted(response.get("content", {}).keys())
-                    for status, response in sorted(operation.get("responses", {}).items())
-                },
+                "parameters": _openapi_parameter_contract(operation.get("parameters", [])),
+                "request_body": _openapi_request_contract(operation.get("requestBody", {})),
+                "responses": _openapi_response_contract(operation.get("responses", {})),
             }
     return summary
 
