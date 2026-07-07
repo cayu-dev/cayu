@@ -20,7 +20,7 @@ from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools._errors import structured_invalid_arguments
 from cayu.workspaces import Workspace, WorkspaceReadResult
 
@@ -111,6 +111,9 @@ def _read_file_tool_spec(
 ) -> ToolSpec:
     return ToolSpec(
         name="read_file",
+        # Workspace image/PDF reads can create artifact snapshots; keep this conservative until
+        # snapshot writes are idempotent/content-addressed.
+        effect=ToolEffect.EXTERNAL,
         description=(
             "Read a file from the active workspace or read an artifact by id. "
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
@@ -952,6 +955,7 @@ class WriteFileTool(Tool):
         name="write_file",
         # Mutates the workspace; never overlaps other tools in a round.
         parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
         description="Write UTF-8 text to a file in the active workspace.",
         input_schema={
             "type": "object",
@@ -1011,6 +1015,7 @@ class WriteFileTool(Tool):
 class ListFilesTool(Tool):
     spec = ToolSpec(
         name="list_files",
+        effect=ToolEffect.NONE,
         description="List files in the active workspace.",
         input_schema={
             "type": "object",
@@ -1062,6 +1067,7 @@ class ListFilesTool(Tool):
 class ListArtifactsTool(Tool):
     spec = ToolSpec(
         name="list_artifacts",
+        effect=ToolEffect.NONE,
         description=(
             "List uploaded/generated artifacts available in the active artifact store. "
             "Use read_file with artifact_id to inspect a listed artifact."

@@ -8,7 +8,7 @@ from hashlib import sha1
 from typing import Any
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.mcp.base import (
     McpClient,
     McpInitializeResult,
@@ -56,6 +56,7 @@ class McpToolAdapter(Tool):
                 description=_tool_description(toolset, definition),
                 input_schema=definition.input_schema,
                 parallel_safe=_mcp_tool_parallel_safe(definition),
+                effect=_mcp_tool_effect(definition),
             )
         )
 
@@ -387,6 +388,20 @@ def _mcp_tool_parallel_safe(definition: McpToolDefinition) -> bool:
     a truthy non-bool value must not be read as read-only.
     """
     return definition.annotations.get("readOnlyHint") is True
+
+
+def _mcp_tool_effect(definition: McpToolDefinition) -> ToolEffect:
+    """Map MCP side-effect hints into Cayu execution semantics.
+
+    Non-bool spoofed values are ignored. ``readOnlyHint`` wins because a read-only
+    tool has no external side effect to de-duplicate. ``idempotentHint`` marks
+    side effects the downstream system can collapse via an operation identity.
+    """
+    if definition.annotations.get("readOnlyHint") is True:
+        return ToolEffect.NONE
+    if definition.annotations.get("idempotentHint") is True:
+        return ToolEffect.IDEMPOTENT
+    return ToolEffect.EXTERNAL
 
 
 def _bounded_text(value: str, max_chars: int) -> str:

@@ -4,18 +4,29 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from cayu.core import AgentSpec, Event, EventType, Message, ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
     InMemorySessionStore,
+    InterruptSessionRequest,
     RunLimits,
     RunRequest,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
 )
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.tools.commands import ExecCommandTool
-from cayu.tools.files import WriteFileTool
-from cayu.tools.knowledge import RememberKnowledgeTool
+from cayu.tools.files import ListArtifactsTool, ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.tools.knowledge import (
+    ListKnowledgeTool,
+    ReadKnowledgeTool,
+    RememberKnowledgeTool,
+    SearchKnowledgeTool,
+)
+from cayu.tools.subagents import SubagentResultTool, SubagentTool
 
 _TOOL_SCHEMA = {
     "type": "object",
@@ -55,6 +66,7 @@ class _Recorder:
         self.completed: list[str] = []
         self.context_idempotency_keys: list[str | None] = []
         self.metadata_idempotency_keys: list[str | None] = []
+        self.metadata_tool_effects: list[str | None] = []
 
 
 class _RecordingTool(Tool):
@@ -66,6 +78,7 @@ class _RecordingTool(Tool):
         *,
         name: str = "recording_tool",
         parallel_safe: bool = True,
+        effect: ToolEffect = ToolEffect.NONE,
     ) -> None:
         super().__init__(
             ToolSpec(
@@ -73,6 +86,7 @@ class _RecordingTool(Tool):
                 description="records execution",
                 input_schema=_TOOL_SCHEMA,
                 parallel_safe=parallel_safe,
+                effect=effect,
             )
         )
         self._recorder = recorder
@@ -85,6 +99,7 @@ class _RecordingTool(Tool):
         rec.order.append(f"start:{tag}")
         rec.context_idempotency_keys.append(ctx.idempotency_key)
         rec.metadata_idempotency_keys.append(ctx.metadata.get("idempotency_key"))
+        rec.metadata_tool_effects.append(ctx.metadata.get("tool_effect"))
         try:
             await asyncio.sleep(args.get("delay", 0.05))
         finally:
@@ -92,6 +107,25 @@ class _RecordingTool(Tool):
         rec.order.append(f"end:{tag}")
         rec.completed.append(tag)
         return ToolResult(content=tag)
+
+
+class _CapturePolicy(ToolPolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolPolicyRequest] = []
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        self.requests.append(request)
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
+class _FakeSubagentRuntime:
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        if False:
+            yield Event(type=EventType.SESSION_STARTED, session_id=request.session_id)
+
+    async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
+        if False:
+            yield Event(type=EventType.SESSION_INTERRUPTED, session_id=request.session_id)
 
 
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -103,6 +137,7 @@ def _build(
     tools: list[Tool],
     tool_calls: list[tuple[str, str, dict]],
     max_parallel_tool_calls: int = 4,
+    tool_policy: ToolPolicy | None = None,
 ) -> CayuApp:
     app = CayuApp(
         session_store=InMemorySessionStore(),
@@ -110,7 +145,11 @@ def _build(
         max_parallel_tool_calls=max_parallel_tool_calls,
     )
     app.register_provider(_ScriptedProvider(tool_calls), default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=tools)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=tools,
+        tool_policy=tool_policy,
+    )
     return app
 
 
@@ -120,6 +159,19 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
     assert ExecCommandTool.spec.parallel_safe is False
     assert WriteFileTool.spec.parallel_safe is False
     assert RememberKnowledgeTool.spec.parallel_safe is False
+    assert ExecCommandTool.spec.effect is ToolEffect.EXTERNAL
+    assert WriteFileTool.spec.effect is ToolEffect.EXTERNAL
+    assert RememberKnowledgeTool.spec.effect is ToolEffect.EXTERNAL
+    assert ReadFileTool.spec.effect is ToolEffect.EXTERNAL
+    assert ListFilesTool.spec.effect is ToolEffect.NONE
+    assert ListArtifactsTool.spec.effect is ToolEffect.NONE
+    assert SearchKnowledgeTool.spec.effect is ToolEffect.NONE
+    assert ListKnowledgeTool.spec.effect is ToolEffect.NONE
+    assert ReadKnowledgeTool.spec.effect is ToolEffect.NONE
+    assert SubagentTool(_FakeSubagentRuntime(), agents={"helper": "helper"}).spec.effect is (
+        ToolEffect.EXTERNAL
+    )
+    assert SubagentResultTool(InMemorySessionStore()).spec.effect is ToolEffect.NONE
 
 
 def test_tool_idempotency_key_preserves_component_boundaries() -> None:
@@ -196,6 +248,40 @@ def test_tool_context_receives_stable_idempotency_key_from_round_identity() -> N
     assert key == expected_key
     assert completed.payload["tool_round_id"] == started.payload["tool_round_id"]
     assert completed.payload["idempotency_key"] == key
+
+
+def test_tool_effect_reaches_policy_started_event_and_tool_context_metadata() -> None:
+    recorder = _Recorder()
+    policy = _CapturePolicy()
+    app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    app.register_provider(_ScriptedProvider([("call_1", "idem_tool", {"tag": "a"})]), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[
+            _RecordingTool(
+                recorder,
+                name="idem_tool",
+                effect=ToolEffect.IDEMPOTENT,
+            )
+        ],
+        tool_policy=policy,
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_effect",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+
+    started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
+    assert started.payload["effect"] == "idempotent"
+    assert [request.tool_effect for request in policy.requests] == [ToolEffect.IDEMPOTENT]
+    assert recorder.metadata_tool_effects == ["idempotent"]
 
 
 def test_parallel_safe_false_does_not_overlap_and_runs_after_the_batch() -> None:
@@ -328,6 +414,58 @@ def test_parallel_safe_false_barrier_runs_before_later_safe_reads() -> None:
     order = recorder.order
     assert order.index("end:c") < order.index("start:a")
     assert order.index("end:c") < order.index("start:b")
+
+
+def test_parallel_safe_uses_registered_declaration_copy() -> None:
+    recorder = _Recorder()
+    serial_tool = _RecordingTool(
+        recorder,
+        name="serial_tool",
+        parallel_safe=False,
+        effect=ToolEffect.IDEMPOTENT,
+    )
+    policy = _CapturePolicy()
+    app = _build(
+        tools=[
+            serial_tool,
+            _RecordingTool(recorder, name="safe_tool"),
+        ],
+        tool_calls=[
+            ("c", "serial_tool", {"tag": "c"}),
+            ("a", "safe_tool", {"tag": "a"}),
+        ],
+        tool_policy=policy,
+    )
+
+    serial_tool.spec = ToolSpec(
+        name="serial_tool",
+        description="mutated after registration",
+        input_schema=_TOOL_SCHEMA,
+        parallel_safe=True,
+        effect=ToolEffect.NONE,
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_registered_parallel_safe_copy",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    order = recorder.order
+    assert order.index("end:c") < order.index("start:a")
+    started = next(
+        event
+        for event in events
+        if event.type == EventType.TOOL_CALL_STARTED and event.tool_name == "serial_tool"
+    )
+    assert started.payload["effect"] == "idempotent"
+    assert policy.requests[0].tool_effect is ToolEffect.IDEMPOTENT
 
 
 def _tool_result_parts_ordered(app: CayuApp, session_id: str) -> list[str]:

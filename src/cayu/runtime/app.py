@@ -49,7 +49,7 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import (
     BoundWorkspace,
     Environment,
@@ -1218,7 +1218,17 @@ def _tool_call_is_parallel_safe(
     registered_tool = registered_agent.tools.get(tool_call.name)
     if registered_tool is None:
         return True
-    return registered_tool.tool.spec.parallel_safe
+    return registered_tool.parallel_safe
+
+
+def _tool_effect(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_call: runtime_records.ToolCallRequest,
+) -> ToolEffect:
+    registered_tool = registered_agent.tools.get(tool_call.name)
+    if registered_tool is None:
+        return ToolEffect.EXTERNAL
+    return registered_tool.effect
 
 
 def _ordered_tool_result_messages(
@@ -2957,6 +2967,7 @@ class CayuApp:
                     continue
 
                 if tool_call.id == pending.tool_call_id:
+                    registered_tool = registered_agent.tools.get(tool_call.name)
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
                         tool_call_id=tool_call.id,
@@ -2968,6 +2979,14 @@ class CayuApp:
                         artifacts=response.artifacts,
                         is_error=False,
                     )
+                    started_payload: dict[str, Any] = {
+                        "tool_call_id": tool_call.id,
+                        "idempotency_key": idempotency_key,
+                        "arguments": deepcopy(tool_call.arguments),
+                        "input_id": pending.input_id,
+                    }
+                    if registered_tool is not None:
+                        started_payload["effect"] = registered_tool.effect.value
                     yield await self._emit(
                         Event(
                             type=EventType.TOOL_CALL_STARTED,
@@ -2975,12 +2994,7 @@ class CayuApp:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             tool_name=tool_call.name,
-                            payload={
-                                "tool_call_id": tool_call.id,
-                                "idempotency_key": idempotency_key,
-                                "arguments": deepcopy(tool_call.arguments),
-                                "input_id": pending.input_id,
-                            },
+                            payload=started_payload,
                         )
                     )
                     async for event, outcome in self._emit_tool_call_result_with_hooks(
@@ -6716,6 +6730,7 @@ class CayuApp:
                 agent=_validate_agent_spec(registered_agent.spec),
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
+                tool_effect=_tool_effect(registered_agent, tool_call),
                 arguments=tool_call.arguments,
                 environment_name=_environment_name(registered_environment),
                 workspace_id=_workspace_id(registered_environment),
@@ -6765,6 +6780,7 @@ class CayuApp:
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
         started_event: Event | None = None
+        registered_tool = registered_agent.tools.get(tool_call.name)
         idempotency_key = tool_execution.tool_idempotency_key(
             session_id=session.id,
             tool_call_id=tool_call.id,
@@ -6778,6 +6794,8 @@ class CayuApp:
                 "idempotency_key": idempotency_key,
                 "arguments": deepcopy(tool_call.arguments),
             }
+            if registered_tool is not None:
+                payload["effect"] = registered_tool.effect.value
             if tool_round_id is not None:
                 payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
@@ -6796,7 +6814,6 @@ class CayuApp:
             )
             yield started_event, None
 
-        registered_tool = registered_agent.tools.get(tool_call.name)
         if registered_tool is None:
             result = ToolResult(
                 content=f"Tool not registered: {tool_call.name}",
@@ -7081,6 +7098,7 @@ class CayuApp:
                         tool_call_id=tool_call.id,
                         approval_id=approval_id,
                         idempotency_key=idempotency_key,
+                        tool_effect=registered_tool.effect,
                         input_id=input_id,
                     ),
                 ),
@@ -9334,6 +9352,8 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         name=tool.name,
         description=tool.description,
         schema=deepcopy(tool.schema),
+        parallel_safe=tool.parallel_safe,
+        effect=tool.effect,
         tool=tool.tool,
     )
 
@@ -9383,11 +9403,14 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         description=spec.description,
         input_schema=copy_json_value(spec.input_schema, "input_schema"),
         parallel_safe=spec.parallel_safe,
+        effect=spec.effect,
     )
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,
         schema=validated_spec.input_schema,
+        parallel_safe=validated_spec.parallel_safe,
+        effect=validated_spec.effect,
         tool=tool,
     )
 

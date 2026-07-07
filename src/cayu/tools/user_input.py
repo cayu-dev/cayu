@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 ASK_USER_TOOL_NAME = "ask_user"
 
@@ -31,6 +31,7 @@ class UserInputTool(Tool):
         ),
         # A pause must not run alongside other tools in a concurrent batch.
         parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
         input_schema={
             "type": "object",
             "additionalProperties": False,

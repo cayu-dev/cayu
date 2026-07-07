@@ -39,6 +39,7 @@ from cayu import (
     SQLiteTaskStore,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
     run_to_completion,
@@ -50,6 +51,7 @@ class GreetTool(Tool):
 
     spec = ToolSpec(
         name="greet",
+        effect=ToolEffect.NONE,
         description="Return a friendly greeting for a name.",
         input_schema={
             "type": "object",

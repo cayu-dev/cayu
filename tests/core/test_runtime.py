@@ -11250,6 +11250,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
     assert events[3].payload == {
         "tool_call_id": "call_1",
         "idempotency_key": events[3].payload["idempotency_key"],
+        "effect": "external",
         "arguments": {"text": "from tool"},
         "tool_round_id": events[3].payload["tool_round_id"],
     }
@@ -14348,6 +14349,7 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
         "tenant": {"id": "tenant_1"},
         "tool_call_id": "call_1",
         "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
+        "tool_effect": "external",
     }
     tool.contexts[0].metadata["tenant"]["id"] = "tool-mutated"
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
@@ -14560,6 +14562,7 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
         "resume": {"id": "resume_1"},
         "tool_call_id": "call_1",
         "idempotency_key": tool.contexts[0].metadata["idempotency_key"],
+        "tool_effect": "external",
     }
     tool.contexts[0].metadata["resume"]["id"] = "tool-mutated"
     session = asyncio.run(store.load("sess_policy_resume_metadata"))

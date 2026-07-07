@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from math import isfinite
 from typing import Any, Protocol, runtime_checkable
 
@@ -13,10 +14,24 @@ from pydantic import (
     PrivateAttr,
     StrictBool,
     computed_field,
+    field_serializer,
     field_validator,
 )
 
 from cayu._validation import copy_json_value, require_clean_nonblank
+
+
+class ToolEffect(StrEnum):
+    """Declared side-effect semantics for a tool execution.
+
+    The runtime uses this as execution metadata, not as an authorization decision:
+    policy still decides whether a call may run. The values describe whether
+    generic runtime retry logic may treat a failed or ambiguous call as retryable.
+    """
+
+    NONE = "none"
+    IDEMPOTENT = "idempotent"
+    EXTERNAL = "external"
 
 
 @dataclass(frozen=True)
@@ -79,6 +94,7 @@ class _ToolSpecInput(BaseModel):
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
     parallel_safe: StrictBool = True
+    effect: ToolEffect = ToolEffect.EXTERNAL
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -97,6 +113,7 @@ class ToolSpec(BaseModel):
     name: str
     description: str = ""
     parallel_safe: StrictBool = True
+    effect: ToolEffect = ToolEffect.EXTERNAL
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
@@ -105,6 +122,7 @@ class ToolSpec(BaseModel):
             name=parsed.name,
             description=parsed.description,
             parallel_safe=parsed.parallel_safe,
+            effect=parsed.effect,
         )
         object.__setattr__(self, "_input_schema", _freeze_value(parsed.input_schema))
 
@@ -112,6 +130,10 @@ class ToolSpec(BaseModel):
     @property
     def input_schema(self) -> dict[str, Any]:
         return _mutable_value(self._input_schema)
+
+    @field_serializer("effect")
+    def serialize_effect(self, value: ToolEffect) -> str:
+        return value.value
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ToolSpec):
@@ -136,6 +158,11 @@ class ToolSpec(BaseModel):
     @classmethod
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
         schema = super().model_json_schema(*args, **kwargs)
+        schema.setdefault("$defs", {})["ToolEffect"] = {
+            "enum": [effect.value for effect in ToolEffect],
+            "title": "ToolEffect",
+            "type": "string",
+        }
         schema.setdefault("properties", {})["input_schema"] = {
             "additionalProperties": True,
             "default": {},

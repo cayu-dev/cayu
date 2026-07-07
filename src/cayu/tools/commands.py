@@ -6,7 +6,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, Runner
 from cayu.tools._errors import structured_invalid_arguments
 
@@ -73,6 +73,7 @@ class ExecCommandTool(Tool):
         name="exec_command",
         # Runs commands with side effects; never overlaps other tools in a round.
         parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
         description="Execute a process or explicit shell command with the active runner.",
         input_schema={
             "type": "object",

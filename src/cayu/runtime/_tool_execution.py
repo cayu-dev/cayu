@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from cayu._validation import copy_json_value
-from cayu.core.tools import Tool, ToolContext, ToolResult
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_policy import ToolPolicyResult
 
@@ -89,12 +89,15 @@ def context_metadata(
     tool_call_id: str,
     approval_id: str | None,
     idempotency_key: str | None = None,
+    tool_effect: ToolEffect | None = None,
     input_id: str | None = None,
 ) -> dict[str, Any]:
     metadata = copy_json_value(request_metadata or {}, "request_metadata")
     metadata["tool_call_id"] = tool_call_id
     if idempotency_key is not None:
         metadata["idempotency_key"] = idempotency_key
+    if tool_effect is not None:
+        metadata["tool_effect"] = tool_effect.value
     if approval_id is not None:
         metadata["approval_id"] = approval_id
     if input_id is not None:

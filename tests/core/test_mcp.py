@@ -34,6 +34,7 @@ from cayu import (
     StdioMcpClient,
     StdioMcpSession,
     ToolContext,
+    ToolEffect,
     connect_mcp_toolset,
     mcp_cayu_tool_name,
     mcp_tool_manifest_hash,
@@ -237,9 +238,19 @@ def test_mcp_tool_adapter_derives_parallel_safe_from_read_only_hint() -> None:
     # barrier (parallel_safe=False) so it never races a sibling in a parallel round.
     definitions = (
         McpToolDefinition(name="read", input_schema={}, annotations={"readOnlyHint": True}),
+        McpToolDefinition(name="idem", input_schema={}, annotations={"idempotentHint": True}),
+        McpToolDefinition(
+            name="read_idem",
+            input_schema={},
+            annotations={"readOnlyHint": True, "idempotentHint": True},
+        ),
         McpToolDefinition(name="unknown", input_schema={}),
         McpToolDefinition(name="write", input_schema={}, annotations={"readOnlyHint": False}),
-        McpToolDefinition(name="spoof", input_schema={}, annotations={"readOnlyHint": "true"}),
+        McpToolDefinition(
+            name="spoof",
+            input_schema={},
+            annotations={"readOnlyHint": "true", "idempotentHint": "true"},
+        ),
     )
     session = FakeMcpSession(definitions=definitions)
     toolset = McpToolset(
@@ -248,11 +259,20 @@ def test_mcp_tool_adapter_derives_parallel_safe_from_read_only_hint() -> None:
         definitions=definitions,
     )
     parallel_safe = {tool.definition.name: tool.spec.parallel_safe for tool in toolset.tools}
+    effects = {tool.definition.name: tool.spec.effect for tool in toolset.tools}
 
     assert parallel_safe["read"] is True
+    assert parallel_safe["idem"] is False
+    assert parallel_safe["read_idem"] is True
     assert parallel_safe["unknown"] is False
     assert parallel_safe["write"] is False
     assert parallel_safe["spoof"] is False
+    assert effects["read"] is ToolEffect.NONE
+    assert effects["idem"] is ToolEffect.IDEMPOTENT
+    assert effects["read_idem"] is ToolEffect.NONE
+    assert effects["unknown"] is ToolEffect.EXTERNAL
+    assert effects["write"] is ToolEffect.EXTERNAL
+    assert effects["spoof"] is ToolEffect.EXTERNAL
 
 
 def test_mcp_tool_manifest_hash_is_stable_for_equivalent_json_order() -> None:

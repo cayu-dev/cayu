@@ -12,7 +12,7 @@ from cayu.core import (
     Message,
     ToolResultPart,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -148,6 +148,13 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     )
 
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    started = next(
+        event
+        for event in resume_events
+        if event.type == EventType.TOOL_CALL_STARTED
+        and event.payload.get("tool_call_id") == "call_1"
+    )
+    assert started.payload["effect"] == ToolEffect.EXTERNAL.value
     completed = next(
         event
         for event in resume_events
@@ -757,7 +764,9 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     )
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert counting.calls == 0  # the recovered tool was never re-executed
-    assert "pending_user_input" not in asyncio.run(store.load_checkpoint("s_rec"))
+    checkpoint = asyncio.run(store.load_checkpoint("s_rec"))
+    assert checkpoint is not None
+    assert "pending_user_input" not in checkpoint
     parts = _tool_result_parts(asyncio.run(store.load_transcript("s_rec")))
     results = {part.tool_call_id: part.content for part in parts}
     assert results["call_1"] == "recovered externally"  # operator-supplied outcome

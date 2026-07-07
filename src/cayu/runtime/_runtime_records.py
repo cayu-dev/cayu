@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
-from cayu.core.tools import Tool, ToolResult
+from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.environments import BoundWorkspace, Environment, EnvironmentFactory, EnvironmentSpec
 from cayu.providers import ModelProvider
 from cayu.runtime.context import ContextPolicy
@@ -38,6 +38,8 @@ class RegisteredTool:
     name: str
     description: str
     schema: dict[str, Any]
+    parallel_safe: bool
+    effect: ToolEffect
     tool: Tool
 
 

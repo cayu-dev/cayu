@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
@@ -257,6 +257,7 @@ class SubagentTool(Tool):
                 name=require_clean_nonblank(name, "name"),
                 # Spawns nested sessions; never overlaps other tools in a round.
                 parallel_safe=False,
+                effect=ToolEffect.EXTERNAL,
                 description=tool_description,
                 input_schema={
                     "type": "object",
@@ -474,6 +475,7 @@ class SubagentResultTool(Tool):
         super().__init__(
             ToolSpec(
                 name=require_clean_nonblank(name, "name"),
+                effect=ToolEffect.NONE,
                 description=description
                 or (
                     "Fetch results from background Cayu subagents. Use child_session_id "

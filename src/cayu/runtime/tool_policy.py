@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.agents import AgentSpec
+from cayu.core.tools import ToolEffect
 from cayu.runtime.sessions import Session
 
 
@@ -37,6 +38,7 @@ class ToolPolicyRequest(BaseModel):
     agent: AgentSpec
     tool_name: str
     tool_call_id: str
+    tool_effect: ToolEffect = ToolEffect.EXTERNAL
     arguments: dict[str, Any] = Field(default_factory=dict)
     environment_name: str | None = None
     workspace_id: str | None = None

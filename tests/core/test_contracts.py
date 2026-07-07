@@ -36,7 +36,7 @@ from cayu.core import (
 )
 from cayu.core.events import copy_event
 from cayu.core.messages import copy_message, copy_message_part
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import (
@@ -2208,6 +2208,20 @@ def test_tool_spec_copy_update_handles_input_schema():
 
     assert copied.input_schema == {"new": ["value"]}
     assert spec.input_schema == {"old": True}
+
+
+def test_tool_spec_effect_defaults_and_validates():
+    default = ToolSpec(name="example")
+    assert default.effect is ToolEffect.EXTERNAL
+
+    idempotent = ToolSpec(name="refund", effect="idempotent")
+    assert idempotent.effect is ToolEffect.IDEMPOTENT
+
+    copied = idempotent.model_copy(update={"effect": ToolEffect.NONE})
+    assert copied.effect is ToolEffect.NONE
+
+    with pytest.raises(ValidationError):
+        ToolSpec(name="bad", effect="retryable")  # type: ignore[arg-type]
 
 
 def test_tool_spec_validation_errors_are_pydantic_errors():

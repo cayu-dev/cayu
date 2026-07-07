@@ -13,7 +13,7 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 
 __all__ = [
@@ -31,6 +31,7 @@ __all__ = [
     "Tool",
     "ToolCallPart",
     "ToolContext",
+    "ToolEffect",
     "ToolResult",
     "ToolResultPart",
     "ToolSpec",

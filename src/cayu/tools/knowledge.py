@@ -12,7 +12,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_nonblank,
 )
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     KnowledgeIndexer,
@@ -138,6 +138,7 @@ class RememberKnowledgePolicy(BaseModel):
 class SearchKnowledgeTool(Tool):
     spec = ToolSpec(
         name="search_knowledge",
+        effect=ToolEffect.NONE,
         description=(
             "Search the active knowledge store for reusable facts, procedures, skills, "
             "documents, warnings, decisions, or other durable context. Use this when "
@@ -402,6 +403,7 @@ class RememberKnowledgeTool(Tool):
         name="remember_knowledge",
         # Writes to the knowledge store; never overlaps other tools in a round.
         parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
         description=(
             "Propose new durable knowledge for the active knowledge store. Use this only "
             "for stable facts, preferences, procedures, warnings, decisions, or lessons "
@@ -758,6 +760,7 @@ def _remember_entry_write_payload(entry: KnowledgeEntry) -> dict[str, Any]:
 class ListKnowledgeTool(Tool):
     spec = ToolSpec(
         name="list_knowledge",
+        effect=ToolEffect.NONE,
         description=(
             "Discover what active knowledge exists without guessing exact search terms. "
             "Use this to list entries or facets such as kinds, labels, aspects, namespaces, "
@@ -977,6 +980,7 @@ class ListKnowledgeTool(Tool):
 class ReadKnowledgeTool(Tool):
     spec = ToolSpec(
         name="read_knowledge",
+        effect=ToolEffect.NONE,
         description=(
             "Read bounded chunks from a knowledge entry returned by search_knowledge. "
             "Use entry_id with an optional chunk_index and around window to expand context."
