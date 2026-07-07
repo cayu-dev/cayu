@@ -31,7 +31,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
-from cayu.runtime.costs import PricingCatalog
+from cayu.runtime.costs import CausalBudgetCostSummary, PricingCatalog, SessionCostSummary
 from cayu.runtime.costs import (
     estimate_causal_budget_cost as build_causal_budget_cost_summary,
 )
@@ -59,8 +59,30 @@ from cayu.runtime.sessions import (
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
-from cayu.runtime.usage import causal_budget_usage_summary
+from cayu.runtime.usage import (
+    CausalBudgetUsageSummary,
+    SessionUsageSummary,
+    causal_budget_usage_summary,
+)
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.server.contracts import (
+    STREAMING_ENDPOINT_RESPONSES,
+    ApiReviewedKnowledgeEntry,
+    ApiSession,
+    ApiTaskDetail,
+    ApiTaskListItem,
+    CausalBudgetSummaryResponse,
+    HealthResponse,
+    ListSessionEventsResponse,
+    ListSessionsResponse,
+    PendingKnowledgeDetailResponse,
+    PendingKnowledgeListResponse,
+    ServerContractResponse,
+    SessionDetailResponse,
+    SessionsSummaryResponse,
+    SessionSummaryResponse,
+    SessionTranscriptResponse,
+)
 from cayu.server.sse import (
     error_to_sse_message,
     event_to_sse_message,
@@ -728,6 +750,10 @@ def create_router(
     # an empty sequence like no dependencies, so `auth=None` keeps current behavior.
     protected: list[Any] = [Depends(auth)] if auth is not None else []
 
+    @router.get("/contract", response_model=ServerContractResponse)
+    async def get_contract():
+        return ServerContractResponse()
+
     async def _marker_sequence(session_id: str, event_id: str) -> int | None:
         """Sequence of the persisted event named by a ``Last-Event-ID`` marker.
 
@@ -796,7 +822,12 @@ def create_router(
 
         return EventSourceResponse(replay())
 
-    @router.post("/run", dependencies=protected)
+    @router.post(
+        "/run",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def run_agent(
         body: RunBody,
         http_request: Request,
@@ -839,7 +870,12 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.run(request))
 
-    @router.post("/resume", dependencies=protected)
+    @router.post(
+        "/resume",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def resume_agent(
         body: ResumeBody,
         http_request: Request,
@@ -869,7 +905,12 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.resume(request))
 
-    @router.post("/sessions/{session_id}/interrupt", dependencies=protected)
+    @router.post(
+        "/sessions/{session_id}/interrupt",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def interrupt_session(
         session_id: NonBlankString,
         body: InterruptSessionBody | None = None,
@@ -921,7 +962,12 @@ def create_router(
 
         return EventSourceResponse(generate())
 
-    @router.post("/tool-approvals/resolve", dependencies=protected)
+    @router.post(
+        "/tool-approvals/resolve",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def resolve_tool_approval(body: ToolApprovalBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -946,7 +992,12 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.resolve_tool_approval(request))
 
-    @router.post("/tool-approvals/recover", dependencies=protected)
+    @router.post(
+        "/tool-approvals/recover",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def recover_tool_approval(body: ToolApprovalRecoveryBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -975,7 +1026,12 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.recover_tool_approval(request))
 
-    @router.post("/user-input/resolve", dependencies=protected)
+    @router.post(
+        "/user-input/resolve",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def resolve_user_input(body: UserInputResolveBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -1001,7 +1057,12 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.resolve_user_input(response))
 
-    @router.post("/user-input/recover", dependencies=protected)
+    @router.post(
+        "/user-input/recover",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
     async def recover_user_input(body: UserInputRecoveryBody):
         session = await session_store.load(body.session_id)
         if session is None:
@@ -1031,7 +1092,7 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.recover_user_input(request))
 
-    @router.get("/sessions")
+    @router.get("/sessions", response_model=ListSessionsResponse)
     async def list_sessions(
         limit: Annotated[int, Query(ge=1, le=1000)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -1081,7 +1142,7 @@ def create_router(
             "total_count": result.total_count,
         }
 
-    @router.post("/sessions/summary")
+    @router.post("/sessions/summary", response_model=SessionsSummaryResponse)
     async def get_sessions_summary(
         body: SessionsSummaryBody | None = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
@@ -1206,7 +1267,7 @@ def create_router(
             "cost": cost_summary,
         }
 
-    @router.get("/sessions/{session_id}/usage")
+    @router.get("/sessions/{session_id}/usage", response_model=SessionUsageSummary)
     async def get_session_usage(session_id: NonBlankString):
         try:
             summary = await cayu_app.get_session_usage(session_id)
@@ -1214,7 +1275,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump()
 
-    @router.post("/sessions/{session_id}/cost")
+    @router.post("/sessions/{session_id}/cost", response_model=SessionCostSummary)
     async def estimate_session_cost(session_id: NonBlankString, body: SessionCostBody):
         try:
             summary = await cayu_app.get_session_cost(
@@ -1226,7 +1287,10 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump(mode="json")
 
-    @router.get("/causal-budgets/{causal_budget_id}/usage")
+    @router.get(
+        "/causal-budgets/{causal_budget_id}/usage",
+        response_model=CausalBudgetUsageSummary,
+    )
     async def get_causal_budget_usage(causal_budget_id: NonBlankString):
         try:
             summary = await cayu_app.get_causal_budget_usage(causal_budget_id)
@@ -1234,7 +1298,10 @@ def create_router(
             raise HTTPException(status_code=404, detail="Causal budget not found") from exc
         return summary.model_dump()
 
-    @router.post("/causal-budgets/{causal_budget_id}/cost")
+    @router.post(
+        "/causal-budgets/{causal_budget_id}/cost",
+        response_model=CausalBudgetCostSummary,
+    )
     async def estimate_causal_budget_cost(
         causal_budget_id: NonBlankString,
         body: SessionCostBody,
@@ -1249,7 +1316,10 @@ def create_router(
             raise HTTPException(status_code=404, detail="Causal budget not found") from exc
         return summary.model_dump(mode="json")
 
-    @router.post("/causal-budgets/{causal_budget_id}/summary")
+    @router.post(
+        "/causal-budgets/{causal_budget_id}/summary",
+        response_model=CausalBudgetSummaryResponse,
+    )
     async def get_causal_budget_summary(
         causal_budget_id: NonBlankString,
         body: SessionCostBody,
@@ -1326,7 +1396,7 @@ def create_router(
             "cost": cost_summary.model_dump(mode="json"),
         }
 
-    @router.get("/sessions/{session_id}/summary")
+    @router.get("/sessions/{session_id}/summary", response_model=SessionSummaryResponse)
     async def get_session_summary(session_id: NonBlankString):
         session = await session_store.load(session_id)
         if session is None:
@@ -1416,7 +1486,7 @@ def create_router(
                 return records
             after_sequence = page[-1].sequence
 
-    @router.get("/sessions/{session_id}/events")
+    @router.get("/sessions/{session_id}/events", response_model=ListSessionEventsResponse)
     async def list_session_events(
         session_id: NonBlankString,
         event_type: str | None = None,
@@ -1460,7 +1530,10 @@ def create_router(
             "has_more": has_more,
         }
 
-    @router.get("/sessions/{session_id}/transcript")
+    @router.get(
+        "/sessions/{session_id}/transcript",
+        response_model=SessionTranscriptResponse,
+    )
     async def get_session_transcript(
         session_id: NonBlankString,
         role: MessageRole | None = None,
@@ -1499,7 +1572,7 @@ def create_router(
             "total_messages": transcript_page.total_records,
         }
 
-    @router.get("/sessions/{session_id}")
+    @router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
     async def get_session(session_id: str):
         session = await session_store.load(session_id)
         if session is None:
@@ -1509,26 +1582,14 @@ def create_router(
         transcript = await session_store.load_transcript(session_id)
 
         return {
-            "session": {
-                "id": session.id,
-                "status": session.status.value,
-                "agent_name": session.agent_name,
-                "provider_name": session.provider_name,
-                "model": session.model,
-                "parent_session_id": session.parent_session_id,
-                "causal_budget_id": session.causal_budget_id,
-                "runtime_name": session.runtime_name,
-                "runtime_version": session.runtime_version,
-                "labels": session.labels,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-            },
+            "session": _serialize_session(session),
             "events": [
                 {
                     "id": e.id,
                     "type": str(e.type),
                     "agent_name": e.agent_name,
+                    "environment_name": e.environment_name,
+                    "workflow_name": e.workflow_name,
                     "tool_name": e.tool_name,
                     "payload": e.payload,
                     "timestamp": e.timestamp.isoformat(),
@@ -1552,7 +1613,11 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return None
 
-    @router.patch("/sessions/{session_id}/labels", dependencies=protected)
+    @router.patch(
+        "/sessions/{session_id}/labels",
+        dependencies=protected,
+        response_model=ApiSession,
+    )
     async def update_session_labels(
         session_id: NonBlankString,
         body: UpdateSessionLabelsBody,
@@ -1565,7 +1630,11 @@ def create_router(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(session)
 
-    @router.patch("/sessions/{session_id}/metadata", dependencies=protected)
+    @router.patch(
+        "/sessions/{session_id}/metadata",
+        dependencies=protected,
+        response_model=ApiSession,
+    )
     async def update_session_metadata(
         session_id: NonBlankString,
         body: UpdateSessionMetadataBody,
@@ -1578,7 +1647,7 @@ def create_router(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(session)
 
-    @router.get("/tasks")
+    @router.get("/tasks", response_model=list[ApiTaskListItem])
     async def list_tasks(
         status: TaskStatus | None = None,
         task_type: str | None = Query(default=None, alias="type"),
@@ -1619,7 +1688,11 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _serialize_task_detail(task)
 
-    @router.post("/tasks/{task_id}/pause", dependencies=protected)
+    @router.post(
+        "/tasks/{task_id}/pause",
+        dependencies=protected,
+        response_model=ApiTaskDetail,
+    )
     async def pause_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
         store = await _require_task_store()
         request_body = body or TaskHoldBody()
@@ -1632,7 +1705,11 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/block", dependencies=protected)
+    @router.post(
+        "/tasks/{task_id}/block",
+        dependencies=protected,
+        response_model=ApiTaskDetail,
+    )
     async def block_task(task_id: NonBlankString, body: TaskHoldBody | None = None):
         store = await _require_task_store()
         request_body = body or TaskHoldBody()
@@ -1645,7 +1722,11 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/needs-attention", dependencies=protected)
+    @router.post(
+        "/tasks/{task_id}/needs-attention",
+        dependencies=protected,
+        response_model=ApiTaskDetail,
+    )
     async def mark_task_needs_attention(
         task_id: NonBlankString,
         body: TaskHoldBody | None = None,
@@ -1661,7 +1742,11 @@ def create_router(
             task_id,
         )
 
-    @router.post("/tasks/{task_id}/resume", dependencies=protected)
+    @router.post(
+        "/tasks/{task_id}/resume",
+        dependencies=protected,
+        response_model=ApiTaskDetail,
+    )
     async def resume_task(task_id: NonBlankString):
         store = await _require_task_store()
         return await _apply_task_action(store.resume_task, task_id)
@@ -1687,7 +1772,7 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _serialize_reviewed_knowledge_entry(entry)
 
-    @router.get("/knowledge/pending")
+    @router.get("/knowledge/pending", response_model=PendingKnowledgeListResponse)
     async def list_pending_knowledge(
         namespace: str | None = None,
         label: Annotated[list[str] | None, Query()] = None,
@@ -1722,7 +1807,10 @@ def create_router(
             "total_entries_known": result.total_entries_known,
         }
 
-    @router.get("/knowledge/pending/{entry_id}")
+    @router.get(
+        "/knowledge/pending/{entry_id}",
+        response_model=PendingKnowledgeDetailResponse,
+    )
     async def get_pending_knowledge(
         entry_id: NonBlankString,
         max_chunks: Annotated[
@@ -1759,17 +1847,25 @@ def create_router(
             "chunk_max_bytes": max_bytes,
         }
 
-    @router.post("/knowledge/{entry_id}/approve", dependencies=protected)
+    @router.post(
+        "/knowledge/{entry_id}/approve",
+        dependencies=protected,
+        response_model=ApiReviewedKnowledgeEntry,
+    )
     async def approve_knowledge(entry_id: NonBlankString):
         workflow = _knowledge_review_workflow()
         return await _apply_knowledge_review_action(workflow.approve, entry_id)
 
-    @router.post("/knowledge/{entry_id}/reject", dependencies=protected)
+    @router.post(
+        "/knowledge/{entry_id}/reject",
+        dependencies=protected,
+        response_model=ApiReviewedKnowledgeEntry,
+    )
     async def reject_knowledge(entry_id: NonBlankString):
         workflow = _knowledge_review_workflow()
         return await _apply_knowledge_review_action(workflow.reject, entry_id)
 
-    @router.get("/health")
+    @router.get("/health", response_model=HealthResponse)
     async def health():
         return {"ok": True}
 

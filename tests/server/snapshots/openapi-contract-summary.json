@@ -1,0 +1,552 @@
+{
+  "components": [
+    "AggregateCostSummary",
+    "AggregateUsageSummary",
+    "ApiEventRecord",
+    "ApiEventSummary",
+    "ApiKnowledgeChunk",
+    "ApiKnowledgeListItem",
+    "ApiReviewedKnowledgeEntry",
+    "ApiSession",
+    "ApiSessionBase",
+    "ApiSessionDetailEvent",
+    "ApiSessionDetailTranscriptMessage",
+    "ApiSessionOutcome",
+    "ApiSessionSummaryItem",
+    "ApiTaskDetail",
+    "ApiTaskListItem",
+    "ApiTranscriptMessage",
+    "BudgetLimit",
+    "BudgetReservation",
+    "BudgetWindow",
+    "CacheUsageMetrics",
+    "CausalBudgetCostSummary",
+    "CausalBudgetSummaryResponse",
+    "CausalBudgetUsageSummary",
+    "ClientGenerationContract",
+    "CostLineItem",
+    "HTTPValidationError",
+    "HealthResponse",
+    "InterruptSessionBody",
+    "KnowledgeVisibility",
+    "ListSessionEventsResponse",
+    "ListSessionsResponse",
+    "MessageRole",
+    "ModelPricing",
+    "PendingKnowledgeDetailResponse",
+    "PendingKnowledgeListResponse",
+    "PricingCatalog",
+    "ResumeBody",
+    "RetryPolicy",
+    "RunBody",
+    "RunLimits",
+    "ServerContractResponse",
+    "SessionCostBody",
+    "SessionCostSummary",
+    "SessionDetailResponse",
+    "SessionOrder",
+    "SessionStatus",
+    "SessionSummaryResponse",
+    "SessionTranscriptResponse",
+    "SessionUsageSummary",
+    "SessionsSummaryBody",
+    "SessionsSummaryResponse",
+    "SseContract",
+    "SseErrorEnvelope",
+    "SseEventEnvelope",
+    "SseFrameExamples",
+    "StructuredOutputSpec",
+    "StructuredOutputStrategy",
+    "TaskHoldBody",
+    "TaskStatus",
+    "ThinkingConfig",
+    "ToolApprovalBody",
+    "ToolApprovalDecision",
+    "ToolApprovalRecoveryBody",
+    "ToolApprovalRecoveryOutcome",
+    "TranscriptSummary",
+    "UpdateSessionLabelsBody",
+    "UpdateSessionMetadataBody",
+    "UsageMetrics",
+    "UserInputRecoveryBody",
+    "UserInputResolveBody",
+    "ValidationError",
+    "VersioningContract"
+  ],
+  "info": {
+    "title": "Cayu",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/causal-budgets/{causal_budget_id}/cost": {
+      "post": {
+        "operation_id": "estimate_causal_budget_cost_api_causal_budgets__causal_budget_id__cost_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/causal-budgets/{causal_budget_id}/summary": {
+      "post": {
+        "operation_id": "get_causal_budget_summary_api_causal_budgets__causal_budget_id__summary_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/causal-budgets/{causal_budget_id}/usage": {
+      "get": {
+        "operation_id": "get_causal_budget_usage_api_causal_budgets__causal_budget_id__usage_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/contract": {
+      "get": {
+        "operation_id": "get_contract_api_contract_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "operation_id": "health_api_health_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/knowledge/pending": {
+      "get": {
+        "operation_id": "list_pending_knowledge_api_knowledge_pending_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/knowledge/pending/{entry_id}": {
+      "get": {
+        "operation_id": "get_pending_knowledge_api_knowledge_pending__entry_id__get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/knowledge/{entry_id}/approve": {
+      "post": {
+        "operation_id": "approve_knowledge_api_knowledge__entry_id__approve_post",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/knowledge/{entry_id}/reject": {
+      "post": {
+        "operation_id": "reject_knowledge_api_knowledge__entry_id__reject_post",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/resume": {
+      "post": {
+        "operation_id": "resume_agent_api_resume_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/run": {
+      "post": {
+        "operation_id": "run_agent_api_run_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions": {
+      "get": {
+        "operation_id": "list_sessions_api_sessions_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/summary": {
+      "post": {
+        "operation_id": "get_sessions_summary_api_sessions_summary_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}": {
+      "delete": {
+        "operation_id": "delete_session_api_sessions__session_id__delete",
+        "request_content": [],
+        "response_content": {
+          "204": [],
+          "422": [
+            "application/json"
+          ]
+        }
+      },
+      "get": {
+        "operation_id": "get_session_api_sessions__session_id__get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/cost": {
+      "post": {
+        "operation_id": "estimate_session_cost_api_sessions__session_id__cost_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/events": {
+      "get": {
+        "operation_id": "list_session_events_api_sessions__session_id__events_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/interrupt": {
+      "post": {
+        "operation_id": "interrupt_session_api_sessions__session_id__interrupt_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/labels": {
+      "patch": {
+        "operation_id": "update_session_labels_api_sessions__session_id__labels_patch",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/metadata": {
+      "patch": {
+        "operation_id": "update_session_metadata_api_sessions__session_id__metadata_patch",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/summary": {
+      "get": {
+        "operation_id": "get_session_summary_api_sessions__session_id__summary_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/transcript": {
+      "get": {
+        "operation_id": "get_session_transcript_api_sessions__session_id__transcript_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/sessions/{session_id}/usage": {
+      "get": {
+        "operation_id": "get_session_usage_api_sessions__session_id__usage_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tasks": {
+      "get": {
+        "operation_id": "list_tasks_api_tasks_get",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tasks/{task_id}/block": {
+      "post": {
+        "operation_id": "block_task_api_tasks__task_id__block_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tasks/{task_id}/needs-attention": {
+      "post": {
+        "operation_id": "mark_task_needs_attention_api_tasks__task_id__needs_attention_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tasks/{task_id}/pause": {
+      "post": {
+        "operation_id": "pause_task_api_tasks__task_id__pause_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tasks/{task_id}/resume": {
+      "post": {
+        "operation_id": "resume_task_api_tasks__task_id__resume_post",
+        "request_content": [],
+        "response_content": {
+          "200": [
+            "application/json"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tool-approvals/recover": {
+      "post": {
+        "operation_id": "recover_tool_approval_api_tool_approvals_recover_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/tool-approvals/resolve": {
+      "post": {
+        "operation_id": "resolve_tool_approval_api_tool_approvals_resolve_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/user-input/recover": {
+      "post": {
+        "operation_id": "recover_user_input_api_user_input_recover_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    },
+    "/api/user-input/resolve": {
+      "post": {
+        "operation_id": "resolve_user_input_api_user_input_resolve_post",
+        "request_content": [
+          "application/json"
+        ],
+        "response_content": {
+          "200": [
+            "text/event-stream"
+          ],
+          "422": [
+            "application/json"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -21,6 +21,8 @@ def event_to_sse_data(event: Event) -> str:
     }
     if event.environment_name is not None:
         data["environment_name"] = event.environment_name
+    if event.workflow_name is not None:
+        data["workflow_name"] = event.workflow_name
     return json.dumps(data)
 
 
