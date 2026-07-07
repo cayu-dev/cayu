@@ -569,11 +569,13 @@ class SessionOutcome(BaseModel):
 class IncompleteSessionRecoveryAction(StrEnum):
     SKIPPED_ACTIVE = "skipped_active"
     SKIPPED_TERMINAL = "skipped_terminal"
+    SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     FINALIZED_INTERRUPT = "finalized_interrupt"
+    FAILED = "failed"
 
 
 class IncompleteSessionRecoveryRequest(BaseModel):

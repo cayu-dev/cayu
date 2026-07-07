@@ -2191,6 +2191,19 @@ class CayuApp:
         self,
         request: IncompleteSessionsRecoveryRequest,
     ) -> list[IncompleteSessionRecoveryResult]:
+        """Sweep non-terminal sessions and repair each one, fault-isolated.
+
+        Returns one result per swept session. A session whose agent is not
+        registered in this process is reported as
+        ``SKIPPED_UNREGISTERED_AGENT``; an unexpected per-session failure is
+        reported as ``FAILED`` with the error in ``message`` — neither aborts
+        the sweep, so one bad row cannot strand every healthy session. A
+        ``FAILED`` entry's ``previous_status`` comes from the sweep's listing
+        snapshot; its ``status`` is the current stored status when the session
+        can still be reloaded (a failed recovery may have progressed it),
+        falling back to the snapshot when it cannot. Session listing failures
+        and cancellation still raise.
+        """
         request = copy_incomplete_sessions_recovery_request(request)
         sessions: list[Session] = []
         seen_session_ids: set[str] = set()
@@ -2218,13 +2231,36 @@ class CayuApp:
 
         results: list[IncompleteSessionRecoveryResult] = []
         for session in sessions:
-            results.append(
-                await self._recover_incomplete_session(
+            # Isolate per-session errors: one broken session must not strand
+            # the sweep (see docstring).
+            try:
+                result = await self._recover_incomplete_session(
                     session=session,
                     reason=request.reason,
                     metadata=request.metadata,
                 )
-            )
+            except Exception as exc:
+                logger.warning(
+                    "Recovery failed for session %s (agent %s): %s",
+                    session.id,
+                    session.agent_name,
+                    exc,
+                )
+                # The failed recovery may have progressed the stored status
+                # before raising; report the current status when the session
+                # can still be reloaded.
+                try:
+                    reloaded = await self.session_store.load(session.id)
+                except Exception:
+                    reloaded = None
+                result = IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=session.status,
+                    status=session.status if reloaded is None else reloaded.status,
+                    actions=(IncompleteSessionRecoveryAction.FAILED,),
+                    message=f"Recovery failed: {type(exc).__name__}: {exc}",
+                )
+            results.append(result)
         return results
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
@@ -7652,7 +7688,19 @@ class CayuApp:
                 message="Session is terminal; recovery skipped.",
             )
 
-        registered_agent = self._get_registered_agent(session.agent_name)
+        try:
+            registered_agent = self._get_registered_agent(session.agent_name)
+        except KeyError:
+            # Expected state, not an error — leave the session untouched and
+            # report a typed skip instead of aborting recovery.
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,),
+                events=(),
+                message=(f"Agent not registered: {session.agent_name!r}; session left untouched."),
+            )
         registered_environment = self._get_registered_environment_for_session(
             session.environment_name
         )
