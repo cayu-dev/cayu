@@ -88,7 +88,7 @@ class SseContract(ApiBaseModel):
 
 
 class ClientGenerationContract(ApiBaseModel):
-    openapi_url: Literal["/openapi.json"] = "/openapi.json"
+    openapi_url: str | None = "/openapi.json"
     supported_targets: tuple[Literal["typescript", "python"], ...] = ("typescript", "python")
     source_of_truth: Literal["openapi"] = "openapi"
 
@@ -105,7 +105,7 @@ class VersioningContract(ApiBaseModel):
 
 
 class ServerContractResponse(ApiBaseModel):
-    api_prefix: Literal["/api"] = SERVER_API_PREFIX
+    api_prefix: str = SERVER_API_PREFIX
     contract_version: str = SERVER_CONTRACT_VERSION
     versioning: VersioningContract = Field(default_factory=VersioningContract)
     sse: SseContract = Field(default_factory=SseContract)

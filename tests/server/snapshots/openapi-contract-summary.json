@@ -1837,10 +1837,16 @@
       "additionalProperties": false,
       "properties": {
         "openapi_url": {
-          "const": "/openapi.json",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": "/openapi.json",
-          "title": "Openapi Url",
-          "type": "string"
+          "title": "Openapi Url"
         },
         "source_of_truth": {
           "const": "openapi",
@@ -2886,7 +2892,6 @@
       "additionalProperties": false,
       "properties": {
         "api_prefix": {
-          "const": "/api",
           "default": "/api",
           "title": "Api Prefix",
           "type": "string"

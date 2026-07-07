@@ -2,26 +2,33 @@
 
 Usage::
 
+    import os
+
     from cayu import CayuApp
-    from cayu.server import create_server
+    from cayu.server import BasicAuth, create_server
 
     app = CayuApp(session_store=..., task_store=..., knowledge_store=...)
     app.register_agent(...)
 
-    server = create_server(app)
+    server = create_server(
+        app,
+        auth=BasicAuth(username="admin", password=os.environ["CAYU_SERVER_PASSWORD"]),
+    )
 
     # Run with: uvicorn my_module:server --port 8000
+    # The bundled CAYU runtime dashboard is served at /cayu by default.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from cayu.runtime.app import CayuApp
 
 try:
+    from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
+    from cayu.server.contracts import SERVER_API_PREFIX
     from cayu.server.routes import create_router
     from cayu.server.sse import event_to_sse_data
     from cayu.server.static import DashboardStaticFiles
@@ -43,8 +50,15 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 __all__ = [
+    "AuthContext",
+    "AuthDependency",
+    "BasicAuth",
+    "DashboardStaticFiles",
+    "create_router",
     "create_server",
     "event_to_sse_data",
+    "mount_cayu",
+    "mount_dashboard",
 ]
 
 
@@ -54,7 +68,11 @@ def create_server(
     title: str = "Cayu",
     cors_origins: list[str] | None = None,
     dashboard_dir: str | Path | None = None,
-    auth: Callable[..., Any] | None = None,
+    dashboard_path: str | None = "/cayu",
+    api_path: str = SERVER_API_PREFIX,
+    auth: AuthDependency | None = None,
+    dev: bool = False,
+    expose_docs: bool | None = None,
     **fastapi_kwargs: Any,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -66,18 +84,49 @@ def create_server(
         app: The CayuApp instance with registered agents/providers.
         title: FastAPI app title.
         cors_origins: Allowed CORS origins. Defaults to localhost:5173 (Vite dev).
-        dashboard_dir: Path to pre-built dashboard static files. Served at ``/``.
-        auth: Optional FastAPI dependency guarding every state-mutating API
-            route (run/resume, session interrupt/delete/mutation, task
-            lifecycle actions, tool-approval resolution/recovery, knowledge
-            review decisions). Raise ``fastapi.HTTPException`` (401/403) inside
-            it to reject a request; read-only routes and ``/health`` stay open.
+        dashboard_dir: Path to pre-built dashboard static files. Defaults to the
+            bundled CAYU dashboard build.
+        dashboard_path: URL path for the bundled dashboard. Defaults to
+            ``/cayu``. Pass ``None`` to disable dashboard mounting.
+        api_path: URL path prefix for the CAYU control plane. Defaults to
+            ``/api``. Use ``/cayu/api`` when embedding dashboard and API under
+            one product path.
+        auth: FastAPI-compatible dependency guarding the CAYU control plane. It
+            must accept ``Request`` and return ``AuthContext``; raise
+            ``fastapi.HTTPException`` (401/403) inside it to reject a request.
+            It protects every control-plane route that can start, change,
+            inspect, or reveal runtime state; only the health route stays open
+            for load balancers.
+        dev: Explicit opt-in for unauthenticated local/dev servers. Without
+            ``auth`` or ``dev=True``, ``create_server`` raises instead of
+            accidentally exposing the control plane.
+        expose_docs: Whether to expose FastAPI's generated ``/openapi.json``,
+            ``/docs``, and ``/redoc`` routes. Defaults to ``True`` in dev mode
+            and ``False`` in protected deployments. Set this explicitly for
+            production deployments that intentionally expose generated docs.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
 
-    server = FastAPI(title=title, **fastapi_kwargs)
+    if auth is None and not dev:
+        raise ValueError(
+            "create_server requires auth=... for protected deployments. "
+            "Pass dev=True only for local development or tests."
+        )
+
+    docs_enabled = dev if expose_docs is None else expose_docs
+    fastapi_options = dict(fastapi_kwargs)
+    if docs_enabled:
+        fastapi_options.setdefault("docs_url", "/docs")
+        fastapi_options.setdefault("redoc_url", "/redoc")
+        fastapi_options.setdefault("openapi_url", "/openapi.json")
+    else:
+        fastapi_options["docs_url"] = None
+        fastapi_options["redoc_url"] = None
+        fastapi_options["openapi_url"] = None
+
+    server = FastAPI(title=title, **fastapi_options)
 
     origins = cors_origins or ["http://localhost:5173"]
     server.add_middleware(
@@ -90,6 +139,12 @@ def create_server(
     session_store = app.session_store
     task_store = app.task_store
     knowledge_store = app.knowledge_store
+    control_plane_path = _normalize_api_path(api_path)
+    dashboard_mount_path = (
+        _normalize_dashboard_path(dashboard_path, api_path=control_plane_path)
+        if dashboard_path is not None
+        else None
+    )
 
     router = create_router(
         cayu_app=app,
@@ -99,25 +154,160 @@ def create_server(
         knowledge_review_namespace=app.knowledge_review_namespace,
         knowledge_review_labels=app.knowledge_review_labels,
         auth=auth,
+        api_path=control_plane_path,
+        openapi_url=server.openapi_url,
     )
     server.include_router(router)
 
-    # Serve pre-built dashboard if available
-    if dashboard_dir is not None:
-        dist_path = Path(dashboard_dir)
-        if dist_path.exists():
-            server.mount(
-                "/",
-                DashboardStaticFiles(directory=str(dist_path), html=True),
-                name="dashboard",
-            )
-    else:
-        builtin_dashboard = Path(__file__).parent / "dashboard"
-        if builtin_dashboard.exists():
-            server.mount(
-                "/",
-                DashboardStaticFiles(directory=str(builtin_dashboard), html=True),
-                name="dashboard",
-            )
+    mount_dashboard(
+        server,
+        dashboard_dir=dashboard_dir,
+        dashboard_path=dashboard_mount_path,
+        auth=auth,
+        api_base_url=control_plane_path,
+    )
 
     return server
+
+
+def mount_cayu(
+    server: Any,
+    app: CayuApp,
+    *,
+    path: str = "/cayu",
+    dashboard: bool = True,
+    dashboard_dir: str | Path | None = None,
+    auth: AuthDependency | None = None,
+    dev: bool = False,
+    name: str = "cayu-dashboard",
+) -> None:
+    """Mount CAYU's control plane and dashboard into an existing FastAPI app.
+
+    This is the high-level adapter for product apps that already own their
+    server. It mounts API routes at ``{path}/api`` and the dashboard shell at
+    ``{path}``, so the browser can use one same-origin product path.
+    """
+    if auth is None and not dev:
+        raise ValueError(
+            "mount_cayu requires auth=... for protected deployments. "
+            "Pass dev=True only for local development or tests."
+        )
+
+    mount_path = _normalize_dashboard_path(path, api_path=None)
+    api_path = _join_public_paths(mount_path, "api")
+    router = create_router(
+        cayu_app=app,
+        session_store=app.session_store,
+        task_store=app.task_store,
+        knowledge_store=app.knowledge_store,
+        knowledge_review_namespace=app.knowledge_review_namespace,
+        knowledge_review_labels=app.knowledge_review_labels,
+        auth=auth,
+        api_path=api_path,
+        openapi_url=getattr(server, "openapi_url", None),
+    )
+    server.include_router(router)
+    if dashboard:
+        mount_dashboard(
+            server,
+            dashboard_dir=dashboard_dir,
+            dashboard_path=mount_path,
+            auth=auth,
+            api_base_url=api_path,
+            name=name,
+        )
+
+
+def mount_dashboard(
+    server: Any,
+    *,
+    dashboard_dir: str | Path | None = None,
+    dashboard_path: str | None = "/cayu",
+    auth: AuthDependency | None = None,
+    api_base_url: str = SERVER_API_PREFIX,
+    name: str = "dashboard",
+) -> bool:
+    """Mount the built CAYU dashboard on a FastAPI app.
+
+    Product apps that compose CAYU with ``create_router`` can call this helper
+    after registering their API routes. It serves one subpath-safe dashboard
+    build under ``dashboard_path`` and injects runtime config so the dashboard
+    uses the selected mount path.
+
+    Returns ``True`` when a dashboard was mounted and ``False`` when mounting
+    was disabled or the dashboard directory is absent.
+    """
+    if dashboard_path is None:
+        return False
+
+    mount_path = _normalize_dashboard_path(dashboard_path, api_path=None)
+    api_url = _normalize_api_base_url(api_base_url)
+    dist_path = Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).parent / "dashboard"
+    if not dist_path.exists():
+        return False
+
+    server.mount(
+        mount_path,
+        DashboardStaticFiles(
+            directory=str(dist_path),
+            html=True,
+            auth=auth,
+            base_path=mount_path,
+            api_base_url=api_url,
+        ),
+        name=name,
+    )
+    return True
+
+
+def _normalize_dashboard_path(path: str, *, api_path: str | None) -> str:
+    value = path.strip()
+    if not value:
+        raise ValueError("dashboard_path must not be blank.")
+    if "?" in value or "#" in value:
+        raise ValueError("dashboard_path must be a URL path, not a URL.")
+    value = "/" + value.strip("/")
+    normalized = "/" if value == "/" else value
+    if api_path is not None and _is_same_or_child_path(normalized, api_path):
+        raise ValueError("dashboard_path must not live inside the CAYU api_path.")
+    return normalized
+
+
+def _normalize_api_path(path: str) -> str:
+    value = path.strip()
+    if not value:
+        raise ValueError("api_path must not be blank.")
+    if "?" in value or "#" in value or "://" in value:
+        raise ValueError("api_path must be a URL path, not a URL.")
+    value = "/" + value.strip("/")
+    if value == "/":
+        raise ValueError("api_path must not be the site root.")
+    return value
+
+
+def _normalize_api_base_url(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("api_base_url must not be blank.")
+    if _is_absolute_url(stripped):
+        return stripped.rstrip("/")
+    return _normalize_api_path(stripped)
+
+
+def _join_public_paths(base: str, child: str) -> str:
+    suffix = child.strip("/")
+    if not suffix:
+        return base
+    return f"/{suffix}" if base == "/" else f"{base}/{suffix}"
+
+
+def _is_same_or_child_path(path: str, parent: str) -> bool:
+    if path == parent:
+        return True
+    if parent == "/":
+        return True
+    return path.startswith(f"{parent}/")
+
+
+def _is_absolute_url(value: str) -> bool:
+    return "://" in value

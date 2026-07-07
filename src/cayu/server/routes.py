@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -65,13 +65,16 @@ from cayu.runtime.usage import (
     causal_budget_usage_summary,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.server.auth import AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
+    SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
     ApiReviewedKnowledgeEntry,
     ApiSession,
     ApiTaskDetail,
     ApiTaskListItem,
     CausalBudgetSummaryResponse,
+    ClientGenerationContract,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionsResponse,
@@ -729,30 +732,39 @@ def create_router(
     knowledge_store=None,
     knowledge_review_namespace: str | None = None,
     knowledge_review_labels: dict[str, str] | None = None,
-    auth: Callable[..., Any] | None = None,
+    auth: AuthDependency | None = None,
+    api_path: str = SERVER_API_PREFIX,
+    openapi_url: str | None = "/openapi.json",
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
     Args:
-        auth: Optional FastAPI dependency guarding every state-mutating route
-            (run/resume, session interrupt/delete/label/metadata mutation, task
-            lifecycle actions, tool-approval resolution/recovery, and knowledge
-            review decisions). It is resolved like any FastAPI dependency (it may
-            declare ``Request``/header parameters) and must raise
-            ``HTTPException`` (401/403) to deny a request; its return value is
-            ignored. Read-only routes and ``/health`` stay open so dashboards
-            keep working. ``None`` (default) leaves all routes unguarded.
+        auth: FastAPI-compatible dependency guarding the CAYU control plane.
+            Production callers should pass this through ``create_server``; only
+            explicit dev-mode callers should leave it unset. It protects every
+            control-plane route that can start, change, inspect, or reveal runtime
+            state; only the health route stays open for load balancers. It must
+            return ``AuthContext`` or a compatible mapping and raise
+            ``HTTPException`` (401/403) to deny a request.
+        api_path: URL path prefix for the CAYU control plane. Defaults to
+            ``/api``.
+        openapi_url: Public OpenAPI schema URL advertised by ``/contract`` for
+            client generation. Pass ``None`` when generated OpenAPI is disabled.
     """
 
-    router = APIRouter(prefix="/api")
+    api_prefix = _normalize_api_path(api_path)
+    router = APIRouter(prefix=api_prefix)
 
-    # Shared dependency list for sensitive (state-mutating) routes. FastAPI treats
-    # an empty sequence like no dependencies, so `auth=None` keeps current behavior.
-    protected: list[Any] = [Depends(auth)] if auth is not None else []
+    # Shared dependency list for control-plane routes. FastAPI treats an empty
+    # sequence like no dependencies, so `auth=None` keeps current dev behavior.
+    protected: list[Any] = [Depends(server_auth_dependency(auth))] if auth is not None else []
 
-    @router.get("/contract", response_model=ServerContractResponse)
+    @router.get("/contract", response_model=ServerContractResponse, dependencies=protected)
     async def get_contract():
-        return ServerContractResponse()
+        return ServerContractResponse(
+            api_prefix=api_prefix,
+            client_generation=ClientGenerationContract(openapi_url=openapi_url),
+        )
 
     async def _marker_sequence(session_id: str, event_id: str) -> int | None:
         """Sequence of the persisted event named by a ``Last-Event-ID`` marker.
@@ -1092,7 +1104,7 @@ def create_router(
 
         return _detached_event_stream_response(cayu_app.recover_user_input(request))
 
-    @router.get("/sessions", response_model=ListSessionsResponse)
+    @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
     async def list_sessions(
         limit: Annotated[int, Query(ge=1, le=1000)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -1142,7 +1154,11 @@ def create_router(
             "total_count": result.total_count,
         }
 
-    @router.post("/sessions/summary", response_model=SessionsSummaryResponse)
+    @router.post(
+        "/sessions/summary",
+        response_model=SessionsSummaryResponse,
+        dependencies=protected,
+    )
     async def get_sessions_summary(
         body: SessionsSummaryBody | None = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
@@ -1267,7 +1283,11 @@ def create_router(
             "cost": cost_summary,
         }
 
-    @router.get("/sessions/{session_id}/usage", response_model=SessionUsageSummary)
+    @router.get(
+        "/sessions/{session_id}/usage",
+        response_model=SessionUsageSummary,
+        dependencies=protected,
+    )
     async def get_session_usage(session_id: NonBlankString):
         try:
             summary = await cayu_app.get_session_usage(session_id)
@@ -1275,7 +1295,11 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return summary.model_dump()
 
-    @router.post("/sessions/{session_id}/cost", response_model=SessionCostSummary)
+    @router.post(
+        "/sessions/{session_id}/cost",
+        response_model=SessionCostSummary,
+        dependencies=protected,
+    )
     async def estimate_session_cost(session_id: NonBlankString, body: SessionCostBody):
         try:
             summary = await cayu_app.get_session_cost(
@@ -1290,6 +1314,7 @@ def create_router(
     @router.get(
         "/causal-budgets/{causal_budget_id}/usage",
         response_model=CausalBudgetUsageSummary,
+        dependencies=protected,
     )
     async def get_causal_budget_usage(causal_budget_id: NonBlankString):
         try:
@@ -1301,6 +1326,7 @@ def create_router(
     @router.post(
         "/causal-budgets/{causal_budget_id}/cost",
         response_model=CausalBudgetCostSummary,
+        dependencies=protected,
     )
     async def estimate_causal_budget_cost(
         causal_budget_id: NonBlankString,
@@ -1319,6 +1345,7 @@ def create_router(
     @router.post(
         "/causal-budgets/{causal_budget_id}/summary",
         response_model=CausalBudgetSummaryResponse,
+        dependencies=protected,
     )
     async def get_causal_budget_summary(
         causal_budget_id: NonBlankString,
@@ -1396,7 +1423,11 @@ def create_router(
             "cost": cost_summary.model_dump(mode="json"),
         }
 
-    @router.get("/sessions/{session_id}/summary", response_model=SessionSummaryResponse)
+    @router.get(
+        "/sessions/{session_id}/summary",
+        response_model=SessionSummaryResponse,
+        dependencies=protected,
+    )
     async def get_session_summary(session_id: NonBlankString):
         session = await session_store.load(session_id)
         if session is None:
@@ -1486,7 +1517,11 @@ def create_router(
                 return records
             after_sequence = page[-1].sequence
 
-    @router.get("/sessions/{session_id}/events", response_model=ListSessionEventsResponse)
+    @router.get(
+        "/sessions/{session_id}/events",
+        response_model=ListSessionEventsResponse,
+        dependencies=protected,
+    )
     async def list_session_events(
         session_id: NonBlankString,
         event_type: str | None = None,
@@ -1533,6 +1568,7 @@ def create_router(
     @router.get(
         "/sessions/{session_id}/transcript",
         response_model=SessionTranscriptResponse,
+        dependencies=protected,
     )
     async def get_session_transcript(
         session_id: NonBlankString,
@@ -1572,7 +1608,11 @@ def create_router(
             "total_messages": transcript_page.total_records,
         }
 
-    @router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+    @router.get(
+        "/sessions/{session_id}",
+        response_model=SessionDetailResponse,
+        dependencies=protected,
+    )
     async def get_session(session_id: str):
         session = await session_store.load(session_id)
         if session is None:
@@ -1647,7 +1687,7 @@ def create_router(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(session)
 
-    @router.get("/tasks", response_model=list[ApiTaskListItem])
+    @router.get("/tasks", response_model=list[ApiTaskListItem], dependencies=protected)
     async def list_tasks(
         status: TaskStatus | None = None,
         task_type: str | None = Query(default=None, alias="type"),
@@ -1772,7 +1812,11 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _serialize_reviewed_knowledge_entry(entry)
 
-    @router.get("/knowledge/pending", response_model=PendingKnowledgeListResponse)
+    @router.get(
+        "/knowledge/pending",
+        response_model=PendingKnowledgeListResponse,
+        dependencies=protected,
+    )
     async def list_pending_knowledge(
         namespace: str | None = None,
         label: Annotated[list[str] | None, Query()] = None,
@@ -1810,6 +1854,7 @@ def create_router(
     @router.get(
         "/knowledge/pending/{entry_id}",
         response_model=PendingKnowledgeDetailResponse,
+        dependencies=protected,
     )
     async def get_pending_knowledge(
         entry_id: NonBlankString,
@@ -1870,3 +1915,15 @@ def create_router(
         return {"ok": True}
 
     return router
+
+
+def _normalize_api_path(path: str) -> str:
+    value = path.strip()
+    if not value:
+        raise ValueError("api_path must not be blank.")
+    if "?" in value or "#" in value or "://" in value:
+        raise ValueError("api_path must be a URL path, not a URL.")
+    value = "/" + value.strip("/")
+    if value == "/":
+        raise ValueError("api_path must not be the site root.")
+    return value

@@ -77,7 +77,7 @@ def main() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     asyncio.run(seed_sessions(app))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/summary",
         params=[

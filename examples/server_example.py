@@ -2,15 +2,17 @@
 
 Usage:
     pip install cayu[server]
-    OPENAI_API_KEY=... python examples/server_example.py
+    CAYU_SERVER_PASSWORD=... OPENAI_API_KEY=... python examples/server_example.py
     # or:
-    ANTHROPIC_API_KEY=... python examples/server_example.py
+    CAYU_SERVER_PASSWORD=... ANTHROPIC_API_KEY=... python examples/server_example.py
     # or (Google Gemini via the OpenAI-compatible endpoint):
-    GEMINI_API_KEY=... python examples/server_example.py
+    CAYU_SERVER_PASSWORD=... GEMINI_API_KEY=... python examples/server_example.py
 
     # Then:
+    # Open http://localhost:8000/cayu/ for the CAYU runtime dashboard.
     curl http://localhost:8000/api/health
-    curl -N -X POST http://localhost:8000/api/run \
+    curl -N -u "${CAYU_SERVER_USERNAME:-admin}:$CAYU_SERVER_PASSWORD" \
+      -X POST http://localhost:8000/api/run \
       -H "Content-Type: application/json" \
       -d '{"prompt": "List files in the workspace"}'
 """
@@ -39,7 +41,7 @@ from cayu import (
     WriteFileTool,
     trim_context_turns,
 )
-from cayu.server import create_server
+from cayu.server import BasicAuth, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "server"
 DB_DIR = WORKSPACE / ".cayu"
@@ -79,8 +81,20 @@ def main() -> None:
         context_policy=RecentContextPolicy(),
     )
 
-    server = create_server(app)
+    server = create_server(app, auth=_server_auth())
     uvicorn.run(server, host="0.0.0.0", port=8000)
+
+
+def _server_auth() -> BasicAuth:
+    password = os.environ.get("CAYU_SERVER_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "Set CAYU_SERVER_PASSWORD before starting examples/server_example.py."
+        )
+    return BasicAuth(
+        username=os.environ.get("CAYU_SERVER_USERNAME", "admin"),
+        password=password,
+    )
 
 
 def _register_provider(app: CayuApp) -> str:

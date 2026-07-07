@@ -4,6 +4,7 @@ import { createRootRoute, createRoute, createRouter, RouterProvider } from "@tan
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
+import { dashboardConfig } from "./lib/config"
 import { DashboardPage } from "./routes/dashboard"
 import { KnowledgePage } from "./routes/knowledge"
 import { RunPage } from "./routes/run"
@@ -54,7 +55,10 @@ const routeTree = rootRoute.addChildren([
   runRoute,
 ])
 
-const router = createRouter({ routeTree })
+const router = createRouter({
+  routeTree,
+  basepath: dashboardConfig.basePath === "/" ? undefined : dashboardConfig.basePath,
+})
 
 declare module "@tanstack/react-router" {
   interface Register {

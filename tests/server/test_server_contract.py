@@ -30,7 +30,7 @@ _STREAMING_ROUTES = {
 
 
 def _client() -> TestClient:
-    return TestClient(create_server(CayuApp()))
+    return TestClient(create_server(CayuApp(), dev=True))
 
 
 def _normalize_schema_node(value):
@@ -129,6 +129,20 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
         "supported_targets": ["typescript", "python"],
         "source_of_truth": "openapi",
     }
+
+
+def test_custom_api_path_updates_contract_and_openapi_paths() -> None:
+    client = TestClient(create_server(CayuApp(), dev=True, api_path="/cayu/api"))
+
+    response = client.get("/cayu/api/contract")
+
+    assert response.status_code == 200
+    assert response.json()["api_prefix"] == "/cayu/api"
+    assert client.get("/api/contract").status_code == 404
+
+    schema = client.get("/openapi.json").json()
+    assert "/cayu/api/run" in schema["paths"]
+    assert "/api/run" not in schema["paths"]
 
 
 def test_streaming_routes_document_sse_response_contract() -> None:

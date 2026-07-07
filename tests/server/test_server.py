@@ -10,6 +10,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cayu import (
@@ -37,7 +38,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
-from cayu.server import create_server
+from cayu.server import create_server, mount_cayu, mount_dashboard
 
 
 class OneShotProvider(ModelProvider):
@@ -73,11 +74,15 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
-    dashboard = client.get("/")
+    assert client.get("/").status_code == 404
+
+    dashboard = client.get("/cayu/")
     assert dashboard.status_code == 200
     assert "root" in dashboard.text
+    assert '"basePath":"/cayu"' in dashboard.text
+    assert '"apiBaseUrl":"/api"' in dashboard.text
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -132,7 +137,7 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
             ],
         )
     )
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     pending = client.get("/api/knowledge/pending")
     assert pending.status_code == 200
@@ -180,7 +185,7 @@ def test_server_rejects_pending_knowledge_with_archived_status() -> None:
             )
         ]
     )
-    client = TestClient(create_server(CayuApp(knowledge_store=store)))
+    client = TestClient(create_server(CayuApp(knowledge_store=store), dev=True))
 
     rejected = client.post("/api/knowledge/pending_bad/reject")
     assert rejected.status_code == 200
@@ -192,7 +197,7 @@ def test_server_rejects_pending_knowledge_with_archived_status() -> None:
 
 
 def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> None:
-    missing_store = TestClient(create_server(CayuApp()))
+    missing_store = TestClient(create_server(CayuApp(), dev=True))
     assert missing_store.get("/api/knowledge/pending").status_code == 404
 
     store = InMemoryKnowledgeStore(
@@ -211,7 +216,7 @@ def test_server_knowledge_review_reports_missing_store_and_scope_errors() -> Non
         knowledge_review_namespace="project:cayu",
         knowledge_review_labels={"project": "cayu"},
     )
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     scoped_list = client.get("/api/knowledge/pending")
     assert scoped_list.status_code == 200
@@ -236,7 +241,7 @@ def test_server_pending_knowledge_detail_validates_chunk_limits() -> None:
             )
         ]
     )
-    client = TestClient(create_server(CayuApp(knowledge_store=store)))
+    client = TestClient(create_server(CayuApp(knowledge_store=store), dev=True))
 
     response = client.get("/api/knowledge/pending/pending_git?max_chunks=0")
     assert response.status_code == 422
@@ -255,7 +260,7 @@ def test_run_threads_inbound_traceparent_into_session_metadata() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     traceparent = "00-11111111111111111111111111111111-2222222222222222-01"
     started = None
@@ -295,7 +300,7 @@ def test_resume_threads_inbound_traceparent_into_session_metadata() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
     session_id = started["session_id"]
@@ -327,7 +332,7 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
 
     asyncio.run(setup_task())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
     tasks = client.get("/api/tasks").json()
 
     assert len(tasks) == 1
@@ -378,7 +383,7 @@ def test_server_task_list_filters_lifecycle_states() -> None:
 
     asyncio.run(setup_task())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
     response = client.get(
         "/api/tasks",
         params={
@@ -411,7 +416,7 @@ def test_server_task_lifecycle_endpoints_hold_and_resume_tasks() -> None:
 
     asyncio.run(setup_task())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
     block_response = client.post(
         "/api/tasks/review_task/block",
         json={
@@ -454,7 +459,7 @@ def test_server_task_lifecycle_endpoints_support_pause_and_needs_attention() -> 
 
     asyncio.run(setup_tasks())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
 
     pause_response = client.post(
         "/api/tasks/pause_task/pause",
@@ -482,7 +487,7 @@ def test_server_task_lifecycle_endpoints_report_invalid_transitions() -> None:
 
     asyncio.run(setup_task())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
 
     hold_response = client.post(
         "/api/tasks/attached_task/block",
@@ -497,14 +502,14 @@ def test_server_task_lifecycle_endpoints_report_invalid_transitions() -> None:
 
 
 def test_server_task_lifecycle_endpoints_report_missing_task_store_and_task() -> None:
-    missing_store_client = TestClient(create_server(CayuApp()))
+    missing_store_client = TestClient(create_server(CayuApp(), dev=True))
 
     missing_store_response = missing_store_client.post("/api/tasks/task_1/block")
     assert missing_store_response.status_code == 404
     assert missing_store_response.json()["detail"] == "Task store is not configured."
 
     task_store = InMemoryTaskStore()
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
 
     missing_task_response = client.post("/api/tasks/missing_task/block")
     assert missing_task_response.status_code == 404
@@ -519,7 +524,7 @@ def test_server_task_lifecycle_endpoints_validate_request_body() -> None:
 
     asyncio.run(setup_task())
 
-    client = TestClient(create_server(CayuApp(task_store=task_store)))
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
     response = client.post("/api/tasks/task_1/block", json={"reason": "   "})
 
     assert response.status_code == 422
@@ -540,7 +545,7 @@ def test_server_exposes_session_usage_summary() -> None:
         )
     )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/usage_1/usage")
 
     assert response.status_code == 200
@@ -572,7 +577,7 @@ def test_server_run_accepts_budget_limits() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream(
         "POST",
@@ -620,7 +625,7 @@ def test_server_run_defaults_and_overrides_max_steps() -> None:
         return original_run(request)
 
     app.run = spy_run  # type: ignore[method-assign]
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -641,7 +646,7 @@ def test_server_resume_overrides_max_steps() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
     session_id = started["session_id"]
@@ -672,7 +677,7 @@ def test_server_rejects_out_of_range_max_steps(path: str, bad_value: int) -> Non
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     body: dict = {"prompt": "hello", "max_steps": bad_value}
     if path == "/api/resume":
@@ -684,7 +689,7 @@ def test_server_rejects_out_of_range_max_steps(path: str, bad_value: int) -> Non
 def test_server_lists_sessions_with_label_filters() -> None:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def seed() -> None:
         await store.create(
@@ -741,7 +746,7 @@ def test_server_lists_sessions_with_label_filters() -> None:
 def test_server_lists_sessions_with_typed_filters() -> None:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def seed() -> None:
         await store.create(
@@ -803,7 +808,7 @@ def test_server_lists_sessions_with_typed_filters() -> None:
 def test_server_lists_sessions_with_typed_and_label_filters_together() -> None:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def seed() -> None:
         await store.create(
@@ -836,7 +841,7 @@ def test_server_lists_sessions_with_typed_and_label_filters_together() -> None:
 def test_server_lists_sessions_with_label_selectors() -> None:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def seed() -> None:
         await store.create(
@@ -920,7 +925,7 @@ def test_server_lists_sessions_with_label_selectors() -> None:
 
 def test_server_session_label_filters_allow_reserved_query_keys() -> None:
     app = CayuApp()
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     response = client.get("/api/sessions?label=cayu:agent=builder")
 
@@ -930,7 +935,7 @@ def test_server_session_label_filters_allow_reserved_query_keys() -> None:
 
 def test_server_rejects_invalid_session_label_filters() -> None:
     app = CayuApp()
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     assert client.get("/api/sessions?label=missing_separator").status_code == 422
     assert client.get("/api/sessions?label=%20=org_123").status_code == 422
@@ -961,7 +966,7 @@ def test_server_exposes_filtered_sessions_summary() -> None:
             )
         )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/summary",
         params=[
@@ -1028,7 +1033,7 @@ def test_server_filtered_sessions_summary_queries_events_in_one_batch() -> None:
 
     app.session_store.query_events = query_events
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/summary",
         params={"label": "organization=org_123", "order_by": "created_at_asc"},
@@ -1057,7 +1062,7 @@ def test_server_sessions_summary_allows_omitted_body() -> None:
         )
     )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/summary",
         params={"label": "organization=org_123"},
@@ -1075,7 +1080,7 @@ def test_server_run_rejects_request_budget_reservations() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     response = client.post(
         "/api/run",
@@ -1113,7 +1118,7 @@ def test_server_session_usage_returns_404_for_missing_session() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/missing/usage")
 
     assert response.status_code == 404
@@ -1125,7 +1130,7 @@ def test_server_session_usage_rejects_blank_session_id() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/%20/usage")
 
     assert response.status_code == 422
@@ -1146,7 +1151,7 @@ def test_server_exposes_session_cost_estimate() -> None:
         )
     )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/cost_1/cost",
         json={
@@ -1217,7 +1222,7 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
             )
         )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     usage_response = client.get("/api/causal-budgets/job_shared/usage")
     pricing_body = {
         "pricing": {
@@ -1372,7 +1377,7 @@ def test_server_session_cost_reports_unpriced_steps() -> None:
         )
     )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/cost_unpriced/cost",
         json={
@@ -1402,7 +1407,7 @@ def test_server_session_cost_returns_404_for_missing_session() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/missing/cost",
         json={
@@ -1428,7 +1433,7 @@ def test_server_session_cost_validates_pricing_body() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/session_1/cost",
         json={
@@ -1463,7 +1468,7 @@ def test_server_exposes_session_summary() -> None:
         )
     )
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/summary_1/summary")
 
     assert response.status_code == 200
@@ -1579,7 +1584,7 @@ def test_server_session_summary_exposes_interrupted_outcome_and_retry() -> None:
 
     asyncio.run(seed())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/summary_interrupted/summary")
 
     assert response.status_code == 200
@@ -1614,7 +1619,7 @@ def test_server_session_summary_returns_404_for_missing_session() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/missing/summary")
 
     assert response.status_code == 404
@@ -1626,7 +1631,7 @@ def test_server_session_summary_rejects_blank_session_id() -> None:
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/%20/summary")
 
     assert response.status_code == 422
@@ -1675,7 +1680,7 @@ def test_server_exposes_paginated_session_events() -> None:
 
     asyncio.run(seed_events())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     first_page = client.get("/api/sessions/events_1/events?limit=2")
     assert first_page.status_code == 200
@@ -1751,7 +1756,7 @@ def test_server_filters_session_events() -> None:
 
     asyncio.run(seed_events())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get(
         "/api/sessions/events_filters/events",
         params={
@@ -1773,7 +1778,7 @@ def test_server_session_events_returns_404_for_missing_session() -> None:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/missing/events")
 
     assert response.status_code == 404
@@ -1797,7 +1802,7 @@ def test_server_session_events_validates_query() -> None:
 
     asyncio.run(create_session())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     assert client.get("/api/sessions/events_validation/events?limit=0").status_code == 422
     assert (
@@ -1840,7 +1845,7 @@ def test_server_exposes_paginated_session_transcript() -> None:
 
     asyncio.run(seed_transcript())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     first_page = client.get("/api/sessions/transcript_1/transcript?limit=2")
 
     assert first_page.status_code == 200
@@ -1894,7 +1899,7 @@ def test_server_filters_session_transcript_by_role() -> None:
 
     asyncio.run(seed_transcript())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/transcript_roles/transcript?role=user")
 
     assert response.status_code == 200
@@ -1913,7 +1918,7 @@ def test_server_session_transcript_returns_404_for_missing_session() -> None:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     response = client.get("/api/sessions/missing/transcript")
 
     assert response.status_code == 404
@@ -1937,7 +1942,7 @@ def test_server_session_transcript_validates_query() -> None:
 
     asyncio.run(create_session())
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     assert client.get("/api/sessions/transcript_validation/transcript?limit=0").status_code == 422
     assert (
@@ -1951,15 +1956,93 @@ def test_dashboard_routes_fall_back_to_index_without_masking_api_or_assets() -> 
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
-    for path in ["/sessions", "/run", "/sessions/session-abc"]:
+    for path in ["/cayu/sessions", "/cayu/run", "/cayu/sessions/session-abc"]:
         response = client.get(path)
         assert response.status_code == 200
         assert '<div id="root"></div>' in response.text
+        assert '"basePath":"/cayu"' in response.text
 
+    assert client.get("/sessions").status_code == 404
     assert client.get("/api/missing").status_code == 404
-    assert client.get("/assets/missing.js").status_code == 404
+    assert client.get("/cayu/assets/missing.js").status_code == 404
+
+
+def test_dashboard_path_can_be_disabled_or_customized() -> None:
+    disabled = TestClient(create_server(CayuApp(), dev=True, dashboard_path=None))
+    assert disabled.get("/cayu/").status_code == 404
+
+    custom = TestClient(create_server(CayuApp(), dev=True, dashboard_path="/inspector"))
+    response = custom.get("/inspector/sessions")
+
+    assert response.status_code == 200
+    assert '<div id="root"></div>' in response.text
+    assert '"basePath":"/inspector"' in response.text
+    assert custom.get("/cayu/").status_code == 404
+
+
+def test_create_server_can_embed_api_under_dashboard_path() -> None:
+    client = TestClient(
+        create_server(
+            CayuApp(),
+            dev=True,
+            dashboard_path="/cayu",
+            api_path="/cayu/api",
+        )
+    )
+
+    dashboard = client.get("/cayu/sessions")
+    assert dashboard.status_code == 200
+    assert '<div id="root"></div>' in dashboard.text
+    assert '"basePath":"/cayu"' in dashboard.text
+    assert '"apiBaseUrl":"/cayu/api"' in dashboard.text
+
+    assert client.get("/cayu/api/health").json() == {"ok": True}
+    assert client.get("/api/health").status_code == 404
+    assert client.get("/cayu/api/missing").status_code == 404
+
+
+def test_mount_dashboard_helper_supports_composed_apps() -> None:
+    app = FastAPI()
+
+    assert mount_dashboard(app, dashboard_path="/inspector") is True
+
+    client = TestClient(app)
+    response = client.get("/inspector/knowledge")
+
+    assert response.status_code == 200
+    assert '<div id="root"></div>' in response.text
+    assert '"basePath":"/inspector"' in response.text
+
+
+def test_mount_cayu_mounts_api_and_dashboard_under_product_path() -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+
+    mount_cayu(server, cayu_app, path="/cayu", dev=True)
+
+    client = TestClient(server)
+    dashboard = client.get("/cayu/knowledge")
+
+    assert dashboard.status_code == 200
+    assert '<div id="root"></div>' in dashboard.text
+    assert '"basePath":"/cayu"' in dashboard.text
+    assert '"apiBaseUrl":"/cayu/api"' in dashboard.text
+    assert client.get("/cayu/api/health").json() == {"ok": True}
+    assert client.get("/api/health").status_code == 404
+    assert client.get("/cayu/api/missing").status_code == 404
+
+
+def test_mount_cayu_can_disable_dashboard_for_api_only_services() -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+
+    mount_cayu(server, cayu_app, path="/cayu", dashboard=False, dev=True)
+
+    client = TestClient(server)
+    assert client.get("/cayu/api/health").json() == {"ok": True}
+    assert client.get("/cayu/").status_code == 404
 
 
 def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
@@ -1967,7 +2050,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     assert client.post("/api/run", json={"prompt": " "}).status_code == 422
     assert client.post("/api/run", json={"prompt": "hello", "agent": " "}).status_code == 422
@@ -2079,7 +2162,7 @@ def test_run_endpoint_passes_retry_policy_to_runtime() -> None:
         )
 
     app.run = run
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream(
         "POST",
@@ -2138,7 +2221,7 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
 
     app.resolve_tool_approval = resolve_tool_approval
     app.recover_tool_approval = recover_tool_approval
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream(
         "POST",
@@ -2191,7 +2274,7 @@ def test_interrupt_session_endpoint_streams_interrupted_event() -> None:
         )
 
     asyncio.run(create_pending_session())
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream(
         "POST",
@@ -2229,7 +2312,7 @@ def test_interrupt_session_endpoint_rejects_completed_session_before_streaming()
         )
 
     asyncio.run(create_completed_session())
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     response = client.post("/api/sessions/session_interrupt_completed/interrupt")
 
@@ -2268,7 +2351,7 @@ def test_interrupt_session_endpoint_rejects_completion_race_before_streaming() -
         await app.session_store.update_status("session_interrupt_race", SessionStatus.RUNNING)
 
     asyncio.run(create_running_session())
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     response = client.post("/api/sessions/session_interrupt_race/interrupt")
 
@@ -2296,7 +2379,7 @@ def test_interrupt_session_endpoint_returns_conflict_while_interruption_finalize
         )
 
     asyncio.run(create_interrupting_session())
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     response = client.post("/api/sessions/session_interrupt_finalizing/interrupt")
 
@@ -2334,7 +2417,7 @@ def test_interrupt_session_endpoint_is_idempotent_for_interrupted_session() -> N
         )
 
     asyncio.run(create_interrupted_session())
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream(
         "POST",
@@ -2351,7 +2434,7 @@ def test_interrupt_session_endpoint_is_idempotent_for_interrupted_session() -> N
 def _lifecycle_store_and_client(seed) -> tuple[InMemorySessionStore, TestClient]:
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
     asyncio.run(seed(store))
     return store, client
 
@@ -2487,7 +2570,7 @@ def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
     # first record + limit=1).
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def seed() -> None:
         session = await store.create(
@@ -2559,7 +2642,7 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -2595,7 +2678,7 @@ def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> Non
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     malformed = client.post(
         "/api/run",
@@ -2618,7 +2701,7 @@ def test_client_disconnect_does_not_cancel_detached_run() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     session_id = None
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
@@ -2644,7 +2727,7 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     async def broken_run(request):
         raise RuntimeError("run exploded before streaming")
@@ -2694,7 +2777,7 @@ def _ask_user_client() -> TestClient:
     app = CayuApp()
     app.register_provider(AskUserProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()])
-    return TestClient(create_server(app))
+    return TestClient(create_server(app, dev=True))
 
 
 def test_server_resolve_user_input_resumes_paused_session() -> None:

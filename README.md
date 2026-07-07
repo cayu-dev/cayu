@@ -1017,6 +1017,45 @@ The provider-neutral transcript is exposed separately at
 Use events to inspect what happened; use transcript to inspect the conversation
 state Cayu will use for resume, compaction, and provider requests.
 
+The optional FastAPI server is fail-closed outside local development. Production
+apps must pass `auth=...` to `create_server(...)`; `dev=True` is only for trusted
+local development and installs an allow-all dependency. Cayu ships `BasicAuth`
+for a minimal deployable guard, and applications can pass their own dependency
+returning an `AuthContext` for JWT, OIDC, session-cookie, or gateway-backed auth.
+FastAPI's generated `/openapi.json`, `/docs`, and `/redoc` routes are enabled by
+default only in `dev=True`; protected deployments disable them unless
+`expose_docs=True` is set intentionally.
+
+`create_server(...)` mounts the bundled dashboard at `/cayu` and the control
+plane at `/api` by default. Set `dashboard_path=None` to expose only the API
+routes, pass a custom dashboard path such as `dashboard_path="/inspector"`, or
+pass `api_path="/cayu/api"` when dashboard and API should live under one product
+path. The dashboard shell, dashboard assets, and control-plane API routes use
+the same auth dependency outside `dev=True`.
+
+Local generated agents should keep their runtime portable: put agent
+registration in a `CayuApp` factory and use `create_server(app, dev=True)` only
+for the trusted local entrypoint. Production entrypoints should pass real auth.
+
+Composed FastAPI apps can mount CAYU under one product path:
+
+```python
+import os
+
+from cayu.server import BasicAuth, mount_cayu
+
+auth = BasicAuth(username="admin", password=os.environ["CAYU_SERVER_PASSWORD"])
+mount_cayu(server, cayu_app, path="/cayu", auth=auth)
+```
+
+This serves the dashboard at `/cayu` and the control plane at `/cayu/api`.
+Existing Next.js apps should usually expose the same shape through a same-origin
+route/proxy (`/cayu` and `/cayu/api/...`) so app middleware can guard the product
+path while the CAYU server still verifies the upstream auth verdict. For
+Cloudflare dashboard plus Fly agent deployments, prefer serving the dashboard at
+Cloudflare and proxying `/cayu/api/...` to the Fly agent rather than making the
+browser talk cross-origin to Fly; that keeps SSE, credentials, and CORS simpler.
+
 For one-call session health views, the optional server exposes
 `GET /api/sessions/{session_id}/summary`. It returns session identity/status,
 event totals and counts, the latest event, transcript message count, and the

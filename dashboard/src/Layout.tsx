@@ -1,5 +1,6 @@
 import { Link, Outlet, useRouterState } from "@tanstack/react-router"
 import { BookOpenCheck, LayoutDashboard, List, Play } from "lucide-react"
+import { dashboardAsset } from "./lib/config"
 import { cn } from "./lib/utils"
 
 const navItems = [
@@ -17,7 +18,7 @@ export function Layout() {
     <div className="flex h-screen overflow-hidden">
       <nav className="w-56 flex-shrink-0 border-r border-border bg-sidebar-background flex flex-col p-4 gap-1">
         <div className="mb-6 px-3">
-          <img src="/logo.svg" alt="cayu" className="h-6" />
+          <img src={dashboardAsset("logo.svg")} alt="cayu" className="h-6" />
         </div>
         {navItems.map(({ to, label, icon: Icon }) => {
           const active = to === "/" ? currentPath === "/" : currentPath.startsWith(to)

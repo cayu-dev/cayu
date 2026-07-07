@@ -1,3 +1,5 @@
+import { apiUrl } from "./config"
+
 export type Session = {
   id: string
   status: string
@@ -126,32 +128,34 @@ async function responseErrorMessage(response: Response): Promise<string> {
 
 export async function fetchSessions(): Promise<Session[]> {
   // GET /api/sessions returns a paginated envelope; the dashboard shows the first page.
-  const page = await fetchJson<{ sessions: Session[] }>("/api/sessions")
+  const page = await fetchJson<{ sessions: Session[] }>(apiUrl("/sessions"))
   return page.sessions
 }
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
-  return fetchJson<SessionDetail>(`/api/sessions/${id}`)
+  return fetchJson<SessionDetail>(apiUrl(`/sessions/${id}`))
 }
 
 export async function fetchTasks(): Promise<Task[]> {
-  return fetchJson<Task[]>("/api/tasks")
+  return fetchJson<Task[]>(apiUrl("/tasks"))
 }
 
 export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
-  return fetchJson<KnowledgePendingPage>("/api/knowledge/pending")
+  return fetchJson<KnowledgePendingPage>(apiUrl("/knowledge/pending"))
 }
 
 export async function fetchPendingKnowledgeEntry(entryId: string): Promise<KnowledgeEntryDetail> {
-  return fetchJson<KnowledgeEntryDetail>(`/api/knowledge/pending/${encodeURIComponent(entryId)}`)
+  return fetchJson<KnowledgeEntryDetail>(
+    apiUrl(`/knowledge/pending/${encodeURIComponent(entryId)}`),
+  )
 }
 
 export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry> {
-  return postJson<KnowledgeEntry>(`/api/knowledge/${encodeURIComponent(entryId)}/approve`)
+  return postJson<KnowledgeEntry>(apiUrl(`/knowledge/${encodeURIComponent(entryId)}/approve`))
 }
 
 export async function rejectKnowledge(entryId: string): Promise<KnowledgeEntry> {
-  return postJson<KnowledgeEntry>(`/api/knowledge/${encodeURIComponent(entryId)}/reject`)
+  return postJson<KnowledgeEntry>(apiUrl(`/knowledge/${encodeURIComponent(entryId)}/reject`))
 }
 
 export async function streamRun(
@@ -162,7 +166,7 @@ export async function streamRun(
 ) {
   const { fetchEventSource } = await import("@microsoft/fetch-event-source")
   try {
-    await fetchEventSource("/api/run", {
+    await fetchEventSource(apiUrl("/run"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
@@ -194,7 +198,7 @@ export async function streamResume(
 ) {
   const { fetchEventSource } = await import("@microsoft/fetch-event-source")
   try {
-    await fetchEventSource("/api/resume", {
+    await fetchEventSource(apiUrl("/resume"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sessionId, prompt }),
