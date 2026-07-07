@@ -1,4 +1,23 @@
 import { apiUrl } from "./config"
+import type {
+  ApiKnowledgeChunk,
+  ApiKnowledgeListItem,
+  ApiReviewedKnowledgeEntry,
+  ApiSessionBase,
+  ApiSessionDetailEvent,
+  ApiSessionDetailTranscriptMessage,
+  ApiTaskListItem,
+  ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
+  GetContractApiContractGetResponse,
+  GetSessionApiSessionsSessionIdGetResponse,
+  ListSessionsApiSessionsGetResponse,
+  ListTasksApiTasksGetResponse,
+  PendingKnowledgeDetailResponse,
+  PendingKnowledgeListResponse,
+  RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
+  SseErrorEnvelope,
+  SseEventEnvelope,
+} from "./generated/server-api"
 
 export const SUPPORTED_SERVER_CONTRACT_VERSION = "1"
 
@@ -14,155 +33,22 @@ export class ApiClientError extends Error {
   }
 }
 
-export type ServerContract = {
-  api_prefix: string
-  contract_version: string
-  versioning: {
-    contract_version: string
-    compatibility: string
-    breaking_change_requires: string[]
-  }
-  sse: {
-    content_type: "text/event-stream"
-    event_id_format: "session_id:event_id"
-    replay_header: "Last-Event-ID"
-    event_data_schema: "SseEventEnvelope"
-    error_event_name: "error"
-    error_data_schema: "SseErrorEnvelope"
-  }
-  client_generation: {
-    openapi_url: string | null
-    supported_targets: string[]
-    source_of_truth: "openapi"
-  }
-}
-
-export type Session = {
-  id: string
-  status: string
-  agent_name: string
-  provider_name: string | null
-  model: string | null
-  parent_session_id: string | null
-  causal_budget_id: string | null
-  runtime_name: string
-  runtime_version: string | null
-  environment_name: string | null
-  created_at: string
-  updated_at: string
-  labels: Record<string, string>
-  metadata?: Record<string, unknown>
-}
-
-export type SessionEvent = {
-  id: string
-  type: string
-  agent_name: string | null
-  environment_name: string | null
-  workflow_name: string | null
-  tool_name: string | null
-  payload: Record<string, unknown>
-  timestamp: string
-}
-
-export type TranscriptMessage = {
-  role: string
-  content: Array<{ type: string; text?: string; tool_name?: string; [key: string]: unknown }>
-}
-
-export type SessionDetail = {
-  session: Session
-  events: SessionEvent[]
-  transcript: TranscriptMessage[]
-}
-
-export type Task = {
-  id: string
-  type: string
-  title: string | null
-  status: string
-  status_reason: string | null
-  status_payload: Record<string, unknown> | null
-  session_id: string | null
-  worker_id: string | null
-  lease_expires_at: string | null
-  created_at: string
-  completed_at: string | null
-}
-
-export type KnowledgeEntry = {
-  entry_id: string
-  namespace: string
-  kind: string
-  visibility: string
-  status: string
-  title: string | null
-  labels: Record<string, string>
-  aspects: string[]
-  impact_targets: string[]
-  source_type: string | null
-  source_uri: string | null
-  source_id: string | null
-  created_by_type: string
-  created_by: string | null
-  created_at: string
-  updated_at: string
-  importance: number | null
-  importance_source: string | null
-  confidence: number | null
-  chunk_count?: number
-  text_preview: string | null
-}
-
-export type KnowledgeEntryDetail = KnowledgeEntry & {
-  text: string
-  metadata: Record<string, unknown>
-  expires_at: string | null
-  chunks: KnowledgeChunk[]
-  chunk_limit: number
-  chunk_max_bytes: number
-}
-
-export type KnowledgeChunk = {
-  chunk_id: string
-  entry_id: string
-  chunk_index: number
-  text: string
-  content_hash: string | null
-  source_uri: string | null
-  metadata: Record<string, unknown>
-}
-
-export type KnowledgePendingPage = {
-  entries: KnowledgeEntry[]
-  truncated: boolean
-  limit: number
-  max_bytes: number
-  total_entries_known: number | null
-}
-
-export type SSEEvent = {
-  id: string
-  type: string
-  session_id: string
-  agent_name: string | null
-  environment_name: string | null
-  workflow_name: string | null
-  tool_name: string | null
-  payload: Record<string, unknown>
-  timestamp: string
-}
+export type ServerContract = GetContractApiContractGetResponse
+export type Session = ApiSessionBase
+export type SessionEvent = ApiSessionDetailEvent
+export type TranscriptMessage = ApiSessionDetailTranscriptMessage
+export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
+export type Task = ApiTaskListItem
+export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
+export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
+export type KnowledgeChunk = ApiKnowledgeChunk
+export type KnowledgePendingPage = PendingKnowledgeListResponse
+export type SSEEvent = SseEventEnvelope
 
 type ErrorEnvelope = {
   detail?: unknown
   error?: unknown
   message?: unknown
-}
-
-type SseErrorEnvelope = {
-  type: "stream.error"
-  error: string
-  error_type: string
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -230,7 +116,7 @@ export async function fetchServerContract(): Promise<ServerContract> {
 
 export async function fetchSessions(): Promise<Session[]> {
   // GET /api/sessions returns a paginated envelope; the dashboard shows the first page.
-  const page = await requestJson<{ sessions: Session[] }>("/sessions")
+  const page = await requestJson<ListSessionsApiSessionsGetResponse>("/sessions")
   return page.sessions
 }
 
@@ -239,7 +125,7 @@ export async function fetchSession(id: string): Promise<SessionDetail> {
 }
 
 export async function fetchTasks(): Promise<Task[]> {
-  return requestJson<Task[]>("/tasks")
+  return requestJson<ListTasksApiTasksGetResponse>("/tasks")
 }
 
 export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
@@ -251,11 +137,15 @@ export async function fetchPendingKnowledgeEntry(entryId: string): Promise<Knowl
 }
 
 export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry> {
-  return postJson<KnowledgeEntry>(`/knowledge/${encodeURIComponent(entryId)}/approve`)
+  return postJson<ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse>(
+    `/knowledge/${encodeURIComponent(entryId)}/approve`,
+  )
 }
 
 export async function rejectKnowledge(entryId: string): Promise<KnowledgeEntry> {
-  return postJson<KnowledgeEntry>(`/knowledge/${encodeURIComponent(entryId)}/reject`)
+  return postJson<RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse>(
+    `/knowledge/${encodeURIComponent(entryId)}/reject`,
+  )
 }
 
 export async function streamRun(

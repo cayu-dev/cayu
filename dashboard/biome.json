@@ -5,7 +5,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["src/**", "!src/components/ui/**", "!**/*.css"]
+    "includes": ["src/**", "!src/components/ui/**", "!src/lib/generated/**", "!**/*.css"]
   },
   "formatter": {
     "enabled": true,

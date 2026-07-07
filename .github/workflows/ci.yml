@@ -71,12 +71,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.18.0
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      - run: npm run check:api
       - run: npm run build:package
       - name: Check packaged dashboard assets
         run: test -z "$(git -C .. status --porcelain -- src/cayu/server/dashboard)"

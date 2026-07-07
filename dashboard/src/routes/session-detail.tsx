@@ -211,7 +211,8 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
                         )}
                         {part.type === "tool_call" && (
                           <span className="font-mono text-xs">
-                            → {part.tool_name}({JSON.stringify(part.arguments || {}).slice(0, 100)})
+                            → {String(part.tool_name || "")}(
+                            {JSON.stringify(part.arguments || {}).slice(0, 100)})
                           </span>
                         )}
                         {part.type === "tool_result" && (

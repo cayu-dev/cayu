@@ -16,7 +16,6 @@ import {
   approveKnowledge,
   fetchPendingKnowledge,
   fetchPendingKnowledgeEntry,
-  type KnowledgeEntry,
   type KnowledgeEntryDetail,
   rejectKnowledge,
 } from "../lib/api"
@@ -58,7 +57,7 @@ function EntryActions({
   onApprove,
   onReject,
 }: {
-  entry: KnowledgeEntry
+  entry: { entry_id: string }
   disabled: boolean
   onApprove: (entryId: string) => void
   onReject: (entryId: string) => void

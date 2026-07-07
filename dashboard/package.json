@@ -3,11 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:package": "tsc && vite build --outDir ../src/cayu/server/dashboard --emptyOutDir",
     "preview": "vite preview",
+    "generate:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py",
+    "check:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py --check",
     "lint": "biome check src/",
     "lint:fix": "biome check --fix src/",
     "format": "biome format --write src/",
@@ -15,6 +20,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
+    "@hey-api/openapi-ts": "0.99.0",
     "@tailwindcss/vite": "^4.3.0",
     "@tanstack/router-devtools": "^1.167.0",
     "@tanstack/router-plugin": "^1.168.13",
