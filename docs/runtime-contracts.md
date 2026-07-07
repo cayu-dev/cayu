@@ -470,7 +470,12 @@ available. If retries are exhausted, or no model step remains for repair, the
 session fails with `session.failed`.
 
 When `strategy="native"` is present, Cayu requires a provider that explicitly
-supports native structured output. OpenAI maps the spec to the Responses API
+supports native structured output (`ModelProvider.supports_native_structured_output`).
+A run, resume, or pause continuation whose resolved provider lacks it raises
+`NativeStructuredOutputUnsupported` before any session is created or its status
+transitioned, so the caller can retry with `strategy="tool"` or re-route —
+model-pattern provider routing means a model name alone can select the
+provider. OpenAI maps the spec to the Responses API
 `text.format` JSON-schema request shape. In native mode, Cayu does not inject the
 runtime final-output tool; it validates the final assistant text as JSON against
 the same schema before emitting `structured_output.validated`. Runtime

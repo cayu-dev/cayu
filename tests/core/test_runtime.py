@@ -92,6 +92,7 @@ from cayu.runtime import (
     MessageWindowContextPolicy,
     ModelCompactor,
     ModelPricing,
+    NativeStructuredOutputUnsupported,
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
     PricingCatalog,
@@ -129,6 +130,7 @@ from cayu.runtime import (
     trim_context_turns,
 )
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime.app import _require_native_structured_output_support
 from cayu.runtime.context import (
     ContextBuildResult,
     RuntimeManagedContextPolicy,
@@ -21298,6 +21300,17 @@ def test_cayu_app_redacts_native_structured_output_repair_prompt_errors():
     assert secret_value not in str(provider.requests[1].messages[-1].model_dump(mode="json"))
 
 
+def _native_answer_spec() -> StructuredOutputSpec:
+    return StructuredOutputSpec(
+        json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+        strategy="native",
+    )
+
+
 def test_cayu_app_rejects_native_structured_output_for_unsupported_provider():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -21310,37 +21323,231 @@ def test_cayu_app_rejects_native_structured_output_for_unsupported_provider():
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    events = asyncio.run(
+    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake") as excinfo:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_structured_output_native_unsupported",
+                    messages=[Message.text("user", "answer with structured output")],
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    # Still a ValueError, so existing handlers (server 4xx mapping) keep working.
+    assert isinstance(excinfo.value, ValueError)
+    # Preflight contract: no session persisted, no model request made.
+    assert asyncio.run(store.load("sess_structured_output_native_unsupported")) is None
+    assert provider.requests == []
+
+
+def test_cayu_app_rejects_native_structured_output_on_model_routed_provider():
+    # Model-pattern routing can select a non-native provider purely by model
+    # name, even when the default provider WOULD support native mode.
+    class NativeDefaultProvider(NativeStructuredOutputFakeProvider):
+        name = "native-default"
+
+    store = InMemorySessionStore()
+    routed = FakeProvider(
+        [
+            ModelStreamEvent.text_delta('{"answer":"ok"}'),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(NativeDefaultProvider([]), default=True)
+    app.register_provider(routed, model_patterns=["fake-*"])
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_structured_output_native_routed",
+                    messages=[Message.text("user", "answer with structured output")],
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    assert asyncio.run(store.load("sess_structured_output_native_routed")) is None
+    assert routed.requests == []
+
+
+def test_cayu_app_resume_rejects_native_structured_output_for_unsupported_provider():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    asyncio.run(
         collect_events(
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_structured_output_native_unsupported",
-                messages=[Message.text("user", "answer with structured output")],
-                structured_output=StructuredOutputSpec(
-                    json_schema={
-                        "type": "object",
-                        "properties": {"answer": {"type": "string"}},
-                        "required": ["answer"],
-                    },
-                    strategy="native",
-                ),
+                session_id="sess_native_resume",
+                messages=[Message.text("user", "go")],
             ),
         )
     )
-    session = asyncio.run(store.load("sess_structured_output_native_unsupported"))
 
-    assert [event.type for event in events] == [
-        EventType.SESSION_STARTED,
-        EventType.TURN_COMPLETED,
-        EventType.SESSION_FAILED,
-    ]
-    assert events[-1].payload["error"] == (
-        "Native structured output is not supported by provider: fake"
-    )
+    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+        asyncio.run(
+            collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="sess_native_resume",
+                    messages=[Message.text("user", "again")],
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    # Checked before the status transition: the session stays resumable.
+    session = asyncio.run(store.load("sess_native_resume"))
     assert session is not None
-    assert session.status == SessionStatus.FAILED
-    assert provider.requests == []
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_cayu_app_rejects_native_structured_output_on_tool_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_native_tool_approval",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    # The paused run had no spec, so the resolver's NATIVE spec would be
+    # adopted — and must be rejected before the status transition.
+    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_native_tool_approval",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load("sess_native_tool_approval"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_rejects_native_structured_output_on_tool_approval_recovery():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_native_approval_recovery",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    with pytest.raises(NativeStructuredOutputUnsupported, match="provider: fake"):
+        asyncio.run(
+            collect_tool_approval_recovery_events(
+                app,
+                ToolApprovalRecoveryRequest(
+                    session_id="sess_native_approval_recovery",
+                    approval_id=approval_id,
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="side effect completed externally",
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load("sess_native_approval_recovery"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_require_native_structured_output_support_helper():
+    app = CayuApp(session_store=InMemorySessionStore())
+    app.register_provider(FakeProvider([]), default=True)
+    registered_provider = app._get_registered_provider("fake")
+
+    # No spec and TOOL specs pass; only NATIVE on a non-native provider raises.
+    _require_native_structured_output_support(None, registered_provider=registered_provider)
+    _require_native_structured_output_support(
+        StructuredOutputSpec(json_schema={"type": "object"}),
+        registered_provider=registered_provider,
+    )
+    with pytest.raises(NativeStructuredOutputUnsupported):
+        _require_native_structured_output_support(
+            _native_answer_spec(), registered_provider=registered_provider
+        )
 
 
 def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
@@ -21619,14 +21826,7 @@ def test_cayu_app_validates_native_structured_output_only_after_tool_round_finis
                 agent_name="assistant",
                 session_id="sess_native_structured_output_after_tool",
                 messages=[Message.text("user", "use tool then answer with json")],
-                structured_output=StructuredOutputSpec(
-                    json_schema={
-                        "type": "object",
-                        "properties": {"answer": {"type": "string"}},
-                        "required": ["answer"],
-                    },
-                    strategy="native",
-                ),
+                structured_output=_native_answer_spec(),
             ),
         )
     )

@@ -30,6 +30,7 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "ModelProvider",
     "ModelRequest",
     "ModelStreamEvent",
+    "NativeStructuredOutputUnsupported",
     "Runner",
     "Workspace",
 )

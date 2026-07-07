@@ -249,6 +249,7 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
+    NativeStructuredOutputUnsupported,
     StructuredOutputError,
     StructuredOutputSpec,
     StructuredOutputStrategy,
@@ -1795,6 +1796,10 @@ class CayuApp:
                 self._route_registered_provider_for_model(model=model)
                 or self._get_registered_provider()
             )
+        # Checked before the session is created so it surfaces to the caller.
+        _require_native_structured_output_support(
+            request.structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment(request.environment_name)
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
@@ -2667,6 +2672,10 @@ class CayuApp:
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        # Checked before the status transition so it surfaces to the caller.
+        _require_native_structured_output_support(
+            request.structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -2869,13 +2878,16 @@ class CayuApp:
         # cannot swap it (a spec matching or absent is fine; a differing one is rejected). Checked
         # before the status transition so it surfaces to the caller rather than being caught by the
         # resume's failure handler. (thinking is a safe override.)
-        _effective_user_input_structured_output(
+        effective_structured_output = _effective_user_input_structured_output(
             structured_output=response.structured_output,
             pending=pending,
         )
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -3229,7 +3241,7 @@ class CayuApp:
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != request.input_id:
             raise ValueError(f"User input id does not match pending input: {request.input_id}")
-        _effective_user_input_structured_output(
+        effective_structured_output = _effective_user_input_structured_output(
             structured_output=request.structured_output,
             pending=pending,
         )
@@ -3240,6 +3252,9 @@ class CayuApp:
         )
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -3421,13 +3436,16 @@ class CayuApp:
             raise ValueError(
                 f"Tool approval id does not match pending approval: {request.approval_id}"
             )
-        _effective_approval_structured_output(
+        effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
             pending_approval=pending_approval,
         )
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -3921,7 +3939,7 @@ class CayuApp:
             raise ValueError(
                 f"Tool approval id does not match pending approval: {request.approval_id}"
             )
-        _effective_approval_structured_output(
+        effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
             pending_approval=pending_approval,
         )
@@ -3932,6 +3950,9 @@ class CayuApp:
         )
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -4214,15 +4235,11 @@ class CayuApp:
                 tail_message_count=len(messages_to_append),
             ):
                 yield event
-            if (
-                structured_output is not None
-                and structured_output.strategy == StructuredOutputStrategy.NATIVE
-                and not getattr(provider, "supports_native_structured_output", False)
-            ):
-                raise ValueError(
-                    "Native structured output is not supported by provider: "
-                    f"{registered_provider.name}"
-                )
+            # Typed backstop: every entry point preflights this before touching
+            # persisted state; anything reaching here is a missed entrance.
+            _require_native_structured_output_support(
+                structured_output, registered_provider=registered_provider
+            )
             if task_id is not None and start_task_on_enter:
                 task = await self._start_task(
                     task_id=task_id,
@@ -9654,6 +9671,28 @@ def _effective_approval_retry_policy(
     if retry_policy is not None:
         return retry_policy
     return pending_approval.retry_policy
+
+
+def _require_native_structured_output_support(
+    structured_output: StructuredOutputSpec | None,
+    *,
+    registered_provider: runtime_records.RegisteredProvider,
+) -> None:
+    """Reject an unsupported ``strategy=NATIVE`` spec at an entry point.
+
+    Called by every entrance before it creates a session or transitions its
+    status, so the typed error reaches the caller with no persisted state
+    changed (model-pattern routing can select the provider by model name
+    alone).
+    """
+    if (
+        structured_output is not None
+        and structured_output.strategy == StructuredOutputStrategy.NATIVE
+        and not registered_provider.provider.supports_native_structured_output
+    ):
+        raise NativeStructuredOutputUnsupported(
+            f"Native structured output is not supported by provider: {registered_provider.name}"
+        )
 
 
 def _effective_approval_structured_output(

@@ -942,8 +942,35 @@ StructuredOutputSpec(
 For OpenAI, Cayu maps this to the Responses API `text.format` JSON-schema mode
 and still validates the final JSON in the runtime before emitting
 `structured_output.validated`. Providers that do not advertise native structured
-output reject `strategy="native"` before making a model request. The portable
-`tool` strategy remains the default.
+output raise `NativeStructuredOutputUnsupported` before any session is created
+or transitioned — model-pattern provider routing means a model name alone can
+select the provider, so catch it to fall back to the portable default:
+
+```python
+from cayu import NativeStructuredOutputUnsupported, StructuredOutputStrategy
+
+try:
+    async for event in app.run(request):
+        ...
+except NativeStructuredOutputUnsupported:
+    # Nothing ran: no session was created. Retry with the portable strategy
+    # (or re-route to a provider with native support).
+    request = request.model_copy(
+        update={
+            "structured_output": request.structured_output.model_copy(
+                update={"strategy": StructuredOutputStrategy.TOOL}
+            )
+        }
+    )
+    async for event in app.run(request):
+        ...
+```
+
+The portable `tool` strategy remains the default. Note that OpenAI's strict
+JSON-schema mode has requirements beyond ordinary JSON Schema — every object
+must set `additionalProperties: false` and list all properties in `required`,
+and `$ref`s must be inlined; schemas that violate these are rejected by
+OpenAI's API at request time.
 
 ## Thinking And Reasoning
 

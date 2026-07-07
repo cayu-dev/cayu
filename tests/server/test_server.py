@@ -96,6 +96,44 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["lease_expires_at"] is None
 
 
+def test_server_run_failure_before_session_does_not_strand_pending_task() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    client = TestClient(create_server(app))
+
+    # Unsupported NATIVE structured output fails before any session exists; the
+    # route-created task must end failed, not sit pending with no session.
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={
+            "prompt": "hello",
+            "structured_output": {
+                "json_schema": {"type": "object"},
+                "strategy": "native",
+            },
+        },
+    ) as response:
+        assert response.status_code == 200
+        stream_text = "\n".join(response.iter_lines())
+    assert "NativeStructuredOutputUnsupported" in stream_text
+
+    tasks = client.get("/api/tasks").json()
+    assert [task["status"] for task in tasks] == ["failed"]
+    assert tasks[0]["session_id"] is None
+
+    # The cleanup is generic: any pre-session failure (here an unregistered
+    # agent) fails its task the same way.
+    with client.stream("POST", "/api/run", json={"prompt": "x", "agent": "ghost"}) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    tasks = client.get("/api/tasks").json()
+    assert sorted(task["status"] for task in tasks) == ["failed", "failed"]
+
+
 def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     store = InMemoryKnowledgeStore(
         [

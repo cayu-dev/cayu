@@ -557,6 +557,12 @@ class ModelProvider(ABC):
     dialect regardless of their registered ``name`` should override this so
     renamed or gateway-routed deployments still fold cache tokens correctly.
     """
+    supports_native_structured_output: bool = False
+    """Whether the adapter honors ``options.structured_output`` with
+    ``strategy: "native"`` by constraining decoding provider-side (e.g. OpenAI
+    ``json_schema`` response format). The runtime rejects ``NATIVE`` specs
+    before running when the resolved provider does not set this.
+    """
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:

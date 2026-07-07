@@ -18,6 +18,18 @@ class StructuredOutputStrategy(StrEnum):
     NATIVE = "native"
 
 
+class NativeStructuredOutputUnsupported(ValueError):
+    """``strategy=NATIVE`` was requested but the resolved provider does not
+    support native structured output.
+
+    Raised before any session is created or transitioned, so the caller can
+    retry with ``strategy="tool"`` (same JSON contract, provider-neutral
+    transport) or route to a provider that sets
+    ``supports_native_structured_output``. Subclasses ``ValueError`` so
+    existing handlers (including the server's 4xx mapping) keep working.
+    """
+
+
 class StructuredOutputSpec(BaseModel):
     """Provider-neutral JSON structured output requirement."""
 

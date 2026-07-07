@@ -169,6 +169,7 @@ from cayu.runtime.stop_policy import (
     has_run_limits,
 )
 from cayu.runtime.structured_output import (
+    NativeStructuredOutputUnsupported,
     StructuredOutputError,
     StructuredOutputSpec,
     StructuredOutputStrategy,
@@ -312,6 +313,7 @@ __all__ = [
     "ModelCompactor",
     "ModelInfo",
     "ModelPricing",
+    "NativeStructuredOutputUnsupported",
     "ObservedDeltaContextEstimator",
     "ParameterConstrainedToolPolicy",
     "ParameterRule",

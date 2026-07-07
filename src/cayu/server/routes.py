@@ -129,6 +129,34 @@ _REPLAY_POLL_INTERVAL_S = 0.05
 _detached_event_pumps: set[asyncio.Task[None]] = set()
 
 
+async def _fail_task_on_prestream_error(
+    event_stream: AsyncIterator[Event],
+    *,
+    task_store: Any,
+    task_id: str,
+) -> AsyncIterator[Event]:
+    """Fail the route-created task when the run dies before its first event.
+
+    A pre-session failure (request validation, unknown agent, unsupported
+    native structured output) would otherwise strand the task as ``pending``
+    with no session ever attached. Once a first event exists, the session owns
+    the task lifecycle and failures are recorded through it.
+    """
+    emitted = False
+    try:
+        async for event in event_stream:
+            emitted = True
+            yield event
+    except BaseException as exc:
+        if not emitted:
+            with contextlib.suppress(Exception):
+                await task_store.fail_task(
+                    task_id,
+                    {"error": str(exc), "error_type": type(exc).__name__},
+                )
+        raise
+
+
 def _detached_event_stream_response(event_stream: AsyncIterator[Event]) -> EventSourceResponse:
     """Run ``event_stream`` to completion in a detached task; stream it as an observer.
 
@@ -880,7 +908,12 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.run(request))
+        event_stream: AsyncIterator[Event] = cayu_app.run(request)
+        if task_id is not None:
+            event_stream = _fail_task_on_prestream_error(
+                event_stream, task_store=task_store, task_id=task_id
+            )
+        return _detached_event_stream_response(event_stream)
 
     @router.post(
         "/resume",

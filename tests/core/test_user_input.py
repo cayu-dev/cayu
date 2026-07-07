@@ -20,10 +20,12 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    NativeStructuredOutputUnsupported,
     ResumeRequest,
     RunRequest,
     SessionStatus,
     StructuredOutputSpec,
+    StructuredOutputStrategy,
     ToolApprovalRecoveryOutcome,
     ToolPolicy,
     ToolPolicyDecision,
@@ -522,6 +524,47 @@ def test_resolve_user_input_rejects_structured_output_swap() -> None:
         )
 
 
+def test_resolve_user_input_rejects_native_structured_output_for_unsupported_provider() -> None:
+    # The paused run had no spec, so the resolver's NATIVE spec would be adopted —
+    # and must be rejected before the status transition (the fake provider does
+    # not support native structured output), leaving the pause resolvable.
+    app, store = _build([("call_1", "ask_user", {"question": "q"})])
+    pause = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_native",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
+        "input_id"
+    ]
+
+    with pytest.raises(NativeStructuredOutputUnsupported):
+        asyncio.run(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id="s_native",
+                        input_id=input_id,
+                        answer="a",
+                        structured_output=StructuredOutputSpec(
+                            json_schema={"type": "object"},
+                            strategy=StructuredOutputStrategy.NATIVE,
+                        ),
+                    )
+                )
+            )
+        )
+
+    session = asyncio.run(store.load("s_native"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
 def test_fork_of_paused_session_is_rejected() -> None:
     app, _store = _build([("call_1", "ask_user", {"question": "q"})])
     asyncio.run(
@@ -684,6 +727,83 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
     assert counting.calls == 0  # guard fired before execution — no double-run
     reloaded = asyncio.run(store.load("s_crash"))
     assert reloaded is not None and reloaded.status == SessionStatus.INTERRUPTED
+
+
+def test_recover_user_input_rejects_native_structured_output_for_unsupported_provider() -> None:
+    # The manual-recovery entrance must apply the same pre-transition gate as the
+    # other five: an unsupported NATIVE spec raises before the session leaves
+    # INTERRUPTED, instead of resuming and failing mid-run via the backstop.
+    store = InMemorySessionStore()
+    counting = _CountingTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(
+        _ScriptedProvider(
+            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+            final_text="all done",
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool(), counting],
+    )
+    pause = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_rec_native",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
+        "input_id"
+    ]
+    asyncio.run(
+        store.append_event(
+            "s_rec_native",
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="s_rec_native",
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+    )
+    stuck = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id="s_rec_native", input_id=input_id, answer="a")
+            )
+        )
+    )
+    assert stuck[-1].payload.get("manual_recovery_required") is True
+
+    with pytest.raises(NativeStructuredOutputUnsupported):
+        asyncio.run(
+            _drain(
+                app.recover_user_input(
+                    UserInputRecoveryRequest(
+                        session_id="s_rec_native",
+                        input_id=input_id,
+                        answer="a",
+                        tool_call_id="call_1",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="recovered externally",
+                        structured_output=StructuredOutputSpec(
+                            json_schema={"type": "object"},
+                            strategy=StructuredOutputStrategy.NATIVE,
+                        ),
+                    )
+                )
+            )
+        )
+
+    session = asyncio.run(store.load("s_rec_native"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
 
 
 def test_recover_user_input_supplies_outcome_and_completes() -> None:

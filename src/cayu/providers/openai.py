@@ -1225,6 +1225,11 @@ def _openai_structured_output_format(options: Mapping[str, Any]) -> dict[str, An
     name = raw.get("name") or "structured_output"
     if not isinstance(name, str):
         raise ValueError("Native structured output name must be a string.")
+    # The schema is forwarded verbatim on purpose: strict mode's rule set
+    # (all-fields-required, additionalProperties: false, inlined $refs, ...)
+    # is OpenAI-defined and drifts, and rewriting the schema here would make
+    # the provider enforce a different contract than the runtime validates
+    # the final JSON against. Violations surface as an OpenAI-side 400.
     return {
         "type": "json_schema",
         "name": require_clean_nonblank(name, "structured_output.name"),
