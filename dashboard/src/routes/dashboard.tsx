@@ -51,10 +51,12 @@ export function DashboardPage() {
   const summary = useQuery({
     queryKey: ["sessions-summary", "dashboard"],
     queryFn: () => fetchSessionsSummary({ limit: 25, order_by: "updated_at_desc" }),
+    refetchInterval: 5000,
   })
   const tasks = useQuery({
     queryKey: ["tasks", "dashboard"],
     queryFn: () => fetchTasks({ limit: 25 }),
+    refetchInterval: 5000,
   })
 
   const sessionItems = summary.data?.sessions || []

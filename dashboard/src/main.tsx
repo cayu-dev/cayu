@@ -11,9 +11,7 @@ import { RunPage } from "./routes/run"
 import { SessionDetailPage } from "./routes/session-detail"
 import { SessionsPage } from "./routes/sessions"
 
-const queryClient = new QueryClient({
-  defaultOptions: { queries: { refetchInterval: 5000 } },
-})
+const queryClient = new QueryClient()
 
 const rootRoute = createRootRoute({ component: Layout })
 

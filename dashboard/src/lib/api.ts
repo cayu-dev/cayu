@@ -13,6 +13,7 @@ import type {
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
+  ListPendingKnowledgeApiKnowledgePendingGetData,
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
   ListTasksApiTasksGetData,
@@ -55,6 +56,9 @@ export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
 export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
 export type KnowledgeChunk = ApiKnowledgeChunk
 export type KnowledgePendingPage = PendingKnowledgeListResponse
+export type KnowledgePendingQuery = NonNullable<
+  ListPendingKnowledgeApiKnowledgePendingGetData["query"]
+>
 export type SSEEvent = SseEventEnvelope
 
 type ErrorEnvelope = {
@@ -190,8 +194,10 @@ export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
   return tasks as Task[]
 }
 
-export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
-  const page = await requestJson<unknown>("/knowledge/pending")
+export async function fetchPendingKnowledge(
+  query: KnowledgePendingQuery = {},
+): Promise<KnowledgePendingPage> {
+  const page = await requestJson<unknown>(`/knowledge/pending${queryString(query)}`)
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.entries)) {
     throw new Error("Unexpected /knowledge/pending response.")
