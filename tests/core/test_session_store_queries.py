@@ -16,10 +16,11 @@ from cayu import (
     SQLiteSessionStore,
     TranscriptQuery,
 )
-from cayu.core import Event, EventType, Message
+from cayu.core import Event, EventType, Message, ThinkingPart, ToolCallPart
 from cayu.runtime import (
     InMemorySessionStore,
     RunRequest,
+    Session,
     SessionIdentity,
     SessionStatus,
     SessionStore,
@@ -1596,6 +1597,179 @@ def test_in_memory_store_event_indexes_stay_consistent_across_delete() -> None:
         )
         assert [record.event.id for record in remaining_merged] == ["b_model"]
         assert await store.query_events(EventQuery(session_id="sess_a")) == []
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_store_transcripts_do_not_alias_caller_messages(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_isolation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+
+        appended = Message.tool_call(
+            tool_call_id="call_1",
+            tool_name="echo",
+            arguments={"nested": {"value": "original"}},
+        )
+        await store.append_transcript_messages(session.id, [appended])
+
+        # Producer-side: mutating the appended message afterwards must not
+        # rewrite stored history.
+        appended_call = appended.content[0]
+        assert isinstance(appended_call, ToolCallPart)
+        appended_call.arguments["nested"]["value"] = "producer-mutated"
+        loaded = await store.load_transcript(session.id)
+        call = loaded[-1].content[0]
+        assert isinstance(call, ToolCallPart)
+        assert call.arguments == {"nested": {"value": "original"}}
+
+        # Consumer-side: mutating a loaded message must not corrupt the store.
+        call.arguments["nested"]["value"] = "consumer-mutated"
+        reloaded = await store.load_transcript(session.id)
+        call = reloaded[-1].content[0]
+        assert isinstance(call, ToolCallPart)
+        assert call.arguments == {"nested": {"value": "original"}}
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_query_transcript_records_do_not_alias_stored_messages(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_query_isolation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_transcript_messages(
+            session.id,
+            [
+                Message(
+                    role="assistant",
+                    content=(
+                        ThinkingPart(
+                            text="reason",
+                            provider_state={"nested": {"value": "original"}},
+                        ),
+                        ToolCallPart(
+                            tool_call_id="call_1",
+                            tool_name="echo",
+                            arguments={"nested": {"value": "original"}},
+                        ),
+                    ),
+                )
+            ],
+        )
+
+        page = await store.query_transcript(
+            TranscriptQuery(session_id=session.id, include_thinking=True)
+        )
+        thinking = page.records[-1].message.content[0]
+        assert isinstance(thinking, ThinkingPart)
+        assert thinking.provider_state is not None
+        thinking.provider_state["nested"]["value"] = "mutated"
+
+        repage = await store.query_transcript(
+            TranscriptQuery(session_id=session.id, include_thinking=True)
+        )
+        thinking = repage.records[-1].message.content[0]
+        assert isinstance(thinking, ThinkingPart)
+        assert thinking.provider_state == {"nested": {"value": "original"}}
+
+        # The thinking-stripped path isolates via the filter's rebuild — a
+        # surviving tool-call payload must not alias stored state either.
+        stripped = await store.query_transcript(
+            TranscriptQuery(session_id=session.id, include_thinking=False)
+        )
+        call = stripped.records[-1].message.content[0]
+        assert isinstance(call, ToolCallPart)
+        call.arguments["nested"]["value"] = "mutated"
+
+        restripped = await store.query_transcript(
+            TranscriptQuery(session_id=session.id, include_thinking=False)
+        )
+        call = restripped.records[-1].message.content[0]
+        assert isinstance(call, ToolCallPart)
+        assert call.arguments == {"nested": {"value": "original"}}
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_fork_transcripts_do_not_alias_source_transcripts(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_fork_isolation_source",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_transcript_messages(
+            source.id,
+            [
+                Message.tool_call(
+                    tool_call_id="call_1",
+                    tool_name="echo",
+                    arguments={"nested": {"value": "original"}},
+                )
+            ],
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+
+        fork = await store.create_fork(
+            source_session_id=source.id,
+            fork=Session(
+                id="sess_fork_isolation_child",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                parent_session_id=source.id,
+                status=SessionStatus.COMPLETED,
+            ),
+            source_statuses={SessionStatus.COMPLETED},
+            transcript_cursor=None,
+            checkpoint_transform=None,
+        )
+
+        fork_transcript = await store.load_transcript(fork.id)
+        call = fork_transcript[-1].content[0]
+        assert isinstance(call, ToolCallPart)
+        call.arguments["nested"]["value"] = "mutated-via-fork"
+
+        source_transcript = await store.load_transcript(source.id)
+        call = source_transcript[-1].content[0]
+        assert isinstance(call, ToolCallPart)
+        assert call.arguments == {"nested": {"value": "original"}}
         await _close_store(store)
 
     asyncio.run(run())

@@ -24,7 +24,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
-from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message
+from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -825,7 +825,10 @@ def filter_transcript_records(
     """Apply a `TranscriptQuery.include_thinking` filter to a page of records.
 
     When ``include_thinking`` is False, ThinkingParts are stripped from each message and
-    records whose message is left empty (a thinking-only turn) are dropped.
+    records whose message is left empty (a thinking-only turn) are dropped. Every
+    surviving message on that path is freshly rebuilt through full validation, so it
+    shares no payload state with the input records; when True, records pass through
+    unchanged and the caller is responsible for any isolation.
     """
     if include_thinking:
         return records
@@ -955,7 +958,13 @@ class SessionStore(ABC):
         session_id: str,
         messages: list[Message],
     ) -> None:
-        """Append provider-neutral transcript messages to a session."""
+        """Append provider-neutral transcript messages to a session.
+
+        Stored state must not alias caller-passed messages: implementations
+        must detach nested JSON payloads (serialize, or use
+        `cayu.core.messages.detach_message`) so a producer mutating a message
+        after append cannot rewrite history.
+        """
 
     @abstractmethod
     async def append_transcript_messages_and_checkpoint(
@@ -964,15 +973,25 @@ class SessionStore(ABC):
         messages: list[Message],
         checkpoint: dict[str, Any],
     ) -> None:
-        """Append transcript messages and persist a checkpoint atomically."""
+        """Append transcript messages and persist a checkpoint atomically.
+
+        Same isolation contract as `append_transcript_messages`.
+        """
 
     @abstractmethod
     async def load_transcript(self, session_id: str) -> list[Message]:
-        """Load provider-neutral transcript messages for a session."""
+        """Load provider-neutral transcript messages for a session.
+
+        Returned messages must not alias stored state: callers own the result
+        and may mutate nested payloads without corrupting the transcript.
+        """
 
     @abstractmethod
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
-        """Query provider-neutral transcript messages with stable message indexes."""
+        """Query provider-neutral transcript messages with stable message indexes.
+
+        Same isolation contract as `load_transcript`.
+        """
 
     @abstractmethod
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
@@ -1084,6 +1103,9 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError(f"Session already exists: {fork.id}")
 
             source_transcript = self._transcripts.get(source_session_id, [])
+            # Fork and source transcripts may share message objects: internal
+            # transcript lists never escape except through the detaching
+            # load/append/query boundaries, so the cheap share stays invisible.
             if transcript_cursor is None:
                 copied_transcript = [copy_message(message) for message in source_transcript]
             else:
@@ -1429,7 +1451,7 @@ class InMemorySessionStore(SessionStore):
         messages: list[Message],
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        copied_messages = copy_transcript_messages(messages)
+        copied_messages = _detach_transcript_messages(messages)
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
@@ -1444,7 +1466,7 @@ class InMemorySessionStore(SessionStore):
         checkpoint: dict[str, Any],
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        copied_messages = copy_transcript_messages(messages)
+        copied_messages = _detach_transcript_messages(messages)
         if not isinstance(checkpoint, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
@@ -1460,7 +1482,7 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
-            return [copy_message(message) for message in self._transcripts.get(session_id, [])]
+            return [detach_message(message) for message in self._transcripts.get(session_id, [])]
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
@@ -1477,7 +1499,15 @@ class InMemorySessionStore(SessionStore):
                 ]
 
             page = indexed_messages[query.offset : query.offset + query.limit]
-            records = [TranscriptRecord(index=index, message=message) for index, message in page]
+            # Per filter_transcript_records' contract, the include_thinking=False
+            # path already isolates — detach only pass-through records.
+            records = [
+                TranscriptRecord(
+                    index=index,
+                    message=detach_message(message) if query.include_thinking else message,
+                )
+                for index, message in page
+            ]
             return TranscriptPage(
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=len(indexed_messages),
@@ -1710,6 +1740,12 @@ def copy_transcript_messages(messages: list[Message]) -> list[Message]:
     if type(messages) is not list:
         raise TypeError("Transcript messages must be a list.")
     return [copy_message(message) for message in messages]
+
+
+def _detach_transcript_messages(messages: list[Message]) -> list[Message]:
+    if type(messages) is not list:
+        raise TypeError("Transcript messages must be a list.")
+    return [detach_message(message) for message in messages]
 
 
 def copy_run_request(request: RunRequest) -> RunRequest:

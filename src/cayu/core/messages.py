@@ -35,9 +35,6 @@ class TextPart(BaseModel):
     def validate_text(cls, value: str) -> str:
         return _require_nonblank("text", value)
 
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> TextPart:
-        return self
-
 
 class ToolCallPart(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -56,9 +53,6 @@ class ToolCallPart(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ToolCallPart:
-        return self
 
 
 class ToolResultPart(BaseModel):
@@ -82,9 +76,6 @@ class ToolResultPart(BaseModel):
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
 
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ToolResultPart:
-        return self
-
 
 class ProviderStatePart(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -102,9 +93,6 @@ class ProviderStatePart(BaseModel):
     @classmethod
     def copy_state(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "state")
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ProviderStatePart:
-        return self
 
 
 class ThinkingPart(BaseModel):
@@ -126,9 +114,6 @@ class ThinkingPart(BaseModel):
     @classmethod
     def copy_provider_state(cls, value):
         return copy_json_value(value, "provider_state")
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ThinkingPart:
-        return self
 
 
 class FilePart(BaseModel):
@@ -152,9 +137,6 @@ class FilePart(BaseModel):
         if type(copied) is not dict:
             raise ValueError("`attachment` must be a file attachment object.")
         return FileAttachment.model_validate(copied).model_dump(mode="json")
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> FilePart:
-        return self
 
 
 class _ValidatedContent(
@@ -180,9 +162,12 @@ class Message(BaseModel):
 
     Messages and their parts are immutable once constructed: attribute
     assignment is rejected, `content` is a tuple, and every part entering the
-    message is copied so the message exclusively owns its JSON payloads. This
-    makes construction the single copy-at-trust-boundary; sharing a stored
-    `Message` afterwards is safe, and hot-path "copies" are no-ops.
+    message is copied so the message exclusively owns its JSON payloads. The
+    freeze is shallow, though — nested payload dicts stay mutable — so sharing
+    a validated instance is safe only while every holder treats payloads as
+    read-only. Hot-path `copy_message` "copies" are no-ops under that
+    contract; `detach_message` produces a genuinely isolated copy for
+    storage/trust boundaries, and `copy.deepcopy` isolates as well.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -197,9 +182,6 @@ class Message(BaseModel):
     @classmethod
     def copy_content(cls, value):
         return _ValidatedContent(copy_message_part(part) for part in value)
-
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Message:
-        return self
 
     @model_validator(mode="after")
     def validate_role_content(self) -> Message:
@@ -345,21 +327,36 @@ _MESSAGE_PART_TYPES = (
 )
 
 
+def detach_message(message: Message) -> Message:
+    """Return an isolated copy of `message` with detached JSON payloads.
+
+    Unlike `copy_message`, this always rebuilds through full validation, so
+    the result shares no mutable state (`arguments`, `structured`,
+    `artifacts`, `state`, `provider_state`, `attachment`) with the input.
+    Boundary primitive for code that hands messages across an ownership
+    boundary — e.g. an in-memory store returning or ingesting transcripts.
+    """
+    if type(message) is not Message:
+        raise TypeError("Messages must be Message instances.")
+    return Message(role=message.role, content=message.content)
+
+
 def copy_message(message: Message) -> Message:
     """Validate `message` and return it unchanged.
 
     `Message` is frozen and copied every part (with its JSON payloads) at
-    construction, so a validated instance can be shared safely: this "copy" is
-    a no-op. Copying happens once, at the construction trust boundary —
-    callers must treat nested payload dicts on returned messages as read-only.
-    Instances that bypassed validation (`model_construct`) are rebuilt through
-    full validation instead.
+    construction, so a validated instance can be shared on hot paths: this
+    "copy" is a no-op. It does NOT isolate nested payload dicts — every holder
+    must treat them as read-only. Use `detach_message` where isolation is
+    required (storage and other trust boundaries). Instances that bypassed
+    validation (`model_construct`) are rebuilt through full validation
+    instead.
     """
     if type(message) is not Message:
         raise TypeError("Messages must be Message instances.")
     if type(message.content) is _ValidatedContent:
         return message
-    return Message(role=message.role, content=message.content)
+    return detach_message(message)
 
 
 def copy_message_part(
