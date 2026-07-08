@@ -22,6 +22,9 @@ import type {
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
   SseErrorEnvelope,
   SseEventEnvelope,
+  ToolApprovalBody,
+  ToolApprovalDecision,
+  UserInputResolveBody,
 } from "./generated/server-api"
 
 export const SUPPORTED_SERVER_CONTRACT_VERSION = "1"
@@ -52,6 +55,7 @@ export type SessionsSummaryQuery = NonNullable<
 export type SessionsPage = ListSessionsApiSessionsGetResponse
 export type Task = ApiTaskListItem
 export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
+export type ApprovalDecision = ToolApprovalDecision
 export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
 export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
 export type KnowledgeChunk = ApiKnowledgeChunk
@@ -227,35 +231,7 @@ export async function streamRun(
   onDone: () => void,
   onError: (message: string) => void,
 ) {
-  const { fetchEventSource } = await import("@microsoft/fetch-event-source")
-  try {
-    await fetchEventSource(apiUrl("/run"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify({ prompt }),
-      async onopen(response) {
-        if (!response.ok) {
-          await throwResponseError(response)
-        }
-      },
-      onmessage(msg) {
-        if (!msg.data) return
-        if (msg.event === "error") {
-          const error = parseSseError(msg.data)
-          throw new Error(error.error)
-        }
-        onEvent(parseSseEvent(msg.data))
-      },
-      onerror(error) {
-        throw error
-      },
-    })
-  } catch (error) {
-    onError(error instanceof Error ? error.message : String(error))
-  } finally {
-    onDone()
-  }
+  await streamJsonPost("/run", { prompt }, onEvent, onDone, onError)
 }
 
 export async function streamResume(
@@ -265,13 +241,41 @@ export async function streamResume(
   onDone: () => void,
   onError: (message: string) => void,
 ) {
+  await streamJsonPost("/resume", { session_id: sessionId, prompt }, onEvent, onDone, onError)
+}
+
+export async function streamResolveToolApproval(
+  body: ToolApprovalBody,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
+  await streamJsonPost("/tool-approvals/resolve", body, onEvent, onDone, onError)
+}
+
+export async function streamResolveUserInput(
+  body: UserInputResolveBody,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
+  await streamJsonPost("/user-input/resolve", body, onEvent, onDone, onError)
+}
+
+async function streamJsonPost(
+  path: string,
+  body: Record<string, unknown>,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
   const { fetchEventSource } = await import("@microsoft/fetch-event-source")
   try {
-    await fetchEventSource(apiUrl("/resume"), {
+    await fetchEventSource(apiUrl(path), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ session_id: sessionId, prompt }),
+      body: JSON.stringify(body),
       async onopen(response) {
         if (!response.ok) {
           await throwResponseError(response)

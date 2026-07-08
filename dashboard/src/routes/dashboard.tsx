@@ -47,6 +47,21 @@ function latestEventLabel(value: unknown) {
   return "no events"
 }
 
+function attentionSessionLabel(item: { session: Session; events: { latest_event: unknown } }) {
+  const latest = item.events.latest_event
+  if (latest && typeof latest === "object" && "payload" in latest) {
+    const payload = (latest as { payload?: unknown }).payload
+    if (payload && typeof payload === "object" && "interruption_type" in payload) {
+      const interruptionType = (payload as { interruption_type?: unknown }).interruption_type
+      if (interruptionType === "tool_approval_required") return "Awaiting approval"
+      if (interruptionType === "user_input_required") return "Awaiting user input"
+    }
+  }
+  if (item.session.status === "failed") return "Failed session"
+  if (item.session.status === "interrupted") return "Interrupted session"
+  return item.session.status
+}
+
 export function DashboardPage() {
   const summary = useQuery({
     queryKey: ["sessions-summary", "dashboard"],
@@ -69,7 +84,8 @@ export function DashboardPage() {
   const completed = list.filter((s) => s.status === "completed").length
   const failed = list.filter((s) => s.status === "failed").length
   const attentionTasks = taskList.filter(needsAttentionTask)
-  const attentionSessions = list.filter(needsAttentionSession)
+  const attentionSessionItems = sessionItems.filter(({ session }) => needsAttentionSession(session))
+  const attentionSessions = attentionSessionItems.map((item) => item.session)
   const usage = summary.data?.usage.usage
   const totalTokens = numericValue(usage?.total_tokens)
 
@@ -174,23 +190,24 @@ export function DashboardPage() {
             </StateMessage>
           ) : (
             <div className="space-y-2">
-              {attentionSessions.slice(0, 4).map((s) => (
+              {attentionSessionItems.slice(0, 4).map((item) => (
                 <Link
-                  key={s.id}
+                  key={item.session.id}
                   to="/sessions/$sessionId"
-                  params={{ sessionId: s.id }}
+                  params={{ sessionId: item.session.id }}
                   className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 truncate text-sm font-medium">
                       <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
-                      <span className="truncate">{s.id}</span>
+                      <span className="truncate">{item.session.id}</span>
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {formatDateTime(s.updated_at || s.created_at)}
+                      {attentionSessionLabel(item)} ·{" "}
+                      {formatDateTime(item.session.updated_at || item.session.created_at)}
                     </div>
                   </div>
-                  <StatusBadge status={s.status} />
+                  <StatusBadge status={item.session.status} />
                 </Link>
               ))}
               {attentionTasks.slice(0, 6).map((t) => (

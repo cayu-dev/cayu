@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router"
-import { AlertCircle, Bot, CheckCircle, Play, Wrench } from "lucide-react"
+import { AlertCircle, Bot, CheckCircle, Play, ShieldCheck, UserRound, Wrench } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { DataCard, Page, PageHeader } from "../components/dashboard/layout"
 import { Button } from "../components/ui/button"
@@ -12,6 +12,8 @@ function LiveEvent({ event }: { event: SSEEvent }) {
     "tool.call.started": <Wrench className="h-3.5 w-3.5 text-primary" />,
     "tool.call.completed": <CheckCircle className="h-3.5 w-3.5 text-chart-2" />,
     "tool.call.failed": <AlertCircle className="h-3.5 w-3.5 text-destructive" />,
+    "tool.call.approval_requested": <ShieldCheck className="h-3.5 w-3.5 text-chart-1" />,
+    "session.awaiting_user_input": <UserRound className="h-3.5 w-3.5 text-chart-3" />,
     "model.started": <Bot className="h-3.5 w-3.5 text-chart-1" />,
     "model.completed": <Bot className="h-3.5 w-3.5 text-chart-1" />,
   }
@@ -28,6 +30,27 @@ function LiveEvent({ event }: { event: SSEEvent }) {
   }
   if (event.type === "session.completed") text = "Session completed"
   if (event.type === "session.failed") text = `Session failed: ${event.payload.error || "unknown"}`
+  if (event.type === "tool.call.approval_requested") {
+    const approval = event.payload.approval
+    const payloadToolName =
+      approval && typeof approval === "object" && "tool_name" in approval
+        ? String((approval as { tool_name?: unknown }).tool_name || "")
+        : ""
+    const toolName = payloadToolName || event.tool_name || "tool"
+    text = `Approval requested: ${toolName}`
+  }
+  if (event.type === "session.awaiting_user_input") {
+    const question =
+      typeof event.payload.question === "string" ? event.payload.question : "Input required"
+    text = `Awaiting user input: ${question}`
+  }
+  if (event.type === "session.interrupted") {
+    const interruptionType =
+      typeof event.payload.interruption_type === "string" ? event.payload.interruption_type : null
+    if (interruptionType === "tool_approval_required") text = "Session paused for approval"
+    else if (interruptionType === "user_input_required") text = "Session paused for user input"
+    else text = "Session interrupted"
+  }
   if (event.type === "task.started") text = "Task started"
   if (event.type === "task.completed") text = "Task completed"
 
@@ -37,6 +60,27 @@ function LiveEvent({ event }: { event: SSEEvent }) {
       <span className="text-sm text-muted-foreground">{text}</span>
     </div>
   )
+}
+
+function runAttention(events: SSEEvent[]) {
+  for (const event of [...events].reverse()) {
+    if (
+      event.type === "session.resumed" ||
+      event.type === "session.completed" ||
+      event.type === "session.failed"
+    ) {
+      return null
+    }
+    if (event.type === "session.interrupted") {
+      if (event.payload.interruption_type === "tool_approval_required") {
+        return "This run is paused for tool approval. Open the session to approve or deny it."
+      }
+      if (event.payload.interruption_type === "user_input_required") {
+        return "This run is paused for user input. Open the session to answer the question."
+      }
+    }
+  }
+  return null
 }
 
 export function RunPage() {
@@ -83,6 +127,7 @@ export function RunPage() {
   }
 
   const lastSessionId = events.at(-1)?.session_id ?? null
+  const attentionMessage = runAttention(events)
 
   return (
     <Page>
@@ -128,6 +173,26 @@ export function RunPage() {
             }
           >
             <div className="h-full overflow-auto px-4 py-2">
+              {attentionMessage && (
+                <div className="my-2 rounded-md border border-chart-1/30 bg-chart-1/5 p-3 text-sm">
+                  <div className="font-medium">{attentionMessage}</div>
+                  {lastSessionId && (
+                    <Button
+                      variant="link"
+                      size="sm"
+                      className="mt-1 h-auto p-0"
+                      onClick={() =>
+                        navigate({
+                          to: "/sessions/$sessionId",
+                          params: { sessionId: lastSessionId },
+                        })
+                      }
+                    >
+                      Resolve in session detail →
+                    </Button>
+                  )}
+                </div>
+              )}
               {events
                 .filter((e) => e.type !== "model.text.delta")
                 .map((e) => (
