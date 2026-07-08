@@ -1,9 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Check, X } from "lucide-react"
 import { type ReactNode, useEffect, useState } from "react"
+import {
+  DataCard,
+  Page,
+  PageHeader,
+  PayloadViewer,
+  StateMessage,
+} from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
-import { Card, CardContent } from "../components/ui/card"
 import {
   Table,
   TableBody,
@@ -91,11 +97,7 @@ function MetadataBlock({ metadata }: { metadata: Record<string, unknown> }) {
   if (Object.keys(metadata).length === 0) {
     return <span className="text-muted-foreground">-</span>
   }
-  return (
-    <pre className="max-h-56 overflow-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
-      {JSON.stringify(metadata, null, 2)}
-    </pre>
-  )
+  return <PayloadViewer value={metadata} maxHeight="max-h-56" />
 }
 
 function DetailRow({ label, value }: { label: string; value: ReactNode }) {
@@ -123,13 +125,17 @@ function KnowledgeDetail({
   onReject: (entryId: string) => void
 }) {
   if (isLoading) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading...</div>
+    return <StateMessage className="py-10">Loading...</StateMessage>
   }
   if (error !== null) {
-    return <div className="p-6 text-sm text-destructive">{error}</div>
+    return (
+      <StateMessage tone="danger" className="py-10">
+        {error}
+      </StateMessage>
+    )
   }
   if (entry === null) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a pending entry</div>
+    return <StateMessage className="py-10">Select a pending entry</StateMessage>
   }
   return (
     <div className="space-y-5 p-6">
@@ -248,111 +254,103 @@ export function KnowledgePage() {
   const mutating = approve.isPending || reject.isPending
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Knowledge Review</h1>
-          <p className="text-sm text-muted-foreground">
-            {pending.data?.total_entries_known ?? 0} pending entries
-          </p>
-        </div>
-      </div>
+    <Page>
+      <PageHeader
+        title="Knowledge Review"
+        description={`${pending.data?.total_entries_known ?? 0} pending entries`}
+      />
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_28rem]">
-        <Card>
-          <CardContent className="p-0">
-            <Table>
-              <TableHeader>
+        <DataCard>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Entry</TableHead>
+                <TableHead>Kind</TableHead>
+                <TableHead>Scope</TableHead>
+                <TableHead>Aspects</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {pending.isLoading ? (
                 <TableRow>
-                  <TableHead>Entry</TableHead>
-                  <TableHead>Kind</TableHead>
-                  <TableHead>Scope</TableHead>
-                  <TableHead>Aspects</TableHead>
-                  <TableHead>Created</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
+                  <TableCell colSpan={6}>
+                    <StateMessage>Loading...</StateMessage>
+                  </TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {pending.isLoading ? (
-                  <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
-                      Loading...
+              ) : error ? (
+                <TableRow>
+                  <TableCell colSpan={6}>
+                    <StateMessage tone="danger">{error}</StateMessage>
+                  </TableCell>
+                </TableRow>
+              ) : entries.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6}>
+                    <StateMessage>No pending knowledge entries</StateMessage>
+                  </TableCell>
+                </TableRow>
+              ) : (
+                entries.map((entry) => (
+                  <TableRow
+                    key={entry.entry_id}
+                    className={
+                      selectedEntryId === entry.entry_id ? "bg-muted/50" : "cursor-pointer"
+                    }
+                    onClick={() => setSelectedEntryId(entry.entry_id)}
+                  >
+                    <TableCell className="max-w-xl whitespace-normal">
+                      <div className="font-medium">{entry.title || entry.entry_id}</div>
+                      <div className="mt-1 text-sm text-muted-foreground">
+                        {entry.text_preview || "No preview available"}
+                      </div>
+                      <div className="mt-2 font-mono text-xs text-muted-foreground">
+                        {entry.entry_id}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{entry.kind}</Badge>
+                    </TableCell>
+                    <TableCell className="max-w-xs whitespace-normal">
+                      <div className="mb-2 font-mono text-xs text-muted-foreground">
+                        {entry.namespace}
+                      </div>
+                      <Labels labels={entry.labels} />
+                    </TableCell>
+                    <TableCell className="max-w-xs whitespace-normal">
+                      <Aspects aspects={entry.aspects} />
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {formatDateTime(entry.created_at)}
+                    </TableCell>
+                    <TableCell onClick={(event) => event.stopPropagation()}>
+                      <EntryActions
+                        entry={entry}
+                        disabled={mutating}
+                        onApprove={approve.mutate}
+                        onReject={reject.mutate}
+                      />
                     </TableCell>
                   </TableRow>
-                ) : error ? (
-                  <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-destructive">
-                      {error}
-                    </TableCell>
-                  </TableRow>
-                ) : entries.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
-                      No pending knowledge entries
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  entries.map((entry) => (
-                    <TableRow
-                      key={entry.entry_id}
-                      className={
-                        selectedEntryId === entry.entry_id ? "bg-muted/50" : "cursor-pointer"
-                      }
-                      onClick={() => setSelectedEntryId(entry.entry_id)}
-                    >
-                      <TableCell className="max-w-xl whitespace-normal">
-                        <div className="font-medium">{entry.title || entry.entry_id}</div>
-                        <div className="mt-1 text-sm text-muted-foreground">
-                          {entry.text_preview || "No preview available"}
-                        </div>
-                        <div className="mt-2 font-mono text-xs text-muted-foreground">
-                          {entry.entry_id}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{entry.kind}</Badge>
-                      </TableCell>
-                      <TableCell className="max-w-xs whitespace-normal">
-                        <div className="mb-2 font-mono text-xs text-muted-foreground">
-                          {entry.namespace}
-                        </div>
-                        <Labels labels={entry.labels} />
-                      </TableCell>
-                      <TableCell className="max-w-xs whitespace-normal">
-                        <Aspects aspects={entry.aspects} />
-                      </TableCell>
-                      <TableCell className="text-sm text-muted-foreground">
-                        {formatDateTime(entry.created_at)}
-                      </TableCell>
-                      <TableCell onClick={(event) => event.stopPropagation()}>
-                        <EntryActions
-                          entry={entry}
-                          disabled={mutating}
-                          onApprove={approve.mutate}
-                          onReject={reject.mutate}
-                        />
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </DataCard>
 
-        <Card>
-          <CardContent className="p-0">
-            <KnowledgeDetail
-              entry={detail.data ?? null}
-              isLoading={detail.isLoading}
-              error={detailError}
-              disabled={mutating}
-              onApprove={approve.mutate}
-              onReject={reject.mutate}
-            />
-          </CardContent>
-        </Card>
+        <DataCard>
+          <KnowledgeDetail
+            entry={detail.data ?? null}
+            isLoading={detail.isLoading}
+            error={detailError}
+            disabled={mutating}
+            onApprove={approve.mutate}
+            onReject={reject.mutate}
+          />
+        </DataCard>
       </div>
-    </div>
+    </Page>
   )
 }

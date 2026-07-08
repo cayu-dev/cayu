@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
+import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
-import { Card, CardContent } from "../components/ui/card"
 import {
   Table,
   TableBody,
@@ -39,70 +39,70 @@ export function SessionsPage() {
   const errorMessage = error instanceof Error ? error.message : "Failed to load sessions."
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Sessions</h1>
-        <Link to="/run" className={buttonVariants()}>
-          New Run
-        </Link>
-      </div>
+    <Page>
+      <PageHeader
+        title="Sessions"
+        actions={
+          <Link to="/run" className={buttonVariants()}>
+            New Run
+          </Link>
+        }
+      />
 
-      <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
+      <DataCard>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Session ID</TableHead>
+              <TableHead>Agent</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Created</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {isLoading ? (
               <TableRow>
-                <TableHead>Session ID</TableHead>
-                <TableHead>Agent</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Created</TableHead>
+                <TableCell colSpan={4}>
+                  <StateMessage>Loading...</StateMessage>
+                </TableCell>
               </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-muted-foreground py-8">
-                    Loading...
+            ) : isError ? (
+              <TableRow>
+                <TableCell colSpan={4}>
+                  <StateMessage tone="danger">{errorMessage}</StateMessage>
+                </TableCell>
+              </TableRow>
+            ) : !sessions?.length ? (
+              <TableRow>
+                <TableCell colSpan={4}>
+                  <StateMessage>No sessions yet</StateMessage>
+                </TableCell>
+              </TableRow>
+            ) : (
+              sessions.map((s) => (
+                <TableRow key={s.id} className="cursor-pointer">
+                  <TableCell>
+                    <Link
+                      to="/sessions/$sessionId"
+                      params={{ sessionId: s.id }}
+                      className="font-mono text-sm text-primary hover:underline"
+                    >
+                      {s.id}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="text-sm">{s.agent_name}</TableCell>
+                  <TableCell>
+                    <StatusBadge status={s.status} />
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    {formatDateTime(s.created_at)}
                   </TableCell>
                 </TableRow>
-              ) : isError ? (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-destructive py-8">
-                    {errorMessage}
-                  </TableCell>
-                </TableRow>
-              ) : !sessions?.length ? (
-                <TableRow>
-                  <TableCell colSpan={4} className="text-center text-muted-foreground py-8">
-                    No sessions yet
-                  </TableCell>
-                </TableRow>
-              ) : (
-                sessions.map((s) => (
-                  <TableRow key={s.id} className="cursor-pointer">
-                    <TableCell>
-                      <Link
-                        to="/sessions/$sessionId"
-                        params={{ sessionId: s.id }}
-                        className="font-mono text-sm text-primary hover:underline"
-                      >
-                        {s.id}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="text-sm">{s.agent_name}</TableCell>
-                    <TableCell>
-                      <StatusBadge status={s.status} />
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {formatDateTime(s.created_at)}
-                    </TableCell>
-                  </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-    </div>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </DataCard>
+    </Page>
   )
 }

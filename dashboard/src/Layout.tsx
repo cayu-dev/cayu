@@ -65,8 +65,8 @@ export function Layout() {
           ) : null}
         </div>
       </nav>
-      <main className="flex-1 overflow-auto">
-        <div className="p-8">
+      <main className="min-w-0 flex-1 overflow-auto">
+        <div className="p-4 sm:p-6 xl:p-8">
           {(contractError || incompatibleContract) && (
             <div className="mb-6 flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
               <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />

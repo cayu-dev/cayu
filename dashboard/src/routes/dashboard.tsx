@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { Activity, CheckCircle, Clock, XCircle } from "lucide-react"
+import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -32,13 +33,15 @@ export function DashboardPage() {
   const failed = list.filter((s) => s.status === "failed").length
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
-        <Link to="/run" className={buttonVariants()}>
-          New Run
-        </Link>
-      </div>
+    <Page>
+      <PageHeader
+        title="Dashboard"
+        actions={
+          <Link to="/run" className={buttonVariants()}>
+            New Run
+          </Link>
+        }
+      />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
@@ -60,79 +63,71 @@ export function DashboardPage() {
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent Sessions</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {sessions.isError ? (
-              <p className="text-sm text-destructive">
-                {sessionsError || "Failed to load sessions."}
-              </p>
-            ) : list.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                No sessions yet.{" "}
-                <Link to="/run" className="text-primary underline">
-                  Start a run
-                </Link>
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {list.slice(0, 8).map((s) => (
-                  <Link
-                    key={s.id}
-                    to="/sessions/$sessionId"
-                    params={{ sessionId: s.id }}
-                    className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate font-mono text-sm">{s.id}</div>
-                      <div className="text-xs text-muted-foreground">
-                        {formatDateTime(s.created_at)}
-                      </div>
-                    </div>
-                    <div className="shrink-0">
-                      <StatusBadge status={s.status} />
-                    </div>
-                  </Link>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Recent Tasks</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {tasks.isError ? (
-              <p className="text-sm text-destructive">{tasksError || "Failed to load tasks."}</p>
-            ) : taskList.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No tasks yet.</p>
-            ) : (
-              <div className="space-y-2">
-                {taskList.slice(0, 8).map((t) => (
-                  <div
-                    key={t.id}
-                    className="flex items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-sm">{t.title || t.type}</div>
-                      <div className="text-xs text-muted-foreground">
-                        {formatDateTime(t.created_at)}
-                      </div>
-                    </div>
-                    <div className="shrink-0">
-                      <StatusBadge status={t.status} />
+        <DataCard title="Recent Sessions" contentClassName="p-4">
+          {sessions.isError ? (
+            <StateMessage tone="danger" className="py-6">
+              {sessionsError || "Failed to load sessions."}
+            </StateMessage>
+          ) : list.length === 0 ? (
+            <StateMessage className="py-6">
+              No sessions yet.{" "}
+              <Link to="/run" className="text-primary underline">
+                Start a run
+              </Link>
+            </StateMessage>
+          ) : (
+            <div className="space-y-2">
+              {list.slice(0, 8).map((s) => (
+                <Link
+                  key={s.id}
+                  to="/sessions/$sessionId"
+                  params={{ sessionId: s.id }}
+                  className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-mono text-sm">{s.id}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatDateTime(s.created_at)}
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
+                  <div className="shrink-0">
+                    <StatusBadge status={s.status} />
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+        </DataCard>
+
+        <DataCard title="Recent Tasks" contentClassName="p-4">
+          {tasks.isError ? (
+            <StateMessage tone="danger" className="py-6">
+              {tasksError || "Failed to load tasks."}
+            </StateMessage>
+          ) : taskList.length === 0 ? (
+            <StateMessage className="py-6">No tasks yet.</StateMessage>
+          ) : (
+            <div className="space-y-2">
+              {taskList.slice(0, 8).map((t) => (
+                <div
+                  key={t.id}
+                  className="flex items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm">{t.title || t.type}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatDateTime(t.created_at)}
+                    </div>
+                  </div>
+                  <div className="shrink-0">
+                    <StatusBadge status={t.status} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </DataCard>
       </div>
-    </div>
+    </Page>
   )
 }

@@ -17,6 +17,7 @@ import {
   Wrench,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
+import { Page, PayloadViewer } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -233,11 +234,7 @@ function EventRow({
           )}
         />
       </button>
-      {expanded && (
-        <pre className="mx-4 mb-3 max-h-56 overflow-auto rounded-md border border-border bg-muted/70 p-3 text-xs">
-          {JSON.stringify(event.payload, null, 2)}
-        </pre>
-      )}
+      {expanded && <PayloadViewer value={event.payload} className="mx-4 mb-3 bg-muted/70" />}
     </div>
   )
 }
@@ -360,7 +357,7 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         : `${Math.floor(duration / 60_000)}m ${Math.round((duration % 60_000) / 1000)}s`
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] flex-col gap-4">
+    <Page className="space-y-4">
       <div className="flex flex-shrink-0 items-start gap-3">
         <Link
           to="/sessions"
@@ -451,8 +448,8 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         </CardContent>
       </Card>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 xl:grid-cols-5">
-        <div className="flex min-h-0 flex-col xl:col-span-3">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-5">
+        <div className="flex min-h-[28rem] flex-col xl:col-span-3">
           <Card className="flex min-h-0 flex-1 gap-0 py-0">
             <CardHeader className="border-b border-border py-4">
               <div className="flex items-center justify-between gap-3">
@@ -491,7 +488,7 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           </Card>
         </div>
 
-        <div className="flex min-h-0 flex-col xl:col-span-2">
+        <div className="flex min-h-[28rem] flex-col xl:col-span-2">
           <Card className="flex min-h-0 flex-1 gap-0 py-0">
             <CardHeader className="border-b border-border py-4">
               <div className="flex items-center justify-between gap-3">
@@ -587,6 +584,6 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           </Card>
         </div>
       )}
-    </div>
+    </Page>
   )
 }

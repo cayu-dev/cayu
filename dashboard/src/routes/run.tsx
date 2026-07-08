@@ -1,8 +1,8 @@
 import { useNavigate } from "@tanstack/react-router"
 import { AlertCircle, Bot, CheckCircle, Play, Wrench } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
+import { DataCard, Page, PageHeader } from "../components/dashboard/layout"
 import { Button } from "../components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Textarea } from "../components/ui/textarea"
 import { type SSEEvent, streamRun } from "../lib/api"
 import { formatCount, modelUsagePayload, numericValue } from "../lib/format"
@@ -85,79 +85,72 @@ export function RunPage() {
   const lastSessionId = events.at(-1)?.session_id ?? null
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] flex-col gap-6">
-      <h1 className="text-2xl font-bold tracking-tight">New Run</h1>
+    <Page>
+      <PageHeader title="New Run" />
 
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Prompt</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Analyze the customer dataset in data/. Write a Python script that extracts top 10 countries by customer count..."
-            disabled={running}
-            rows={4}
-            className="resize-none"
-          />
-          {error && <p className="text-sm text-destructive">{error}</p>}
-          <div className="flex items-center justify-end">
-            <Button onClick={handleRun} disabled={running || !prompt.trim()}>
-              <Play className="h-4 w-4 mr-2" />
-              {running ? "Running..." : "Run"}
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      <DataCard title="Prompt" headerClassName="pb-3" contentClassName="space-y-3 p-4">
+        <Textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Analyze the customer dataset in data/. Write a Python script that extracts top 10 countries by customer count..."
+          disabled={running}
+          rows={4}
+          className="resize-none"
+        />
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <div className="flex items-center justify-end">
+          <Button onClick={handleRun} disabled={running || !prompt.trim()}>
+            <Play className="h-4 w-4 mr-2" />
+            {running ? "Running..." : "Run"}
+          </Button>
+        </div>
+      </DataCard>
 
       {events.length > 0 && (
-        <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 xl:grid-cols-2">
-          <Card className="flex min-h-0 flex-col">
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">Events</CardTitle>
-                {lastSessionId && !running && (
-                  <Button
-                    variant="link"
-                    size="sm"
-                    className="h-auto p-0 text-xs"
-                    onClick={() =>
-                      navigate({ to: "/sessions/$sessionId", params: { sessionId: lastSessionId } })
-                    }
-                  >
-                    View Session →
-                  </Button>
-                )}
-              </div>
-            </CardHeader>
-            <CardContent className="min-h-0 flex-1 p-0">
-              <div className="h-full overflow-auto px-4 py-2">
-                {events
-                  .filter((e) => e.type !== "model.text.delta")
-                  .map((e) => (
-                    <LiveEvent key={e.id} event={e} />
-                  ))}
-                <div ref={eventsEndRef} />
-              </div>
-            </CardContent>
-          </Card>
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+          <DataCard
+            title="Events"
+            className="min-h-[22rem]"
+            contentClassName="min-h-0 flex-1"
+            actions={
+              lastSessionId && !running ? (
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-xs"
+                  onClick={() =>
+                    navigate({ to: "/sessions/$sessionId", params: { sessionId: lastSessionId } })
+                  }
+                >
+                  View Session →
+                </Button>
+              ) : null
+            }
+          >
+            <div className="h-full overflow-auto px-4 py-2">
+              {events
+                .filter((e) => e.type !== "model.text.delta")
+                .map((e) => (
+                  <LiveEvent key={e.id} event={e} />
+                ))}
+              <div ref={eventsEndRef} />
+            </div>
+          </DataCard>
 
-          <Card className="flex min-h-0 flex-col">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base">Agent Output</CardTitle>
-            </CardHeader>
-            <CardContent className="min-h-0 flex-1 p-0">
-              <div className="h-full overflow-auto p-4">
-                <pre className="whitespace-pre-wrap break-words font-sans text-sm">
-                  {textOutput || "Waiting for output..."}
-                </pre>
-                <div ref={outputEndRef} />
-              </div>
-            </CardContent>
-          </Card>
+          <DataCard
+            title="Agent Output"
+            className="min-h-[22rem]"
+            contentClassName="min-h-0 flex-1"
+          >
+            <div className="h-full overflow-auto p-4">
+              <pre className="whitespace-pre-wrap break-words font-sans text-sm">
+                {textOutput || "Waiting for output..."}
+              </pre>
+              <div ref={outputEndRef} />
+            </div>
+          </DataCard>
         </div>
       )}
-    </div>
+    </Page>
   )
 }
