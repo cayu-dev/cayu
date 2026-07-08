@@ -23,6 +23,7 @@ from cayu.environments import (
     copy_bound_workspace,
     copy_workspace_snapshot,
 )
+from cayu.environments.bindings import _reset_workspace_after_failed_clone
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.workspaces import (
     LocalWorkspace,
@@ -430,6 +431,114 @@ def test_git_repository_binding_rejects_option_like_git_inputs() -> None:
         GitRepositoryBinding(repo_url="https://example.com/acme/app.git", git_executable="-git")
 
 
+def test_reset_workspace_after_failed_clone_clears_local_workspace(tmp_path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("x", encoding="utf-8")
+    (root / "partial.txt").write_text("partial", encoding="utf-8")
+    workspace = LocalWorkspace(root, workspace_id="ws")
+
+    asyncio.run(
+        _reset_workspace_after_failed_clone(workspace, timeout_s=None, output_limit_bytes=1024)
+    )
+
+    # Partial clone artifacts (including the .git directory and dotfiles) are removed, so the
+    # workspace is empty again and a later bind is not permanently bricked.
+    assert list(root.iterdir()) == []
+
+
+def test_reset_workspace_after_failed_clone_propagates_cancellation(tmp_path) -> None:
+    # Cleanup swallows ordinary errors, but a CancelledError arriving mid-cleanup must propagate
+    # rather than being dropped (which would leave the task cancelled-but-not-delivered).
+    runner_root = tmp_path / "runner"
+    runner_root.mkdir()
+
+    class CancellingRunner(LocalRunner):
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            raise asyncio.CancelledError
+
+    workspace = RunnerWorkspace(CancellingRunner(runner_root), workspace_id="ws")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            _reset_workspace_after_failed_clone(workspace, timeout_s=None, output_limit_bytes=1024)
+        )
+
+
+def test_git_repository_binding_resets_workspace_after_failed_clone(tmp_path) -> None:
+    _require_git()
+    origin, commit = _create_bare_origin(tmp_path)
+    runner_root = tmp_path / "runner"
+    runner_root.mkdir()
+
+    class FlakyCloneRunner(LocalRunner):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self._root = root
+            self.fail_next_clone = True
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            if command.argv and "clone" in command.argv and self.fail_next_clone:
+                self.fail_next_clone = False
+                # Simulate a clone that dies mid-transfer, leaving partial non-work-tree artifacts.
+                (self._root / ".git").mkdir(exist_ok=True)
+                (self._root / "partial.txt").write_text("partial", encoding="utf-8")
+                return ExecResult(stdout="", stderr="fatal: early EOF", exit_code=128)
+            return await super().exec(command, **kwargs)
+
+    runner = FlakyCloneRunner(runner_root)
+    workspace = RunnerWorkspace(runner, workspace_id="runner-repo")
+    binding = GitRepositoryBinding(repo_url=str(origin), ref="main")
+
+    async def run() -> BoundWorkspace:
+        with pytest.raises(RuntimeError):
+            await binding.bind(workspace, runner, session_id="sess_clone_fail")
+        # The failed clone's partial artifacts were reset, so the workspace is empty again and the
+        # retry clones cleanly instead of being permanently bricked.
+        assert not (runner_root / "partial.txt").exists()
+        assert not (runner_root / ".git").exists()
+        return await binding.bind(workspace, runner, session_id="sess_clone_retry")
+
+    bound = asyncio.run(run())
+
+    assert (runner_root / ".git").is_dir()
+    assert bound.snapshot is not None
+    assert bound.snapshot.version == commit
+
+
+def test_git_repository_binding_resets_workspace_after_cancelled_clone(tmp_path) -> None:
+    # A cancelled/interrupted clone leaves the same partial, bricking state as an ordinary failure,
+    # so it must also reset the workspace (CancelledError is a BaseException, not an Exception).
+    _require_git()
+    origin, _ = _create_bare_origin(tmp_path)
+    runner_root = tmp_path / "runner"
+    runner_root.mkdir()
+
+    class CancellingCloneRunner(LocalRunner):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self._root = root
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            if command.argv and "clone" in command.argv:
+                (self._root / ".git").mkdir(exist_ok=True)
+                (self._root / "partial.txt").write_text("partial", encoding="utf-8")
+                raise asyncio.CancelledError
+            return await super().exec(command, **kwargs)
+
+    runner = CancellingCloneRunner(runner_root)
+    workspace = RunnerWorkspace(runner, workspace_id="repo")
+    binding = GitRepositoryBinding(repo_url=str(origin), ref="main")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(binding.bind(workspace, runner, session_id="sess_clone_cancel"))
+
+    # The cancellation propagated, but the workspace was still reset to empty (not bricked).
+    assert not (runner_root / "partial.txt").exists()
+    assert not (runner_root / ".git").exists()
+
+
 def test_bind_request_rejects_invalid_values() -> None:
     invalid_workspace: Any = object()
     invalid_runner: Any = object()
@@ -680,6 +789,130 @@ def test_sync_binding_can_finalize_from_copied_bound_workspace(tmp_path) -> None
     assert binding._states == {}
 
 
+def test_sync_binding_rejects_concurrent_bind_on_fixed_target(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    (target_root / "stale.txt").write_text("stale", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        await binding.bind(source, None, session_id="sess_a")
+        # sess_a still holds the shared fixed target; a concurrent second bind must be rejected
+        # instead of interleaving clear/copy over it.
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_b")
+
+    asyncio.run(run())
+    # The reservation was taken before any mutating await, so the rejected bind never touched the
+    # target, and sess_a's reservation is still held.
+    assert binding._active_fixed_target_ids == {"target"}
+
+
+def test_sync_binding_allows_sequential_reuse_of_fixed_target(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_a")
+        await binding.finalize(bound, outcome="completed")
+        # finalize released the reservation, so a later session reuses the same target cleanly.
+        await binding.bind(source, None, session_id="sess_b")
+
+    asyncio.run(run())
+    assert binding._active_fixed_target_ids == {"target"}
+
+
+def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_a")
+        binding.abandon(bound)
+        # abandon released the reservation, so a re-bind of the same target succeeds.
+        await binding.bind(source, None, session_id="sess_b")
+
+    asyncio.run(run())
+    assert binding._active_fixed_target_ids == {"target"}
+
+
+def test_sync_binding_factory_targets_are_not_reservation_gated(tmp_path) -> None:
+    # The concurrency guard applies only to a shared fixed target; factory targets are per-bind.
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    made: list[LocalWorkspace] = []
+
+    async def factory(context: SyncBindingContext) -> Workspace:
+        root = tmp_path / f"target_{len(made)}"
+        root.mkdir()
+        target = LocalWorkspace(root, workspace_id=f"target_{len(made)}")
+        made.append(target)
+        return target
+
+    binding = SyncBinding(target_workspace_factory=factory)
+
+    async def run() -> None:
+        await binding.bind(source, None, session_id="sess_a")
+        await binding.bind(source, None, session_id="sess_b")
+
+    asyncio.run(run())
+    assert len(made) == 2
+    assert binding._active_fixed_target_ids == set()
+
+
+def test_sync_binding_releases_fixed_target_when_bind_fails(tmp_path) -> None:
+    # A bind that fails mid-way must release its reservation (via the except path), or the fixed
+    # target would be stuck rejecting every later bind after one transient failure.
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    (target_root / "stale.txt").write_text("stale", encoding="utf-8")
+
+    class ExplodingClearWorkspace(LocalWorkspace):
+        fail_clear = True
+
+        async def delete(self, path: str) -> None:
+            if self.fail_clear:
+                raise RuntimeError("clear failed")
+            await super().delete(path)
+
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = ExplodingClearWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="clear failed"):
+            await binding.bind(source, None, session_id="sess_fail")
+        # The failed bind released its reservation, so a retry can bind the same target.
+        assert binding._active_fixed_target_ids == set()
+        target.fail_clear = False
+        await binding.bind(source, None, session_id="sess_retry")
+        assert binding._active_fixed_target_ids == {"target"}
+
+    asyncio.run(run())
+
+
 def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -894,14 +1127,22 @@ def test_sync_binding_abandon_releases_state_without_syncing(tmp_path) -> None:
 
 
 def test_sync_binding_rebind_replaces_leaked_state_for_same_session(tmp_path) -> None:
+    # Concurrent sessions must use a factory (a shared fixed target rejects overlapping binds), so
+    # the leaked-state scenario is exercised through per-session factory targets.
     source_root = tmp_path / "source"
-    target_root = tmp_path / "target"
     source_root.mkdir()
-    target_root.mkdir()
     (source_root / "a.txt").write_text("before", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
-    target = LocalWorkspace(target_root, workspace_id="target")
-    binding = SyncBinding(target_workspace=target)
+    made: list[LocalWorkspace] = []
+
+    async def factory(context: SyncBindingContext) -> Workspace:
+        root = tmp_path / f"target_{len(made)}"
+        root.mkdir()
+        target = LocalWorkspace(root, workspace_id=f"target_{len(made)}")
+        made.append(target)
+        return target
+
+    binding = SyncBinding(target_workspace_factory=factory)
 
     async def run() -> None:
         first = await binding.bind(source, None, session_id="sess_leak")
@@ -914,6 +1155,29 @@ def test_sync_binding_rebind_replaces_leaked_state_for_same_session(tmp_path) ->
             await binding.finalize(first, outcome="completed")
 
     asyncio.run(run())
+
+
+def test_sync_binding_same_session_rebind_reuses_fixed_target(tmp_path) -> None:
+    # A same-session rebind of a fixed target is not a concurrent bind: the prior state is pruned
+    # (releasing its reservation) before the new bind re-reserves the target.
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        first = await binding.bind(source, None, session_id="sess_x")
+        rebound = await binding.bind(source, None, session_id="sess_x")
+        assert len(binding._states) == 1
+        assert first.state_key not in binding._states
+        assert rebound.state_key in binding._states
+
+    asyncio.run(run())
+    assert binding._active_fixed_target_ids == {"target"}
 
 
 def test_sync_binding_prunes_expired_states_on_bind(tmp_path) -> None:

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import io
+import shutil
 import tarfile
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -63,6 +66,9 @@ class _SyncBindingState:
     created_at: float
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
+    # Id of the fixed target workspace this bind reserved (None for factory targets), so the
+    # reservation that guards against concurrent binds is released when this state is dropped.
+    target_id: str | None = None
 
 
 DEFAULT_SYNC_STATE_TTL_S = 24 * 60 * 60.0
@@ -398,7 +404,20 @@ class GitRepositoryBinding(WorkspaceBinding):
                 timeout_s=self.timeout_s,
                 output_limit_bytes=self.output_limit_bytes,
             )
-            await executor.run("clone", self.repo_url, ".")
+            try:
+                await executor.run("clone", self.repo_url, ".")
+            except BaseException:
+                # A clone that dies mid-transfer — an ordinary failure OR a cancellation/interrupt —
+                # leaves partial artifacts that are non-empty AND not a valid work tree, so every
+                # later bind would raise (neither empty nor a work tree): a permanent brick from one
+                # transient failure. Reset the workspace to the empty state it was just verified to
+                # be in so a retry can clone cleanly, then re-raise (propagating the cancellation).
+                await _reset_workspace_after_failed_clone(
+                    workspace,
+                    timeout_s=self.timeout_s,
+                    output_limit_bytes=self.output_limit_bytes,
+                )
+                raise
 
         await self._fetch_extra_refspecs(executor)
         if self.ref is not None:
@@ -514,7 +533,11 @@ class SyncBinding(WorkspaceBinding):
     or ``target_workspace_factory`` identifies the workspace visible to tools
     during the run, typically a sandbox filesystem wrapper. The target workspace
     should be dedicated to this binding because the default clean policy deletes
-    files in the target before copying source files in.
+    files in the target before copying source files in. A fixed ``target_workspace``
+    is therefore single-session: a concurrent ``bind`` against a target already held
+    by an active bind of this instance is rejected (use ``target_workspace_factory``
+    for concurrent sessions). The guard is per binding instance, so sharing one fixed
+    target across separate ``SyncBinding`` instances stays out of contract.
 
     File copies use one bulk tar transfer per direction when a workspace
     exposes ``read_tar_bytes``/``write_tar_bytes`` (RunnerWorkspace does), and
@@ -561,6 +584,10 @@ class SyncBinding(WorkspaceBinding):
         self.delete_missing = delete_missing
         self.state_ttl_s = _validate_optional_positive_number(state_ttl_s, "state_ttl_s")
         self._states: dict[str, _SyncBindingState] = {}
+        # Ids of fixed target workspaces with an active (un-finalized) bind. A fixed target is a
+        # single shared filesystem, so overlapping binds would clear/copy over each other; reject
+        # the second instead of corrupting silently. Factory targets are per-bind and never tracked.
+        self._active_fixed_target_ids: set[str] = set()
 
     async def bind(
         self,
@@ -596,72 +623,84 @@ class SyncBinding(WorkspaceBinding):
         target = await self._target_workspace(context)
         if _same_workspace_resource(workspace, target):
             raise ValueError("SyncBinding source and target workspaces must be different.")
-        source_paths = await _list_workspace_paths(
-            workspace,
-            self.pattern,
-            limit=self.max_files,
-            role="source",
-        )
-        cleaned_paths: tuple[str, ...] = ()
-        if self.clean_target == "always":
-            cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
-            target_baseline_paths: tuple[str, ...] = ()
-        else:
-            target_baseline_paths = await _list_workspace_paths(
-                target,
+        # Reserve a fixed target before any mutating await so a concurrent bind against the same
+        # shared target is rejected rather than interleaving clear/copy over it. The check-and-add is
+        # synchronous, so two coroutines cannot both pass it. Released when this bind's state is
+        # dropped (finalize/abandon/prune), so sequential reuse and same-session rebind still work.
+        reserved_target_id = self._reserve_fixed_target(target)
+        try:
+            source_paths = await _list_workspace_paths(
+                workspace,
                 self.pattern,
                 limit=self.max_files,
-                role="target",
+                role="source",
             )
-        copied_bytes = await _copy_paths(
-            source=workspace,
-            target=target,
-            paths=source_paths,
-            max_file_bytes=self.max_file_bytes,
-        )
-        bind_metadata = {
-            **request_metadata,
-            "sync_binding": {
-                "source_workspace_id": workspace.id,
-                "target_workspace_id": target.id,
-                "pattern": self.pattern,
-                "max_files": self.max_files,
-                "max_file_bytes": self.max_file_bytes,
-                "clean_target": self.clean_target,
-                "sync_back": self.sync_back,
-                "delete_missing": self.delete_missing,
-                "copied_files": len(source_paths),
-                "copied_bytes": copied_bytes,
-                "cleaned_target_files": len(cleaned_paths),
-            },
-        }
-        bound = BoundWorkspace(
-            workspace=target,
-            source_workspace=workspace,
-            runner=runner,
-            path=self.path,
-            metadata=bind_metadata,
-            snapshot=WorkspaceSnapshot(
-                snapshot_id=f"sync-bind:{session_id}",
-                workspace_id=workspace.id,
-                source="sync",
-                metadata={
+            cleaned_paths: tuple[str, ...] = ()
+            if self.clean_target == "always":
+                cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
+                target_baseline_paths: tuple[str, ...] = ()
+            else:
+                target_baseline_paths = await _list_workspace_paths(
+                    target,
+                    self.pattern,
+                    limit=self.max_files,
+                    role="target",
+                )
+            copied_bytes = await _copy_paths(
+                source=workspace,
+                target=target,
+                paths=source_paths,
+                max_file_bytes=self.max_file_bytes,
+            )
+            bind_metadata = {
+                **request_metadata,
+                "sync_binding": {
+                    "source_workspace_id": workspace.id,
                     "target_workspace_id": target.id,
+                    "pattern": self.pattern,
+                    "max_files": self.max_files,
+                    "max_file_bytes": self.max_file_bytes,
+                    "clean_target": self.clean_target,
+                    "sync_back": self.sync_back,
+                    "delete_missing": self.delete_missing,
                     "copied_files": len(source_paths),
                     "copied_bytes": copied_bytes,
+                    "cleaned_target_files": len(cleaned_paths),
                 },
-            ),
-            state_key=uuid4().hex,
-        )
-        if bound.state_key is None:
-            raise RuntimeError("SyncBinding bound workspace missing state key.")
-        self._states[bound.state_key] = _SyncBindingState(
-            session_id=session_id,
-            created_at=time.monotonic(),
-            source_paths=source_paths,
-            target_baseline_paths=target_baseline_paths,
-        )
-        return bound
+            }
+            bound = BoundWorkspace(
+                workspace=target,
+                source_workspace=workspace,
+                runner=runner,
+                path=self.path,
+                metadata=bind_metadata,
+                snapshot=WorkspaceSnapshot(
+                    snapshot_id=f"sync-bind:{session_id}",
+                    workspace_id=workspace.id,
+                    source="sync",
+                    metadata={
+                        "target_workspace_id": target.id,
+                        "copied_files": len(source_paths),
+                        "copied_bytes": copied_bytes,
+                    },
+                ),
+                state_key=uuid4().hex,
+            )
+            if bound.state_key is None:
+                raise RuntimeError("SyncBinding bound workspace missing state key.")
+            self._states[bound.state_key] = _SyncBindingState(
+                session_id=session_id,
+                created_at=time.monotonic(),
+                source_paths=source_paths,
+                target_baseline_paths=target_baseline_paths,
+                target_id=reserved_target_id,
+            )
+            return bound
+        except BaseException:
+            # A failed bind must not leak its reservation (the state that would release it was never
+            # stored). Success keeps the reservation until the bind's state is dropped.
+            self._release_fixed_target(reserved_target_id)
+            raise
 
     async def finalize(
         self,
@@ -749,6 +788,35 @@ class SyncBinding(WorkspaceBinding):
             raise TypeError("SyncBinding abandon requires a BoundWorkspace.")
         self._discard_sync_state(bound)
 
+    def _reserve_fixed_target(self, target: Workspace) -> str | None:
+        """Reserve a fixed target for the duration of a bind, or raise if one is already active.
+
+        Returns the reserved id (to store on the bind state) or ``None`` for factory targets, which
+        are per-bind and cannot collide.
+        """
+
+        if self.target_workspace is None:
+            return None
+        target_id = target.id
+        if target_id in self._active_fixed_target_ids:
+            raise ValueError(
+                f"SyncBinding target_workspace {target_id!r} is already bound by an active "
+                "session; use target_workspace_factory for concurrent sessions."
+            )
+        self._active_fixed_target_ids.add(target_id)
+        return target_id
+
+    def _release_fixed_target(self, target_id: str | None) -> None:
+        if target_id is not None:
+            self._active_fixed_target_ids.discard(target_id)
+
+    def _remove_state(self, state_key: str) -> None:
+        """The single place that drops a `_states` entry: pop it and release the fixed-target
+        reservation it held, so a reservation can never outlive its state."""
+        state = self._states.pop(state_key, None)
+        if state is not None:
+            self._release_fixed_target(state.target_id)
+
     def _prune_sync_states(self, *, session_id: str) -> None:
         now = time.monotonic()
         stale_keys = [
@@ -758,7 +826,7 @@ class SyncBinding(WorkspaceBinding):
             or (self.state_ttl_s is not None and now - state.created_at > self.state_ttl_s)
         ]
         for key in stale_keys:
-            del self._states[key]
+            self._remove_state(key)
 
     def _get_sync_state(self, bound: BoundWorkspace) -> _SyncBindingState:
         if bound.state_key is not None:
@@ -772,7 +840,7 @@ class SyncBinding(WorkspaceBinding):
 
     def _discard_sync_state(self, bound: BoundWorkspace) -> None:
         if bound.state_key is not None:
-            self._states.pop(bound.state_key, None)
+            self._remove_state(bound.state_key)
 
 
 def copy_bound_workspace(bound: BoundWorkspace) -> BoundWorkspace:
@@ -1233,6 +1301,60 @@ async def _require_empty_workspace_for_git_clone(
         raise ValueError(
             "GitRepositoryBinding can only clone into an empty workspace or an existing Git work tree."
         )
+
+
+async def _reset_workspace_after_failed_clone(
+    workspace: Workspace,
+    *,
+    timeout_s: int | None,
+    output_limit_bytes: int,
+) -> None:
+    """Best-effort removal of a failed clone's partial artifacts, returning the workspace to the
+    empty state verified before the clone so a later bind can retry.
+
+    Only ``LocalWorkspace`` and ``RunnerWorkspace`` reach here (``_git_executor_for_workspace``
+    rejects other types). Cleanup failures are swallowed so the original clone error is what
+    propagates from the caller's ``raise``; a ``CancelledError`` mid-cleanup still propagates.
+    """
+
+    try:
+        if isinstance(workspace, LocalWorkspace):
+            # Off the event loop: removing a large partial clone with shutil.rmtree is blocking.
+            await asyncio.to_thread(_remove_local_workspace_contents, workspace.root)
+        elif isinstance(workspace, RunnerWorkspace):
+            await workspace.runner.exec(
+                ExecCommand.process(
+                    workspace.python_executable,
+                    "-c",
+                    (
+                        "import os, shutil\n"
+                        # Materialize before removing: deleting entries while iterating the live
+                        # directory can skip siblings.
+                        "for entry in list(os.scandir('.')):\n"
+                        "    if entry.is_dir(follow_symlinks=False):\n"
+                        "        shutil.rmtree(entry.path, ignore_errors=True)\n"
+                        "    else:\n"
+                        "        os.remove(entry.path)\n"
+                    ),
+                ),
+                cwd=workspace.cwd,
+                timeout_s=timeout_s,
+                output_limit_bytes=output_limit_bytes,
+            )
+    except Exception:
+        # Swallow cleanup errors so the original clone error surfaces, but let a CancelledError
+        # (or other BaseException) propagate rather than dropping a requested cancellation.
+        pass
+
+
+def _remove_local_workspace_contents(root: Path) -> None:
+    # Materialize before removing: iterdir() is lazy, and deleting entries while iterating the live
+    # directory skips siblings.
+    for entry in list(root.iterdir()):
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
 
 
 def _validate_git_repo_url(value: str) -> str:
