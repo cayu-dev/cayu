@@ -184,6 +184,14 @@ class AggregateUsageSummary(ApiBaseModel):
     session_summaries: tuple[SessionUsageSummary, ...]
 
 
+class UsageBreakdownItem(ApiBaseModel):
+    provider_name: str | None
+    model: str | None
+    session_count: StrictInt = Field(ge=0)
+    model_steps: StrictInt = Field(ge=0)
+    usage: UsageMetrics
+
+
 class AggregateCostSummary(ApiBaseModel):
     session_ids: list[str]
     session_count: StrictInt = Field(ge=0)
@@ -202,6 +210,8 @@ class SessionsSummaryResponse(ApiBaseModel):
     next_cursor: str | None
     total_count: StrictInt | None = Field(ge=0)
     usage: AggregateUsageSummary
+    provider_breakdown: tuple[UsageBreakdownItem, ...] = Field(default_factory=tuple)
+    model_breakdown: tuple[UsageBreakdownItem, ...] = Field(default_factory=tuple)
     cost: AggregateCostSummary | None
 
 

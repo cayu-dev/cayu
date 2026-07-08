@@ -74,7 +74,25 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app, dev=True))
+    client = TestClient(
+        create_server(
+            app,
+            dev=True,
+            dashboard_config={
+                "apiBaseUrl": "/ignored",
+                "pricingCatalog": {
+                    "prices": [
+                        {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_per_million": "1",
+                            "output_per_million": "3",
+                        }
+                    ]
+                },
+            },
+        )
+    )
 
     assert client.get("/").status_code == 404
 
@@ -83,6 +101,7 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert "root" in dashboard.text
     assert '"basePath":"/cayu"' in dashboard.text
     assert '"apiBaseUrl":"/api"' in dashboard.text
+    assert '"pricingCatalog":{"prices":[{"provider_name":"fake"' in dashboard.text
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -1038,6 +1057,52 @@ def test_server_exposes_filtered_sessions_summary() -> None:
     ]
     assert body["usage"]["session_count"] == 2
     assert body["usage"]["usage"]["total_tokens"] == 24
+    assert body["provider_breakdown"] == [
+        {
+            "provider_name": "fake",
+            "model": None,
+            "session_count": 2,
+            "model_steps": 2,
+            "usage": {
+                "provider_name": "fake",
+                "requested_model": "fake-model",
+                "model": None,
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "reasoning_output_tokens": 0,
+                "cache": {
+                    "read_tokens": 0,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 8,
+                    "uncached_input_tokens": 12,
+                },
+            },
+        }
+    ]
+    assert body["model_breakdown"] == [
+        {
+            "provider_name": "fake",
+            "model": "fake-model",
+            "session_count": 2,
+            "model_steps": 2,
+            "usage": {
+                "provider_name": "fake",
+                "requested_model": "fake-model",
+                "model": "fake-model",
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "total_tokens": 24,
+                "reasoning_output_tokens": 0,
+                "cache": {
+                    "read_tokens": 0,
+                    "write_tokens": 0,
+                    "cached_input_tokens": 8,
+                    "uncached_input_tokens": 12,
+                },
+            },
+        }
+    ]
     assert body["cost"]["session_count"] == 2
     assert body["cost"]["total_cost"] == "0.000020"
     assert [item["session_id"] for item in body["cost"]["session_costs"]] == [

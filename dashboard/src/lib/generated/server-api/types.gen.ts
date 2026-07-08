@@ -1692,9 +1692,17 @@ export type SessionsSummaryBody = {
 export type SessionsSummaryResponse = {
     cost: AggregateCostSummary | null;
     /**
+     * Model Breakdown
+     */
+    model_breakdown?: Array<UsageBreakdownItem>;
+    /**
      * Next Cursor
      */
     next_cursor: string | null;
+    /**
+     * Provider Breakdown
+     */
+    provider_breakdown?: Array<UsageBreakdownItem>;
     /**
      * Session Count
      */
@@ -2060,6 +2068,29 @@ export type UpdateSessionMetadataBody = {
     metadata: {
         [key: string]: unknown;
     };
+};
+
+/**
+ * UsageBreakdownItem
+ */
+export type UsageBreakdownItem = {
+    /**
+     * Model
+     */
+    model: string | null;
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Provider Name
+     */
+    provider_name: string | null;
+    /**
+     * Session Count
+     */
+    session_count: number;
+    usage: UsageMetrics;
 };
 
 /**

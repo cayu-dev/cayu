@@ -20,6 +20,7 @@ import type {
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
+  SessionsSummaryBody,
   SseErrorEnvelope,
   SseEventEnvelope,
   ToolApprovalBody,
@@ -175,10 +176,11 @@ export async function fetchSessionsPage(query: SessionListQuery = {}): Promise<S
 
 export async function fetchSessionsSummary(
   query: SessionsSummaryQuery = {},
+  body: SessionsSummaryBody = {},
 ): Promise<SessionsSummary> {
   return requestJson<SessionsSummary>(`/sessions/summary${queryString(query)}`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify(body),
   })
 }
 

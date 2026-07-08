@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -63,7 +63,9 @@ from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import (
     CausalBudgetUsageSummary,
     SessionUsageSummary,
+    UsageMetrics,
     causal_budget_usage_summary,
+    usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server.auth import AuthDependency, server_auth_dependency
@@ -86,6 +88,7 @@ from cayu.server.contracts import (
     SessionsSummaryResponse,
     SessionSummaryResponse,
     SessionTranscriptResponse,
+    UsageBreakdownItem,
 )
 from cayu.server.sse import (
     error_to_sse_message,
@@ -449,6 +452,74 @@ def _serialize_session_base(session: Session) -> dict[str, Any]:
 
 def _serialize_session(session: Session) -> dict[str, Any]:
     return {**_serialize_session_base(session), "metadata": session.metadata}
+
+
+def _usage_breakdown(
+    events: list[Event],
+    *,
+    key_fn: Callable[[UsageMetrics], tuple[str | None, str | None]],
+) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+    for event in events:
+        if event.type != EventType.MODEL_COMPLETED:
+            continue
+        metrics = usage_metrics_from_event_payload(event.payload)
+        if metrics is None:
+            continue
+        provider_name, model = key_fn(metrics)
+        key = (provider_name, model)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "provider_name": provider_name,
+                "model": model,
+                "session_ids": set(),
+                "model_steps": 0,
+                "usage": UsageMetrics(provider_name=provider_name, model=model),
+            },
+        )
+        bucket["session_ids"].add(event.session_id)
+        bucket["model_steps"] += 1
+        bucket["usage"] = _add_usage_metrics(bucket["usage"], metrics)
+
+    items = [
+        UsageBreakdownItem(
+            provider_name=provider_name,
+            model=model,
+            session_count=len(bucket["session_ids"]),
+            model_steps=bucket["model_steps"],
+            usage=bucket["usage"],
+        ).model_dump()
+        for (provider_name, model), bucket in buckets.items()
+    ]
+    return sorted(
+        items,
+        key=lambda item: (
+            -item["usage"]["total_tokens"],
+            item["provider_name"] or "",
+            item["model"] or "",
+        ),
+    )
+
+
+def _add_usage_metrics(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
+    return UsageMetrics(
+        provider_name=left.provider_name,
+        requested_model=left.requested_model or right.requested_model,
+        model=left.model,
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        total_tokens=left.total_tokens + right.total_tokens,
+        reasoning_output_tokens=left.reasoning_output_tokens + right.reasoning_output_tokens,
+        cache={
+            "read_tokens": left.cache.read_tokens + right.cache.read_tokens,
+            "write_tokens": left.cache.write_tokens + right.cache.write_tokens,
+            "cached_input_tokens": left.cache.cached_input_tokens
+            + right.cache.cached_input_tokens,
+            "uncached_input_tokens": left.cache.uncached_input_tokens
+            + right.cache.uncached_input_tokens,
+        },
+    )
 
 
 def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:
@@ -1278,14 +1349,22 @@ def create_router(
             events=usage_events,
         ).model_dump()
         usage_summary.pop("causal_budget_id", None)
+        model_events = [
+            record.event
+            for record in sorted(all_event_records, key=lambda record: record.sequence)
+            if record.event.type == EventType.MODEL_COMPLETED
+        ]
+        provider_breakdown = _usage_breakdown(
+            model_events,
+            key_fn=lambda metrics: (metrics.provider_name, None),
+        )
+        model_breakdown = _usage_breakdown(
+            model_events,
+            key_fn=lambda metrics: (metrics.provider_name, metrics.model),
+        )
 
         cost_summary = None
         if body.pricing is not None:
-            model_events = [
-                record.event
-                for record in sorted(all_event_records, key=lambda record: record.sequence)
-                if record.event.type == EventType.MODEL_COMPLETED
-            ]
             aggregate_cost = build_session_cost_summary(
                 session_id="session-query",
                 events=model_events,
@@ -1337,6 +1416,8 @@ def create_router(
             "next_cursor": result.next_cursor,
             "total_count": result.total_count,
             "usage": usage_summary,
+            "provider_breakdown": provider_breakdown,
+            "model_breakdown": model_breakdown,
             "cost": cost_summary,
         }
 

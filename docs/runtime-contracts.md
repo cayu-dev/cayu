@@ -661,6 +661,13 @@ of matching sessions when available, and `next_cursor` can be passed back as the
 pagination through `debug_state`: `needs_attention`, `session_failure`,
 `tool_issue`, or `interruption`.
 
+The `usage` field summarizes model and tool usage for the returned page. The
+`provider_breakdown` and `model_breakdown` fields group `model.completed` usage
+events by provider and provider/model, respectively, so dashboards can show real
+token totals without guessing from session-level model lists. If the request body
+includes a `PricingCatalog`, the `cost` field is populated with estimated cost
+line items and `unpriced_model_steps`; otherwise `cost` is `null`.
+
 ```bash
 curl -X POST \
   "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)&debug_state=needs_attention" \

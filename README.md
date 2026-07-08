@@ -1065,6 +1065,11 @@ pass `api_path="/cayu/api"` when dashboard and API should live under one product
 path. The dashboard shell, dashboard assets, and control-plane API routes use
 the same auth dependency outside `dev=True`.
 
+Apps that want the bundled dashboard to estimate cost can inject a pricing
+catalog through `dashboard_config={"pricingCatalog": pricing.model_dump(mode="json")}`.
+The dashboard sends that catalog to summary endpoints when rendering usage
+views. Pricing remains application-owned and is not inferred or fetched by Cayu.
+
 Local generated agents should keep their runtime portable: put agent
 registration in a `CayuApp` factory and use `create_server(app, dev=True)` only
 for the trusted local entrypoint. Production entrypoints should pass real auth.

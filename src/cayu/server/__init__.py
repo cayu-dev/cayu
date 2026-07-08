@@ -73,6 +73,7 @@ def create_server(
     auth: AuthDependency | None = None,
     dev: bool = False,
     expose_docs: bool | None = None,
+    dashboard_config: dict[str, Any] | None = None,
     **fastapi_kwargs: Any,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -104,6 +105,9 @@ def create_server(
             ``/docs``, and ``/redoc`` routes. Defaults to ``True`` in dev mode
             and ``False`` in protected deployments. Set this explicitly for
             production deployments that intentionally expose generated docs.
+        dashboard_config: Optional JSON-serializable runtime config injected
+            into the bundled dashboard shell. ``basePath`` and ``apiBaseUrl``
+            are owned by the server mount and cannot be overridden here.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
     """
     from fastapi import FastAPI
@@ -165,6 +169,7 @@ def create_server(
         dashboard_path=dashboard_mount_path,
         auth=auth,
         api_base_url=control_plane_path,
+        dashboard_config=dashboard_config,
     )
 
     return server
@@ -179,6 +184,7 @@ def mount_cayu(
     dashboard_dir: str | Path | None = None,
     auth: AuthDependency | None = None,
     dev: bool = False,
+    dashboard_config: dict[str, Any] | None = None,
     name: str = "cayu-dashboard",
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
@@ -214,6 +220,7 @@ def mount_cayu(
             dashboard_path=mount_path,
             auth=auth,
             api_base_url=api_path,
+            dashboard_config=dashboard_config,
             name=name,
         )
 
@@ -225,6 +232,7 @@ def mount_dashboard(
     dashboard_path: str | None = "/cayu",
     auth: AuthDependency | None = None,
     api_base_url: str = SERVER_API_PREFIX,
+    dashboard_config: dict[str, Any] | None = None,
     name: str = "dashboard",
 ) -> bool:
     """Mount the built CAYU dashboard on a FastAPI app.
@@ -256,6 +264,7 @@ def mount_dashboard(
             auth=auth,
             base_path=mount_path,
             api_base_url=api_url,
+            dashboard_config=dashboard_config,
         ),
         name=name,
     )

@@ -3197,6 +3197,13 @@
             }
           ]
         },
+        "model_breakdown": {
+          "items": {
+            "$ref": "#/components/schemas/UsageBreakdownItem"
+          },
+          "title": "Model Breakdown",
+          "type": "array"
+        },
         "next_cursor": {
           "anyOf": [
             {
@@ -3207,6 +3214,13 @@
             }
           ],
           "title": "Next Cursor"
+        },
+        "provider_breakdown": {
+          "items": {
+            "$ref": "#/components/schemas/UsageBreakdownItem"
+          },
+          "title": "Provider Breakdown",
+          "type": "array"
         },
         "session_count": {
           "minimum": 0.0,
@@ -3872,6 +3886,55 @@
         "metadata"
       ],
       "title": "UpdateSessionMetadataBody",
+      "type": "object"
+    },
+    "UsageBreakdownItem": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/UsageMetrics"
+        }
+      },
+      "required": [
+        "provider_name",
+        "model",
+        "session_count",
+        "model_steps",
+        "usage"
+      ],
+      "title": "UsageBreakdownItem",
       "type": "object"
     },
     "UsageMetrics": {

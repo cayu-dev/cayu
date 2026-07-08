@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link, Outlet, useRouterState } from "@tanstack/react-router"
-import { AlertTriangle, BookOpenCheck, LayoutDashboard, List, Play } from "lucide-react"
+import { AlertTriangle, BarChart3, BookOpenCheck, LayoutDashboard, List, Play } from "lucide-react"
 import {
   fetchServerContract,
   isSupportedServerContract,
@@ -12,6 +12,7 @@ import { cn } from "./lib/utils"
 const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/sessions", label: "Sessions", icon: List },
+  { to: "/usage", label: "Usage", icon: BarChart3 },
   { to: "/knowledge", label: "Knowledge", icon: BookOpenCheck },
   { to: "/run", label: "New Run", icon: Play },
 ] as const

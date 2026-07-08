@@ -23,6 +23,8 @@ from cayu import (
     KnowledgeEntry,
     KnowledgeStatus,
     Message,
+    ModelPricing,
+    PricingCatalog,
     RunRequest,
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
@@ -41,6 +43,17 @@ from cayu.tools import UserInputTool
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-pending-actions"
 DB_DIR = WORKSPACE / ".cayu"
 
+DEMO_PRICING = PricingCatalog(
+    prices=(
+        ModelPricing(
+            provider_name="fake",
+            model="fake-model",
+            input_per_million="1.00",
+            output_per_million="3.00",
+        ),
+    )
+)
+
 
 class DashboardDemoProvider(ModelProvider):
     """Deterministic provider that creates dashboard-friendly session states."""
@@ -51,16 +64,7 @@ class DashboardDemoProvider(ModelProvider):
         prompt = _request_text(request).lower()
         if _has_tool_result(request):
             yield ModelStreamEvent.text_delta(_final_text(prompt))
-            yield ModelStreamEvent.completed(
-                {
-                    "finish_reason": "stop",
-                    "usage": {
-                        "input_tokens": 220,
-                        "output_tokens": 48,
-                        "total_tokens": 268,
-                    },
-                }
-            )
+            yield ModelStreamEvent.completed(_completed_payload("stop", input_tokens=220, output_tokens=48))
             return
 
         if "provider failure" in prompt:
@@ -76,7 +80,9 @@ class DashboardDemoProvider(ModelProvider):
                     "risk": "demo policy blocks production deployment",
                 },
             )
-            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            yield ModelStreamEvent.completed(
+                _completed_payload("tool_calls", input_tokens=180, output_tokens=18)
+            )
             return
 
         if "approval" in prompt:
@@ -89,7 +95,9 @@ class DashboardDemoProvider(ModelProvider):
                     "risk": "writes external production state",
                 },
             )
-            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            yield ModelStreamEvent.completed(
+                _completed_payload("tool_calls", input_tokens=185, output_tokens=20)
+            )
             return
 
         if "question" in prompt or "user input" in prompt:
@@ -101,7 +109,9 @@ class DashboardDemoProvider(ModelProvider):
                     "options": ["staging", "production"],
                 },
             )
-            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            yield ModelStreamEvent.completed(
+                _completed_payload("tool_calls", input_tokens=170, output_tokens=16)
+            )
             return
 
         if "failure" in prompt:
@@ -110,7 +120,9 @@ class DashboardDemoProvider(ModelProvider):
                 name="failing_health_check",
                 arguments={"service": "billing-worker"},
             )
-            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            yield ModelStreamEvent.completed(
+                _completed_payload("tool_calls", input_tokens=165, output_tokens=14)
+            )
             return
 
         yield ModelStreamEvent.tool_call(
@@ -118,7 +130,9 @@ class DashboardDemoProvider(ModelProvider):
             name="echo",
             arguments={"text": "Collected run telemetry for dashboard inspection."},
         )
-        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+        yield ModelStreamEvent.completed(
+            _completed_payload("tool_calls", input_tokens=150, output_tokens=12)
+        )
 
 
 class EchoTool(Tool):
@@ -186,6 +200,17 @@ def _request_text(request: ModelRequest) -> str:
 
 def _has_tool_result(request: ModelRequest) -> bool:
     return any(message.role == "tool" for message in request.messages)
+
+
+def _completed_payload(finish_reason: str, *, input_tokens: int, output_tokens: int) -> dict:
+    return {
+        "finish_reason": finish_reason,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+    }
 
 
 def _final_text(prompt: str) -> str:
@@ -379,7 +404,11 @@ def main() -> None:
     app = build_app()
     asyncio.run(seed_sessions(app))
     asyncio.run(seed_pending_knowledge(app.knowledge_store))
-    server = create_server(app, dev=True)
+    server = create_server(
+        app,
+        dev=True,
+        dashboard_config={"pricingCatalog": DEMO_PRICING.model_dump(mode="json")},
+    )
     host = os.environ.get("CAYU_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("CAYU_DASHBOARD_PORT", "8001"))
     print(f"Dashboard demo ready: http://{host}:{port}/cayu/", flush=True)

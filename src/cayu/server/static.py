@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
@@ -30,6 +31,7 @@ class DashboardStaticFiles(StaticFiles):
         auth: AuthDependency | None = None,
         base_path: str = "/",
         api_base_url: str = "/api",
+        dashboard_config: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(directory=directory, html=html, **kwargs)
@@ -41,6 +43,7 @@ class DashboardStaticFiles(StaticFiles):
             base=self._base_path,
             child=self._api_base_url,
         )
+        self._dashboard_config = dict(dashboard_config or {})
 
     async def get_response(self, path: str, scope: Scope):
         if _is_excluded_path(path, self._excluded_api_path):
@@ -71,6 +74,7 @@ class DashboardStaticFiles(StaticFiles):
                 text,
                 base_path=self._base_path,
                 api_base_url=self._api_base_url,
+                dashboard_config=self._dashboard_config,
             ),
             media_type="text/html",
         )
@@ -99,9 +103,12 @@ def _inject_dashboard_config(
     *,
     base_path: str,
     api_base_url: str,
+    dashboard_config: dict[str, Any] | None = None,
 ) -> str:
+    config = dict(dashboard_config or {})
+    config.update({"basePath": base_path, "apiBaseUrl": api_base_url})
     config_json = json.dumps(
-        {"basePath": base_path, "apiBaseUrl": api_base_url},
+        jsonable_encoder(config),
         separators=(",", ":"),
     ).replace("<", "\\u003c")
     script = f"<script>window.__CAYU_DASHBOARD_CONFIG__={config_json};</script>"

@@ -1,6 +1,9 @@
+import type { PricingCatalog } from "./generated/server-api"
+
 export type DashboardConfig = {
   basePath: string
   apiBaseUrl: string
+  pricingCatalog: PricingCatalog | null
 }
 
 declare global {
@@ -12,6 +15,7 @@ declare global {
 export const dashboardConfig: DashboardConfig = {
   basePath: normalizePublicPath(window.__CAYU_DASHBOARD_CONFIG__?.basePath ?? "/"),
   apiBaseUrl: normalizePublicUrl(window.__CAYU_DASHBOARD_CONFIG__?.apiBaseUrl ?? "/api"),
+  pricingCatalog: window.__CAYU_DASHBOARD_CONFIG__?.pricingCatalog ?? null,
 }
 
 export function apiUrl(path: string): string {
