@@ -5,6 +5,7 @@ import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { fetchSessions, fetchTasks } from "../lib/api"
+import { formatDateTime } from "../lib/format"
 
 function StatusBadge({ status }: { status: string }) {
   const variant =
@@ -39,7 +40,7 @@ export function DashboardPage() {
         </Link>
       </div>
 
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
           { icon: Activity, label: "Total Sessions", value: list.length },
           { icon: Clock, label: "Running", value: running },
@@ -58,7 +59,7 @@ export function DashboardPage() {
         ))}
       </div>
 
-      <div className="grid grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>Recent Sessions</CardTitle>
@@ -82,15 +83,17 @@ export function DashboardPage() {
                     key={s.id}
                     to="/sessions/$sessionId"
                     params={{ sessionId: s.id }}
-                    className="flex items-center justify-between p-3 rounded-md hover:bg-muted transition-colors no-underline text-foreground"
+                    className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
                   >
-                    <div>
-                      <div className="font-mono text-sm">{s.id}</div>
+                    <div className="min-w-0">
+                      <div className="truncate font-mono text-sm">{s.id}</div>
                       <div className="text-xs text-muted-foreground">
-                        {new Date(s.created_at).toLocaleString()}
+                        {formatDateTime(s.created_at)}
                       </div>
                     </div>
-                    <StatusBadge status={s.status} />
+                    <div className="shrink-0">
+                      <StatusBadge status={s.status} />
+                    </div>
                   </Link>
                 ))}
               </div>
@@ -112,15 +115,17 @@ export function DashboardPage() {
                 {taskList.slice(0, 8).map((t) => (
                   <div
                     key={t.id}
-                    className="flex items-center justify-between p-3 rounded-md bg-muted/50"
+                    className="flex items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
                   >
-                    <div>
-                      <div className="text-sm">{t.title || t.type}</div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm">{t.title || t.type}</div>
                       <div className="text-xs text-muted-foreground">
-                        {new Date(t.created_at).toLocaleString()}
+                        {formatDateTime(t.created_at)}
                       </div>
                     </div>
-                    <StatusBadge status={t.status} />
+                    <div className="shrink-0">
+                      <StatusBadge status={t.status} />
+                    </div>
                   </div>
                 ))}
               </div>

@@ -10,8 +10,8 @@ import type {
   ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
   GetContractApiContractGetResponse,
   GetSessionApiSessionsSessionIdGetResponse,
+  GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   ListSessionsApiSessionsGetResponse,
-  ListTasksApiTasksGetResponse,
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
@@ -38,6 +38,7 @@ export type Session = ApiSessionBase
 export type SessionEvent = ApiSessionDetailEvent
 export type TranscriptMessage = ApiSessionDetailTranscriptMessage
 export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
+export type SessionSummary = GetSessionSummaryApiSessionsSessionIdSummaryGetResponse
 export type Task = ApiTaskListItem
 export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
 export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
@@ -49,6 +50,12 @@ type ErrorEnvelope = {
   detail?: unknown
   error?: unknown
   message?: unknown
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -116,20 +123,37 @@ export async function fetchServerContract(): Promise<ServerContract> {
 
 export async function fetchSessions(): Promise<Session[]> {
   // GET /api/sessions returns a paginated envelope; the dashboard shows the first page.
-  const page = await requestJson<ListSessionsApiSessionsGetResponse>("/sessions")
-  return page.sessions
+  const page = await requestJson<unknown>("/sessions")
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.sessions)) {
+    throw new Error("Unexpected /sessions response.")
+  }
+  return (pageObject as ListSessionsApiSessionsGetResponse).sessions
 }
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
   return requestJson<SessionDetail>(`/sessions/${id}`)
 }
 
+export async function fetchSessionSummary(id: string): Promise<SessionSummary> {
+  return requestJson<SessionSummary>(`/sessions/${id}/summary`)
+}
+
 export async function fetchTasks(): Promise<Task[]> {
-  return requestJson<ListTasksApiTasksGetResponse>("/tasks")
+  const tasks = await requestJson<unknown>("/tasks")
+  if (!Array.isArray(tasks)) {
+    throw new Error("Unexpected /tasks response.")
+  }
+  return tasks as Task[]
 }
 
 export async function fetchPendingKnowledge(): Promise<KnowledgePendingPage> {
-  return requestJson<KnowledgePendingPage>("/knowledge/pending")
+  const page = await requestJson<unknown>("/knowledge/pending")
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.entries)) {
+    throw new Error("Unexpected /knowledge/pending response.")
+  }
+  return pageObject as KnowledgePendingPage
 }
 
 export async function fetchPendingKnowledgeEntry(entryId: string): Promise<KnowledgeEntryDetail> {

@@ -12,6 +12,7 @@ import {
   TableRow,
 } from "../components/ui/table"
 import { fetchSessions } from "../lib/api"
+import { formatDateTime } from "../lib/format"
 
 function StatusBadge({ status }: { status: string }) {
   const variant =
@@ -93,7 +94,7 @@ export function SessionsPage() {
                       <StatusBadge status={s.status} />
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground">
-                      {new Date(s.created_at).toLocaleString()}
+                      {formatDateTime(s.created_at)}
                     </TableCell>
                   </TableRow>
                 ))

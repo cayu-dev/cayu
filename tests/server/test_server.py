@@ -101,7 +101,7 @@ def test_server_run_failure_before_session_does_not_strand_pending_task() -> Non
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    client = TestClient(create_server(app))
+    client = TestClient(create_server(app, dev=True))
 
     # Unsupported NATIVE structured output fails before any session exists; the
     # route-created task must end failed, not sit pending with no session.

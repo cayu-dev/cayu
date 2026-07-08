@@ -242,7 +242,9 @@ def mount_dashboard(
 
     mount_path = _normalize_dashboard_path(dashboard_path, api_path=None)
     api_url = _normalize_api_base_url(api_base_url)
-    dist_path = Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).parent / "dashboard"
+    dist_path = (
+        Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).parent / "dashboard"
+    )
     if not dist_path.exists():
         return False
 

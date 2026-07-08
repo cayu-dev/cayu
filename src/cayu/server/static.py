@@ -104,11 +104,7 @@ def _inject_dashboard_config(
         {"basePath": base_path, "apiBaseUrl": api_base_url},
         separators=(",", ":"),
     ).replace("<", "\\u003c")
-    script = (
-        "<script>"
-        f"window.__CAYU_DASHBOARD_CONFIG__={config_json};"
-        "</script>"
-    )
+    script = f"<script>window.__CAYU_DASHBOARD_CONFIG__={config_json};</script>"
     if _HEAD_END in html:
         return html.replace(_HEAD_END, f"{script}{_HEAD_END}", 1)
     return f"{script}{html}"

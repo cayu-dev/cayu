@@ -5,6 +5,7 @@ import { Button } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Textarea } from "../components/ui/textarea"
 import { type SSEEvent, streamRun } from "../lib/api"
+import { formatCount, modelUsagePayload, numericValue } from "../lib/format"
 
 function LiveEvent({ event }: { event: SSEEvent }) {
   const icons: Record<string, React.ReactNode> = {
@@ -18,8 +19,12 @@ function LiveEvent({ event }: { event: SSEEvent }) {
   let text = event.type
   if (event.tool_name) text += ` — ${event.tool_name}`
   if (event.type === "model.completed") {
-    const usage = event.payload.usage as Record<string, number> | undefined
-    if (usage) text = `model.completed (${usage.input_tokens} in / ${usage.output_tokens} out)`
+    const usage = modelUsagePayload(event.payload)
+    const inputTokens = numericValue(usage.input_tokens)
+    const outputTokens = numericValue(usage.output_tokens)
+    if (inputTokens > 0 || outputTokens > 0) {
+      text = `model.completed (${formatCount(inputTokens)} in / ${formatCount(outputTokens)} out)`
+    }
   }
   if (event.type === "session.completed") text = "Session completed"
   if (event.type === "session.failed") text = `Session failed: ${event.payload.error || "unknown"}`
@@ -80,7 +85,7 @@ export function RunPage() {
   const lastSessionId = events.at(-1)?.session_id ?? null
 
   return (
-    <div className="flex flex-col h-[calc(100vh-4rem)] gap-6">
+    <div className="flex h-[calc(100vh-4rem)] flex-col gap-6">
       <h1 className="text-2xl font-bold tracking-tight">New Run</h1>
 
       <Card>
@@ -107,8 +112,8 @@ export function RunPage() {
       </Card>
 
       {events.length > 0 && (
-        <div className="grid grid-cols-2 gap-6 flex-1 min-h-0">
-          <Card className="flex flex-col min-h-0">
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 xl:grid-cols-2">
+          <Card className="flex min-h-0 flex-col">
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
                 <CardTitle className="text-base">Events</CardTitle>
@@ -116,7 +121,7 @@ export function RunPage() {
                   <Button
                     variant="link"
                     size="sm"
-                    className="text-xs p-0 h-auto"
+                    className="h-auto p-0 text-xs"
                     onClick={() =>
                       navigate({ to: "/sessions/$sessionId", params: { sessionId: lastSessionId } })
                     }
@@ -126,7 +131,7 @@ export function RunPage() {
                 )}
               </div>
             </CardHeader>
-            <CardContent className="p-0 flex-1 min-h-0">
+            <CardContent className="min-h-0 flex-1 p-0">
               <div className="h-full overflow-auto px-4 py-2">
                 {events
                   .filter((e) => e.type !== "model.text.delta")
@@ -138,13 +143,13 @@ export function RunPage() {
             </CardContent>
           </Card>
 
-          <Card className="flex flex-col min-h-0">
+          <Card className="flex min-h-0 flex-col">
             <CardHeader className="pb-3">
               <CardTitle className="text-base">Agent Output</CardTitle>
             </CardHeader>
-            <CardContent className="p-0 flex-1 min-h-0">
+            <CardContent className="min-h-0 flex-1 p-0">
               <div className="h-full overflow-auto p-4">
-                <pre className="text-sm whitespace-pre-wrap font-sans">
+                <pre className="whitespace-pre-wrap break-words font-sans text-sm">
                   {textOutput || "Waiting for output..."}
                 </pre>
                 <div ref={outputEndRef} />

@@ -19,6 +19,7 @@ import {
   type KnowledgeEntryDetail,
   rejectKnowledge,
 } from "../lib/api"
+import { formatDateTime } from "../lib/format"
 
 function Labels({ labels }: { labels: Record<string, string> }) {
   const entries = Object.entries(labels)
@@ -91,7 +92,7 @@ function MetadataBlock({ metadata }: { metadata: Record<string, unknown> }) {
     return <span className="text-muted-foreground">-</span>
   }
   return (
-    <pre className="max-h-56 overflow-auto rounded-md border bg-muted/30 p-3 text-xs">
+    <pre className="max-h-56 overflow-auto rounded-md border border-border bg-muted/30 p-3 text-xs">
       {JSON.stringify(metadata, null, 2)}
     </pre>
   )
@@ -149,12 +150,12 @@ function KnowledgeDetail({
         <DetailRow label="Aspects" value={<Aspects aspects={entry.aspects} />} />
         <DetailRow label="Source" value={entry.source_type || "-"} />
         <DetailRow label="Source ID" value={entry.source_id || "-"} />
-        <DetailRow label="Created" value={new Date(entry.created_at).toLocaleString()} />
+        <DetailRow label="Created" value={formatDateTime(entry.created_at)} />
       </div>
 
       <div>
         <div className="mb-2 text-sm font-medium">Text</div>
-        <div className="max-h-[24rem] overflow-auto whitespace-pre-wrap rounded-md border bg-background p-4 text-sm">
+        <div className="max-h-[24rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-4 text-sm">
           {entry.text}
         </div>
       </div>
@@ -166,14 +167,17 @@ function KnowledgeDetail({
             <div className="text-sm text-muted-foreground">No chunks available</div>
           ) : (
             entry.chunks.map((chunk) => (
-              <div key={chunk.chunk_id} className="rounded-md border bg-background p-3">
+              <div
+                key={chunk.chunk_id}
+                className="rounded-md border border-border bg-background p-3"
+              >
                 <div className="mb-2 flex items-center justify-between gap-3">
                   <Badge variant="outline">#{chunk.chunk_index}</Badge>
                   <span className="truncate font-mono text-xs text-muted-foreground">
                     {chunk.chunk_id}
                   </span>
                 </div>
-                <div className="max-h-44 overflow-auto whitespace-pre-wrap text-sm">
+                <div className="max-h-44 overflow-auto whitespace-pre-wrap break-words text-sm">
                   {chunk.text}
                 </div>
               </div>
@@ -318,7 +322,7 @@ export function KnowledgePage() {
                         <Aspects aspects={entry.aspects} />
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
-                        {new Date(entry.created_at).toLocaleString()}
+                        {formatDateTime(entry.created_at)}
                       </TableCell>
                       <TableCell onClick={(event) => event.stopPropagation()}>
                         <EntryActions

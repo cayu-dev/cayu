@@ -88,9 +88,7 @@ def main() -> None:
 def _server_auth() -> BasicAuth:
     password = os.environ.get("CAYU_SERVER_PASSWORD")
     if not password:
-        raise RuntimeError(
-            "Set CAYU_SERVER_PASSWORD before starting examples/server_example.py."
-        )
+        raise RuntimeError("Set CAYU_SERVER_PASSWORD before starting examples/server_example.py.")
     return BasicAuth(
         username=os.environ.get("CAYU_SERVER_USERNAME", "admin"),
         password=password,
