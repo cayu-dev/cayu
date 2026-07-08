@@ -158,6 +158,17 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
             ),
             identity=_identity(),
         )
+        await store.create(
+            RunRequest(
+                agent_name="operator",
+                session_id="sess_openai_operator",
+                causal_budget_id="job_ops",
+                environment_name="sandbox",
+                labels={"marker": "literal%token", "workflow": "pr-review"},
+                messages=[Message.text("user", "review PR")],
+            ),
+            identity=SessionIdentity(provider_name="openai", model="gpt-5.5"),
+        )
         await store.update_status("sess_builder_1", SessionStatus.RUNNING)
         await store.update_status("sess_builder_2", SessionStatus.COMPLETED)
 
@@ -187,6 +198,30 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
                 SessionQuery(causal_budget_id="job_build", order_by=SessionOrder.CREATED_AT_ASC)
             )
         ).sessions
+        openai_sessions = (
+            await store.list_sessions(
+                SessionQuery(provider_name="openai", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        model_sessions = (
+            await store.list_sessions(
+                SessionQuery(model="gpt-5.5", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        query_by_agent_sessions = (
+            await store.list_sessions(SessionQuery(q="OPER", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
+        query_by_model_sessions = (
+            await store.list_sessions(SessionQuery(q="gpt-5", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
+        query_by_label_sessions = (
+            await store.list_sessions(
+                SessionQuery(q="pr-review", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        query_by_literal_percent_sessions = (
+            await store.list_sessions(SessionQuery(q="%", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
 
         assert [session.id for session in builder_sessions] == [
             "sess_builder_1",
@@ -201,6 +236,14 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         assert [session.id for session in causal_sessions] == [
             "sess_builder_1",
             "sess_builder_2",
+        ]
+        assert [session.id for session in openai_sessions] == ["sess_openai_operator"]
+        assert [session.id for session in model_sessions] == ["sess_openai_operator"]
+        assert [session.id for session in query_by_agent_sessions] == ["sess_openai_operator"]
+        assert [session.id for session in query_by_model_sessions] == ["sess_openai_operator"]
+        assert [session.id for session in query_by_label_sessions] == ["sess_openai_operator"]
+        assert [session.id for session in query_by_literal_percent_sessions] == [
+            "sess_openai_operator"
         ]
         await _close_store(store)
 

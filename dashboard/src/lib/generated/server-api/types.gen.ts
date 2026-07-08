@@ -2601,6 +2601,10 @@ export type ListSessionsApiSessionsGetData = {
          */
         cursor?: string | null;
         /**
+         * Q
+         */
+        q?: string | null;
+        /**
          * Status
          */
         status?: SessionStatus | null;
@@ -2608,6 +2612,14 @@ export type ListSessionsApiSessionsGetData = {
          * Agent Name
          */
         agent_name?: string | null;
+        /**
+         * Provider Name
+         */
+        provider_name?: string | null;
+        /**
+         * Model
+         */
+        model?: string | null;
         /**
          * Environment Name
          */
@@ -2667,6 +2679,10 @@ export type GetSessionsSummaryApiSessionsSummaryPostData = {
          */
         offset?: number;
         /**
+         * Q
+         */
+        q?: string | null;
+        /**
          * Status
          */
         status?: SessionStatus | null;
@@ -2674,6 +2690,14 @@ export type GetSessionsSummaryApiSessionsSummaryPostData = {
          * Agent Name
          */
         agent_name?: string | null;
+        /**
+         * Provider Name
+         */
+        provider_name?: string | null;
+        /**
+         * Model
+         */
+        model?: string | null;
         /**
          * Environment Name
          */

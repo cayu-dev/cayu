@@ -77,6 +77,11 @@ _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _T = TypeVar("_T")
 
 
+def _like_contains_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
     row = connection.execute(
         "SELECT 1 FROM cayu_sessions WHERE id = ?",
@@ -1081,12 +1086,43 @@ class SQLiteSessionStore(SessionStore):
         clauses: list[str] = []
         params: list[object] = []
 
+        if query.q is not None:
+            like = _like_contains_pattern(query.q)
+            clauses.append(
+                """
+                (
+                    id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR agent_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR provider_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR model COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR environment_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR parent_session_id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR causal_budget_id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM cayu_session_labels
+                        WHERE cayu_session_labels.session_id = cayu_sessions.id
+                          AND (
+                            cayu_session_labels.key COLLATE NOCASE LIKE ? ESCAPE '\\'
+                            OR cayu_session_labels.value COLLATE NOCASE LIKE ? ESCAPE '\\'
+                          )
+                    )
+                )
+                """
+            )
+            params.extend([like, like, like, like, like, like, like, like, like])
         if query.status is not None:
             clauses.append("status = ?")
             params.append(str(query.status))
         if query.agent_name is not None:
             clauses.append("agent_name = ?")
             params.append(query.agent_name)
+        if query.provider_name is not None:
+            clauses.append("provider_name = ?")
+            params.append(query.provider_name)
+        if query.model is not None:
+            clauses.append("model = ?")
+            params.append(query.model)
         if query.environment_name is not None:
             clauses.append("environment_name = ?")
             params.append(query.environment_name)

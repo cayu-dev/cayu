@@ -11,7 +11,11 @@ import type {
   GetContractApiContractGetResponse,
   GetSessionApiSessionsSessionIdGetResponse,
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
+  GetSessionsSummaryApiSessionsSummaryPostData,
+  GetSessionsSummaryApiSessionsSummaryPostResponse,
+  ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
+  ListTasksApiTasksGetData,
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
@@ -39,7 +43,14 @@ export type SessionEvent = ApiSessionDetailEvent
 export type TranscriptMessage = ApiSessionDetailTranscriptMessage
 export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
 export type SessionSummary = GetSessionSummaryApiSessionsSessionIdSummaryGetResponse
+export type SessionsSummary = GetSessionsSummaryApiSessionsSummaryPostResponse
+export type SessionListQuery = NonNullable<ListSessionsApiSessionsGetData["query"]>
+export type SessionsSummaryQuery = NonNullable<
+  GetSessionsSummaryApiSessionsSummaryPostData["query"]
+>
+export type SessionsPage = ListSessionsApiSessionsGetResponse
 export type Task = ApiTaskListItem
+export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
 export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
 export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
 export type KnowledgeChunk = ApiKnowledgeChunk
@@ -56,6 +67,24 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null
+}
+
+function queryString(query: Record<string, unknown> = {}): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item !== undefined && item !== null && item !== "") {
+          params.append(key, String(item))
+        }
+      }
+      continue
+    }
+    params.set(key, String(value))
+  }
+  const encoded = params.toString()
+  return encoded ? `?${encoded}` : ""
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -121,14 +150,28 @@ export async function fetchServerContract(): Promise<ServerContract> {
   return requestJson<ServerContract>("/contract")
 }
 
-export async function fetchSessions(): Promise<Session[]> {
+export async function fetchSessions(query: SessionListQuery = {}): Promise<Session[]> {
   // GET /api/sessions returns a paginated envelope; the dashboard shows the first page.
-  const page = await requestJson<unknown>("/sessions")
+  const page = await fetchSessionsPage(query)
+  return page.sessions
+}
+
+export async function fetchSessionsPage(query: SessionListQuery = {}): Promise<SessionsPage> {
+  const page = await requestJson<unknown>(`/sessions${queryString(query)}`)
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.sessions)) {
     throw new Error("Unexpected /sessions response.")
   }
-  return (pageObject as ListSessionsApiSessionsGetResponse).sessions
+  return pageObject as ListSessionsApiSessionsGetResponse
+}
+
+export async function fetchSessionsSummary(
+  query: SessionsSummaryQuery = {},
+): Promise<SessionsSummary> {
+  return requestJson<SessionsSummary>(`/sessions/summary${queryString(query)}`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  })
 }
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
@@ -139,8 +182,8 @@ export async function fetchSessionSummary(id: string): Promise<SessionSummary> {
   return requestJson<SessionSummary>(`/sessions/${id}/summary`)
 }
 
-export async function fetchTasks(): Promise<Task[]> {
-  const tasks = await requestJson<unknown>("/tasks")
+export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
+  const tasks = await requestJson<unknown>(`/tasks${queryString(query)}`)
   if (!Array.isArray(tasks)) {
     throw new Error("Unexpected /tasks response.")
   }

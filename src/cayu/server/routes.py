@@ -1142,8 +1142,11 @@ def create_router(
         limit: Annotated[int, Query(ge=1, le=1000)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
         cursor: Annotated[str | None, Query()] = None,
+        q: Annotated[str | None, Query()] = None,
         status: SessionStatus | None = None,
         agent_name: str | None = None,
+        provider_name: str | None = None,
+        model: str | None = None,
         environment_name: str | None = None,
         parent_session_id: str | None = None,
         causal_budget_id: str | None = None,
@@ -1156,8 +1159,11 @@ def create_router(
         try:
             result = await session_store.list_sessions(
                 SessionQuery(
+                    q=_clean_optional_query_value(q, "q"),
                     status=status,
                     agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                    provider_name=_clean_optional_query_value(provider_name, "provider_name"),
+                    model=_clean_optional_query_value(model, "model"),
                     environment_name=_clean_optional_query_value(
                         environment_name,
                         "environment_name",
@@ -1196,8 +1202,11 @@ def create_router(
         body: SessionsSummaryBody | None = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
         offset: Annotated[int, Query(ge=0)] = 0,
+        q: Annotated[str | None, Query()] = None,
         status: SessionStatus | None = None,
         agent_name: str | None = None,
+        provider_name: str | None = None,
+        model: str | None = None,
         environment_name: str | None = None,
         parent_session_id: str | None = None,
         causal_budget_id: str | None = None,
@@ -1211,8 +1220,11 @@ def create_router(
         sessions = (
             await session_store.list_sessions(
                 SessionQuery(
+                    q=_clean_optional_query_value(q, "q"),
                     status=status,
                     agent_name=_clean_optional_query_value(agent_name, "agent_name"),
+                    provider_name=_clean_optional_query_value(provider_name, "provider_name"),
+                    model=_clean_optional_query_value(model, "model"),
                     environment_name=_clean_optional_query_value(
                         environment_name,
                         "environment_name",

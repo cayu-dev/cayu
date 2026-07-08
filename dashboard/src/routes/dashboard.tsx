@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
-import { Activity, CheckCircle, Clock, XCircle } from "lucide-react"
+import { Activity, AlertTriangle, CheckCircle, Database, ListTodo, XCircle } from "lucide-react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
-import { fetchSessions, fetchTasks } from "../lib/api"
-import { formatDateTime } from "../lib/format"
+import { fetchSessionsSummary, fetchTasks, type Session, type Task } from "../lib/api"
+import { formatCount, formatDateTime, numericValue } from "../lib/format"
 
 function StatusBadge({ status }: { status: string }) {
   const variant =
@@ -20,17 +20,56 @@ function StatusBadge({ status }: { status: string }) {
   return <Badge variant={variant}>{status}</Badge>
 }
 
-export function DashboardPage() {
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: fetchSessions })
-  const tasks = useQuery({ queryKey: ["tasks"], queryFn: fetchTasks })
+function isActiveSession(session: Session) {
+  return ["pending", "running", "interrupting"].includes(session.status)
+}
 
-  const list = sessions.data || []
+function isActiveTask(task: Task) {
+  return ["pending", "claimed", "running", "paused", "blocked", "needs_attention"].includes(
+    task.status,
+  )
+}
+
+function needsAttentionTask(task: Task) {
+  return ["blocked", "needs_attention", "failed"].includes(task.status)
+}
+
+function needsAttentionSession(session: Session) {
+  return ["failed", "interrupted"].includes(session.status)
+}
+
+function latestEventLabel(value: unknown) {
+  if (typeof value === "string") return value
+  if (value && typeof value === "object" && "type" in value) {
+    const type = (value as { type?: unknown }).type
+    return typeof type === "string" ? type : "event"
+  }
+  return "no events"
+}
+
+export function DashboardPage() {
+  const summary = useQuery({
+    queryKey: ["sessions-summary", "dashboard"],
+    queryFn: () => fetchSessionsSummary({ limit: 25, order_by: "updated_at_desc" }),
+  })
+  const tasks = useQuery({
+    queryKey: ["tasks", "dashboard"],
+    queryFn: () => fetchTasks({ limit: 25 }),
+  })
+
+  const sessionItems = summary.data?.sessions || []
+  const list = sessionItems.map((item) => item.session)
   const taskList = tasks.data || []
-  const sessionsError = sessions.error instanceof Error ? sessions.error.message : null
+  const sessionsError = summary.error instanceof Error ? summary.error.message : null
   const tasksError = tasks.error instanceof Error ? tasks.error.message : null
-  const running = list.filter((s) => s.status === "running").length
+  const activeSessions = list.filter(isActiveSession)
+  const activeTasks = taskList.filter(isActiveTask)
   const completed = list.filter((s) => s.status === "completed").length
   const failed = list.filter((s) => s.status === "failed").length
+  const attentionTasks = taskList.filter(needsAttentionTask)
+  const attentionSessions = list.filter(needsAttentionSession)
+  const usage = summary.data?.usage.usage
+  const totalTokens = numericValue(usage?.total_tokens)
 
   return (
     <Page>
@@ -45,11 +84,31 @@ export function DashboardPage() {
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
-          { icon: Activity, label: "Total Sessions", value: list.length },
-          { icon: Clock, label: "Running", value: running },
-          { icon: CheckCircle, label: "Completed", value: completed },
-          { icon: XCircle, label: "Failed", value: failed },
-        ].map(({ icon: Icon, label, value }) => (
+          {
+            icon: Activity,
+            label: "Active Work",
+            value: activeSessions.length + activeTasks.length,
+            detail: `${activeSessions.length} sessions / ${activeTasks.length} tasks`,
+          },
+          {
+            icon: CheckCircle,
+            label: "Completed",
+            value: completed,
+            detail: "sessions in current view",
+          },
+          {
+            icon: XCircle,
+            label: "Failed",
+            value: failed,
+            detail: "sessions in current view",
+          },
+          {
+            icon: Database,
+            label: "Tokens",
+            value: formatCount(totalTokens),
+            detail: `${formatCount(usage?.input_tokens)} in / ${formatCount(usage?.output_tokens)} out`,
+          },
+        ].map(({ icon: Icon, label, value, detail }) => (
           <Card key={label}>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">{label}</CardTitle>
@@ -57,6 +116,7 @@ export function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="text-3xl font-bold">{value}</div>
+              <div className="mt-1 truncate text-sm text-muted-foreground">{detail}</div>
             </CardContent>
           </Card>
         ))}
@@ -64,7 +124,7 @@ export function DashboardPage() {
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <DataCard title="Recent Sessions" contentClassName="p-4">
-          {sessions.isError ? (
+          {summary.isError ? (
             <StateMessage tone="danger" className="py-6">
               {sessionsError || "Failed to load sessions."}
             </StateMessage>
@@ -77,7 +137,7 @@ export function DashboardPage() {
             </StateMessage>
           ) : (
             <div className="space-y-2">
-              {list.slice(0, 8).map((s) => (
+              {sessionItems.slice(0, 8).map(({ session: s, events }) => (
                 <Link
                   key={s.id}
                   to="/sessions/$sessionId"
@@ -86,14 +146,67 @@ export function DashboardPage() {
                 >
                   <div className="min-w-0">
                     <div className="truncate font-mono text-sm">{s.id}</div>
-                    <div className="text-xs text-muted-foreground">
-                      {formatDateTime(s.created_at)}
+                    <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                      <span>{formatDateTime(s.updated_at || s.created_at)}</span>
+                      <span className="truncate">{s.agent_name}</span>
+                      <span className="truncate">{latestEventLabel(events.latest_event)}</span>
                     </div>
                   </div>
                   <div className="shrink-0">
                     <StatusBadge status={s.status} />
                   </div>
                 </Link>
+              ))}
+            </div>
+          )}
+        </DataCard>
+
+        <DataCard title="Needs Attention" contentClassName="p-4">
+          {summary.isError || tasks.isError ? (
+            <StateMessage tone="danger" className="py-6">
+              {sessionsError || tasksError || "Failed to load dashboard state."}
+            </StateMessage>
+          ) : attentionSessions.length === 0 && attentionTasks.length === 0 ? (
+            <StateMessage className="py-6">
+              No failed sessions, blocked tasks, or needs-attention tasks in the current view.
+            </StateMessage>
+          ) : (
+            <div className="space-y-2">
+              {attentionSessions.slice(0, 4).map((s) => (
+                <Link
+                  key={s.id}
+                  to="/sessions/$sessionId"
+                  params={{ sessionId: s.id }}
+                  className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 truncate text-sm font-medium">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+                      <span className="truncate">{s.id}</span>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {formatDateTime(s.updated_at || s.created_at)}
+                    </div>
+                  </div>
+                  <StatusBadge status={s.status} />
+                </Link>
+              ))}
+              {attentionTasks.slice(0, 6).map((t) => (
+                <div
+                  key={t.id}
+                  className="flex items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 truncate text-sm font-medium">
+                      <ListTodo className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate">{t.title || t.type}</span>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {t.status_reason || formatDateTime(t.created_at)}
+                    </div>
+                  </div>
+                  <StatusBadge status={t.status} />
+                </div>
               ))}
             </div>
           )}

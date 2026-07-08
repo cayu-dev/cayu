@@ -455,8 +455,11 @@ def copy_label_selector_requirements(
 class SessionQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    q: str | None = None
     status: SessionStatus | None = None
     agent_name: str | None = None
+    provider_name: str | None = None
+    model: str | None = None
     environment_name: str | None = None
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
@@ -483,7 +486,15 @@ class SessionQuery(BaseModel):
             raise ValueError("cursor and a non-zero offset cannot be combined.")
         return self
 
-    @field_validator("agent_name", "environment_name", "parent_session_id", "causal_budget_id")
+    @field_validator(
+        "q",
+        "agent_name",
+        "provider_name",
+        "model",
+        "environment_name",
+        "parent_session_id",
+        "causal_budget_id",
+    )
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -1855,8 +1866,11 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
     if type(query) is not SessionQuery:
         raise TypeError("Session queries must be SessionQuery instances.")
     return SessionQuery(
+        q=query.q,
         status=query.status,
         agent_name=query.agent_name,
+        provider_name=query.provider_name,
+        model=query.model,
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
@@ -1905,9 +1919,15 @@ def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:
 
 
 def _session_matches(session: Session, query: SessionQuery) -> bool:
+    if query.q is not None and not _session_query_text_matches(session, query.q):
+        return False
     if query.status is not None and session.status != query.status:
         return False
     if query.agent_name is not None and session.agent_name != query.agent_name:
+        return False
+    if query.provider_name is not None and session.provider_name != query.provider_name:
+        return False
+    if query.model is not None and session.model != query.model:
         return False
     if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
         return False
@@ -1921,6 +1941,26 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
             return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
+    )
+
+
+def _session_query_text_matches(session: Session, query: str) -> bool:
+    needle = query.casefold()
+    haystacks = [
+        session.id,
+        session.agent_name,
+        session.provider_name,
+        session.model,
+        session.environment_name,
+        session.parent_session_id,
+        session.causal_budget_id,
+        *session.labels.keys(),
+        *session.labels.values(),
+    ]
+    return any(
+        needle in value.casefold()
+        for value in haystacks
+        if type(value) is str and value
     )
 
 

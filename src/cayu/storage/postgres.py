@@ -173,6 +173,11 @@ _TASK_RETURNING_COLUMNS = (
 )
 
 
+def _ilike_contains_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 @dataclass(frozen=True)
 class PostgresEmbeddingBackfillResult:
     """Result of a bounded Postgres knowledge embedding backfill."""
@@ -3768,12 +3773,43 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         clauses: list[str] = []
         params: list[object] = []
 
+        if query.q is not None:
+            like = _ilike_contains_pattern(query.q)
+            clauses.append(
+                """
+                (
+                    id ILIKE %s ESCAPE '\\'
+                    OR agent_name ILIKE %s ESCAPE '\\'
+                    OR provider_name ILIKE %s ESCAPE '\\'
+                    OR model ILIKE %s ESCAPE '\\'
+                    OR environment_name ILIKE %s ESCAPE '\\'
+                    OR parent_session_id ILIKE %s ESCAPE '\\'
+                    OR causal_budget_id ILIKE %s ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM cayu_session_labels
+                        WHERE cayu_session_labels.session_id = cayu_sessions.id
+                          AND (
+                            cayu_session_labels.key ILIKE %s ESCAPE '\\'
+                            OR cayu_session_labels.value ILIKE %s ESCAPE '\\'
+                          )
+                    )
+                )
+                """
+            )
+            params.extend([like, like, like, like, like, like, like, like, like])
         if query.status is not None:
             clauses.append("status = %s")
             params.append(str(query.status))
         if query.agent_name is not None:
             clauses.append("agent_name = %s")
             params.append(query.agent_name)
+        if query.provider_name is not None:
+            clauses.append("provider_name = %s")
+            params.append(query.provider_name)
+        if query.model is not None:
+            clauses.append("model = %s")
+            params.append(query.model)
         if query.environment_name is not None:
             clauses.append("environment_name = %s")
             params.append(query.environment_name)

@@ -514,6 +514,16 @@ def test_postgres_session_store_lists_sessions_with_filters_and_pagination(postg
             ),
             identity=_identity(),
         )
+        await store.create(
+            RunRequest(
+                agent_name="operator",
+                session_id="sess_openai_operator",
+                environment_name="sandbox",
+                labels={"marker": "literal%token", "workflow": "pr-review"},
+                messages=[Message.text("user", "review PR")],
+            ),
+            identity=SessionIdentity(provider_name="openai", model="gpt-5.5"),
+        )
         await store.update_status("sess_builder_1", SessionStatus.RUNNING)
         await store.update_status("sess_builder_2", SessionStatus.COMPLETED)
 
@@ -535,11 +545,41 @@ def test_postgres_session_store_lists_sessions_with_filters_and_pagination(postg
                 SessionQuery(limit=1, offset=1, order_by=SessionOrder.CREATED_AT_ASC)
             )
         ).sessions
+        openai_sessions = (
+            await store.list_sessions(
+                SessionQuery(provider_name="openai", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        model_sessions = (
+            await store.list_sessions(
+                SessionQuery(model="gpt-5.5", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        query_by_agent_sessions = (
+            await store.list_sessions(SessionQuery(q="OPER", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
+        query_by_model_sessions = (
+            await store.list_sessions(SessionQuery(q="gpt-5", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
+        query_by_label_sessions = (
+            await store.list_sessions(
+                SessionQuery(q="pr-review", order_by=SessionOrder.CREATED_AT_ASC)
+            )
+        ).sessions
+        query_by_literal_percent_sessions = (
+            await store.list_sessions(SessionQuery(q="%", order_by=SessionOrder.CREATED_AT_ASC))
+        ).sessions
 
         assert [s.id for s in builder_sessions] == ["sess_builder_1", "sess_builder_2"]
         assert [s.id for s in hosted_sessions] == ["sess_builder_2", "sess_reviewer"]
         assert [s.id for s in completed_sessions] == ["sess_builder_2"]
         assert [s.id for s in paged_sessions] == ["sess_builder_2"]
+        assert [s.id for s in openai_sessions] == ["sess_openai_operator"]
+        assert [s.id for s in model_sessions] == ["sess_openai_operator"]
+        assert [s.id for s in query_by_agent_sessions] == ["sess_openai_operator"]
+        assert [s.id for s in query_by_model_sessions] == ["sess_openai_operator"]
+        assert [s.id for s in query_by_label_sessions] == ["sess_openai_operator"]
+        assert [s.id for s in query_by_literal_percent_sessions] == ["sess_openai_operator"]
 
     _run(postgres_dsn, ops)
 
