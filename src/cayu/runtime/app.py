@@ -278,6 +278,7 @@ from cayu.runtime.tool_policy import (
     taint_labels_from_metadata,
 )
 from cayu.runtime.usage import (
+    USAGE_BEARING_EVENT_TYPES,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
@@ -449,14 +450,14 @@ class _SessionUsageTracker:
     Run-limit and request-budget checks run at every phase boundary (before
     the model step, after the model step, before a tool round, and before each
     tool call). Instead of reloading and re-parsing the session's full event
-    log on every check, the tracker tail-queries only the usage-bearing event
-    types (``model.completed`` for token usage and cost, ``tool.call.started``
-    for the tool-call counter) appended after the last sequence it has seen
-    and folds them into an in-memory list. Events are append-only with
-    monotonically increasing sequences, so the tail can never miss an update.
+    log on every check, the tracker tail-queries all usage-bearing event types
+    (``model.completed`` for token usage and cost, ``tool.call.started`` for
+    the tool-call counter) in ONE store query per refresh, sharing one
+    sequence watermark. Events are append-only with monotonically increasing
+    sequences, so a single ordered tail read can never miss an update.
     """
 
-    _EVENT_TYPES = (EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED)
+    _EVENT_TYPES = USAGE_BEARING_EVENT_TYPES
 
     def __init__(self, app: CayuApp, *, session_id: str) -> None:
         self._app = app
@@ -465,19 +466,19 @@ class _SessionUsageTracker:
         self._events: list[Event] = []
 
     async def _new_usage_records(self) -> list[EventRecord]:
-        new_records: list[EventRecord] = []
-        for event_type in self._EVENT_TYPES:
-            new_records.extend(
-                await self._app._query_all_event_records(
-                    EventQuery(
-                        session_id=self._session_id,
-                        event_type=event_type,
-                        after_sequence=self._after_sequence,
-                    )
-                )
+        # INVARIANT: exactly one store query per refresh. Splitting this into
+        # per-type queries reintroduces a lost-event race: an event appended
+        # between two queries that share `_after_sequence` can land below the
+        # merged watermark and is skipped forever (undercounting spend — the
+        # a39851e -> 7cda7b9 regression, issue #101). Per-type filtering must
+        # happen store-side via `event_types`, never by re-querying per type.
+        return await self._app._query_all_event_records(
+            EventQuery(
+                session_id=self._session_id,
+                event_types=self._EVENT_TYPES,
+                after_sequence=self._after_sequence,
             )
-        new_records.sort(key=lambda record: record.sequence)
-        return new_records
+        )
 
     async def mark_current_position(self) -> None:
         """Move the cursor to the current event tail without counting history."""
@@ -2385,25 +2386,13 @@ class CayuApp:
         the event log — per-delta stream events in particular — is irrelevant
         to usage summaries and budget checks, so it is never loaded here.
         """
-        usage_event_records = await self._query_all_event_records(
+        records = await self._query_all_event_records(
             EventQuery(
                 session_id=session_id,
-                event_type=EventType.MODEL_COMPLETED,
+                event_types=USAGE_BEARING_EVENT_TYPES,
             )
         )
-        tool_event_records = await self._query_all_event_records(
-            EventQuery(
-                session_id=session_id,
-                event_type=EventType.TOOL_CALL_STARTED,
-            )
-        )
-        return [
-            record.event
-            for record in sorted(
-                [*usage_event_records, *tool_event_records],
-                key=lambda record: record.sequence,
-            )
-        ]
+        return [record.event for record in records]
 
     async def get_causal_budget_usage(
         self,
@@ -2418,25 +2407,13 @@ class CayuApp:
         )
         if not sessions:
             raise KeyError(f"Causal budget not found: {causal_budget_id}") from None
-        usage_event_records = await self._query_all_event_records(
+        records = await self._query_all_event_records(
             EventQuery(
                 causal_budget_id=causal_budget_id,
-                event_type=EventType.MODEL_COMPLETED,
+                event_types=USAGE_BEARING_EVENT_TYPES,
             )
         )
-        tool_event_records = await self._query_all_event_records(
-            EventQuery(
-                causal_budget_id=causal_budget_id,
-                event_type=EventType.TOOL_CALL_STARTED,
-            )
-        )
-        events = [
-            record.event
-            for record in sorted(
-                [*usage_event_records, *tool_event_records],
-                key=lambda record: record.sequence,
-            )
-        ]
+        events = [record.event for record in records]
         return causal_budget_usage_summary(
             causal_budget_id=causal_budget_id,
             session_ids=[session.id for session in sessions],
@@ -2478,6 +2455,7 @@ class CayuApp:
                     session_ids=query.session_ids,
                     causal_budget_id=query.causal_budget_id,
                     event_type=query.event_type,
+                    event_types=query.event_types,
                     agent_name=query.agent_name,
                     environment_name=query.environment_name,
                     workflow_name=query.workflow_name,

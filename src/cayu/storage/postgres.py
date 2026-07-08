@@ -208,6 +208,7 @@ def _event_query_with_session_ids(
         session_ids=session_ids,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
+        event_types=query.event_types,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,
@@ -3610,6 +3611,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if query.event_type is not None:
             clauses.append("cayu_events.event_type = %s")
             params.append(str(query.event_type))
+        if query.event_types:
+            placeholders = ", ".join("%s" for _ in query.event_types)
+            clauses.append(f"cayu_events.event_type IN ({placeholders})")
+            params.extend(str(event_type) for event_type in query.event_types)
         if query.agent_name is not None:
             clauses.append("cayu_events.agent_name = %s")
             params.append(query.agent_name)

@@ -784,6 +784,12 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         )
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
+        multi_type_records = await store.query_events(
+            EventQuery(
+                event_types=(EventType.SESSION_STARTED, EventType.TOOL_CALL_COMPLETED),
+                limit=10,
+            )
+        )
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
@@ -802,6 +808,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         ]
         assert [r.event.id for r in read_file_records] == ["event_2"]
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]
+        assert [r.event.id for r in multi_type_records] == ["event_1", "event_2", "event_4"]
         assert [r.event.id for r in cursor_records] == ["event_3", "event_4"]
 
         # A batch containing a duplicate event id must roll back atomically.

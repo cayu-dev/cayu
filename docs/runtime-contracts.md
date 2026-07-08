@@ -190,13 +190,20 @@ JSONL can be added later as an export/debug format. It should not be the primary
 Session stores expose two read surfaces:
 
 - `load_events(session_id)` returns the full event list for one session.
-- `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads.
+- `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
 
-The optional FastAPI server exposes the same event query surface at
+The runtime's usage accounting depends on `event_types`: it reads all
+usage-bearing types in one query sharing one sequence watermark, so per-type
+reads cannot skip events appended between them. Out-of-tree stores should
+implement `event_types`; a store that ignores it returns extra event types,
+which the usage folding tolerates but is a wider read than intended.
+
+The optional FastAPI server exposes the session event query endpoint at
 `GET /api/sessions/{session_id}/events`. The endpoint validates the session,
 accepts `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,
 `environment_name`, and `workflow_name` filters, and returns durable event
-records with `sequence`, `has_more`, and `next_sequence`. Clients should use
+records with `sequence`, `has_more`, and `next_sequence`; `event_types` is a
+runtime/store-level query field and is not exposed here. Clients should use
 this endpoint for timelines, logs, replay panes, and polling instead of fetching
 the full session when they only need events.
 

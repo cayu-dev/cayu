@@ -657,6 +657,124 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
     asyncio.run(run_store_operations())
 
 
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_query_events_with_multiple_event_types(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_multi_type",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            "sess_multi_type",
+            [
+                Event(
+                    id="event_delta",
+                    type=EventType.MODEL_TEXT_DELTA,
+                    session_id="sess_multi_type",
+                    payload={"delta": "noise"},
+                ),
+                Event(
+                    id="event_model",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_multi_type",
+                    payload={"finish_reason": "stop"},
+                ),
+                Event(
+                    id="event_tool",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="sess_multi_type",
+                    tool_name="echo",
+                    payload={"tool_call_id": "call_1"},
+                ),
+                Event(
+                    id="event_model_2",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_multi_type",
+                    payload={"finish_reason": "stop"},
+                ),
+            ],
+        )
+
+        usage_types = (EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED)
+        multi = await store.query_events(
+            EventQuery(session_id="sess_multi_type", event_types=usage_types, limit=10)
+        )
+        assert [record.event.id for record in multi] == [
+            "event_model",
+            "event_tool",
+            "event_model_2",
+        ]
+        assert [record.sequence for record in multi] == sorted(record.sequence for record in multi)
+
+        # `event_types` without a session filter exercises the type-index path.
+        unscoped = await store.query_events(EventQuery(event_types=usage_types, limit=10))
+        assert [record.event.id for record in unscoped] == [
+            "event_model",
+            "event_tool",
+            "event_model_2",
+        ]
+
+        # Combines with the sequence cursor.
+        after_first = await store.query_events(
+            EventQuery(
+                session_id="sess_multi_type",
+                event_types=usage_types,
+                after_sequence=multi[0].sequence,
+                limit=10,
+            )
+        )
+        assert [record.event.id for record in after_first] == ["event_tool", "event_model_2"]
+
+        # A single-element `event_types` matches the singular `event_type` query.
+        singular = await store.query_events(
+            EventQuery(
+                session_id="sess_multi_type",
+                event_type=EventType.MODEL_COMPLETED,
+                limit=10,
+            )
+        )
+        plural_single = await store.query_events(
+            EventQuery(
+                session_id="sess_multi_type",
+                event_types=(EventType.MODEL_COMPLETED,),
+                limit=10,
+            )
+        )
+        assert [record.event.id for record in plural_single] == [
+            record.event.id for record in singular
+        ]
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_event_query_event_types_validation() -> None:
+    with pytest.raises(ValidationError, match="not both"):
+        EventQuery(
+            event_type=EventType.MODEL_COMPLETED,
+            event_types=(EventType.TOOL_CALL_STARTED,),
+        )
+    with pytest.raises(ValidationError, match="sequence of event types"):
+        EventQuery(event_types="model.completed")
+    with pytest.raises(ValidationError, match="duplicates"):
+        EventQuery(event_types=(EventType.MODEL_COMPLETED, "model.completed"))
+    normalized = EventQuery(event_types=("model.completed", EventType.TOOL_CALL_STARTED))
+    assert normalized.event_types == (
+        EventType.MODEL_COMPLETED,
+        EventType.TOOL_CALL_STARTED,
+    )
+
+
 def test_sqlite_session_store_batches_large_event_session_id_queries(tmp_path, monkeypatch):
     import cayu.storage.sqlite as sqlite_module
 

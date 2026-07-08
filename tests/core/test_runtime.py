@@ -17823,7 +17823,11 @@ def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
     asyncio.run(run())
 
     assert store.load_events_called is False
-    assert [str(query.event_type) for query in store.event_queries] == [
+    # One query carrying all usage-bearing types: per-type queries sharing a
+    # watermark can skip events appended between them (issue #101).
+    assert len(store.event_queries) == 1
+    assert store.event_queries[0].event_type is None
+    assert [str(event_type) for event_type in store.event_queries[0].event_types] == [
         "model.completed",
         "tool.call.started",
     ]
@@ -17869,8 +17873,26 @@ def test_cayu_app_query_all_event_records_preserves_filters():
                 limit=1,
             )
         )
-
         assert [record.event.session_id for record in records] == ["query_all_b"]
+
+        # The paginator rebuilds the query field-by-field; a dropped
+        # `event_types` would silently widen usage reads (the delta leaks in).
+        await store.append_event(
+            "query_all_b",
+            Event(
+                type=EventType.MODEL_TEXT_DELTA,
+                session_id="query_all_b",
+                payload={"delta": "noise"},
+            ),
+        )
+        multi_type_records = await app._query_all_event_records(
+            EventQuery(
+                session_ids=("query_all_b",),
+                event_types=(EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED),
+                limit=1,
+            )
+        )
+        assert [record.event.type for record in multi_type_records] == [EventType.MODEL_COMPLETED]
 
     asyncio.run(run())
 
@@ -25967,6 +25989,180 @@ def test_parallel_tool_round_executes_calls_concurrently_by_default():
     tool_message = next(message for message in transcript if message.role == "tool")
     assert [part.tool_call_id for part in tool_message.content] == ["call_a", "call_b"]
     assert [part.content for part in tool_message.content] == ["a", "b"]
+
+
+def test_parallel_tool_round_composes_with_tool_call_limit_and_usage_counting():
+    # Composition pin for issue #101's real-world trigger: a genuinely
+    # concurrent tool round under RunLimits. The whole round is gated against
+    # limits BEFORE execution (mid-round re-evaluation is skipped), and the
+    # usage summary must count every tool.call.started the parallel round
+    # appended — the undercount the watermark race used to cause.
+    class RendezvousTool(Tool):
+        spec = ToolSpec(
+            name="rendezvous",
+            description="Wait until every call in the round has started.",
+            input_schema={
+                "type": "object",
+                "properties": {"slot": {"type": "string"}},
+                "required": ["slot"],
+            },
+        )
+
+        def __init__(self, expected_arrivals: int) -> None:
+            self.expected_arrivals = expected_arrivals
+            self.arrivals = 0
+            self.all_arrived = asyncio.Event()
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            self.arrivals += 1
+            if self.arrivals >= self.expected_arrivals:
+                self.all_arrived.set()
+            # Deadlocks under sequential execution: each call waits for the
+            # other call in the same round to start.
+            await asyncio.wait_for(self.all_arrived.wait(), timeout=2)
+            return ToolResult(content=args["slot"])
+
+    store = InMemorySessionStore()
+    tool = RendezvousTool(expected_arrivals=2)
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_a", name="rendezvous", arguments={"slot": "a"}),
+                ModelStreamEvent.tool_call(id="call_b", name="rendezvous", arguments={"slot": "b"}),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.tool_call(id="call_c", name="rendezvous", arguments={"slot": "c"}),
+                ModelStreamEvent.tool_call(id="call_d", name="rendezvous", arguments={"slot": "d"}),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 20, "output_tokens": 4, "total_tokens": 24},
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_parallel_limit",
+                messages=[Message.text("user", "fan out twice")],
+                limits=RunLimits(max_tool_calls=3),
+            ),
+        )
+    )
+
+    # Round 1 (2 parallel calls) fits the limit and genuinely ran concurrently.
+    assert tool.arrivals == 2
+    started_ids = [
+        event.payload["tool_call_id"]
+        for event in events
+        if event.type == EventType.TOOL_CALL_STARTED
+    ]
+    assert started_ids == ["call_a", "call_b"]
+
+    # Round 2 (2 more calls) would exceed max_tool_calls=3; the whole round is
+    # gated before execution, so neither call starts.
+    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    assert limit_event.payload["limit"] == "tool_calls"
+    assert limit_event.payload["actual"] == 4
+    failed_ids = {
+        event.payload["tool_call_id"]
+        for event in events
+        if event.type == EventType.TOOL_CALL_FAILED
+    }
+    assert failed_ids == {"call_c", "call_d"}
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+    # The usage summary counts every started call of the parallel round and
+    # both model steps — the undercount the watermark race used to cause.
+    summary = asyncio.run(app.get_session_usage("sess_parallel_limit"))
+    assert summary.tool_calls == 2
+    assert summary.model_steps == 2
+    assert summary.usage.total_tokens == 36
+
+
+def test_cayu_app_usage_summary_spans_tool_approval_pause_and_resume():
+    # Composition pin: usage accounting rebuilds from the full event tail on
+    # every entrance, so totals must span both segments of a paused run.
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "pause here"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {"input_tokens": 20, "output_tokens": 4, "total_tokens": 24},
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_usage_across_pause",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    resume_events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_usage_across_pause",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+
+    summary = asyncio.run(app.get_session_usage("sess_usage_across_pause"))
+    assert summary.model_steps == 2
+    assert summary.tool_calls == 1
+    assert summary.usage.total_tokens == 36
 
 
 def test_parallel_tool_round_concurrency_is_capped_by_semaphore():

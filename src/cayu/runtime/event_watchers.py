@@ -506,6 +506,7 @@ def event_query_after_cursor(
         session_ids=query.session_ids,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
+        event_types=query.event_types,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,

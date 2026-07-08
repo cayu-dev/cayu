@@ -693,6 +693,7 @@ class EventQuery(BaseModel):
     session_ids: tuple[str, ...] = Field(default_factory=tuple)
     causal_budget_id: str | None = None
     event_type: EventType | str | None = None
+    event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
     agent_name: str | None = None
     environment_name: str | None = None
     workflow_name: str | None = None
@@ -746,6 +747,22 @@ class EventQuery(BaseModel):
             return value
         return Event(type=value, session_id="query").type
 
+    @field_validator("event_types", mode="before")
+    @classmethod
+    def copy_event_types(cls, value) -> tuple[EventType | str, ...]:
+        if value is None:
+            return ()
+        if type(value) is str:
+            raise ValueError("`event_types` must be a sequence of event types.")
+        normalized: list[EventType | str] = []
+        for item in tuple(value):
+            if not isinstance(item, EventType):
+                item = Event(type=item, session_id="query").type
+            if item in normalized:
+                raise ValueError("`event_types` must not contain duplicates.")
+            normalized.append(item)
+        return tuple(normalized)
+
     @field_validator("since", "until")
     @classmethod
     def validate_query_timestamp(cls, value: datetime | None, info) -> datetime | None:
@@ -759,6 +776,8 @@ class EventQuery(BaseModel):
     def validate_time_range(self) -> EventQuery:
         if self.session_id is not None and self.session_ids:
             raise ValueError("Use either `session_id` or `session_ids`, not both.")
+        if self.event_type is not None and self.event_types:
+            raise ValueError("Use either `event_type` or `event_types`, not both.")
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError("EventQuery since must be before until.")
         return self
@@ -1367,13 +1386,18 @@ class InMemorySessionStore(SessionStore):
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
-        event_type = str(query.event_type) if query.event_type is not None else None
+        # `event_type` and `event_types` are mutually exclusive, so they
+        # collapse into one filter set (empty = no type filter).
+        if query.event_type is not None:
+            event_types = frozenset((str(query.event_type),))
+        else:
+            event_types = frozenset(str(event_type) for event_type in query.event_types)
         async with self._lock:
-            candidates = self._query_candidate_records(query, event_type)
+            candidates = self._query_candidate_records(query, event_types)
             records = [
                 record
                 for record in candidates
-                if _event_record_matches(record, query, event_type)
+                if _event_record_matches(record, query, event_types)
                 and _event_record_matches_session(record, query, self._sessions)
             ]
             if query.order_by == EventOrder.SEQUENCE_DESC:
@@ -1389,7 +1413,7 @@ class InMemorySessionStore(SessionStore):
     def _query_candidate_records(
         self,
         query: EventQuery,
-        event_type: str | None,
+        event_types: frozenset[str],
     ) -> list[EventRecord]:
         """Pick the narrowest index that still covers a query's candidate rows.
 
@@ -1404,8 +1428,14 @@ class InMemorySessionStore(SessionStore):
                 merged.extend(self._session_event_records.get(session_id, []))
             merged.sort(key=lambda record: record.sequence)
             return merged
-        if event_type is not None:
-            return self._type_event_records.get(event_type, [])
+        if event_types:
+            if len(event_types) == 1:
+                return self._type_event_records.get(next(iter(event_types)), [])
+            merged = []
+            for event_type in event_types:
+                merged.extend(self._type_event_records.get(event_type, []))
+            merged.sort(key=lambda record: record.sequence)
+            return merged
         return self._event_records
 
     async def summarize_events(self, session_id: str) -> EventSummary:
@@ -1947,6 +1977,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         session_ids=query.session_ids,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
+        event_types=query.event_types,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,
@@ -2037,11 +2068,7 @@ def _session_query_text_matches(session: Session, query: str) -> bool:
         *session.labels.keys(),
         *session.labels.values(),
     ]
-    return any(
-        needle in value.casefold()
-        for value in haystacks
-        if type(value) is str and value
-    )
+    return any(needle in value.casefold() for value in haystacks if type(value) is str and value)
 
 
 def _label_selector_matches(
@@ -2154,7 +2181,7 @@ def _session_after_cursor(
 def _event_record_matches(
     record: EventRecord,
     query: EventQuery,
-    event_type: str | None,
+    event_types: frozenset[str],
 ) -> bool:
     event = record.event
     if query.after_sequence is not None and record.sequence <= query.after_sequence:
@@ -2168,7 +2195,7 @@ def _event_record_matches(
         return False
     if query.until is not None and event_timestamp >= query.until:
         return False
-    if event_type is not None and str(event.type) != event_type:
+    if event_types and str(event.type) not in event_types:
         return False
     if query.agent_name is not None and event.agent_name != query.agent_name:
         return False

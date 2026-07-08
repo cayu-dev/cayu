@@ -221,6 +221,18 @@ def usage_metrics_payload(metrics: UsageMetrics | None) -> dict[str, Any] | None
     return metrics.model_dump()
 
 
+# The event types usage accounting reads and folds: `tool.call.started`
+# drives the tool-call counter, `model.completed` carries token usage and
+# cost inputs. The runtime's usage readers (the session usage tracker and the
+# session/causal-budget summaries) query exactly this tuple; a new
+# usage-bearing type must be added here AND handled in
+# `session_usage_summary` below.
+USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
+    EventType.MODEL_COMPLETED,
+    EventType.TOOL_CALL_STARTED,
+)
+
+
 def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
     provider_names: list[str] = []
     models: list[str] = []

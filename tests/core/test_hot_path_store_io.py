@@ -217,6 +217,86 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
     asyncio.run(run())
 
 
+class _MidRefreshAppendingStore(InMemorySessionStore):
+    """Deterministically replays the issue-#101 watermark race.
+
+    On the first ``query_events`` call it appends one ``model.completed`` and
+    one ``tool.call.started`` event after computing its result. With the old
+    per-type refresh (two queries sharing one watermark), the second query of
+    the same refresh returned only the tool event, the shared watermark jumped
+    past the model event, and its tokens were lost forever. A single
+    ``event_types`` query sees nothing mid-refresh, so the next refresh picks
+    both events up.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.query_events_calls = 0
+        self._raced = False
+
+    async def query_events(self, query=None):
+        self.query_events_calls += 1
+        records = await super().query_events(query)
+        if not self._raced:
+            self._raced = True
+            await super().append_events(
+                "sess_race",
+                [
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id="sess_race",
+                        agent_name="assistant",
+                        payload={
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 1,
+                                "total_tokens": 11,
+                            },
+                        },
+                    ),
+                    Event(
+                        type=EventType.TOOL_CALL_STARTED,
+                        session_id="sess_race",
+                        tool_name="echo",
+                        payload={"tool_call_id": "call_race"},
+                    ),
+                ],
+            )
+        return records
+
+
+def test_session_usage_tracker_never_skips_events_appended_mid_refresh():
+    store = _MidRefreshAppendingStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+
+    async def run():
+        await _create_running_session(store, "sess_race")
+        tracker = runtime_app_module._SessionUsageTracker(app, session_id="sess_race")
+
+        # First refresh: the store races an append mid-refresh. The refresh
+        # must be ONE store query, and must not advance the watermark past
+        # the raced events it never saw.
+        assert await tracker.usage_events() == []
+        assert store.query_events_calls == 1
+
+        # Second refresh recovers BOTH raced events — the old two-query
+        # refresh skipped the model.completed event forever.
+        events = await tracker.usage_events()
+        assert [event.type for event in events] == [
+            EventType.MODEL_COMPLETED,
+            EventType.TOOL_CALL_STARTED,
+        ]
+        assert store.query_events_calls == 2
+
+        summary = session_usage_summary("sess_race", events)
+        assert summary.usage.total_tokens == 11
+        assert summary.tool_calls == 1
+
+    asyncio.run(run())
+
+
 def test_stream_interrupt_poll_throttles_and_signal_bypasses_throttle():
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
