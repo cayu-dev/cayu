@@ -199,6 +199,8 @@ class AggregateCostSummary(ApiBaseModel):
 class SessionsSummaryResponse(ApiBaseModel):
     session_count: StrictInt = Field(ge=0)
     sessions: list[ApiSessionSummaryItem]
+    next_cursor: str | None
+    total_count: StrictInt | None = Field(ge=0)
     usage: AggregateUsageSummary
     cost: AggregateCostSummary | None
 

@@ -50,6 +50,13 @@ class SessionStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class SessionDebugState(StrEnum):
+    NEEDS_ATTENTION = "needs_attention"
+    SESSION_FAILURE = "session_failure"
+    TOOL_ISSUE = "tool_issue"
+    INTERRUPTION = "interruption"
+
+
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -457,6 +464,7 @@ class SessionQuery(BaseModel):
 
     q: str | None = None
     status: SessionStatus | None = None
+    debug_state: SessionDebugState | None = None
     agent_name: str | None = None
     provider_name: str | None = None
     model: str | None = None
@@ -1421,9 +1429,17 @@ class InMemorySessionStore(SessionStore):
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
+        base_query = query.model_copy(update={"debug_state": None})
         async with self._lock:
             matching = [
-                session for session in self._sessions.values() if _session_matches(session, query)
+                session
+                for session in self._sessions.values()
+                if _session_matches(session, base_query)
+                and _session_matches_debug_state(
+                    session,
+                    self._session_event_records.get(session.id, []),
+                    query.debug_state,
+                )
             ]
             total = len(matching) if query.include_total_count else None
             ordered = _sort_sessions(matching, query.order_by)
@@ -1904,6 +1920,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
     return SessionQuery(
         q=query.q,
         status=query.status,
+        debug_state=query.debug_state,
         agent_name=query.agent_name,
         provider_name=query.provider_name,
         model=query.model,
@@ -1959,6 +1976,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
         return False
     if query.status is not None and session.status != query.status:
         return False
+    if query.debug_state is not None:
+        raise ValueError("SessionQuery debug_state requires event-aware store filtering.")
     if query.agent_name is not None and session.agent_name != query.agent_name:
         return False
     if query.provider_name is not None and session.provider_name != query.provider_name:
@@ -1978,6 +1997,31 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
     )
+
+
+def _session_matches_debug_state(
+    session: Session,
+    records: list[EventRecord],
+    debug_state: SessionDebugState | None,
+) -> bool:
+    if debug_state is None:
+        return True
+    has_tool_debug_event = any(_is_tool_debug_event(record.event.type) for record in records)
+    has_session_failure = session.status == SessionStatus.FAILED
+    has_interruption = session.status == SessionStatus.INTERRUPTED
+    if debug_state == SessionDebugState.TOOL_ISSUE:
+        return has_tool_debug_event
+    if debug_state == SessionDebugState.SESSION_FAILURE:
+        return has_session_failure
+    if debug_state == SessionDebugState.INTERRUPTION:
+        return has_interruption
+    if debug_state == SessionDebugState.NEEDS_ATTENTION:
+        return has_session_failure or has_interruption or has_tool_debug_event
+    return False
+
+
+def _is_tool_debug_event(event_type: EventType | str) -> bool:
+    return event_type in {EventType.TOOL_CALL_FAILED, EventType.TOOL_CALL_BLOCKED}
 
 
 def _session_query_text_matches(session: Session, query: str) -> bool:

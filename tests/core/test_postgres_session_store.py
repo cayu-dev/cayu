@@ -21,6 +21,7 @@ from cayu.runtime import (
     EventQuery,
     RunRequest,
     Session,
+    SessionDebugState,
     SessionIdentity,
     SessionOrder,
     SessionQuery,
@@ -1581,6 +1582,121 @@ def test_postgres_session_store_cursor_pagination_is_stable_across_orders(postgr
                     break
                 cursor = page.next_cursor
             assert collected == expected_ids, order
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_filters_debug_state_before_pagination(postgres_dsn):
+    async def create(
+        store,
+        session_id: str,
+        status: SessionStatus,
+        events: list[Event],
+    ) -> None:
+        await store.create(_lifecycle_request(session_id), identity=_identity())
+        await store.update_status(session_id, status)
+        await store.append_events(session_id, events)
+
+    async def ops(store):
+        await create(
+            store,
+            "pg_debug_normal",
+            SessionStatus.COMPLETED,
+            [Event(type=EventType.SESSION_COMPLETED, session_id="pg_debug_normal")],
+        )
+        await create(
+            store,
+            "pg_debug_tool_failed",
+            SessionStatus.COMPLETED,
+            [
+                Event(type=EventType.TOOL_CALL_FAILED, session_id="pg_debug_tool_failed"),
+                Event(type=EventType.SESSION_COMPLETED, session_id="pg_debug_tool_failed"),
+            ],
+        )
+        await create(
+            store,
+            "pg_debug_tool_blocked",
+            SessionStatus.COMPLETED,
+            [
+                Event(type=EventType.TOOL_CALL_BLOCKED, session_id="pg_debug_tool_blocked"),
+                Event(type=EventType.SESSION_COMPLETED, session_id="pg_debug_tool_blocked"),
+            ],
+        )
+        await create(
+            store,
+            "pg_debug_failed",
+            SessionStatus.FAILED,
+            [Event(type=EventType.SESSION_FAILED, session_id="pg_debug_failed")],
+        )
+        await create(
+            store,
+            "pg_debug_interrupted",
+            SessionStatus.INTERRUPTED,
+            [Event(type=EventType.SESSION_INTERRUPTED, session_id="pg_debug_interrupted")],
+        )
+
+        tool_issues = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.TOOL_ISSUE,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        assert [session.id for session in tool_issues.sessions] == [
+            "pg_debug_tool_failed",
+            "pg_debug_tool_blocked",
+        ]
+
+        needs_attention = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.NEEDS_ATTENTION,
+                order_by=SessionOrder.CREATED_AT_ASC,
+                limit=3,
+                include_total_count=True,
+            )
+        )
+        assert [session.id for session in needs_attention.sessions] == [
+            "pg_debug_tool_failed",
+            "pg_debug_tool_blocked",
+            "pg_debug_failed",
+        ]
+        assert needs_attention.total_count == 4
+        assert needs_attention.next_cursor is not None
+
+        next_page = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.NEEDS_ATTENTION,
+                order_by=SessionOrder.CREATED_AT_ASC,
+                limit=3,
+                cursor=needs_attention.next_cursor,
+                include_total_count=True,
+            )
+        )
+        assert [session.id for session in next_page.sessions] == ["pg_debug_interrupted"]
+        assert next_page.total_count == 4
+        assert next_page.next_cursor is None
+
+        assert [
+            session.id
+            for session in (
+                await store.list_sessions(
+                    SessionQuery(
+                        debug_state=SessionDebugState.SESSION_FAILURE,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                    )
+                )
+            ).sessions
+        ] == ["pg_debug_failed"]
+        assert [
+            session.id
+            for session in (
+                await store.list_sessions(
+                    SessionQuery(
+                        debug_state=SessionDebugState.INTERRUPTION,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                    )
+                )
+            ).sessions
+        ] == ["pg_debug_interrupted"]
 
     _run(postgres_dsn, ops)
 

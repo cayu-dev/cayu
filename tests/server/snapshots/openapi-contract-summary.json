@@ -2983,6 +2983,16 @@
       "title": "SessionCostSummary",
       "type": "object"
     },
+    "SessionDebugState": {
+      "enum": [
+        "needs_attention",
+        "session_failure",
+        "tool_issue",
+        "interruption"
+      ],
+      "title": "SessionDebugState",
+      "type": "string"
+    },
     "SessionDetailResponse": {
       "additionalProperties": false,
       "properties": {
@@ -3187,6 +3197,17 @@
             }
           ]
         },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
         "session_count": {
           "minimum": 0.0,
           "title": "Session Count",
@@ -3199,6 +3220,18 @@
           "title": "Sessions",
           "type": "array"
         },
+        "total_count": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Total Count"
+        },
         "usage": {
           "$ref": "#/components/schemas/AggregateUsageSummary"
         }
@@ -3206,6 +3239,8 @@
       "required": [
         "session_count",
         "sessions",
+        "next_cursor",
+        "total_count",
         "usage",
         "cost"
       ],
@@ -4826,6 +4861,22 @@
           },
           {
             "in": "query",
+            "name": "debug_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionDebugState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Debug State"
+            }
+          },
+          {
+            "in": "query",
             "name": "environment_name",
             "required": false,
             "schema": {
@@ -5046,6 +5097,38 @@
                 }
               ],
               "title": "Causal Budget Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "debug_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/SessionDebugState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Debug State"
             }
           },
           {

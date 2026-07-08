@@ -27,6 +27,7 @@ from cayu import (
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
+    StaticToolPolicy,
     Tool,
     ToolContext,
     ToolEffect,
@@ -64,6 +65,19 @@ class DashboardDemoProvider(ModelProvider):
 
         if "provider failure" in prompt:
             raise RuntimeError("Provider stream failed while preparing the model response.")
+
+        if "blocked" in prompt:
+            yield ModelStreamEvent.tool_call(
+                id="call_blocked_deploy",
+                name="deploy_service",
+                arguments={
+                    "service": "checkout-api",
+                    "environment": "production",
+                    "risk": "demo policy blocks production deployment",
+                },
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
 
         if "approval" in prompt:
             yield ModelStreamEvent.tool_call(
@@ -201,6 +215,8 @@ def _seed_note(events) -> str:
             return " (user input pending)"
         if event_type == "tool.call.failed":
             return f" (failed tool: {event.tool_name})"
+        if event_type == "tool.call.blocked":
+            return f" (blocked tool: {event.tool_name})"
         if event_type == "session.failed":
             error_type = event.payload.get("error_type") if isinstance(event.payload, dict) else None
             return f" ({error_type or 'session failed'})"
@@ -239,6 +255,14 @@ async def seed_sessions(app: CayuApp) -> None:
                 agent_name="demo-failure",
                 session_id="sess_dashboard_failed_tool",
                 messages=[Message.text("user", "Create a failure dashboard session.")],
+            ),
+        ),
+        await _drain(
+            app,
+            RunRequest(
+                agent_name="demo-blocked-tool",
+                session_id="sess_dashboard_blocked_tool",
+                messages=[Message.text("user", "Create a blocked tool dashboard session.")],
             ),
         ),
         await _drain(
@@ -318,7 +342,8 @@ def build_app() -> CayuApp:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(exist_ok=True)
     for name in ("sessions.db", "tasks.db", "knowledge.db"):
-        (DB_DIR / name).unlink(missing_ok=True)
+        for path in DB_DIR.glob(f"{name}*"):
+            path.unlink(missing_ok=True)
 
     knowledge_store = SQLiteKnowledgeStore(DB_DIR / "knowledge.db")
     app = CayuApp(
@@ -338,6 +363,11 @@ def build_app() -> CayuApp:
     )
     app.register_agent(AgentSpec(name="demo-user-input", model="fake-model"), tools=shared_tools)
     app.register_agent(AgentSpec(name="demo-failure", model="fake-model"), tools=shared_tools)
+    app.register_agent(
+        AgentSpec(name="demo-blocked-tool", model="fake-model"),
+        tools=shared_tools,
+        tool_policy=StaticToolPolicy(deny=["deploy_service"]),
+    )
     app.register_agent(
         AgentSpec(name="demo-session-failed", model="fake-model"),
         tools=shared_tools,

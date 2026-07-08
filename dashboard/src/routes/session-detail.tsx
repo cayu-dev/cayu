@@ -42,6 +42,13 @@ import {
   modelUsagePayload,
   numericValue,
 } from "../lib/format"
+import {
+  isFailureEventType,
+  latestFailureEvent,
+  objectPayload,
+  optionalString,
+  summarizeFailureEvent,
+} from "../lib/session-debug"
 import { cn } from "../lib/utils"
 
 function EventIcon({ type }: { type: string }) {
@@ -133,16 +140,6 @@ function eventTone(type: string) {
   return "bg-muted-foreground"
 }
 
-function isFailureEventType(type: string) {
-  return (
-    type === "session.failed" ||
-    type === "tool.call.failed" ||
-    type === "tool.call.blocked" ||
-    type.endsWith(".failed") ||
-    type.includes(".error")
-  )
-}
-
 type PendingAction =
   | {
       kind: "approval"
@@ -158,16 +155,6 @@ type PendingAction =
       question: string
       options: string[]
     }
-
-function objectPayload(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null
-}
-
-function optionalString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null
-}
 
 function stringList(value: unknown): string[] {
   return Array.isArray(value)
@@ -392,12 +379,7 @@ function EventDetailPanel({ event }: { event: SessionEvent | null }) {
   }
 
   const failure = isFailureEventType(event.type)
-  const error =
-    typeof event.payload.error === "string"
-      ? event.payload.error
-      : typeof event.payload.message === "string"
-        ? event.payload.message
-        : null
+  const failureSummary = failure ? summarizeFailureEvent(event) : null
 
   return (
     <div className="min-h-0 space-y-4 p-4">
@@ -413,10 +395,10 @@ function EventDetailPanel({ event }: { event: SessionEvent | null }) {
         <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm">
           <div className="mb-1 flex items-center gap-2 font-medium text-destructive">
             <AlertTriangle className="h-4 w-4" />
-            Failure Event
+            {failureSummary?.label || "Failure Event"}
           </div>
           <div className="break-words text-muted-foreground">
-            {error || "Inspect the payload for failure details."}
+            {failureSummary?.detail || "Inspect the payload for failure details."}
           </div>
         </div>
       )}
@@ -638,6 +620,41 @@ function PendingActionBanner({
   )
 }
 
+function FailureDebugBanner({
+  event,
+  selected,
+  onInspect,
+}: {
+  event: SessionEvent
+  selected: boolean
+  onInspect: () => void
+}) {
+  const summary = summarizeFailureEvent(event)
+  const badgeLabel = summary.kind === "tool_issue" ? "Tool issue" : "Debug failure"
+
+  return (
+    <Card className="border-destructive/30 bg-destructive/5">
+      <CardContent className="flex flex-col gap-3 p-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="destructive">
+              <AlertTriangle className="mr-1 h-3.5 w-3.5" />
+              {badgeLabel}
+            </Badge>
+            <Badge variant="outline">{summary.eventType}</Badge>
+            {summary.toolName && <Badge variant="secondary">{summary.toolName}</Badge>}
+          </div>
+          <p className="mt-2 text-sm font-medium">{summary.label}</p>
+          <p className="mt-1 break-words text-sm text-muted-foreground">{summary.detail}</p>
+        </div>
+        <Button variant={selected ? "secondary" : "outline"} onClick={onInspect}>
+          {selected ? "Inspecting event" : "Inspect event"}
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
 function transcriptMessageKey(
   message: { role: string; content: Array<Record<string, unknown>> },
   index: number,
@@ -791,6 +808,7 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
   const selectedEvent = filteredEvents.find((event) => event.id === selectedEventId) ?? null
   const pendingAction = pendingActionFromEvents(session.status, filteredEvents)
+  const failureEvent = latestFailureEvent(filteredEvents)
   const canResume =
     ["completed", "failed", "interrupted"].includes(session.status) && !pendingAction
   const eventUsage = fallbackUsage(filteredEvents)
@@ -931,6 +949,14 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           onAnswer={(answer) =>
             pendingAction.kind === "user_input" && void handleUserInputAnswer(pendingAction, answer)
           }
+        />
+      )}
+
+      {failureEvent && (
+        <FailureDebugBanner
+          event={failureEvent}
+          selected={selectedEventId === failureEvent.id}
+          onInspect={() => setSelectedEventId(failureEvent.id)}
         />
       )}
 

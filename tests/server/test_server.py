@@ -1030,6 +1030,8 @@ def test_server_exposes_filtered_sessions_summary() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["session_count"] == 2
+    assert body["total_count"] == 2
+    assert body["next_cursor"] is None
     assert [item["session"]["id"] for item in body["sessions"]] == [
         "summary_filter_invoice",
         "summary_filter_research",
@@ -1109,9 +1111,193 @@ def test_server_sessions_summary_allows_omitted_body() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["session_count"] == 1
+    assert body["total_count"] == 1
+    assert body["next_cursor"] is None
     assert body["sessions"][0]["session"]["id"] == "summary_no_body"
     assert body["usage"]["usage"]["total_tokens"] == 12
     assert body["cost"] is None
+
+
+def test_server_sessions_summary_filters_debug_states_before_pagination() -> None:
+    app = CayuApp()
+
+    async def create(session_id: str, status: SessionStatus, events: list[Event]) -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, status)
+        await app.session_store.append_events(session_id, events)
+
+    async def seed() -> None:
+        await create(
+            "debug_normal_completed",
+            SessionStatus.COMPLETED,
+            [
+                Event(
+                    id="debug_normal_completed_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="debug_normal_completed",
+                )
+            ],
+        )
+        await create(
+            "debug_tool_failed_completed",
+            SessionStatus.COMPLETED,
+            [
+                Event(
+                    id="debug_tool_failed_event",
+                    type=EventType.TOOL_CALL_FAILED,
+                    session_id="debug_tool_failed_completed",
+                    tool_name="deploy_service",
+                    payload={"error": "deploy failed"},
+                ),
+                Event(
+                    id="debug_tool_failed_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="debug_tool_failed_completed",
+                ),
+            ],
+        )
+        await create(
+            "debug_tool_blocked_completed",
+            SessionStatus.COMPLETED,
+            [
+                Event(
+                    id="debug_tool_blocked_event",
+                    type=EventType.TOOL_CALL_BLOCKED,
+                    session_id="debug_tool_blocked_completed",
+                    tool_name="deploy_service",
+                    payload={"reason": "policy denied"},
+                ),
+                Event(
+                    id="debug_tool_blocked_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="debug_tool_blocked_completed",
+                ),
+            ],
+        )
+        await create(
+            "debug_failed_session",
+            SessionStatus.FAILED,
+            [
+                Event(
+                    id="debug_failed_terminal",
+                    type=EventType.SESSION_FAILED,
+                    session_id="debug_failed_session",
+                    payload={"error": "provider failed", "error_type": "RuntimeError"},
+                )
+            ],
+        )
+        await create(
+            "debug_interrupted_session",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="debug_interrupted_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="debug_interrupted_session",
+                    payload={"interruption_type": "tool_approval_required"},
+                )
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    tool_response = client.post(
+        "/api/sessions/summary",
+        params={
+            "debug_state": "tool_issue",
+            "order_by": "created_at_asc",
+        },
+    )
+    assert tool_response.status_code == 200
+    tool_body = tool_response.json()
+    assert tool_body["session_count"] == 2
+    assert tool_body["total_count"] == 2
+    assert tool_body["next_cursor"] is None
+    assert [item["session"]["id"] for item in tool_body["sessions"]] == [
+        "debug_tool_failed_completed",
+        "debug_tool_blocked_completed",
+    ]
+    assert tool_body["sessions"][0]["events"]["counts_by_type"]["tool.call.failed"] == 1
+    assert tool_body["sessions"][1]["events"]["counts_by_type"]["tool.call.blocked"] == 1
+
+    list_response = client.get(
+        "/api/sessions",
+        params={
+            "debug_state": "tool_issue",
+            "order_by": "created_at_asc",
+        },
+    )
+    assert list_response.status_code == 200
+    list_body = list_response.json()
+    assert list_body["total_count"] == 2
+    assert list_body["next_cursor"] is None
+    assert [session["id"] for session in list_body["sessions"]] == [
+        "debug_tool_failed_completed",
+        "debug_tool_blocked_completed",
+    ]
+
+    failure_response = client.post(
+        "/api/sessions/summary",
+        params={"debug_state": "session_failure", "order_by": "created_at_asc"},
+    )
+    assert failure_response.status_code == 200
+    assert [item["session"]["id"] for item in failure_response.json()["sessions"]] == [
+        "debug_failed_session"
+    ]
+
+    interruption_response = client.post(
+        "/api/sessions/summary",
+        params={"debug_state": "interruption", "order_by": "created_at_asc"},
+    )
+    assert interruption_response.status_code == 200
+    assert [item["session"]["id"] for item in interruption_response.json()["sessions"]] == [
+        "debug_interrupted_session"
+    ]
+
+    attention_response = client.post(
+        "/api/sessions/summary",
+        params={
+            "debug_state": "needs_attention",
+            "limit": 3,
+            "order_by": "created_at_asc",
+        },
+    )
+    assert attention_response.status_code == 200
+    attention_body = attention_response.json()
+    assert attention_body["session_count"] == 3
+    assert attention_body["total_count"] == 4
+    assert attention_body["next_cursor"] is not None
+    assert [item["session"]["id"] for item in attention_body["sessions"]] == [
+        "debug_tool_failed_completed",
+        "debug_tool_blocked_completed",
+        "debug_failed_session",
+    ]
+
+    next_attention_response = client.post(
+        "/api/sessions/summary",
+        params={
+            "cursor": attention_body["next_cursor"],
+            "debug_state": "needs_attention",
+            "limit": 3,
+            "order_by": "created_at_asc",
+        },
+    )
+    assert next_attention_response.status_code == 200
+    next_attention_body = next_attention_response.json()
+    assert next_attention_body["session_count"] == 1
+    assert next_attention_body["total_count"] == 4
+    assert next_attention_body["next_cursor"] is None
+    assert [item["session"]["id"] for item in next_attention_body["sessions"]] == [
+        "debug_interrupted_session",
+    ]
 
 
 def test_server_run_rejects_request_budget_reservations() -> None:

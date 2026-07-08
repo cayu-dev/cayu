@@ -14,11 +14,14 @@ import {
   TableHeader,
   TableRow,
 } from "../components/ui/table"
-import { fetchSessionsPage, type SessionListQuery } from "../lib/api"
+import { fetchSessionsSummary, type SessionsSummary, type SessionsSummaryQuery } from "../lib/api"
 import { formatDateTime } from "../lib/format"
+import { summarizeSessionDebugState } from "../lib/session-debug"
 
 type SessionDateOrder = "updated_at_desc" | "updated_at_asc" | "created_at_desc" | "created_at_asc"
-type SessionStatusFilter = "all" | Exclude<SessionListQuery["status"], null | undefined>
+type SessionStatusFilter = "all" | Exclude<SessionsSummaryQuery["status"], null | undefined>
+type DebugFilter = "all" | Exclude<SessionsSummaryQuery["debug_state"], null | undefined>
+type SessionSummaryItem = SessionsSummary["sessions"][number]
 
 const SESSION_STATUSES = [
   "pending",
@@ -44,6 +47,29 @@ function StatusBadge({ status }: { status: string }) {
   return <Badge variant={variant}>{status}</Badge>
 }
 
+function DebugBadge({ item }: { item: SessionSummaryItem }) {
+  const summary = summarizeSessionDebugState({
+    status: item.session.status,
+    latestEvent: item.events.latest_event,
+    terminalEvent: item.outcome.terminal_event,
+    countsByType: item.events.counts_by_type,
+  })
+  if (!summary) {
+    return <span className="text-sm text-muted-foreground">-</span>
+  }
+  return (
+    <div className="min-w-0">
+      <Badge
+        variant={summary.kind === "interruption" ? "outline" : "destructive"}
+        className="max-w-44 truncate"
+      >
+        {summary.label}
+      </Badge>
+      <div className="mt-1 max-w-56 truncate text-xs text-muted-foreground">{summary.detail}</div>
+    </div>
+  )
+}
+
 function optionalFilter(value: string) {
   const trimmed = value.trim()
   return trimmed === "" ? undefined : trimmed
@@ -63,16 +89,18 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 export function SessionsPage() {
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState<SessionStatusFilter>("all")
+  const [debugFilter, setDebugFilter] = useState<DebugFilter>("all")
   const [orderBy, setOrderBy] = useState<SessionDateOrder>("updated_at_desc")
   const debouncedSearch = useDebouncedValue(search, 300)
-  const query = useMemo<SessionListQuery>(
+  const query = useMemo<SessionsSummaryQuery>(
     () => ({
       limit: 100,
       order_by: orderBy,
       q: optionalFilter(debouncedSearch),
+      debug_state: debugFilter === "all" ? undefined : debugFilter,
       status: status === "all" ? undefined : status,
     }),
-    [debouncedSearch, orderBy, status],
+    [debouncedSearch, debugFilter, orderBy, status],
   )
 
   const {
@@ -81,17 +109,18 @@ export function SessionsPage() {
     isError,
     isLoading,
   } = useQuery({
-    queryKey: ["sessions", query],
-    queryFn: () => fetchSessionsPage(query),
+    queryKey: ["sessions-summary", "sessions-page", query],
+    queryFn: () => fetchSessionsSummary(query),
   })
   const errorMessage = error instanceof Error ? error.message : "Failed to load sessions."
   const list = sessionsPage?.sessions || []
-  const totalCount = sessionsPage?.total_count ?? list.length
-  const hasFilters = search.trim() !== "" || status !== "all"
+  const totalCount = sessionsPage?.total_count ?? sessionsPage?.session_count ?? list.length
+  const hasFilters = search.trim() !== "" || status !== "all" || debugFilter !== "all"
 
   function clearFilters() {
     setSearch("")
     setStatus("all")
+    setDebugFilter("all")
   }
 
   return (
@@ -107,7 +136,7 @@ export function SessionsPage() {
 
       <DataCard
         title="Sessions"
-        description={`${list.length} shown${totalCount !== list.length ? ` of ${totalCount}` : ""} matching sessions`}
+        description={`${list.length} shown${totalCount !== list.length || sessionsPage?.next_cursor ? ` of ${totalCount}` : ""} matching sessions`}
       >
         <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border p-4">
           <div className="relative min-w-56 flex-[2_1_18rem]">
@@ -133,6 +162,18 @@ export function SessionsPage() {
             ))}
           </select>
           <select
+            value={debugFilter}
+            onChange={(event) => setDebugFilter(event.target.value as DebugFilter)}
+            className={selectClassName}
+            aria-label="Filter by debug state"
+          >
+            <option value="all">All debug states</option>
+            <option value="needs_attention">Needs attention</option>
+            <option value="session_failure">Session failures</option>
+            <option value="tool_issue">Tool issues</option>
+            <option value="interruption">Interruptions</option>
+          </select>
+          <select
             value={orderBy}
             onChange={(event) => setOrderBy(event.target.value as SessionDateOrder)}
             className={selectClassName}
@@ -156,6 +197,7 @@ export function SessionsPage() {
               <TableHead>Session ID</TableHead>
               <TableHead>Agent</TableHead>
               <TableHead>Status</TableHead>
+              <TableHead>Debug</TableHead>
               <TableHead>Provider</TableHead>
               <TableHead>Model</TableHead>
               <TableHead>Updated</TableHead>
@@ -164,46 +206,51 @@ export function SessionsPage() {
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={6}>
+                <TableCell colSpan={7}>
                   <StateMessage>Loading...</StateMessage>
                 </TableCell>
               </TableRow>
             ) : isError ? (
               <TableRow>
-                <TableCell colSpan={6}>
+                <TableCell colSpan={7}>
                   <StateMessage tone="danger">{errorMessage}</StateMessage>
                 </TableCell>
               </TableRow>
             ) : !list.length ? (
               <TableRow>
-                <TableCell colSpan={6}>
+                <TableCell colSpan={7}>
                   <StateMessage>
                     {hasFilters ? "No sessions match the current filters." : "No sessions yet"}
                   </StateMessage>
                 </TableCell>
               </TableRow>
             ) : (
-              list.map((s) => (
-                <TableRow key={s.id} className="cursor-pointer">
+              list.map((item) => (
+                <TableRow key={item.session.id} className="cursor-pointer">
                   <TableCell>
                     <Link
                       to="/sessions/$sessionId"
-                      params={{ sessionId: s.id }}
+                      params={{ sessionId: item.session.id }}
                       className="font-mono text-sm text-primary hover:underline"
                     >
-                      {s.id}
+                      {item.session.id}
                     </Link>
                   </TableCell>
-                  <TableCell className="text-sm">{s.agent_name}</TableCell>
+                  <TableCell className="text-sm">{item.session.agent_name}</TableCell>
                   <TableCell>
-                    <StatusBadge status={s.status} />
+                    <StatusBadge status={item.session.status} />
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">{s.provider_name}</TableCell>
-                  <TableCell className="max-w-56 truncate text-sm text-muted-foreground">
-                    {s.model}
+                  <TableCell>
+                    <DebugBadge item={item} />
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
-                    {formatDateTime(s.updated_at || s.created_at)}
+                    {item.session.provider_name}
+                  </TableCell>
+                  <TableCell className="max-w-56 truncate text-sm text-muted-foreground">
+                    {item.session.model}
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    {formatDateTime(item.session.updated_at || item.session.created_at)}
                   </TableCell>
                 </TableRow>
               ))

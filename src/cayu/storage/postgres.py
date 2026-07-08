@@ -64,6 +64,7 @@ from cayu.runtime.sessions import (
     LabelSelectorOperator,
     RunRequest,
     Session,
+    SessionDebugState,
     SessionIdentity,
     SessionListResult,
     SessionOutcome,
@@ -3801,6 +3802,41 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if query.status is not None:
             clauses.append("status = %s")
             params.append(str(query.status))
+        if query.debug_state is not None:
+            tool_debug_sql = """
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_events
+                    WHERE cayu_events.session_id = cayu_sessions.id
+                      AND cayu_events.event_type IN (%s, %s)
+                )
+                """
+            if query.debug_state == SessionDebugState.TOOL_ISSUE:
+                clauses.append(tool_debug_sql)
+                params.extend(
+                    [
+                        str(EventType.TOOL_CALL_FAILED),
+                        str(EventType.TOOL_CALL_BLOCKED),
+                    ]
+                )
+            elif query.debug_state == SessionDebugState.SESSION_FAILURE:
+                clauses.append("status = %s")
+                params.append(str(SessionStatus.FAILED))
+            elif query.debug_state == SessionDebugState.INTERRUPTION:
+                clauses.append("status = %s")
+                params.append(str(SessionStatus.INTERRUPTED))
+            elif query.debug_state == SessionDebugState.NEEDS_ATTENTION:
+                clauses.append(f"(status IN (%s, %s) OR {tool_debug_sql})")
+                params.extend(
+                    [
+                        str(SessionStatus.FAILED),
+                        str(SessionStatus.INTERRUPTED),
+                        str(EventType.TOOL_CALL_FAILED),
+                        str(EventType.TOOL_CALL_BLOCKED),
+                    ]
+                )
+            else:
+                raise ValueError(f"Unsupported session debug_state: {query.debug_state}")
         if query.agent_name is not None:
             clauses.append("agent_name = %s")
             params.append(query.agent_name)

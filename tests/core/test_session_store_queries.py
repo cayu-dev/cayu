@@ -21,6 +21,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     RunRequest,
     Session,
+    SessionDebugState,
     SessionIdentity,
     SessionStatus,
     SessionStore,
@@ -246,6 +247,122 @@ def test_session_stores_list_sessions_with_filters_and_pagination(
         assert [session.id for session in query_by_literal_percent_sessions] == [
             "sess_openai_operator"
         ]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_list_sessions_with_debug_state_filter(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def create(session_id: str, status: SessionStatus, events: list[Event]) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "debug")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status(session_id, status)
+        await store.append_events(session_id, events)
+
+    async def run_store_operations() -> None:
+        await create(
+            "debug_query_normal",
+            SessionStatus.COMPLETED,
+            [Event(type=EventType.SESSION_COMPLETED, session_id="debug_query_normal")],
+        )
+        await create(
+            "debug_query_tool_failure",
+            SessionStatus.COMPLETED,
+            [
+                Event(type=EventType.TOOL_CALL_FAILED, session_id="debug_query_tool_failure"),
+                Event(type=EventType.SESSION_COMPLETED, session_id="debug_query_tool_failure"),
+            ],
+        )
+        await create(
+            "debug_query_tool_blocked",
+            SessionStatus.COMPLETED,
+            [
+                Event(type=EventType.TOOL_CALL_BLOCKED, session_id="debug_query_tool_blocked"),
+                Event(type=EventType.SESSION_COMPLETED, session_id="debug_query_tool_blocked"),
+            ],
+        )
+        await create(
+            "debug_query_session_failure",
+            SessionStatus.FAILED,
+            [Event(type=EventType.SESSION_FAILED, session_id="debug_query_session_failure")],
+        )
+        await create(
+            "debug_query_interruption",
+            SessionStatus.INTERRUPTED,
+            [Event(type=EventType.SESSION_INTERRUPTED, session_id="debug_query_interruption")],
+        )
+
+        tool_issues = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.TOOL_ISSUE,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        session_failures = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.SESSION_FAILURE,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        interruptions = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.INTERRUPTION,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            )
+        )
+        needs_attention = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.NEEDS_ATTENTION,
+                order_by=SessionOrder.CREATED_AT_ASC,
+                limit=2,
+                include_total_count=True,
+            )
+        )
+
+        assert [session.id for session in tool_issues.sessions] == [
+            "debug_query_tool_failure",
+            "debug_query_tool_blocked",
+        ]
+        assert [session.id for session in session_failures.sessions] == [
+            "debug_query_session_failure"
+        ]
+        assert [session.id for session in interruptions.sessions] == [
+            "debug_query_interruption"
+        ]
+        assert [session.id for session in needs_attention.sessions] == [
+            "debug_query_tool_failure",
+            "debug_query_tool_blocked",
+        ]
+        assert needs_attention.total_count == 4
+        assert needs_attention.next_cursor is not None
+
+        second_attention_page = await store.list_sessions(
+            SessionQuery(
+                debug_state=SessionDebugState.NEEDS_ATTENTION,
+                order_by=SessionOrder.CREATED_AT_ASC,
+                limit=2,
+                cursor=needs_attention.next_cursor,
+                include_total_count=True,
+            )
+        )
+        assert [session.id for session in second_attention_page.sessions] == [
+            "debug_query_session_failure",
+            "debug_query_interruption",
+        ]
+        assert second_attention_page.total_count == 4
+        assert second_attention_page.next_cursor is None
         await _close_store(store)
 
     asyncio.run(run_store_operations())

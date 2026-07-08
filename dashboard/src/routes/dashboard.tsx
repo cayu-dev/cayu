@@ -5,8 +5,15 @@ import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboar
 import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
-import { fetchSessionsSummary, fetchTasks, type Session, type Task } from "../lib/api"
+import {
+  fetchSessionsSummary,
+  fetchTasks,
+  type Session,
+  type SessionsSummary,
+  type Task,
+} from "../lib/api"
 import { formatCount, formatDateTime, numericValue } from "../lib/format"
+import { summarizeSessionDebugState } from "../lib/session-debug"
 
 function StatusBadge({ status }: { status: string }) {
   const variant =
@@ -34,8 +41,21 @@ function needsAttentionTask(task: Task) {
   return ["blocked", "needs_attention", "failed"].includes(task.status)
 }
 
-function needsAttentionSession(session: Session) {
-  return ["failed", "interrupted"].includes(session.status)
+type SessionSummaryItem = SessionsSummary["sessions"][number]
+
+function sessionDebugSummary(item: SessionSummaryItem) {
+  return summarizeSessionDebugState({
+    status: item.session.status,
+    latestEvent: item.events.latest_event,
+    terminalEvent: item.outcome.terminal_event,
+    countsByType: item.events.counts_by_type,
+  })
+}
+
+function needsAttentionSessionItem(item: SessionSummaryItem) {
+  return (
+    ["failed", "interrupted"].includes(item.session.status) || sessionDebugSummary(item) !== null
+  )
 }
 
 function latestEventLabel(value: unknown) {
@@ -47,16 +67,9 @@ function latestEventLabel(value: unknown) {
   return "no events"
 }
 
-function attentionSessionLabel(item: { session: Session; events: { latest_event: unknown } }) {
-  const latest = item.events.latest_event
-  if (latest && typeof latest === "object" && "payload" in latest) {
-    const payload = (latest as { payload?: unknown }).payload
-    if (payload && typeof payload === "object" && "interruption_type" in payload) {
-      const interruptionType = (payload as { interruption_type?: unknown }).interruption_type
-      if (interruptionType === "tool_approval_required") return "Awaiting approval"
-      if (interruptionType === "user_input_required") return "Awaiting user input"
-    }
-  }
+function attentionSessionLabel(item: SessionSummaryItem) {
+  const debug = sessionDebugSummary(item)
+  if (debug) return debug.label
   if (item.session.status === "failed") return "Failed session"
   if (item.session.status === "interrupted") return "Interrupted session"
   return item.session.status
@@ -84,7 +97,7 @@ export function DashboardPage() {
   const completed = list.filter((s) => s.status === "completed").length
   const failed = list.filter((s) => s.status === "failed").length
   const attentionTasks = taskList.filter(needsAttentionTask)
-  const attentionSessionItems = sessionItems.filter(({ session }) => needsAttentionSession(session))
+  const attentionSessionItems = sessionItems.filter(needsAttentionSessionItem)
   const attentionSessions = attentionSessionItems.map((item) => item.session)
   const usage = summary.data?.usage.usage
   const totalTokens = numericValue(usage?.total_tokens)
@@ -186,7 +199,7 @@ export function DashboardPage() {
             </StateMessage>
           ) : attentionSessions.length === 0 && attentionTasks.length === 0 ? (
             <StateMessage className="py-6">
-              No failed sessions, blocked tasks, or needs-attention tasks in the current view.
+              No sessions or tasks need attention in the current view.
             </StateMessage>
           ) : (
             <div className="space-y-2">

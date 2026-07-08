@@ -1576,6 +1576,11 @@ export type SessionCostSummary = {
 };
 
 /**
+ * SessionDebugState
+ */
+export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
+
+/**
  * SessionDetailResponse
  */
 export type SessionDetailResponse = {
@@ -1687,6 +1692,10 @@ export type SessionsSummaryBody = {
 export type SessionsSummaryResponse = {
     cost: AggregateCostSummary | null;
     /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
      * Session Count
      */
     session_count: number;
@@ -1694,6 +1703,10 @@ export type SessionsSummaryResponse = {
      * Sessions
      */
     sessions: Array<ApiSessionSummaryItem>;
+    /**
+     * Total Count
+     */
+    total_count: number | null;
     usage: AggregateUsageSummary;
 };
 
@@ -2609,6 +2622,10 @@ export type ListSessionsApiSessionsGetData = {
          */
         status?: SessionStatus | null;
         /**
+         * Debug State
+         */
+        debug_state?: SessionDebugState | null;
+        /**
          * Agent Name
          */
         agent_name?: string | null;
@@ -2679,6 +2696,10 @@ export type GetSessionsSummaryApiSessionsSummaryPostData = {
          */
         offset?: number;
         /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
          * Q
          */
         q?: string | null;
@@ -2686,6 +2707,10 @@ export type GetSessionsSummaryApiSessionsSummaryPostData = {
          * Status
          */
         status?: SessionStatus | null;
+        /**
+         * Debug State
+         */
+        debug_state?: SessionDebugState | null;
         /**
          * Agent Name
          */

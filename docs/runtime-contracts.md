@@ -647,9 +647,16 @@ includes a `PricingCatalog`. This is the right endpoint for app dashboards like
 "usage and cost for org 123's AP Q2 invoice sessions" where there may not be one
 shared causal budget id.
 
+Like `GET /api/sessions`, the summary endpoint is paginated. `session_count` is
+the number of sessions in the returned page, `total_count` is the total number
+of matching sessions when available, and `next_cursor` can be passed back as the
+`cursor` query parameter for the next page. Debug filters are applied before
+pagination through `debug_state`: `needs_attention`, `session_failure`,
+`tool_issue`, or `interruption`.
+
 ```bash
 curl -X POST \
-  "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)" \
+  "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)&debug_state=needs_attention" \
   -H "Content-Type: application/json" \
   -d '{"pricing":{"prices":[{"provider_name":"openai","model":"gpt-5.5","match":"prefix","input_per_million":"2.00","output_per_million":"8.00","cache_read_input_per_million":"0.50"}]}}'
 ```

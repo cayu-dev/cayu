@@ -48,6 +48,7 @@ from cayu.runtime.sessions import (
     ResumeRequest,
     RunRequest,
     Session,
+    SessionDebugState,
     SessionOrder,
     SessionOutcome,
     SessionQuery,
@@ -1144,6 +1145,7 @@ def create_router(
         cursor: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
         status: SessionStatus | None = None,
+        debug_state: SessionDebugState | None = None,
         agent_name: str | None = None,
         provider_name: str | None = None,
         model: str | None = None,
@@ -1161,6 +1163,7 @@ def create_router(
                 SessionQuery(
                     q=_clean_optional_query_value(q, "q"),
                     status=status,
+                    debug_state=debug_state,
                     agent_name=_clean_optional_query_value(agent_name, "agent_name"),
                     provider_name=_clean_optional_query_value(provider_name, "provider_name"),
                     model=_clean_optional_query_value(model, "model"),
@@ -1202,8 +1205,10 @@ def create_router(
         body: SessionsSummaryBody | None = None,
         limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
         offset: Annotated[int, Query(ge=0)] = 0,
+        cursor: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
         status: SessionStatus | None = None,
+        debug_state: SessionDebugState | None = None,
         agent_name: str | None = None,
         provider_name: str | None = None,
         model: str | None = None,
@@ -1217,11 +1222,12 @@ def create_router(
         body = body or SessionsSummaryBody()
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
-        sessions = (
-            await session_store.list_sessions(
+        try:
+            result = await session_store.list_sessions(
                 SessionQuery(
                     q=_clean_optional_query_value(q, "q"),
                     status=status,
+                    debug_state=debug_state,
                     agent_name=_clean_optional_query_value(agent_name, "agent_name"),
                     provider_name=_clean_optional_query_value(provider_name, "provider_name"),
                     model=_clean_optional_query_value(model, "model"),
@@ -1241,10 +1247,14 @@ def create_router(
                     label_selectors=label_selectors,
                     limit=limit,
                     offset=offset,
+                    cursor=cursor,
+                    include_total_count=True,
                     order_by=order_by,
                 )
             )
-        ).sessions
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sessions = result.sessions
         session_event_records_by_id: dict[str, list[EventRecord]] = {}
         session_ids = [session.id for session in sessions]
         all_event_records = await _query_all_session_event_records(session_ids)
@@ -1324,6 +1334,8 @@ def create_router(
         return {
             "session_count": len(sessions),
             "sessions": session_items,
+            "next_cursor": result.next_cursor,
+            "total_count": result.total_count,
             "usage": usage_summary,
             "cost": cost_summary,
         }
