@@ -231,6 +231,28 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 return copy_knowledge_entry(entry)
         return await self.update_entry_status(clean_id, KnowledgeStatus.DELETED)
 
+    async def prune_expired(self, *, now: datetime | None = None) -> int:
+        cutoff = datetime.now(UTC) if now is None else now
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT id FROM cayu_knowledge_entries "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (sqlite_support.format_datetime(cutoff),),
+            ).fetchall()
+            expired_ids = [str(row["id"]) for row in rows]
+            if not expired_ids:
+                return 0
+            with self._connection:
+                # FTS is a virtual table (no FK cascade), so clear chunks/FTS explicitly; the
+                # entries DELETE then cascades to labels/aspects/impact_targets.
+                for entry_id in expired_ids:
+                    self._delete_chunks_unlocked(entry_id)
+                self._connection.executemany(
+                    "DELETE FROM cayu_knowledge_entries WHERE id = ?",
+                    [(entry_id,) for entry_id in expired_ids],
+                )
+            return len(expired_ids)
+
     async def replace_chunks(
         self,
         entry_id: str,

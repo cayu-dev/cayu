@@ -152,6 +152,11 @@ _KNOWLEDGE_SEARCH_PAGE_SIZE = 500
 _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
 _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS = 2000
 _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER = 8
+# Identifies the embedding space (model + preprocessing + normalization) a stored vector belongs to.
+# Writes stamp it and reads filter on it, so bumping this constant after changing the embedding recipe
+# segregates old vectors (they stop matching and are re-embedded / pruned) instead of silently mixing
+# two spaces. The column is added now, while cheap, so a future bump needs no re-migration.
+_EMBEDDING_SPACE_VERSION = 1
 # Upper bound on chunks a single semantic search will lazily embed when it finds
 # entries whose write-time embedding was deferred (provider outage). The
 # missing-embedding LEFT JOIN returns nothing in steady state, so this cap only
@@ -397,6 +402,13 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved "
         "ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence)",
+    ),
+    # Add the embedding-space version column so the standard `cayu storage migrate` deploy step (which
+    # runs this table via PostgresSessionStore) reaches an existing cayu_knowledge_embeddings table.
+    # `IF EXISTS` makes it a no-op when the embeddings table was never created (embedding store unused).
+    12: (
+        "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
+        "ADD COLUMN IF NOT EXISTS embedding_space_version INTEGER NOT NULL DEFAULT 1",
     ),
 }
 
@@ -1507,6 +1519,26 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return await self.update_entry_status(entry_id, KnowledgeStatus.DELETED)
 
+    async def prune_expired(self, *, now: datetime | None = None) -> int:
+        cutoff = datetime.now(UTC) if now is None else now
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    # The entries DELETE cascades (ON DELETE CASCADE) to chunks, labels, aspects, and
+                    # — for the embedding subclass — cayu_knowledge_embeddings, so no override is needed.
+                    await cur.execute(
+                        "DELETE FROM cayu_knowledge_entries "
+                        "WHERE expires_at IS NOT NULL AND expires_at <= %s",
+                        (cutoff,),
+                    )
+                    pruned = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return pruned
+
     async def replace_chunks(
         self,
         entry_id: str,
@@ -2222,6 +2254,22 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         ], len(rows) > query.limit
 
 
+def _warn_if_embedding_dims_exceed_hnsw(dimensions: int) -> None:
+    """Warn (do not reject) when embedding dimensions exceed pgvector's HNSW cap.
+
+    pgvector's HNSW index supports at most 2000 dimensions. Larger models (e.g. 3072-dim) are still
+    allowed — the store just can't build the index, so semantic search falls back to an exact O(n)
+    brute-force scan. Surface that loudly instead of failing silently.
+    """
+    if dimensions > _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS:
+        logger.warning(
+            "Embedding dimensions (%d) exceed pgvector's HNSW limit (%d); the HNSW index will not be "
+            "created and semantic search will fall back to an exact brute-force scan (O(n) per query).",
+            dimensions,
+            _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS,
+        )
+
+
 class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     """Postgres knowledge store with pgvector-backed semantic chunk search."""
 
@@ -2242,6 +2290,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         if not isinstance(embedding_provider, TextEmbeddingProvider):
             raise TypeError("embedding_provider must implement TextEmbeddingProvider.")
         _validate_positive_int(embedding_dimensions, "embedding_dimensions")
+        _warn_if_embedding_dims_exceed_hnsw(embedding_dimensions)
         self.embedding_provider = embedding_provider
         self.embedding_model = require_clean_nonblank(embedding_model, "embedding_model")
         self.embedding_dimensions = embedding_dimensions
@@ -2436,11 +2485,20 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                                 model TEXT NOT NULL,
                                 dimensions INTEGER NOT NULL,
                                 embedding vector({self.embedding_dimensions}) NOT NULL,
+                                embedding_space_version INTEGER NOT NULL DEFAULT 1,
                                 created_at TIMESTAMPTZ NOT NULL,
                                 updated_at TIMESTAMPTZ NOT NULL
                             )
                             """,
                         )
+                    )
+                    # Belt-and-suspenders for an existing embeddings table opened directly in CREATE
+                    # mode (where `_apply_pending` won't re-run migrations on a non-fresh DB). The
+                    # canonical path for existing DBs is revision 12 in `_MIGRATION_STEPS`, applied by
+                    # `cayu storage migrate`; both are idempotent.
+                    await cur.execute(
+                        "ALTER TABLE cayu_knowledge_embeddings "
+                        "ADD COLUMN IF NOT EXISTS embedding_space_version INTEGER NOT NULL DEFAULT 1"
                     )
                     await self._validate_embedding_schema(cur)
                     await cur.execute(
@@ -2455,6 +2513,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                         ON cayu_knowledge_embeddings(model, dimensions)
                         """
                     )
+                    # HNSW tops out at 2000 dims; above the cap no index is built and semantic search
+                    # falls back to an exact brute-force scan (the constructor warns — see
+                    # _warn_if_embedding_dims_exceed_hnsw).
                     if self.embedding_dimensions <= _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS:
                         await cur.execute(
                             """
@@ -2500,6 +2561,20 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 "Postgres knowledge embedding dimension mismatch: "
                 f"expected {expected}, found {actual or 'missing embedding column'}."
             )
+        await cur.execute(
+            """
+            SELECT 1
+            FROM pg_attribute AS a
+            WHERE a.attrelid = 'cayu_knowledge_embeddings'::regclass
+              AND a.attname = 'embedding_space_version'
+              AND NOT a.attisdropped
+            """
+        )
+        if await cur.fetchone() is None:
+            raise RuntimeError(
+                "Postgres knowledge embedding schema is missing the embedding_space_version column. "
+                "Run with schema_mode=CREATE or MIGRATE first."
+            )
 
     async def _semantic_search_rows(
         self,
@@ -2543,6 +2618,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                         JOIN cayu_knowledge_entries AS e ON e.id = emb.entry_id
                         WHERE emb.model = %s
                           AND emb.dimensions = %s
+                          AND emb.embedding_space_version = %s
                           AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
                         {where_sql}
                         {none_sql}
@@ -2582,6 +2658,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     vector_literal,
                     self.embedding_model,
                     self.embedding_dimensions,
+                    _EMBEDDING_SPACE_VERSION,
                     *params,
                     *none_params,
                     vector_literal,
@@ -2613,10 +2690,15 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                      AND emb.entry_id = c.entry_id
                      AND emb.model = %s
                      AND emb.dimensions = %s
+                     AND emb.embedding_space_version = %s
                      AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
                     """
             missing_embedding_filter_sql = "AND emb.chunk_id IS NULL"
-            current_embedding_params = [self.embedding_model, self.embedding_dimensions]
+            current_embedding_params = [
+                self.embedding_model,
+                self.embedding_dimensions,
+                _EMBEDDING_SPACE_VERSION,
+            ]
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 cast(
@@ -2835,6 +2917,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     _knowledge_chunk_content_hash(chunk),
                     self.embedding_model,
                     self.embedding_dimensions,
+                    _EMBEDDING_SPACE_VERSION,
                     _postgres_vector_literal(embedding.vector),
                     now,
                     now,
@@ -2849,16 +2932,18 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     content_hash,
                     model,
                     dimensions,
+                    embedding_space_version,
                     embedding,
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s::vector, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s, %s)
                 ON CONFLICT (chunk_id) DO UPDATE SET
                     entry_id = excluded.entry_id,
                     content_hash = excluded.content_hash,
                     model = excluded.model,
                     dimensions = excluded.dimensions,
+                    embedding_space_version = excluded.embedding_space_version,
                     embedding = excluded.embedding,
                     updated_at = excluded.updated_at
                 """,
@@ -2875,7 +2960,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT chunk_id, entry_id, content_hash, model, dimensions
+                SELECT chunk_id, entry_id, content_hash, model, dimensions, embedding_space_version
                 FROM cayu_knowledge_embeddings
                 WHERE chunk_id = ANY(%s)
                 """,
@@ -2891,6 +2976,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 or str(row[2]) != _knowledge_chunk_content_hash(chunk)
                 or str(row[3]) != self.embedding_model
                 or int(row[4]) != self.embedding_dimensions
+                or int(row[5]) != _EMBEDDING_SPACE_VERSION
             ):
                 missing.append(chunk)
         return missing

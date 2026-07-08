@@ -1217,3 +1217,238 @@ def test_postgres_knowledge_store_list_reports_multi_chunk_counts(postgres_dsn: 
 
     counts = {item.entry.id: item.chunk_count for item in result.entries}
     assert counts == {"single": 1, "multi": 3}
+
+
+async def _count_embeddings(dsn: str) -> int:
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute("SELECT COUNT(*) FROM cayu_knowledge_embeddings")
+        row = await cur.fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def test_postgres_knowledge_store_prune_expired_hard_deletes(postgres_dsn: str) -> None:
+    # MEM-05: prune_expired hard-deletes expired entries; the read filter only hides them.
+    async def ops(store):
+        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.put_entry(
+            KnowledgeEntry(
+                id="expired",
+                text="deployment warning",
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        pruned = await store.prune_expired()
+        leftover = await store.search(KnowledgeQuery(text="deployment", include_expired=True))
+        return pruned, [hit.entry.id for hit in leftover.hits], await store.get_entry("expired")
+
+    pruned, leftover_ids, expired_entry = _run(postgres_dsn, ops)
+
+    assert pruned == 1
+    assert expired_entry is None
+    assert leftover_ids == ["active"]
+
+
+def test_postgres_embedding_store_prune_expired_cascades_to_embeddings(postgres_dsn: str) -> None:
+    # MEM-05: the embedding subclass inherits prune_expired; the entries FK cascade must also drop
+    # the vectors from cayu_knowledge_embeddings (no explicit override needed).
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await store.put_entry(
+                KnowledgeEntry(
+                    id="expired",
+                    text="GitHub credential proxy runbook.",
+                    expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                )
+            )
+            before = await _count_embeddings(postgres_dsn)
+            pruned = await store.prune_expired()
+            after = await _count_embeddings(postgres_dsn)
+        finally:
+            await store.close()
+        return before, pruned, after
+
+    before, pruned, after = asyncio.run(ops())
+
+    assert before == 1
+    assert pruned == 1
+    assert after == 0
+
+
+def test_postgres_embedding_store_stamps_embedding_space_version(postgres_dsn: str) -> None:
+    # MEM-08: writes stamp the current embedding-space version, reads filter on it, and semantic
+    # search still resolves the current-version vectors.
+    async def ops():
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await store.put_entry(KnowledgeEntry(id="doc", text="GitHub credential proxy runbook."))
+            result = await store.search(
+                KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+            )
+        finally:
+            await store.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT DISTINCT embedding_space_version FROM cayu_knowledge_embeddings"
+            )
+            versions = sorted(row[0] for row in await cur.fetchall())
+        return [hit.entry.id for hit in result.hits], versions
+
+    hit_ids, versions = asyncio.run(ops())
+
+    assert hit_ids == ["doc"]
+    assert versions == [1]
+
+
+async def _distinct_embedding_versions(dsn: str) -> list[int]:
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute("SELECT DISTINCT embedding_space_version FROM cayu_knowledge_embeddings")
+        return sorted(int(row[0]) for row in await cur.fetchall())
+
+
+def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MEM-08 checklist Finding 1: prove the version column actually SEGREGATES spaces. Bumping
+    # _EMBEDDING_SPACE_VERSION must (a) exclude prior-version vectors from the semantic read filter AND
+    # the missing-embedding check, and (b) make a full search re-embed them at the new version. The stamp
+    # test alone would pass even if a read-site predicate were missing (v1 == v1 matches everywhere).
+    import cayu.storage.postgres as pg
+    from cayu.storage.postgres import _semantic_query_text
+
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await store.put_entry(KnowledgeEntry(id="doc", text="GitHub credential proxy runbook."))
+            version_before = await _distinct_embedding_versions(postgres_dsn)
+
+            # Prior rows are now a different embedding space.
+            monkeypatch.setattr(pg, "_EMBEDDING_SPACE_VERSION", 2)
+            query = KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
+
+            # (a1) semantic read filter excludes the v1 row (call the internal directly → no backfill).
+            query_vector = await store._embed_query(query, _semantic_query_text(query))
+            raw_rows, _ = await store._semantic_search_rows(query, query_vector)
+
+            # (a2) the missing-embedding check treats the v1 chunk as missing under v2.
+            missing = await store._missing_embedding_chunks(await store.read_chunks("doc"))
+
+            # (b) a full search re-embeds the doc at v2 (upsert) and finds it.
+            result = await store.search(query)
+            version_after = await _distinct_embedding_versions(postgres_dsn)
+        finally:
+            await store.close()
+        return (
+            version_before,
+            [row[0] for row in raw_rows],
+            len(missing),
+            [hit.entry.id for hit in result.hits],
+            version_after,
+        )
+
+    version_before, excluded_ids, missing_count, hit_ids, version_after = asyncio.run(ops())
+
+    assert version_before == [1]
+    assert excluded_ids == []  # v1 vector excluded by the v2 read filter, no backfill
+    assert missing_count == 1  # v1 chunk seen as missing under v2
+    assert hit_ids == ["doc"]  # full search re-embeds then finds it
+    assert version_after == [2]  # row migrated to the new space version
+
+
+async def _embedding_space_version_column_exists(dsn: str) -> bool:
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'cayu_knowledge_embeddings' "
+            "AND column_name = 'embedding_space_version'"
+        )
+        return await cur.fetchone() is not None
+
+
+def test_postgres_storage_migrate_adds_embedding_space_version_to_existing_table(
+    postgres_dsn: str,
+) -> None:
+    # Finding 2 (nurazem): the standard `cayu storage migrate` deploy step runs PostgresSessionStore
+    # migrations only. An embeddings table created before this column must still get it from that path
+    # (revision 12), or the app strands in the default VALIDATE mode at startup.
+    async def ops():
+        import psycopg
+
+        from cayu import PostgresEmbeddingKnowledgeStore, PostgresSessionStore
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+
+        # Build the full schema + embeddings table, then simulate a pre-column DB: drop the column and
+        # roll the recorded schema revision back below 12 so the column addition is pending.
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await store._ensure_ready()
+        finally:
+            await store.close()
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "ALTER TABLE cayu_knowledge_embeddings DROP COLUMN embedding_space_version"
+            )
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 12")
+            await conn.commit()
+        column_before = await _embedding_space_version_column_exists(postgres_dsn)
+
+        # The documented deploy step migrates via the session store only.
+        session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await session_store.ensure_schema()
+        finally:
+            await session_store.close()
+        column_after = await _embedding_space_version_column_exists(postgres_dsn)
+
+        # And the embedding store now opens clean in the default VALIDATE mode.
+        validate_store = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            schema_mode=SchemaMode.VALIDATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            await validate_store._ensure_ready()
+            validated = True
+        finally:
+            await validate_store.close()
+        return column_before, column_after, validated
+
+    column_before, column_after, validated = asyncio.run(ops())
+
+    assert column_before is False  # sanity: we really simulated a pre-column table
+    assert column_after is True  # the deploy migrate path added it
+    assert validated  # VALIDATE-mode startup no longer strands

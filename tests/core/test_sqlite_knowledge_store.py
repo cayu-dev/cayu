@@ -147,6 +147,34 @@ def test_sqlite_knowledge_store_defaults_hide_inactive_and_expired(tmp_path) -> 
     assert [hit.entry.id for hit in expired.hits] == ["expired", "active"]
 
 
+def test_sqlite_knowledge_store_prune_expired_hard_deletes(tmp_path) -> None:
+    # MEM-05: prune_expired reclaims expired entries (and their chunks/FTS) rather than just hiding them.
+    store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
+
+    async def run():
+        await store.put_entry(KnowledgeEntry(id="active", text="deployment warning"))
+        await store.put_entry(
+            KnowledgeEntry(
+                id="expired",
+                text="deployment warning",
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        pruned = await store.prune_expired()
+        leftover = await store.search(KnowledgeQuery(text="deployment", include_expired=True))
+        expired_entry = await store.get_entry("expired")
+        active_entry = await store.get_entry("active")
+        await _close(store)
+        return pruned, leftover, expired_entry, active_entry
+
+    pruned, leftover, expired_entry, active_entry = asyncio.run(run())
+
+    assert pruned == 1
+    assert expired_entry is None
+    assert active_entry is not None
+    assert [hit.entry.id for hit in leftover.hits] == ["active"]
+
+
 def test_sqlite_knowledge_store_conditionally_transitions_status(tmp_path) -> None:
     store = SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite")
 

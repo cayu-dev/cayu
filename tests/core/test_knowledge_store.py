@@ -30,6 +30,7 @@ from cayu.storage import (
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
+    KnowledgeStore,
     KnowledgeVisibility,
 )
 from cayu.storage.memory import copy_knowledge_entry
@@ -321,6 +322,72 @@ def test_in_memory_knowledge_store_excludes_non_active_and_expired_by_default() 
     assert [hit.entry.id for hit in active_result.hits] == ["active"]
     assert [hit.entry.id for hit in pending_result.hits] == ["pending"]
     assert [hit.entry.id for hit in expired_result.hits] == ["expired", "active"]
+
+
+def test_in_memory_knowledge_store_prune_expired_removes_expired_entries() -> None:
+    # MEM-05: the read filter only hides expired entries (include_expired=True still surfaces them);
+    # prune_expired reclaims them for good.
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry(
+            KnowledgeEntry(id="active", text="Active deployment warning.", kind="warning")
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="expired",
+                text="Expired deployment warning.",
+                kind="warning",
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        pruned = await store.prune_expired()
+        leftover = await store.search(KnowledgeQuery(text="deployment", include_expired=True))
+        return pruned, leftover, await store.get_entry("expired"), await store.get_entry("active")
+
+    pruned, leftover, expired_entry, active_entry = asyncio.run(run())
+
+    assert pruned == 1
+    assert expired_entry is None
+    assert active_entry is not None
+    assert [hit.entry.id for hit in leftover.hits] == ["active"]
+
+
+def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
+    # MEM-05: the embedding subclass must also reclaim the vector, not just the entry/chunks.
+    async def run():
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+        )
+        await store.put_entry(
+            KnowledgeEntry(
+                id="expired",
+                text="Expired secret rotation runbook.",
+                kind="procedure",
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
+        embeddings_before = len(store._chunk_embeddings)
+        pruned = await store.prune_expired()
+        return (
+            embeddings_before,
+            pruned,
+            len(store._chunk_embeddings),
+            await store.get_entry("expired"),
+        )
+
+    embeddings_before, pruned, embeddings_after, entry = asyncio.run(run())
+
+    assert embeddings_before == 1
+    assert pruned == 1
+    assert embeddings_after == 0
+    assert entry is None
+
+
+def test_knowledge_store_prune_expired_is_not_abstract() -> None:
+    # prune_expired is a concrete NotImplementedError default (not @abstractmethod), so existing
+    # out-of-tree KnowledgeStore subclasses still instantiate. Mirrors the SessionStore convention.
+    assert "prune_expired" not in KnowledgeStore.__abstractmethods__
 
 
 def test_in_memory_knowledge_store_chunks_are_bounded_and_scope_checked() -> None:

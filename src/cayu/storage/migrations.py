@@ -101,6 +101,11 @@ REVISIONS: tuple[Revision, ...] = (
     # Purely additive (new table only) — older binaries never touch it and keep
     # working, so the floor stays at revision 10's compatible_from.
     Revision(revision=11, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Add cayu_knowledge_embeddings.embedding_space_version (Postgres/pgvector only; SQLite has no
+    # embeddings table, so this revision carries no SQLite DDL). Purely additive (a nullable-with-
+    # default column), so the floor stays at revision 10's compatible_from and older binaries keep
+    # working.
+    Revision(revision=12, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

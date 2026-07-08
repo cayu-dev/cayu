@@ -757,6 +757,17 @@ class KnowledgeStore(ABC):
     async def list_entries(self, query: KnowledgeListQuery) -> KnowledgeListResult:
         """List entries/facets for discovery without requiring a lexical search term."""
 
+    async def prune_expired(self, *, now: datetime | None = None) -> int:
+        """Hard-delete entries whose ``expires_at`` is at or before ``now`` (default: current UTC).
+
+        Returns the count removed. The read-time filter (:func:`_entry_is_expired`) only *hides*
+        expired entries; this reclaims their storage. Hosts call it on a schedule or opportunistically.
+        ``now`` is injectable for deterministic tests.
+
+        Default raises ``NotImplementedError`` so out-of-tree stores keep working.
+        """
+        raise NotImplementedError("This KnowledgeStore does not support prune_expired.")
+
 
 class InMemoryKnowledgeStore(KnowledgeStore):
     """In-memory knowledge store for tests, demos, and single-process apps."""
@@ -861,6 +872,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._chunks.pop(clean_id, None)
             return copy_knowledge_entry(entry)
         return await self.update_entry_status(clean_id, KnowledgeStatus.DELETED)
+
+    async def prune_expired(self, *, now: datetime | None = None) -> int:
+        cutoff = datetime.now(UTC) if now is None else now
+        expired_ids = [
+            entry_id
+            for entry_id, entry in self._entries.items()
+            if entry.expires_at is not None and entry.expires_at <= cutoff
+        ]
+        for entry_id in expired_ids:
+            self._entries.pop(entry_id, None)
+            self._chunks.pop(entry_id, None)
+        return len(expired_ids)
 
     async def replace_chunks(
         self, entry_id: str, chunks: list[KnowledgeChunk]
@@ -1086,6 +1109,18 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         if hard and deleted is not None:
             self._drop_entry_embeddings(deleted.id)
         return deleted
+
+    async def prune_expired(self, *, now: datetime | None = None) -> int:
+        cutoff = datetime.now(UTC) if now is None else now
+        expired_ids = [
+            entry_id
+            for entry_id, entry in self._entries.items()
+            if entry.expires_at is not None and entry.expires_at <= cutoff
+        ]
+        pruned = await super().prune_expired(now=cutoff)
+        for entry_id in expired_ids:
+            self._drop_entry_embeddings(entry_id)
+        return pruned
 
     async def replace_chunks(
         self,

@@ -890,7 +890,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11 are purely additive, so they inherit the prior floor;
+    # Revisions 2-7, 11, and 12 are purely additive, so they inherit the prior floor;
     # only the breaking revisions (1, 8, 9, 10) raise compatible_from to themselves.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
@@ -905,6 +905,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (9, 9),
         (10, 10),
         (11, 10),
+        (12, 10),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
