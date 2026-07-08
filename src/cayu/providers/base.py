@@ -168,6 +168,19 @@ def _optional_clean_error_field(value: str | None, field_name: str) -> str | Non
     return require_clean_nonblank(value, field_name)
 
 
+class NativeStructuredOutputSchemaInvalid(ValueError):
+    """A ``strategy=NATIVE`` structured-output JSON Schema uses constructs the
+    resolved provider's native mode would reject at request time.
+
+    Raised by ``ModelProvider.preflight_native_structured_output_schema``
+    before any session is created or transitioned, so the caller can fix the
+    schema (the message names the offending JSON path, e.g.
+    ``$/properties/address``) or retry with ``strategy="tool"`` (same JSON
+    contract, provider-neutral transport). Subclasses ``ValueError`` so
+    existing handlers (including the server's 4xx mapping) keep working.
+    """
+
+
 class InputTokenCountResult(BaseModel):
     """Provider-neutral input token count for a model request.
 
@@ -567,6 +580,21 @@ class ModelProvider(ABC):
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
         return ModelContextPressureProfile()
+
+    def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
+        """Optionally reject a NATIVE structured-output schema this adapter's
+        provider API would refuse, before any model request is made.
+
+        The runtime calls this at every entrance (after the
+        ``supports_native_structured_output`` check, before any session is
+        created or transitioned) with a caller-owned copy of the schema;
+        implementations must not mutate it. Adapters should raise
+        ``NativeStructuredOutputSchemaInvalid`` with a path-specific message.
+        The default accepts everything: adapters without provider-specific
+        schema rules stay source-compatible.
+        """
+
+        return None
 
     async def count_input_tokens(
         self,

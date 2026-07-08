@@ -25,6 +25,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    NativeStructuredOutputSchemaInvalid,
     UsageDialect,
     copy_input_token_count_result,
     copy_model_context_pressure_profile,
@@ -55,6 +56,7 @@ from cayu.providers.openai import (
     build_openai_payload,
     openai_embedding_result,
     openai_response_events,
+    preflight_openai_native_structured_output_schema,
 )
 from cayu.providers.vertex import (
     HttpxVertexTransport,
@@ -97,6 +99,7 @@ __all__ = [
     "ModelRequest",
     "ModelStreamEvent",
     "ModelStreamEventType",
+    "NativeStructuredOutputSchemaInvalid",
     "OpenAIAPIError",
     "OpenAIContextOverflowError",
     "OpenAIError",
@@ -123,4 +126,5 @@ __all__ = [
     "normalize_model_completion",
     "openai_embedding_result",
     "openai_response_events",
+    "preflight_openai_native_structured_output_schema",
 ]

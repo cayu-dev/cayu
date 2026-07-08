@@ -5,7 +5,12 @@ import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    escape_json_pointer_segment,
+    require_clean_nonblank,
+    unescape_json_pointer_segment,
+)
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -58,6 +63,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    NativeStructuredOutputSchemaInvalid,
 )
 
 if TYPE_CHECKING:
@@ -97,6 +103,16 @@ _PROTECTED_HEADER_NAMES = {
     "content-type",
 }
 _OPENAI_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# RFC 6901 array index: ASCII digits, no leading zeros. str.isdigit() is too
+# loose here — it accepts '01' and non-decimal digits like '²' (which int()
+# then rejects with a raw ValueError).
+_OPENAI_POINTER_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
+# Bounds this module's own recursion in the schema preflight walk, far above
+# any schema OpenAI native mode accepts; NOT a model of OpenAI's (drifting)
+# nesting limit.
+_OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH = 128
+# OpenAI rejects every $ref sibling key except these containers.
+_OPENAI_REF_SIBLING_ALLOWLIST = frozenset({"$ref", "$defs", "definitions"})
 _VALID_REASONING_STATES = {"inline", "server"}
 
 
@@ -274,6 +290,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         return ModelContextPressureProfile(
             tool_schema_chars_per_token=OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
         )
+
+    def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
+        preflight_openai_native_structured_output_schema(json_schema)
 
     def __init__(
         self,
@@ -1210,6 +1229,185 @@ def _openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def preflight_openai_native_structured_output_schema(json_schema: dict[str, Any]) -> None:
+    """Reject a NATIVE structured-output schema OpenAI strict mode always refuses.
+
+    Checks only the structural rules that have been invariant since strict
+    mode launched: the root must be an object schema, every object schema must
+    set ``additionalProperties: false``, every ``properties`` key must appear
+    in ``required``, and every ``$ref`` must resolve inside the document,
+    carry no sibling keys beyond ``$defs``/``definitions``, and point at a
+    schema that itself satisfies these rules. Keyword-level limits are
+    deliberately not checked: OpenAI has only ever relaxed them, so a denylist
+    would falsely reject schemas the API now accepts. Violations outside this
+    core still surface as an OpenAI-side 400.
+
+    Raises ``NativeStructuredOutputSchemaInvalid`` (a ``ValueError``) with the
+    offending JSON path for schema-rule violations, and ``TypeError`` when
+    ``json_schema`` is not a dict (a caller error, matching the runtime's
+    copy/validate conventions).
+    """
+    if type(json_schema) is not dict:
+        raise TypeError("Native structured output schema must be an object.")
+    root: Any = json_schema
+    if "$ref" in json_schema:
+        root = _resolve_openai_schema_ref(json_schema["$ref"], document=json_schema, path="$")
+    if type(root) is not dict or not _is_openai_object_schema(root):
+        raise NativeStructuredOutputSchemaInvalid(
+            "$: OpenAI native structured output requires the root schema to be an object type."
+        )
+    _walk_openai_strict_schema(json_schema, document=json_schema, path="$", walked_refs=set())
+
+
+def _walk_openai_strict_schema(
+    schema: Any,
+    *,
+    document: dict[str, Any],
+    path: str,
+    walked_refs: set[str],
+    depth: int = 0,
+) -> None:
+    # Boolean subschemas (`true`/`false`) are terminal; anything else non-dict
+    # is malformed JSON Schema and already rejected by the runtime's generic
+    # Draft 2020-12 check.
+    if type(schema) is not dict:
+        return
+    if depth > _OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH:
+        raise NativeStructuredOutputSchemaInvalid(
+            f"{path}: schema nesting exceeds the preflight depth limit "
+            f"({_OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH})."
+        )
+    if "$ref" in schema:
+        # OpenAI rejects any $ref sibling key except the $defs/definitions
+        # container the root form needs ({"$ref": "#/$defs/x", "$defs": ...}
+        # is accepted; a description sibling is a 400 — probed live 2026-07).
+        siblings = sorted(key for key in schema if key not in _OPENAI_REF_SIBLING_ALLOWLIST)
+        if siblings:
+            raise NativeStructuredOutputSchemaInvalid(
+                f"{path}: OpenAI native structured output does not allow $ref to "
+                f"carry sibling keys (found: {', '.join(siblings)}); only "
+                "$defs/definitions may accompany it."
+            )
+        ref = schema["$ref"]
+        target = _resolve_openai_schema_ref(ref, document=document, path=path)
+        # Walk each distinct ref target exactly once so referenced schemas are
+        # held to the same rules wherever they live in the document, while
+        # recursive schemas ("$ref": "#", supported by OpenAI) cannot loop.
+        if ref not in walked_refs:
+            walked_refs.add(ref)
+            _walk_openai_strict_schema(
+                target,
+                document=document,
+                path=f"${ref[1:]}",
+                walked_refs=walked_refs,
+                depth=depth + 1,
+            )
+    if _is_openai_object_schema(schema):
+        _check_openai_object_schema(schema, path=path)
+    for keyword in ("properties", "$defs", "definitions"):
+        members = schema.get(keyword)
+        if type(members) is dict:
+            for key, subschema in members.items():
+                _walk_openai_strict_schema(
+                    subschema,
+                    document=document,
+                    path=f"{path}/{keyword}/{escape_json_pointer_segment(str(key))}",
+                    walked_refs=walked_refs,
+                    depth=depth + 1,
+                )
+    items = schema.get("items")
+    if items is not None:
+        _walk_openai_strict_schema(
+            items,
+            document=document,
+            path=f"{path}/items",
+            walked_refs=walked_refs,
+            depth=depth + 1,
+        )
+    for keyword in ("prefixItems", "anyOf", "oneOf", "allOf"):
+        entries = schema.get(keyword)
+        if type(entries) is list:
+            for index, subschema in enumerate(entries):
+                _walk_openai_strict_schema(
+                    subschema,
+                    document=document,
+                    path=f"{path}/{keyword}[{index}]",
+                    walked_refs=walked_refs,
+                    depth=depth + 1,
+                )
+    additional = schema.get("additionalProperties")
+    if type(additional) is dict:
+        _walk_openai_strict_schema(
+            additional,
+            document=document,
+            path=f"{path}/additionalProperties",
+            walked_refs=walked_refs,
+            depth=depth + 1,
+        )
+
+
+def _check_openai_object_schema(schema: dict[str, Any], *, path: str) -> None:
+    if schema.get("additionalProperties") is not False:
+        raise NativeStructuredOutputSchemaInvalid(
+            f"{path}: OpenAI native structured output requires every object schema "
+            "to set additionalProperties: false."
+        )
+    properties = schema.get("properties")
+    property_names = list(properties) if type(properties) is dict else []
+    required = schema.get("required")
+    required_names = set(required) if type(required) is list else set()
+    missing = [name for name in property_names if name not in required_names]
+    if missing:
+        raise NativeStructuredOutputSchemaInvalid(
+            f"{path}: OpenAI native structured output requires every property to be "
+            f"listed in required; missing: {', '.join(sorted(missing))}."
+        )
+
+
+def _is_openai_object_schema(schema: dict[str, Any]) -> bool:
+    if "properties" in schema:
+        return True
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        return True
+    return type(schema_type) is list and "object" in schema_type
+
+
+def _resolve_openai_schema_ref(ref: Any, *, document: dict[str, Any], path: str) -> Any:
+    if type(ref) is not str or not ref.startswith("#"):
+        raise NativeStructuredOutputSchemaInvalid(
+            f"{path}/$ref: OpenAI native structured output requires internal $refs "
+            f"(a JSON pointer starting with '#'); got: {ref!r}."
+        )
+    pointer = ref[1:]
+    if pointer and not pointer.startswith("/"):
+        raise NativeStructuredOutputSchemaInvalid(
+            f"{path}/$ref: $ref does not resolve within the schema document: {ref!r}."
+        )
+    target: Any = document
+    if pointer:
+        for raw_segment in pointer[1:].split("/"):
+            # Escape handling is deliberately lenient: ~1/~0 are decoded and
+            # everything else is matched literally. OpenAI's own resolver
+            # accepts non-RFC-6901 segments the same way (probed live 2026-07:
+            # "#/$defs/a~b" resolves against a literal "a~b" key), so strict
+            # escape validation here would falsely reject working schemas.
+            segment = unescape_json_pointer_segment(raw_segment)
+            if type(target) is dict and segment in target:
+                target = target[segment]
+            elif (
+                type(target) is list
+                and _OPENAI_POINTER_INDEX_RE.fullmatch(segment)
+                and int(segment) < len(target)
+            ):
+                target = target[int(segment)]
+            else:
+                raise NativeStructuredOutputSchemaInvalid(
+                    f"{path}/$ref: $ref does not resolve within the schema document: {ref!r}."
+                )
+    return target
+
+
 def _openai_structured_output_format(options: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = options.get("structured_output")
     if raw is None:
@@ -1225,11 +1423,12 @@ def _openai_structured_output_format(options: Mapping[str, Any]) -> dict[str, An
     name = raw.get("name") or "structured_output"
     if not isinstance(name, str):
         raise ValueError("Native structured output name must be a string.")
-    # The schema is forwarded verbatim on purpose: strict mode's rule set
-    # (all-fields-required, additionalProperties: false, inlined $refs, ...)
-    # is OpenAI-defined and drifts, and rewriting the schema here would make
-    # the provider enforce a different contract than the runtime validates
-    # the final JSON against. Violations surface as an OpenAI-side 400.
+    # The schema is forwarded verbatim on purpose: rewriting it here would
+    # make the provider enforce a different contract than the runtime
+    # validates the final JSON against. The stable structural core of strict
+    # mode is rejected earlier by preflight_openai_native_structured_output_schema
+    # (via the runtime's pre-session preflight); rules outside that core are
+    # OpenAI-defined and drift, so violations still surface as an OpenAI-side 400.
     return {
         "type": "json_schema",
         "name": require_clean_nonblank(name, "structured_output.name"),

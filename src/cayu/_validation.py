@@ -84,6 +84,24 @@ def require_finite(value: float, field_name: str) -> float:
     return value
 
 
+def escape_json_pointer_segment(key: str) -> str:
+    """Escape one JSON-pointer reference token per RFC 6901 (`~`→`~0`, `/`→`~1`).
+
+    Used to build the `$`-rooted, `/`-separated error paths shared by the
+    runtime's structured-output validation and provider schema preflights.
+    """
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def unescape_json_pointer_segment(segment: str) -> str:
+    """Decode one JSON-pointer reference token per RFC 6901 (`~1`→`/`, `~0`→`~`).
+
+    The replace order is load-bearing: `~1` must be decoded before `~0` so
+    that `~01` becomes `~1`, not `/` (RFC 6901 section 4).
+    """
+    return segment.replace("~1", "/").replace("~0", "~")
+
+
 def copy_json_value(value: Any, field_name: str) -> Any:
     return _copy_json_value(value, field_name, set())
 

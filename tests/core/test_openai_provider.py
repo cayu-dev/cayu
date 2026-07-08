@@ -29,6 +29,7 @@ from cayu.providers import (
     ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
+    NativeStructuredOutputSchemaInvalid,
     OpenAIAPIError,
     OpenAIContextOverflowError,
     OpenAIProtocolError,
@@ -37,6 +38,7 @@ from cayu.providers import (
     build_openai_payload,
     openai_embedding_result,
     openai_response_events,
+    preflight_openai_native_structured_output_schema,
 )
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.openai import openai_stream_events
@@ -317,6 +319,319 @@ def test_build_openai_payload_rejects_openai_text_override_with_native_structure
 
     with pytest.raises(ValueError, match="cannot be combined with native structured output"):
         build_openai_payload(request)
+
+
+def test_openai_native_schema_preflight_accepts_strict_compliant_schema() -> None:
+    preflight_openai_native_structured_output_schema(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "address": {
+                    "type": ["object", "null"],
+                    "properties": {"street": {"type": "string"}},
+                    "required": ["street"],
+                    "additionalProperties": False,
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"code": {"type": "integer"}},
+                            "required": ["code"],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
+            "required": ["answer", "address", "tags", "value"],
+            "additionalProperties": False,
+        }
+    )
+
+
+def test_openai_native_schema_preflight_accepts_recursive_refs() -> None:
+    preflight_openai_native_structured_output_schema(
+        {
+            "type": "object",
+            "properties": {
+                "whole": {"$ref": "#"},
+                "node": {"$ref": "#/$defs/node"},
+            },
+            "required": ["whole", "node"],
+            "additionalProperties": False,
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "children": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+                    },
+                    "required": ["children"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    )
+
+
+def test_openai_native_schema_preflight_resolves_root_ref() -> None:
+    preflight_openai_native_structured_output_schema(
+        {
+            "$ref": "#/$defs/answer",
+            "$defs": {
+                "answer": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    )
+
+
+def test_openai_native_schema_preflight_requires_root_object() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$: OpenAI native structured output requires the root schema",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {"type": "array", "items": {"type": "string"}}
+        )
+
+
+def test_openai_native_schema_preflight_requires_additional_properties_false() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/properties/address: .*additionalProperties: false",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "object",
+                        "properties": {"street": {"type": "string"}},
+                        "required": ["street"],
+                    }
+                },
+                "required": ["address"],
+                "additionalProperties": False,
+            }
+        )
+
+
+def test_openai_native_schema_preflight_requires_all_properties_required() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$: .*listed in required; missing: note\.",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}, "note": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            }
+        )
+
+
+def test_openai_native_schema_preflight_rejects_external_ref() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/properties/item/\$ref: .*internal \$refs",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"item": {"$ref": "https://example.com/schema.json"}},
+                "required": ["item"],
+                "additionalProperties": False,
+            }
+        )
+
+
+def test_openai_native_schema_preflight_rejects_unresolvable_ref() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/properties/item/\$ref: .*does not resolve",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"item": {"$ref": "#/$defs/missing"}},
+                "required": ["item"],
+                "additionalProperties": False,
+                "$defs": {},
+            }
+        )
+
+
+def test_openai_native_schema_preflight_rejects_ref_sibling_keys() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/properties/item: .*sibling keys \(found: description\)",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"item": {"$ref": "#/$defs/base", "description": "sibling"}},
+                "required": ["item"],
+                "additionalProperties": False,
+                "$defs": {
+                    "base": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                        "additionalProperties": False,
+                    }
+                },
+            }
+        )
+
+
+def test_openai_native_schema_preflight_walks_ref_targets() -> None:
+    # A referenced schema must satisfy the strict rules even when it lives
+    # under a container keyword the structural walk does not descend into.
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/x-container/obj: .*additionalProperties: false",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"item": {"$ref": "#/x-container/obj"}},
+                "required": ["item"],
+                "additionalProperties": False,
+                "x-container": {
+                    "obj": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    }
+                },
+            }
+        )
+
+
+def test_openai_native_schema_preflight_accepts_mutually_recursive_ref_targets() -> None:
+    preflight_openai_native_structured_output_schema(
+        {
+            "type": "object",
+            "properties": {"tree": {"$ref": "#/$defs/a"}},
+            "required": ["tree"],
+            "additionalProperties": False,
+            "$defs": {
+                "a": {
+                    "type": "object",
+                    "properties": {"b": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/b"}]}},
+                    "required": ["b"],
+                    "additionalProperties": False,
+                },
+                "b": {
+                    "type": "object",
+                    "properties": {"a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/a"}]}},
+                    "required": ["a"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+
+
+def test_openai_native_schema_preflight_array_index_refs_follow_rfc_6901() -> None:
+    def schema_with_ref(pointer: str) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"item": {"$ref": pointer}},
+            "required": ["item"],
+            "additionalProperties": False,
+            "anyOf": [{"type": "string"}, {"type": "integer"}],
+        }
+
+    preflight_openai_native_structured_output_schema(schema_with_ref("#/anyOf/1"))
+
+    # Leading zeros and non-decimal Unicode "digits" are not RFC 6901 array
+    # indices; both must fail with the typed unresolvable-ref error (the
+    # latter previously escaped as a raw int() ValueError).
+    for bad_index in ("01", "²"):
+        with pytest.raises(
+            NativeStructuredOutputSchemaInvalid,
+            match=r"\$/properties/item/\$ref: .*does not resolve",
+        ):
+            preflight_openai_native_structured_output_schema(
+                schema_with_ref(f"#/anyOf/{bad_index}")
+            )
+
+
+def test_openai_native_schema_preflight_rejects_overdeep_nesting() -> None:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"leaf": {"type": "string"}},
+        "required": ["leaf"],
+        "additionalProperties": False,
+    }
+    for _ in range(200):
+        schema = {
+            "type": "object",
+            "properties": {"child": schema},
+            "required": ["child"],
+            "additionalProperties": False,
+        }
+
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"exceeds the preflight depth limit",
+    ):
+        preflight_openai_native_structured_output_schema(schema)
+
+
+def test_openai_native_schema_preflight_walks_anyof_and_items() -> None:
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$/properties/entries/items/anyOf\[1\]: .*missing: code\.",
+    ):
+        preflight_openai_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {"code": {"type": "integer"}},
+                                    "required": [],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
+                    }
+                },
+                "required": ["entries"],
+                "additionalProperties": False,
+            }
+        )
+
+
+def test_openai_provider_preflights_native_structured_output_schema() -> None:
+    provider = OpenAIProvider(api_key="test-key", transport=RecordingTransport())
+
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$: .*additionalProperties: false",
+    ):
+        provider.preflight_native_structured_output_schema(
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            }
+        )
 
 
 def test_build_openai_payload_translates_file_attachments() -> None:

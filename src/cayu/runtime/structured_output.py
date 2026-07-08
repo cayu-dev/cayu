@@ -8,7 +8,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationInfo, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, escape_json_pointer_segment, require_clean_nonblank
 
 STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
 
@@ -306,6 +306,5 @@ def _json_path(parts: Any) -> str:
         if type(part) is int:
             path = f"{path}[{part}]"
         else:
-            escaped = str(part).replace("~", "~0").replace("/", "~1")
-            path = f"{path}/{escaped}"
+            path = f"{path}/{escape_json_pointer_segment(str(part))}"
     return path

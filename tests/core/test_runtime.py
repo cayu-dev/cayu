@@ -43,6 +43,8 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    NativeStructuredOutputSchemaInvalid,
+    OpenAIProvider,
 )
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import RunnerCancelledError
@@ -262,6 +264,11 @@ class OtherProvider(FakeProvider):
 
 class NativeStructuredOutputFakeProvider(FakeProvider):
     supports_native_structured_output = True
+
+
+class SchemaRejectingProvider(NativeStructuredOutputFakeProvider):
+    def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
+        raise NativeStructuredOutputSchemaInvalid("$: rejected by provider preflight.")
 
 
 class MutatingProvider(FakeProvider):
@@ -22040,6 +22047,131 @@ def test_require_native_structured_output_support_helper():
         _require_native_structured_output_support(
             _native_answer_spec(), registered_provider=registered_provider
         )
+
+
+def test_cayu_app_rejects_invalid_native_structured_output_schema_before_run():
+    store = InMemorySessionStore()
+    provider = SchemaRejectingProvider([])
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid, match="rejected by provider preflight"
+    ) as excinfo:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_native_schema_invalid",
+                    messages=[Message.text("user", "answer with structured output")],
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    # Still a ValueError, so existing handlers (server 4xx mapping) keep working.
+    assert isinstance(excinfo.value, ValueError)
+    # Preflight contract: no session persisted, no model request made.
+    assert asyncio.run(store.load("sess_native_schema_invalid")) is None
+    assert provider.requests == []
+
+
+def test_cayu_app_rejects_openai_native_schema_before_first_model_call():
+    # The issue-#151 acceptance path end-to-end: a schema OpenAI strict mode
+    # always refuses (no `additionalProperties: false`) fails before any
+    # session is created and before the transport is touched.
+    class UnreachableTransport:
+        def stream_response_events(self, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+            raise AssertionError("preflight must reject before any model request")
+
+        async def create_response(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("preflight must reject before any model request")
+
+    store = InMemorySessionStore()
+    provider = OpenAIProvider(api_key="test-key", transport=UnreachableTransport())
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+    with pytest.raises(
+        NativeStructuredOutputSchemaInvalid,
+        match=r"\$: .*additionalProperties: false",
+    ):
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_openai_native_schema_invalid",
+                    messages=[Message.text("user", "answer with structured output")],
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    assert asyncio.run(store.load("sess_openai_native_schema_invalid")) is None
+
+
+def test_cayu_app_rejects_invalid_native_structured_output_schema_on_tool_approval():
+    # Composition: the resolver adopts the effective spec from the pending
+    # checkpoint, and the provider schema preflight must run on THAT spec
+    # before the status transition — not just on the run() request path.
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = SchemaRejectingProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_native_schema_tool_approval",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    # The paused run had no spec, so the resolver's NATIVE spec would be
+    # adopted — and its schema must be rejected before the status transition.
+    with pytest.raises(NativeStructuredOutputSchemaInvalid, match="rejected by provider preflight"):
+        asyncio.run(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id="sess_native_schema_tool_approval",
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                    structured_output=_native_answer_spec(),
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load("sess_native_schema_tool_approval"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
 
 
 def test_cayu_app_retries_structured_output_with_durable_repair_prompt():

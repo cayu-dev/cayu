@@ -967,9 +967,14 @@ except NativeStructuredOutputUnsupported:
 ```
 
 The portable `tool` strategy remains the default. Note that OpenAI's strict
-JSON-schema mode has requirements beyond ordinary JSON Schema — every object
-must set `additionalProperties: false` and list all properties in `required`,
-and `$ref`s must be inlined; schemas that violate these are rejected by
+JSON-schema mode has requirements beyond ordinary JSON Schema. Its stable
+structural core — the root schema is an object, every object sets
+`additionalProperties: false` and lists all properties in `required`, and
+every `$ref` resolves inside the document, carries no sibling keys beyond
+`$defs`/`definitions`, and points at a schema that satisfies the same rules —
+is checked before any session is created: violations raise
+`NativeStructuredOutputSchemaInvalid` (a `ValueError`) naming the offending
+JSON path. OpenAI-side restrictions outside that core are still rejected by
 OpenAI's API at request time.
 
 ## Thinking And Reasoning

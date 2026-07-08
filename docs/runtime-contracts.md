@@ -475,7 +475,17 @@ A run, resume, or pause continuation whose resolved provider lacks it raises
 `NativeStructuredOutputUnsupported` before any session is created or its status
 transitioned, so the caller can retry with `strategy="tool"` or re-route —
 model-pattern provider routing means a model name alone can select the
-provider. OpenAI maps the spec to the Responses API
+provider. After that support check, the resolved provider's own schema
+preflight (`ModelProvider.preflight_native_structured_output_schema`) runs at
+the same pre-session boundary: schemas the provider's native mode always
+refuses raise `NativeStructuredOutputSchemaInvalid` with the offending JSON
+path, again with no persisted state changed. For OpenAI this covers strict
+mode's stable structural core (object root, `additionalProperties: false`,
+all properties in `required`, and internal resolvable `$ref`s with no sibling
+keys beyond `$defs`/`definitions` whose targets are held to the same rules);
+restrictions outside that core still surface as an OpenAI-side 400 at request
+time.
+OpenAI maps the spec to the Responses API
 `text.format` JSON-schema request shape. In native mode, Cayu does not inject the
 runtime final-output tool; it validates the final assistant text as JSON against
 the same schema before emitting `structured_output.validated`. Runtime

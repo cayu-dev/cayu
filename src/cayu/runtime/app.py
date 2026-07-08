@@ -4253,8 +4253,9 @@ class CayuApp:
                 tail_message_count=len(messages_to_append),
             ):
                 yield event
-            # Typed backstop: every entry point preflights this before touching
-            # persisted state; anything reaching here is a missed entrance.
+            # Typed backstop for a missed entrance: every entry point already
+            # preflights this before touching persisted state. Here the session
+            # is running, so a raise fails it cleanly instead of preventing it.
             _require_native_structured_output_support(
                 structured_output, registered_provider=registered_provider
             )
@@ -9735,21 +9736,27 @@ def _require_native_structured_output_support(
     *,
     registered_provider: runtime_records.RegisteredProvider,
 ) -> None:
-    """Reject an unsupported ``strategy=NATIVE`` spec at an entry point.
+    """Reject an unusable ``strategy=NATIVE`` spec at an entry point.
 
     Called by every entrance before it creates a session or transitions its
     status, so the typed error reaches the caller with no persisted state
     changed (model-pattern routing can select the provider by model name
-    alone).
+    alone). Raises ``NativeStructuredOutputUnsupported`` when the resolved
+    provider has no native mode, then lets the provider's own schema preflight
+    reject schemas its native mode would refuse at request time
+    (``NativeStructuredOutputSchemaInvalid``). One pre-existing mid-run call
+    in ``_run_session`` reuses this helper as a typed backstop for missed
+    entrances; a raise there fails the already-running session cleanly.
     """
-    if (
-        structured_output is not None
-        and structured_output.strategy == StructuredOutputStrategy.NATIVE
-        and not registered_provider.provider.supports_native_structured_output
-    ):
+    if structured_output is None or structured_output.strategy != StructuredOutputStrategy.NATIVE:
+        return
+    if not registered_provider.provider.supports_native_structured_output:
         raise NativeStructuredOutputUnsupported(
             f"Native structured output is not supported by provider: {registered_provider.name}"
         )
+    registered_provider.provider.preflight_native_structured_output_schema(
+        copy_json_value(structured_output.json_schema, "json_schema")
+    )
 
 
 def _effective_approval_structured_output(
