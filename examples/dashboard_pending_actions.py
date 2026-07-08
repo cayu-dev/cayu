@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 
 import uvicorn
@@ -48,8 +49,8 @@ DEMO_PRICING = PricingCatalog(
         ModelPricing(
             provider_name="fake",
             model="fake-model",
-            input_per_million="1.00",
-            output_per_million="3.00",
+            input_per_million=Decimal("1.00"),
+            output_per_million=Decimal("3.00"),
         ),
     )
 )
@@ -64,7 +65,9 @@ class DashboardDemoProvider(ModelProvider):
         prompt = _request_text(request).lower()
         if _has_tool_result(request):
             yield ModelStreamEvent.text_delta(_final_text(prompt))
-            yield ModelStreamEvent.completed(_completed_payload("stop", input_tokens=220, output_tokens=48))
+            yield ModelStreamEvent.completed(
+                _completed_payload("stop", input_tokens=220, output_tokens=48)
+            )
             return
 
         if "provider failure" in prompt:
@@ -243,7 +246,9 @@ def _seed_note(events) -> str:
         if event_type == "tool.call.blocked":
             return f" (blocked tool: {event.tool_name})"
         if event_type == "session.failed":
-            error_type = event.payload.get("error_type") if isinstance(event.payload, dict) else None
+            error_type = (
+                event.payload.get("error_type") if isinstance(event.payload, dict) else None
+            )
             return f" ({error_type or 'session failed'})"
     return ""
 
@@ -403,7 +408,9 @@ def build_app() -> CayuApp:
 def main() -> None:
     app = build_app()
     asyncio.run(seed_sessions(app))
-    asyncio.run(seed_pending_knowledge(app.knowledge_store))
+    knowledge_store = app.knowledge_store
+    assert isinstance(knowledge_store, SQLiteKnowledgeStore)
+    asyncio.run(seed_pending_knowledge(knowledge_store))
     server = create_server(
         app,
         dev=True,

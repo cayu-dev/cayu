@@ -77,6 +77,11 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.11
+        working-directory: .
+      - run: uv sync --frozen --extra dev --extra server --python 3.11
+        working-directory: .
       - run: npm run check:api
       - run: npm run build:package
       - name: Check packaged dashboard assets

@@ -61,6 +61,7 @@ from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
 from cayu.runtime.usage import (
+    CacheUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
@@ -511,14 +512,13 @@ def _add_usage_metrics(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
         output_tokens=left.output_tokens + right.output_tokens,
         total_tokens=left.total_tokens + right.total_tokens,
         reasoning_output_tokens=left.reasoning_output_tokens + right.reasoning_output_tokens,
-        cache={
-            "read_tokens": left.cache.read_tokens + right.cache.read_tokens,
-            "write_tokens": left.cache.write_tokens + right.cache.write_tokens,
-            "cached_input_tokens": left.cache.cached_input_tokens
-            + right.cache.cached_input_tokens,
-            "uncached_input_tokens": left.cache.uncached_input_tokens
+        cache=CacheUsageMetrics(
+            read_tokens=left.cache.read_tokens + right.cache.read_tokens,
+            write_tokens=left.cache.write_tokens + right.cache.write_tokens,
+            cached_input_tokens=left.cache.cached_input_tokens + right.cache.cached_input_tokens,
+            uncached_input_tokens=left.cache.uncached_input_tokens
             + right.cache.uncached_input_tokens,
-        },
+        ),
     )
 
 

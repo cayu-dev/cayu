@@ -15,6 +15,7 @@ import uvicorn
 
 from cayu import (
     CayuApp,
+    KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
@@ -48,7 +49,7 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
             impact_targets=["sandbox.git.push"],
             source_type="tool",
             source_id="remember_01",
-            created_by_type="model",
+            created_by_type=KnowledgeActorType.MODEL,
             created_by="assistant",
             confidence=0.91,
             metadata={
@@ -95,7 +96,7 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
             impact_targets=["invoice.refund"],
             source_type="tool",
             source_id="remember_02",
-            created_by_type="model",
+            created_by_type=KnowledgeActorType.MODEL,
             created_by="assistant",
             confidence=0.78,
             metadata={"session_id": "sess_invoice_refund_review"},

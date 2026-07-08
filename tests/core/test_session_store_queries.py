@@ -338,9 +338,7 @@ def test_session_stores_list_sessions_with_debug_state_filter(
         assert [session.id for session in session_failures.sessions] == [
             "debug_query_session_failure"
         ]
-        assert [session.id for session in interruptions.sessions] == [
-            "debug_query_interruption"
-        ]
+        assert [session.id for session in interruptions.sessions] == ["debug_query_interruption"]
         assert [session.id for session in needs_attention.sessions] == [
             "debug_query_tool_failure",
             "debug_query_tool_blocked",
