@@ -227,6 +227,7 @@ with `PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py`.
 User guides:
 
 - [PR-reviewer recipe](docs/recipes/pr-reviewer.md) — the featured end-to-end example.
+- [Business approvals recipe](docs/recipes/business-approvals.md) — multi-tier approve/condition/decline on top of the binary approval primitive.
 - [Triggering runs](docs/triggering-runs.md) — which start verb (run / dispatch / task worker / subagent / event watcher) fits your trigger.
 - [Environment factories](docs/environment-factories.md) — per-session workspaces, runners, and bindings.
 - [Build a runner](docs/build-a-runner.md) — run commands on your own platform.
