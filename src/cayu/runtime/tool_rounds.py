@@ -7,7 +7,11 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime.approvals import ToolApprovalRecoveryOutcome
+from cayu.runtime.approvals import (
+    ResolutionActor,
+    ToolApprovalRecoveryOutcome,
+    copy_resolution_actor,
+)
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -38,6 +42,7 @@ class ToolRoundRecoveryRequest(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -74,6 +79,11 @@ class ToolRoundRecoveryRequest(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         return copy_json_value(value, info.field_name)
+
+    @field_validator("resolved_by")
+    @classmethod
+    def copy_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
     @field_validator("structured_output")
     @classmethod
@@ -113,6 +123,7 @@ def copy_tool_round_recovery_request(
         artifacts=copy_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
+        resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,
         budget_limits=(

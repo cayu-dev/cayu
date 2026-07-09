@@ -215,6 +215,29 @@ class SessionsSummaryResponse(ApiBaseModel):
     cost: AggregateCostSummary | None
 
 
+class ApiPendingAction(ApiBaseModel):
+    id: str
+    kind: Literal["tool_approval", "user_input", "manual_recovery"]
+    session: ApiSessionBase
+    event: ApiEventRecord
+    title: str
+    detail: str | None = None
+    tool_name: str | None = None
+    approval_id: str | None = None
+    input_id: str | None = None
+    round_id: str | None = None
+    tool_call_id: str | None = None
+    question: str | None = None
+    options: list[str] = Field(default_factory=list)
+    arguments: dict[str, Any] | None = None
+
+
+class PendingActionsResponse(ApiBaseModel):
+    actions: list[ApiPendingAction]
+    total_count: StrictInt = Field(ge=0)
+    inspected_session_count: StrictInt = Field(ge=0)
+
+
 class TranscriptSummary(ApiBaseModel):
     total_messages: StrictInt = Field(ge=0)
 

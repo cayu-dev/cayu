@@ -12291,6 +12291,12 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
                 message="side effect verified externally",
                 structured={"verified": True},
                 reason="operator checked the downstream system",
+                resolved_by=ResolutionActor(
+                    subject="operator@example.com",
+                    tenant="tenant-a",
+                    source=ResolutionActorSource.REQUEST,
+                    claims={"role": "incident-responder"},
+                ),
             ),
         )
     )
@@ -12315,6 +12321,18 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
     )
     assert recovered.payload["result"]["content"] == "side effect verified externally"
     assert recovered.payload["result"]["is_error"] is False
+    assert recovered.payload["resolved_by"] == {
+        "subject": "operator@example.com",
+        "tenant": "tenant-a",
+        "source": "request",
+    }
+    resumed = next(event for event in recovery_events if event.type == EventType.SESSION_RESUMED)
+    assert resumed.payload["resolved_by"] == {
+        "subject": "operator@example.com",
+        "tenant": "tenant-a",
+        "source": "request",
+    }
+    assert "claims" not in recovered.payload["resolved_by"]
     assert recovery_events[-1].type == EventType.SESSION_COMPLETED
     assert not any(
         "outcome_unknown" in str(event.payload.get("result", "")) for event in recovery_events

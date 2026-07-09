@@ -7,6 +7,7 @@ import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
 import { DashboardPage } from "./routes/dashboard"
 import { KnowledgePage } from "./routes/knowledge"
+import { PendingActionsPage } from "./routes/pending-actions"
 import { RunPage } from "./routes/run"
 import { SessionDetailPage } from "./routes/session-detail"
 import { SessionsPage } from "./routes/sessions"
@@ -41,6 +42,12 @@ const tasksRoute = createRoute({
   component: TasksPage,
 })
 
+const pendingActionsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/pending-actions",
+  component: PendingActionsPage,
+})
+
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
@@ -64,6 +71,7 @@ const routeTree = rootRoute.addChildren([
   sessionsRoute,
   usageRoute,
   tasksRoute,
+  pendingActionsRoute,
   sessionDetailRoute,
   knowledgeRoute,
   runRoute,

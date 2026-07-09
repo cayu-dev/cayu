@@ -1436,6 +1436,313 @@ def test_server_sessions_summary_filters_debug_states_before_pagination() -> Non
     ]
 
 
+def test_server_pending_actions_lists_blocking_session_work() -> None:
+    app = CayuApp()
+
+    def pending_tool_call(tool_call_id: str, tool_name: str) -> dict[str, object]:
+        return {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "arguments": {},
+            "policy_decision": None,
+            "reason": None,
+            "metadata": {},
+            "active_taint_labels": [],
+        }
+
+    def approval_checkpoint(
+        *,
+        approval_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "pending_tool_approval": {
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "agent_name": "assistant",
+                "tool_calls": [
+                    {
+                        **pending_tool_call(tool_call_id, tool_name),
+                        "arguments": arguments or {},
+                    }
+                ],
+            }
+        }
+
+    def user_input_checkpoint(
+        *,
+        input_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        question: str,
+        options: list[str],
+    ) -> dict[str, object]:
+        return {
+            "pending_user_input": {
+                "input_id": input_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "question": question,
+                "options": options,
+                "arguments": {},
+                "agent_name": "assistant",
+                "tool_calls": [pending_tool_call(tool_call_id, tool_name)],
+            }
+        }
+
+    def tool_round_checkpoint(
+        *,
+        round_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "pending_tool_round": {
+                "round_id": round_id,
+                "agent_name": "assistant",
+                "tool_calls": [
+                    {
+                        **pending_tool_call(tool_call_id, tool_name),
+                        "arguments": arguments or {},
+                    }
+                ],
+            }
+        }
+
+    async def create(
+        session_id: str,
+        status: SessionStatus,
+        events: list[Event],
+        checkpoint: dict[str, object] | None = None,
+    ) -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, status)
+        await app.session_store.append_events(session_id, events)
+        if checkpoint is not None:
+            await app.session_store.checkpoint(session_id, checkpoint)
+
+    async def seed() -> None:
+        await create(
+            "pending_approval",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="approval_requested",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id="pending_approval",
+                    tool_name="deploy",
+                    payload={
+                        "approval": {
+                            "approval_id": "approval_1",
+                            "tool_name": "deploy",
+                            "reason": "production write",
+                            "arguments": {"service": "api"},
+                        }
+                    },
+                )
+            ],
+            checkpoint=approval_checkpoint(
+                approval_id="approval_1",
+                tool_call_id="call_deploy",
+                tool_name="deploy",
+                arguments={"service": "api"},
+            ),
+        )
+        await create(
+            "pending_user_input",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="awaiting_user_input",
+                    type=EventType.SESSION_AWAITING_USER_INPUT,
+                    session_id="pending_user_input",
+                    payload={
+                        "input_id": "input_1",
+                        "tool_call_id": "call_ask",
+                        "question": "Deploy now?",
+                        "options": ["yes", "no"],
+                    },
+                )
+            ],
+            checkpoint=user_input_checkpoint(
+                input_id="input_1",
+                tool_call_id="call_ask",
+                tool_name="ask_user",
+                question="Deploy now?",
+                options=["yes", "no"],
+            ),
+        )
+        await create(
+            "manual_recovery",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="manual_recovery_event",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="manual_recovery",
+                    payload={
+                        "interruption_type": "tool_approval_required",
+                        "manual_recovery_required": True,
+                        "approval_id": "approval_2",
+                        "tool_call_id": "call_refund",
+                        "tool_name": "refund",
+                        "error": "tool outcome unknown",
+                    },
+                )
+            ],
+            checkpoint=approval_checkpoint(
+                approval_id="approval_2",
+                tool_call_id="call_refund",
+                tool_name="refund",
+                arguments={"invoice_id": "inv_123"},
+            ),
+        )
+        await create(
+            "manual_tool_round_recovery",
+            SessionStatus.FAILED,
+            [
+                Event(
+                    id="manual_tool_round_started",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="manual_tool_round_recovery",
+                    tool_name="charge_card",
+                    payload={
+                        "tool_round_id": "round_crashed",
+                        "tool_call_id": "call_charge",
+                    },
+                ),
+                Event(
+                    id="manual_tool_round_recovery_event",
+                    type=EventType.SESSION_FAILED,
+                    session_id="manual_tool_round_recovery",
+                    payload={
+                        "interruption_type": "runtime_interrupted",
+                        "manual_recovery_required": True,
+                        "tool_round_id": "round_crashed",
+                        "tool_call_id": "call_charge",
+                        "tool_name": "charge_card",
+                        "error": "tool outcome unknown",
+                    },
+                ),
+            ],
+            checkpoint=tool_round_checkpoint(
+                round_id="round_crashed",
+                tool_call_id="call_charge",
+                tool_name="charge_card",
+                arguments={"amount": 42},
+            ),
+        )
+        await create(
+            "missing_checkpoint",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="missing_checkpoint_event",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="missing_checkpoint",
+                    payload={
+                        "interruption_type": "tool_approval_required",
+                        "manual_recovery_required": True,
+                        "approval_id": "approval_missing",
+                        "tool_call_id": "call_missing",
+                        "tool_name": "refund",
+                        "error": "tool outcome unknown",
+                    },
+                )
+            ],
+        )
+        await create(
+            "resumed_approval",
+            SessionStatus.INTERRUPTED,
+            [
+                Event(
+                    id="old_approval",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id="resumed_approval",
+                    payload={"approval": {"approval_id": "old_approval", "tool_name": "deploy"}},
+                ),
+                Event(
+                    id="resumed_after_old_approval",
+                    type=EventType.SESSION_RESUMED,
+                    session_id="resumed_approval",
+                ),
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.get("/api/pending-actions")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["inspected_session_count"] == 6
+    assert body["total_count"] == 4
+    actions_by_session = {action["session"]["id"]: action for action in body["actions"]}
+    assert set(actions_by_session) == {
+        "manual_recovery",
+        "manual_tool_round_recovery",
+        "pending_user_input",
+        "pending_approval",
+    }
+    approval = actions_by_session["pending_approval"]
+    assert approval["kind"] == "tool_approval"
+    assert approval["approval_id"] == "approval_1"
+    assert approval["arguments"] == {"service": "api"}
+    user_input = actions_by_session["pending_user_input"]
+    assert user_input["kind"] == "user_input"
+    assert user_input["input_id"] == "input_1"
+    assert user_input["question"] == "Deploy now?"
+    assert user_input["options"] == ["yes", "no"]
+    tool_round = actions_by_session["manual_tool_round_recovery"]
+    assert tool_round["kind"] == "manual_recovery"
+    assert tool_round["round_id"] == "round_crashed"
+    assert tool_round["tool_call_id"] == "call_charge"
+    assert tool_round["approval_id"] is None
+    assert tool_round["input_id"] is None
+    assert tool_round["arguments"] == {"amount": 42}
+    approval_recovery = actions_by_session["manual_recovery"]
+    assert approval_recovery["kind"] == "manual_recovery"
+    assert approval_recovery["arguments"] == {"invoice_id": "inv_123"}
+
+    filtered = client.get("/api/pending-actions?kind=user_input&q=deploy")
+    assert filtered.status_code == 200
+    filtered_body = filtered.json()
+    assert filtered_body["total_count"] == 1
+    assert filtered_body["actions"][0]["session"]["id"] == "pending_user_input"
+
+    exact = client.get("/api/pending-actions?session_id=manual_recovery")
+    assert exact.status_code == 200
+    exact_body = exact.json()
+    assert exact_body["inspected_session_count"] == 1
+    assert exact_body["total_count"] == 1
+    assert exact_body["actions"][0]["kind"] == "manual_recovery"
+
+    tool_round_exact = client.get("/api/pending-actions?session_id=manual_tool_round_recovery")
+    assert tool_round_exact.status_code == 200
+    tool_round_exact_body = tool_round_exact.json()
+    assert tool_round_exact_body["inspected_session_count"] == 1
+    assert tool_round_exact_body["total_count"] == 1
+    assert tool_round_exact_body["actions"][0]["round_id"] == "round_crashed"
+
+    stale_exact = client.get("/api/pending-actions?session_id=missing_checkpoint")
+    assert stale_exact.status_code == 200
+    stale_body = stale_exact.json()
+    assert stale_body["inspected_session_count"] == 1
+    assert stale_body["total_count"] == 0
+
+
 def test_server_run_rejects_request_budget_reservations() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
@@ -2637,15 +2944,23 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
         await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
 
     asyncio.run(create_interrupted_session("session_dev_actor"))
+    asyncio.run(create_interrupted_session("session_dev_tool_round_actor"))
 
     captured = []
+    captured_tool_round = []
 
     async def resolve_tool_approval(request):
         captured.append(request)
         if False:
             yield None
 
+    async def recover_tool_round(request):
+        captured_tool_round.append(request)
+        if False:
+            yield None
+
     app.resolve_tool_approval = resolve_tool_approval
+    app.recover_tool_round = recover_tool_round
     client = TestClient(create_server(app, dev=True))
 
     # A dev-mode body can assert an identity but never verified/system
@@ -2667,6 +2982,26 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
     assert actor is not None
     assert actor.subject == "operator@example.com"
     assert actor.source is ResolutionActorSource.REQUEST
+
+    with client.stream(
+        "POST",
+        "/api/tool-rounds/recover",
+        json={
+            "session_id": "session_dev_tool_round_actor",
+            "round_id": "round_1",
+            "tool_call_id": "call_1",
+            "outcome": "completed",
+            "message": "verified externally",
+            "resolved_by": {"subject": "round-operator@example.com", "source": "system"},
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    round_actor = captured_tool_round[0].resolved_by
+    assert round_actor is not None
+    assert round_actor.subject == "round-operator@example.com"
+    assert round_actor.source is ResolutionActorSource.REQUEST
 
     # Reserved system subjects cannot be claimed through the body: the
     # request-source re-stamp trips the reserved-prefix validation.

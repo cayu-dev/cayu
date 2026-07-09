@@ -2,6 +2,7 @@ import { apiUrl } from "./config"
 import type {
   ApiKnowledgeChunk,
   ApiKnowledgeListItem,
+  ApiPendingAction,
   ApiReviewedKnowledgeEntry,
   ApiSessionBase,
   ApiSessionDetailEvent,
@@ -15,6 +16,8 @@ import type {
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetTaskApiTasksTaskIdGetResponse,
+  ListPendingActionsApiPendingActionsGetData,
+  ListPendingActionsApiPendingActionsGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
@@ -29,6 +32,10 @@ import type {
   TaskHoldBody,
   ToolApprovalBody,
   ToolApprovalDecision,
+  ToolApprovalRecoveryBody,
+  ToolApprovalRecoveryOutcome,
+  ToolRoundRecoveryBody,
+  UserInputRecoveryBody,
   UserInputResolveBody,
 } from "./generated/server-api"
 
@@ -62,7 +69,14 @@ export type Task = ApiTaskListItem
 export type TaskDetail = ApiTaskDetail
 export type TaskHold = TaskHoldBody
 export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
+export type PendingAction = ApiPendingAction
+export type PendingActionsPage = ListPendingActionsApiPendingActionsGetResponse
+export type PendingActionsQuery = NonNullable<ListPendingActionsApiPendingActionsGetData["query"]>
 export type ApprovalDecision = ToolApprovalDecision
+export type RecoveryOutcome = ToolApprovalRecoveryOutcome
+export type ToolApprovalRecovery = ToolApprovalRecoveryBody
+export type ToolRoundRecovery = ToolRoundRecoveryBody
+export type UserInputRecovery = UserInputRecoveryBody
 export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
 export type KnowledgeEntryDetail = PendingKnowledgeDetailResponse
 export type KnowledgeChunk = ApiKnowledgeChunk
@@ -213,6 +227,17 @@ export async function fetchTask(taskId: string): Promise<TaskDetail> {
   return requestJson<GetTaskApiTasksTaskIdGetResponse>(`/tasks/${encodeURIComponent(taskId)}`)
 }
 
+export async function fetchPendingActions(
+  query: PendingActionsQuery = {},
+): Promise<PendingActionsPage> {
+  const page = await requestJson<unknown>(`/pending-actions${queryString(query)}`)
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.actions)) {
+    throw new Error("Unexpected /pending-actions response.")
+  }
+  return pageObject as PendingActionsPage
+}
+
 export async function pauseTask(taskId: string, body: TaskHold = {}): Promise<TaskDetail> {
   return postJson(`/tasks/${encodeURIComponent(taskId)}/pause`, body)
 }
@@ -289,6 +314,24 @@ export async function streamResolveToolApproval(
   await streamJsonPost("/tool-approvals/resolve", body, onEvent, onDone, onError)
 }
 
+export async function streamRecoverToolApproval(
+  body: ToolApprovalRecoveryBody,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
+  await streamJsonPost("/tool-approvals/recover", body, onEvent, onDone, onError)
+}
+
+export async function streamRecoverToolRound(
+  body: ToolRoundRecoveryBody,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
+  await streamJsonPost("/tool-rounds/recover", body, onEvent, onDone, onError)
+}
+
 export async function streamResolveUserInput(
   body: UserInputResolveBody,
   onEvent: (event: SSEEvent) => void,
@@ -296,6 +339,15 @@ export async function streamResolveUserInput(
   onError: (message: string) => void,
 ) {
   await streamJsonPost("/user-input/resolve", body, onEvent, onDone, onError)
+}
+
+export async function streamRecoverUserInput(
+  body: UserInputRecoveryBody,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+) {
+  await streamJsonPost("/user-input/recover", body, onEvent, onDone, onError)
 }
 
 async function streamJsonPost(

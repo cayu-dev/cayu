@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   BarChart3,
   BookOpenCheck,
+  CircleAlert,
   LayoutDashboard,
   List,
   ListTodo,
@@ -22,6 +23,7 @@ const navItems = [
   { to: "/sessions", label: "Sessions", icon: List },
   { to: "/usage", label: "Usage", icon: BarChart3 },
   { to: "/tasks", label: "Tasks", icon: ListTodo },
+  { to: "/pending-actions", label: "Pending", icon: CircleAlert },
   { to: "/knowledge", label: "Knowledge", icon: BookOpenCheck },
   { to: "/run", label: "New Run", icon: Play },
 ] as const

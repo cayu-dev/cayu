@@ -19,6 +19,7 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    EventType,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -130,6 +131,21 @@ class DashboardDemoProvider(ModelProvider):
             )
             return
 
+        if "manual recovery" in prompt:
+            yield ModelStreamEvent.tool_call(
+                id="call_external_side_effect",
+                name="external_side_effect",
+                arguments={
+                    "operation": "refund_invoice",
+                    "invoice_id": "inv_demo_recovery",
+                    "amount": 1280,
+                },
+            )
+            yield ModelStreamEvent.completed(
+                _completed_payload("tool_calls", input_tokens=175, output_tokens=15)
+            )
+            return
+
         yield ModelStreamEvent.tool_call(
             id="call_echo_summary",
             name="echo",
@@ -191,6 +207,47 @@ class FailingHealthCheckTool(Tool):
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         raise RuntimeError(f"Health check failed for {args['service']}: timeout after 30s")
+
+
+class ExternalSideEffectTool(Tool):
+    spec = ToolSpec(
+        name="external_side_effect",
+        description="Pretend to perform an external side effect for manual recovery demos.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string"},
+                "invoice_id": {"type": "string"},
+                "amount": {"type": "number"},
+            },
+            "required": ["operation", "invoice_id", "amount"],
+        },
+        effect=ToolEffect.EXTERNAL,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(
+            content=f"External operation {args['operation']} accepted for {args['invoice_id']}.",
+            structured={"operation": args["operation"], "invoice_id": args["invoice_id"]},
+        )
+
+
+class ManualRecoveryDemoSessionStore(SQLiteSessionStore):
+    """Drop one terminal event to leave a real pending tool-round recovery case."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self._dropped_terminal_once = False
+
+    async def append_events(self, session_id: str, events: list) -> None:
+        if not self._dropped_terminal_once and any(
+            event.type == EventType.TOOL_CALL_COMPLETED
+            and event.tool_name == "external_side_effect"
+            for event in events
+        ):
+            self._dropped_terminal_once = True
+            raise RuntimeError("terminal tool event unavailable for manual recovery demo")
+        await super().append_events(session_id, events)
 
 
 def _request_text(request: ModelRequest) -> str:
@@ -303,6 +360,14 @@ async def seed_sessions(app: CayuApp) -> None:
                 agent_name="demo-session-failed",
                 session_id="sess_dashboard_session_failed",
                 messages=[Message.text("user", "Create a provider failure dashboard session.")],
+            ),
+        ),
+        await _drain(
+            app,
+            RunRequest(
+                agent_name="demo-manual-recovery",
+                session_id="sess_dashboard_manual_recovery",
+                messages=[Message.text("user", "Create a manual recovery dashboard session.")],
             ),
         ),
     ]
@@ -475,14 +540,20 @@ def build_app() -> CayuApp:
 
     knowledge_store = SQLiteKnowledgeStore(DB_DIR / "knowledge.db")
     app = CayuApp(
-        session_store=SQLiteSessionStore(DB_DIR / "sessions.db"),
+        session_store=ManualRecoveryDemoSessionStore(DB_DIR / "sessions.db"),
         task_store=SQLiteTaskStore(DB_DIR / "tasks.db"),
         knowledge_store=knowledge_store,
         enable_logging=False,
     )
     app.register_provider(DashboardDemoProvider(), default=True)
 
-    shared_tools = [EchoTool(), DeployServiceTool(), FailingHealthCheckTool(), UserInputTool()]
+    shared_tools = [
+        EchoTool(),
+        DeployServiceTool(),
+        FailingHealthCheckTool(),
+        ExternalSideEffectTool(),
+        UserInputTool(),
+    ]
     app.register_agent(AgentSpec(name="demo-completed", model="fake-model"), tools=shared_tools)
     app.register_agent(
         AgentSpec(name="demo-approval", model="fake-model"),
@@ -498,6 +569,10 @@ def build_app() -> CayuApp:
     )
     app.register_agent(
         AgentSpec(name="demo-session-failed", model="fake-model"),
+        tools=shared_tools,
+    )
+    app.register_agent(
+        AgentSpec(name="demo-manual-recovery", model="fake-model"),
         tools=shared_tools,
     )
     return app

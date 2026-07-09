@@ -275,6 +275,64 @@ export type ApiKnowledgeListItem = {
 };
 
 /**
+ * ApiPendingAction
+ */
+export type ApiPendingAction = {
+    /**
+     * Approval Id
+     */
+    approval_id?: string | null;
+    /**
+     * Arguments
+     */
+    arguments?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Detail
+     */
+    detail?: string | null;
+    event: ApiEventRecord;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Input Id
+     */
+    input_id?: string | null;
+    /**
+     * Kind
+     */
+    kind: 'tool_approval' | 'user_input' | 'manual_recovery';
+    /**
+     * Options
+     */
+    options?: Array<string>;
+    /**
+     * Question
+     */
+    question?: string | null;
+    /**
+     * Round Id
+     */
+    round_id?: string | null;
+    session: ApiSessionBase;
+    /**
+     * Title
+     */
+    title: string;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id?: string | null;
+    /**
+     * Tool Name
+     */
+    tool_name?: string | null;
+};
+
+/**
  * ApiReviewedKnowledgeEntry
  */
 export type ApiReviewedKnowledgeEntry = {
@@ -1222,6 +1280,24 @@ export type ModelPricing = {
 };
 
 /**
+ * PendingActionsResponse
+ */
+export type PendingActionsResponse = {
+    /**
+     * Actions
+     */
+    actions: Array<ApiPendingAction>;
+    /**
+     * Inspected Session Count
+     */
+    inspected_session_count: number;
+    /**
+     * Total Count
+     */
+    total_count: number;
+};
+
+/**
  * PendingKnowledgeDetailResponse
  */
 export type PendingKnowledgeDetailResponse = {
@@ -2141,6 +2217,7 @@ export type ToolRoundRecoveryBody = {
      * Reason
      */
     reason?: string | null;
+    resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
     /**
      * Round Id
@@ -2707,6 +2784,52 @@ export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses = {
 };
 
 export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse = RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses[keyof RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses];
+
+export type ListPendingActionsApiPendingActionsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Session Limit
+         */
+        session_limit?: number;
+        /**
+         * Session Id
+         */
+        session_id?: string | null;
+        /**
+         * Q
+         */
+        q?: string | null;
+        /**
+         * Kind
+         */
+        kind?: string | null;
+    };
+    url: '/api/pending-actions';
+};
+
+export type ListPendingActionsApiPendingActionsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListPendingActionsApiPendingActionsGetError = ListPendingActionsApiPendingActionsGetErrors[keyof ListPendingActionsApiPendingActionsGetErrors];
+
+export type ListPendingActionsApiPendingActionsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: PendingActionsResponse;
+};
+
+export type ListPendingActionsApiPendingActionsGetResponse = ListPendingActionsApiPendingActionsGetResponses[keyof ListPendingActionsApiPendingActionsGetResponses];
 
 export type ResumeAgentApiResumePostData = {
     body: ResumeBody;

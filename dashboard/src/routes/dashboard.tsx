@@ -6,8 +6,10 @@ import { Badge } from "../components/ui/badge"
 import { buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import {
+  fetchPendingActions,
   fetchSessionsSummary,
   fetchTasks,
+  type PendingAction,
   type Session,
   type SessionsSummary,
   type Task,
@@ -75,6 +77,12 @@ function attentionSessionLabel(item: SessionSummaryItem) {
   return item.session.status
 }
 
+function pendingActionLabel(action: PendingAction) {
+  if (action.kind === "tool_approval") return "Awaiting approval"
+  if (action.kind === "user_input") return "Awaiting user input"
+  return "Manual recovery required"
+}
+
 export function DashboardPage() {
   const summary = useQuery({
     queryKey: ["sessions-summary", "dashboard"],
@@ -86,10 +94,16 @@ export function DashboardPage() {
     queryFn: () => fetchTasks({ limit: 25 }),
     refetchInterval: 5000,
   })
+  const pendingActions = useQuery({
+    queryKey: ["pending-actions", "dashboard"],
+    queryFn: () => fetchPendingActions({ limit: 25 }),
+    refetchInterval: 5000,
+  })
 
   const sessionItems = summary.data?.sessions || []
   const list = sessionItems.map((item) => item.session)
   const taskList = tasks.data || []
+  const pendingActionList = pendingActions.data?.actions || []
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
   const tasksError = tasks.error instanceof Error ? tasks.error.message : null
   const activeSessions = list.filter(isActiveSession)
@@ -118,8 +132,8 @@ export function DashboardPage() {
           {
             icon: Activity,
             label: "Active Work",
-            value: activeSessions.length + activeTasks.length,
-            detail: `${activeSessions.length} sessions / ${activeTasks.length} tasks`,
+            value: activeSessions.length + activeTasks.length + pendingActionList.length,
+            detail: `${activeSessions.length} sessions / ${activeTasks.length} tasks / ${pendingActionList.length} pending`,
           },
           {
             icon: CheckCircle,
@@ -192,17 +206,54 @@ export function DashboardPage() {
           )}
         </DataCard>
 
-        <DataCard title="Needs Attention" contentClassName="p-4">
-          {summary.isError || tasks.isError ? (
+        <DataCard
+          title="Needs Attention"
+          contentClassName="p-4"
+          actions={
+            <Link
+              to="/pending-actions"
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Pending
+            </Link>
+          }
+        >
+          {summary.isError || tasks.isError || pendingActions.isError ? (
             <StateMessage tone="danger" className="py-6">
-              {sessionsError || tasksError || "Failed to load dashboard state."}
+              {sessionsError ||
+                tasksError ||
+                (pendingActions.error instanceof Error ? pendingActions.error.message : null) ||
+                "Failed to load dashboard state."}
             </StateMessage>
-          ) : attentionSessions.length === 0 && attentionTasks.length === 0 ? (
+          ) : attentionSessions.length === 0 &&
+            attentionTasks.length === 0 &&
+            pendingActionList.length === 0 ? (
             <StateMessage className="py-6">
-              No sessions or tasks need attention in the current view.
+              No sessions, tasks, or pending actions need attention in the current view.
             </StateMessage>
           ) : (
             <div className="space-y-2">
+              {pendingActionList.slice(0, 5).map((action) => (
+                <Link
+                  key={action.id}
+                  to="/sessions/$sessionId"
+                  params={{ sessionId: action.session.id }}
+                  className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 truncate text-sm font-medium">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-chart-1" />
+                      <span className="truncate">{pendingActionLabel(action)}</span>
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {action.detail || action.question || action.tool_name || action.session.id}
+                    </div>
+                  </div>
+                  <Badge variant="outline" className="shrink-0">
+                    {action.session.agent_name}
+                  </Badge>
+                </Link>
+              ))}
               {attentionSessionItems.slice(0, 4).map((item) => (
                 <Link
                   key={item.session.id}

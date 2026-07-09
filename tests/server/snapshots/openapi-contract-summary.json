@@ -496,6 +496,139 @@
       "title": "ApiKnowledgeListItem",
       "type": "object"
     },
+    "ApiPendingAction": {
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Approval Id"
+        },
+        "arguments": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Arguments"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Detail"
+        },
+        "event": {
+          "$ref": "#/components/schemas/ApiEventRecord"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "input_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Input Id"
+        },
+        "kind": {
+          "enum": [
+            "tool_approval",
+            "user_input",
+            "manual_recovery"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Options",
+          "type": "array"
+        },
+        "question": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Question"
+        },
+        "round_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Round Id"
+        },
+        "session": {
+          "$ref": "#/components/schemas/ApiSessionBase"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Call Id"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "session",
+        "event",
+        "title"
+      ],
+      "title": "ApiPendingAction",
+      "type": "object"
+    },
     "ApiReviewedKnowledgeEntry": {
       "additionalProperties": false,
       "properties": {
@@ -2339,6 +2472,35 @@
       "title": "ModelPricing",
       "type": "object"
     },
+    "PendingActionsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/components/schemas/ApiPendingAction"
+          },
+          "title": "Actions",
+          "type": "array"
+        },
+        "inspected_session_count": {
+          "minimum": 0.0,
+          "title": "Inspected Session Count",
+          "type": "integer"
+        },
+        "total_count": {
+          "minimum": 0.0,
+          "title": "Total Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "actions",
+        "total_count",
+        "inspected_session_count"
+      ],
+      "title": "PendingActionsResponse",
+      "type": "object"
+    },
     "PendingKnowledgeDetailResponse": {
       "additionalProperties": false,
       "properties": {
@@ -4036,6 +4198,16 @@
           ],
           "title": "Reason"
         },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "retry_policy": {
           "anyOf": [
             {
@@ -5078,6 +5250,105 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiReviewedKnowledgeEntry"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/pending-actions": {
+      "get": {
+        "operation_id": "list_pending_actions_api_pending_actions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(tool_approval|user_input|manual_recovery)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_limit",
+            "required": false,
+            "schema": {
+              "default": 250,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Session Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/PendingActionsResponse"
               }
             }
           },

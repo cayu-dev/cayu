@@ -26,11 +26,17 @@ import { Button } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Input } from "../components/ui/input"
 import {
+  type PendingAction as ApiPendingAction,
+  fetchPendingActions,
   fetchSession,
   fetchSessionSummary,
+  type RecoveryOutcome,
   type SessionEvent,
   type SessionSummary,
   type SSEEvent,
+  streamRecoverToolApproval,
+  streamRecoverToolRound,
+  streamRecoverUserInput,
   streamResolveToolApproval,
   streamResolveUserInput,
   streamResume,
@@ -155,85 +161,53 @@ type PendingAction =
       question: string
       options: string[]
     }
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : []
-}
-
-function pendingActionFromEvents(
-  sessionStatus: string,
-  events: SessionEvent[],
-): PendingAction | null {
-  if (sessionStatus !== "interrupted") return null
-
-  for (const event of [...events].reverse()) {
-    if (
-      event.type === "session.resumed" ||
-      event.type === "session.completed" ||
-      event.type === "session.failed"
-    ) {
-      return null
+  | {
+      kind: "manual_recovery"
+      approvalId: string | null
+      inputId: string | null
+      roundId: string | null
+      toolCallId: string
+      toolName: string | null
+      question: string | null
+      detail: string
+      arguments: unknown
     }
 
-    if (event.type === "tool.call.approval_requested") {
-      const approval = objectPayload(event.payload.approval)
-      const approvalId = optionalString(approval?.approval_id)
-      if (approval && approvalId) {
-        return {
-          kind: "approval",
-          approvalId,
-          toolName: optionalString(approval.tool_name) || event.tool_name || "tool",
-          reason: optionalString(approval.reason),
-          arguments: approval.arguments || {},
-        }
-      }
-    }
-
-    if (event.type === "session.awaiting_user_input") {
-      const inputId = optionalString(event.payload.input_id)
-      if (inputId) {
-        return {
-          kind: "user_input",
-          inputId,
-          toolCallId: optionalString(event.payload.tool_call_id),
-          question: optionalString(event.payload.question) || "Input required",
-          options: stringList(event.payload.options),
-        }
-      }
-    }
-
-    if (event.type === "session.interrupted") {
-      if (event.payload.interruption_type === "tool_approval_required") {
-        const approval = objectPayload(event.payload.approval)
-        const approvalId = optionalString(approval?.approval_id)
-        if (approval && approvalId) {
-          return {
-            kind: "approval",
-            approvalId,
-            toolName: optionalString(approval.tool_name) || event.tool_name || "tool",
-            reason: optionalString(approval.reason),
-            arguments: approval.arguments || {},
-          }
-        }
-      }
-      if (event.payload.interruption_type === "user_input_required") {
-        const userInput = objectPayload(event.payload.user_input)
-        const inputId = optionalString(userInput?.input_id)
-        if (userInput && inputId) {
-          return {
-            kind: "user_input",
-            inputId,
-            toolCallId: optionalString(userInput.tool_call_id),
-            question: optionalString(userInput.question) || "Input required",
-            options: stringList(userInput.options),
-          }
-        }
-      }
+function pendingActionFromApi(action: ApiPendingAction | undefined): PendingAction | null {
+  if (!action) return null
+  if (action.kind === "tool_approval" && action.approval_id) {
+    return {
+      kind: "approval",
+      approvalId: action.approval_id,
+      toolName: action.tool_name || "tool",
+      reason: action.detail ?? null,
+      arguments: action.arguments || {},
     }
   }
-
+  if (action.kind === "user_input" && action.input_id) {
+    return {
+      kind: "user_input",
+      inputId: action.input_id,
+      toolCallId: action.tool_call_id ?? null,
+      question: action.question || action.detail || "Input required",
+      options: action.options ?? [],
+    }
+  }
+  if (action.kind === "manual_recovery" && action.tool_call_id) {
+    return {
+      kind: "manual_recovery",
+      approvalId: action.approval_id ?? null,
+      inputId: action.input_id ?? null,
+      roundId: action.round_id ?? null,
+      toolCallId: action.tool_call_id,
+      toolName: action.tool_name ?? null,
+      question: action.question ?? null,
+      detail:
+        action.detail ||
+        "A previously started tool result must be reconciled before the session can continue.",
+      arguments: action.arguments || action.event.payload,
+    }
+  }
   return null
 }
 
@@ -511,6 +485,7 @@ function PendingActionBanner({
   onApprove,
   onDeny,
   onAnswer,
+  onRecover,
 }: {
   action: PendingAction
   resolving: boolean
@@ -518,9 +493,13 @@ function PendingActionBanner({
   onApprove: (reason: string | null) => void
   onDeny: (reason: string | null) => void
   onAnswer: (answer: string) => void
+  onRecover: (outcome: RecoveryOutcome, message: string, answer: string | null) => void
 }) {
   const [answer, setAnswer] = useState("")
   const [reason, setReason] = useState("")
+  const [recoveryOutcome, setRecoveryOutcome] = useState<RecoveryOutcome>("completed")
+  const [recoveryMessage, setRecoveryMessage] = useState("")
+  const [recoveryAnswer, setRecoveryAnswer] = useState("")
 
   if (action.kind === "approval") {
     return (
@@ -565,6 +544,90 @@ function PendingActionBanner({
             disabled={resolving}
           />
           <PayloadViewer value={action.arguments} maxHeight="max-h-48" />
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (action.kind === "manual_recovery") {
+    const requiresAnswer = action.inputId !== null
+    const recoveryDisabled =
+      resolving || !recoveryMessage.trim() || (requiresAnswer && !recoveryAnswer.trim())
+
+    return (
+      <Card className="border-destructive/30 bg-destructive/5">
+        <CardContent className="space-y-4 p-4">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="destructive">
+                  <AlertTriangle className="mr-1 h-3.5 w-3.5" />
+                  Manual recovery required
+                </Badge>
+                {action.toolName && <Badge variant="secondary">{action.toolName}</Badge>}
+              </div>
+              <p className="mt-2 text-sm font-medium">
+                A tool call started before its terminal result was recorded.
+              </p>
+              <p className="mt-1 break-words text-sm text-muted-foreground">{action.detail}</p>
+              <div className="mt-2 space-y-1 break-all font-mono text-xs text-muted-foreground">
+                <div>tool_call_id: {action.toolCallId}</div>
+                {action.approvalId && <div>approval_id: {action.approvalId}</div>}
+                {action.inputId && <div>input_id: {action.inputId}</div>}
+                {action.roundId && <div>round_id: {action.roundId}</div>}
+              </div>
+              {action.question && (
+                <p className="mt-2 break-words text-sm text-muted-foreground">
+                  Question: {action.question}
+                </p>
+              )}
+            </div>
+            <div className="grid shrink-0 gap-2 sm:grid-cols-[8.5rem_auto] lg:grid-cols-1">
+              <select
+                value={recoveryOutcome}
+                onChange={(event) => setRecoveryOutcome(event.target.value as RecoveryOutcome)}
+                disabled={resolving}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                aria-label="Recovery outcome"
+              >
+                <option value="completed">Completed</option>
+                <option value="failed">Failed</option>
+              </select>
+              <Button
+                disabled={recoveryDisabled}
+                onClick={() =>
+                  onRecover(
+                    recoveryOutcome,
+                    recoveryMessage.trim(),
+                    requiresAnswer ? recoveryAnswer.trim() : null,
+                  )
+                }
+              >
+                Recover
+              </Button>
+            </div>
+          </div>
+          {requiresAnswer && (
+            <Input
+              value={recoveryAnswer}
+              onChange={(event) => setRecoveryAnswer(event.target.value)}
+              placeholder="Re-supply the user answer for recovery"
+              disabled={resolving}
+            />
+          )}
+          <Input
+            value={recoveryMessage}
+            onChange={(event) => setRecoveryMessage(event.target.value)}
+            placeholder="Externally verified result or failure reason"
+            disabled={resolving}
+          />
+          <div className="space-y-2">
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Tool arguments
+            </div>
+            <PayloadViewer value={action.arguments} maxHeight="max-h-48" />
+          </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
         </CardContent>
       </Card>
@@ -679,6 +742,12 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     refetchInterval: live ? 2000 : 5000,
     enabled: !isError,
   })
+  const pendingActionQuery = useQuery({
+    queryKey: ["pending-actions", "session", sessionId],
+    queryFn: () => fetchPendingActions({ session_id: sessionId, limit: 1 }),
+    refetchInterval: live ? 2000 : 5000,
+    enabled: !isError,
+  })
 
   const [resumePrompt, setResumePrompt] = useState("")
   const [resuming, setResuming] = useState(false)
@@ -719,9 +788,11 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         if (!streamFailed) {
           setResumePrompt("")
         }
-        void Promise.all([refetch(), summaryQuery.refetch()]).finally(() => {
-          setLiveEvents([])
-        })
+        void Promise.all([refetch(), summaryQuery.refetch(), pendingActionQuery.refetch()]).finally(
+          () => {
+            setLiveEvents([])
+          },
+        )
       },
       (message) => {
         streamFailed = true
@@ -731,11 +802,13 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   }
 
   const finishContinuation = (streamFailed: boolean) => {
-    void Promise.all([refetch(), summaryQuery.refetch()]).finally(() => {
-      if (!streamFailed) {
-        setLiveEvents([])
-      }
-    })
+    void Promise.all([refetch(), summaryQuery.refetch(), pendingActionQuery.refetch()]).finally(
+      () => {
+        if (!streamFailed) {
+          setLiveEvents([])
+        }
+      },
+    )
   }
 
   const handleApprovalDecision = async (
@@ -792,6 +865,84 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     )
   }
 
+  const handleManualRecovery = async (
+    action: Extract<PendingAction, { kind: "manual_recovery" }>,
+    outcome: RecoveryOutcome,
+    message: string,
+    answer: string | null,
+  ) => {
+    let streamFailed = false
+    setResolvingAction(true)
+    setLiveEvents([])
+    setActionError(null)
+    const onEvent = (event: SSEEvent) => setLiveEvents((prev) => [...prev, event])
+    const onDone = () => {
+      setResolvingAction(false)
+      finishContinuation(streamFailed)
+    }
+    const onError = (message: string) => {
+      streamFailed = true
+      setActionError(message)
+    }
+
+    if (action.inputId) {
+      if (!answer) {
+        setActionError("Manual user-input recovery requires an answer.")
+        setResolvingAction(false)
+        return
+      }
+      await streamRecoverUserInput(
+        {
+          session_id: sessionId,
+          input_id: action.inputId,
+          tool_call_id: action.toolCallId,
+          answer,
+          outcome,
+          message,
+        },
+        onEvent,
+        onDone,
+        onError,
+      )
+      return
+    }
+
+    if (action.approvalId) {
+      await streamRecoverToolApproval(
+        {
+          session_id: sessionId,
+          approval_id: action.approvalId,
+          tool_call_id: action.toolCallId,
+          outcome,
+          message,
+        },
+        onEvent,
+        onDone,
+        onError,
+      )
+      return
+    }
+
+    if (action.roundId) {
+      await streamRecoverToolRound(
+        {
+          session_id: sessionId,
+          round_id: action.roundId,
+          tool_call_id: action.toolCallId,
+          outcome,
+          message,
+        },
+        onEvent,
+        onDone,
+        onError,
+      )
+      return
+    }
+
+    setActionError("Manual recovery requires an approval_id, input_id, or round_id.")
+    setResolvingAction(false)
+  }
+
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
   if (isError) {
     return (
@@ -807,10 +958,14 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const allEvents = [...events, ...liveEvents.map((e, i) => ({ ...e, id: `live-${i}` }))]
   const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
   const selectedEvent = filteredEvents.find((event) => event.id === selectedEventId) ?? null
-  const pendingAction = pendingActionFromEvents(session.status, filteredEvents)
+  const pendingAction = pendingActionFromApi(pendingActionQuery.data?.actions[0])
+  const pendingActionStateUnknown =
+    session.status === "interrupted" && (pendingActionQuery.isLoading || pendingActionQuery.isError)
   const failureEvent = latestFailureEvent(filteredEvents)
   const canResume =
-    ["completed", "failed", "interrupted"].includes(session.status) && !pendingAction
+    ["completed", "failed", "interrupted"].includes(session.status) &&
+    !pendingAction &&
+    !pendingActionStateUnknown
   const eventUsage = fallbackUsage(filteredEvents)
   const models = summaryModels(summary)
   const modelSteps = summary?.usage.model_steps ?? fallbackModelSteps(filteredEvents)
@@ -934,7 +1089,13 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
 
       {pendingAction && (
         <PendingActionBanner
-          key={pendingAction.kind === "approval" ? pendingAction.approvalId : pendingAction.inputId}
+          key={
+            pendingAction.kind === "approval"
+              ? pendingAction.approvalId
+              : pendingAction.kind === "user_input"
+                ? pendingAction.inputId
+                : pendingAction.toolCallId
+          }
           action={pendingAction}
           resolving={resolvingAction}
           error={actionError}
@@ -948,6 +1109,10 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           }
           onAnswer={(answer) =>
             pendingAction.kind === "user_input" && void handleUserInputAnswer(pendingAction, answer)
+          }
+          onRecover={(outcome, message, answer) =>
+            pendingAction.kind === "manual_recovery" &&
+            void handleManualRecovery(pendingAction, outcome, message, answer)
           }
         />
       )}
