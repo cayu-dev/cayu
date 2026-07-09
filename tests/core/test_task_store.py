@@ -698,7 +698,9 @@ def test_task_stores_search_tasks(store_factory: StoreFactory, tmp_path):
         by_title = await store.list_tasks(TaskQuery(q="billing", order_by=TaskOrder.CREATED_AT_ASC))
         assert [task.id for task in by_title] == ["task_billing_export"]
 
-        by_reason = await store.list_tasks(TaskQuery(q="UPSTREAM", order_by=TaskOrder.CREATED_AT_ASC))
+        by_reason = await store.list_tasks(
+            TaskQuery(q="UPSTREAM", order_by=TaskOrder.CREATED_AT_ASC)
+        )
         assert [task.id for task in by_reason] == ["task_billing_export"]
 
         by_agent = await store.list_tasks(TaskQuery(q="invoice-agent"))

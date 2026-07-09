@@ -472,6 +472,63 @@ def test_server_task_list_filters_lifecycle_states() -> None:
     assert [task["id"] for task in search_response.json()] == ["blocked_task"]
 
 
+def test_server_task_detail_returns_full_payload() -> None:
+    task_store = InMemoryTaskStore()
+
+    async def setup_task() -> None:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="detail_task",
+                type="review",
+                title="Inspect detail",
+                description="Full task payload should stay off the list endpoint.",
+                input={"document": "invoice.pdf", "amount": 42},
+                metadata={"tenant": "acme", "priority": "high"},
+            )
+        )
+        await task_store.start_task("detail_task", session_id="sess_detail")
+        await task_store.complete_task("detail_task", {"accepted": True})
+
+    asyncio.run(setup_task())
+
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
+
+    list_response = client.get("/api/tasks")
+    assert list_response.status_code == 200
+    list_task = list_response.json()[0]
+    assert list_task["id"] == "detail_task"
+    assert "input" not in list_task
+    assert "result" not in list_task
+    assert "error" not in list_task
+    assert "metadata" not in list_task
+    assert "started_at" not in list_task
+
+    detail_response = client.get("/api/tasks/detail_task")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["id"] == "detail_task"
+    assert detail["description"] == "Full task payload should stay off the list endpoint."
+    assert detail["session_id"] == "sess_detail"
+    assert detail["input"] == {"document": "invoice.pdf", "amount": 42}
+    assert detail["result"] == {"accepted": True}
+    assert detail["error"] is None
+    assert detail["metadata"] == {"tenant": "acme", "priority": "high"}
+    assert isinstance(detail["started_at"], str)
+
+
+def test_server_task_detail_reports_missing_store_and_task() -> None:
+    missing_store_client = TestClient(create_server(CayuApp(), dev=True))
+    missing_store_response = missing_store_client.get("/api/tasks/task_1")
+    assert missing_store_response.status_code == 404
+    assert missing_store_response.json()["detail"] == "Task store is not configured."
+
+    task_store = InMemoryTaskStore()
+    client = TestClient(create_server(CayuApp(task_store=task_store), dev=True))
+    missing_task_response = client.get("/api/tasks/missing_task")
+    assert missing_task_response.status_code == 404
+    assert missing_task_response.json()["detail"] == "Task not found: missing_task"
+
+
 def test_server_task_lifecycle_endpoints_hold_and_resume_tasks() -> None:
     task_store = InMemoryTaskStore()
 

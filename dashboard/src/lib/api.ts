@@ -14,6 +14,7 @@ import type {
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
+  GetTaskApiTasksTaskIdGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
@@ -206,6 +207,10 @@ export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
     throw new Error("Unexpected /tasks response.")
   }
   return tasks as Task[]
+}
+
+export async function fetchTask(taskId: string): Promise<TaskDetail> {
+  return requestJson<GetTaskApiTasksTaskIdGetResponse>(`/tasks/${encodeURIComponent(taskId)}`)
 }
 
 export async function pauseTask(taskId: string, body: TaskHold = {}): Promise<TaskDetail> {

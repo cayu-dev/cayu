@@ -6139,6 +6139,42 @@
         }
       }
     },
+    "/api/tasks/{task_id}": {
+      "get": {
+        "operation_id": "get_task_api_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskDetail"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/tasks/{task_id}/block": {
       "post": {
         "operation_id": "block_task_api_tasks__task_id__block_post",

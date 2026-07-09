@@ -3228,6 +3228,36 @@ export type ListTasksApiTasksGetResponses = {
 
 export type ListTasksApiTasksGetResponse = ListTasksApiTasksGetResponses[keyof ListTasksApiTasksGetResponses];
 
+export type GetTaskApiTasksTaskIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}';
+};
+
+export type GetTaskApiTasksTaskIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetTaskApiTasksTaskIdGetError = GetTaskApiTasksTaskIdGetErrors[keyof GetTaskApiTasksTaskIdGetErrors];
+
+export type GetTaskApiTasksTaskIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskDetail;
+};
+
+export type GetTaskApiTasksTaskIdGetResponse = GetTaskApiTasksTaskIdGetResponses[keyof GetTaskApiTasksTaskIdGetResponses];
+
 export type BlockTaskApiTasksTaskIdBlockPostData = {
     /**
      * Body

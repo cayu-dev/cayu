@@ -1861,6 +1861,18 @@ def create_router(
             raise HTTPException(status_code=404, detail="Task store is not configured.")
         return task_store
 
+    @router.get(
+        "/tasks/{task_id}",
+        response_model=ApiTaskDetail,
+        dependencies=protected,
+    )
+    async def get_task(task_id: NonBlankString):
+        store = await _require_task_store()
+        task = await store.load_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        return _serialize_task_detail(task)
+
     async def _apply_task_action(action, task_id: str):
         try:
             task = await action(task_id)

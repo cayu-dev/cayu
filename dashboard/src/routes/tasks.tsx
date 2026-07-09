@@ -22,6 +22,7 @@ import {
 } from "../components/ui/table"
 import {
   blockTask,
+  fetchTask,
   fetchTasks,
   markTaskNeedsAttention,
   pauseTask,
@@ -161,7 +162,15 @@ export function TasksPage() {
     refetchInterval: 5000,
   })
   const taskList = tasks.data ?? []
-  const selectedTask = taskList.find((task) => task.id === selectedTaskId) ?? taskList[0] ?? null
+  const selectedListTask =
+    taskList.find((task) => task.id === selectedTaskId) ?? taskList[0] ?? null
+  const taskDetail = useQuery({
+    queryKey: ["task", selectedListTask?.id],
+    queryFn: () => fetchTask(selectedListTask?.id ?? ""),
+    enabled: selectedListTask != null,
+    refetchInterval: 5000,
+  })
+  const selectedTask = taskDetail.data ?? selectedListTask
   const hasNextPage = taskList.length === PAGE_LIMIT
   const hasPreviousPage = offset > 0
   const hasFilters = status !== "all" || search.trim() !== ""
@@ -205,6 +214,7 @@ export function TasksPage() {
         }
         return current.map((item) => (item.id === task.id ? { ...item, ...task } : item))
       })
+      queryClient.setQueryData<TaskDetail>(["task", task.id], task)
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["tasks"] }),
         queryClient.invalidateQueries({ queryKey: ["sessions-summary", "dashboard"] }),
@@ -458,6 +468,14 @@ export function TasksPage() {
                     {formatDateTime(selectedTask.updated_at)}
                   </span>
                 </div>
+                {taskDetail.data?.started_at && (
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-muted-foreground">Started</span>
+                    <span className="text-right text-xs">
+                      {formatDateTime(taskDetail.data.started_at)}
+                    </span>
+                  </div>
+                )}
                 {selectedTask.status_reason && (
                   <div className="rounded-md border border-border bg-muted/40 p-3">
                     <div className="mb-1 text-xs font-medium text-muted-foreground">Reason</div>
@@ -476,6 +494,40 @@ export function TasksPage() {
                   <div>
                     <div className="mb-1 text-xs font-medium text-muted-foreground">Payload</div>
                     <PayloadViewer value={selectedTask.status_payload} />
+                  </div>
+                )}
+                {taskDetail.isLoading && (
+                  <StateMessage className="py-3">Loading full task payload...</StateMessage>
+                )}
+                {taskDetail.isError && (
+                  <StateMessage tone="danger" className="py-3">
+                    {taskDetail.error instanceof Error
+                      ? taskDetail.error.message
+                      : "Failed to load full task payload."}
+                  </StateMessage>
+                )}
+                {taskDetail.data && (
+                  <div className="grid gap-3">
+                    <div>
+                      <div className="mb-1 text-xs font-medium text-muted-foreground">Input</div>
+                      <PayloadViewer value={taskDetail.data.input} />
+                    </div>
+                    {taskDetail.data.result != null && (
+                      <div>
+                        <div className="mb-1 text-xs font-medium text-muted-foreground">Result</div>
+                        <PayloadViewer value={taskDetail.data.result} />
+                      </div>
+                    )}
+                    {taskDetail.data.error != null && (
+                      <div>
+                        <div className="mb-1 text-xs font-medium text-muted-foreground">Error</div>
+                        <PayloadViewer value={taskDetail.data.error} />
+                      </div>
+                    )}
+                    <div>
+                      <div className="mb-1 text-xs font-medium text-muted-foreground">Metadata</div>
+                      <PayloadViewer value={taskDetail.data.metadata} />
+                    </div>
                   </div>
                 )}
               </div>
