@@ -94,6 +94,8 @@ SyncBackPolicy = Literal["always", "on_success", "never"]
 
 GIT_REPOSITORY_METADATA_KEY = "git_repository"
 
+SYNC_DISTINCT_WORKSPACES_ERROR = "SyncBinding source and target workspaces must be different."
+
 
 @dataclass(frozen=True)
 class WorkspaceSnapshot:
@@ -621,8 +623,7 @@ class SyncBinding(WorkspaceBinding):
             metadata=request_metadata,
         )
         target = await self._target_workspace(context)
-        if _same_workspace_resource(workspace, target):
-            raise ValueError("SyncBinding source and target workspaces must be different.")
+        _reject_same_or_indeterminate_target(workspace, target)
         # Reserve a fixed target before any mutating await so a concurrent bind against the same
         # shared target is rejected rather than interleaving clear/copy over it. The check-and-add is
         # synchronous, so two coroutines cannot both pass it. Released when this bind's state is
@@ -917,44 +918,24 @@ def _validate_finalize_request(
     return copy_json_value(metadata, "metadata")
 
 
-def _same_workspace_resource(source: Workspace, target: Workspace) -> bool:
-    if target is source or target.id == source.id:
-        return True
+def _reject_same_or_indeterminate_target(source: Workspace, target: Workspace) -> None:
+    """Refuse a SyncBinding whose target is, or might be, the same resource as the source.
 
-    source_root = getattr(source, "root", None)
-    target_root = getattr(target, "root", None)
-    if source_root is not None and target_root is not None:
-        source_runner = getattr(source, "runner", None)
-        target_runner = getattr(target, "runner", None)
-        return _runner_resource_key(source_runner) == _runner_resource_key(target_runner) and str(
-            source_root
-        ) == str(target_root)
-
-    if (
-        hasattr(source, "runner")
-        and hasattr(target, "runner")
-        and hasattr(source, "cwd")
-        and hasattr(target, "cwd")
-    ):
-        source_cwd = getattr(source, "cwd", None)
-        target_cwd = getattr(target, "cwd", None)
-        source_runner = getattr(source, "runner", None)
-        target_runner = getattr(target, "runner", None)
-        return _runner_resource_key(source_runner) == _runner_resource_key(target_runner) and (
-            source_cwd or "."
-        ) == (target_cwd or ".")
-
-    return False
-
-
-def _runner_resource_key(runner: Any) -> tuple[Any, ...]:
-    if runner is None:
-        return (None,)
-    for attr in ("sandbox_id", "name", "container_name", "sandbox_name", "root"):
-        value = getattr(runner, attr, None)
-        if value is not None:
-            return (type(runner), attr, str(value))
-    return (type(runner), "object", id(runner))
+    Fails closed: when either workspace cannot report a stable ``resource_key`` the identity is
+    indeterminate, so the bind is refused rather than risk ``_clear_workspace`` wiping the source.
+    """
+    if source is target or source.id == target.id:
+        raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
+    source_key, target_key = source.resource_key, target.resource_key
+    if source_key is None or target_key is None:
+        unknown = type(source if source_key is None else target).__name__
+        raise ValueError(
+            "SyncBinding cannot confirm the source and target are different workspaces: "
+            f"{unknown} does not define resource_key. Override Workspace.resource_key on {unknown} "
+            "to return a stable identity token, or use target_workspace_factory for per-bind targets."
+        )
+    if source_key == target_key:
+        raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
 
 
 def _validate_positive_int(value: int, field_name: str, *, owner: str = "SyncBinding") -> int:

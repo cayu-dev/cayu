@@ -10,6 +10,7 @@ from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
+    _runner_workspace_resource_key,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -52,6 +53,10 @@ class MicrosandboxWorkspace(Workspace):
             self.id = f"microsandbox:{runner.name}:{self.root}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        return _runner_workspace_resource_key(self.runner, str(self.root))
 
     async def read_bytes(
         self,

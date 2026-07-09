@@ -195,3 +195,43 @@ class Workspace(ABC):
         Every backend must match ``pattern`` against workspace-relative POSIX
         file paths with the normative semantics of ``matches_list_pattern``.
         """
+
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        """Stable, hashable token identifying the underlying resource (filesystem/sandbox area)
+        this workspace reads and writes, so callers can tell whether two ``Workspace`` objects
+        point at the SAME place.
+
+        Returns ``None`` when identity cannot be determined. ``SyncBinding`` then refuses to bind
+        rather than risk clearing a target that is actually the source; override this in a custom
+        ``Workspace`` to return a stable identity token and enable that safety check.
+        """
+        return None
+
+
+def _local_resource_key(path: object) -> tuple[object, ...]:
+    """Canonical identity for a host-filesystem directory, shared by every host-backed workspace view."""
+    return ("local", str(path))
+
+
+def _runner_resource_key(runner: object) -> tuple[object, ...] | None:
+    """Stable identity for a runner, or ``None`` when the runner exposes no stable identifier.
+
+    Returning ``None`` for an indeterminate runner lets runner-backed workspaces fail closed rather
+    than treating Python object identity as proof that two runners are distinct resources.
+    """
+    if runner is None:
+        return None
+    for attr in ("sandbox_id", "name", "container_name", "sandbox_name", "root"):
+        value = getattr(runner, attr, None)
+        if value is not None:
+            return (type(runner), attr, str(value))
+    return None
+
+
+def _runner_workspace_resource_key(runner: object, path: str) -> tuple[object, ...] | None:
+    """Compose a runner-backed workspace key, or ``None`` when the runner identity is indeterminate."""
+    runner_key = _runner_resource_key(runner)
+    if runner_key is None:
+        return None
+    return ("runner", runner_key, path)

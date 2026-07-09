@@ -11,6 +11,7 @@ from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
+    _runner_workspace_resource_key,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -62,6 +63,10 @@ class E2BWorkspace(Workspace):
             self.id = f"e2b:{runner.sandbox_id}:{self.root}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        return _runner_workspace_resource_key(self.runner, str(self.root))
 
     async def read_bytes(
         self,

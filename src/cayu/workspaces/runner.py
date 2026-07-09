@@ -7,11 +7,13 @@ from collections.abc import Sequence
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import ExecCommand, Runner
+from cayu.runners import ExecCommand, LocalRunner, Runner
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
+    _local_resource_key,
+    _runner_resource_key,
     translate_list_pattern,
     validate_list_pattern,
 )
@@ -337,6 +339,23 @@ class RunnerWorkspace(Workspace):
             self.id = f"runner:{getattr(runner, 'isolation', 'unknown')}:{self.cwd or '.'}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
+
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        runner = self.runner
+        # LocalRunner reads/writes the host filesystem directly, so a RunnerWorkspace over it aliases
+        # the same directory a LocalWorkspace addresses. Emit the canonical host-fs key so SyncBinding
+        # detects that alias and refuses to clear one view while the other is the source.
+        if isinstance(runner, LocalRunner):
+            host_dir = runner.root if self.cwd is None else (runner.root / self.cwd).resolve()
+            return _local_resource_key(host_dir)
+        # Check identity first so an indeterminate runner fails closed (None) without calling resolve_cwd.
+        runner_key = _runner_resource_key(runner)
+        if runner_key is None:
+            return None
+        # Key by the runner's resolved absolute working directory so this RunnerWorkspace and the native
+        # wrapper (E2BWorkspace / MicrosandboxWorkspace) over the same sandbox directory produce equal keys.
+        return ("runner", runner_key, runner.resolve_cwd(self.cwd))
 
     async def read_bytes(
         self,

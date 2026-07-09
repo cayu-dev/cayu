@@ -10,6 +10,7 @@ from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
+    _local_resource_key,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -32,6 +33,10 @@ class LocalWorkspace(Workspace):
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
         self.root = root_path
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return _local_resource_key(self.root)
 
     async def read_bytes(
         self,

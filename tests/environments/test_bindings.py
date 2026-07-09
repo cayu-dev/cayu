@@ -24,8 +24,9 @@ from cayu.environments import (
     copy_workspace_snapshot,
 )
 from cayu.environments.bindings import _reset_workspace_after_failed_clone
-from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
+from cayu.runners import E2BRunner, ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.workspaces import (
+    E2BWorkspace,
     LocalWorkspace,
     RunnerWorkspace,
     Workspace,
@@ -764,6 +765,161 @@ def test_sync_binding_rejects_target_with_same_runner_cwd(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="different"):
         asyncio.run(run())
+
+
+class _OpaqueWorkspace(StubWorkspace):
+    """Custom Workspace with no stable identity (``resource_key`` defaults to None)."""
+
+    def __init__(self, workspace_id: str) -> None:
+        self.id = workspace_id
+
+
+class _KeyedWorkspace(StubWorkspace):
+    """Custom Workspace that reports a stable identity via ``resource_key``."""
+
+    def __init__(self, workspace_id: str, key: str) -> None:
+        self.id = workspace_id
+        self._key = key
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("keyed", self._key)
+
+
+def test_sync_binding_refuses_indeterminate_custom_workspace_identity() -> None:
+    source = _OpaqueWorkspace("source")
+    target = _OpaqueWorkspace("target")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_sync_opaque",
+        )
+
+    with pytest.raises(ValueError, match="does not define resource_key"):
+        asyncio.run(run())
+
+
+def test_sync_binding_rejects_custom_workspace_with_matching_resource_key() -> None:
+    source = _KeyedWorkspace("source", "shared")
+    target = _KeyedWorkspace("target", "shared")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_sync_keyed_same",
+        )
+
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(run())
+
+
+def test_sync_binding_allows_custom_workspace_with_distinct_resource_key() -> None:
+    source = _KeyedWorkspace("source", "src")
+    target = _KeyedWorkspace("target", "dst")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_sync_keyed_diff",
+        )
+
+    asyncio.run(run())
+
+
+def test_sync_binding_rejects_local_workspace_aliased_by_runner_workspace(tmp_path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    local = LocalWorkspace(root, workspace_id="local")
+    runner_view = RunnerWorkspace(LocalRunner(root), cwd=None, workspace_id="runner")
+
+    async def run(source, target) -> None:
+        await SyncBinding(target_workspace=target).bind(source, None, session_id="sess_alias")
+
+    # A LocalRunner-backed RunnerWorkspace addresses the same host dir as the LocalWorkspace, so the
+    # canonical "local" key must match in both directions (pre-fix these differed and the source was wiped).
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(run(local, runner_view))
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(run(runner_view, local))
+
+
+def test_sync_binding_allows_local_and_runner_workspace_over_distinct_roots(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="local")
+    target = RunnerWorkspace(LocalRunner(target_root), cwd=None, workspace_id="runner")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_distinct_roots",
+        )
+
+    asyncio.run(run())
+
+
+def test_sync_binding_refuses_runner_workspace_with_indeterminate_runner() -> None:
+    # StubRunner exposes none of the probed identity attrs, so its resource_key is indeterminate.
+    # Two distinct stub runners over the "same" external resource must fail closed, not pass on object id.
+    source = RunnerWorkspace(StubRunner(), workspace_id="source")
+    target = RunnerWorkspace(StubRunner(), workspace_id="target")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_opaque_runner",
+        )
+
+    with pytest.raises(ValueError, match="does not define resource_key"):
+        asyncio.run(run())
+
+
+def _offline_e2b_runner(default_cwd: str = "/home/user/workspace") -> E2BRunner:
+    return E2BRunner(object(), sandbox_id="sbx_same", default_cwd=default_cwd, e2b_module=object())
+
+
+def test_runner_workspace_resource_key_matches_native_e2b_wrapper() -> None:
+    runner = _offline_e2b_runner()
+    native = E2BWorkspace(runner, workspace_id="e2b")
+    runner_view = RunnerWorkspace(runner, cwd=None, workspace_id="runner")
+
+    # A RunnerWorkspace over a remote runner addresses the runner's default_cwd; its key must resolve to
+    # that absolute guest path so it matches the native wrapper (pre-fix the RunnerWorkspace path was ".").
+    assert runner_view.resource_key == native.resource_key
+    assert runner_view.resource_key[2] == "/home/user/workspace"
+
+
+def test_sync_binding_rejects_native_e2b_wrapper_aliased_by_runner_workspace() -> None:
+    runner = _offline_e2b_runner()
+    native = E2BWorkspace(runner, workspace_id="e2b")
+    runner_view = RunnerWorkspace(runner, cwd=None, workspace_id="runner")
+
+    async def run(source, target) -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source, runner, session_id="sess_remote_alias"
+        )
+
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(run(native, runner_view))
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(run(runner_view, native))
+
+
+def test_sync_binding_allows_native_e2b_wrapper_over_distinct_dir() -> None:
+    runner = _offline_e2b_runner(default_cwd="/home/user/workspace")
+    native = E2BWorkspace(runner, root="/home/user/other", workspace_id="e2b")
+    runner_view = RunnerWorkspace(runner, cwd=None, workspace_id="runner")
+
+    # Same sandbox, genuinely different guest directories -> distinct keys -> not aliased.
+    assert native.resource_key != runner_view.resource_key
 
 
 def test_sync_binding_can_finalize_from_copied_bound_workspace(tmp_path) -> None:
