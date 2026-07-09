@@ -335,6 +335,13 @@ class SubagentTool(Tool):
                 "context_mode": spec.context_mode.value,
                 "mode": spec.mode.value,
                 "parent_session_id": ctx.session_id,
+                # Durable parent->child link recorded on the child row at spawn, so a parent that crashes
+                # before its spawn tool call's TOOL_CALL_COMPLETED persists can still re-attach the child
+                # during recovery instead of resolving it as unknown. Recovery matches on idempotency_key
+                # (encodes session+tool_round+tool_call), which is round-scoped; tool_call_id is kept for
+                # human/debug readability. Both come from the runtime-injected ctx.metadata.
+                "tool_call_id": ctx.metadata.get("tool_call_id"),
+                "idempotency_key": ctx.metadata.get("idempotency_key"),
             },
         }
         # Propagate the parent session's taint across the subagent boundary so the child's

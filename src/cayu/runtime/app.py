@@ -8591,6 +8591,13 @@ class CayuApp:
             cancellation_artifacts=cancellation_artifacts,
             cancellation_artifacts_by_id=cancellation_artifacts_by_id,
         )
+        # Re-attach any background subagent child spawned by an interrupted spawn call so the parent
+        # transcript keeps the parent->child linkage on the interrupt path too (AGT-02 factor-5 sweep).
+        interrupted_results = await self._reattach_subagent_children_in_outcomes(
+            session_id=session.id,
+            tool_round_id=tool_round_id,
+            outcomes=interrupted_results,
+        )
         tool_outcomes = _redact_tool_call_outcomes(tool_outcomes, self._secret_redactor)
         interrupted_results = _redact_tool_call_outcomes(
             interrupted_results,
@@ -8623,6 +8630,88 @@ class CayuApp:
             interrupted_messages,
             cleared_checkpoint,
         )
+
+    async def _subagent_children_by_idempotency_key(
+        self,
+        parent_session_id: str,
+    ) -> dict[str, Session]:
+        """Map spawning ``idempotency_key`` -> child session for this parent's BACKGROUND subagent children.
+
+        Only background children are re-attached: a recovered foreground child has no supported fetch path
+        (``subagent_result`` refuses non-background sessions), so re-attaching it would leave a dangling
+        reference. The key encodes (session, tool_round, tool_call), so it binds a child to the exact
+        pending spawn call and is immune to a provider reusing a ``tool_call_id`` across rounds.
+        """
+        children: dict[str, Session] = {}
+        for child in await self._list_all_sessions(
+            SessionQuery(parent_session_id=parent_session_id, order_by=SessionOrder.CREATED_AT_ASC)
+        ):
+            if not _is_background_subagent_session(child):
+                continue
+            idempotency_key = tool_round_recovery.subagent_child_idempotency_key(child)
+            if idempotency_key is not None:
+                children[idempotency_key] = child
+        return children
+
+    def _reattached_subagent_result(
+        self,
+        children: dict[str, Session],
+        idempotency_key: str,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        tool_round_id: str,
+    ) -> ToolResult | None:
+        """The re-attach ToolResult for a spawn call whose child is in ``children``, or None on a miss.
+
+        Shared by the crash-recovery and live-interrupt paths; each supplies its own fallback for a miss.
+        """
+        child = children.get(idempotency_key)
+        if child is None:
+            return None
+        return tool_round_recovery.recovered_subagent_tool_result(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            child=child,
+        )
+
+    async def _reattach_subagent_children_in_outcomes(
+        self,
+        *,
+        session_id: str,
+        tool_round_id: str | None,
+        outcomes: list[runtime_records.ToolCallOutcome],
+    ) -> list[runtime_records.ToolCallOutcome]:
+        """Replace incomplete spawn outcomes with a subagent re-attach when a background child exists.
+
+        Factor-5 sweep of AGT-02: the live-interrupt close path records the parent->child linkage the same
+        way crash recovery does, matching each outcome's call to its child by the round-scoped idempotency
+        key. Returns ``outcomes`` unchanged when the round is unknown or the parent has no matching child.
+        """
+        if tool_round_id is None or not outcomes:
+            return outcomes
+        children = await self._subagent_children_by_idempotency_key(session_id)
+        if not children:
+            return outcomes
+        reattached: list[runtime_records.ToolCallOutcome] = []
+        for outcome in outcomes:
+            result = self._reattached_subagent_result(
+                children,
+                tool_execution.tool_idempotency_key(
+                    session_id=session_id,
+                    tool_round_id=tool_round_id,
+                    tool_call_id=outcome.call.id,
+                ),
+                tool_call_id=outcome.call.id,
+                tool_name=outcome.call.name,
+                tool_round_id=tool_round_id,
+            )
+            if result is None:
+                reattached.append(outcome)
+            else:
+                reattached.append(runtime_records.ToolCallOutcome(call=outcome.call, result=result))
+        return reattached
 
     async def _recover_pending_tool_round(
         self,
@@ -8671,6 +8760,17 @@ class CayuApp:
             events=events,
             pending_round=pending_round,
         )
+        # Re-attach any background subagent children spawned during this round: a parent that crashed
+        # before its spawn tool call's terminal event still has the child linked via the child row's
+        # metadata, so recover the child (id + status) instead of resolving the call as an unknown
+        # outcome (AGT-02). Match on the per-call idempotency_key so a child binds to the exact pending
+        # spawn call in THIS round, not a same-id child from an earlier round. Skip the child scan when
+        # every pending call already has a recorded outcome (nothing to re-attach).
+        subagent_children: dict[str, Session] = {}
+        if any(
+            recorded_outcomes.get(call.tool_call_id) is None for call in pending_round.tool_calls
+        ):
+            subagent_children = await self._subagent_children_by_idempotency_key(session.id)
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         for pending_tool_call in pending_round.tool_calls:
             recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
@@ -8683,14 +8783,30 @@ class CayuApp:
                 name=pending_tool_call.tool_name,
                 arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
             )
-            result = tool_round_recovery.unknown_recovered_tool_result(
-                pending_tool_call=pending_tool_call,
-                pending_round=pending_round,
-                started=pending_tool_call.tool_call_id in started_ids,
+            expected_idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending_round.round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+            )
+            result = self._reattached_subagent_result(
+                subagent_children,
+                expected_idempotency_key,
+                tool_call_id=pending_tool_call.tool_call_id,
+                tool_name=pending_tool_call.tool_name,
+                tool_round_id=pending_round.round_id,
+            )
+            if result is None:
+                result = tool_round_recovery.unknown_recovered_tool_result(
+                    pending_tool_call=pending_tool_call,
+                    pending_round=pending_round,
+                    started=pending_tool_call.tool_call_id in started_ids,
+                )
+            event_type = (
+                EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
             )
             async for event, outcome in self._emit_tool_call_result_with_hooks(
                 event=Event(
-                    type=EventType.TOOL_CALL_FAILED,
+                    type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
@@ -8698,11 +8814,7 @@ class CayuApp:
                     payload={
                         "tool_round_id": pending_round.round_id,
                         "tool_call_id": tool_call.id,
-                        "idempotency_key": tool_execution.tool_idempotency_key(
-                            session_id=session.id,
-                            tool_round_id=pending_round.round_id,
-                            tool_call_id=tool_call.id,
-                        ),
+                        "idempotency_key": expected_idempotency_key,
                         "recovered": True,
                         "result": result.model_dump(),
                     },
@@ -11294,8 +11406,15 @@ def _interrupted_tool_call_event(
     }
     if tool_round_id is not None:
         payload["tool_round_id"] = tool_round_id
+    # The event type must match the result: genuine interruptions are is_error=True (FAILED), but a
+    # re-attached subagent child that already COMPLETED yields is_error=False and must emit COMPLETED —
+    # otherwise the event contradicts its own payload (mirrors the crash-recovery path).
     return Event(
-        type=EventType.TOOL_CALL_FAILED,
+        type=(
+            EventType.TOOL_CALL_FAILED
+            if tool_call_outcome.result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        ),
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),

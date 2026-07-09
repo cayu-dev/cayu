@@ -7511,13 +7511,17 @@ def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
     assert child.parent_session_id == "sess_subagent_parent"
     assert child.causal_budget_id == "job_subagent"
     assert child.status == SessionStatus.COMPLETED
-    assert child.metadata["subagent"] == {
-        "agent": "reviewer",
-        "agent_name": "reviewer",
-        "context_mode": "task_only",
-        "mode": "foreground",
-        "parent_session_id": "sess_subagent_parent",
-    }
+    subagent_meta = child.metadata["subagent"]
+    assert subagent_meta["agent"] == "reviewer"
+    assert subagent_meta["agent_name"] == "reviewer"
+    assert subagent_meta["context_mode"] == "task_only"
+    assert subagent_meta["mode"] == "foreground"
+    assert subagent_meta["parent_session_id"] == "sess_subagent_parent"
+    # Durable parent->child linkage stamped at spawn (AGT-02): the child records the spawning
+    # tool_call_id and idempotency_key so recovery can re-attach it if the parent crashes before
+    # TOOL_CALL_COMPLETED. idempotency_key is a runtime-computed hash, so assert shape not value.
+    assert subagent_meta["tool_call_id"] == "call_subagent"
+    assert isinstance(subagent_meta["idempotency_key"], str) and subagent_meta["idempotency_key"]
 
     child_transcript = asyncio.run(store.load_transcript(child.id))
     assert [message.role for message in child_transcript] == ["user", "assistant"]
@@ -12434,6 +12438,352 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
     assert recovered_result.tool_call_id == "call_1"
     assert recovered_result.is_error is True
     assert "outcome is unknown" in recovered_result.content
+
+
+async def _seed_crashed_spawn_parent(
+    store,
+    *,
+    child_status,
+    mode: str = "background",
+    linkage: str = "correct",
+):
+    """Reproduce the AGT-02 crash window: a parent with an in-progress ``subagent`` spawn tool round
+    (STARTED, no terminal event) and a durably-created child.
+
+    ``mode`` is the child's subagent mode ("background" re-attaches; "foreground" must fall back).
+    ``linkage`` controls the child's stamped idempotency_key: "correct" stamps the child's real key,
+    "none" omits it, "wrong_round" stamps a key for a different tool round (both must fall back)."""
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.runtime import _tool_execution as tool_execution
+    from cayu.runtime import _tool_round_recovery as tool_round_recovery
+
+    identity = SessionIdentity(provider_name="fake", model="fake-model")
+    await store.create(
+        RunRequest(
+            agent_name="parent",
+            session_id="parent",
+            messages=[Message.text("user", "spawn a reviewer")],
+        ),
+        identity=identity,
+    )
+    # Build the pending round first so the child can stamp the round-scoped idempotency_key.
+    checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+        None,
+        agent_name="parent",
+        environment_name=None,
+        task_id=None,
+        tool_calls=[
+            runtime_records.ToolCallRequest(
+                id="call_spawn",
+                name="subagent",
+                arguments={"agent": "reviewer", "task": "review"},
+            )
+        ],
+        policy_outcomes=None,
+        structured_output=None,
+    )
+
+    subagent_meta = {"agent": "reviewer", "mode": mode, "tool_call_id": "call_spawn"}
+    if linkage == "correct":
+        subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
+            session_id="parent", tool_round_id=pending_round.round_id, tool_call_id="call_spawn"
+        )
+    elif linkage == "wrong_round":
+        subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
+            session_id="parent", tool_round_id="a-different-round", tool_call_id="call_spawn"
+        )
+    await store.create(
+        RunRequest(
+            agent_name="reviewer",
+            session_id="child",
+            parent_session_id="parent",
+            messages=[Message.text("user", "review")],
+            metadata={"subagent": subagent_meta},
+        ),
+        identity=identity,
+    )
+    await store.append_transcript_messages(
+        "child",
+        [Message.text("user", "review"), Message.text("assistant", "looks good")],
+    )
+    await store.update_status("child", child_status)
+
+    await store.checkpoint("parent", checkpoint)
+    await store.append_events(
+        "parent",
+        [
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="parent",
+                payload={"tool_round_id": pending_round.round_id, "tool_call_id": "call_spawn"},
+            )
+        ],
+    )
+    await store.update_status("parent", SessionStatus.RUNNING)
+    return pending_round
+
+
+def _recovered_parent_tool_result(store):
+    transcript = asyncio.run(store.load_transcript("parent"))
+    tool_message = next(message for message in reversed(transcript) if message.role == "tool")
+    return tool_message.content[0]
+
+
+def _recovered_tool_event(result):
+    return next(
+        event
+        for event in result.events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        and event.payload.get("recovered") is True
+    )
+
+
+def _recover_parent(child_status, *, mode: str = "background", linkage: str = "correct"):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        subagent_tool = SubagentTool(
+            app,
+            agents={
+                "reviewer": SubagentSpec(
+                    agent_name="reviewer",
+                    description="Review delegated work.",
+                )
+            },
+        )
+        app.register_agent(AgentSpec(name="parent", model="fake-model"), tools=[subagent_tool])
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        await _seed_crashed_spawn_parent(
+            store, child_status=child_status, mode=mode, linkage=linkage
+        )
+        result = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="parent", reason="worker restart")
+        )
+        return store, result
+
+    return asyncio.run(run())
+
+
+def test_recovery_reattaches_completed_subagent_child():
+    store, result = _recover_parent(SessionStatus.COMPLETED)
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.tool_call_id == "call_spawn"
+    assert recovered.is_error is False
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
+    assert recovered.structured["child_session_id"] == "child"
+    assert recovered.structured["parent_session_id"] == "parent"
+    assert recovered.structured["status"] == "completed"
+    assert recovered.structured["outcome_unknown"] is False
+    # The retrieval guidance must name the real tool (subagent_result), not a nonexistent one.
+    assert "subagent_result" in recovered.content
+    assert "get_subagent_result" not in recovered.content
+    # A completed re-attach must emit a COMPLETED (not FAILED) event, matching normal execution.
+    assert _recovered_tool_event(result).type == EventType.TOOL_CALL_COMPLETED
+
+
+def test_recovery_reattaches_interrupted_subagent_child_as_error():
+    store, result = _recover_parent(SessionStatus.INTERRUPTED)
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.tool_call_id == "call_spawn"
+    assert recovered.is_error is True
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
+    assert recovered.structured["child_session_id"] == "child"
+    assert recovered.structured["status"] == "interrupted"
+    # A terminal child is a known (if failed) outcome, not an unknown one.
+    assert recovered.structured["outcome_unknown"] is False
+    assert _recovered_tool_event(result).type == EventType.TOOL_CALL_FAILED
+
+
+def test_recovery_without_child_linkage_falls_back_to_unknown_outcome():
+    # Non-vacuity: a child that does NOT record its idempotency_key cannot be re-attached, so recovery
+    # must fall back to the pre-AGT-02 "outcome unknown" result.
+    store, result = _recover_parent(SessionStatus.COMPLETED, linkage="none")
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.tool_call_id == "call_spawn"
+    assert recovered.is_error is True
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
+    assert recovered.structured["outcome_unknown"] is True
+    assert "child_session_id" not in recovered.structured
+    assert _recovered_tool_event(result).type == EventType.TOOL_CALL_FAILED
+
+
+def test_recovery_does_not_reattach_foreground_child():
+    # Foreground children have no supported fetch path (subagent_result refuses non-background sessions),
+    # so recovery must NOT re-attach them — it falls back to "outcome unknown" instead of a dangling ref.
+    store, _result = _recover_parent(SessionStatus.COMPLETED, mode="foreground")
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
+    assert "child_session_id" not in recovered.structured
+
+
+def test_recovery_ignores_child_stamped_for_a_different_round():
+    # Round-scoping: a child whose idempotency_key encodes a different tool round (e.g. a same-tool_call_id
+    # child from an earlier round) must NOT be re-attached to this round's pending spawn call.
+    store, _result = _recover_parent(SessionStatus.COMPLETED, linkage="wrong_round")
+    recovered = _recovered_parent_tool_result(store)
+
+    assert recovered.structured["recovery_reason"] == "pending_tool_round_missing_terminal_event"
+    assert "child_session_id" not in recovered.structured
+
+
+async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
+    """Seed a parent + a background child stamped for `child_round_id`, then run the interrupt-close
+    re-attach against a generic interrupted outcome for tool round `tool_round_id`."""
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.runtime import _tool_execution as tool_execution
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    identity = SessionIdentity(provider_name="fake", model="fake-model")
+    await store.create(
+        RunRequest(agent_name="parent", session_id="parent", messages=[Message.text("user", "go")]),
+        identity=identity,
+    )
+    key = tool_execution.tool_idempotency_key(
+        session_id="parent", tool_round_id=child_round_id, tool_call_id="call_spawn"
+    )
+    await store.create(
+        RunRequest(
+            agent_name="reviewer",
+            session_id="child",
+            parent_session_id="parent",
+            messages=[Message.text("user", "review")],
+            metadata={
+                "subagent": {
+                    "agent": "reviewer",
+                    "mode": "background",
+                    "tool_call_id": "call_spawn",
+                    "idempotency_key": key,
+                }
+            },
+        ),
+        identity=identity,
+    )
+    await store.update_status("child", SessionStatus.INTERRUPTED)
+    interrupted = runtime_records.ToolCallOutcome(
+        call=runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={}),
+        result=ToolResult(
+            content="Tool call interrupted before completion.",
+            structured={"interrupted": True, "tool_call_id": "call_spawn"},
+            is_error=True,
+        ),
+    )
+    outcomes = await app._reattach_subagent_children_in_outcomes(
+        session_id="parent", tool_round_id=tool_round_id, outcomes=[interrupted]
+    )
+    return outcomes[0].result
+
+
+def test_interrupt_close_reattaches_background_subagent_child():
+    # Factor-5 sweep: the live-interrupt close path records the parent->child linkage like crash recovery.
+    result = asyncio.run(
+        _reattach_interrupted_spawn(tool_round_id="round-1", child_round_id="round-1")
+    )
+
+    assert result.structured["recovery_reason"] == "pending_tool_round_reattached_subagent"
+    assert result.structured["child_session_id"] == "child"
+    assert result.structured["status"] == "interrupted"
+    assert result.is_error is True
+
+
+def test_interrupt_close_ignores_child_from_a_different_round():
+    # Non-vacuity + round-scoping: a child stamped for a different round is not re-attached; the generic
+    # interrupted outcome is returned unchanged.
+    result = asyncio.run(
+        _reattach_interrupted_spawn(tool_round_id="round-2", child_round_id="round-1")
+    )
+
+    assert result.structured == {"interrupted": True, "tool_call_id": "call_spawn"}
+    assert "child_session_id" not in result.structured
+
+
+async def _close_interrupted_spawn_and_collect_events(child_status):
+    """Drive `_close_interrupted_tool_round` for an interrupted `subagent` spawn whose background child is
+    in `child_status`, returning the emitted events. Exercises the event-type derivation on that path."""
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.runtime import _tool_execution as tool_execution
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="parent", model="fake-model"))
+    identity = SessionIdentity(provider_name="fake", model="fake-model")
+    await store.create(
+        RunRequest(agent_name="parent", session_id="parent", messages=[Message.text("user", "go")]),
+        identity=identity,
+    )
+    key = tool_execution.tool_idempotency_key(
+        session_id="parent", tool_round_id="round-1", tool_call_id="call_spawn"
+    )
+    await store.create(
+        RunRequest(
+            agent_name="reviewer",
+            session_id="child",
+            parent_session_id="parent",
+            messages=[Message.text("user", "review")],
+            metadata={
+                "subagent": {
+                    "agent": "reviewer",
+                    "mode": "background",
+                    "tool_call_id": "call_spawn",
+                    "idempotency_key": key,
+                }
+            },
+        ),
+        identity=identity,
+    )
+    await store.append_transcript_messages(
+        "child", [Message.text("user", "review"), Message.text("assistant", "done")]
+    )
+    await store.update_status("child", child_status)
+    parent = await store.load("parent")
+    events = []
+    async for event in app._close_interrupted_tool_round(
+        session=parent,
+        registered_agent=app._get_registered_agent("parent"),
+        registered_environment=None,
+        messages=[],
+        tool_calls=[
+            runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={})
+        ],
+        tool_outcomes=[],
+        tool_round_id="round-1",
+    ):
+        events.append(event)
+    return [event for event in events if event.payload.get("tool_call_id") == "call_spawn"]
+
+
+def test_interrupt_close_emits_completed_event_for_reattached_completed_child():
+    # A re-attached child that already COMPLETED must emit TOOL_CALL_COMPLETED, not a FAILED event whose
+    # payload contradicts it (the crash path already derives the type from result.is_error).
+    spawn_events = asyncio.run(_close_interrupted_spawn_and_collect_events(SessionStatus.COMPLETED))
+
+    assert len(spawn_events) == 1
+    event = spawn_events[0]
+    assert event.type == EventType.TOOL_CALL_COMPLETED
+    assert event.payload["result"]["is_error"] is False
+    assert event.payload["result"]["structured"]["child_session_id"] == "child"
+    assert (
+        event.payload["result"]["structured"]["recovery_reason"]
+        == "pending_tool_round_reattached_subagent"
+    )
+
+
+def test_interrupt_close_emits_failed_event_for_reattached_interrupted_child():
+    spawn_events = asyncio.run(
+        _close_interrupted_spawn_and_collect_events(SessionStatus.INTERRUPTED)
+    )
+
+    assert len(spawn_events) == 1
+    event = spawn_events[0]
+    assert event.type == EventType.TOOL_CALL_FAILED
+    assert event.payload["result"]["is_error"] is True
+    assert event.payload["result"]["structured"]["child_session_id"] == "child"
 
 
 def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id():

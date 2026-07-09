@@ -14,6 +14,7 @@ from cayu.runtime.approvals import (
     PendingToolCallApproval,
     copy_pending_tool_call_approval,
 )
+from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
@@ -283,6 +284,69 @@ def unknown_recovered_tool_result(
             "outcome_unknown": True,
         },
         is_error=True,
+    )
+
+
+_SUBAGENT_RECOVERY_TERMINAL_STATUSES = frozenset(
+    {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED}
+)
+
+
+def subagent_child_idempotency_key(child: Session) -> str | None:
+    """The tool-execution ``idempotency_key`` a child subagent session records, or None if unlinked.
+
+    The key encodes (session, tool_round, tool_call), so matching on it binds a recovered child to the
+    exact pending spawn call — round-scoped, immune to providers reusing a ``tool_call_id`` across rounds.
+    """
+    subagent = child.metadata.get("subagent")
+    if not isinstance(subagent, dict):
+        return None
+    idempotency_key = subagent.get("idempotency_key")
+    return idempotency_key if type(idempotency_key) is str and idempotency_key else None
+
+
+def recovered_subagent_tool_result(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    tool_round_id: str,
+    child: Session,
+) -> ToolResult:
+    """Re-attach a recovered subagent-spawn tool call to its durably-created child session.
+
+    Closes the parent->child linkage window: instead of resolving an incomplete spawn call as an unknown
+    (or generic interrupted) outcome, record the discovered child (id + terminal status) so the parent
+    transcript keeps a durable reference. The parent can fetch the child's full output later via
+    ``subagent_result``. Shared by the crash-recovery and live-interrupt close paths.
+    """
+    status = child.status
+    terminal = status in _SUBAGENT_RECOVERY_TERMINAL_STATUSES
+    if terminal:
+        content = (
+            f"Subagent {child.id} was recovered with terminal status {status.value} after Cayu "
+            "recovered an incomplete tool round. Use subagent_result for its full output."
+        )
+    else:
+        # A non-terminal child means its in-process execution did not survive the crash. The linkage is
+        # still recorded so the parent can inspect or re-run the child rather than losing the reference.
+        content = (
+            f"Subagent {child.id} was spawned but did not reach a terminal status before Cayu recovered "
+            f"an incomplete tool round (status {status.value}); its outcome is unknown."
+        )
+    return ToolResult(
+        content=content,
+        structured={
+            "recovered": True,
+            "recovery_reason": "pending_tool_round_reattached_subagent",
+            "tool_round_id": tool_round_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "child_session_id": child.id,
+            "parent_session_id": child.parent_session_id,
+            "status": status.value,
+            "outcome_unknown": not terminal,
+        },
+        is_error=status is not SessionStatus.COMPLETED,
     )
 
 
