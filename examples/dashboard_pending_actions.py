@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
@@ -18,12 +19,16 @@ import uvicorn
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
+    ArtifactScope,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
     EventType,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
+    LocalArtifactStore,
     Message,
     ModelPricing,
     PricingCatalog,
@@ -531,12 +536,48 @@ async def seed_tasks(app: CayuApp) -> None:
     print("Seeded task queue examples: 8", flush=True)
 
 
+async def seed_artifacts(app: CayuApp) -> None:
+    environment = app.get_environment("demo-local").environment
+    artifact_store = environment.artifact_store
+    assert isinstance(artifact_store, LocalArtifactStore)
+    await artifact_store.put_bytes(
+        b"checkout-api deploy log\nstatus=ok\nrelease=2026.07.09\n",
+        filename="checkout-deploy.log",
+        content_type="text/plain",
+        scope=ArtifactScope.SESSION,
+        session_id="sess_dashboard_completed",
+        agent_name="demo-completed",
+        environment_name="demo-local",
+        metadata={"demo": True, "source": "deploy_service"},
+    )
+    await artifact_store.put_bytes(
+        b'{"invoice_id":"inv_demo_42","status":"needs_review","amount":1280}\n',
+        filename="invoice-review.json",
+        content_type="application/json",
+        scope=ArtifactScope.SESSION,
+        session_id="sess_dashboard_awaiting_approval",
+        agent_name="demo-approval",
+        environment_name="demo-local",
+        metadata={"demo": True, "source": "approval_queue"},
+    )
+    await artifact_store.put_bytes(
+        b"workspace=cayu-demo\nrunner=local\nartifact_store=demo-artifacts\n",
+        filename="environment-summary.txt",
+        content_type="text/plain",
+        scope=ArtifactScope.ENVIRONMENT,
+        environment_name="demo-local",
+        metadata={"demo": True, "purpose": "control-plane inventory"},
+    )
+    print("Seeded artifact examples: 3", flush=True)
+
+
 def build_app() -> CayuApp:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(exist_ok=True)
     for name in ("sessions.db", "tasks.db", "knowledge.db"):
         for path in DB_DIR.glob(f"{name}*"):
             path.unlink(missing_ok=True)
+    shutil.rmtree(DB_DIR / "artifacts", ignore_errors=True)
 
     knowledge_store = SQLiteKnowledgeStore(DB_DIR / "knowledge.db")
     app = CayuApp(
@@ -544,6 +585,18 @@ def build_app() -> CayuApp:
         task_store=SQLiteTaskStore(DB_DIR / "tasks.db"),
         knowledge_store=knowledge_store,
         enable_logging=False,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(
+                name="demo-local",
+                metadata={"tier": "demo", "region": "local"},
+            ),
+            artifact_store=LocalArtifactStore(DB_DIR / "artifacts", store_id="demo-artifacts"),
+            knowledge_store=knowledge_store,
+            workspace_instructions="Use the dashboard demo workspace for local control-plane checks.",
+        ),
+        default=True,
     )
     app.register_provider(DashboardDemoProvider(), default=True)
 
@@ -582,6 +635,7 @@ def main() -> None:
     app = build_app()
     asyncio.run(seed_sessions(app))
     asyncio.run(seed_tasks(app))
+    asyncio.run(seed_artifacts(app))
     knowledge_store = app.knowledge_store
     assert isinstance(knowledge_store, SQLiteKnowledgeStore)
     asyncio.run(seed_pending_knowledge(knowledge_store))

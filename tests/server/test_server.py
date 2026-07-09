@@ -2,8 +2,10 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import asyncio
+import base64
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -14,21 +16,28 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cayu import (
+    REDACTED_SECRET,
     AgentSpec,
+    ArtifactScope,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeStatus,
+    LocalArtifactStore,
     Message,
     MessageRole,
+    SecretRedactor,
     TaskCreate,
     TaskStatus,
     TextPart,
     ThinkingPart,
     UserInputTool,
 )
+from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -63,6 +72,61 @@ class UsageProvider(ModelProvider):
                 }
             }
         )
+
+
+class CountingArtifactStore(ArtifactStore):
+    id = "counting-artifacts"
+
+    async def put_bytes(
+        self,
+        content: bytes,
+        *,
+        filename: str,
+        content_type: str | None = None,
+        scope: ArtifactScope = ArtifactScope.SESSION,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ArtifactMetadata:
+        raise NotImplementedError
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        raise FileNotFoundError(artifact_id)
+
+    async def list(
+        self,
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        environment_name: str | None = None,
+        limit: int | None = None,
+    ) -> ArtifactListResult:
+        requested = min(limit or 0, 10_500)
+        artifacts = tuple(
+            ArtifactMetadata(
+                id=f"artifact_{index:05d}",
+                filename=f"artifact-{index:05d}.txt",
+                content_type="text/plain",
+                size_bytes=0,
+                scope=ArtifactScope.ENVIRONMENT,
+                environment_name="local-review",
+            )
+            for index in range(requested)
+        )
+        return ArtifactListResult(
+            artifacts=artifacts,
+            total_count=20_000,
+            truncated=True,
+        )
+
+    async def delete(self, artifact_id: str) -> None:
+        return None
 
 
 async def _collect_run(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -151,6 +215,303 @@ def test_server_run_failure_before_session_does_not_strand_pending_task() -> Non
 
     tasks = client.get("/api/tasks").json()
     assert sorted(task["status"] for task in tasks) == ["failed", "failed"]
+
+
+def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="reviewer",
+            model="fake-model",
+            metadata={"team": "platform"},
+            provider_options={"temperature": 0},
+            system_prompt="Review runtime state.",
+        ),
+        tools=[UserInputTool()],
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local-review", metadata={"tenant": "test"}),
+            artifact_store=artifact_store,
+            workspace_instructions="Use local workspace instructions.",
+        ),
+        default=True,
+    )
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"deployment log\nstatus=ok\n",
+            filename="deploy.log",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+            agent_name="reviewer",
+            environment_name="local-review",
+            metadata={"source": "test"},
+        )
+    )
+
+    client = TestClient(create_server(app, dev=True))
+
+    agents = client.get("/api/agents")
+    assert agents.status_code == 200
+    agents_body = agents.json()
+    assert agents_body["total_count"] == 1
+    assert agents_body["agents"][0]["name"] == "reviewer"
+    assert agents_body["agents"][0]["metadata"] == {"team": "platform"}
+    assert agents_body["agents"][0]["has_system_prompt"] is True
+    assert [tool["name"] for tool in agents_body["agents"][0]["tools"]] == ["ask_user"]
+
+    environments = client.get("/api/environments")
+    assert environments.status_code == 200
+    environments_body = environments.json()
+    assert environments_body["total_count"] == 1
+    assert environments_body["environments"][0]["name"] == "local-review"
+    assert environments_body["environments"][0]["artifact_store_id"] == "test-artifacts"
+    assert environments_body["environments"][0]["workspace_instructions"] == "inline"
+
+    artifacts = client.get("/api/artifacts", params={"session_id": "sess_inventory"})
+    assert artifacts.status_code == 200
+    artifacts_body = artifacts.json()
+    assert artifacts_body["total_count"] == 1
+    assert artifacts_body["artifacts"][0]["id"] == artifact.id
+    assert artifacts_body["artifacts"][0]["artifact_store_id"] == "test-artifacts"
+    assert artifacts_body["artifacts"][0]["metadata"] == {"source": "test"}
+
+    read = client.get(
+        f"/api/artifacts/{artifact.id}",
+        params={"artifact_store_id": "test-artifacts", "max_bytes": 10},
+    )
+    assert read.status_code == 200
+    read_body = read.json()
+    assert read_body["artifact"]["id"] == artifact.id
+    assert read_body["preview_base64"] == base64.b64encode(b"deployment").decode()
+    assert read_body["text_preview"] == "deployment"
+    assert read_body["total_bytes"] == len(b"deployment log\nstatus=ok\n")
+    assert read_body["truncated"] is True
+
+    malformed_without_store = client.get("/api/artifacts/not-a-local-artifact-id")
+    assert malformed_without_store.status_code == 404
+    assert malformed_without_store.json()["detail"] == "Artifact not found"
+
+    malformed_with_store = client.get(
+        "/api/artifacts/not-a-local-artifact-id",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert malformed_with_store.status_code == 422
+    assert "local artifact id" in malformed_with_store.json()["detail"]
+
+
+def test_server_control_plane_inventory_redacts_configured_secrets(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
+    app = CayuApp(secret_redactor=SecretRedactor("secret-token"))
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="reviewer",
+            model="fake-model",
+            metadata={"note": "agent secret-token"},
+            provider_options={"header": "Bearer secret-token"},
+        ),
+        tools=[UserInputTool()],
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local-review", metadata={"note": "env secret-token"}),
+            artifact_store=artifact_store,
+        ),
+        default=True,
+    )
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"deployment secret-token\n",
+            filename="deploy.log",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+            agent_name="reviewer",
+            environment_name="local-review",
+            metadata={"note": "artifact secret-token"},
+        )
+    )
+
+    client = TestClient(create_server(app, dev=True))
+
+    agent = client.get("/api/agents").json()["agents"][0]
+    environment = client.get("/api/environments").json()["environments"][0]
+    artifact_list_item = client.get("/api/artifacts").json()["artifacts"][0]
+    artifact_read_body = client.get(
+        f"/api/artifacts/{artifact.id}",
+        params={"artifact_store_id": "test-artifacts"},
+    ).json()
+    artifact_read = artifact_read_body["artifact"]
+
+    assert agent["metadata"] == {"note": f"agent {REDACTED_SECRET}"}
+    assert agent["provider_options"] == {"header": f"Bearer {REDACTED_SECRET}"}
+    assert environment["metadata"] == {"note": f"env {REDACTED_SECRET}"}
+    assert artifact_list_item["metadata"] == {"note": f"artifact {REDACTED_SECRET}"}
+    assert artifact_read["metadata"] == {"note": f"artifact {REDACTED_SECRET}"}
+    assert artifact_read_body["text_preview"] == f"deployment {REDACTED_SECRET}\n"
+    assert (
+        artifact_read_body["preview_base64"]
+        == base64.b64encode(f"deployment {REDACTED_SECRET}\n".encode()).decode()
+    )
+
+
+def test_server_artifact_inventory_rejects_duplicate_store_ids(tmp_path) -> None:
+    app = CayuApp()
+    first_store = LocalArtifactStore(tmp_path / "first", store_id="duplicate-store")
+    second_store = LocalArtifactStore(tmp_path / "second", store_id="duplicate-store")
+    app.register_environment(
+        Environment(EnvironmentSpec(name="first"), artifact_store=first_store),
+        default=True,
+    )
+    app.register_environment(
+        Environment(EnvironmentSpec(name="second"), artifact_store=second_store),
+    )
+    asyncio.run(
+        first_store.put_bytes(
+            b"first",
+            filename="first.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="first",
+        )
+    )
+    asyncio.run(
+        second_store.put_bytes(
+            b"second",
+            filename="second.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.ENVIRONMENT,
+            environment_name="second",
+        )
+    )
+
+    response = TestClient(create_server(app, dev=True)).get("/api/artifacts")
+
+    assert response.status_code == 409
+    assert "duplicate-store" in response.json()["detail"]
+
+
+def test_server_artifact_inventory_paginates_across_registered_stores(tmp_path) -> None:
+    app = CayuApp()
+    first_store = LocalArtifactStore(tmp_path / "first", store_id="first-store")
+    second_store = LocalArtifactStore(tmp_path / "second", store_id="second-store")
+    app.register_environment(
+        Environment(EnvironmentSpec(name="first"), artifact_store=first_store),
+        default=True,
+    )
+    app.register_environment(
+        Environment(EnvironmentSpec(name="second"), artifact_store=second_store),
+    )
+    created = [
+        (
+            "first-store",
+            asyncio.run(
+                first_store.put_bytes(
+                    b"one",
+                    filename="one.txt",
+                    content_type="text/plain",
+                    scope=ArtifactScope.ENVIRONMENT,
+                    environment_name="first",
+                )
+            ),
+        ),
+        (
+            "second-store",
+            asyncio.run(
+                second_store.put_bytes(
+                    b"two",
+                    filename="two.txt",
+                    content_type="text/plain",
+                    scope=ArtifactScope.ENVIRONMENT,
+                    environment_name="second",
+                )
+            ),
+        ),
+        (
+            "first-store",
+            asyncio.run(
+                first_store.put_bytes(
+                    b"three",
+                    filename="three.txt",
+                    content_type="text/plain",
+                    scope=ArtifactScope.ENVIRONMENT,
+                    environment_name="first",
+                )
+            ),
+        ),
+    ]
+    expected_ids = [
+        artifact.id
+        for _store_id, artifact in sorted(
+            created,
+            key=lambda item: (item[1].created_at.isoformat(), item[0], item[1].id),
+            reverse=True,
+        )
+    ]
+    client = TestClient(create_server(app, dev=True))
+
+    first_page = client.get("/api/artifacts", params={"limit": 2})
+    second_page = client.get("/api/artifacts", params={"limit": 2, "offset": 2})
+
+    assert first_page.status_code == 200
+    first_body = first_page.json()
+    assert [artifact["id"] for artifact in first_body["artifacts"]] == expected_ids[:2]
+    assert first_body["total_count"] == 3
+    assert first_body["limit"] == 2
+    assert first_body["offset"] == 0
+    assert first_body["next_offset"] == 2
+    assert first_body["truncated"] is True
+
+    assert second_page.status_code == 200
+    second_body = second_page.json()
+    assert [artifact["id"] for artifact in second_body["artifacts"]] == expected_ids[2:]
+    assert second_body["total_count"] == 3
+    assert second_body["limit"] == 2
+    assert second_body["offset"] == 2
+    assert second_body["next_offset"] is None
+    assert second_body["truncated"] is False
+
+
+def test_server_artifact_inventory_rejects_unbounded_offsets(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
+    app = CayuApp()
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local-review"), artifact_store=artifact_store),
+        default=True,
+    )
+
+    response = TestClient(create_server(app, dev=True)).get(
+        "/api/artifacts",
+        params={"offset": 10_001},
+    )
+
+    assert response.status_code == 422
+
+
+def test_server_artifact_inventory_does_not_advertise_unusable_next_offset() -> None:
+    app = CayuApp()
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local-review"), artifact_store=CountingArtifactStore()),
+        default=True,
+    )
+
+    response = TestClient(create_server(app, dev=True)).get(
+        "/api/artifacts",
+        params={"offset": 10_000, "limit": 500},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["offset"] == 10_000
+    assert body["limit"] == 500
+    assert body["total_count"] == 20_000
+    assert body["artifacts"]
+    assert body["next_offset"] is None
+    assert body["truncated"] is True
 
 
 def test_server_exposes_pending_knowledge_review_endpoints() -> None:

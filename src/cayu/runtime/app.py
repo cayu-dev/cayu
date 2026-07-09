@@ -60,6 +60,7 @@ from cayu.environments import (
     EnvironmentSpec,
     WorkspaceInstructions,
     WorkspaceSnapshot,
+    copy_bound_workspace,
     copy_environment,
     copy_workspace_snapshot,
     load_workspace_instructions,
@@ -1461,6 +1462,10 @@ class CayuApp:
         self._sessions_requesting_interruption: set[str] = set()
         self._session_interrupt_signals: dict[str, asyncio.Event] = {}
 
+    def redact_json(self, value: Any) -> Any:
+        """Return a JSON-compatible value with configured secret values redacted."""
+        return self._secret_redactor.redact_json(value)
+
     def register_agent(
         self,
         spec: AgentSpec,
@@ -1629,6 +1634,31 @@ class CayuApp:
     def list_environments(self) -> tuple[str, ...]:
         """Return the names of all registered environments (concrete or factory), sorted."""
         return tuple(sorted(self._environments))
+
+    def list_environment_registrations(self) -> tuple[runtime_records.RegisteredEnvironment, ...]:
+        """Return registered environment metadata without materializing factories."""
+        registrations: list[runtime_records.RegisteredEnvironment] = []
+        for name in sorted(self._environments):
+            registered_environment = self._environments[name]
+            registrations.append(
+                runtime_records.RegisteredEnvironment(
+                    spec=registered_environment.spec.model_copy(deep=True),
+                    environment=copy_environment(registered_environment.environment),
+                    factory=registered_environment.factory,
+                    bound_workspace=(
+                        copy_bound_workspace(registered_environment.bound_workspace)
+                        if registered_environment.bound_workspace is not None
+                        else None
+                    ),
+                    binding_payload=copy_json_value(
+                        registered_environment.binding_payload,
+                        "binding_payload",
+                    )
+                    if registered_environment.binding_payload is not None
+                    else None,
+                )
+            )
+        return tuple(registrations)
 
     def _get_registered_agent(self, name: str) -> runtime_records.RegisteredAgentState:
         agent_name = require_clean_nonblank(name, "agent.name")

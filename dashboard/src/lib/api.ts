@@ -1,5 +1,9 @@
 import { apiUrl } from "./config"
 import type {
+  AgentsResponse,
+  ApiAgentSummary,
+  ApiArtifactSummary,
+  ApiEnvironmentSummary,
   ApiKnowledgeChunk,
   ApiKnowledgeListItem,
   ApiPendingAction,
@@ -9,13 +13,19 @@ import type {
   ApiSessionDetailTranscriptMessage,
   ApiTaskDetail,
   ApiTaskListItem,
+  ApiToolSummary,
   ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
+  ArtifactReadResponse,
+  ArtifactsResponse,
+  EnvironmentsResponse,
+  GetArtifactApiArtifactsArtifactIdGetData,
   GetContractApiContractGetResponse,
   GetSessionApiSessionsSessionIdGetResponse,
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetTaskApiTasksTaskIdGetResponse,
+  ListArtifactsApiArtifactsGetData,
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
@@ -54,6 +64,16 @@ export class ApiClientError extends Error {
 }
 
 export type ServerContract = GetContractApiContractGetResponse
+export type AgentSummary = ApiAgentSummary
+export type ToolSummary = ApiToolSummary
+export type AgentsPage = AgentsResponse
+export type EnvironmentSummary = ApiEnvironmentSummary
+export type EnvironmentsPage = EnvironmentsResponse
+export type ArtifactSummary = ApiArtifactSummary
+export type ArtifactsPage = ArtifactsResponse
+export type ArtifactRead = ArtifactReadResponse
+export type ArtifactsQuery = NonNullable<ListArtifactsApiArtifactsGetData["query"]>
+export type ArtifactReadQuery = NonNullable<GetArtifactApiArtifactsArtifactIdGetData["query"]>
 export type Session = ApiSessionBase
 export type SessionEvent = ApiSessionDetailEvent
 export type TranscriptMessage = ApiSessionDetailTranscriptMessage
@@ -180,6 +200,42 @@ export function isSupportedServerContract(contract: ServerContract): boolean {
 
 export async function fetchServerContract(): Promise<ServerContract> {
   return requestJson<ServerContract>("/contract")
+}
+
+export async function fetchAgents(): Promise<AgentsPage> {
+  const page = await requestJson<unknown>("/agents")
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.agents)) {
+    throw new Error("Unexpected /agents response.")
+  }
+  return pageObject as AgentsPage
+}
+
+export async function fetchEnvironments(): Promise<EnvironmentsPage> {
+  const page = await requestJson<unknown>("/environments")
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.environments)) {
+    throw new Error("Unexpected /environments response.")
+  }
+  return pageObject as EnvironmentsPage
+}
+
+export async function fetchArtifacts(query: ArtifactsQuery = {}): Promise<ArtifactsPage> {
+  const page = await requestJson<unknown>(`/artifacts${queryString(query)}`)
+  const pageObject = objectRecord(page)
+  if (pageObject === null || !Array.isArray(pageObject.artifacts)) {
+    throw new Error("Unexpected /artifacts response.")
+  }
+  return pageObject as ArtifactsPage
+}
+
+export async function fetchArtifact(
+  artifactId: string,
+  query: ArtifactReadQuery = {},
+): Promise<ArtifactRead> {
+  return requestJson<ArtifactRead>(
+    `/artifacts/${encodeURIComponent(artifactId)}${queryString(query)}`,
+  )
 }
 
 export async function fetchSessions(query: SessionListQuery = {}): Promise<Session[]> {

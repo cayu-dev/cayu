@@ -5,7 +5,10 @@ import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
+import { AgentsPage } from "./routes/agents"
+import { ArtifactsPage } from "./routes/artifacts"
 import { DashboardPage } from "./routes/dashboard"
+import { EnvironmentsPage } from "./routes/environments"
 import { KnowledgePage } from "./routes/knowledge"
 import { PendingActionsPage } from "./routes/pending-actions"
 import { RunPage } from "./routes/run"
@@ -48,6 +51,24 @@ const pendingActionsRoute = createRoute({
   component: PendingActionsPage,
 })
 
+const agentsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/agents",
+  component: AgentsPage,
+})
+
+const environmentsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/environments",
+  component: EnvironmentsPage,
+})
+
+const artifactsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/artifacts",
+  component: ArtifactsPage,
+})
+
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
@@ -72,6 +93,9 @@ const routeTree = rootRoute.addChildren([
   usageRoute,
   tasksRoute,
   pendingActionsRoute,
+  agentsRoute,
+  environmentsRoute,
+  artifactsRoute,
   sessionDetailRoute,
   knowledgeRoute,
   runRoute,

@@ -5,6 +5,20 @@ export type ClientOptions = {
 };
 
 /**
+ * AgentsResponse
+ */
+export type AgentsResponse = {
+    /**
+     * Agents
+     */
+    agents: Array<ApiAgentSummary>;
+    /**
+     * Total Count
+     */
+    total_count: number;
+};
+
+/**
  * AggregateCostSummary
  */
 export type AggregateCostSummary = {
@@ -79,6 +93,168 @@ export type AggregateUsageSummary = {
      */
     tool_calls: number;
     usage: UsageMetrics;
+};
+
+/**
+ * ApiAgentSummary
+ */
+export type ApiAgentSummary = {
+    /**
+     * Has System Prompt
+     */
+    has_system_prompt: boolean;
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string | null;
+    /**
+     * Provider Options
+     */
+    provider_options: {
+        [key: string]: unknown;
+    };
+    /**
+     * Thinking
+     */
+    thinking: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Tool Count
+     */
+    tool_count: number;
+    /**
+     * Tools
+     */
+    tools: Array<ApiToolSummary>;
+};
+
+/**
+ * ApiArtifactSummary
+ */
+export type ApiArtifactSummary = {
+    /**
+     * Agent Name
+     */
+    agent_name: string | null;
+    /**
+     * Artifact Store Id
+     */
+    artifact_store_id: string;
+    /**
+     * Content Type
+     */
+    content_type: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Environment Name
+     */
+    environment_name: string | null;
+    /**
+     * Filename
+     */
+    filename: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Scope
+     */
+    scope: string;
+    /**
+     * Session Id
+     */
+    session_id: string | null;
+    /**
+     * Size Bytes
+     */
+    size_bytes: number;
+};
+
+/**
+ * ApiEnvironmentSummary
+ */
+export type ApiEnvironmentSummary = {
+    /**
+     * Artifact Store Id
+     */
+    artifact_store_id: string | null;
+    /**
+     * Binding Type
+     */
+    binding_type: string | null;
+    /**
+     * Bound Workspace
+     */
+    bound_workspace?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Is Factory
+     */
+    is_factory: boolean;
+    /**
+     * Knowledge Store Type
+     */
+    knowledge_store_type: string | null;
+    /**
+     * Mcp Server Count
+     */
+    mcp_server_count: number;
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Proxy Type
+     */
+    proxy_type: string | null;
+    /**
+     * Runner Type
+     */
+    runner_type: string | null;
+    /**
+     * Vault Type
+     */
+    vault_type: string | null;
+    /**
+     * Workspace Id
+     */
+    workspace_id: string | null;
+    /**
+     * Workspace Instructions
+     */
+    workspace_instructions: string | null;
 };
 
 /**
@@ -808,6 +984,34 @@ export type ApiTaskListItem = {
 };
 
 /**
+ * ApiToolSummary
+ */
+export type ApiToolSummary = {
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Effect
+     */
+    effect: string;
+    /**
+     * Input Schema
+     */
+    input_schema: {
+        [key: string]: unknown;
+    };
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Parallel Safe
+     */
+    parallel_safe: boolean;
+};
+
+/**
  * ApiTranscriptMessage
  */
 export type ApiTranscriptMessage = {
@@ -825,6 +1029,64 @@ export type ApiTranscriptMessage = {
      * Role
      */
     role: string;
+};
+
+/**
+ * ArtifactReadResponse
+ */
+export type ArtifactReadResponse = {
+    artifact: ApiArtifactSummary;
+    /**
+     * Preview Base64
+     */
+    preview_base64: string;
+    /**
+     * Text Preview
+     */
+    text_preview: string | null;
+    /**
+     * Total Bytes
+     */
+    total_bytes: number;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
+ * ArtifactScope
+ */
+export type ArtifactScope = 'session' | 'environment';
+
+/**
+ * ArtifactsResponse
+ */
+export type ArtifactsResponse = {
+    /**
+     * Artifacts
+     */
+    artifacts: Array<ApiArtifactSummary>;
+    /**
+     * Limit
+     */
+    limit: number;
+    /**
+     * Next Offset
+     */
+    next_offset?: number | null;
+    /**
+     * Offset
+     */
+    offset: number;
+    /**
+     * Total Count
+     */
+    total_count?: number | null;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
 };
 
 /**
@@ -1151,6 +1413,20 @@ export type CostLineItem = {
      * Uncached Input Tokens
      */
     uncached_input_tokens: number;
+};
+
+/**
+ * EnvironmentsResponse
+ */
+export type EnvironmentsResponse = {
+    /**
+     * Environments
+     */
+    environments: Array<ApiEnvironmentSummary>;
+    /**
+     * Total Count
+     */
+    total_count: number;
 };
 
 /**
@@ -2502,6 +2778,141 @@ export type VersioningContract = {
     contract_version?: string;
 };
 
+export type ListAgentsApiAgentsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/agents';
+};
+
+export type ListAgentsApiAgentsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: AgentsResponse;
+};
+
+export type ListAgentsApiAgentsGetResponse = ListAgentsApiAgentsGetResponses[keyof ListAgentsApiAgentsGetResponses];
+
+export type GetAgentApiAgentsAgentNameGetData = {
+    body?: never;
+    path: {
+        /**
+         * Agent Name
+         */
+        agent_name: string;
+    };
+    query?: never;
+    url: '/api/agents/{agent_name}';
+};
+
+export type GetAgentApiAgentsAgentNameGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetAgentApiAgentsAgentNameGetError = GetAgentApiAgentsAgentNameGetErrors[keyof GetAgentApiAgentsAgentNameGetErrors];
+
+export type GetAgentApiAgentsAgentNameGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: AgentsResponse;
+};
+
+export type GetAgentApiAgentsAgentNameGetResponse = GetAgentApiAgentsAgentNameGetResponses[keyof GetAgentApiAgentsAgentNameGetResponses];
+
+export type ListArtifactsApiArtifactsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Offset
+         */
+        offset?: number;
+        /**
+         * Artifact Store Id
+         */
+        artifact_store_id?: string | null;
+        /**
+         * Scope
+         */
+        scope?: ArtifactScope | null;
+        /**
+         * Session Id
+         */
+        session_id?: string | null;
+        /**
+         * Environment Name
+         */
+        environment_name?: string | null;
+    };
+    url: '/api/artifacts';
+};
+
+export type ListArtifactsApiArtifactsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListArtifactsApiArtifactsGetError = ListArtifactsApiArtifactsGetErrors[keyof ListArtifactsApiArtifactsGetErrors];
+
+export type ListArtifactsApiArtifactsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ArtifactsResponse;
+};
+
+export type ListArtifactsApiArtifactsGetResponse = ListArtifactsApiArtifactsGetResponses[keyof ListArtifactsApiArtifactsGetResponses];
+
+export type GetArtifactApiArtifactsArtifactIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Artifact Id
+         */
+        artifact_id: string;
+    };
+    query?: {
+        /**
+         * Artifact Store Id
+         */
+        artifact_store_id?: string | null;
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+    };
+    url: '/api/artifacts/{artifact_id}';
+};
+
+export type GetArtifactApiArtifactsArtifactIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetArtifactApiArtifactsArtifactIdGetError = GetArtifactApiArtifactsArtifactIdGetErrors[keyof GetArtifactApiArtifactsArtifactIdGetErrors];
+
+export type GetArtifactApiArtifactsArtifactIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ArtifactReadResponse;
+};
+
+export type GetArtifactApiArtifactsArtifactIdGetResponse = GetArtifactApiArtifactsArtifactIdGetResponses[keyof GetArtifactApiArtifactsArtifactIdGetResponses];
+
 export type EstimateCausalBudgetCostApiCausalBudgetsCausalBudgetIdCostPostData = {
     body: SessionCostBody;
     path: {
@@ -2607,6 +3018,52 @@ export type GetContractApiContractGetResponses = {
 };
 
 export type GetContractApiContractGetResponse = GetContractApiContractGetResponses[keyof GetContractApiContractGetResponses];
+
+export type ListEnvironmentsApiEnvironmentsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/environments';
+};
+
+export type ListEnvironmentsApiEnvironmentsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EnvironmentsResponse;
+};
+
+export type ListEnvironmentsApiEnvironmentsGetResponse = ListEnvironmentsApiEnvironmentsGetResponses[keyof ListEnvironmentsApiEnvironmentsGetResponses];
+
+export type GetEnvironmentApiEnvironmentsEnvironmentNameGetData = {
+    body?: never;
+    path: {
+        /**
+         * Environment Name
+         */
+        environment_name: string;
+    };
+    query?: never;
+    url: '/api/environments/{environment_name}';
+};
+
+export type GetEnvironmentApiEnvironmentsEnvironmentNameGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetEnvironmentApiEnvironmentsEnvironmentNameGetError = GetEnvironmentApiEnvironmentsEnvironmentNameGetErrors[keyof GetEnvironmentApiEnvironmentsEnvironmentNameGetErrors];
+
+export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EnvironmentsResponse;
+};
+
+export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponse = GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses[keyof GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

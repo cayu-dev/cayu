@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any
@@ -21,6 +22,7 @@ from pydantic import (
 from sse_starlette.sse import EventSourceResponse
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
+from cayu.artifacts import ArtifactScope, ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
@@ -83,12 +85,16 @@ from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
     SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
+    AgentsResponse,
     ApiReviewedKnowledgeEntry,
     ApiSession,
     ApiTaskDetail,
     ApiTaskListItem,
+    ArtifactReadResponse,
+    ArtifactsResponse,
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
+    EnvironmentsResponse,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionsResponse,
@@ -123,6 +129,8 @@ _DEFAULT_RUN_MAX_STEPS = 20
 _MAX_RUN_STEPS = 256
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
+_ARTIFACT_PAGE_LIMIT_MAX = 500
+_ARTIFACT_PAGE_OFFSET_MAX = 10_000
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
 _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
 _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
@@ -567,6 +575,180 @@ def _serialize_session_base(session: Session) -> dict[str, Any]:
 
 def _serialize_session(session: Session) -> dict[str, Any]:
     return {**_serialize_session_base(session), "metadata": session.metadata}
+
+
+def _redact_control_plane_json(cayu_app: Any, value: Any, field_name: str) -> Any:
+    copied = copy_json_value(value, field_name)
+    redactor = getattr(cayu_app, "redact_json", None)
+    if callable(redactor):
+        return redactor(copied)
+    return copied
+
+
+def _serialize_tool(cayu_app: Any, tool: Any) -> dict[str, Any]:
+    effect = getattr(tool.effect, "value", str(tool.effect))
+    return {
+        "name": tool.name,
+        "description": _redact_control_plane_json(cayu_app, tool.description, "description"),
+        "input_schema": _redact_control_plane_json(cayu_app, tool.schema, "input_schema"),
+        "parallel_safe": tool.parallel_safe,
+        "effect": effect,
+    }
+
+
+def _serialize_agent(cayu_app: Any, agent: Any) -> dict[str, Any]:
+    spec = agent.spec
+    thinking = (
+        None
+        if spec.thinking is None
+        else _redact_control_plane_json(cayu_app, spec.thinking.model_dump(mode="json"), "thinking")
+    )
+    tools = [_serialize_tool(cayu_app, tool) for tool in agent.tools.values()]
+    return {
+        "name": spec.name,
+        "provider_name": spec.provider_name,
+        "model": spec.model,
+        "tool_count": len(tools),
+        "tools": sorted(tools, key=lambda item: item["name"]),
+        "metadata": _redact_control_plane_json(cayu_app, spec.metadata, "metadata"),
+        "provider_options": _redact_control_plane_json(
+            cayu_app,
+            spec.provider_options,
+            "provider_options",
+        ),
+        "thinking": thinking,
+        "has_system_prompt": spec.system_prompt is not None and bool(spec.system_prompt.strip()),
+    }
+
+
+def _object_type_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    return type(value).__name__
+
+
+def _object_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    object_id = getattr(value, "id", None)
+    return object_id if isinstance(object_id, str) and object_id.strip() else None
+
+
+def _workspace_instruction_summary(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return "inline"
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        return "inline"
+    mode = getattr(value, "mode", None)
+    if isinstance(mode, str):
+        return mode
+    return type(value).__name__
+
+
+def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
+    environment = record.environment
+    workspace = environment.workspace
+    artifact_store = environment.artifact_store
+    bound_workspace = record.bound_workspace
+    bound_payload = None
+    if bound_workspace is not None:
+        bound_payload = {
+            "source_workspace_id": _object_id(bound_workspace.source_workspace),
+            "bound_workspace_id": _object_id(bound_workspace.workspace),
+            "runner_type": _object_type_name(bound_workspace.runner),
+            "path": bound_workspace.path,
+            "metadata": _redact_control_plane_json(
+                cayu_app,
+                bound_workspace.metadata,
+                "metadata",
+            ),
+        }
+    return {
+        "name": record.spec.name,
+        "metadata": _redact_control_plane_json(cayu_app, record.spec.metadata, "metadata"),
+        "is_factory": record.factory is not None,
+        "workspace_id": _object_id(workspace),
+        "artifact_store_id": _object_id(artifact_store),
+        "runner_type": _object_type_name(environment.runner),
+        "binding_type": _object_type_name(environment.binding),
+        "vault_type": _object_type_name(environment.vault),
+        "proxy_type": _object_type_name(environment.proxy),
+        "knowledge_store_type": _object_type_name(environment.knowledge_store),
+        "mcp_server_count": len(environment.mcp_servers),
+        "workspace_instructions": _workspace_instruction_summary(
+            environment.workspace_instructions
+        ),
+        "bound_workspace": bound_payload,
+    }
+
+
+def _artifact_stores_by_id(cayu_app: Any) -> dict[str, ArtifactStore]:
+    stores: dict[str, ArtifactStore] = {}
+    for record in cayu_app.list_environment_registrations():
+        store = record.environment.artifact_store
+        if isinstance(store, ArtifactStore):
+            existing = stores.get(store.id)
+            if existing is not None and existing is not store:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Multiple registered environments use the same artifact_store_id: "
+                        f"{store.id}. Configure unique artifact store ids."
+                    ),
+                )
+            stores[store.id] = store
+    return stores
+
+
+def _serialize_artifact(cayu_app: Any, metadata: Any, *, artifact_store_id: str) -> dict[str, Any]:
+    return {
+        "id": metadata.id,
+        "artifact_store_id": artifact_store_id,
+        "filename": metadata.filename,
+        "content_type": metadata.content_type,
+        "size_bytes": metadata.size_bytes,
+        "scope": metadata.scope.value,
+        "session_id": metadata.session_id,
+        "agent_name": metadata.agent_name,
+        "environment_name": metadata.environment_name,
+        "created_at": metadata.created_at.isoformat(),
+        "metadata": _redact_control_plane_json(cayu_app, metadata.metadata, "metadata"),
+    }
+
+
+def _artifact_sort_key(artifact: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(artifact["created_at"]),
+        str(artifact["artifact_store_id"]),
+        str(artifact["id"]),
+    )
+
+
+def _decode_artifact_text(content: bytes, content_type: str) -> str | None:
+    if content_type.startswith("text/") or content_type in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+        "application/x-yaml",
+    }:
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            return content.decode("utf-8", errors="replace")
+    return None
+
+
+def _artifact_read_preview(cayu_app: Any, read: Any) -> tuple[str, str | None]:
+    text_preview = _decode_artifact_text(read.content, read.metadata.content_type)
+    if text_preview is None:
+        return base64.b64encode(read.content).decode("ascii"), None
+    redacted_preview = _redact_control_plane_json(cayu_app, text_preview, "artifact.content")
+    if not isinstance(redacted_preview, str):
+        raise TypeError("Artifact text preview redaction must return a string.")
+    return base64.b64encode(redacted_preview.encode("utf-8")).decode("ascii"), redacted_preview
 
 
 def _object_payload(value: Any) -> dict[str, Any] | None:
@@ -1830,6 +2012,183 @@ def create_router(
         )
 
         return _detached_event_stream_response(cayu_app.recover_user_input(request))
+
+    @router.get("/agents", response_model=AgentsResponse, dependencies=protected)
+    async def list_agents():
+        agents = [
+            _serialize_agent(cayu_app, cayu_app.get_agent(name)) for name in cayu_app.list_agents()
+        ]
+        return {"agents": agents, "total_count": len(agents)}
+
+    @router.get("/agents/{agent_name}", response_model=AgentsResponse, dependencies=protected)
+    async def get_agent(agent_name: NonBlankString):
+        try:
+            agent = cayu_app.get_agent(agent_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Agent not found") from exc
+        serialized = _serialize_agent(cayu_app, agent)
+        return {"agents": [serialized], "total_count": 1}
+
+    @router.get(
+        "/environments",
+        response_model=EnvironmentsResponse,
+        dependencies=protected,
+    )
+    async def list_environments():
+        records = cayu_app.list_environment_registrations()
+        environments = [_serialize_environment(cayu_app, record) for record in records]
+        return {"environments": environments, "total_count": len(environments)}
+
+    @router.get(
+        "/environments/{environment_name}",
+        response_model=EnvironmentsResponse,
+        dependencies=protected,
+    )
+    async def get_environment(environment_name: NonBlankString):
+        record = next(
+            (
+                item
+                for item in cayu_app.list_environment_registrations()
+                if item.spec.name == environment_name
+            ),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="Environment not found")
+        return {"environments": [_serialize_environment(cayu_app, record)], "total_count": 1}
+
+    @router.get("/artifacts", response_model=ArtifactsResponse, dependencies=protected)
+    async def list_artifacts(
+        limit: Annotated[int, Query(ge=1, le=_ARTIFACT_PAGE_LIMIT_MAX)] = 100,
+        offset: Annotated[int, Query(ge=0, le=_ARTIFACT_PAGE_OFFSET_MAX)] = 0,
+        artifact_store_id: Annotated[str | None, Query()] = None,
+        scope: ArtifactScope | None = None,
+        session_id: Annotated[str | None, Query()] = None,
+        environment_name: Annotated[str | None, Query()] = None,
+    ):
+        requested_store_id = _clean_optional_query_value(
+            artifact_store_id,
+            "artifact_store_id",
+        )
+        stores = _artifact_stores_by_id(cayu_app)
+        if requested_store_id is not None:
+            store = stores.get(requested_store_id)
+            if store is None:
+                raise HTTPException(status_code=404, detail="Artifact store not found")
+            selected_stores = {requested_store_id: store}
+        else:
+            selected_stores = stores
+
+        artifacts: list[dict[str, Any]] = []
+        total_count: int | None = 0
+        truncated = False
+        per_store_limit = offset + limit
+        for store_id, store in selected_stores.items():
+            page = await store.list(
+                scope=scope,
+                session_id=_clean_optional_query_value(session_id, "session_id"),
+                environment_name=_clean_optional_query_value(
+                    environment_name,
+                    "environment_name",
+                ),
+                limit=per_store_limit,
+            )
+            artifacts.extend(
+                _serialize_artifact(cayu_app, artifact, artifact_store_id=store_id)
+                for artifact in page.artifacts
+            )
+            if page.total_count is None:
+                total_count = None
+                truncated = True
+            elif total_count is not None:
+                total_count += page.total_count
+            truncated = truncated or page.truncated
+
+        artifacts.sort(key=_artifact_sort_key, reverse=True)
+        page_artifacts = artifacts[offset : offset + limit]
+        next_offset = None
+        has_more = False
+        if total_count is None:
+            if len(artifacts) > offset + limit or truncated:
+                has_more = True
+                candidate_next_offset = offset + limit
+                if candidate_next_offset <= _ARTIFACT_PAGE_OFFSET_MAX:
+                    next_offset = candidate_next_offset
+        elif offset + limit < total_count:
+            has_more = True
+            candidate_next_offset = offset + limit
+            if candidate_next_offset <= _ARTIFACT_PAGE_OFFSET_MAX:
+                next_offset = candidate_next_offset
+        truncated = has_more
+        return {
+            "artifacts": page_artifacts,
+            "total_count": total_count,
+            "truncated": truncated,
+            "limit": limit,
+            "offset": offset,
+            "next_offset": next_offset,
+        }
+
+    async def _read_artifact_from_request(
+        artifact_id: str,
+        artifact_store_id: str | None,
+        *,
+        max_bytes: int | None = None,
+    ):
+        stores = _artifact_stores_by_id(cayu_app)
+        requested_store_id = _clean_optional_query_value(
+            artifact_store_id,
+            "artifact_store_id",
+        )
+        if requested_store_id is not None:
+            store = stores.get(requested_store_id)
+            if store is None:
+                raise HTTPException(status_code=404, detail="Artifact store not found")
+            try:
+                return requested_store_id, await store.read_bytes(artifact_id, max_bytes=max_bytes)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="Artifact not found") from exc
+
+        matches = []
+        for store_id, store in stores.items():
+            try:
+                matches.append((store_id, await store.read_bytes(artifact_id, max_bytes=max_bytes)))
+            except (FileNotFoundError, ValueError):
+                continue
+        if not matches:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Artifact id exists in multiple stores; pass artifact_store_id.",
+            )
+        return matches[0]
+
+    @router.get(
+        "/artifacts/{artifact_id}",
+        response_model=ArtifactReadResponse,
+        dependencies=protected,
+    )
+    async def get_artifact(
+        artifact_id: NonBlankString,
+        artifact_store_id: Annotated[str | None, Query()] = None,
+        max_bytes: Annotated[int, Query(ge=1, le=262_144)] = 64_000,
+    ):
+        store_id, read = await _read_artifact_from_request(
+            artifact_id,
+            artifact_store_id,
+            max_bytes=max_bytes,
+        )
+        preview_base64, text_preview = _artifact_read_preview(cayu_app, read)
+        return {
+            "artifact": _serialize_artifact(cayu_app, read.metadata, artifact_store_id=store_id),
+            "preview_base64": preview_base64,
+            "text_preview": text_preview,
+            "total_bytes": read.total_bytes,
+            "truncated": read.truncated,
+        }
 
     @router.get(
         "/pending-actions",

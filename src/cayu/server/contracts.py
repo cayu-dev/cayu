@@ -238,6 +238,83 @@ class PendingActionsResponse(ApiBaseModel):
     inspected_session_count: StrictInt = Field(ge=0)
 
 
+class ApiToolSummary(ApiBaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    parallel_safe: StrictBool
+    effect: str
+
+
+class ApiAgentSummary(ApiBaseModel):
+    name: str
+    provider_name: str | None
+    model: str
+    tool_count: StrictInt = Field(ge=0)
+    tools: list[ApiToolSummary]
+    metadata: dict[str, Any]
+    provider_options: dict[str, Any]
+    thinking: dict[str, Any] | None
+    has_system_prompt: StrictBool
+
+
+class AgentsResponse(ApiBaseModel):
+    agents: list[ApiAgentSummary]
+    total_count: StrictInt = Field(ge=0)
+
+
+class ApiEnvironmentSummary(ApiBaseModel):
+    name: str
+    metadata: dict[str, Any]
+    is_factory: StrictBool
+    workspace_id: str | None
+    artifact_store_id: str | None
+    runner_type: str | None
+    binding_type: str | None
+    vault_type: str | None
+    proxy_type: str | None
+    knowledge_store_type: str | None
+    mcp_server_count: StrictInt = Field(ge=0)
+    workspace_instructions: str | None
+    bound_workspace: dict[str, Any] | None = None
+
+
+class EnvironmentsResponse(ApiBaseModel):
+    environments: list[ApiEnvironmentSummary]
+    total_count: StrictInt = Field(ge=0)
+
+
+class ApiArtifactSummary(ApiBaseModel):
+    id: str
+    artifact_store_id: str
+    filename: str
+    content_type: str
+    size_bytes: StrictInt = Field(ge=0)
+    scope: str
+    session_id: str | None
+    agent_name: str | None
+    environment_name: str | None
+    created_at: str
+    metadata: dict[str, Any]
+
+
+class ArtifactsResponse(ApiBaseModel):
+    artifacts: list[ApiArtifactSummary]
+    total_count: StrictInt | None = Field(default=None, ge=0)
+    truncated: StrictBool
+    limit: StrictInt = Field(ge=1)
+    offset: StrictInt = Field(ge=0)
+    next_offset: StrictInt | None = Field(default=None, ge=0)
+
+
+class ArtifactReadResponse(ApiBaseModel):
+    artifact: ApiArtifactSummary
+    preview_base64: str
+    text_preview: str | None
+    total_bytes: StrictInt = Field(ge=0)
+    truncated: StrictBool
+
+
 class TranscriptSummary(ApiBaseModel):
     total_messages: StrictInt = Field(ge=0)
 
