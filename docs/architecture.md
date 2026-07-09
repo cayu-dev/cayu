@@ -35,11 +35,13 @@ core
   mcp -> core
   environments -> artifacts + workspaces + runners + vaults + proxies + mcp
   runtime -> core + providers + artifacts + runners + workspaces + storage + vaults + proxies + mcp
+  workflows -> core + runtime
   cli -> runtime + project scaffolding
   dashboard -> runtime API / event store
 ```
 
-`core` should stay small and stable. It defines events, messages, agents, tools, workflows, and shared value objects.
+`core` should stay small and stable. It defines events, messages, agents, tools, the abstract workflow contract, and shared value objects.
+`workflows` contains orchestration-as-code helper primitives layered above the runtime; it may depend on runtime session/event contracts, but runtime should not depend on workflow helpers.
 
 ## Runtime Shape
 
@@ -47,7 +49,7 @@ core
 RunRequest
   -> SessionStore creates session
   -> Environment provides execution context
-  -> Agent runtime streams provider/tool/workflow events
+  -> Agent runtime streams provider/tool events
   -> EventSink emits to terminal/dashboard/webhook
   -> SessionStore persists append-only event log
 ```

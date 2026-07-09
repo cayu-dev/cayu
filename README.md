@@ -277,7 +277,8 @@ Tool policies authorize registered tool calls before execution. Denied calls emi
 
 ```text
 src/cayu/
-  core/        runtime primitives: events, messages, agents, tools, workflows
+  core/        framework primitives: events, messages, agents, tools
+  workflows/   orchestration-as-code helper primitives
   artifacts/   uploaded/generated file storage contracts
   environments/ execution context contracts
   runtime/     app runtime, sessions, event sinks
@@ -1582,6 +1583,13 @@ Run the live OpenAI example with local tools:
 ```bash
 export OPENAI_API_KEY=...
 PYTHONPATH=src python examples/openai_local_tools.py
+```
+
+Run the workflow helpers example without credentials, or switch it to live OpenAI:
+
+```bash
+PYTHONPATH=src python examples/workflow_helpers.py
+CAYU_WORKFLOW_PROVIDER=openai OPENAI_API_KEY=... PYTHONPATH=src python examples/workflow_helpers.py
 ```
 
 Run the live OpenAI-compatible Chat Completions example with local tools (shown with Google

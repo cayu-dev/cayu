@@ -9779,6 +9779,28 @@ class CayuApp:
                     )
                     return
 
+    async def emit_events(self, session_id: str, events: list[Event]) -> list[Event]:
+        """Persist events for one session and fan them out to runtime sinks.
+
+        Restricted to the ``workflow.`` and ``custom.`` namespaces: runtime
+        events (e.g. ``model.completed``) carry emission side effects such as
+        budget accounting that only the runtime's own paths apply, so letting
+        them through here would silently skip those.
+        """
+        if type(events) is not list:
+            raise TypeError("Runtime events must be a list.")
+        for event in events:
+            if type(event) is not Event:
+                raise TypeError("Runtime events must be Event instances.")
+            if not str(event.type).startswith(("workflow.", "custom.")):
+                raise ValueError(
+                    "emit_events only accepts workflow. or custom. namespace "
+                    f"events; got {str(event.type)!r}."
+                )
+            if str(event.type).startswith("custom.cayu."):
+                raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
+        return await self._emit_many(session_id, events)
+
     async def _emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
         if type(events) is not list:
             raise TypeError("Runtime events must be a list.")

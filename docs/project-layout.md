@@ -11,6 +11,7 @@ The framework repo is horizontal by subsystem:
 ```text
 src/cayu/
   core/
+  workflows/
   environments/
   runtime/
   providers/

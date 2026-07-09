@@ -1591,8 +1591,8 @@ injects bounded snippets as model-facing synthetic user context before the lates
 real user message. It does not append those snippets to the durable transcript.
 It emits `knowledge.search.started`, `knowledge.search.completed`,
 `knowledge.search.failed`, and `knowledge.injected` events for audit/debugging.
-Search failures are fail-open by default; configure `fail_open=False` when a
-missing knowledge lookup should fail the session before the provider request.
+Search failures fail closed by default; configure `fail_open=True` when a
+missing knowledge lookup should not block the provider request.
 
 This slice does not add graph retrieval, remote source connectors, background
 remembering workers, or agent-led mutation of existing knowledge. Those layers
