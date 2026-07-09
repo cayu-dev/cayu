@@ -775,6 +775,43 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
+def test_sqlite_session_store_revision_twelve_remains_compatible(tmp_path):
+    # Revision 13 is Postgres-only DDL. SQLite databases at revision 12 still satisfy
+    # this binary's compatibility floor and should not require a no-op migrate before use.
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def create() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_rev12",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await _close(store)
+
+    asyncio.run(create())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 13")
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def assert_compatible() -> None:
+        loaded = await reopened.load("sess_sqlite_rev12")
+        assert loaded is not None
+        await _close(reopened)
+
+    asyncio.run(assert_compatible())
+
+
 def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
     # The cayu_ prefix (ADR 0001 Decision 5) means an app's own unprefixed tables in
     # the same database no longer block initialization — they simply coexist.
@@ -890,7 +927,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7, 11, and 12 are purely additive, so they inherit the prior floor;
+    # Revisions 2-7 and 11-13 are purely additive, so they inherit the prior floor;
     # only the breaking revisions (1, 8, 9, 10) raise compatible_from to themselves.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
@@ -906,6 +943,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (10, 10),
         (11, 10),
         (12, 10),
+        (13, 10),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

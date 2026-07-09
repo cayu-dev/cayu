@@ -43,6 +43,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS cayu_events (
         sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        insert_xid xid8 NOT NULL DEFAULT pg_current_xact_id(),
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         session_order BIGINT NOT NULL,
         event_id TEXT NOT NULL,
@@ -137,6 +138,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
     "ON cayu_events(session_id, session_order)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name ON cayu_events(agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_environment_name ON cayu_events(environment_name)",

@@ -106,6 +106,11 @@ REVISIONS: tuple[Revision, ...] = (
     # default column), so the floor stays at revision 10's compatible_from and older binaries keep
     # working.
     Revision(revision=12, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Add cayu_events.insert_xid so Postgres cross-session event consumers can
+    # avoid advancing an after_sequence cursor past events inserted by still-open
+    # transactions. This is a Postgres-only additive DDL revision; SQLite has no
+    # DDL for it and older SQLite DBs remain compatible with this binary.
+    Revision(revision=13, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

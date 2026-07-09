@@ -120,6 +120,32 @@ def test_validate_mode_succeeds_after_create(postgres_dsn: str) -> None:
     asyncio.run(runner())
 
 
+def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 13")
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 13"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
 def test_migrate_mode_initializes_baseline_idempotently(postgres_dsn: str) -> None:
     async def runner() -> None:
         await _drop_all(postgres_dsn)

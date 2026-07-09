@@ -148,6 +148,7 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
+_POSTGRES_MIN_REQUIRED_REVISION = 13
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _KNOWLEDGE_SEARCH_PAGE_SIZE = 500
 _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
@@ -219,6 +220,14 @@ def _event_query_with_session_ids(
         limit=query.limit,
         order_by=query.order_by,
     )
+
+
+def _event_query_is_single_session(query: EventQuery) -> bool:
+    return query.session_id is not None or len(query.session_ids) == 1
+
+
+def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
+    return query.after_sequence is not None and not _event_query_is_single_session(query)
 
 
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
@@ -417,6 +426,11 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE IF EXISTS cayu_knowledge_embeddings "
         "ADD COLUMN IF NOT EXISTS embedding_space_version INTEGER NOT NULL DEFAULT 1",
     ),
+    13: (
+        "ALTER TABLE cayu_events "
+        "ADD COLUMN IF NOT EXISTS insert_xid xid8 NOT NULL DEFAULT pg_current_xact_id()",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
+    ),
 }
 
 
@@ -537,15 +551,27 @@ class _PostgresStoreBase:
                 state = await self._read_schema_state(cur)
                 if self._schema_mode is schema.SchemaMode.VALIDATE:
                     schema.validate(state)
+                    self._validate_postgres_schema(state)
                 elif self._schema_mode is schema.SchemaMode.CREATE:
                     if state.revision == schema.UNINITIALIZED:
                         await self._apply_pending(cur, state)
                     else:
                         schema.validate(state)
+                        self._validate_postgres_schema(state)
                 else:  # MIGRATE
                     await self._apply_pending(cur, state)
-                    schema.validate(await self._read_schema_state(cur))
+                    state = await self._read_schema_state(cur)
+                    schema.validate(state)
+                    self._validate_postgres_schema(state)
             await conn.commit()
+
+    def _validate_postgres_schema(self, state: schema.SchemaState) -> None:
+        if state.revision < _POSTGRES_MIN_REQUIRED_REVISION:
+            raise schema.SchemaTooOld(
+                f"Postgres schema is at revision {state.revision}; this build requires "
+                f">= {_POSTGRES_MIN_REQUIRED_REVISION}. Run `cayu storage migrate` before "
+                "starting."
+            )
 
     async def _read_schema_state(self, cur: Any) -> schema.SchemaState:
         return await read_schema_state(cur)
@@ -3585,13 +3611,37 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         query = copy_event_query(query)
         if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
             return await self._query_events_by_session_id_batches(query)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._query_events(cur, query, safe_insert_xid=None)
 
+    async def _query_events(
+        self,
+        cur: Any,
+        query: EventQuery,
+        *,
+        safe_insert_xid: Any,
+        force_snapshot_cutoff: bool = False,
+    ) -> list[EventRecord]:
+        needs_snapshot_cutoff = force_snapshot_cutoff or _event_query_needs_snapshot_cutoff(query)
+        if needs_snapshot_cutoff and safe_insert_xid is None:
+            await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
+            row = await cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to read Postgres event visibility snapshot.")
+            safe_insert_xid = row[0]
         clauses: list[str] = []
         params: list[object] = []
 
         if query.after_sequence is not None:
             clauses.append("cayu_events.sequence > %s")
             params.append(query.after_sequence)
+        if needs_snapshot_cutoff:
+            # Postgres identity values are allocated at INSERT but published at COMMIT.
+            # Cross-session event consumers must not advance an after_sequence cursor
+            # past an event inserted by a still-open transaction with a lower identity.
+            clauses.append("cayu_events.insert_xid < %s")
+            params.append(safe_insert_xid)
         if query.session_id is not None:
             clauses.append("cayu_events.session_id = %s")
             params.append(query.session_id)
@@ -3632,35 +3682,46 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         order_direction = "DESC" if query.order_by.value == "sequence_desc" else "ASC"
         params.append(query.limit)
 
-        await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
-            # where_sql is built only from hard-coded clause literals; all values
-            # are bound via %s params, so the assembled text carries no user input.
-            await cur.execute(
-                cast(
-                    "LiteralString",
-                    f"""
-                    SELECT cayu_events.sequence, cayu_events.event
-                    FROM cayu_events
-                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                    {where_sql}
-                    ORDER BY cayu_events.sequence {order_direction}
-                    LIMIT %s
-                    """,
-                ),
-                params,
-            )
-            rows = await cur.fetchall()
-            return [EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))) for row in rows]
+        # where_sql is built only from hard-coded clause literals; all values
+        # are bound via %s params, so the assembled text carries no user input.
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT cayu_events.sequence, cayu_events.event
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {where_sql}
+                ORDER BY cayu_events.sequence {order_direction}
+                LIMIT %s
+                """,
+            ),
+            params,
+        )
+        rows = await cur.fetchall()
+        return [EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))) for row in rows]
 
     async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []
-        for batch in _event_query_session_id_batches(query.session_ids):
-            records.extend(
-                await self.query_events(
-                    _event_query_with_session_ids(query, session_ids=batch),
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            safe_insert_xid = None
+            needs_snapshot_cutoff = query.after_sequence is not None
+            if needs_snapshot_cutoff:
+                await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
+                row = await cur.fetchone()
+                if row is None:
+                    raise RuntimeError("Failed to read Postgres event visibility snapshot.")
+                safe_insert_xid = row[0]
+            for batch in _event_query_session_id_batches(query.session_ids):
+                records.extend(
+                    await self._query_events(
+                        cur,
+                        _event_query_with_session_ids(query, session_ids=batch),
+                        safe_insert_xid=safe_insert_xid,
+                        force_snapshot_cutoff=needs_snapshot_cutoff,
+                    )
                 )
-            )
         records.sort(
             key=lambda record: record.sequence,
             reverse=query.order_by.value == "sequence_desc",

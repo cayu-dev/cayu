@@ -198,6 +198,19 @@ Session stores expose two read surfaces:
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
 
+Event ordering has two distinct cursors. The per-session event order is dense
+and gap-free within a session. The global `EventRecord.sequence` is the durable
+cross-session cursor used by dashboards, watchers, and outbox-style readers.
+Postgres allocates that global identity value at insert time, while the row only
+becomes visible at commit. A Postgres cross-session
+`query_events(... after_sequence=...)` implementation must therefore exclude
+rows inserted by transactions that are not yet old enough to be below
+`pg_snapshot_xmin(pg_current_snapshot())`; that reader may delay while an older
+writer is open, but it must never advance its cursor past an invisible lower
+sequence. Single-session reads use the per-session ordering invariant and should
+not be delayed by unrelated open transactions. SQLite and in-memory stores
+serialize writes, so allocation order and visibility order are already aligned.
+
 The runtime's usage accounting depends on `event_types`: it reads all
 usage-bearing types in one query sharing one sequence watermark, so per-type
 reads cannot skip events appended between them. Out-of-tree stores should
@@ -337,6 +350,10 @@ ordered at-least-once delivery. The watcher cursor advances only after the
 handler succeeds or the event reaches `max_attempts` and is dead-lettered. If a
 handler fails below the attempt ceiling, the cursor stays on that event and the
 next watcher run retries it before later matching events.
+For Postgres-backed stores, this guarantee depends on the snapshot-safe
+`query_events` rule in the SessionStore contract: a watcher can be briefly
+delayed by an older open event-write transaction, but it must not skip that
+event by consuming a later committed sequence first.
 Watcher throughput is controlled by `EventWatcher.batch_size` and the
 `run_event_watchers(..., limit=...)` call; `EventQuery.limit` is ignored for
 delivery because the watcher owns the cursor.
