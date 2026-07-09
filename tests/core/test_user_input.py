@@ -176,6 +176,60 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     assert "pending_user_input" not in asyncio.run(store.load_checkpoint("s_resume"))
 
 
+def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
+    from cayu import ResolutionActor, ResolutionActorSource
+
+    app, store = _build(
+        [("call_1", "ask_user", {"question": "Which env?"})],
+        final_text="Deploying to prod.",
+    )
+    pause_events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_actor",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    input_id = next(
+        e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+
+    resume_events = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id="s_actor",
+                    input_id=input_id,
+                    answer="prod",
+                    resolved_by=ResolutionActor(
+                        subject="operator@example.com",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                )
+            )
+        )
+    )
+
+    # `claims` stay on the request and are excluded from event payloads.
+    expected_actor = {
+        "subject": "operator@example.com",
+        "tenant": None,
+        "source": "request",
+    }
+    resumed = next(e for e in resume_events if e.type == EventType.SESSION_RESUMED)
+    assert resumed.payload["resolved_by"] == expected_actor
+    answered = next(
+        e
+        for e in resume_events
+        if e.type == EventType.TOOL_CALL_COMPLETED and e.payload.get("tool_call_id") == "call_1"
+    )
+    assert answered.payload["resolved_by"] == expected_actor
+    assert asyncio.run(store.load("s_actor")).status == SessionStatus.COMPLETED
+
+
 def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
     # Model emits [echo, ask_user, echo] in one step. Nothing runs before the pause; on
     # resume the echoes execute and the ask_user answer is injected, all in model order.

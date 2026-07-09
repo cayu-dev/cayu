@@ -388,3 +388,107 @@ def test_dev_server_without_auth_keeps_routes_open() -> None:
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
         list(response.iter_lines())
+
+
+def _approval_capture_app() -> tuple[CayuApp, list]:
+    from cayu import Message, RunRequest
+    from cayu.runtime import SessionIdentity, SessionStatus
+
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_interrupted_session(session_id: str) -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    import asyncio
+
+    asyncio.run(create_interrupted_session("session_actor"))
+
+    captured: list = []
+
+    async def resolve_tool_approval(request):
+        captured.append(request)
+        if False:
+            yield None
+
+    app.resolve_tool_approval = resolve_tool_approval
+    return app, captured
+
+
+def test_authenticated_resolution_derives_resolved_by_from_auth_context() -> None:
+    from cayu import ResolutionActorSource
+
+    app, captured = _approval_capture_app()
+    client = TestClient(create_server(app, auth=_require_bearer_token))
+
+    with client.stream(
+        "POST",
+        "/api/tool-approvals/resolve",
+        headers=_AUTH_HEADERS,
+        json={
+            "session_id": "session_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    actor = captured[0].resolved_by
+    assert actor is not None
+    assert actor.subject == "test-user"
+    assert actor.source is ResolutionActorSource.HTTP_AUTH
+    assert actor.claims == {"scheme": "bearer"}
+
+
+def test_authenticated_resolution_reserved_auth_subject_returns_400() -> None:
+    def reserved_subject_auth(request: Request) -> AuthContext:
+        if request.headers.get("Authorization") != f"Bearer {_TOKEN}":
+            raise HTTPException(status_code=401, detail="Missing or invalid credentials.")
+        return AuthContext(subject="cayu:ops", claims={"scheme": "bearer"})
+
+    app, captured = _approval_capture_app()
+    client = TestClient(create_server(app, auth=reserved_subject_auth))
+
+    response = client.post(
+        "/api/tool-approvals/resolve",
+        headers=_AUTH_HEADERS,
+        json={
+            "session_id": "session_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "reserved" in response.json()["detail"]
+    assert captured == []
+
+
+def test_authenticated_resolution_rejects_body_resolved_by() -> None:
+    app, captured = _approval_capture_app()
+    client = TestClient(create_server(app, auth=_require_bearer_token))
+
+    response = client.post(
+        "/api/tool-approvals/resolve",
+        headers=_AUTH_HEADERS,
+        json={
+            "session_id": "session_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+            "resolved_by": {"subject": "someone-else"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "derived from the authenticated caller" in response.json()["detail"]
+    assert captured == []

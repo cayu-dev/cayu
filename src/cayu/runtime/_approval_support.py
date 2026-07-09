@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
@@ -12,15 +13,44 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
+    ResolutionActor,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    resolution_actor_payload,
 )
 from cayu.runtime.sessions import Session
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
+
+
+def pending_approval_expired(approval: PendingToolApproval, now: datetime) -> bool:
+    """Whether a pending approval's window has closed at ``now``.
+
+    Pure access-time check (no daemon); the resolution winner evaluates it
+    after the atomic status claim. A future lifecycle sweep (issue #104) can
+    call this on interrupted sessions to proactively deny expired approvals.
+    """
+    return approval.expires_at is not None and now >= approval.expires_at
+
+
+class ApprovalResolutionHistory(NamedTuple):
+    has_denied_result: bool
+    has_approved_call: bool
+    has_executed_or_recovered_result: bool
+
+    @property
+    def has_granted_activity(self) -> bool:
+        """The approval was already granted or produced executed results.
+
+        Expiry gates only the FIRST grant: a retry after a mid-run crash
+        re-resolves an approval that was authorized in-window, so coercing it
+        to a denial would contradict the recorded grant (and deadlock against
+        ``validate_retry_decision``).
+        """
+        return self.has_approved_call or self.has_executed_or_recovered_result
 
 
 class ToolApprovalManualRecoveryRequired(RuntimeError):
@@ -50,6 +80,8 @@ def resumed_event(
     environment_name: str | None,
     approval: PendingToolApproval,
     decision: ToolApprovalDecision,
+    resolved_by: ResolutionActor | None = None,
+    expired: bool = False,
 ) -> Event:
     return Event(
         type=EventType.SESSION_RESUMED,
@@ -61,6 +93,8 @@ def resumed_event(
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
             "decision": decision.value,
+            "resolved_by": resolution_actor_payload(resolved_by),
+            "expired": expired,
         },
     )
 
@@ -277,12 +311,11 @@ def recorded_tool_outcomes(
     return outcomes
 
 
-def validate_retry_decision(
+def approval_resolution_history(
     *,
     events: list[Event],
     approval: PendingToolApproval,
-    decision: ToolApprovalDecision,
-) -> None:
+) -> ApprovalResolutionHistory:
     has_denied_result = False
     has_approved_call = False
     has_executed_or_recovered_result = False
@@ -297,14 +330,25 @@ def validate_retry_decision(
         elif event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}:
             has_executed_or_recovered_result = True
 
-    if decision == ToolApprovalDecision.APPROVE and has_denied_result:
+    return ApprovalResolutionHistory(
+        has_denied_result=has_denied_result,
+        has_approved_call=has_approved_call,
+        has_executed_or_recovered_result=has_executed_or_recovered_result,
+    )
+
+
+def validate_retry_decision(
+    *,
+    history: ApprovalResolutionHistory,
+    approval: PendingToolApproval,
+    decision: ToolApprovalDecision,
+) -> None:
+    if decision == ToolApprovalDecision.APPROVE and history.has_denied_result:
         raise RuntimeError(
             "Tool approval was already denied and cannot be retried as approved: "
             f"{approval.approval_id}"
         )
-    if decision == ToolApprovalDecision.DENY and (
-        has_approved_call or has_executed_or_recovered_result
-    ):
+    if decision == ToolApprovalDecision.DENY and history.has_granted_activity:
         raise RuntimeError(
             "Tool approval already has approved or executed tool results and "
             f"cannot be retried as denied: {approval.approval_id}"

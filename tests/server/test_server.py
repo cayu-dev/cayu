@@ -2618,6 +2618,86 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
     }
 
 
+def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> None:
+    from cayu import ResolutionActorSource
+
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_interrupted_session(session_id: str) -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    asyncio.run(create_interrupted_session("session_dev_actor"))
+
+    captured = []
+
+    async def resolve_tool_approval(request):
+        captured.append(request)
+        if False:
+            yield None
+
+    app.resolve_tool_approval = resolve_tool_approval
+    client = TestClient(create_server(app, dev=True))
+
+    # A dev-mode body can assert an identity but never verified/system
+    # provenance: the server re-stamps the source as "request".
+    with client.stream(
+        "POST",
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_dev_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+            "resolved_by": {"subject": "operator@example.com", "source": "system"},
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    actor = captured[0].resolved_by
+    assert actor is not None
+    assert actor.subject == "operator@example.com"
+    assert actor.source is ResolutionActorSource.REQUEST
+
+    # Reserved system subjects cannot be claimed through the body: the
+    # request-source re-stamp trips the reserved-prefix validation.
+    response = client.post(
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_dev_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+            "resolved_by": {"subject": "cayu:approval-expiry", "source": "system"},
+        },
+    )
+    assert response.status_code == 400
+    assert "reserved for system actors" in response.json()["detail"]
+    assert len(captured) == 1
+
+    # No body actor means no provenance in dev mode.
+    with client.stream(
+        "POST",
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_dev_actor",
+            "approval_id": "approval_1",
+            "decision": "approve",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    assert captured[1].resolved_by is None
+
+
 def test_interrupt_session_endpoint_streams_interrupted_event() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)

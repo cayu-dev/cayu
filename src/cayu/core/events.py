@@ -94,6 +94,7 @@ class EventType(StrEnum):
     TOOL_CALL_APPROVAL_REQUESTED = "tool.call.approval_requested"
     TOOL_CALL_APPROVED = "tool.call.approved"
     TOOL_CALL_APPROVAL_DENIED = "tool.call.approval_denied"
+    TOOL_CALL_APPROVAL_EXPIRED = "tool.call.approval_expired"
 
     WORKFLOW_STARTED = "workflow.started"
     WORKFLOW_STEP_STARTED = "workflow.step.started"

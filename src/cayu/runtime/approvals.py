@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
@@ -15,6 +16,9 @@ from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
 
+RESOLUTION_ACTOR_RESERVED_SUBJECT_PREFIX = "cayu:"
+EXPIRY_RESOLUTION_ACTOR_SUBJECT = "cayu:approval-expiry"
+
 
 class ToolApprovalDecision(StrEnum):
     APPROVE = "approve"
@@ -24,6 +28,99 @@ class ToolApprovalDecision(StrEnum):
 class ToolApprovalRecoveryOutcome(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ResolutionActorSource(StrEnum):
+    """How a ``ResolutionActor``'s identity claim was established.
+
+    ``HTTP_AUTH`` is produced only by the server layer from a verified
+    ``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or
+    dev-mode HTTP body); ``SYSTEM`` marks runtime-generated actors such as
+    deterministic approval expiry. Direct SDK callers are a trusted boundary
+    and may construct system actors; HTTP bodies cannot — the server re-stamps
+    dev-mode bodies to ``REQUEST`` and rejects them entirely under auth.
+    """
+
+    HTTP_AUTH = "http_auth"
+    REQUEST = "request"
+    SYSTEM = "system"
+
+
+class ResolutionActor(BaseModel):
+    """Typed actor identity for approval and user-input resolutions.
+
+    Stamped into resolution event payloads so the audit trail answers who
+    resolved a pause without consulting app-side state. ``reason`` and
+    ``metadata`` on resolution requests remain caller-claimed free-form data;
+    this model is the provenance field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str
+    tenant: str | None = None
+    source: ResolutionActorSource | None = None
+    claims: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("subject", "tenant")
+    @classmethod
+    def validate_nonblank_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("claims", mode="before")
+    @classmethod
+    def copy_claims(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_value(value, "claims")
+
+    @model_validator(mode="after")
+    def validate_reserved_subject(self) -> ResolutionActor:
+        if (
+            self.subject.startswith(RESOLUTION_ACTOR_RESERVED_SUBJECT_PREFIX)
+            and self.source != ResolutionActorSource.SYSTEM
+        ):
+            raise ValueError(
+                "ResolutionActor subjects prefixed "
+                f"{RESOLUTION_ACTOR_RESERVED_SUBJECT_PREFIX!r} are reserved for system actors."
+            )
+        return self
+
+
+def copy_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | None:
+    if actor is None:
+        return None
+    if type(actor) is not ResolutionActor:
+        raise TypeError("Resolution actors must be ResolutionActor instances.")
+    return ResolutionActor(
+        subject=actor.subject,
+        tenant=actor.tenant,
+        source=actor.source,
+        claims=copy_json_value(actor.claims, "claims"),
+    )
+
+
+def expiry_resolution_actor() -> ResolutionActor:
+    """The system actor stamped on deterministic approval-expiry resolutions."""
+
+    return ResolutionActor(
+        subject=EXPIRY_RESOLUTION_ACTOR_SUBJECT,
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def resolution_actor_payload(actor: ResolutionActor | None) -> dict[str, Any] | None:
+    """JSON-safe event payload form of an actor (``None`` stays ``None``).
+
+    ``claims`` are deliberately excluded: they carry deployment authorization
+    state (scopes/roles) for in-process use on the request, and nothing
+    redacts durable event payloads. The audit trail's who/how is
+    ``subject``/``tenant``/``source``.
+    """
+
+    if actor is None:
+        return None
+    return actor.model_dump(mode="json", exclude={"claims"})
 
 
 class ToolApprovalRequest(BaseModel):
@@ -42,6 +139,7 @@ class ToolApprovalRequest(BaseModel):
     decision: ToolApprovalDecision
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -69,6 +167,11 @@ class ToolApprovalRequest(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("resolved_by")
+    @classmethod
+    def copy_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
     @field_validator("structured_output")
     @classmethod
@@ -118,6 +221,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -154,6 +258,11 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         return copy_json_value(value, info.field_name)
+
+    @field_validator("resolved_by")
+    @classmethod
+    def copy_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
     @field_validator("structured_output")
     @classmethod
@@ -262,6 +371,16 @@ class PendingToolApproval(BaseModel):
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
+    expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware.")
+        return value.astimezone(UTC)
 
     @classmethod
     def from_event(cls, event: Event) -> PendingToolApproval:
@@ -358,6 +477,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         decision=request.decision,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
+        resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,
         budget_limits=(
@@ -387,6 +507,7 @@ def copy_tool_approval_recovery_request(
         artifacts=copy_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
+        resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,
         budget_limits=(
@@ -426,6 +547,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
             else None
         ),
         retry_policy=copy_retry_policy(approval.retry_policy) if approval.retry_policy else None,
+        expires_at=approval.expires_at,
     )
 
 

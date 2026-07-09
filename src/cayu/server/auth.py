@@ -48,7 +48,7 @@ AuthDependencyResult = AuthContext | Mapping[str, Any]
 AuthDependency = Callable[[Any], AuthDependencyResult | Awaitable[AuthDependencyResult]]
 
 
-def server_auth_dependency(auth: AuthDependency) -> AuthDependency:
+def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitable[AuthContext]]:
     """Wrap a user auth callable so routes receive a validated AuthContext."""
 
     async def dependency(request: Request) -> AuthContext:

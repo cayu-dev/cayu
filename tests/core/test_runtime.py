@@ -98,8 +98,11 @@ from cayu.runtime import (
     NativeStructuredOutputUnsupported,
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
+    PendingToolApproval,
     PricingCatalog,
     RecentTurnsContextPolicy,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
     RunLimits,
@@ -13736,6 +13739,473 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
     assert asyncio.run(store.load_checkpoint("sess_tool_approval_allow")) == {}
 
 
+class ExpiringApprovalPolicy(ToolPolicy):
+    def __init__(self, expires_in_seconds: float = 60.0) -> None:
+        self.expires_in_seconds = expires_in_seconds
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        return ToolPolicyResult(
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+            reason=f"Approval required for {request.tool_name}.",
+            approval_expires_in_seconds=self.expires_in_seconds,
+        )
+
+
+def _reviewer_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="reviewer@example.com",
+        tenant="acme",
+        source=ResolutionActorSource.REQUEST,
+        claims={"role": "admin"},
+    )
+
+
+def _approval_pause_app(
+    *,
+    store: InMemorySessionStore,
+    tool: Tool,
+    policy: ToolPolicy,
+    clock=None,
+) -> tuple[CayuApp, FakeProvider]:
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("resolved"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, clock=clock)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=policy,
+    )
+    return app, provider
+
+
+def test_tool_approval_resolution_events_carry_resolved_by_actor():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    app, _provider = _approval_pause_app(store=store, tool=tool, policy=RequireApprovalPolicy())
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_actor",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_actor",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                reason="looks safe",
+                resolved_by=_reviewer_actor(),
+            ),
+        )
+    )
+
+    # `claims` stay on the request and are excluded from event payloads.
+    expected_actor = {
+        "subject": "reviewer@example.com",
+        "tenant": "acme",
+        "source": "request",
+    }
+    resumed = next(event for event in events if event.type == EventType.SESSION_RESUMED)
+    assert resumed.payload["resolved_by"] == expected_actor
+    assert resumed.payload["expired"] is False
+    approved = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
+    assert approved.payload["resolved_by"] == expected_actor
+    assert tool.calls == [{"value": "secret"}]
+
+
+def test_tool_approval_denial_events_carry_resolved_by_actor():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    app, _provider = _approval_pause_app(store=store, tool=tool, policy=RequireApprovalPolicy())
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_denial_actor",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_denial_actor",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.DENY,
+                reason="not safe",
+                resolved_by=_reviewer_actor(),
+            ),
+        )
+    )
+
+    denied = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_DENIED)
+    assert denied.payload["resolved_by"]["subject"] == "reviewer@example.com"
+    assert denied.payload["resolved_by"]["source"] == "request"
+    assert denied.payload["expired"] is False
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in events)
+    assert tool.calls == []
+
+
+def test_resolution_actor_rejects_reserved_subject_for_request_sources():
+    with pytest.raises(ValidationError, match="reserved for system actors"):
+        ResolutionActor(subject="cayu:approval-expiry")
+    with pytest.raises(ValidationError, match="reserved for system actors"):
+        ResolutionActor(subject="cayu:anything", source=ResolutionActorSource.REQUEST)
+    from cayu.runtime.approvals import EXPIRY_RESOLUTION_ACTOR_SUBJECT
+
+    system_actor = ResolutionActor(
+        subject=EXPIRY_RESOLUTION_ACTOR_SUBJECT,
+        source=ResolutionActorSource.SYSTEM,
+    )
+    assert system_actor.subject == EXPIRY_RESOLUTION_ACTOR_SUBJECT
+
+
+def test_expired_tool_approval_resolves_as_deterministic_denial():
+    clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    app, _provider = _approval_pause_app(
+        store=store,
+        tool=tool,
+        policy=ExpiringApprovalPolicy(expires_in_seconds=60),
+        clock=lambda: clock["now"],
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_expiry",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_event = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    pending = PendingToolApproval.from_event(approval_event)
+    assert pending.expires_at == datetime(2026, 7, 9, 12, 1, tzinfo=UTC)
+
+    clock["now"] = datetime(2026, 7, 9, 12, 2, tzinfo=UTC)
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_expiry",
+                approval_id=pending.approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                reason="approve it anyway",
+                resolved_by=_reviewer_actor(),
+            ),
+        )
+    )
+
+    resumed = next(event for event in events if event.type == EventType.SESSION_RESUMED)
+    assert resumed.payload["decision"] == "deny"
+    assert resumed.payload["expired"] is True
+    assert resumed.payload["resolved_by"]["subject"] == "cayu:approval-expiry"
+    assert resumed.payload["resolved_by"]["source"] == "system"
+
+    expired_event = next(
+        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED
+    )
+    assert expired_event.payload["approval_id"] == pending.approval_id
+    assert expired_event.payload["expires_at"] == "2026-07-09T12:01:00+00:00"
+    assert expired_event.payload["requested_decision"] == "approve"
+    assert expired_event.payload["resolved_by"]["subject"] == "cayu:approval-expiry"
+    assert expired_event.payload["triggered_by"]["subject"] == "reviewer@example.com"
+
+    denied = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_DENIED)
+    assert denied.payload["expired"] is True
+    assert "expired at" in denied.payload["reason"]
+    assert denied.payload["resolved_by"]["source"] == "system"
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert tool.calls == []
+    session = asyncio.run(store.load("sess_approval_expiry"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
+
+
+def test_unexpired_tool_approval_resolves_normally():
+    clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    app, _provider = _approval_pause_app(
+        store=store,
+        tool=tool,
+        policy=ExpiringApprovalPolicy(expires_in_seconds=60),
+        clock=lambda: clock["now"],
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_unexpired",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    clock["now"] = datetime(2026, 7, 9, 12, 0, 30, tzinfo=UTC)
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_unexpired",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in events)
+    assert any(event.type == EventType.TOOL_CALL_APPROVED for event in events)
+    assert tool.calls == [{"value": "secret"}]
+
+
+def test_multi_call_approval_round_uses_minimum_ttl():
+    # The round is approved/denied as a whole, so any approval-requiring
+    # call's TTL bounds the round: the shortest window wins, not the gating
+    # (first) call's.
+    class PerToolTtlPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                approval_expires_in_seconds=300 if request.tool_name == "side_effect" else 60,
+            )
+
+    clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "one"},
+                ),
+                ModelStreamEvent.tool_call(id="call_2", name="echo", arguments={"text": "two"}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, clock=lambda: clock["now"])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool(), EchoTool()],
+        tool_policy=PerToolTtlPolicy(),
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_multi_ttl",
+                messages=[Message.text("user", "use both tools")],
+            ),
+        )
+    )
+    approval_event = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    pending = PendingToolApproval.from_event(approval_event)
+    # The gating call (side_effect, 300s) does not win: echo's 60s bound does.
+    assert pending.expires_at == datetime(2026, 7, 9, 12, 1, tzinfo=UTC)
+
+
+def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
+    # Expiry gates the FIRST grant only: a retry of an approval that was
+    # granted in-window (crash after tool.call.approved) must honor the grant
+    # even when the retry lands after the window — coercing it to a denial
+    # would contradict the recorded grant and wedge the session.
+    clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    app, _provider = _approval_pause_app(
+        store=store,
+        tool=tool,
+        policy=ExpiringApprovalPolicy(expires_in_seconds=60),
+        clock=lambda: clock["now"],
+    )
+
+    interrupt_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_expiry_retry",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+    approval_id = next(
+        event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    ).payload["approval"]["approval_id"]
+
+    # A prior in-window resolve crashed after recording the grant.
+    asyncio.run(
+        store.append_event(
+            "sess_expiry_retry",
+            Event(
+                type=EventType.TOOL_CALL_APPROVED,
+                session_id="sess_expiry_retry",
+                agent_name="assistant",
+                tool_name="side_effect",
+                payload={"approval_id": approval_id, "tool_call_id": "call_1"},
+            ),
+        )
+    )
+
+    clock["now"] = datetime(2026, 7, 9, 12, 5, tzinfo=UTC)
+    events = asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_expiry_retry",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+    )
+
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in events)
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_DENIED for event in events)
+    assert tool.calls == [{"value": "secret"}]
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
+    # Recovery reconciles a side effect authorized in-window before a crash;
+    # it is never blocked by expiry, but an out-of-window reconciliation is
+    # stamped for the audit trail.
+    clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    store = FailingTerminalToolEventStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "secret"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("recovered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, clock=lambda: clock["now"])
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=ExpiringApprovalPolicy(expires_in_seconds=60),
+    )
+
+    async def run():
+        interrupt_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recovery_actor",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event
+            for event in interrupt_events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+
+        # In-window approve crashes when the terminal tool event fails to
+        # persist; the stream ends interrupted and recovery is required.
+        crashed_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_recovery_actor",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        assert crashed_events[-1].type == EventType.SESSION_INTERRUPTED
+
+        # The operator reconciles the external outcome after the window closed.
+        clock["now"] = datetime(2026, 7, 9, 12, 5, tzinfo=UTC)
+        return await collect_tool_approval_recovery_events(
+            app,
+            ToolApprovalRecoveryRequest(
+                session_id="sess_recovery_actor",
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="side effect completed externally",
+                resolved_by=_reviewer_actor(),
+            ),
+        )
+
+    recovery_events = asyncio.run(run())
+
+    resumed = next(event for event in recovery_events if event.type == EventType.SESSION_RESUMED)
+    assert resumed.payload["resolved_by"]["subject"] == "reviewer@example.com"
+    assert resumed.payload["expired"] is True
+    recovered = next(
+        event
+        for event in recovery_events
+        if event.type == EventType.TOOL_CALL_COMPLETED
+        and event.payload.get("manual_recovery") is True
+    )
+    assert recovered.payload["resolved_by"]["subject"] == "reviewer@example.com"
+    assert recovered.payload["resolved_by"]["source"] == "request"
+    assert recovered.payload["expired"] is True
+    assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in recovery_events)
+    assert recovery_events[-1].type == EventType.SESSION_COMPLETED
+
+
 def test_cayu_app_preserves_structured_output_across_tool_approval():
     store = InMemorySessionStore()
     tool = SideEffectTool()
@@ -26953,6 +27423,7 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
         limits=RunLimits(max_tool_calls=3, scope="session"),
         budget_limits=(fake_budget_limit("2.50"),),
         retry_policy=RetryPolicy(max_attempts=3),
+        expires_at=datetime(2026, 7, 9, 12, 30, tzinfo=UTC),
     )
 
     # Same round-trip as the durable checkpoint: model_dump(mode="json") in,
@@ -26962,12 +27433,14 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
     assert restored.limits == RunLimits(max_tool_calls=3, scope="session")
     assert restored.budget_limits == (fake_budget_limit("2.50"),)
     assert restored.retry_policy == RetryPolicy(max_attempts=3)
+    assert restored.expires_at == pending.expires_at
 
     copied = copy_pending_tool_approval(pending)
     assert copied.max_steps == 7
     assert copied.limits == pending.limits
     assert copied.budget_limits == pending.budget_limits
     assert copied.retry_policy == pending.retry_policy
+    assert copied.expires_at == pending.expires_at
 
 
 def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
@@ -26981,7 +27454,7 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
         tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
     )
     payload = legacy.model_dump(mode="json")
-    for key in ("max_steps", "limits", "budget_limits", "retry_policy"):
+    for key in ("max_steps", "limits", "budget_limits", "retry_policy", "expires_at"):
         payload.pop(key)
 
     restored = PendingToolApproval(**payload)
@@ -26989,6 +27462,7 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
     assert restored.limits is None
     assert restored.budget_limits is None
     assert restored.retry_policy is None
+    assert restored.expires_at is None
 
 
 def test_effective_approval_run_config_prefers_override_then_pending_then_default():

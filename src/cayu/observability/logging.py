@@ -41,6 +41,7 @@ _WARNING_EVENTS = {
     EventType.MODEL_RETRY,
     EventType.TOOL_CALL_BLOCKED,
     EventType.TOOL_CALL_APPROVAL_DENIED,
+    EventType.TOOL_CALL_APPROVAL_EXPIRED,
     EventType.RUNTIME_SINK_FAILED,
 }
 _ERROR_EVENTS = {
@@ -163,6 +164,7 @@ def _summarize_event(
         EventType.TOOL_CALL_APPROVAL_REQUESTED,
         EventType.TOOL_CALL_APPROVED,
         EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.TOOL_CALL_APPROVAL_EXPIRED,
     }:
         _append(parts, "tool", event.tool_name, redactor=redactor)
         _append(parts, "call", payload.get("tool_call_id"), redactor=redactor)

@@ -115,4 +115,5 @@ def validate_tool_policy_result(result: ToolPolicyResult) -> ToolPolicyResult:
         decision=result.decision,
         reason=result.reason,
         metadata=copy_json_value(result.metadata, "metadata"),
+        approval_expires_in_seconds=result.approval_expires_in_seconds,
     )

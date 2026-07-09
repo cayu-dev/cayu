@@ -4,6 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
+from math import isfinite
 from types import MappingProxyType
 from typing import Any
 
@@ -70,13 +71,21 @@ class ToolPolicyRequest(BaseModel):
 
 
 class ToolPolicyResult(BaseModel):
-    """Authorization decision for one tool call."""
+    """Authorization decision for one tool call.
+
+    ``approval_expires_in_seconds`` is honored only when ``decision`` is
+    ``REQUIRE_APPROVAL``: the runtime converts it to an absolute
+    ``expires_at`` on the pending approval checkpoint, after which resolution
+    deterministically denies the round. ``None`` means the approval never
+    expires.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     decision: ToolPolicyDecision
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    approval_expires_in_seconds: float | None = None
 
     @field_validator("reason")
     @classmethod
@@ -93,6 +102,19 @@ class ToolPolicyResult(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("approval_expires_in_seconds", mode="before")
+    @classmethod
+    def validate_approval_expires_in_seconds(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        # mode="before" so a bool is seen raw instead of coerced to 1.0/0.0.
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("approval_expires_in_seconds must be a number.")
+        seconds = float(value)
+        if not isfinite(seconds) or seconds <= 0:
+            raise ValueError("approval_expires_in_seconds must be a positive finite number.")
+        return seconds
 
 
 class ToolPolicy(ABC):
@@ -148,17 +170,28 @@ class AlwaysRequireApprovalToolPolicy(ToolPolicy):
     are allowed; when omitted, every tool call requires approval. Use this to gate
     side-effecting tools (post a PR comment, send an email) behind
     ``resolve_tool_approval`` without hand-writing a policy — instead of abusing a
-    deny-everything rule.
+    deny-everything rule. ``expires_in_seconds`` bounds how long the resulting
+    pending approval stays resolvable before it deterministically denies.
     """
 
-    def __init__(self, *, tools: Iterable[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        tools: Iterable[str] | None = None,
+        expires_in_seconds: float | None = None,
+    ) -> None:
         self.tools = _copy_tool_name_set(tools, "tools") if tools is not None else None
+        self.expires_in_seconds = ToolPolicyResult(
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+            approval_expires_in_seconds=expires_in_seconds,
+        ).approval_expires_in_seconds
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         if self.tools is None or request.tool_name in self.tools:
             return ToolPolicyResult(
                 decision=ToolPolicyDecision.REQUIRE_APPROVAL,
                 reason=f"Tool requires caller approval by policy: {request.tool_name}",
+                approval_expires_in_seconds=self.expires_in_seconds,
             )
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 

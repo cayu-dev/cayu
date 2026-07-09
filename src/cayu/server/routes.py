@@ -25,6 +25,8 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
+    ResolutionActor,
+    ResolutionActorSource,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -70,7 +72,7 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
-from cayu.server.auth import AuthDependency, server_auth_dependency
+from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
     SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
@@ -289,6 +291,7 @@ class ToolApprovalBody(BaseModel):
     decision: ToolApprovalDecision
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -321,6 +324,7 @@ class ToolApprovalRecoveryBody(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -381,6 +385,7 @@ class UserInputResolveBody(BaseModel):
     structured: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -413,6 +418,7 @@ class UserInputRecoveryBody(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -426,6 +432,53 @@ class UserInputRecoveryBody(BaseModel):
         if value is None:
             return None
         return copy_request_budget_limits(value)
+
+
+def _request_resolution_actor(
+    auth_context: AuthContext | None,
+    body_resolved_by: ResolutionActor | None,
+) -> ResolutionActor | None:
+    """Derive the typed resolution actor for an approval/user-input route.
+
+    With auth configured, provenance comes from the verified caller and a
+    body-supplied actor is rejected loudly (mirroring the reserved ``cayu:``
+    label rejection) — a silent override would let clients believe they
+    recorded an actor the audit trail replaced. Dev-mode bodies are accepted
+    but re-stamped ``source="request"``, so a request can never claim
+    server-verified (``http_auth``) or system provenance.
+    """
+    if auth_context is not None:
+        if body_resolved_by is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "resolved_by is derived from the authenticated caller and "
+                    "cannot be supplied in the request body."
+                ),
+            )
+        try:
+            return ResolutionActor(
+                subject=auth_context.subject,
+                tenant=auth_context.tenant,
+                source=ResolutionActorSource.HTTP_AUTH,
+                claims=auth_context.claims,
+            )
+        except ValueError as exc:
+            # AuthContext.subject is unconstrained, so an auth backend can hand
+            # back a reserved ``cayu:``-prefixed subject; surface that as a
+            # clean 400 instead of an unhandled 500.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body_resolved_by is None:
+        return None
+    try:
+        return ResolutionActor(
+            subject=body_resolved_by.subject,
+            tenant=body_resolved_by.tenant,
+            source=ResolutionActorSource.REQUEST,
+            claims=body_resolved_by.claims,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
@@ -890,7 +943,26 @@ def create_router(
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
     # sequence like no dependencies, so `auth=None` keeps current dev behavior.
-    protected: list[Any] = [Depends(server_auth_dependency(auth))] if auth is not None else []
+    auth_dependency = server_auth_dependency(auth) if auth is not None else None
+    protected: list[Any] = [Depends(auth_dependency)] if auth_dependency is not None else []
+
+    async def _optional_auth_context(request: Request) -> AuthContext | None:
+        # The four approval/user-input resolution routes take this as a
+        # handler parameter INSTEAD of `dependencies=protected`: one callable
+        # both guards the route (its 401/403 raises before the handler body)
+        # and yields the verified caller identity for typed `resolved_by`
+        # provenance. Splitting guard and extraction into two differently
+        # wrapped callables would invoke the user's auth dependency twice per
+        # request (FastAPI caches per-callable, not per-underlying-auth).
+        # Handlers must take this via the `= Depends(...)` default form: with
+        # `from __future__ import annotations`, a function-local Annotated
+        # alias is an unresolvable string annotation that FastAPI silently
+        # degrades to a required query parameter.
+        if auth_dependency is None:
+            return None
+        return await auth_dependency(request)
+
+    optional_auth_context = Depends(_optional_auth_context)
 
     @router.get("/contract", response_model=ServerContractResponse, dependencies=protected)
     async def get_contract():
@@ -1114,11 +1186,13 @@ def create_router(
 
     @router.post(
         "/tool-approvals/resolve",
-        dependencies=protected,
         response_class=EventSourceResponse,
         responses=STREAMING_ENDPOINT_RESPONSES,
     )
-    async def resolve_tool_approval(body: ToolApprovalBody):
+    async def resolve_tool_approval(
+        body: ToolApprovalBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1132,6 +1206,7 @@ def create_router(
             decision=body.decision,
             reason=body.reason,
             metadata=body.metadata,
+            resolved_by=_request_resolution_actor(auth_context, body.resolved_by),
             max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
@@ -1144,11 +1219,13 @@ def create_router(
 
     @router.post(
         "/tool-approvals/recover",
-        dependencies=protected,
         response_class=EventSourceResponse,
         responses=STREAMING_ENDPOINT_RESPONSES,
     )
-    async def recover_tool_approval(body: ToolApprovalRecoveryBody):
+    async def recover_tool_approval(
+        body: ToolApprovalRecoveryBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1166,6 +1243,7 @@ def create_router(
             artifacts=body.artifacts,
             reason=body.reason,
             metadata=body.metadata,
+            resolved_by=_request_resolution_actor(auth_context, body.resolved_by),
             max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
@@ -1212,11 +1290,13 @@ def create_router(
 
     @router.post(
         "/user-input/resolve",
-        dependencies=protected,
         response_class=EventSourceResponse,
         responses=STREAMING_ENDPOINT_RESPONSES,
     )
-    async def resolve_user_input(body: UserInputResolveBody):
+    async def resolve_user_input(
+        body: UserInputResolveBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1231,6 +1311,7 @@ def create_router(
             structured=body.structured,
             artifacts=body.artifacts,
             metadata=body.metadata,
+            resolved_by=_request_resolution_actor(auth_context, body.resolved_by),
             max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
@@ -1243,11 +1324,13 @@ def create_router(
 
     @router.post(
         "/user-input/recover",
-        dependencies=protected,
         response_class=EventSourceResponse,
         responses=STREAMING_ENDPOINT_RESPONSES,
     )
-    async def recover_user_input(body: UserInputRecoveryBody):
+    async def recover_user_input(
+        body: UserInputRecoveryBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1266,6 +1349,7 @@ def create_router(
             artifacts=body.artifacts,
             reason=body.reason,
             metadata=body.metadata,
+            resolved_by=_request_resolution_actor(auth_context, body.resolved_by),
             max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,

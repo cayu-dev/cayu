@@ -2612,6 +2612,57 @@
       "title": "PricingCatalog",
       "type": "object"
     },
+    "ResolutionActor": {
+      "additionalProperties": false,
+      "description": "Typed actor identity for approval and user-input resolutions.\n\nStamped into resolution event payloads so the audit trail answers who\nresolved a pause without consulting app-side state. ``reason`` and\n``metadata`` on resolution requests remain caller-claimed free-form data;\nthis model is the provenance field.",
+      "properties": {
+        "claims": {
+          "additionalProperties": true,
+          "title": "Claims",
+          "type": "object"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActorSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "title": "ResolutionActor",
+      "type": "object"
+    },
+    "ResolutionActorSource": {
+      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\ndev-mode HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot \u2014 the server re-stamps\ndev-mode bodies to ``REQUEST`` and rejects them entirely under auth.",
+      "enum": [
+        "http_auth",
+        "request",
+        "system"
+      ],
+      "title": "ResolutionActorSource",
+      "type": "string"
+    },
     "ResumeBody": {
       "properties": {
         "budget_limits": {
@@ -3691,6 +3742,16 @@
           ],
           "title": "Reason"
         },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "retry_policy": {
           "anyOf": [
             {
@@ -3820,6 +3881,16 @@
             }
           ],
           "title": "Reason"
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "retry_policy": {
           "anyOf": [
@@ -4280,6 +4351,16 @@
           ],
           "title": "Reason"
         },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "retry_policy": {
           "anyOf": [
             {
@@ -4406,6 +4487,16 @@
           "additionalProperties": true,
           "title": "Metadata",
           "type": "object"
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "retry_policy": {
           "anyOf": [

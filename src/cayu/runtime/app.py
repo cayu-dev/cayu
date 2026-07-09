@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fnmatch import fnmatchcase
 from importlib.metadata import PackageNotFoundError, version
@@ -103,6 +103,8 @@ from cayu.runtime.approvals import (
     copy_pending_tool_approval,
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
+    expiry_resolution_actor,
+    resolution_actor_payload,
 )
 from cayu.runtime.budgets import (
     BudgetCheck,
@@ -170,6 +172,7 @@ from cayu.runtime.event_watchers import (
     EventWatcherRunResult,
     EventWatcherStore,
     InMemoryEventWatcherStore,
+    _clock_or_utc_now,
     event_query_after_cursor,
     event_watcher_error_payload,
     run_event_watcher_handler,
@@ -1350,6 +1353,7 @@ class CayuApp:
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
         tool_timeout_seconds: float | None = None,
         max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
@@ -1374,6 +1378,8 @@ class CayuApp:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
         policies = validate_loop_policies(loop_policies, field_name="loop_policies")
+        # Wall-clock seam for time-based approval expiry (tests inject a fake).
+        self._clock = _clock_or_utc_now(clock)
         manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
         context_counting_config = copy_context_counting_config(context_counting)
         resolved_secret_redactor = (
@@ -2974,6 +2980,7 @@ class CayuApp:
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                             "input_id": pending.input_id,
                             "tool_call_id": pending.tool_call_id,
+                            "resolved_by": resolution_actor_payload(response.resolved_by),
                         },
                     )
                 )
@@ -3059,6 +3066,7 @@ class CayuApp:
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
                                 "input_id": pending.input_id,
+                                "resolved_by": resolution_actor_payload(response.resolved_by),
                                 "result": result.model_dump(),
                             },
                         ),
@@ -3342,6 +3350,7 @@ class CayuApp:
                         "manual_recovery": True,
                         "reason": request.reason,
                         "metadata": request.metadata,
+                        "resolved_by": resolution_actor_payload(request.resolved_by),
                         "result": recovered_result.model_dump(),
                     },
                 ),
@@ -3358,6 +3367,7 @@ class CayuApp:
                         "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                         "input_id": pending.input_id,
                         "tool_call_id": pending.tool_call_id,
+                        "resolved_by": resolution_actor_payload(request.resolved_by),
                     },
                 ),
                 recovery_tool_event,
@@ -3399,6 +3409,7 @@ class CayuApp:
             structured=request.structured,
             artifacts=request.artifacts,
             metadata=request.metadata,
+            resolved_by=request.resolved_by,
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
@@ -3486,10 +3497,12 @@ class CayuApp:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         emit_resume_event: bool = True,
+        enforce_expiry: bool = True,
     ) -> AsyncIterator[Event]:
         environment_name = _environment_name(registered_environment)
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        expired = False
         # Restore the original run's config persisted on the pending approval;
         # explicit overrides on the approval request win. Approvals persisted
         # before this state existed fall back to the historical defaults.
@@ -3514,11 +3527,46 @@ class CayuApp:
         try:
             transcript = await self.session_store.load_transcript(session.id)
             approval_events = await self.session_store.load_events(session.id)
-            approval_support.validate_retry_decision(
+            history = approval_support.approval_resolution_history(
                 events=approval_events,
+                approval=pending_approval,
+            )
+            # Expiry gates the FIRST grant only: a retry of an approval that
+            # already has granted or executed activity was authorized
+            # in-window before a crash, so coercing it to a denial would
+            # contradict the recorded grant (and trip validate_retry_decision).
+            if (
+                enforce_expiry
+                and approval_support.pending_approval_expired(pending_approval, self._clock())
+                and not history.has_granted_activity
+            ):
+                expired = True
+                # Captured before the coercion below replaces them on the request.
+                requested_decision = request.decision
+                triggered_by = request.resolved_by
+                assert pending_approval.expires_at is not None
+                expired_at_iso = pending_approval.expires_at.isoformat()
+                request = ToolApprovalRequest(
+                    session_id=request.session_id,
+                    approval_id=request.approval_id,
+                    decision=ToolApprovalDecision.DENY,
+                    reason=f"Tool approval expired at {expired_at_iso}.",
+                    metadata=copy_json_value(request.metadata, "metadata"),
+                    resolved_by=expiry_resolution_actor(),
+                    max_steps=request.max_steps,
+                    limits=request.limits,
+                    budget_limits=request.budget_limits,
+                    retry_policy=request.retry_policy,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    loop_policies=request.loop_policies,
+                )
+            approval_support.validate_retry_decision(
+                history=history,
                 approval=pending_approval,
                 decision=request.decision,
             )
+            resolved_by_payload = resolution_actor_payload(request.resolved_by)
             recorded_outcomes = approval_support.recorded_tool_outcomes(
                 events=approval_events,
                 approval=pending_approval,
@@ -3542,6 +3590,26 @@ class CayuApp:
                         environment_name=environment_name,
                         approval=pending_approval,
                         decision=request.decision,
+                        resolved_by=request.resolved_by,
+                        expired=expired,
+                    )
+                )
+            if expired:
+                yield await self._emit(
+                    Event(
+                        type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=pending_approval.tool_name,
+                        payload={
+                            "approval_id": pending_approval.approval_id,
+                            "tool_call_id": pending_approval.tool_call_id,
+                            "expires_at": expired_at_iso,
+                            "requested_decision": requested_decision.value,
+                            "resolved_by": resolved_by_payload,
+                            "triggered_by": resolution_actor_payload(triggered_by),
+                        },
                     )
                 )
 
@@ -3710,6 +3778,7 @@ class CayuApp:
                                 "tool_call_id": tool_call.id,
                                 "reason": request.reason,
                                 "metadata": request.metadata,
+                                "resolved_by": resolved_by_payload,
                             },
                         )
                     )
@@ -3744,6 +3813,8 @@ class CayuApp:
                                 "approval_required": approval_required,
                                 "reason": request.reason,
                                 "metadata": request.metadata,
+                                "resolved_by": resolved_by_payload,
+                                "expired": expired,
                                 "result": result.model_dump(),
                             },
                         ),
@@ -3980,6 +4051,13 @@ class CayuApp:
             if recovered_result.is_error
             else EventType.TOOL_CALL_COMPLETED
         )
+        # Recovery reconciles an externally executed side effect that was
+        # authorized before the crash, so an expired window does not block it
+        # (an expired-never-approved approval has no started tool to recover).
+        # The out-of-window reconciliation is still stamped for the audit trail.
+        recovered_after_expiry = approval_support.pending_approval_expired(
+            pending_approval, self._clock()
+        )
 
         try:
             events = await self.session_store.load_events(session.id)
@@ -4041,6 +4119,8 @@ class CayuApp:
                         "manual_recovery": True,
                         "reason": request.reason,
                         "metadata": request.metadata,
+                        "resolved_by": resolution_actor_payload(request.resolved_by),
+                        "expired": recovered_after_expiry,
                         "result": recovered_result.model_dump(),
                     },
                 ),
@@ -4054,6 +4134,8 @@ class CayuApp:
                     environment_name=environment_name,
                     approval=pending_approval,
                     decision=ToolApprovalDecision.APPROVE,
+                    resolved_by=request.resolved_by,
+                    expired=recovered_after_expiry,
                 ),
                 recovery_tool_event,
             ]
@@ -4094,6 +4176,7 @@ class CayuApp:
             decision=ToolApprovalDecision.APPROVE,
             reason=request.reason,
             metadata=request.metadata,
+            resolved_by=request.resolved_by,
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
@@ -4110,6 +4193,7 @@ class CayuApp:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             emit_resume_event=False,
+            enforce_expiry=False,
         ):
             yield event
 
@@ -7828,6 +7912,22 @@ class CayuApp:
             raise RuntimeError("Session already has a pending tool approval.")
         checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
 
+        # The round resolves as a whole, so any approval-requiring call's TTL
+        # bounds the whole round: take the MINIMUM across the round's policy
+        # results (first-call-wins would silently extend a sibling's shorter
+        # window).
+        round_ttls = [policy_result.approval_expires_in_seconds]
+        if policy_outcomes is not None:
+            round_ttls.extend(
+                outcome.result.approval_expires_in_seconds
+                for outcome in policy_outcomes
+                if outcome.result is not None
+                and outcome.result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+            )
+        bounded_ttls = [ttl for ttl in round_ttls if ttl is not None]
+        expires_at: datetime | None = None
+        if bounded_ttls:
+            expires_at = self._clock() + timedelta(seconds=min(bounded_ttls))
         approval = PendingToolApproval(
             approval_id=str(uuid4()),
             tool_call_id=tool_call.id,
@@ -7852,6 +7952,7 @@ class CayuApp:
                 copy_request_budget_limits(budget_limits) if budget_limits is not None else None
             ),
             retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
+            expires_at=expires_at,
         )
         checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
             mode="json"
@@ -7900,6 +8001,9 @@ class CayuApp:
             raise RuntimeError("Session already has a pending user input.")
         checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
 
+        # Expiry is approval-only by design: a pending question waits for its
+        # human indefinitely, so PendingUserInput deliberately has no
+        # expires_at (do not mirror the approval checkpoint's TTL here).
         pending = PendingUserInput(
             input_id=str(uuid4()),
             tool_call_id=tool_call.id,

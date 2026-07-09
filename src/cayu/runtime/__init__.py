@@ -4,6 +4,8 @@ from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
+    ResolutionActor,
+    ResolutionActorSource,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -329,6 +331,8 @@ __all__ = [
     "RegisteredAgent",
     "RegisteredEnvironment",
     "RequiredFieldRule",
+    "ResolutionActor",
+    "ResolutionActorSource",
     "ResumeRequest",
     "RetryDecision",
     "RetryPolicy",

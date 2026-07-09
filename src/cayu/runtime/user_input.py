@@ -9,8 +9,10 @@ from cayu._validation import copy_json_value, require_clean_nonblank, require_no
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
+    ResolutionActor,
     ToolApprovalRecoveryOutcome,
     copy_pending_tool_call_approval,
+    copy_resolution_actor,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -37,6 +39,7 @@ class UserInputResponse(BaseModel):
     structured: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -62,6 +65,11 @@ class UserInputResponse(BaseModel):
     @classmethod
     def copy_json_fields(cls, value, info):
         return copy_json_value(value, info.field_name)
+
+    @field_validator("resolved_by")
+    @classmethod
+    def copy_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
     @field_validator("structured_output")
     @classmethod
@@ -202,6 +210,7 @@ def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:
         structured=copy_json_value(response.structured, "structured"),
         artifacts=copy_json_value(response.artifacts, "artifacts"),
         metadata=copy_json_value(response.metadata, "metadata"),
+        resolved_by=copy_resolution_actor(response.resolved_by),
         max_steps=response.max_steps,
         limits=copy_run_limits(response.limits) if response.limits is not None else None,
         budget_limits=(
@@ -285,6 +294,7 @@ class UserInputRecoveryRequest(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    resolved_by: ResolutionActor | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     budget_limits: tuple[BudgetLimit, ...] | None = None
@@ -300,6 +310,11 @@ class UserInputRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("resolved_by")
+    @classmethod
+    def copy_resolved_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
     @field_validator("answer", "message")
     @classmethod
@@ -362,6 +377,7 @@ def copy_user_input_recovery_request(
         artifacts=copy_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
+        resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,
         budget_limits=(

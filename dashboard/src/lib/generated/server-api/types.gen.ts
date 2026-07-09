@@ -1370,6 +1370,48 @@ export type PricingCatalog = {
 };
 
 /**
+ * ResolutionActor
+ *
+ * Typed actor identity for approval and user-input resolutions.
+ *
+ * Stamped into resolution event payloads so the audit trail answers who
+ * resolved a pause without consulting app-side state. ``reason`` and
+ * ``metadata`` on resolution requests remain caller-claimed free-form data;
+ * this model is the provenance field.
+ */
+export type ResolutionActor = {
+    /**
+     * Claims
+     */
+    claims?: {
+        [key: string]: unknown;
+    };
+    source?: ResolutionActorSource | null;
+    /**
+     * Subject
+     */
+    subject: string;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+};
+
+/**
+ * ResolutionActorSource
+ *
+ * How a ``ResolutionActor``'s identity claim was established.
+ *
+ * ``HTTP_AUTH`` is produced only by the server layer from a verified
+ * ``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or
+ * dev-mode HTTP body); ``SYSTEM`` marks runtime-generated actors such as
+ * deterministic approval expiry. Direct SDK callers are a trusted boundary
+ * and may construct system actors; HTTP bodies cannot — the server re-stamps
+ * dev-mode bodies to ``REQUEST`` and rejects them entirely under auth.
+ */
+export type ResolutionActorSource = 'http_auth' | 'request' | 'system';
+
+/**
  * ResumeBody
  */
 export type ResumeBody = {
@@ -1975,6 +2017,7 @@ export type ToolApprovalBody = {
      * Reason
      */
     reason?: string | null;
+    resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
     /**
      * Session Id
@@ -2033,6 +2076,7 @@ export type ToolApprovalRecoveryBody = {
      * Reason
      */
     reason?: string | null;
+    resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
     /**
      * Session Id
@@ -2261,6 +2305,7 @@ export type UserInputRecoveryBody = {
      * Reason
      */
     reason?: string | null;
+    resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
     /**
      * Session Id
@@ -2318,6 +2363,7 @@ export type UserInputResolveBody = {
     metadata?: {
         [key: string]: unknown;
     };
+    resolved_by?: ResolutionActor | null;
     retry_policy?: RetryPolicy | null;
     /**
      * Session Id
