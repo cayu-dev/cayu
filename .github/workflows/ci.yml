@@ -50,6 +50,8 @@ jobs:
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --frozen --extra dev --extra server --python ${{ matrix.python-version }}
       - run: uv run pytest -q
+        env:
+          CAYU_REQUIRE_POSTGRES: "1"
 
   lockfile:
     name: Lockfile sync

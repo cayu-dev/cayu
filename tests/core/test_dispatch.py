@@ -431,10 +431,6 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
         assert reloaded.worker_id == "worker_b"  # still the reclaimer's
 
 
-@pytest.mark.skipif(
-    not os.environ.get("CAYU_TEST_POSTGRES_DSN"),
-    reason="requires CAYU_TEST_POSTGRES_DSN for the real SKIP-LOCKED claim path",
-)
 def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> None:
     # In-memory sessions + a real PostgresTaskStore queue: two concurrent workers must
     # claim distinct dispatch tasks through the actual FOR UPDATE SKIP LOCKED path. A
