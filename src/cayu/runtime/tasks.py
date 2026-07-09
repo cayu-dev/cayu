@@ -153,6 +153,7 @@ class TaskCreate(BaseModel):
 class TaskQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    q: str | None = None
     status: TaskStatus | None = None
     type: str | None = None
     session_id: str | None = None
@@ -162,7 +163,7 @@ class TaskQuery(BaseModel):
     offset: StrictInt = Field(default=0, ge=0)
     order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
 
-    @field_validator("type", "session_id", "parent_task_id", "assigned_agent_name")
+    @field_validator("q", "type", "session_id", "parent_task_id", "assigned_agent_name")
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -742,6 +743,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
     if type(query) is not TaskQuery:
         raise TypeError("Task queries must be TaskQuery instances.")
     return TaskQuery(
+        q=query.q,
         status=query.status,
         type=query.type,
         session_id=query.session_id,
@@ -854,6 +856,8 @@ def _raise_task_claim_attach_error(
 
 
 def _task_matches(task: Task, query: TaskQuery) -> bool:
+    if query.q is not None and not _task_matches_search(task, query.q):
+        return False
     if query.status is not None and task.status != query.status:
         return False
     if query.type is not None and task.type != query.type:
@@ -868,6 +872,23 @@ def _task_matches(task: Task, query: TaskQuery) -> bool:
     )
 
 
+def _task_matches_search(task: Task, query: str) -> bool:
+    needle = query.casefold()
+    haystacks = (
+        task.id,
+        task.type,
+        task.title,
+        task.description,
+        task.status.value,
+        task.session_id,
+        task.parent_task_id,
+        task.assigned_agent_name,
+        task.worker_id,
+        task.status_reason,
+    )
+    return any(value is not None and needle in value.casefold() for value in haystacks)
+
+
 def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
     if query.type is not None and task.type != query.type:
         return False
@@ -880,6 +901,8 @@ def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
 
 
 def _ensure_claim_query_supported(query: TaskQuery) -> None:
+    if query.q is not None:
+        raise ValueError("Task claim queries do not support q.")
     if query.session_id is not None:
         raise ValueError("Task claim queries do not support session_id.")
     if query.limit != TaskQuery.model_fields["limit"].default:

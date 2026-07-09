@@ -283,25 +283,25 @@ class ApiTaskListItem(ApiBaseModel):
     id: str
     type: str
     title: str | None
+    description: str | None
     status: str
     status_reason: str | None
     status_payload: dict[str, Any] | None
     session_id: str | None
+    parent_task_id: str | None
+    assigned_agent_name: str | None
     worker_id: str | None
     lease_expires_at: str | None
     created_at: str
+    updated_at: str
     completed_at: str | None
 
 
 class ApiTaskDetail(ApiTaskListItem):
-    description: str | None
-    parent_task_id: str | None
-    assigned_agent_name: str | None
     input: dict[str, Any]
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     metadata: dict[str, Any]
-    updated_at: str
     started_at: str | None
 
 

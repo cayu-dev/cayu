@@ -59,7 +59,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tasks import Task, TaskCreate, TaskQuery, TaskStatus
+from cayu.runtime.tasks import Task, TaskCreate, TaskOrder, TaskQuery, TaskStatus
 from cayu.runtime.usage import (
     CacheUsageMetrics,
     CausalBudgetUsageSummary,
@@ -695,13 +695,17 @@ def _serialize_task_list_item(task: Task) -> dict[str, Any]:
         "id": task.id,
         "type": task.type,
         "title": task.title,
+        "description": task.description,
         "status": task.status.value,
         "status_reason": task.status_reason,
         "status_payload": task.status_payload,
         "session_id": task.session_id,
+        "parent_task_id": task.parent_task_id,
+        "assigned_agent_name": task.assigned_agent_name,
         "worker_id": task.worker_id,
         "lease_expires_at": (task.lease_expires_at.isoformat() if task.lease_expires_at else None),
         "created_at": task.created_at.isoformat(),
+        "updated_at": task.updated_at.isoformat(),
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
     }
 
@@ -709,14 +713,10 @@ def _serialize_task_list_item(task: Task) -> dict[str, Any]:
 def _serialize_task_detail(task: Task) -> dict[str, Any]:
     return {
         **_serialize_task_list_item(task),
-        "description": task.description,
-        "parent_task_id": task.parent_task_id,
-        "assigned_agent_name": task.assigned_agent_name,
         "input": task.input,
         "result": task.result,
         "error": task.error,
         "metadata": task.metadata,
-        "updated_at": task.updated_at.isoformat(),
         "started_at": task.started_at.isoformat() if task.started_at else None,
     }
 
@@ -1827,11 +1827,13 @@ def create_router(
 
     @router.get("/tasks", response_model=list[ApiTaskListItem], dependencies=protected)
     async def list_tasks(
+        q: str | None = None,
         status: TaskStatus | None = None,
         task_type: str | None = Query(default=None, alias="type"),
         session_id: str | None = None,
         parent_task_id: str | None = None,
         assigned_agent_name: str | None = None,
+        order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC,
         limit: int = 50,
         offset: int = 0,
     ):
@@ -1839,11 +1841,13 @@ def create_router(
             return []
         try:
             query = TaskQuery(
+                q=q,
                 status=status,
                 type=task_type,
                 session_id=session_id,
                 parent_task_id=parent_task_id,
                 assigned_agent_name=assigned_agent_name,
+                order_by=order_by,
                 limit=limit,
                 offset=offset,
             )

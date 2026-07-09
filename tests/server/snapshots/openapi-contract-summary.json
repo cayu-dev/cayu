@@ -1292,22 +1292,22 @@
         "id",
         "type",
         "title",
+        "description",
         "status",
         "status_reason",
         "status_payload",
         "session_id",
+        "parent_task_id",
+        "assigned_agent_name",
         "worker_id",
         "lease_expires_at",
         "created_at",
+        "updated_at",
         "completed_at",
-        "description",
-        "parent_task_id",
-        "assigned_agent_name",
         "input",
         "result",
         "error",
         "metadata",
-        "updated_at",
         "started_at"
       ],
       "title": "ApiTaskDetail",
@@ -1316,6 +1316,17 @@
     "ApiTaskListItem": {
       "additionalProperties": false,
       "properties": {
+        "assigned_agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assigned Agent Name"
+        },
         "completed_at": {
           "anyOf": [
             {
@@ -1331,6 +1342,17 @@
           "title": "Created At",
           "type": "string"
         },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
         "id": {
           "title": "Id",
           "type": "string"
@@ -1345,6 +1367,17 @@
             }
           ],
           "title": "Lease Expires At"
+        },
+        "parent_task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Task Id"
         },
         "session_id": {
           "anyOf": [
@@ -1399,6 +1432,10 @@
           "title": "Type",
           "type": "string"
         },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
         "worker_id": {
           "anyOf": [
             {
@@ -1415,13 +1452,17 @@
         "id",
         "type",
         "title",
+        "description",
         "status",
         "status_reason",
         "status_payload",
         "session_id",
+        "parent_task_id",
+        "assigned_agent_name",
         "worker_id",
         "lease_expires_at",
         "created_at",
+        "updated_at",
         "completed_at"
       ],
       "title": "ApiTaskListItem",
@@ -3514,6 +3555,16 @@
       },
       "title": "TaskHoldBody",
       "type": "object"
+    },
+    "TaskOrder": {
+      "enum": [
+        "created_at_asc",
+        "created_at_desc",
+        "updated_at_asc",
+        "updated_at_desc"
+      ],
+      "title": "TaskOrder",
+      "type": "string"
     },
     "TaskStatus": {
       "enum": [
@@ -5975,6 +6026,15 @@
           },
           {
             "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TaskOrder",
+              "default": "updated_at_desc"
+            }
+          },
+          {
+            "in": "query",
             "name": "parent_task_id",
             "required": false,
             "schema": {
@@ -5987,6 +6047,22 @@
                 }
               ],
               "title": "Parent Task Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
             }
           },
           {

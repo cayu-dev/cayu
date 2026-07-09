@@ -1629,6 +1629,25 @@ class SQLiteTaskStore(TaskStore):
         clauses: list[str] = []
         params: list[object] = []
 
+        if query.q is not None:
+            like = _like_contains_pattern(query.q)
+            clauses.append(
+                """
+                (
+                    id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR type COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR title COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR description COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR status COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR session_id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR parent_task_id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR assigned_agent_name COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR worker_id COLLATE NOCASE LIKE ? ESCAPE '\\'
+                    OR status_reason COLLATE NOCASE LIKE ? ESCAPE '\\'
+                )
+                """
+            )
+            params.extend([like] * 10)
         if query.status is not None:
             clauses.append("status = ?")
             params.append(str(query.status))

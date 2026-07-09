@@ -6,6 +6,7 @@ import type {
   ApiSessionBase,
   ApiSessionDetailEvent,
   ApiSessionDetailTranscriptMessage,
+  ApiTaskDetail,
   ApiTaskListItem,
   ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
   GetContractApiContractGetResponse,
@@ -20,9 +21,11 @@ import type {
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
+  ResumeTaskApiTasksTaskIdResumePostResponse,
   SessionsSummaryBody,
   SseErrorEnvelope,
   SseEventEnvelope,
+  TaskHoldBody,
   ToolApprovalBody,
   ToolApprovalDecision,
   UserInputResolveBody,
@@ -55,6 +58,8 @@ export type SessionsSummaryQuery = NonNullable<
 >
 export type SessionsPage = ListSessionsApiSessionsGetResponse
 export type Task = ApiTaskListItem
+export type TaskDetail = ApiTaskDetail
+export type TaskHold = TaskHoldBody
 export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
 export type ApprovalDecision = ToolApprovalDecision
 export type KnowledgeEntry = ApiKnowledgeListItem | ApiReviewedKnowledgeEntry
@@ -115,8 +120,11 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   return res.json() as Promise<T>
 }
 
-function postJson<T>(path: string): Promise<T> {
-  return requestJson<T>(path, { method: "POST" })
+function postJson<T>(path: string, body?: unknown): Promise<T> {
+  return requestJson<T>(path, {
+    method: "POST",
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
 }
 
 async function throwResponseError(response: Response): Promise<never> {
@@ -198,6 +206,27 @@ export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
     throw new Error("Unexpected /tasks response.")
   }
   return tasks as Task[]
+}
+
+export async function pauseTask(taskId: string, body: TaskHold = {}): Promise<TaskDetail> {
+  return postJson(`/tasks/${encodeURIComponent(taskId)}/pause`, body)
+}
+
+export async function blockTask(taskId: string, body: TaskHold = {}): Promise<TaskDetail> {
+  return postJson(`/tasks/${encodeURIComponent(taskId)}/block`, body)
+}
+
+export async function markTaskNeedsAttention(
+  taskId: string,
+  body: TaskHold = {},
+): Promise<TaskDetail> {
+  return postJson(`/tasks/${encodeURIComponent(taskId)}/needs-attention`, body)
+}
+
+export async function resumeTask(taskId: string): Promise<TaskDetail> {
+  return postJson<ResumeTaskApiTasksTaskIdResumePostResponse>(
+    `/tasks/${encodeURIComponent(taskId)}/resume`,
+  )
 }
 
 export async function fetchPendingKnowledge(

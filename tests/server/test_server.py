@@ -400,18 +400,18 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
     assert tasks[0]["status_reason"] is None
     assert tasks[0]["status_payload"] is None
     assert tasks[0]["session_id"] is None
+    assert tasks[0]["parent_task_id"] is None
+    assert tasks[0]["assigned_agent_name"] == "assistant"
     assert tasks[0]["worker_id"] == "worker_a"
     assert tasks[0]["completed_at"] is None
     assert isinstance(tasks[0]["lease_expires_at"], str)
     assert isinstance(tasks[0]["created_at"], str)
-    assert "parent_task_id" not in tasks[0]
-    assert "assigned_agent_name" not in tasks[0]
-    assert "description" not in tasks[0]
+    assert tasks[0]["description"] is None
     assert "input" not in tasks[0]
     assert "result" not in tasks[0]
     assert "error" not in tasks[0]
     assert "metadata" not in tasks[0]
-    assert "updated_at" not in tasks[0]
+    assert isinstance(tasks[0]["updated_at"], str)
 
 
 def test_server_task_list_filters_lifecycle_states() -> None:
@@ -456,6 +456,20 @@ def test_server_task_list_filters_lifecycle_states() -> None:
     assert tasks[0]["status"] == "blocked"
     assert tasks[0]["status_reason"] == "Waiting on upstream import"
     assert tasks[0]["status_payload"] == {"dependency": "import_123"}
+
+    oldest_first_response = client.get(
+        "/api/tasks",
+        params={"order_by": "created_at_asc"},
+    )
+    assert oldest_first_response.status_code == 200
+    assert [task["id"] for task in oldest_first_response.json()] == [
+        "blocked_task",
+        "ready_task",
+    ]
+
+    search_response = client.get("/api/tasks", params={"q": "upstream"})
+    assert search_response.status_code == 200
+    assert [task["id"] for task in search_response.json()] == ["blocked_task"]
 
 
 def test_server_task_lifecycle_endpoints_hold_and_resume_tasks() -> None:

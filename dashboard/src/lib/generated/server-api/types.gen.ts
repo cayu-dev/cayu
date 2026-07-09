@@ -686,6 +686,10 @@ export type ApiTaskDetail = {
  */
 export type ApiTaskListItem = {
     /**
+     * Assigned Agent Name
+     */
+    assigned_agent_name: string | null;
+    /**
      * Completed At
      */
     completed_at: string | null;
@@ -694,6 +698,10 @@ export type ApiTaskListItem = {
      */
     created_at: string;
     /**
+     * Description
+     */
+    description: string | null;
+    /**
      * Id
      */
     id: string;
@@ -701,6 +709,10 @@ export type ApiTaskListItem = {
      * Lease Expires At
      */
     lease_expires_at: string | null;
+    /**
+     * Parent Task Id
+     */
+    parent_task_id: string | null;
     /**
      * Session Id
      */
@@ -727,6 +739,10 @@ export type ApiTaskListItem = {
      * Type
      */
     type: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
     /**
      * Worker Id
      */
@@ -1870,6 +1886,11 @@ export type TaskHoldBody = {
      */
     reason?: string | null;
 };
+
+/**
+ * TaskOrder
+ */
+export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
 
 /**
  * TaskStatus
@@ -3151,6 +3172,10 @@ export type ListTasksApiTasksGetData = {
     path?: never;
     query?: {
         /**
+         * Q
+         */
+        q?: string | null;
+        /**
          * Status
          */
         status?: TaskStatus | null;
@@ -3170,6 +3195,7 @@ export type ListTasksApiTasksGetData = {
          * Assigned Agent Name
          */
         assigned_agent_name?: string | null;
+        order_by?: TaskOrder;
         /**
          * Limit
          */

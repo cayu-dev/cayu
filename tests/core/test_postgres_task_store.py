@@ -228,6 +228,12 @@ def test_postgres_task_store_list_tasks_with_filters_and_pagination(postgres_dsn
         )
         completed_tasks = await store.list_tasks(TaskQuery(status=TaskStatus.COMPLETED))
         child_tasks = await store.list_tasks(TaskQuery(parent_task_id="task_2"))
+        search_tasks = await store.list_tasks(
+            TaskQuery(q="invoice", order_by=TaskOrder.CREATED_AT_ASC)
+        )
+        search_parent_tasks = await store.list_tasks(
+            TaskQuery(q="TASK_2", order_by=TaskOrder.CREATED_AT_ASC)
+        )
         paged_tasks = await store.list_tasks(
             TaskQuery(limit=1, offset=1, order_by=TaskOrder.CREATED_AT_ASC)
         )
@@ -236,6 +242,8 @@ def test_postgres_task_store_list_tasks_with_filters_and_pagination(postgres_dsn
         assert [t.id for t in invoice_agent_tasks] == ["task_1", "task_2"]
         assert [t.id for t in completed_tasks] == ["task_2"]
         assert [t.id for t in child_tasks] == ["task_3"]
+        assert [t.id for t in search_tasks] == ["task_1", "task_2"]
+        assert [t.id for t in search_parent_tasks] == ["task_2", "task_3"]
         assert [t.id for t in paged_tasks] == ["task_2"]
 
     _run(postgres_dsn, ops)

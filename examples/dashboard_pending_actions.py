@@ -31,6 +31,8 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
     StaticToolPolicy,
+    TaskCreate,
+    TaskQuery,
     Tool,
     ToolContext,
     ToolEffect,
@@ -368,6 +370,102 @@ async def seed_pending_knowledge(store: SQLiteKnowledgeStore) -> None:
     print(f"Seeded pending knowledge entries: {len(entries)}", flush=True)
 
 
+async def seed_tasks(app: CayuApp) -> None:
+    if app.task_store is None:
+        return
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_review_invoice",
+            type="review",
+            title="Review invoice exception",
+            assigned_agent_name="demo-completed",
+            input={"invoice_id": "inv_demo_42", "amount": 1280},
+        )
+    )
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_billing_export",
+            type="sync",
+            title="Wait for billing export",
+            assigned_agent_name="demo-failure",
+            input={"system": "billing"},
+        )
+    )
+    await app.block_task(
+        "queue_billing_export",
+        reason="Waiting on upstream billing export",
+        payload={"dependency": "billing_export_2026_07_08"},
+    )
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_missing_target",
+            type="deploy",
+            title="Resolve deployment target",
+            assigned_agent_name="demo-approval",
+            input={"service": "payments-api"},
+        )
+    )
+    await app.mark_task_needs_attention(
+        "queue_missing_target",
+        reason="Operator must choose staging or production target",
+        payload={"options": ["staging", "production"]},
+    )
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_paused_audit",
+            type="audit",
+            title="Paused nightly audit",
+            assigned_agent_name="demo-user-input",
+            input={"scope": "workspace"},
+        )
+    )
+    await app.pause_task("queue_paused_audit", reason="Paused for dashboard demo")
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_claimed_worker",
+            type="worker_claimed",
+            title="Claimed by worker",
+            assigned_agent_name="demo-completed",
+        )
+    )
+    await app.task_store.claim_task(
+        "worker-demo-1",
+        TaskQuery(type="worker_claimed"),
+        lease_seconds=300,
+    )
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_running_session",
+            type="run",
+            title="Attached approval session",
+            assigned_agent_name="demo-approval",
+        )
+    )
+    await app.task_store.start_task(
+        "queue_running_session",
+        session_id="sess_dashboard_awaiting_approval",
+    )
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_completed_cleanup",
+            type="cleanup",
+            title="Completed cleanup",
+            assigned_agent_name="demo-completed",
+        )
+    )
+    await app.task_store.complete_task("queue_completed_cleanup", {"status": "ok"})
+    await app.create_task(
+        TaskCreate(
+            task_id="queue_failed_check",
+            type="health_check",
+            title="Failed health check",
+            assigned_agent_name="demo-failure",
+        )
+    )
+    await app.task_store.fail_task("queue_failed_check", {"error": "dependency timeout"})
+    print("Seeded task queue examples: 8", flush=True)
+
+
 def build_app() -> CayuApp:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(exist_ok=True)
@@ -408,6 +506,7 @@ def build_app() -> CayuApp:
 def main() -> None:
     app = build_app()
     asyncio.run(seed_sessions(app))
+    asyncio.run(seed_tasks(app))
     knowledge_store = app.knowledge_store
     assert isinstance(knowledge_store, SQLiteKnowledgeStore)
     asyncio.run(seed_pending_knowledge(knowledge_store))

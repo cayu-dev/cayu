@@ -4292,6 +4292,25 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         clauses: list[str] = []
         params: list[object] = []
 
+        if query.q is not None:
+            like = _ilike_contains_pattern(query.q)
+            clauses.append(
+                """
+                (
+                    id ILIKE %s ESCAPE '\\'
+                    OR type ILIKE %s ESCAPE '\\'
+                    OR title ILIKE %s ESCAPE '\\'
+                    OR description ILIKE %s ESCAPE '\\'
+                    OR status ILIKE %s ESCAPE '\\'
+                    OR session_id ILIKE %s ESCAPE '\\'
+                    OR parent_task_id ILIKE %s ESCAPE '\\'
+                    OR assigned_agent_name ILIKE %s ESCAPE '\\'
+                    OR worker_id ILIKE %s ESCAPE '\\'
+                    OR status_reason ILIKE %s ESCAPE '\\'
+                )
+                """
+            )
+            params.extend([like] * 10)
         if query.status is not None:
             clauses.append("status = %s")
             params.append(str(query.status))

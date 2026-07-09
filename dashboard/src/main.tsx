@@ -10,6 +10,7 @@ import { KnowledgePage } from "./routes/knowledge"
 import { RunPage } from "./routes/run"
 import { SessionDetailPage } from "./routes/session-detail"
 import { SessionsPage } from "./routes/sessions"
+import { TasksPage } from "./routes/tasks"
 import { UsagePage } from "./routes/usage"
 
 const queryClient = new QueryClient()
@@ -34,6 +35,12 @@ const usageRoute = createRoute({
   component: UsagePage,
 })
 
+const tasksRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/tasks",
+  component: TasksPage,
+})
+
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
@@ -56,6 +63,7 @@ const routeTree = rootRoute.addChildren([
   dashboardRoute,
   sessionsRoute,
   usageRoute,
+  tasksRoute,
   sessionDetailRoute,
   knowledgeRoute,
   runRoute,

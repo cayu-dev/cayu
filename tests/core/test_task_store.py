@@ -526,6 +526,10 @@ def test_task_stores_validate_worker_lease_inputs(store_factory: StoreFactory, t
             await store.heartbeat("task_validate_worker", "worker_a", extend_seconds=0)
         with pytest.raises(ValueError, match="max_reclaims must be >= 1"):
             await store.reclaim_expired(max_reclaims=0)
+        with pytest.raises(ValueError, match="do not support q"):
+            await store.claim_task("worker_b", TaskQuery(q="invoice"))
+        with pytest.raises(ValueError, match="do not support q"):
+            await store.reclaim_expired(query=TaskQuery(q="invoice"))
         with pytest.raises(ValueError, match="do not support session_id"):
             await store.claim_task("worker_b", TaskQuery(session_id="sess_1"))
         with pytest.raises(ValueError, match="do not support session_id"):
@@ -663,6 +667,42 @@ def test_task_stores_claim_is_fifo_regardless_of_display_order(
         )
         assert second is not None
         assert second.id == "task_new"
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_search_tasks(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(
+            TaskCreate(
+                task_id="task_billing_export",
+                type="sync",
+                title="Wait for billing export",
+                assigned_agent_name="billing-agent",
+            )
+        )
+        await store.create_task(
+            TaskCreate(
+                task_id="task_invoice_review",
+                type="review",
+                title="Review invoice",
+                assigned_agent_name="invoice-agent",
+            )
+        )
+        await store.block_task("task_billing_export", reason="Waiting on upstream export")
+
+        by_title = await store.list_tasks(TaskQuery(q="billing", order_by=TaskOrder.CREATED_AT_ASC))
+        assert [task.id for task in by_title] == ["task_billing_export"]
+
+        by_reason = await store.list_tasks(TaskQuery(q="UPSTREAM", order_by=TaskOrder.CREATED_AT_ASC))
+        assert [task.id for task in by_reason] == ["task_billing_export"]
+
+        by_agent = await store.list_tasks(TaskQuery(q="invoice-agent"))
+        assert [task.id for task in by_agent] == ["task_invoice_review"]
         await _close_store(store)
 
     asyncio.run(run_store_operations())
