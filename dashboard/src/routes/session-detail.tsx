@@ -22,11 +22,13 @@ import {
 import { useEffect, useRef, useState } from "react"
 import { Page, PayloadViewer } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
-import { Button } from "../components/ui/button"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Input } from "../components/ui/input"
 import {
   type PendingAction as ApiPendingAction,
+  type ArtifactSummary,
+  fetchArtifacts,
   fetchPendingActions,
   fetchSession,
   fetchSessionSummary,
@@ -42,12 +44,14 @@ import {
   streamResume,
 } from "../lib/api"
 import {
+  formatBytes,
   formatCount,
   formatDateTime,
   formatTime,
   modelUsagePayload,
   numericValue,
 } from "../lib/format"
+import { dashboardPath } from "../lib/links"
 import {
   isFailureEventType,
   latestFailureEvent,
@@ -729,6 +733,53 @@ function transcriptPartKey(index: number) {
   return String(index)
 }
 
+function SessionArtifacts({
+  artifacts,
+  sessionId,
+}: {
+  artifacts: ArtifactSummary[]
+  sessionId: string
+}) {
+  if (artifacts.length === 0) return null
+  return (
+    <Card className="flex-shrink-0">
+      <CardHeader className="flex flex-row items-start justify-between gap-3">
+        <div>
+          <CardTitle>Session Artifacts</CardTitle>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Files and generated artifacts linked to this session.
+          </p>
+        </div>
+        <a
+          href={dashboardPath("/artifacts", { session_id: sessionId })}
+          className={buttonVariants({ variant: "outline", size: "sm" })}
+        >
+          Open artifacts
+        </a>
+      </CardHeader>
+      <CardContent className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+        {artifacts.slice(0, 6).map((artifact) => (
+          <a
+            key={`${artifact.artifact_store_id}:${artifact.id}`}
+            href={dashboardPath("/artifacts", {
+              artifact_store_id: artifact.artifact_store_id,
+              session_id: sessionId,
+              q: artifact.id,
+            })}
+            className="block min-w-0 rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
+          >
+            <div className="truncate text-sm font-medium">{artifact.filename}</div>
+            <div className="mt-1 flex min-w-0 items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span className="truncate">{artifact.content_type}</span>
+              <span className="shrink-0">{formatBytes(artifact.size_bytes)}</span>
+            </div>
+          </a>
+        ))}
+      </CardContent>
+    </Card>
+  )
+}
+
 export function SessionDetailPage({ live }: { live?: boolean }) {
   const { sessionId } = useParams({ from: "/sessions/$sessionId" })
   const { data, error, isError, isLoading, refetch } = useQuery({
@@ -747,6 +798,12 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     queryFn: () => fetchPendingActions({ session_id: sessionId, limit: 1 }),
     refetchInterval: live ? 2000 : 5000,
     enabled: !isError,
+  })
+  const sessionArtifacts = useQuery({
+    queryKey: ["session-artifacts", sessionId],
+    queryFn: () => fetchArtifacts({ session_id: sessionId, limit: 6 }),
+    enabled: !isError,
+    staleTime: 10_000,
   })
 
   const [resumePrompt, setResumePrompt] = useState("")
@@ -1018,6 +1075,28 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
             {session.provider_name && <Badge variant="outline">{session.provider_name}</Badge>}
             {session.model && <Badge variant="outline">{session.model}</Badge>}
           </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <a
+              href={dashboardPath("/agents", { q: session.agent_name })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Agent
+            </a>
+            {session.environment_name && (
+              <a
+                href={dashboardPath("/environments", { q: session.environment_name })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Environment
+              </a>
+            )}
+            <a
+              href={dashboardPath("/artifacts", { session_id: session.id })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Artifacts
+            </a>
+          </div>
         </div>
       </div>
 
@@ -1086,6 +1165,8 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           />
         </CardContent>
       </Card>
+
+      <SessionArtifacts artifacts={sessionArtifacts.data?.artifacts ?? []} sessionId={session.id} />
 
       {pendingAction && (
         <PendingActionBanner

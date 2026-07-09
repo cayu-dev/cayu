@@ -33,6 +33,7 @@ import {
   type TaskListQuery,
 } from "../lib/api"
 import { formatDateTime } from "../lib/format"
+import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
 
 type TaskStatusFilter = "all" | NonNullable<TaskListQuery["status"]>
@@ -137,7 +138,11 @@ function taskMatchesQuery(task: TaskDetail, query: TaskListQuery) {
 
 export function TasksPage() {
   const queryClient = useQueryClient()
-  const [search, setSearch] = useState("")
+  const [search, setSearch] = useState(() => currentQueryParam("q"))
+  const [assignedAgentFilter, setAssignedAgentFilter] = useState(() =>
+    currentQueryParam("assigned_agent_name"),
+  )
+  const [sessionFilter, setSessionFilter] = useState(() => currentQueryParam("session_id"))
   const [status, setStatus] = useState<TaskStatusFilter>("all")
   const [orderBy, setOrderBy] = useState<TaskOrder>("updated_at_desc")
   const [offset, setOffset] = useState(0)
@@ -148,12 +153,14 @@ export function TasksPage() {
   const query = useMemo<TaskListQuery>(
     () => ({
       q: optionalFilter(debouncedSearch),
+      assigned_agent_name: optionalFilter(assignedAgentFilter),
+      session_id: optionalFilter(sessionFilter),
       status: status === "all" ? undefined : status,
       order_by: orderBy,
       limit: PAGE_LIMIT,
       offset,
     }),
-    [debouncedSearch, offset, orderBy, status],
+    [assignedAgentFilter, debouncedSearch, offset, orderBy, sessionFilter, status],
   )
 
   const tasks = useQuery({
@@ -173,7 +180,11 @@ export function TasksPage() {
   const selectedTask = taskDetail.data ?? selectedListTask
   const hasNextPage = taskList.length === PAGE_LIMIT
   const hasPreviousPage = offset > 0
-  const hasFilters = status !== "all" || search.trim() !== ""
+  const hasFilters =
+    status !== "all" ||
+    search.trim() !== "" ||
+    assignedAgentFilter.trim() !== "" ||
+    sessionFilter.trim() !== ""
 
   useEffect(() => {
     if (!selectedTaskId && taskList.length > 0) {
@@ -224,9 +235,12 @@ export function TasksPage() {
 
   function clearFilters() {
     setSearch("")
+    setAssignedAgentFilter("")
+    setSessionFilter("")
     setStatus("all")
     setOrderBy("updated_at_desc")
     setOffset(0)
+    replaceDashboardLocation("/tasks")
   }
 
   function runAction(nextAction: TaskAction, task: Task) {
@@ -295,6 +309,12 @@ export function TasksPage() {
             <Button variant="outline" size="sm" onClick={clearFilters}>
               Clear
             </Button>
+          )}
+          {(assignedAgentFilter || sessionFilter) && (
+            <div className="flex min-w-full flex-wrap gap-2 pt-1 text-xs">
+              {assignedAgentFilter && <Badge variant="outline">agent: {assignedAgentFilter}</Badge>}
+              {sessionFilter && <Badge variant="outline">session: {sessionFilter}</Badge>}
+            </div>
           )}
         </div>
       </DataCard>
@@ -432,9 +452,16 @@ export function TasksPage() {
                 </div>
                 <div className="flex items-start justify-between gap-3">
                   <span className="text-muted-foreground">Agent</span>
-                  <span className="max-w-56 truncate font-mono text-xs">
-                    {selectedTask.assigned_agent_name ?? "-"}
-                  </span>
+                  {selectedTask.assigned_agent_name ? (
+                    <a
+                      href={dashboardPath("/agents", { q: selectedTask.assigned_agent_name })}
+                      className="max-w-56 truncate font-mono text-xs text-primary hover:underline"
+                    >
+                      {selectedTask.assigned_agent_name}
+                    </a>
+                  ) : (
+                    <span className="max-w-56 truncate font-mono text-xs">-</span>
+                  )}
                 </div>
                 {selectedTask.parent_task_id && (
                   <div className="flex items-start justify-between gap-3">

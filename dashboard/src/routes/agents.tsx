@@ -9,6 +9,7 @@ import {
   StateMessage,
 } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
 import {
   Table,
@@ -18,8 +19,17 @@ import {
   TableHeader,
   TableRow,
 } from "../components/ui/table"
-import { type AgentSummary, fetchAgents, type ToolSummary } from "../lib/api"
-import { formatCount } from "../lib/format"
+import {
+  type AgentSummary,
+  fetchAgents,
+  fetchSessionsSummary,
+  fetchTasks,
+  type SessionsSummary,
+  type Task,
+  type ToolSummary,
+} from "../lib/api"
+import { formatCount, formatDateTime } from "../lib/format"
+import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
@@ -70,7 +80,55 @@ function ToolRow({ tool }: { tool: ToolSummary }) {
   )
 }
 
-function AgentDetail({ agent }: { agent: AgentSummary | null }) {
+type SessionSummaryItem = SessionsSummary["sessions"][number]
+
+function RecentSessionLink({ item }: { item: SessionSummaryItem }) {
+  return (
+    <a
+      href={dashboardPath(`/sessions/${encodeURIComponent(item.session.id)}`)}
+      className="block rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <span className="truncate font-mono text-xs font-medium">{item.session.id}</span>
+        <Badge variant="outline">{item.session.status}</Badge>
+      </div>
+      <div className="mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span>{formatDateTime(item.session.updated_at)}</span>
+        <span>{formatCount(item.events.total_events)} events</span>
+        {item.events.latest_event && <span>{item.events.latest_event.type}</span>}
+      </div>
+    </a>
+  )
+}
+
+function TaskLink({ task }: { task: Task }) {
+  return (
+    <a
+      href={dashboardPath("/tasks", { q: task.id })}
+      className="block rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <span className="truncate text-sm font-medium">{task.title || task.type}</span>
+        <Badge variant="outline">{task.status}</Badge>
+      </div>
+      <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{task.id}</div>
+    </a>
+  )
+}
+
+function AgentDetail({
+  agent,
+  relatedSessions,
+  relatedSessionsLoading,
+  relatedTasks,
+  relatedTasksLoading,
+}: {
+  agent: AgentSummary | null
+  relatedSessions: SessionsSummary | undefined
+  relatedSessionsLoading: boolean
+  relatedTasks: Task[] | undefined
+  relatedTasksLoading: boolean
+}) {
   if (agent === null) {
     return (
       <StateMessage className="py-16">Select an agent to inspect its runtime shape.</StateMessage>
@@ -141,6 +199,71 @@ function AgentDetail({ agent }: { agent: AgentSummary | null }) {
       </section>
 
       <section className="rounded-md border border-border">
+        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
+          <div>
+            <h3 className="text-sm font-semibold">Related Work</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Recent sessions and queued tasks using this agent.
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <a
+              href={dashboardPath("/sessions", { agent_name: agent.name })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Sessions
+            </a>
+            <a
+              href={dashboardPath("/tasks", { assigned_agent_name: agent.name })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Tasks
+            </a>
+          </div>
+        </div>
+        <div className="grid gap-4 p-4 lg:grid-cols-2">
+          <div>
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Recent sessions
+            </div>
+            <div className="space-y-2">
+              {relatedSessionsLoading ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Loading sessions...
+                </StateMessage>
+              ) : (relatedSessions?.sessions ?? []).length > 0 ? (
+                relatedSessions?.sessions.map((item) => (
+                  <RecentSessionLink key={item.session.id} item={item} />
+                ))
+              ) : (
+                <StateMessage className="rounded-md border border-border py-6">
+                  No sessions found for this agent.
+                </StateMessage>
+              )}
+            </div>
+          </div>
+          <div>
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Queue tasks
+            </div>
+            <div className="space-y-2">
+              {relatedTasksLoading ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Loading tasks...
+                </StateMessage>
+              ) : (relatedTasks ?? []).length > 0 ? (
+                relatedTasks?.map((task) => <TaskLink key={task.id} task={task} />)
+              ) : (
+                <StateMessage className="rounded-md border border-border py-6">
+                  No tasks assigned to this agent.
+                </StateMessage>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-md border border-border">
         <div className="border-b border-border px-4 py-3">
           <h3 className="text-sm font-semibold">Tools</h3>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -160,7 +283,7 @@ function AgentDetail({ agent }: { agent: AgentSummary | null }) {
 }
 
 export function AgentsPage() {
-  const [search, setSearch] = useState("")
+  const [search, setSearch] = useState(() => currentQueryParam("q"))
   const [selectedAgentName, setSelectedAgentName] = useState<string | null>(null)
   const debouncedSearch = useDebouncedValue(search, 300)
 
@@ -184,6 +307,23 @@ export function AgentsPage() {
 
   const selectedAgent =
     filteredAgents.find((agent) => agent.name === selectedAgentName) ?? filteredAgents[0] ?? null
+  const relatedSessions = useQuery({
+    queryKey: ["agent-related-sessions", selectedAgent?.name],
+    queryFn: () =>
+      fetchSessionsSummary({
+        agent_name: selectedAgent?.name,
+        limit: 5,
+        order_by: "updated_at_desc",
+      }),
+    enabled: selectedAgent !== null,
+    staleTime: 10_000,
+  })
+  const relatedTasks = useQuery({
+    queryKey: ["agent-related-tasks", selectedAgent?.name],
+    queryFn: () => fetchTasks({ assigned_agent_name: selectedAgent?.name, limit: 5 }),
+    enabled: selectedAgent !== null,
+    staleTime: 10_000,
+  })
   const error = agents.error instanceof Error ? agents.error.message : null
 
   return (
@@ -199,14 +339,28 @@ export function AgentsPage() {
           description={`${formatCount(agents.data?.total_count)} configured agents`}
         >
           <div className="border-b border-border p-4">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search agents, models, providers, tools..."
-                className="pl-8"
-              />
+            <div className="flex min-w-0 gap-2">
+              <div className="relative min-w-0 flex-1">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search agents, models, providers, tools..."
+                  className="pl-8"
+                />
+              </div>
+              {search.trim() !== "" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setSearch("")
+                    replaceDashboardLocation("/agents")
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
             </div>
           </div>
           {agents.isLoading ? (
@@ -259,7 +413,13 @@ export function AgentsPage() {
         </DataCard>
 
         <DataCard title="Agent Detail" description="Read-only runtime contract.">
-          <AgentDetail agent={selectedAgent} />
+          <AgentDetail
+            agent={selectedAgent}
+            relatedSessions={relatedSessions.data}
+            relatedSessionsLoading={relatedSessions.isLoading}
+            relatedTasks={relatedTasks.data}
+            relatedTasksLoading={relatedTasks.isLoading}
+          />
         </DataCard>
       </div>
     </Page>

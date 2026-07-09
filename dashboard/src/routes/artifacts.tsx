@@ -10,7 +10,7 @@ import {
   StateMessage,
 } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
-import { Button } from "../components/ui/button"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
 import {
   Table,
@@ -27,7 +27,8 @@ import {
   fetchArtifact,
   fetchArtifacts,
 } from "../lib/api"
-import { formatCount, formatDateTime } from "../lib/format"
+import { formatBytes, formatCount, formatDateTime } from "../lib/format"
+import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
 
 type ArtifactScopeFilter = "all" | "session" | "environment"
@@ -43,13 +44,6 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
     return () => window.clearTimeout(handle)
   }, [delayMs, value])
   return debounced
-}
-
-function formatBytes(value: number | null | undefined) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "-"
-  if (value < 1024) return `${formatCount(value)} B`
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function artifactMatchesSearch(artifact: ArtifactSummary, query: string) {
@@ -176,6 +170,11 @@ function scopeFilter(value: string): ArtifactScopeFilter {
   return "all"
 }
 
+function optionalFilter(value: string) {
+  const trimmed = value.trim()
+  return trimmed === "" ? undefined : trimmed
+}
+
 function ArtifactPreview({ read }: { read: ArtifactRead | null }) {
   if (read === null) {
     return (
@@ -284,18 +283,35 @@ function ArtifactDetail({
             }}
             maxHeight="max-h-96"
           />
-          {artifact.session_id && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-3"
-              render={
-                <Link to="/sessions/$sessionId" params={{ sessionId: artifact.session_id }} />
-              }
-            >
-              Open session
-            </Button>
-          )}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {artifact.session_id && (
+              <Button
+                variant="outline"
+                size="sm"
+                render={
+                  <Link to="/sessions/$sessionId" params={{ sessionId: artifact.session_id }} />
+                }
+              >
+                Session
+              </Button>
+            )}
+            {artifact.agent_name && (
+              <a
+                href={dashboardPath("/agents", { q: artifact.agent_name })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Agent
+              </a>
+            )}
+            {artifact.environment_name && (
+              <a
+                href={dashboardPath("/environments", { q: artifact.environment_name })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Environment
+              </a>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -303,8 +319,18 @@ function ArtifactDetail({
 }
 
 export function ArtifactsPage() {
-  const [search, setSearch] = useState("")
-  const [scope, setScope] = useState<ArtifactScopeFilter>("all")
+  const [search, setSearch] = useState(() => currentQueryParam("q"))
+  const [scope, setScope] = useState<ArtifactScopeFilter>(() =>
+    scopeFilter(currentQueryParam("scope")),
+  )
+  const [artifactStoreId, setArtifactStoreId] = useState(() =>
+    currentQueryParam("artifact_store_id"),
+  )
+  const [sessionFilter, setSessionFilter] = useState(() => currentQueryParam("session_id"))
+  const [agentFilter, setAgentFilter] = useState(() => currentQueryParam("agent_name"))
+  const [environmentFilter, setEnvironmentFilter] = useState(() =>
+    currentQueryParam("environment_name"),
+  )
   const [offset, setOffset] = useState(0)
   const [selectedArtifactKey, setSelectedArtifactKey] = useState<string | null>(null)
   const debouncedSearch = useDebouncedValue(search, 300)
@@ -313,9 +339,13 @@ export function ArtifactsPage() {
     () => ({
       limit: PAGE_LIMIT,
       offset,
+      agent_name: optionalFilter(agentFilter),
+      artifact_store_id: optionalFilter(artifactStoreId),
+      environment_name: optionalFilter(environmentFilter),
+      session_id: optionalFilter(sessionFilter),
       scope: scope === "all" ? undefined : scope,
     }),
-    [offset, scope],
+    [agentFilter, artifactStoreId, environmentFilter, offset, scope, sessionFilter],
   )
 
   const artifacts = useQuery({
@@ -359,6 +389,23 @@ export function ArtifactsPage() {
   const listError = artifacts.error instanceof Error ? artifacts.error.message : null
   const readError = read.error instanceof Error ? read.error.message : null
   const SelectedIcon = selectedArtifact ? artifactIcon(selectedArtifact) : FileArchive
+  const hasServerFilters =
+    artifactStoreId.trim() !== "" ||
+    sessionFilter.trim() !== "" ||
+    agentFilter.trim() !== "" ||
+    environmentFilter.trim() !== ""
+
+  function clearServerFilters() {
+    setArtifactStoreId("")
+    setSessionFilter("")
+    setAgentFilter("")
+    setEnvironmentFilter("")
+    setOffset(0)
+    replaceDashboardLocation("/artifacts", {
+      q: optionalFilter(search),
+      scope: scope === "all" ? undefined : scope,
+    })
+  }
 
   return (
     <Page>
@@ -385,6 +432,11 @@ export function ArtifactsPage() {
                 <option value="session">Session</option>
                 <option value="environment">Environment</option>
               </select>
+              {hasServerFilters && (
+                <Button variant="outline" size="sm" onClick={clearServerFilters}>
+                  Clear links
+                </Button>
+              )}
               <PaginationControls
                 data={artifacts.data}
                 onPrevious={() => setOffset((value) => clampOffset(value - PAGE_LIMIT))}
@@ -410,6 +462,16 @@ export function ArtifactsPage() {
                 className="pl-8"
               />
             </div>
+            {hasServerFilters && (
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                {artifactStoreId && <Badge variant="outline">store: {artifactStoreId}</Badge>}
+                {sessionFilter && <Badge variant="outline">session: {sessionFilter}</Badge>}
+                {agentFilter && <Badge variant="outline">agent: {agentFilter}</Badge>}
+                {environmentFilter && (
+                  <Badge variant="outline">environment: {environmentFilter}</Badge>
+                )}
+              </div>
+            )}
           </div>
           {artifacts.isLoading ? (
             <StateMessage>Loading artifacts...</StateMessage>

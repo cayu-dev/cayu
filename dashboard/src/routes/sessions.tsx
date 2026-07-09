@@ -16,6 +16,7 @@ import {
 } from "../components/ui/table"
 import { fetchSessionsSummary, type SessionsSummary, type SessionsSummaryQuery } from "../lib/api"
 import { formatDateTime } from "../lib/format"
+import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 
 type SessionDateOrder = "updated_at_desc" | "updated_at_asc" | "created_at_desc" | "created_at_asc"
@@ -88,6 +89,10 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 export function SessionsPage() {
   const [search, setSearch] = useState("")
+  const [agentFilter, setAgentFilter] = useState(() => currentQueryParam("agent_name"))
+  const [environmentFilter, setEnvironmentFilter] = useState(() =>
+    currentQueryParam("environment_name"),
+  )
   const [status, setStatus] = useState<SessionStatusFilter>("all")
   const [debugFilter, setDebugFilter] = useState<DebugFilter>("all")
   const [orderBy, setOrderBy] = useState<SessionDateOrder>("updated_at_desc")
@@ -96,11 +101,13 @@ export function SessionsPage() {
     () => ({
       limit: 100,
       order_by: orderBy,
+      agent_name: optionalFilter(agentFilter),
+      environment_name: optionalFilter(environmentFilter),
       q: optionalFilter(debouncedSearch),
       debug_state: debugFilter === "all" ? undefined : debugFilter,
       status: status === "all" ? undefined : status,
     }),
-    [debouncedSearch, debugFilter, orderBy, status],
+    [agentFilter, debouncedSearch, debugFilter, environmentFilter, orderBy, status],
   )
 
   const {
@@ -115,12 +122,20 @@ export function SessionsPage() {
   const errorMessage = error instanceof Error ? error.message : "Failed to load sessions."
   const list = sessionsPage?.sessions || []
   const totalCount = sessionsPage?.total_count ?? sessionsPage?.session_count ?? list.length
-  const hasFilters = search.trim() !== "" || status !== "all" || debugFilter !== "all"
+  const hasFilters =
+    search.trim() !== "" ||
+    agentFilter.trim() !== "" ||
+    environmentFilter.trim() !== "" ||
+    status !== "all" ||
+    debugFilter !== "all"
 
   function clearFilters() {
     setSearch("")
+    setAgentFilter("")
+    setEnvironmentFilter("")
     setStatus("all")
     setDebugFilter("all")
+    replaceDashboardLocation("/sessions")
   }
 
   return (
@@ -144,7 +159,7 @@ export function SessionsPage() {
             <Input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search sessions..."
+              placeholder="Search sessions, agents, environments, providers, models, labels..."
               className="pl-8"
             />
           </div>
@@ -189,6 +204,14 @@ export function SessionsPage() {
               Clear
             </Button>
           )}
+          {(agentFilter || environmentFilter) && (
+            <div className="flex min-w-full flex-wrap gap-2 pt-1 text-xs">
+              {agentFilter && <Badge variant="outline">agent: {agentFilter}</Badge>}
+              {environmentFilter && (
+                <Badge variant="outline">environment: {environmentFilter}</Badge>
+              )}
+            </div>
+          )}
         </div>
 
         <Table>
@@ -196,8 +219,9 @@ export function SessionsPage() {
             <TableRow>
               <TableHead>Session ID</TableHead>
               <TableHead>Agent</TableHead>
+              <TableHead>Environment</TableHead>
               <TableHead>Status</TableHead>
-              <TableHead>Debug</TableHead>
+              <TableHead>Attention</TableHead>
               <TableHead>Provider</TableHead>
               <TableHead>Model</TableHead>
               <TableHead>Updated</TableHead>
@@ -206,19 +230,19 @@ export function SessionsPage() {
           <TableBody>
             {isLoading ? (
               <TableRow>
-                <TableCell colSpan={7}>
+                <TableCell colSpan={8}>
                   <StateMessage>Loading...</StateMessage>
                 </TableCell>
               </TableRow>
             ) : isError ? (
               <TableRow>
-                <TableCell colSpan={7}>
+                <TableCell colSpan={8}>
                   <StateMessage tone="danger">{errorMessage}</StateMessage>
                 </TableCell>
               </TableRow>
             ) : !list.length ? (
               <TableRow>
-                <TableCell colSpan={7}>
+                <TableCell colSpan={8}>
                   <StateMessage>
                     {hasFilters ? "No sessions match the current filters." : "No sessions yet"}
                   </StateMessage>
@@ -237,6 +261,20 @@ export function SessionsPage() {
                     </Link>
                   </TableCell>
                   <TableCell className="text-sm">{item.session.agent_name}</TableCell>
+                  <TableCell className="max-w-44 truncate text-sm text-muted-foreground">
+                    {item.session.environment_name ? (
+                      <a
+                        href={dashboardPath("/environments", {
+                          q: item.session.environment_name,
+                        })}
+                        className="text-primary hover:underline"
+                      >
+                        {item.session.environment_name}
+                      </a>
+                    ) : (
+                      "-"
+                    )}
+                  </TableCell>
                   <TableCell>
                     <StatusBadge status={item.session.status} />
                   </TableCell>

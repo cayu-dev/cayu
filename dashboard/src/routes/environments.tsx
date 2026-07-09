@@ -9,6 +9,7 @@ import {
   StateMessage,
 } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
 import {
   Table,
@@ -18,8 +19,16 @@ import {
   TableHeader,
   TableRow,
 } from "../components/ui/table"
-import { type EnvironmentSummary, fetchEnvironments } from "../lib/api"
-import { formatCount } from "../lib/format"
+import {
+  type ArtifactSummary,
+  type EnvironmentSummary,
+  fetchArtifacts,
+  fetchEnvironments,
+  fetchSessionsSummary,
+  type SessionsSummary,
+} from "../lib/api"
+import { formatBytes, formatCount, formatDateTime } from "../lib/format"
+import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
@@ -89,7 +98,59 @@ function CapabilityTile({
   )
 }
 
-function EnvironmentDetail({ environment }: { environment: EnvironmentSummary | null }) {
+type SessionSummaryItem = SessionsSummary["sessions"][number]
+
+function RelatedSession({ item }: { item: SessionSummaryItem }) {
+  return (
+    <a
+      href={dashboardPath(`/sessions/${encodeURIComponent(item.session.id)}`)}
+      className="block rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <span className="truncate font-mono text-xs font-medium">{item.session.id}</span>
+        <Badge variant="outline">{item.session.status}</Badge>
+      </div>
+      <div className="mt-1 truncate text-xs text-muted-foreground">
+        {item.session.agent_name} · {formatDateTime(item.session.updated_at)}
+      </div>
+    </a>
+  )
+}
+
+function RelatedArtifact({ artifact }: { artifact: ArtifactSummary }) {
+  return (
+    <a
+      href={dashboardPath("/artifacts", {
+        artifact_store_id: artifact.artifact_store_id,
+        environment_name: artifact.environment_name,
+        q: artifact.id,
+      })}
+      className="block rounded-md border border-border p-3 transition-colors hover:bg-muted/40"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <span className="truncate text-sm font-medium">{artifact.filename}</span>
+        <span className="shrink-0 text-xs text-muted-foreground">
+          {formatBytes(artifact.size_bytes)}
+        </span>
+      </div>
+      <div className="mt-1 truncate font-mono text-xs text-muted-foreground">{artifact.id}</div>
+    </a>
+  )
+}
+
+function EnvironmentDetail({
+  environment,
+  relatedSessions,
+  relatedSessionsLoading,
+  relatedArtifacts,
+  relatedArtifactsLoading,
+}: {
+  environment: EnvironmentSummary | null
+  relatedSessions: SessionsSummary | undefined
+  relatedSessionsLoading: boolean
+  relatedArtifacts: ArtifactSummary[] | undefined
+  relatedArtifactsLoading: boolean
+}) {
   if (environment === null) {
     return (
       <StateMessage className="py-16">
@@ -151,12 +212,82 @@ function EnvironmentDetail({ environment }: { environment: EnvironmentSummary | 
           }
         />
       </div>
+
+      <section className="rounded-md border border-border">
+        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
+          <div>
+            <h3 className="text-sm font-semibold">Related Work</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Sessions and artifacts connected to this environment.
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <a
+              href={dashboardPath("/sessions", { environment_name: environment.name })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Sessions
+            </a>
+            <a
+              href={dashboardPath("/artifacts", { environment_name: environment.name })}
+              className={buttonVariants({ variant: "outline", size: "sm" })}
+            >
+              Artifacts
+            </a>
+          </div>
+        </div>
+        <div className="grid gap-4 p-4 lg:grid-cols-2">
+          <div>
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Recent sessions
+            </div>
+            <div className="space-y-2">
+              {relatedSessionsLoading ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Loading sessions...
+                </StateMessage>
+              ) : (relatedSessions?.sessions ?? []).length > 0 ? (
+                relatedSessions?.sessions.map((item) => (
+                  <RelatedSession key={item.session.id} item={item} />
+                ))
+              ) : (
+                <StateMessage className="rounded-md border border-border py-6">
+                  No sessions found for this environment.
+                </StateMessage>
+              )}
+            </div>
+          </div>
+          <div>
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Recent artifacts
+            </div>
+            <div className="space-y-2">
+              {relatedArtifactsLoading ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Loading artifacts...
+                </StateMessage>
+              ) : (relatedArtifacts ?? []).length > 0 ? (
+                relatedArtifacts?.map((artifact) => (
+                  <RelatedArtifact
+                    key={`${artifact.artifact_store_id}:${artifact.id}`}
+                    artifact={artifact}
+                  />
+                ))
+              ) : (
+                <StateMessage className="rounded-md border border-border py-6">
+                  No artifacts found for this environment.
+                </StateMessage>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   )
 }
 
 export function EnvironmentsPage() {
-  const [search, setSearch] = useState("")
+  const [search, setSearch] = useState(() => currentQueryParam("q"))
   const [selectedEnvironmentName, setSelectedEnvironmentName] = useState<string | null>(null)
   const debouncedSearch = useDebouncedValue(search, 300)
 
@@ -185,6 +316,27 @@ export function EnvironmentsPage() {
     filteredEnvironments.find((environment) => environment.name === selectedEnvironmentName) ??
     filteredEnvironments[0] ??
     null
+  const relatedSessions = useQuery({
+    queryKey: ["environment-related-sessions", selectedEnvironment?.name],
+    queryFn: () =>
+      fetchSessionsSummary({
+        environment_name: selectedEnvironment?.name,
+        limit: 5,
+        order_by: "updated_at_desc",
+      }),
+    enabled: selectedEnvironment !== null,
+    staleTime: 10_000,
+  })
+  const relatedArtifacts = useQuery({
+    queryKey: ["environment-related-artifacts", selectedEnvironment?.name],
+    queryFn: () =>
+      fetchArtifacts({
+        environment_name: selectedEnvironment?.name,
+        limit: 5,
+      }),
+    enabled: selectedEnvironment !== null,
+    staleTime: 10_000,
+  })
   const error = environments.error instanceof Error ? environments.error.message : null
 
   return (
@@ -200,14 +352,28 @@ export function EnvironmentsPage() {
           description={`${formatCount(environments.data?.total_count)} configured environments`}
         >
           <div className="border-b border-border p-4">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search environments, runners, workspaces, stores..."
-                className="pl-8"
-              />
+            <div className="flex min-w-0 gap-2">
+              <div className="relative min-w-0 flex-1">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search environments, runners, workspaces, stores..."
+                  className="pl-8"
+                />
+              </div>
+              {search.trim() !== "" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setSearch("")
+                    replaceDashboardLocation("/environments")
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
             </div>
           </div>
           {environments.isLoading ? (
@@ -259,7 +425,13 @@ export function EnvironmentsPage() {
         </DataCard>
 
         <DataCard title="Environment Detail" description="Read-only runtime wiring.">
-          <EnvironmentDetail environment={selectedEnvironment} />
+          <EnvironmentDetail
+            environment={selectedEnvironment}
+            relatedSessions={relatedSessions.data}
+            relatedSessionsLoading={relatedSessions.isLoading}
+            relatedArtifacts={relatedArtifacts.data?.artifacts}
+            relatedArtifactsLoading={relatedArtifacts.isLoading}
+          />
         </DataCard>
       </div>
     </Page>

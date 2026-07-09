@@ -2064,11 +2064,18 @@ def create_router(
         artifact_store_id: Annotated[str | None, Query()] = None,
         scope: ArtifactScope | None = None,
         session_id: Annotated[str | None, Query()] = None,
+        agent_name: Annotated[str | None, Query()] = None,
         environment_name: Annotated[str | None, Query()] = None,
     ):
         requested_store_id = _clean_optional_query_value(
             artifact_store_id,
             "artifact_store_id",
+        )
+        requested_session_id = _clean_optional_query_value(session_id, "session_id")
+        requested_agent_name = _clean_optional_query_value(agent_name, "agent_name")
+        requested_environment_name = _clean_optional_query_value(
+            environment_name,
+            "environment_name",
         )
         stores = _artifact_stores_by_id(cayu_app)
         if requested_store_id is not None:
@@ -2086,11 +2093,9 @@ def create_router(
         for store_id, store in selected_stores.items():
             page = await store.list(
                 scope=scope,
-                session_id=_clean_optional_query_value(session_id, "session_id"),
-                environment_name=_clean_optional_query_value(
-                    environment_name,
-                    "environment_name",
-                ),
+                session_id=requested_session_id,
+                agent_name=requested_agent_name,
+                environment_name=requested_environment_name,
                 limit=per_store_limit,
             )
             artifacts.extend(

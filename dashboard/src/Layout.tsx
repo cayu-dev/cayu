@@ -21,17 +21,33 @@ import {
 import { dashboardAsset } from "./lib/config"
 import { cn } from "./lib/utils"
 
-const navItems = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/sessions", label: "Sessions", icon: List },
-  { to: "/usage", label: "Usage", icon: BarChart3 },
-  { to: "/tasks", label: "Tasks", icon: ListTodo },
-  { to: "/pending-actions", label: "Pending", icon: CircleAlert },
-  { to: "/knowledge", label: "Knowledge", icon: BookOpenCheck },
-  { to: "/agents", label: "Agents", icon: Bot },
-  { to: "/environments", label: "Environments", icon: Boxes },
-  { to: "/artifacts", label: "Artifacts", icon: FileArchive },
-  { to: "/run", label: "New Run", icon: Play },
+const navSections = [
+  {
+    label: "Operate",
+    items: [
+      { to: "/", label: "Dashboard", icon: LayoutDashboard },
+      { to: "/sessions", label: "Sessions", icon: List },
+      { to: "/tasks", label: "Tasks", icon: ListTodo },
+      { to: "/pending-actions", label: "Pending", icon: CircleAlert },
+      { to: "/usage", label: "Usage", icon: BarChart3 },
+    ],
+  },
+  {
+    label: "Knowledge",
+    items: [{ to: "/knowledge", label: "Knowledge", icon: BookOpenCheck }],
+  },
+  {
+    label: "Runtime",
+    items: [
+      { to: "/agents", label: "Agents", icon: Bot },
+      { to: "/environments", label: "Environments", icon: Boxes },
+      { to: "/artifacts", label: "Artifacts", icon: FileArchive },
+    ],
+  },
+  {
+    label: "Create",
+    items: [{ to: "/run", label: "New Run", icon: Play }],
+  },
 ] as const
 
 export function Layout() {
@@ -53,24 +69,31 @@ export function Layout() {
         <div className="mb-6 px-3">
           <img src={dashboardAsset("logo.svg")} alt="cayu" className="h-6" />
         </div>
-        {navItems.map(({ to, label, icon: Icon }) => {
-          const active = to === "/" ? currentPath === "/" : currentPath.startsWith(to)
-          return (
-            <Link
-              key={to}
-              to={to}
-              className={cn(
-                "flex items-center gap-3 px-3 py-2 rounded-md text-sm no-underline transition-colors",
-                active
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-                  : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground",
-              )}
-            >
-              <Icon size={18} />
-              {label}
-            </Link>
-          )
-        })}
+        {navSections.map((section, sectionIndex) => (
+          <div
+            key={section.label}
+            className={cn("space-y-1", sectionIndex > 0 && "mt-3 border-t border-border pt-3")}
+          >
+            {section.items.map(({ to, label, icon: Icon }) => {
+              const active = to === "/" ? currentPath === "/" : currentPath.startsWith(to)
+              return (
+                <Link
+                  key={to}
+                  to={to}
+                  className={cn(
+                    "flex items-center gap-3 px-3 py-2 rounded-md text-sm no-underline transition-colors",
+                    active
+                      ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
+                      : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground",
+                  )}
+                >
+                  <Icon size={18} />
+                  {label}
+                </Link>
+              )
+            })}
+          </div>
+        ))}
         <div className="mt-auto rounded-md border border-sidebar-border bg-background/70 px-3 py-2 text-xs text-muted-foreground">
           {contract.isLoading ? (
             <span>Checking API contract...</span>

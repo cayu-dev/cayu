@@ -8,6 +8,13 @@ export function formatCount(value: number | null | undefined) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "0"
 }
 
+export function formatBytes(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-"
+  if (value < 1024) return `${formatCount(value)} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
 export function formatDecimal(value: string | number | null | undefined) {
   if (value === null || value === undefined || value === "") return "-"
   const numeric = typeof value === "number" ? value : Number(value)

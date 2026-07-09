@@ -95,11 +95,13 @@ class LocalArtifactStore(ArtifactStore):
         *,
         scope: ArtifactScope | None = None,
         session_id: str | None = None,
+        agent_name: str | None = None,
         environment_name: str | None = None,
         limit: int | None = None,
     ) -> ArtifactListResult:
         validated_scope = _validate_scope(scope) if scope is not None else None
         session_id = _validate_optional_id(session_id, "session_id")
+        agent_name = _validate_optional_id(agent_name, "agent_name")
         environment_name = _validate_optional_id(environment_name, "environment_name")
         validated_limit = _validate_limit(limit, "limit")
         return await asyncio.to_thread(
@@ -107,6 +109,7 @@ class LocalArtifactStore(ArtifactStore):
             self.root,
             validated_scope,
             session_id,
+            agent_name,
             environment_name,
             validated_limit,
         )
@@ -206,6 +209,7 @@ def _list_artifacts(
     root: Path,
     scope: ArtifactScope | None,
     session_id: str | None,
+    agent_name: str | None,
     environment_name: str | None,
     limit: int | None,
 ) -> ArtifactListResult:
@@ -220,6 +224,8 @@ def _list_artifacts(
         if scope is not None and artifact.scope != scope:
             continue
         if session_id is not None and artifact.session_id != session_id:
+            continue
+        if agent_name is not None and artifact.agent_name != agent_name:
             continue
         if environment_name is not None and artifact.environment_name != environment_name:
             continue

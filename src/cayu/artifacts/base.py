@@ -173,6 +173,7 @@ class ArtifactStore(ABC):
         *,
         scope: ArtifactScope | None = None,
         session_id: str | None = None,
+        agent_name: str | None = None,
         environment_name: str | None = None,
         limit: int | None = None,
     ) -> ArtifactListResult:

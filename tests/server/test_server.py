@@ -104,6 +104,7 @@ class CountingArtifactStore(ArtifactStore):
         *,
         scope: ArtifactScope | None = None,
         session_id: str | None = None,
+        agent_name: str | None = None,
         environment_name: str | None = None,
         limit: int | None = None,
     ) -> ArtifactListResult:
@@ -278,6 +279,18 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     assert artifacts_body["artifacts"][0]["id"] == artifact.id
     assert artifacts_body["artifacts"][0]["artifact_store_id"] == "test-artifacts"
     assert artifacts_body["artifacts"][0]["metadata"] == {"source": "test"}
+
+    artifacts_by_agent = client.get("/api/artifacts", params={"agent_name": "reviewer"})
+    assert artifacts_by_agent.status_code == 200
+    artifacts_by_agent_body = artifacts_by_agent.json()
+    assert artifacts_by_agent_body["total_count"] == 1
+    assert artifacts_by_agent_body["artifacts"][0]["id"] == artifact.id
+
+    artifacts_by_other_agent = client.get("/api/artifacts", params={"agent_name": "other"})
+    assert artifacts_by_other_agent.status_code == 200
+    artifacts_by_other_agent_body = artifacts_by_other_agent.json()
+    assert artifacts_by_other_agent_body["total_count"] == 0
+    assert artifacts_by_other_agent_body["artifacts"] == []
 
     read = client.get(
         f"/api/artifacts/{artifact.id}",

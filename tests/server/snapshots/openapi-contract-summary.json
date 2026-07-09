@@ -5356,6 +5356,22 @@
         "parameters": [
           {
             "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
             "name": "artifact_store_id",
             "required": false,
             "schema": {

@@ -2849,6 +2849,10 @@ export type ListArtifactsApiArtifactsGetData = {
          */
         session_id?: string | null;
         /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+        /**
          * Environment Name
          */
         environment_name?: string | null;
