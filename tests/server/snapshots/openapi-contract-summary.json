@@ -3892,6 +3892,147 @@
       "title": "ToolApprovalRecoveryOutcome",
       "type": "string"
     },
+    "ToolRoundRecoveryBody": {
+      "description": "Body for recovering a crashed ordinary tool call with an operator outcome.\n\n``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default\nto ``None``: the resumed run applies the runtime defaults (a pending tool\nround persists no run configuration). Explicit values override them.",
+      "properties": {
+        "artifacts": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "budget_limits": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/BudgetLimit"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Budget Limits"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_steps": {
+          "anyOf": [
+            {
+              "maximum": 256.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Steps"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "outcome": {
+          "$ref": "#/components/schemas/ToolApprovalRecoveryOutcome"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "retry_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/RetryPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "round_id": {
+          "minLength": 1,
+          "title": "Round Id",
+          "type": "string"
+        },
+        "session_id": {
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "structured": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Structured"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/StructuredOutputSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "round_id",
+        "tool_call_id",
+        "outcome",
+        "message"
+      ],
+      "title": "ToolRoundRecoveryBody",
+      "type": "object"
+    },
     "TranscriptSummary": {
       "additionalProperties": false,
       "properties": {
@@ -6394,6 +6535,37 @@
           "content": {
             "application/json": {
               "$ref": "#/components/schemas/ToolApprovalBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tool-rounds/recover": {
+      "post": {
+        "operation_id": "recover_tool_round_api_tool_rounds_recover_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ToolRoundRecoveryBody"
             }
           },
           "required": true

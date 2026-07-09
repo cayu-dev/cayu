@@ -198,6 +198,48 @@ def recorded_tool_outcomes(
     return outcomes, started_ids
 
 
+def validate_tool_round_recovery_target(
+    *,
+    events: list[Event],
+    pending_round: PendingToolRound,
+    tool_call_id: str,
+) -> None:
+    """Reject manual recovery targets that need no recovery or never started.
+
+    Scoped by the round's session-unique ``tool_round_id`` payload key — the
+    same ledger key `recorded_tool_outcomes` reads, so a call this guard
+    accepts is exactly one the automatic close would otherwise synthesize an
+    unknown outcome for.
+    """
+    started = False
+    terminal = False
+    terminal_event_types = {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+    for event in events:
+        if event.payload.get("tool_round_id") != pending_round.round_id:
+            continue
+        if event.payload.get("tool_call_id") != tool_call_id:
+            continue
+        if event.type == EventType.TOOL_CALL_STARTED:
+            started = True
+        elif event.type in terminal_event_types:
+            terminal = True
+
+    if terminal:
+        raise RuntimeError(
+            f"Tool call already has a terminal event and does not need recovery: {tool_call_id}. "
+            "Resume the session to close the round from the persisted outcome."
+        )
+    if not started:
+        raise RuntimeError(
+            f"Tool round recovery requires a recorded tool.call.started event: {tool_call_id}"
+        )
+
+
 def unknown_recovered_tool_result(
     *,
     pending_tool_call: PendingToolCallApproval,

@@ -95,6 +95,7 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    PendingToolCallApproval,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -277,6 +278,10 @@ from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
+from cayu.runtime.tool_rounds import (
+    ToolRoundRecoveryRequest,
+    copy_tool_round_recovery_request,
+)
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
     CausalBudgetUsageSummary,
@@ -406,6 +411,16 @@ class _EnvironmentBindingFinalizeResult:
 logger = logging.getLogger(__name__)
 
 
+# A crashed ordinary tool round can leave the session FAILED (in-process
+# persistence error) or in a stale live status (process kill), so operator
+# reconciliation accepts all of them; INTERRUPTED covers interrupt-adjacent
+# shapes that preserved the pending round.
+_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTING,
+    SessionStatus.INTERRUPTED,
+    SessionStatus.FAILED,
+}
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -4097,6 +4112,358 @@ class CayuApp:
             emit_resume_event=False,
         ):
             yield event
+
+    async def recover_tool_round(
+        self,
+        request: ToolRoundRecoveryRequest,
+    ) -> AsyncIterator[Event]:
+        """Recover a crashed ordinary tool round with an operator-verified outcome.
+
+        A tool call in a non-approval round started but recorded no terminal event
+        (a crash mid-tool), so an automatic resume would close it as an
+        unknown-outcome failure. The caller supplies the externally verified outcome
+        for that `tool_call_id`; Cayu persists it as the call's terminal result and
+        never re-runs the tool. One call per invocation: if other
+        started-but-unresolved calls remain, the session returns to INTERRUPTED with
+        `manual_recovery_required` naming the next call; otherwise the round closes
+        from the recorded outcomes and the model loop continues. A crashed round can
+        leave the session FAILED (an in-process persistence error) or in a stale live
+        status (a process kill), so FAILED, RUNNING, and INTERRUPTING are accepted
+        alongside INTERRUPTED; the in-process claim registered while this recovery
+        streams blocks concurrent recoveries and the sweep, but — like the sweep —
+        it cannot see work active on another worker. If this call fails AFTER the
+        recovered terminal event persisted, the session closes to the resumable
+        INTERRUPTED state with the failure on the `session.interrupted` event and
+        the evidence stays durable: do not retry the same `tool_call_id` (the
+        guard rejects it) — `resume(...)` finishes the round from the persisted
+        outcome.
+        """
+        if type(request) is not ToolRoundRecoveryRequest:
+            raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
+        request = copy_tool_round_recovery_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_round is None:
+            raise RuntimeError("Session has no pending tool round.")
+        if pending_round.round_id != request.round_id:
+            raise ValueError(f"Tool round id does not match pending round: {request.round_id}")
+        effective_structured_output = _effective_tool_round_structured_output(
+            structured_output=request.structured_output,
+            pending_round=pending_round,
+        )
+
+        pending_tool_call = approval_support.round_tool_call_for_recovery(
+            pending_calls=pending_round.tool_calls,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        if pending_round.agent_name != registered_agent.spec.name:
+            raise RuntimeError(
+                f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
+            )
+        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        if self._has_active_session_tasks(loaded_session.id):
+            raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
+        session = await self.session_store.transition_status(
+            loaded_session.id,
+            from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
+            to_status=SessionStatus.RUNNING,
+        )
+        # Claim the session in the in-process registry (as run/resume do) so a
+        # concurrent recover_tool_round or the recovery sweep cannot double-claim
+        # the now-RUNNING session while this recovery streams. Registration and
+        # the other-owner re-check are await-free, so the pair is atomic on the
+        # event loop; the pre-transition check above cannot see a claimant that
+        # registers while our transition awaits.
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._register_active_session_task(
+                session.id,
+                current_task,
+                task_id=None,
+                task_started=False,
+                task_finished=False,
+            )
+            if any(
+                record.runtime_task is not current_task and not record.runtime_task.done()
+                for record in self._active_session_run_records(session.id)
+            ):
+                # Another in-process owner holds the session; it owns the status.
+                self._unregister_active_session_task(session.id, current_task)
+                raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
+        try:
+            async for event in self._recover_tool_round_claimed(
+                request=request,
+                original_status=loaded_session.status,
+                session=session,
+                pending_round=pending_round,
+                pending_tool_call=pending_tool_call,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                effective_structured_output=effective_structured_output,
+            ):
+                yield event
+        finally:
+            if current_task is not None:
+                self._unregister_active_session_task(session.id, current_task)
+
+    async def _recover_tool_round_claimed(
+        self,
+        *,
+        request: ToolRoundRecoveryRequest,
+        original_status: SessionStatus,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        pending_tool_call: PendingToolCallApproval,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        effective_structured_output: StructuredOutputSpec | None,
+    ) -> AsyncIterator[Event]:
+        recovered_result = ToolResult(
+            content=request.message,
+            structured=request.structured,
+            artifacts=request.artifacts,
+            is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
+        )
+        event_type = (
+            EventType.TOOL_CALL_FAILED
+            if recovered_result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        )
+        environment_name = _environment_name(registered_environment)
+        recovery_persisted = False
+
+        try:
+            events = await self.session_store.load_events(session.id)
+            tool_round_recovery.validate_tool_round_recovery_target(
+                events=events,
+                pending_round=pending_round,
+                tool_call_id=request.tool_call_id,
+            )
+            factory_resolution = await self._resolve_registered_environment_factory_for_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                session = await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "tool_round_id": pending_round.round_id,
+                            "error": str(factory_resolution.error),
+                            "error_type": type(factory_resolution.error).__name__,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
+            recovery_tool_event, recovered_result = _redact_tool_result_event(
+                event=Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=pending_tool_call.tool_name,
+                    payload={
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_round_id=pending_round.round_id,
+                            tool_call_id=pending_tool_call.tool_call_id,
+                        ),
+                        "manual_recovery": True,
+                        "reason": request.reason,
+                        "metadata": request.metadata,
+                        "result": recovered_result.model_dump(),
+                    },
+                ),
+                result=recovered_result,
+                redactor=self._secret_redactor,
+            )
+            recovery_events = [
+                Event(
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                    },
+                ),
+                recovery_tool_event,
+            ]
+            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            recovery_persisted = True
+            for event in emitted_recovery_events:
+                yield event
+            tool_call = runtime_records.ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            tool_event = emitted_recovery_events[-1]
+            # Manual recovery persists the operator-supplied result before hooks run, so
+            # after_tool_call is observe-only here (v1): the threaded modification is ignored.
+            async for event, _modified in self._run_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=recovered_result,
+                task_id=pending_round.task_id,
+                redactor=self._secret_redactor,
+                allow_modification=False,
+            ):
+                yield event
+
+            events = await self.session_store.load_events(session.id)
+            recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+                events=events,
+                pending_round=pending_round,
+            )
+            remaining_ids = started_ids - set(recorded_outcomes)
+            if remaining_ids:
+                # One call per invocation: another call in this round also started
+                # without a terminal event, so it needs its own operator-verified
+                # outcome before the round can close. The result persisted above is
+                # durable; the next recover_tool_round reuses it through the
+                # recorded-outcome ledger.
+                next_call = next(
+                    call for call in pending_round.tool_calls if call.tool_call_id in remaining_ids
+                )
+                session = await self.session_store.update_status(
+                    session.id, SessionStatus.INTERRUPTED
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "manual_recovery_required": True,
+                            "tool_round_id": pending_round.round_id,
+                            "tool_call_id": next_call.tool_call_id,
+                            "tool_name": next_call.tool_name,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ):
+                    yield event
+                return
+        except GeneratorExit:
+            # Abandonment: finalize to INTERRUPTED (do NOT roll back to a live status).
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
+        except Exception as exc:
+            if not recovery_persisted:
+                # Nothing durable happened yet — restore the crashed status so the
+                # operator can retry the recovery unchanged.
+                await self.session_store.update_status(session.id, original_status)
+                raise
+            # The operator's terminal event is durable. Rolling back to the original
+            # status would strand a stale-live original (RUNNING/INTERRUPTING is not
+            # resumable), so close to the resumable INTERRUPTED state with a terminal
+            # event carrying the failure — resume() then finishes the round from the
+            # persisted outcome (mirrors recover_user_input's closure branch).
+            session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            async for event in self._emit_terminal_event_with_hooks(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            ):
+                yield event
+            return
+
+        try:
+            # Inside the guarded block for GeneratorExit coherence (aclose at a yield
+            # finalizes via the handler below). A task CANCELLATION here is caught by
+            # neither handler — as in every recovery entrance — and is finalized by
+            # the sweep once the task is done; the claim registry is cleaned by the
+            # caller's finally either way.
+            transcript = await self.session_store.load_transcript(session.id)
+            # _run_session recovers the pending round at entry: it reuses the terminal
+            # event persisted above, closes never-started calls as not-executed errors,
+            # appends the round's tool results, clears the checkpoint atomically, and
+            # continues the model loop.
+            async for event in self._run_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                messages=transcript,
+                messages_to_append=[],
+                max_steps=request.max_steps or _DEFAULT_APPROVAL_MAX_STEPS,
+                limits=request.limits or RunLimits(),
+                budget_limits=request.budget_limits or (),
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                structured_output=effective_structured_output,
+                thinking=request.thinking,
+                request_loop_policies=request.loop_policies,
+                request_metadata=request.metadata,
+                task_id=pending_round.task_id,
+                task_worker_id=None,
+                start_event_type=None,
+                start_event_payload={},
+                start_task_on_enter=False,
+            ):
+                yield event
+        except GeneratorExit:
+            # Abandonment while continuing the round: finalize to INTERRUPTED instead
+            # of leaking a RUNNING session (mirrors recover_user_input's guard).
+            await self._finalize_abandoned_session_by_id(session.id)
+            raise
 
     async def _run_session(
         self,
@@ -9634,6 +10001,26 @@ def _effective_user_input_structured_output(
     if not _structured_output_specs_equal(structured_output, pending.structured_output):
         raise ValueError("structured_output does not match the paused run contract.")
     return copy_structured_output_spec(pending.structured_output)
+
+
+def _effective_tool_round_structured_output(
+    *,
+    structured_output: StructuredOutputSpec | None,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> StructuredOutputSpec | None:
+    # Mirror _effective_user_input_structured_output: inherit the crashed run's spec when
+    # the operator supplies none; adopt the operator's spec when the run had none; a
+    # differing spec is a swap of the contract fixed by the provider history and is
+    # rejected.
+    if type(pending_round) is not tool_round_recovery.PendingToolRound:
+        raise TypeError("Pending tool round must be a PendingToolRound.")
+    if structured_output is None:
+        return copy_structured_output_spec(pending_round.structured_output)
+    if pending_round.structured_output is None:
+        return copy_structured_output_spec(structured_output)
+    if not _structured_output_specs_equal(structured_output, pending_round.structured_output):
+        raise ValueError("structured_output does not match the crashed run contract.")
+    return copy_structured_output_spec(pending_round.structured_output)
 
 
 def _effective_approval_thinking(

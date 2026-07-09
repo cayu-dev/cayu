@@ -3183,3 +3183,19 @@ def test_server_recover_user_input_route_is_registered() -> None:
         },
     )
     assert response.status_code == 404
+
+
+def test_server_recover_tool_round_route_is_registered() -> None:
+    client = _ask_user_client()
+    # Unknown session → 404 (route exists and validates the session before streaming).
+    response = client.post(
+        "/api/tool-rounds/recover",
+        json={
+            "session_id": "missing",
+            "round_id": "round_1",
+            "tool_call_id": "call_1",
+            "outcome": "completed",
+            "message": "recovered",
+        },
+    )
+    assert response.status_code == 404

@@ -60,6 +60,7 @@ from cayu.runtime.sessions import (
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskOrder, TaskQuery, TaskStatus
+from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
     CacheUsageMetrics,
     CausalBudgetUsageSummary,
@@ -313,6 +314,38 @@ class ToolApprovalRecoveryBody(BaseModel):
 
     session_id: NonBlankString
     approval_id: NonBlankString
+    tool_call_id: NonBlankString
+    outcome: ToolApprovalRecoveryOutcome
+    message: NonBlankString
+    structured: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    reason: NonBlankString | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
+    structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_request_budget_limits(value)
+
+
+class ToolRoundRecoveryBody(BaseModel):
+    """Body for recovering a crashed ordinary tool call with an operator outcome.
+
+    ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+    to ``None``: the resumed run applies the runtime defaults (a pending tool
+    round persists no run configuration). Explicit values override them.
+    """
+
+    session_id: NonBlankString
+    round_id: NonBlankString
     tool_call_id: NonBlankString
     outcome: ToolApprovalRecoveryOutcome
     message: NonBlankString
@@ -1142,6 +1175,40 @@ def create_router(
         )
 
         return _detached_event_stream_response(cayu_app.recover_tool_approval(request))
+
+    @router.post(
+        "/tool-rounds/recover",
+        dependencies=protected,
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
+    async def recover_tool_round(body: ToolRoundRecoveryBody):
+        session = await session_store.load(body.session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {body.session_id}",
+            )
+
+        request = ToolRoundRecoveryRequest(
+            session_id=body.session_id,
+            round_id=body.round_id,
+            tool_call_id=body.tool_call_id,
+            outcome=body.outcome,
+            message=body.message,
+            structured=body.structured,
+            artifacts=body.artifacts,
+            reason=body.reason,
+            metadata=body.metadata,
+            max_steps=body.max_steps,
+            limits=body.limits,
+            budget_limits=body.budget_limits,
+            retry_policy=body.retry_policy,
+            structured_output=body.structured_output,
+            thinking=body.thinking,
+        )
+
+        return _detached_event_stream_response(cayu_app.recover_tool_round(request))
 
     @router.post(
         "/user-input/resolve",

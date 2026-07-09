@@ -2058,6 +2058,69 @@ export type ToolApprovalRecoveryBody = {
 export type ToolApprovalRecoveryOutcome = 'completed' | 'failed';
 
 /**
+ * ToolRoundRecoveryBody
+ *
+ * Body for recovering a crashed ordinary tool call with an operator outcome.
+ *
+ * ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
+ * to ``None``: the resumed run applies the runtime defaults (a pending tool
+ * round persists no run configuration). Explicit values override them.
+ */
+export type ToolRoundRecoveryBody = {
+    /**
+     * Artifacts
+     */
+    artifacts?: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Budget Limits
+     */
+    budget_limits?: Array<BudgetLimit> | null;
+    limits?: RunLimits | null;
+    /**
+     * Max Steps
+     */
+    max_steps?: number | null;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Metadata
+     */
+    metadata?: {
+        [key: string]: unknown;
+    };
+    outcome: ToolApprovalRecoveryOutcome;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    retry_policy?: RetryPolicy | null;
+    /**
+     * Round Id
+     */
+    round_id: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Structured
+     */
+    structured?: {
+        [key: string]: unknown;
+    } | null;
+    structured_output?: StructuredOutputSpec | null;
+    thinking?: ThinkingConfig | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+};
+
+/**
  * TranscriptSummary
  */
 export type TranscriptSummary = {
@@ -3436,6 +3499,31 @@ export type ResolveToolApprovalApiToolApprovalsResolvePostResponses = {
 };
 
 export type ResolveToolApprovalApiToolApprovalsResolvePostResponse = ResolveToolApprovalApiToolApprovalsResolvePostResponses[keyof ResolveToolApprovalApiToolApprovalsResolvePostResponses];
+
+export type RecoverToolRoundApiToolRoundsRecoverPostData = {
+    body: ToolRoundRecoveryBody;
+    path?: never;
+    query?: never;
+    url: '/api/tool-rounds/recover';
+};
+
+export type RecoverToolRoundApiToolRoundsRecoverPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RecoverToolRoundApiToolRoundsRecoverPostError = RecoverToolRoundApiToolRoundsRecoverPostErrors[keyof RecoverToolRoundApiToolRoundsRecoverPostErrors];
+
+export type RecoverToolRoundApiToolRoundsRecoverPostResponses = {
+    /**
+     * SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.
+     */
+    200: string;
+};
+
+export type RecoverToolRoundApiToolRoundsRecoverPostResponse = RecoverToolRoundApiToolRoundsRecoverPostResponses[keyof RecoverToolRoundApiToolRoundsRecoverPostResponses];
 
 export type RecoverUserInputApiUserInputRecoverPostData = {
     body: UserInputRecoveryBody;

@@ -206,6 +206,7 @@ from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
+from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
     CacheUsageMetrics,
     CausalBudgetUsageSummary,
@@ -376,6 +377,7 @@ __all__ = [
     "ToolPolicyDecision",
     "ToolPolicyRequest",
     "ToolPolicyResult",
+    "ToolRoundRecoveryRequest",
     "TranscriptDigestCompactor",
     "TranscriptPage",
     "TranscriptQuery",

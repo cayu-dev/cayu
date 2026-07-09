@@ -24,6 +24,7 @@ _STREAMING_ROUTES = {
     "/api/sessions/{session_id}/interrupt",
     "/api/tool-approvals/resolve",
     "/api/tool-approvals/recover",
+    "/api/tool-rounds/recover",
     "/api/user-input/resolve",
     "/api/user-input/recover",
 }
