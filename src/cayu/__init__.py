@@ -52,6 +52,10 @@ from cayu.core.tools import (
     WorkspaceHandle,
 )
 from cayu.core.workflows import Workflow, WorkflowSpec
+from cayu.egress import (
+    CredentialMode,
+    HttpEgressPolicy,
+)
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -381,6 +385,8 @@ from cayu.runtime import (
     UsageTriggeredContextPolicy,
     UserInputRecoveryRequest,
     UserInputResponse,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
     causal_budget_usage_summary,
     classify_retryable_error,
     copy_context_counting_config,
@@ -646,6 +652,7 @@ __all__ = [
     "ContextRequest",
     "ContextUsageState",
     "CostLineItem",
+    "CredentialMode",
     "CredentialProxy",
     "CredentialProxyHandle",
     "DefaultContextPolicy",
@@ -704,6 +711,7 @@ __all__ = [
     "ForkSessionRequest",
     "GateOutcome",
     "GitRepositoryBinding",
+    "HttpEgressPolicy",
     "HttpMcpClient",
     "HttpMcpSession",
     "ImageArtifactReader",
@@ -954,6 +962,8 @@ __all__ = [
     "VaultError",
     "VaultHandle",
     "VertexProvider",
+    "VirtualCredentialSpec",
+    "VirtualEgressEnvironmentFactory",
     "WebhookSignatureError",
     "Workflow",
     "WorkflowBase",

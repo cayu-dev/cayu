@@ -6,6 +6,7 @@ from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_nonblank
+from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._secrets import (
     merge_secret_env_values,
     normalize_runner_secret_env,
@@ -68,6 +69,8 @@ class LocalRunner(Runner):
         inherit_env: bool = False,
         secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
         secret_resolver: SecretResolver | None = None,
+        credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
+        allow_raw_secret_env: bool = True,
     ) -> None:
         if not isinstance(root, str | PathLike):
             raise TypeError("LocalRunner root must be a string or Path.")
@@ -80,8 +83,12 @@ class LocalRunner(Runner):
             raise NotADirectoryError(f"Runner root is not a directory: {root_path}")
         self.root = root_path
         self.inherit_env = inherit_env
+        self.credential_mode = normalize_credential_mode(credential_mode)
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
-            secret_env, secret_resolver
+            secret_env,
+            secret_resolver,
+            credential_mode=self.credential_mode,
+            allow_raw_secret_env=allow_raw_secret_env,
         )
 
     async def exec(

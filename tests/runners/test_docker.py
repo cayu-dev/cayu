@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import pytest
@@ -274,6 +275,47 @@ def test_create_bind_mount_mode(monkeypatch, tmp_path):
         "apt-get install -y whois",
     ] in issued
     assert runner.close_action == "remove"
+
+
+def test_create_setup_env_overlay_uses_env_file_not_argv(monkeypatch):
+    issued = []
+    env_file_contents: list[str] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        issued.append(command.argv)
+        if "--env-file" in command.argv:
+            env_file = command.argv[command.argv.index("--env-file") + 1]
+            assert os.path.exists(env_file)
+            with open(env_file) as handle:
+                env_file_contents.append(handle.read())
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    asyncio.run(
+        DockerRunner.create(
+            "a1",
+            docker_path="/usr/bin/docker",
+            image="debian:stable-slim",
+            setup_commands=("python -V",),
+            env_overlay={
+                "STRIPE_SECRET_KEY": "sk_test_cayu_vc_setupsecret",
+                "HTTPS_PROXY": "http://cayu-egress:8080",
+            },
+        )
+    )
+
+    setup_exec = next(
+        argv
+        for argv in issued
+        if argv[:4] == ["/usr/bin/docker", "exec", "-u", "root"] and argv[-1] == "python -V"
+    )
+    assert "--env-file" in setup_exec
+    assert not any("sk_test_cayu_vc_setupsecret" in item for item in setup_exec)
+    assert not any("STRIPE_SECRET_KEY=" in item for item in setup_exec)
+    assert any(
+        "STRIPE_SECRET_KEY=sk_test_cayu_vc_setupsecret\n" in data for data in env_file_contents
+    )
 
 
 def test_validate_mount_path_normalizes_existing_dir(tmp_path):
@@ -701,4 +743,22 @@ def test_runner_secret_env_requires_resolver():
             "a1",
             docker_path="/usr/bin/docker",
             secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        )
+
+
+def test_create_prevalidates_secret_env_mode_before_docker_calls(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        raise AssertionError("docker should not be called after local validation fails")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(ValueError, match="virtual_egress"):
+        asyncio.run(
+            DockerRunner.create(
+                "a1",
+                docker_path="/usr/bin/docker",
+                secret_env={"API_TOKEN": SecretRef(name="api_token")},
+                secret_resolver=StaticVault({"api_token": "sk-super-secret-token"}),
+                credential_mode="virtual_egress",
+            )
         )

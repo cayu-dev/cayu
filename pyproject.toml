@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "cryptography>=42",
   "fastapi>=0.115",
   "httpx2>=2.3,<3",
   "opentelemetry-api>=1.20",
@@ -48,6 +49,9 @@ files = [
 e2b = [
   "e2b>=2.28,<3",
 ]
+egress = [
+  "cryptography>=42",
+]
 microsandbox = [
   "microsandbox>=0.5.5,<0.6",
 ]
@@ -64,6 +68,7 @@ server = [
   "sse-starlette>=2.0",
 ]
 all = [
+  "cryptography>=42",
   "e2b>=2.28,<3",
   "fastapi>=0.115",
   "google-auth[requests]>=2,<3",

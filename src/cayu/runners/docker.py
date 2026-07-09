@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from cayu._validation import require_clean_nonblank
+from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -84,6 +85,19 @@ def _validate_mount_path(mount_path: str) -> str:
     if not os.path.isdir(value):
         raise ValueError(f"DockerRunner mount_path must be an existing directory: {value!r}")
     return value
+
+
+def _validate_ca_mount(ca_mount: tuple[str, str]) -> tuple[str, str]:
+    host_path, guest_path = ca_mount
+    host_path = require_clean_nonblank(host_path, "ca_mount host path")
+    guest_path = require_clean_nonblank(guest_path, "ca_mount guest path")
+    if not os.path.isabs(host_path) or not os.path.isfile(host_path):
+        raise ValueError("ca_mount host path must be an existing absolute file.")
+    if not posixpath.isabs(guest_path):
+        raise ValueError("ca_mount guest path must be an absolute guest path.")
+    if "," in host_path or "," in guest_path:
+        raise ValueError("ca_mount paths must not contain commas.")
+    return host_path, guest_path
 
 
 def _build_docker_exec_argv(
@@ -224,9 +238,10 @@ class DockerRunner(Runner):
     convenience tier, **not** a security boundary. The host ``docker`` process
     inherits the host environment (the CLI needs it); the containerized command
     receives only the explicit per-call ``env`` plus declared ``secret_env``,
-    forwarded by name via ``-e`` with values carried in the CLI process env —
-    never in host-visible argv. ``secret_env`` entries are resolved through
-    ``secret_resolver`` at exec time and redacted from captured output.
+    carried through a private ``--env-file`` so values are never in
+    host-visible argv or the Docker CLI's own process environment. ``secret_env``
+    entries are resolved through ``secret_resolver`` at exec time and redacted
+    from captured output.
     """
 
     isolation = "docker"
@@ -243,14 +258,24 @@ class DockerRunner(Runner):
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
         secret_resolver: SecretResolver | None = None,
+        credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
+        allow_raw_secret_env: bool = True,
+        env_overlay: Mapping[str, str] | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
+        self.credential_mode = normalize_credential_mode(credential_mode)
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
-            secret_env, secret_resolver
+            secret_env,
+            secret_resolver,
+            credential_mode=self.credential_mode,
+            allow_raw_secret_env=allow_raw_secret_env,
         )
+        # Trusted egress overlay (proxy vars + CA trust). Applied last on every
+        # exec so model-controlled env cannot unset the enforced egress path.
+        self.env_overlay = dict(env_overlay) if env_overlay else {}
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
@@ -275,6 +300,12 @@ class DockerRunner(Runner):
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
         secret_resolver: SecretResolver | None = None,
+        credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
+        allow_raw_secret_env: bool = True,
+        network: str | None = None,
+        extra_hosts: Sequence[str] = (),
+        env_overlay: Mapping[str, str] | None = None,
+        ca_mount: tuple[str, str] | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -284,6 +315,12 @@ class DockerRunner(Runner):
         needs python3 — install it via ``setup_commands``). ``runtime`` is passed
         to ``docker run --runtime`` (e.g. ``runsc``/``kata``). ``setup_commands``
         run as root.
+
+        For virtual egress, ``network`` attaches the container to a Docker network
+        (e.g. an ``--internal`` one that blocks direct internet), ``extra_hosts``
+        adds ``--add-host`` entries, ``ca_mount`` bind-mounts a
+        ``(host_path, guest_path)`` CA read-only, and ``env_overlay`` is applied to
+        every exec's environment (after model env, so it cannot be unset).
         """
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
@@ -300,6 +337,13 @@ class DockerRunner(Runner):
         if default_cwd is None:
             default_cwd = mount_path if mount_path is not None else DEFAULT_DOCKER_CWD
         default_cwd = _validate_guest_cwd(default_cwd)
+        mode = normalize_credential_mode(credential_mode)
+        normalize_runner_secret_env(
+            secret_env,
+            secret_resolver,
+            credential_mode=mode,
+            allow_raw_secret_env=allow_raw_secret_env,
+        )
         try:
             if replace:
                 await _run_docker(docker, ["rm", "-f", name])
@@ -307,8 +351,18 @@ class DockerRunner(Runner):
             if runtime:
                 run_argv += ["--runtime", runtime]
             run_argv += ["--name", name]
+            if network is not None:
+                run_argv += ["--network", require_clean_nonblank(network, "network")]
+            for host_entry in extra_hosts:
+                run_argv += ["--add-host", require_clean_nonblank(host_entry, "extra_hosts")]
             if mount_path is not None:
                 run_argv += ["--mount", f"type=bind,source={mount_path},target={mount_path}"]
+            if ca_mount is not None:
+                ca_host, ca_guest = _validate_ca_mount(ca_mount)
+                run_argv += [
+                    "--mount",
+                    f"type=bind,source={ca_host},target={ca_guest},readonly",
+                ]
             run_argv += [image, "sleep", "infinity"]
             started = await _run_docker(docker, run_argv)
             if started.exit_code != 0:
@@ -333,10 +387,18 @@ class DockerRunner(Runner):
                 )
                 if made.exit_code != 0:
                     raise RuntimeError(f"docker workspace mkdir failed: {made.stderr[:300]}")
+            # Setup runs on the (already-attached) network with the egress
+            # overlay applied, so any setup traffic is brokered like the app's —
+            # it is subject to the same egress policy, so bake tools that need
+            # arbitrary hosts into the image rather than installing them here.
+            setup_environment = dict(env_overlay or {})
             for cmd in setup_commands:
-                res = await _run_docker(
-                    docker, ["exec", "-u", "root", name, "sh", "-c", cmd], timeout_s=300
-                )
+                with runner_env_file(setup_environment) as setup_env_file:
+                    setup_argv = ["exec", "-u", "root"]
+                    if setup_env_file is not None:
+                        setup_argv += ["--env-file", setup_env_file]
+                    setup_argv += [name, "sh", "-c", cmd]
+                    res = await _run_docker(docker, setup_argv, timeout_s=300)
                 if res.exit_code != 0:
                     raise RuntimeError(f"docker setup command failed: {cmd!r}: {res.stderr[:300]}")
         except BaseException:
@@ -352,6 +414,9 @@ class DockerRunner(Runner):
             timeout_cleanup=timeout_policy,
             secret_env=secret_env,
             secret_resolver=secret_resolver,
+            credential_mode=mode,
+            allow_raw_secret_env=allow_raw_secret_env,
+            env_overlay=env_overlay,
         )
 
     async def exec(
@@ -374,6 +439,9 @@ class DockerRunner(Runner):
             else {}
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
+        if self.env_overlay:
+            # Applied last: the enforced egress overlay must win over model env.
+            environment.update(self.env_overlay)
         command_id = uuid4().hex
         pid_file = f"{DOCKER_COMMAND_STATE_DIR}/{command_id}.pid"
         handle = _DockerCommandHandle(

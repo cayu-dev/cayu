@@ -47,7 +47,13 @@ from cayu.providers import (
     OpenAIProvider,
 )
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
-from cayu.runners import RunnerCancelledError
+from cayu.runners import (
+    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ExecCommand,
+    ExecResult,
+    Runner,
+    RunnerCancelledError,
+)
 from cayu.runtime import (
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
@@ -2967,6 +2973,182 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
     assert tool_events[0].payload["result"]["structured"] == {"workspace_id": workspace.id}
 
 
+def test_cayu_app_streams_out_of_band_events_from_environment_factory(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "factory"
+        workspace_root.mkdir()
+        app = CayuApp(session_store=store, enable_logging=False)
+
+        class EmittingFactory(EnvironmentFactory):
+            async def create(
+                self,
+                request: EnvironmentFactoryRequest,
+            ) -> EnvironmentFactoryResult:
+                await app.emit_event(
+                    Event(
+                        type=EventType.EGRESS_GRANT_MINTED,
+                        session_id=request.session_id,
+                        agent_name=request.agent_name,
+                        environment_name=request.environment_name,
+                        payload={"grant_id": "grant_1"},
+                    )
+                )
+                return EnvironmentFactoryResult(
+                    environment=Environment(
+                        EnvironmentSpec(name="dynamic"),
+                        workspace=LocalWorkspace(
+                            workspace_root,
+                            workspace_id="factory-workspace",
+                        ),
+                    ),
+                )
+
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            EmittingFactory(),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        return await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_oob",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+
+    events = asyncio.run(run())
+    event_types = [event.type for event in events]
+
+    assert EventType.EGRESS_GRANT_MINTED in event_types
+    assert event_types.index(EventType.EGRESS_GRANT_MINTED) < event_types.index(
+        EventType.SESSION_STARTED
+    )
+    event = next(event for event in events if event.type == EventType.EGRESS_GRANT_MINTED)
+    assert event.agent_name == "assistant"
+    assert event.environment_name == "dynamic"
+    assert event.payload == {"grant_id": "grant_1"}
+
+
+def test_cayu_app_scoped_event_emitter_rejects_unlisted_event_types():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_scoped",
+                messages=[Message.text("user", "run")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        emitter = app.scoped_event_emitter(event_types=(EventType.EGRESS_GRANT_MINTED,))
+
+        emitted = await emitter(
+            Event(
+                type=EventType.EGRESS_GRANT_MINTED,
+                session_id="sess_scoped",
+                payload={"grant_id": "grant_1"},
+            )
+        )
+        with pytest.raises(ValueError, match="not allowed"):
+            await emitter(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="sess_scoped",
+                )
+            )
+        return emitted, await store.load_events("sess_scoped")
+
+    emitted, events = asyncio.run(run())
+
+    assert emitted.type == EventType.EGRESS_GRANT_MINTED
+    assert [event.type for event in events] == [EventType.EGRESS_GRANT_MINTED]
+
+
+def test_cayu_app_streams_out_of_band_events_from_binding_finalize():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+
+        class FinalizeEmitterBinding(WorkspaceBinding):
+            async def bind(
+                self,
+                workspace,
+                runner,
+                *,
+                session_id,
+                agent_name=None,
+                environment_name=None,
+                metadata=None,
+            ):
+                return BoundWorkspace(path="/bound")
+
+            async def finalize(self, bound, *, outcome=None, metadata=None):
+                await app.emit_event(
+                    Event(
+                        type=EventType.EGRESS_GRANT_REVOKED,
+                        session_id=metadata["session_id"],
+                        agent_name="assistant",
+                        environment_name="dynamic",
+                        payload={"grant_id": "grant_1", "outcome": outcome},
+                    )
+                )
+                return None
+
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                binding=FinalizeEmitterBinding(),
+            )
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        return await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_finalize_oob",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+
+    events = asyncio.run(run())
+    event_types = [event.type for event in events]
+
+    assert EventType.EGRESS_GRANT_REVOKED in event_types
+    assert event_types.index(EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED) < event_types.index(
+        EventType.EGRESS_GRANT_REVOKED
+    )
+    assert event_types.index(EventType.EGRESS_GRANT_REVOKED) < event_types.index(
+        EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
+    )
+    event = next(event for event in events if event.type == EventType.EGRESS_GRANT_REVOKED)
+    assert event.payload == {"grant_id": "grant_1", "outcome": "completed"}
+
+
 def test_cayu_app_environment_factory_failure_fails_session_before_start_event(tmp_path):
     async def run():
         store = InMemorySessionStore()
@@ -3020,6 +3202,140 @@ def test_cayu_app_environment_factory_failure_fails_session_before_start_event(t
     assert events[2].payload["error_type"] == "RuntimeError"
     assert len(factory.requests) == 1
     assert provider.requests == []
+
+
+def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_fails():
+    class ClosingRunner(Runner):
+        isolation = "test"
+        default_cwd = "/"
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def exec(
+            self,
+            command: ExecCommand,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_s: int | None = None,
+            stdin: str | None = None,
+            output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        ) -> ExecResult:
+            raise AssertionError("runner should not execute")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    class FailingReconnectCheckpointStore(InMemorySessionStore):
+        async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
+            if runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state:
+                raise RuntimeError("reconnect checkpoint unavailable")
+            await super().checkpoint(session_id, state)
+
+    async def run() -> tuple[list[Event], ClosingRunner, FakeProvider]:
+        runner = ClosingRunner()
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic"), runner=runner)
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=FailingReconnectCheckpointStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_post_create_fail",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, runner, provider
+
+    events, runner, provider = asyncio.run(run())
+
+    assert runner.close_calls == 1
+    assert runner._closed is True
+    assert provider.requests == []
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[1].payload["error"] == "reconnect checkpoint unavailable"
+
+
+def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_is_cancelled():
+    class ClosingRunner(Runner):
+        isolation = "test"
+        default_cwd = "/"
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def exec(
+            self,
+            command: ExecCommand,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_s: int | None = None,
+            stdin: str | None = None,
+            output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        ) -> ExecResult:
+            raise AssertionError("runner should not execute")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    class CancellingReconnectCheckpointStore(InMemorySessionStore):
+        async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
+            if runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state:
+                raise asyncio.CancelledError()
+            await super().checkpoint(session_id, state)
+
+    async def run() -> ClosingRunner:
+        runner = ClosingRunner()
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic"), runner=runner)
+        )
+        app = CayuApp(session_store=CancellingReconnectCheckpointStore(), enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(asyncio.CancelledError):
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_factory_post_create_cancel",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        return runner
+
+    runner = asyncio.run(run())
+
+    assert runner.close_calls == 1
+    assert runner._closed is True
 
 
 def test_cayu_app_environment_factory_failure_runs_failed_session_hooks(tmp_path):

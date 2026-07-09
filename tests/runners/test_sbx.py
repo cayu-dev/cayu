@@ -538,3 +538,25 @@ def test_runner_secret_env_requires_resolver():
             sbx_path="/usr/bin/sbx",
             secret_env={"API_TOKEN": SecretRef(name="api_token")},
         )
+
+
+def test_create_prevalidates_secret_env_mode_before_sbx_resources(monkeypatch):
+    async def fake_run_subprocess(command, **kwargs):
+        raise AssertionError("sbx should not be called after local validation fails")
+
+    def fake_mkdtemp(prefix):
+        raise AssertionError("temp mount should not be created after local validation fails")
+
+    monkeypatch.setattr("cayu.runners.sbx.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("cayu.runners.sbx.tempfile.mkdtemp", fake_mkdtemp)
+
+    with pytest.raises(ValueError, match="virtual_egress"):
+        asyncio.run(
+            SbxRunner.create(
+                "a1",
+                sbx_path="/usr/bin/sbx",
+                secret_env={"API_TOKEN": SecretRef(name="api_token")},
+                secret_resolver=StaticVault({"api_token": "sk-super-secret-token"}),
+                credential_mode="virtual_egress",
+            )
+        )

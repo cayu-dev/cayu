@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from cayu._validation import require_clean_nonblank
+from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -221,6 +222,8 @@ class SbxRunner(Runner):
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
         secret_resolver: SecretResolver | None = None,
+        credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
+        allow_raw_secret_env: bool = True,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.mount_path = require_clean_nonblank(mount_path, "mount_path")
@@ -232,8 +235,12 @@ class SbxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.credential_mode = normalize_credential_mode(credential_mode)
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
-            secret_env, secret_resolver
+            secret_env,
+            secret_resolver,
+            credential_mode=self.credential_mode,
+            allow_raw_secret_env=allow_raw_secret_env,
         )
         self._owns_mount = owns_mount
 
@@ -253,6 +260,8 @@ class SbxRunner(Runner):
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef] = (),
         secret_resolver: SecretResolver | None = None,
+        credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
+        allow_raw_secret_env: bool = True,
     ) -> SbxRunner:
         """Create a sandbox via the sbx CLI and return a runner bound to it.
 
@@ -269,6 +278,13 @@ class SbxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        mode = normalize_credential_mode(credential_mode)
+        normalize_runner_secret_env(
+            secret_env,
+            secret_resolver,
+            credential_mode=mode,
+            allow_raw_secret_env=allow_raw_secret_env,
+        )
         owns_mount = mount_path is None
         if owns_mount:
             mount_path = tempfile.mkdtemp(prefix="cayu-sbx-")
@@ -319,6 +335,8 @@ class SbxRunner(Runner):
             timeout_cleanup=timeout_policy,
             secret_env=secret_env,
             secret_resolver=secret_resolver,
+            credential_mode=mode,
+            allow_raw_secret_env=allow_raw_secret_env,
         )
 
     async def exec(

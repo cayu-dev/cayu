@@ -33,6 +33,12 @@ class EventType(StrEnum):
     BUDGET_RESERVATION_RELEASED = "budget.reservation_released"
 
     CREDENTIAL_PROXY_CHECKED = "credential.proxy.checked"
+    CREDENTIAL_MODE_SELECTED = "credential.mode.selected"
+
+    EGRESS_GRANT_MINTED = "egress.grant.minted"
+    EGRESS_GRANT_REVOKED = "egress.grant.revoked"
+    EGRESS_REQUEST_AUTHORIZED = "egress.request.authorized"
+    EGRESS_REQUEST_DENIED = "egress.request.denied"
 
     MCP_MANIFEST_CHECKED = "mcp.manifest.checked"
     MCP_MANIFEST_BLOCKED = "mcp.manifest.blocked"

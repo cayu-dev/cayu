@@ -32,6 +32,7 @@ core
   storage -> core
   vaults -> core
   proxies -> vaults + core
+  egress -> proxies + vaults + core   (Docker adapter also uses runners)
   mcp -> core
   environments -> artifacts + workspaces + runners + vaults + proxies + mcp
   runtime -> core + providers + artifacts + runners + workspaces + storage + vaults + proxies + mcp

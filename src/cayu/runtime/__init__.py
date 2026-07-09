@@ -88,6 +88,12 @@ from cayu.runtime.dispatch import (
     copy_dispatch_handle,
     copy_dispatch_request,
 )
+from cayu.runtime.egress import (
+    VIRTUAL_EGRESS_EVENT_TYPES,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
+    VirtualEgressRunnerRequest,
+)
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.event_watchers import (
     EventWatcher,
@@ -229,6 +235,7 @@ __all__ = [
     "ANY_TAINT_LABEL",
     "TAINT_LABELS_METADATA_KEY",
     "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
+    "VIRTUAL_EGRESS_EVENT_TYPES",
     "AfterToolCallDecision",
     "AllowAllToolPolicy",
     "AllowlistRule",
@@ -390,6 +397,9 @@ __all__ = [
     "UsageTriggeredContextPolicy",
     "UserInputRecoveryRequest",
     "UserInputResponse",
+    "VirtualCredentialSpec",
+    "VirtualEgressEnvironmentFactory",
+    "VirtualEgressRunnerRequest",
     "causal_budget_usage_summary",
     "classify_retryable_error",
     "copy_context_counting_config",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import mimetypes
 import time
@@ -39,7 +40,7 @@ from cayu.artifacts import (
     validate_file_attachment_content_type,
 )
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -365,6 +366,7 @@ class _ActiveSessionRun:
     turn_usage_tracker: _SessionUsageTracker | None = None
     turn_completed_event: Event | None = None
     turn_completed_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    out_of_band_events: asyncio.Queue[Event] = field(default_factory=asyncio.Queue)
 
 
 @dataclass(frozen=True)
@@ -1891,6 +1893,10 @@ class CayuApp:
             registered_environment = resolution.registered_environment
             for event in resolution.events:
                 yield event
+                async for queued_event in self._drain_out_of_band_session_events(session.id):
+                    yield queued_event
+            async for queued_event in self._drain_out_of_band_session_events(session.id):
+                yield queued_event
             if resolution.error is not None:
                 session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
                 async for event in self._emit_terminal_event_with_hooks(
@@ -1910,6 +1916,8 @@ class CayuApp:
                     registered_environment=registered_environment,
                 ):
                     yield event
+                    async for queued_event in self._drain_out_of_band_session_events(session.id):
+                        yield queued_event
                 return
 
             if workspace_instructions is None:
@@ -1985,7 +1993,10 @@ class CayuApp:
             start_event_payload={"agent_name": registered_agent.spec.name},
         )
         try:
-            async for event in session_stream:
+            async for event in self._stream_with_out_of_band_session_events(
+                session.id,
+                session_stream,
+            ):
                 yield event
         except asyncio.CancelledError:
             if await self._session_interrupt_requested(session.id):
@@ -2014,7 +2025,10 @@ class CayuApp:
             start_event_payload_extra={},
         )
         try:
-            async for event in session_stream:
+            async for event in self._stream_with_out_of_band_session_events(
+                request.session_id,
+                session_stream,
+            ):
                 yield event
         except GeneratorExit:
             await session_stream.aclose()
@@ -2336,7 +2350,10 @@ class CayuApp:
             start_event_payload_extra=start_event_payload_extra,
         )
         try:
-            async for event in session_stream:
+            async for event in self._stream_with_out_of_band_session_events(
+                request.session_id,
+                session_stream,
+            ):
                 yield event
         except GeneratorExit:
             await session_stream.aclose()
@@ -3157,7 +3174,7 @@ class CayuApp:
             )
             pending_cleared = True
 
-            async for event in self._run_session(
+            session_stream = self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -3180,6 +3197,10 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
+            )
+            async for event in self._stream_with_out_of_band_session_events(
+                session.id,
+                session_stream,
             ):
                 yield event
         except Exception as exc:
@@ -3864,7 +3885,7 @@ class CayuApp:
                 )
             )
 
-            async for event in self._run_session(
+            session_stream = self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -3892,6 +3913,10 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
+            )
+            async for event in self._stream_with_out_of_band_session_events(
+                session.id,
+                session_stream,
             ):
                 yield event
         except GeneratorExit:
@@ -8916,6 +8941,66 @@ class CayuApp:
     def _active_session_run_records(self, session_id: str) -> tuple[_ActiveSessionRun, ...]:
         return tuple(self._active_session_runs.get(session_id, {}).values())
 
+    async def _stream_with_out_of_band_session_events(
+        self,
+        session_id: str,
+        stream: AsyncIterator[Event],
+    ) -> AsyncIterator[Event]:
+        try:
+            async for event in stream:
+                yield event
+                async for queued_event in self._drain_out_of_band_session_events(session_id):
+                    yield queued_event
+            async for queued_event in self._drain_out_of_band_session_events(session_id):
+                yield queued_event
+        except GeneratorExit:
+            await _close_async_iterator(stream)
+            raise
+
+    async def _drain_out_of_band_session_events(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[Event]:
+        for active_run in self._active_session_run_records(session_id):
+            while not active_run.out_of_band_events.empty():
+                yield active_run.out_of_band_events.get_nowait()
+
+    def _queue_out_of_band_session_event(self, event: Event) -> None:
+        for active_run in self._active_session_run_records(event.session_id):
+            if active_run.runtime_task.done():
+                continue
+            active_run.out_of_band_events.put_nowait(copy_event(event))
+
+    def scoped_event_emitter(
+        self,
+        *,
+        event_types: Iterable[EventType | str],
+    ) -> Callable[[Event], Awaitable[Event]]:
+        """Return an out-of-band emitter constrained to specific event types."""
+        allowed = frozenset(str(event_type) for event_type in event_types)
+        if not allowed:
+            raise ValueError("scoped_event_emitter requires at least one event type.")
+
+        async def emit(event: Event) -> Event:
+            if str(event.type) not in allowed:
+                raise ValueError(f"Event type {event.type!r} is not allowed for this emitter.")
+            return await self.emit_event(event)
+
+        return emit
+
+    async def emit_event(self, event: Event) -> Event:
+        """Publish an event to the session store and all sinks.
+
+        Low-level seam for runtime-owned out-of-band session events. Prefer
+        ``scoped_event_emitter`` when handing an emitter to a component. Redaction
+        is applied by the sinks; callers must not place raw secrets in the payload.
+        """
+        if not isinstance(event, Event):
+            raise TypeError("emit_event requires an Event instance.")
+        emitted = await self._emit(event)
+        self._queue_out_of_band_session_event(emitted)
+        return emitted
+
     async def _emit(self, event: Event) -> Event:
         await self.session_store.append_event(event.session_id, event)
         if event.type == EventType.MODEL_COMPLETED:
@@ -8975,6 +9060,8 @@ class CayuApp:
                 )
             )
         ]
+        result: EnvironmentFactoryResult | None = None
+        environment: Environment | None = None
         try:
             request = EnvironmentFactoryRequest(
                 session_id=session.id,
@@ -9007,7 +9094,27 @@ class CayuApp:
                 environment_name=environment_name,
                 reconnect_metadata=reconnect_metadata,
             )
-        except Exception as exc:
+            events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            "environment_name": environment.spec.name,
+                            "result_metadata": copy_json_value(result.metadata, "result_metadata"),
+                            "reconnect_metadata": reconnect_metadata,
+                        },
+                    )
+                )
+            )
+        except BaseException as exc:
+            if result is not None:
+                await _close_unclaimed_factory_environment(result.environment)
+            if not isinstance(exc, Exception):
+                raise
             events.append(
                 await self._emit(
                     Event(
@@ -9029,22 +9136,8 @@ class CayuApp:
                 error=exc,
             )
 
-        events.append(
-            await self._emit(
-                Event(
-                    type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        **base_payload,
-                        "environment_name": environment.spec.name,
-                        "result_metadata": copy_json_value(result.metadata, "result_metadata"),
-                        "reconnect_metadata": reconnect_metadata,
-                    },
-                )
-            )
-        )
+        if environment is None:
+            raise RuntimeError("Environment factory did not produce an environment.")
         return _EnvironmentFactoryResolutionResult(
             registered_environment=runtime_records.RegisteredEnvironment(
                 spec=registered_environment.spec,
@@ -11247,6 +11340,21 @@ async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
     close = getattr(iterator, "aclose", None)
     if close is not None:
         await close()
+
+
+async def _close_unclaimed_factory_environment(environment: Environment) -> None:
+    runner = environment.runner
+    if runner is not None:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await runner.close()
+
+    binding = environment.binding
+    close = getattr(binding, "close", None)
+    if callable(close):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
 
 @dataclass
