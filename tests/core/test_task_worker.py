@@ -10,16 +10,21 @@ import pytest
 from cayu import (
     AgentSpec,
     CayuApp,
+    EventType,
     Message,
     ModelStreamEvent,
+    ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
+    SQLiteSessionStore,
     SQLiteTaskStore,
     Task,
     TaskCreate,
     TaskQuery,
     run_task_worker,
 )
+from cayu.runtime import SessionStatus
+from cayu.runtime.sessions import SessionIdentity
 
 
 def _build(tmp_path: Path) -> tuple[CayuApp, SQLiteTaskStore]:
@@ -143,3 +148,118 @@ def test_run_task_worker_fails_task_when_handler_leaves_it_active(tmp_path: Path
         "error": "RuntimeError",
         "message": "Task handler returned without completing or failing the task.",
     }
+
+
+def test_resume_completes_the_running_task_already_attached_to_the_session(
+    tmp_path: Path,
+) -> None:
+    session_store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def scenario():
+        task = await task_store.create_task(TaskCreate(task_id="task-resume", type="job"))
+        await session_store.create(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="session-resume",
+                task_id=task.id,
+                messages=[Message.text("user", "original")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await session_store.update_status("session-resume", SessionStatus.INTERRUPTED)
+        await task_store.start_task(task.id, session_id="session-resume")
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="session-resume",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        return await task_store.load_task(task.id), events
+
+    task, events = asyncio.run(scenario())
+
+    assert task is not None
+    assert task.status == "completed"
+    assert task.session_id == "session-resume"
+    assert [event.type for event in events][-3:] == [
+        EventType.TASK_COMPLETED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+
+
+def test_resume_rejects_multiple_running_tasks_attached_to_the_same_session(
+    tmp_path: Path,
+) -> None:
+    session_store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
+    provider = ScriptedModelProvider([])
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def scenario() -> None:
+        await session_store.create(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="session-ambiguous-tasks",
+                messages=[Message.text("user", "original")],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await session_store.update_status(
+            "session-ambiguous-tasks",
+            SessionStatus.INTERRUPTED,
+        )
+        for task_id in ("task-ambiguous-a", "task-ambiguous-b"):
+            await task_store.create_task(TaskCreate(task_id=task_id, type="job"))
+            await task_store.start_task(task_id, session_id="session-ambiguous-tasks")
+
+        async for _ in app.resume(
+            ResumeRequest(
+                session_id="session-ambiguous-tasks",
+                messages=[Message.text("user", "continue")],
+            )
+        ):
+            pass
+
+    with pytest.raises(
+        RuntimeError,
+        match="Session has multiple running tasks attached: session-ambiguous-tasks",
+    ):
+        asyncio.run(scenario())
+
+    session = asyncio.run(session_store.load("session-ambiguous-tasks"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert provider.requests == []

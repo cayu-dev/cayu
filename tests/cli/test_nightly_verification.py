@@ -5,6 +5,10 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _load_nightly_verification() -> ModuleType:
@@ -392,3 +396,80 @@ def test_internal_evals_hermetic_success_is_reported_without_live_credentials() 
         prerequisites=(),
         evidence={"returncode": 0},
     )
+
+
+def test_sigkill_recovery_check_pins_process_boundary_suite() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "sigkill-recovery")
+
+    assert check.lane == "recovery"
+    assert check.command == (
+        "uv",
+        "run",
+        "pytest",
+        "tests/recovery/test_sigkill_recovery.py",
+        "-q",
+        "-m",
+        "not postgres_recovery",
+    )
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.prerequisites == ("POSIX SIGKILL",)
+    assert check.requires_sigkill is True
+    assert set(check.unset_env) == {
+        "ANTHROPIC_API_KEY",
+        "E2B_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+    }
+
+
+def test_baseline_and_postgres_checks_partition_the_recovery_suite() -> None:
+    core = next(check for check in nightly.CHECKS if check.id == "core-pytest")
+    postgres = next(check for check in nightly.CHECKS if check.id == "postgres-required")
+
+    assert core.command[-2:] == ("-m", "not sigkill_recovery")
+    assert postgres.command[-2:] == (
+        "-m",
+        "not sigkill_recovery or postgres_recovery",
+    )
+
+
+def test_sigkill_recovery_skips_before_running_when_sigkill_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "sigkill-recovery")
+    called = False
+
+    def runner(command, env):
+        nonlocal called
+        called = True
+        return nightly.CommandOutcome(returncode=0)
+
+    monkeypatch.setattr(nightly, "_sigkill_available", lambda: False)
+
+    result = nightly.run_checks([check], environ={}, runner=runner)[0]
+
+    assert called is False
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason == "POSIX SIGKILL is unavailable"
+
+
+def test_strict_sigkill_selection_reports_command_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(nightly, "_sigkill_available", lambda: True)
+    monkeypatch.setattr(
+        nightly,
+        "_run_subprocess",
+        lambda command, env, timeout_s: nightly.CommandOutcome(
+            returncode=1,
+            stderr="SIGKILL recovery assertion failed",
+        ),
+    )
+
+    exit_code = nightly.main(["--check", "sigkill-recovery", "--strict"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "| sigkill-recovery | recovery | failed |" in output
+    assert "SIGKILL recovery assertion failed" in output

@@ -275,7 +275,14 @@ from cayu.runtime.structured_output import (
     validate_structured_output_text,
     validate_structured_output_tool_arguments,
 )
-from cayu.runtime.tasks import Task, TaskCreate, TaskStore, copy_task_create
+from cayu.runtime.tasks import (
+    Task,
+    TaskCreate,
+    TaskQuery,
+    TaskStatus,
+    TaskStore,
+    copy_task_create,
+)
 from cayu.runtime.tool_policy import (
     TAINT_LABELS_METADATA_KEY,
     TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
@@ -2067,10 +2074,12 @@ class CayuApp:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
         request = _validate_resume_request(request)
+        task_id = await self._linked_running_task_id(request.session_id)
         session_stream = self._resume_session(
             request=request,
-            task_id=None,
+            task_id=task_id,
             start_event_payload_extra={},
+            start_task_on_enter=False,
         )
         try:
             async for event in self._stream_with_out_of_band_session_events(
@@ -2407,6 +2416,7 @@ class CayuApp:
             request=resume_request,
             task_id=request.task_id,
             start_event_payload_extra=start_event_payload_extra,
+            start_task_on_enter=True,
         )
         try:
             async for event in self._stream_with_out_of_band_session_events(
@@ -2750,6 +2760,7 @@ class CayuApp:
         request: ResumeRequest,
         task_id: str | None,
         start_event_payload_extra: dict[str, Any],
+        start_task_on_enter: bool,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
@@ -2830,6 +2841,7 @@ class CayuApp:
                 "appended_messages": len(request.messages),
                 **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
             },
+            start_task_on_enter=start_task_on_enter,
         )
         try:
             async for event in session_stream:
@@ -5758,6 +5770,26 @@ class CayuApp:
                 worker_id=worker_id,
             )
         return await self.task_store.start_task(task_id, session_id=session.id)
+
+    async def _linked_running_task_id(self, session_id: str) -> str | None:
+        """Find the one running task already attached to a resumed session.
+
+        Task attachment is durable in ``TaskStore`` while ``ResumeRequest`` carries
+        no task id. Re-associate that task before entering the resumed loop so a
+        post-crash completion or failure terminalizes the original work item.
+        """
+        if self.task_store is None:
+            return None
+        tasks = await self.task_store.list_tasks(
+            TaskQuery(
+                status=TaskStatus.RUNNING,
+                session_id=session_id,
+                limit=2,
+            )
+        )
+        if len(tasks) > 1:
+            raise RuntimeError(f"Session has multiple running tasks attached: {session_id}")
+        return tasks[0].id if tasks else None
 
     async def _complete_task(
         self,

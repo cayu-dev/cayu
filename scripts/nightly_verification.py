@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -60,6 +61,7 @@ class VerificationCheck:
     requires_provider_api_key: bool = False
     requires_docker: bool = False
     requires_postgres: bool = False
+    requires_sigkill: bool = False
     timeout_s: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     reason: str | None = None
 
@@ -105,7 +107,15 @@ CHECKS: tuple[VerificationCheck, ...] = (
         id="core-pytest",
         capability="core runtime, stores, evals, server, local runner",
         lane="python",
-        command=("uv", "run", "pytest", "-q", "-rs"),
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "-q",
+            "-rs",
+            "-m",
+            "not sigkill_recovery",
+        ),
         status_on_success=STATUS_VERIFIED,
         unset_env=_LIVE_CREDENTIAL_ENV,
     ),
@@ -132,7 +142,15 @@ CHECKS: tuple[VerificationCheck, ...] = (
         id="postgres-required",
         capability="Postgres stores, migrations, pgvector, and dispatch claims",
         lane="postgres",
-        command=("uv", "run", "pytest", "-q", "-rs"),
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "-q",
+            "-rs",
+            "-m",
+            "not sigkill_recovery or postgres_recovery",
+        ),
         status_on_success=STATUS_VERIFIED,
         prerequisites=("Docker daemon or CAYU_TEST_POSTGRES_DSN",),
         env={"CAYU_REQUIRE_POSTGRES": "1"},
@@ -387,8 +405,19 @@ CHECKS: tuple[VerificationCheck, ...] = (
         id="sigkill-recovery",
         capability="crash recovery across a real process boundary",
         lane="recovery",
-        status_on_success=STATUS_UNCLAIMED,
-        reason="No subprocess/SIGKILL recovery harness is currently defined.",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/recovery/test_sigkill_recovery.py",
+            "-q",
+            "-m",
+            "not postgres_recovery",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("POSIX SIGKILL",),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+        requires_sigkill=True,
     ),
     VerificationCheck(
         id="real-spend-budgets",
@@ -618,6 +647,8 @@ def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str])
         missing.append("Docker daemon is unavailable")
     if check.requires_postgres and not _postgres_available(environ):
         missing.append("Postgres is unavailable: set CAYU_TEST_POSTGRES_DSN or run Docker")
+    if check.requires_sigkill and not _sigkill_available():
+        missing.append("POSIX SIGKILL is unavailable")
     return missing
 
 
@@ -625,6 +656,10 @@ def _module_missing(name: str) -> bool:
     import importlib.util
 
     return importlib.util.find_spec(name) is None
+
+
+def _sigkill_available() -> bool:
+    return os.name == "posix" and hasattr(signal, "SIGKILL")
 
 
 def _command_missing(name: str, environ: Mapping[str, str]) -> bool:

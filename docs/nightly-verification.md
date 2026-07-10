@@ -39,6 +39,7 @@ list the check IDs:
 uv run python scripts/nightly_verification.py --list
 uv run python scripts/nightly_verification.py --check core-pytest --strict
 uv run python scripts/nightly_verification.py --check internal-evals-hermetic --strict
+uv run python scripts/nightly_verification.py --check sigkill-recovery --strict
 uv run python scripts/nightly_verification.py --check docker-runner --strict
 ```
 
@@ -88,6 +89,7 @@ or in CI.
 | Lane | Needs | Spend | Current check |
 | --- | --- | ---: | --- |
 | Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest`, `internal-evals-hermetic` |
+| Process-death recovery | POSIX `SIGKILL`; deterministic SQLite stores and scripted providers | $0 | `sigkill-recovery` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
@@ -95,7 +97,7 @@ or in CI.
 | E2B live | `cayu[e2b]`, `E2B_API_KEY` | E2B quota | `e2b-live-*` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | OpenAI/Anthropic smoke | provider API key | provider-dependent | `*-live` provider-smoke checks |
-| Known holes | browser/runtime harnesses | varies | `unclaimed` checks |
+| Known holes | dashboard browser behavior and real provider spend | varies | `unclaimed` checks |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
 package build, and packaged-asset status checks. It still does not run dashboard
@@ -118,8 +120,9 @@ high level:
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
 | OpenAI/Anthropic artifact, context, knowledge, subagent, and structured-output demos | smoke | provider-smoke checks |
+| real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
+| real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | dashboard browser behavior | unclaimed | `dashboard-behavior` |
-| crash recovery across a real process boundary | unclaimed | `sigkill-recovery` |
 | budgets under real provider spend | unclaimed | `real-spend-budgets` |
 
 Do not update this document with exact pass counts. Counts move as tests are
@@ -166,6 +169,7 @@ Run only the local required lanes:
 uv run python scripts/nightly_verification.py \
   --check core-pytest \
   --check internal-evals-hermetic \
+  --check sigkill-recovery \
   --check postgres-required \
   --check docker-runner \
   --strict
@@ -187,6 +191,26 @@ does not claim multi-phase approval resume, live-provider promotion, browser
 behavior, `SIGKILL` recovery, provider billing reconciliation, LLM-judged
 quality, or baseline release gating. Use the dedicated live lanes when model or
 sandbox spend is intended.
+
+`sigkill-recovery` runs the credential-free SQLite scenarios in a dedicated
+POSIX process-death lane:
+
+```bash
+uv run python scripts/nightly_verification.py \
+  --check sigkill-recovery \
+  --strict
+```
+
+Each scenario launches a real worker process, waits for a committed-state
+killpoint, sends `SIGKILL` to its process group, and recovers from a fresh
+process using the same durable stores. The assertions cover automatic unknown
+tool outcomes, manual tool reconciliation, partially finalized approval
+interrupts, background-child reattachment, and both sides of the task
+claim/attachment seam. The `postgres-required` lane additionally runs the
+Postgres-marked claim cases. This proves deterministic process-boundary
+recovery; it does not claim operating-system supervision, arbitrary external
+exactly-once behavior, live-provider behavior, remote sandbox restart, machine
+reboot, or cross-region failover.
 
 Run credential-gated lanes only when the credential and quota are intentionally
 available:
@@ -219,7 +243,6 @@ values.
 These are intentionally still visible as `unclaimed`:
 
 - dashboard runtime/browser behavior;
-- crash recovery across a real `SIGKILL` or process-boundary death;
 - budgets under real provider spend with an explicit cap.
 
 Scheduled automation in #174 should decide which skipped or unclaimed statuses
