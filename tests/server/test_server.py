@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -130,6 +131,113 @@ class CountingArtifactStore(ArtifactStore):
 
     async def delete(self, artifact_id: str) -> None:
         return None
+
+
+class InvalidArtifactDataStore(CountingArtifactStore):
+    id = "invalid-artifact-data"
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        metadata = ArtifactMetadata.model_construct(
+            id=artifact_id,
+            filename="invalid.txt",
+            content_type="text/\ud800",
+            size_bytes=0,
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+            metadata={},
+        )
+        return ArtifactReadResult(metadata=metadata, content=b"", total_bytes=0)
+
+
+class WrongArtifactDataStore(CountingArtifactStore):
+    id = "wrong-artifact-data"
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        content = b"different artifact content"
+        return ArtifactReadResult(
+            metadata=ArtifactMetadata(
+                id="different-artifact",
+                filename="different.txt",
+                content_type="text/plain",
+                size_bytes=len(content),
+                scope=ArtifactScope.SESSION,
+                session_id="sess_inventory",
+            ),
+            content=content,
+            total_bytes=len(content),
+        )
+
+
+class OverreadArtifactDataStore(CountingArtifactStore):
+    id = "overread-artifact-data"
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        content = b"store ignored the requested limit"
+        return ArtifactReadResult(
+            metadata=ArtifactMetadata(
+                id=artifact_id,
+                filename="overread.txt",
+                content_type="text/plain",
+                size_bytes=len(content),
+                scope=ArtifactScope.SESSION,
+                session_id="sess_inventory",
+            ),
+            content=content,
+            total_bytes=len(content),
+        )
+
+
+class UnavailableArtifactStore(CountingArtifactStore):
+    id = "unavailable-artifacts"
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        raise PermissionError("Artifact backend is unavailable.")
+
+    async def list(
+        self,
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        limit: int | None = None,
+    ) -> ArtifactListResult:
+        raise PermissionError("Artifact backend is unavailable.")
+
+
+class InvalidArtifactListStore(CountingArtifactStore):
+    id = "invalid-artifact-list"
+
+    async def list(
+        self,
+        *,
+        scope: ArtifactScope | None = None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        environment_name: str | None = None,
+        limit: int | None = None,
+    ) -> ArtifactListResult:
+        return cast("ArtifactListResult", None)
 
 
 async def _collect_run(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -306,6 +414,22 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     assert read_body["total_bytes"] == len(b"deployment log\nstatus=ok\n")
     assert read_body["truncated"] is True
 
+    json_with_charset = asyncio.run(
+        artifact_store.put_bytes(
+            b'{"status":"ok"}',
+            filename="status.json",
+            content_type="application/json; charset=utf-8",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    json_preview = client.get(
+        f"/api/artifacts/{json_with_charset.id}",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert json_preview.status_code == 200
+    assert json_preview.json()["text_preview"] == '{"status":"ok"}'
+
     malformed_without_store = client.get("/api/artifacts/not-a-local-artifact-id")
     assert malformed_without_store.status_code == 404
     assert malformed_without_store.json()["detail"] == "Artifact not found"
@@ -314,8 +438,341 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
         "/api/artifacts/not-a-local-artifact-id",
         params={"artifact_store_id": "test-artifacts"},
     )
-    assert malformed_with_store.status_code == 422
-    assert "local artifact id" in malformed_with_store.json()["detail"]
+    assert malformed_with_store.status_code == 404
+    assert malformed_with_store.json()["detail"] == "Artifact not found"
+
+    padded_id = client.get(
+        f"/api/artifacts/%20{artifact.id}%20",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert padded_id.status_code == 404
+    assert padded_id.json()["detail"] == "Artifact not found"
+
+
+def test_artifact_content_endpoint_serves_bounded_downloads_safely(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local-review", metadata={"tenant": "test"}),
+            artifact_store=artifact_store,
+        ),
+        default=True,
+    )
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"deployment log\nstatus=ok\n",
+            filename="deploy.log",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+            agent_name="reviewer",
+            environment_name="local-review",
+            metadata={"source": "test"},
+        )
+    )
+
+    client = TestClient(create_server(app, dev=True))
+
+    missing_store = client.get(f"/api/artifacts/{artifact.id}/content")
+    assert missing_store.status_code == 422
+
+    blank_store = client.get(
+        f"/api/artifacts/{artifact.id}/content",
+        params={"artifact_store_id": "   "},
+    )
+    assert blank_store.status_code == 422
+
+    padded_store = client.get(
+        f"/api/artifacts/{artifact.id}/content",
+        params={"artifact_store_id": " test-artifacts "},
+    )
+    assert padded_store.status_code == 422
+    assert "must not start or end with whitespace" in padded_store.json()["detail"]
+
+    content = client.get(
+        f"/api/artifacts/{artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert content.status_code == 200
+    assert content.content == b"deployment log\nstatus=ok\n"
+    assert content.headers["content-type"].startswith("text/plain")
+    assert content.headers["x-cayu-artifact-id"] == artifact.id
+    assert content.headers["x-cayu-artifact-store-id"] == "test-artifacts"
+    assert content.headers["content-disposition"].startswith('attachment; filename="deploy.log"')
+    assert content.headers["cache-control"] == "private, no-store"
+
+    invalid_id = client.get(
+        "/api/artifacts/not-a-local-artifact-id/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert invalid_id.status_code == 404
+    assert invalid_id.json()["detail"] == "Artifact not found"
+
+    padded_id = client.get(
+        f"/api/artifacts/%20{artifact.id}%20/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert padded_id.status_code == 404
+    assert padded_id.json()["detail"] == "Artifact not found"
+
+    for malformed_id in (f"art_{'a' * 300}", "art_%00x", "art_%0Ax"):
+        malformed_response = client.get(
+            f"/api/artifacts/{malformed_id}/content",
+            params={"artifact_store_id": "test-artifacts"},
+        )
+        assert malformed_response.status_code == 404
+        assert malformed_response.json()["detail"] == "Artifact not found"
+
+    oversized_content = client.get(
+        f"/api/artifacts/{artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts", "max_bytes": 10},
+    )
+    assert oversized_content.status_code == 413
+    assert "exceeds the requested max_bytes" in oversized_content.json()["detail"]
+
+    inline_content = client.get(
+        f"/api/artifacts/{artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts", "disposition": "inline"},
+    )
+    assert inline_content.status_code == 200
+    assert inline_content.headers["content-disposition"].startswith('inline; filename="deploy.log"')
+    assert inline_content.headers["x-content-type-options"] == "nosniff"
+
+    html_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"<script>alert('no inline')</script>",
+            filename="unsafe.html",
+            content_type="text/html",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    html_content = client.get(
+        f"/api/artifacts/{html_artifact.id}/content",
+        params={
+            "artifact_store_id": "test-artifacts",
+            "disposition": "inline",
+        },
+    )
+    assert html_content.status_code == 200
+    assert html_content.headers["content-disposition"].startswith(
+        'attachment; filename="unsafe.html"'
+    )
+    assert html_content.headers["x-content-type-options"] == "nosniff"
+
+    svg_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+            filename="unsafe.svg",
+            content_type="image/svg+xml",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    svg_content = client.get(
+        f"/api/artifacts/{svg_artifact.id}/content",
+        params={
+            "artifact_store_id": "test-artifacts",
+            "disposition": "inline",
+        },
+    )
+    assert svg_content.status_code == 200
+    assert svg_content.headers["content-disposition"].startswith(
+        'attachment; filename="unsafe.svg"'
+    )
+    assert svg_content.headers["x-content-type-options"] == "nosniff"
+
+    with pytest.raises(ValueError, match="control characters"):
+        asyncio.run(
+            artifact_store.put_bytes(
+                b"bad content type",
+                filename="bad-content-type.txt",
+                content_type="text/plain\r\nX-Bad: y",
+                scope=ArtifactScope.SESSION,
+                session_id="sess_inventory",
+            )
+        )
+    with pytest.raises(ValueError, match="surrogate code points"):
+        asyncio.run(
+            artifact_store.put_bytes(
+                b"bad filename",
+                filename="bad\ud800.txt",
+                content_type="text/plain",
+                scope=ArtifactScope.SESSION,
+                session_id="sess_inventory",
+            )
+        )
+    unsafe_filename_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"unsafe filename",
+            filename="bad/path\r\nX: y.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    unsafe_content = client.get(
+        f"/api/artifacts/{unsafe_filename_artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert unsafe_content.status_code == 200
+    assert 'filename="bad_path__X: y.txt"' in unsafe_content.headers["content-disposition"]
+    assert "bad%2Fpath" not in unsafe_content.headers["content-disposition"]
+    assert "\r" not in unsafe_content.headers["content-disposition"]
+    assert "\n" not in unsafe_content.headers["content-disposition"]
+    assert "%0D" not in unsafe_content.headers["content-disposition"]
+    assert "%0A" not in unsafe_content.headers["content-disposition"]
+
+    bidi_filename_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"unicode filename controls",
+            filename="report\u202efdp\u2066\u2069.exe",
+            content_type="application/octet-stream",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    bidi_filename_content = client.get(
+        f"/api/artifacts/{bidi_filename_artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert bidi_filename_content.status_code == 200
+    bidi_disposition = bidi_filename_content.headers["content-disposition"]
+    assert 'filename="report_fdp__.exe"' in bidi_disposition
+    assert "filename*=UTF-8''report_fdp__.exe" in bidi_disposition
+    assert "%E2%80%AE" not in bidi_disposition
+    assert "%E2%81%A6" not in bidi_disposition
+    assert "%E2%81%A9" not in bidi_disposition
+
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="invalid-artifact-environment"),
+            artifact_store=InvalidArtifactDataStore(),
+        )
+    )
+    invalid_store_data = client.get(
+        "/api/artifacts/invalid/content",
+        params={"artifact_store_id": "invalid-artifact-data"},
+    )
+    assert invalid_store_data.status_code == 500
+    assert invalid_store_data.json() == {"detail": "Artifact store returned invalid artifact data."}
+
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="wrong-artifact-environment"),
+            artifact_store=WrongArtifactDataStore(),
+        )
+    )
+    wrong_store_data = client.get(
+        "/api/artifacts/requested/content",
+        params={"artifact_store_id": "wrong-artifact-data"},
+    )
+    assert wrong_store_data.status_code == 500
+    assert wrong_store_data.json() == {"detail": "Artifact store returned invalid artifact data."}
+
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="overread-artifact-environment"),
+            artifact_store=OverreadArtifactDataStore(),
+        )
+    )
+    overread_store_data = client.get(
+        "/api/artifacts/requested/content",
+        params={"artifact_store_id": "overread-artifact-data", "max_bytes": 1},
+    )
+    assert overread_store_data.status_code == 500
+    assert overread_store_data.json() == {
+        "detail": "Artifact store returned invalid artifact data."
+    }
+
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="unavailable-artifact-environment"),
+            artifact_store=UnavailableArtifactStore(),
+        )
+    )
+    for unavailable_path in (
+        "/api/artifacts/requested",
+        "/api/artifacts/requested/content",
+    ):
+        unavailable_store = client.get(
+            unavailable_path,
+            params={"artifact_store_id": "unavailable-artifacts"},
+        )
+        assert unavailable_store.status_code == 503
+        assert unavailable_store.json() == {"detail": "Artifact store is unavailable."}
+        assert unavailable_store.headers["content-type"].startswith("application/json")
+
+    unavailable_list = client.get(
+        "/api/artifacts",
+        params={"artifact_store_id": "unavailable-artifacts"},
+    )
+    assert unavailable_list.status_code == 503
+    assert unavailable_list.json() == {"detail": "Artifact store is unavailable."}
+    assert unavailable_list.headers["content-type"].startswith("application/json")
+
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="invalid-artifact-list-environment"),
+            artifact_store=InvalidArtifactListStore(),
+        )
+    )
+    invalid_list = client.get(
+        "/api/artifacts",
+        params={"artifact_store_id": "invalid-artifact-list"},
+    )
+    assert invalid_list.status_code == 500
+    assert invalid_list.json() == {"detail": "Artifact store returned invalid artifact data."}
+    assert invalid_list.headers["content-type"].startswith("application/json")
+
+    long_filename_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"bounded header",
+            filename=f"{'a' * 20_000}.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    bounded_header = client.get(
+        f"/api/artifacts/{long_filename_artifact.id}/content",
+        params={"artifact_store_id": "test-artifacts"},
+    )
+    assert bounded_header.status_code == 200
+    disposition_header = bounded_header.headers["content-disposition"]
+    assert len(disposition_header.encode("latin-1")) < 2048
+    assert ".txt" in disposition_header
+
+    symlink_artifact = asyncio.run(
+        artifact_store.put_bytes(
+            b"artifact-content",
+            filename="symlink.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_inventory",
+        )
+    )
+    outside_content = tmp_path / "outside-secret.txt"
+    outside_content.write_bytes(b"host-secret-data")
+    content_path = artifact_store.root / symlink_artifact.id / "content"
+    content_path.unlink()
+    try:
+        content_path.symlink_to(outside_content)
+    except OSError:
+        pass
+    else:
+        symlink_content = client.get(
+            f"/api/artifacts/{symlink_artifact.id}/content",
+            params={"artifact_store_id": "test-artifacts"},
+        )
+        assert symlink_content.status_code == 500
+        assert symlink_content.json() == {
+            "detail": "Artifact store returned invalid artifact data."
+        }
+        assert symlink_content.content != outside_content.read_bytes()
 
 
 def test_server_control_plane_inventory_redacts_configured_secrets(tmp_path) -> None:
@@ -3005,11 +3462,31 @@ def test_dashboard_routes_fall_back_to_index_without_masking_api_or_assets() -> 
         response = client.get(path)
         assert response.status_code == 200
         assert '<div id="root"></div>' in response.text
+        assert '<base href="/cayu/" />' in response.text
         assert '"basePath":"/cayu"' in response.text
 
     assert client.get("/sessions").status_code == 404
     assert client.get("/api/missing").status_code == 404
     assert client.get("/cayu/assets/missing.js").status_code == 404
+
+
+def test_dashboard_uses_effective_paths_when_server_is_nested_under_asgi_mount() -> None:
+    parent = FastAPI()
+    parent.mount("/product", create_server(CayuApp(), dev=True))
+
+    client = TestClient(parent)
+    response = client.get("/product/cayu/sessions/deep-link")
+
+    assert response.status_code == 200
+    assert '<base href="/product/cayu/" />' in response.text
+    assert '"basePath":"/product/cayu"' in response.text
+    assert '"apiBaseUrl":"/product/api"' in response.text
+
+    asset_paths = re.findall(r'(?:src|href)="\./(assets/[^"]+)"', response.text)
+    assert asset_paths
+    for asset_path in asset_paths:
+        assert client.get(f"/product/cayu/{asset_path}").status_code == 200
+        assert client.get(f"/cayu/{asset_path}").status_code == 404
 
 
 def test_dashboard_path_can_be_disabled_or_customized() -> None:
@@ -3021,6 +3498,7 @@ def test_dashboard_path_can_be_disabled_or_customized() -> None:
 
     assert response.status_code == 200
     assert '<div id="root"></div>' in response.text
+    assert '<base href="/inspector/" />' in response.text
     assert '"basePath":"/inspector"' in response.text
     assert custom.get("/cayu/").status_code == 404
 
@@ -3038,6 +3516,7 @@ def test_create_server_can_embed_api_under_dashboard_path() -> None:
     dashboard = client.get("/cayu/sessions")
     assert dashboard.status_code == 200
     assert '<div id="root"></div>' in dashboard.text
+    assert '<base href="/cayu/" />' in dashboard.text
     assert '"basePath":"/cayu"' in dashboard.text
     assert '"apiBaseUrl":"/cayu/api"' in dashboard.text
 
@@ -3056,7 +3535,62 @@ def test_mount_dashboard_helper_supports_composed_apps() -> None:
 
     assert response.status_code == 200
     assert '<div id="root"></div>' in response.text
+    assert '<base href="/inspector/" />' in response.text
     assert '"basePath":"/inspector"' in response.text
+
+
+def test_mount_dashboard_injects_base_before_custom_shell_assets(tmp_path) -> None:
+    dashboard_dir = tmp_path / "dashboard"
+    assets_dir = dashboard_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    (dashboard_dir / "index.html").write_text(
+        '<!doctype html><!-- <head data-fake=">"> -->'
+        '<html><HEAD data-theme="dark" data-label="a > b">'
+        '<script src="./assets/app.js"></script></HEAD><body>custom</body></html>',
+        encoding="utf-8",
+    )
+    (assets_dir / "app.js").write_text("window.customDashboard = true", encoding="utf-8")
+
+    app = FastAPI()
+    assert (
+        mount_dashboard(
+            app,
+            dashboard_dir=dashboard_dir,
+            dashboard_path="/inspector",
+        )
+        is True
+    )
+
+    client = TestClient(app)
+    response = client.get("/inspector/sessions/deep-link")
+
+    assert response.status_code == 200
+    assert '<base href="/inspector/" />' in response.text
+    assert response.text.index("<base ") < response.text.index("./assets/app.js")
+    assert client.get("/inspector/assets/app.js").status_code == 200
+
+
+def test_mount_dashboard_preserves_doctype_for_custom_shell_without_head(tmp_path) -> None:
+    dashboard_dir = tmp_path / "dashboard"
+    assets_dir = dashboard_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    (dashboard_dir / "index.html").write_text(
+        '<!doctype html><html lang="en"><body>'
+        '<script src="./assets/app.js"></script></body></html>',
+        encoding="utf-8",
+    )
+    (assets_dir / "app.js").write_text("window.customDashboard = true", encoding="utf-8")
+
+    app = FastAPI()
+    assert mount_dashboard(app, dashboard_dir=dashboard_dir, dashboard_path="/inspector") is True
+
+    response = TestClient(app).get("/inspector/sessions/deep-link")
+
+    assert response.status_code == 200
+    assert response.text.startswith("<!doctype html><html")
+    assert '<head>\n    <base href="/inspector/" />' in response.text
+    assert response.text.index("<!doctype html>") < response.text.index("<head>")
+    assert response.text.index("<head>") < response.text.index("./assets/app.js")
 
 
 def test_mount_cayu_mounts_api_and_dashboard_under_product_path() -> None:
@@ -3070,6 +3604,7 @@ def test_mount_cayu_mounts_api_and_dashboard_under_product_path() -> None:
 
     assert dashboard.status_code == 200
     assert '<div id="root"></div>' in dashboard.text
+    assert '<base href="/cayu/" />' in dashboard.text
     assert '"basePath":"/cayu"' in dashboard.text
     assert '"apiBaseUrl":"/cayu/api"' in dashboard.text
     assert client.get("/cayu/api/health").json() == {"ok": True}

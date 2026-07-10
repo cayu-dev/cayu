@@ -161,6 +161,43 @@ def test_streaming_routes_document_sse_response_contract() -> None:
         assert "SseErrorEnvelope" in description
 
 
+def test_artifact_routes_document_typed_errors_and_content_response() -> None:
+    schema = _client().get("/openapi.json").json()
+    operation = schema["paths"]["/api/artifacts/{artifact_id}/content"]["get"]
+
+    artifact_store_parameter = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["name"] == "artifact_store_id"
+    )
+    assert artifact_store_parameter["required"] is True
+    assert artifact_store_parameter["schema"]["minLength"] == 1
+
+    success = operation["responses"]["200"]
+    assert success["content"]["application/octet-stream"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+    assert set(success["headers"]) == {
+        "Cache-Control",
+        "Content-Disposition",
+        "X-Content-Type-Options",
+        "X-Cayu-Artifact-Id",
+        "X-Cayu-Artifact-Store-Id",
+    }
+    for status_code in ("404", "409", "413", "500", "503"):
+        assert operation["responses"][status_code]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApiErrorResponse"
+        }
+
+    for path in ("/api/artifacts", "/api/artifacts/{artifact_id}"):
+        responses = schema["paths"][path]["get"]["responses"]
+        for status_code in ("404", "409", "500", "503"):
+            assert responses[status_code]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+            }
+
+
 def test_sse_serialization_matches_contract_envelope() -> None:
     event = Event(
         id="event_1",

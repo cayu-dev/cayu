@@ -24,6 +24,7 @@ from cayu._validation import (
     copy_label_map,
     require_clean_nonblank,
     require_nonblank,
+    require_unicode_scalar_text,
 )
 from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
@@ -33,6 +34,8 @@ from cayu.artifacts import (
     ArtifactScope,
     FileAttachment,
     FileAttachmentKind,
+    InvalidArtifactIdError,
+    copy_artifact_read_result,
     file_attachment,
     file_attachment_from_payload,
     resolved_file_attachment,
@@ -11778,7 +11781,8 @@ def _artifact_store_id(
     artifact_store_id = getattr(registered_environment.environment.artifact_store, "id", None)
     if artifact_store_id is None:
         return None
-    return require_clean_nonblank(artifact_store_id, "artifact_store.id")
+    artifact_store_id = require_clean_nonblank(artifact_store_id, "artifact_store.id")
+    return require_unicode_scalar_text(artifact_store_id, "artifact_store.id")
 
 
 def _artifact_store(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
@@ -11800,12 +11804,13 @@ async def _resolved_file_attachments(
     max_total_file_attachment_bytes: int,
     max_file_attachments_per_request: int,
 ) -> tuple[dict[str, dict[str, Any]], set[str]]:
-    # Returns (resolved, unresolvable_prompt_ids). A prompt file part that cannot be resolved (wrong
-    # session_id at attach time, a since-deleted artifact, a malformed/corrupt reference) fails open:
-    # it is reported back so the caller can project it to a text note instead of failing the run
-    # forever. Tool-result attachments stay fail-closed — a tool that produced an artifact must
-    # resolve it — and an id referenced by BOTH a prompt file and a tool result stays fail-closed too
-    # (the tool-result path would otherwise brick on a missing resolved entry).
+    # Returns (resolved, unresolvable_prompt_ids). A prompt file part whose reference is missing,
+    # malformed, or no longer accessible in this scope fails open: it is reported back so the
+    # caller can project it to a text note instead of failing the run forever. Store outages and
+    # invalid store results fail closed so the model cannot answer without a required file.
+    # Tool-result attachments also stay fail-closed, and an id referenced by BOTH a prompt file and
+    # a tool result stays fail-closed (the tool-result path would otherwise brick on a missing
+    # resolved entry).
     attachment_refs, prompt_file_artifact_ids, tool_result_artifact_ids = _file_attachment_refs(
         messages
     )
@@ -11836,9 +11841,13 @@ async def _resolved_file_attachments(
         if attachment.artifact_id in resolved or attachment.artifact_id in unresolvable_prompt_ids:
             continue
         try:
-            result = await artifact_store.read_bytes(
-                attachment.artifact_id,
-                max_bytes=attachment.size_bytes,
+            result = copy_artifact_read_result(
+                await artifact_store.read_bytes(
+                    attachment.artifact_id,
+                    max_bytes=attachment.size_bytes,
+                ),
+                expected_artifact_id=attachment.artifact_id,
+                max_content_bytes=attachment.size_bytes,
             )
             artifact = result.metadata
             if artifact.scope.value == "session" and artifact.session_id != session.id:
@@ -11860,7 +11869,7 @@ async def _resolved_file_attachments(
                 raise _FileAttachmentUnavailable(
                     "File attachment size changed before provider request."
                 )
-        except (OSError, ValueError, _FileAttachmentUnavailable):
+        except (FileNotFoundError, InvalidArtifactIdError, _FileAttachmentUnavailable):
             # Fail open only for files that are EXCLUSIVELY prompt attachments. A tool-result
             # reference (including an id shared with a prompt file) stays fail-closed, because the
             # provider builder raises on a tool-result part whose artifact is not resolved.

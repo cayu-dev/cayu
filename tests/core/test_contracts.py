@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import pickle
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
+import cayu.artifacts.local as artifact_local_module
 import cayu.runners._subprocess as runner_subprocess_module
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
@@ -14,10 +18,13 @@ from cayu.artifacts import (
     ArtifactMetadata,
     ArtifactReadResult,
     ArtifactScope,
+    ArtifactStoreUnavailableError,
     FileAttachment,
     FileAttachmentKind,
+    InvalidArtifactIdError,
     LocalArtifactStore,
     ResolvedFileAttachment,
+    copy_artifact_read_result,
     file_attachment,
     file_attachment_from_payload,
 )
@@ -2503,6 +2510,9 @@ def test_local_workspace_reads_writes_and_lists_files(tmp_path):
 
 
 def test_local_artifact_store_puts_reads_lists_and_deletes_artifacts(tmp_path):
+    with pytest.raises(ValueError, match="surrogate code points"):
+        LocalArtifactStore(tmp_path / "invalid-artifacts", store_id="artifacts_\ud800")
+
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
 
     session_artifact = asyncio.run(
@@ -2548,6 +2558,13 @@ def test_local_artifact_store_puts_reads_lists_and_deletes_artifacts(tmp_path):
     with pytest.raises(FileNotFoundError):
         asyncio.run(store.read_bytes(session_artifact.id))
 
+    store.id = "artifacts_\ud800"
+    with pytest.raises(ValueError, match="surrogate code points"):
+        Environment(
+            EnvironmentSpec(name="invalid-store"),
+            artifact_store=store,
+        )
+
 
 def test_local_artifact_store_enforces_scope_owners_and_limits(tmp_path):
     store = LocalArtifactStore(tmp_path / "artifacts")
@@ -2589,11 +2606,264 @@ def test_local_artifact_store_enforces_scope_owners_and_limits(tmp_path):
     with pytest.raises(ValueError, match="limit"):
         asyncio.run(store.list(limit=0))
 
+    for invalid_id in (
+        "",
+        " ",
+        " art_1",
+        "not_artifact",
+        "art_1",
+        f"art_{'a' * 300}",
+        "art_\x00x",
+        "art_\nx",
+        f"art_{'A' * 32}",
+    ):
+        with pytest.raises(InvalidArtifactIdError):
+            asyncio.run(store.read_bytes(invalid_id))
+        with pytest.raises(InvalidArtifactIdError):
+            asyncio.run(store.delete(invalid_id))
+
     non_artifact_dir = tmp_path / "artifacts" / "not_artifact"
     non_artifact_dir.mkdir()
     with pytest.raises(ValueError, match="local artifact id"):
         asyncio.run(store.delete("not_artifact"))
     assert non_artifact_dir.exists()
+
+    malformed_artifact_dir = tmp_path / "artifacts" / "art_not_addressable"
+    malformed_artifact_dir.mkdir()
+    malformed_metadata = ArtifactMetadata(
+        id=malformed_artifact_dir.name,
+        filename="malformed.txt",
+        content_type="text/plain",
+        size_bytes=0,
+        session_id="sess_1",
+    )
+    (malformed_artifact_dir / "metadata.json").write_text(
+        malformed_metadata.model_dump_json(),
+        encoding="utf-8",
+    )
+    (malformed_artifact_dir / "content").write_bytes(b"")
+
+    listed = asyncio.run(store.list())
+
+    assert malformed_artifact_dir.name not in {artifact.id for artifact in listed.artifacts}
+
+
+def test_local_artifact_store_rejects_symlinked_artifact_files(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"artifact-content",
+            filename="artifact.txt",
+            session_id="sess_1",
+        )
+    )
+    outside_content = tmp_path / "outside.txt"
+    outside_content.write_bytes(b"host-secret-data")
+    content_path = store.root / artifact.id / "content"
+    content_path.unlink()
+    try:
+        content_path.symlink_to(outside_content)
+    except OSError:
+        pytest.skip("Symbolic links are unavailable on this platform.")
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        asyncio.run(store.read_bytes(artifact.id))
+
+    second = asyncio.run(
+        store.put_bytes(
+            b"second-content",
+            filename="second.txt",
+            session_id="sess_1",
+        )
+    )
+    metadata_path = store.root / second.id / "metadata.json"
+    outside_metadata = tmp_path / "outside-metadata.json"
+    outside_metadata.write_bytes(metadata_path.read_bytes())
+    metadata_path.unlink()
+    metadata_path.symlink_to(outside_metadata)
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        asyncio.run(store.read_bytes(second.id))
+
+
+def test_local_artifact_store_without_directory_fd_support(monkeypatch, tmp_path):
+    monkeypatch.setattr(artifact_local_module, "_SUPPORTS_DIRECTORY_FD", False)
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"fallback-content",
+            filename="fallback.txt",
+            session_id="sess_1",
+        )
+    )
+
+    read = asyncio.run(store.read_bytes(artifact.id, max_bytes=8))
+    listed = asyncio.run(store.list())
+
+    assert read.content == b"fallback"
+    assert read.total_bytes == len(b"fallback-content")
+    assert read.truncated is True
+    assert listed.artifacts == (artifact,)
+
+    outside_content = tmp_path / "outside.txt"
+    outside_content.write_bytes(b"host-secret-data")
+    content_path = store.root / artifact.id / "content"
+    content_path.unlink()
+    try:
+        content_path.symlink_to(outside_content)
+    except OSError:
+        content_path.write_bytes(b"fallback-content")
+    else:
+        with pytest.raises(ValueError, match="not a regular file"):
+            asyncio.run(store.read_bytes(artifact.id))
+
+    asyncio.run(store.delete(artifact.id))
+    assert not (store.root / artifact.id).exists()
+
+
+def test_local_artifact_store_classifies_permission_failures_as_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"artifact-content",
+            filename="artifact.txt",
+            session_id="sess_1",
+        )
+    )
+    content_path = store.root / artifact.id / "content"
+    real_open = artifact_local_module.os.open
+
+    def deny_content_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == "content" or path == content_path:
+            raise PermissionError(errno.EACCES, "Permission denied", str(content_path))
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifact_local_module.os, "open", deny_content_open)
+
+    with pytest.raises(ArtifactStoreUnavailableError) as exc_info:
+        asyncio.run(store.read_bytes(artifact.id))
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+def test_local_artifact_store_does_not_hide_list_backend_failures(monkeypatch, tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    asyncio.run(
+        store.put_bytes(
+            b"artifact-content",
+            filename="artifact.txt",
+            session_id="sess_1",
+        )
+    )
+
+    def deny_metadata_read(_path, *, parent_fd=None):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(artifact_local_module, "_load_metadata", deny_metadata_read)
+
+    with pytest.raises(ArtifactStoreUnavailableError) as exc_info:
+        asyncio.run(store.list())
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+def test_local_artifact_store_rejects_replaced_root(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"artifact-content",
+            filename="artifact.txt",
+            session_id="sess_1",
+        )
+    )
+    original_root = tmp_path / "original-artifacts"
+    store.root.rename(original_root)
+    store.root.mkdir()
+
+    operations = (
+        lambda: asyncio.run(store.list()),
+        lambda: asyncio.run(store.read_bytes(artifact.id)),
+        lambda: asyncio.run(
+            store.put_bytes(
+                b"redirected-content",
+                filename="redirected.txt",
+                session_id="sess_1",
+            )
+        ),
+        lambda: asyncio.run(store.delete(artifact.id)),
+    )
+    for operation in operations:
+        with pytest.raises(ArtifactStoreUnavailableError, match="root changed"):
+            operation()
+
+    assert list(store.root.iterdir()) == []
+    assert (original_root / artifact.id / "content").read_bytes() == b"artifact-content"
+
+    store.root.rmdir()
+    outside_root = tmp_path / "outside-artifacts"
+    outside_root.mkdir()
+    try:
+        store.root.symlink_to(outside_root, target_is_directory=True)
+    except OSError:
+        pass
+    else:
+        with pytest.raises(ArtifactStoreUnavailableError, match="root changed"):
+            asyncio.run(store.list())
+        assert list(outside_root.iterdir()) == []
+
+
+def test_local_artifact_store_anchors_inflight_write_to_open_root(monkeypatch, tmp_path):
+    if not artifact_local_module._SUPPORTS_DIRECTORY_FD:
+        pytest.skip("Directory-relative filesystem operations are unavailable.")
+
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    original_root = tmp_path / "original-artifacts"
+    replacement_root = tmp_path / "replacement-artifacts"
+    replacement_root.mkdir()
+    real_mkdir = artifact_local_module.os.mkdir
+    swapped = False
+
+    def swap_root_before_artifact_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is not None and not swapped:
+            store.root.rename(original_root)
+            replacement_root.rename(store.root)
+            swapped = True
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifact_local_module.os, "mkdir", swap_root_before_artifact_mkdir)
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="root changed"):
+        asyncio.run(
+            store.put_bytes(
+                b"anchored-content",
+                filename="anchored.txt",
+                session_id="sess_1",
+            )
+        )
+
+    assert swapped is True
+    assert list(store.root.iterdir()) == []
+    created = list(original_root.glob("art_*/content"))
+    assert len(created) == 1
+    assert created[0].read_bytes() == b"anchored-content"
+
+
+def test_local_artifact_store_detects_windows_reparse_points():
+    assert artifact_local_module._is_windows_reparse_point(
+        SimpleNamespace(st_file_attributes=0x400, st_reparse_tag=0)  # type: ignore[arg-type]
+    )
+    assert artifact_local_module._is_windows_reparse_point(
+        SimpleNamespace(st_file_attributes=0, st_reparse_tag=0xA0000003)  # type: ignore[arg-type]
+    )
+    assert not artifact_local_module._is_windows_reparse_point(
+        SimpleNamespace(st_file_attributes=0, st_reparse_tag=0)  # type: ignore[arg-type]
+    )
 
 
 def test_artifact_result_types_validate_boundary_values():
@@ -2603,6 +2873,7 @@ def test_artifact_result_types_validate_boundary_values():
         content_type="text/plain",
         size_bytes=3,
         session_id="sess_1",
+        metadata={"nested": {"items": [1]}},
     )
     read_result = ArtifactReadResult(
         metadata=artifact,
@@ -2613,6 +2884,59 @@ def test_artifact_result_types_validate_boundary_values():
 
     assert read_result.metadata == artifact
     assert list_result.artifacts == (artifact,)
+
+    with pytest.raises(ValidationError, match="frozen"):
+        artifact.content_type = "text/html"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        artifact.metadata["new"] = True
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        artifact.metadata["nested"]["items"].append(2)
+    with pytest.raises(TypeError):
+        dict.__setitem__(artifact.metadata, "base_mutation", True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        list.append(artifact.metadata["nested"]["items"], 2)
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        artifact.metadata._data = {}  # type: ignore[attr-defined]
+    assert artifact.model_dump(mode="json")["metadata"] == {"nested": {"items": [1]}}
+
+    default_metadata = ArtifactMetadata(
+        id="art_default",
+        filename="default.txt",
+        size_bytes=0,
+        session_id="sess_1",
+    )
+    with pytest.raises(TypeError):
+        default_metadata.metadata["new"] = True  # type: ignore[index]
+    restored_artifact = pickle.loads(pickle.dumps(artifact))
+    assert restored_artifact == artifact
+    assert restored_artifact.model_dump(mode="json") == artifact.model_dump(mode="json")
+
+    copied_artifact = artifact.model_copy(
+        update={"metadata": {"nested": {"items": [2]}}},
+    )
+    assert copied_artifact.metadata == {"nested": {"items": [2]}}
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        copied_artifact.metadata["nested"]["items"].append(3)
+    with pytest.raises(ValidationError, match="control characters"):
+        artifact.model_copy(update={"content_type": "text/plain\r\nX-Bad: value"})
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        artifact.model_copy(update={"unknown_field": True})
+
+    sparse_artifact = ArtifactMetadata(
+        id="art_sparse",
+        filename="sparse.txt",
+        size_bytes=0,
+        session_id="sess_1",
+    )
+    sparse_copy = sparse_artifact.model_copy(update={"content_type": "text/plain"})
+    assert sparse_copy.model_fields_set == sparse_artifact.model_fields_set | {"content_type"}
+    assert sparse_copy.model_dump(mode="json", exclude_unset=True) == {
+        "id": "art_sparse",
+        "filename": "sparse.txt",
+        "content_type": "text/plain",
+        "size_bytes": 0,
+        "session_id": "sess_1",
+    }
 
     with pytest.raises(ValueError, match="session_id"):
         ArtifactMetadata(
@@ -2627,6 +2951,78 @@ def test_artifact_result_types_validate_boundary_values():
             filename="a.txt",
             size_bytes=0,
             scope=ArtifactScope.ENVIRONMENT,
+        )
+
+    with pytest.raises(ValueError, match="surrogate code points"):
+        ArtifactMetadata(
+            id="art_1",
+            filename="bad\ud800.txt",
+            size_bytes=0,
+            session_id="sess_1",
+        )
+
+    for field_name in ("id", "session_id", "agent_name", "environment_name"):
+        values = {
+            "id": "art_1",
+            "filename": "a.txt",
+            "size_bytes": 0,
+            "session_id": "sess_1",
+        }
+        values[field_name] = f"{field_name}_\ud800"
+        with pytest.raises(ValueError, match="surrogate code points"):
+            ArtifactMetadata(**values)
+
+    for metadata in ({"bad_\ud800": "value"}, {"nested": ["bad_\ud800"]}):
+        with pytest.raises(ValueError, match="surrogate code points"):
+            ArtifactMetadata(
+                id="art_1",
+                filename="a.txt",
+                size_bytes=0,
+                session_id="sess_1",
+                metadata=metadata,
+            )
+
+    for content_type in ("text/pläin", "text/\ud800"):
+        with pytest.raises(ValueError, match="printable ASCII"):
+            ArtifactMetadata(
+                id="art_1",
+                filename="a.txt",
+                content_type=content_type,
+                size_bytes=0,
+                session_id="sess_1",
+            )
+
+    with pytest.raises(ValueError, match="at most 1024"):
+        ArtifactMetadata(
+            id="art_1",
+            filename="a.txt",
+            content_type="x" * 1025,
+            size_bytes=0,
+            session_id="sess_1",
+        )
+
+    invalid_constructed_metadata = ArtifactMetadata.model_construct(
+        id="art_1",
+        filename="a.txt",
+        content_type="text/\ud800",
+        size_bytes=0,
+        scope=ArtifactScope.SESSION,
+        session_id="sess_1",
+        agent_name=None,
+        environment_name=None,
+        created_at=artifact.created_at,
+        metadata={},
+    )
+    with pytest.raises(ValueError, match="printable ASCII"):
+        ArtifactReadResult(
+            metadata=invalid_constructed_metadata,
+            content=b"",
+            total_bytes=0,
+        )
+    with pytest.raises(ValueError, match="printable ASCII"):
+        ArtifactListResult(
+            artifacts=(invalid_constructed_metadata,),
+            total_count=1,
         )
 
     with pytest.raises(TypeError, match="content"):
@@ -2646,6 +3042,19 @@ def test_artifact_result_types_validate_boundary_values():
 
     with pytest.raises(ValueError, match="truncated must match"):
         ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=4, truncated=False)
+
+    mismatched_size_metadata = artifact.model_copy(update={"size_bytes": 4})
+    with pytest.raises(ValueError, match="size_bytes must equal total_bytes"):
+        ArtifactReadResult(
+            metadata=mismatched_size_metadata,
+            content=b"abc",
+            total_bytes=3,
+        )
+
+    with pytest.raises(ValueError, match="different artifact id"):
+        copy_artifact_read_result(read_result, expected_artifact_id="art_other")
+    with pytest.raises(ValueError, match="requested byte limit"):
+        copy_artifact_read_result(read_result, max_content_bytes=2)
 
     with pytest.raises(TypeError, match="artifacts"):
         ArtifactListResult(artifacts="a.txt", total_count=1)  # type: ignore[arg-type]

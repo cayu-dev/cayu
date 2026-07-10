@@ -174,6 +174,7 @@ def test_protected_server_can_expose_generated_docs_explicitly() -> None:
         ("GET", "/api/sessions/session-1/events", None),
         ("GET", "/api/sessions/session-1/transcript", None),
         ("GET", "/api/sessions/session-1", None),
+        ("GET", "/api/artifacts/missing/content", None),
         ("GET", "/api/tasks", None),
         ("GET", "/api/knowledge/pending", None),
         ("GET", "/api/knowledge/pending/entry-1", None),

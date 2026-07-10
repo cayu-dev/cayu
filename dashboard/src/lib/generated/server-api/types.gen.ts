@@ -258,6 +258,16 @@ export type ApiEnvironmentSummary = {
 };
 
 /**
+ * ApiErrorResponse
+ */
+export type ApiErrorResponse = {
+    /**
+     * Detail
+     */
+    detail: string;
+};
+
+/**
  * ApiEventRecord
  */
 export type ApiEventRecord = {
@@ -2862,9 +2872,25 @@ export type ListArtifactsApiArtifactsGetData = {
 
 export type ListArtifactsApiArtifactsGetErrors = {
     /**
+     * The requested artifact store or artifact does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * Registered artifact-store identifiers are not unique.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * An artifact store is misconfigured or returned invalid data.
+     */
+    500: ApiErrorResponse;
+    /**
+     * An artifact store is unavailable.
+     */
+    503: ApiErrorResponse;
 };
 
 export type ListArtifactsApiArtifactsGetError = ListArtifactsApiArtifactsGetErrors[keyof ListArtifactsApiArtifactsGetErrors];
@@ -2901,9 +2927,25 @@ export type GetArtifactApiArtifactsArtifactIdGetData = {
 
 export type GetArtifactApiArtifactsArtifactIdGetErrors = {
     /**
+     * The requested artifact store or artifact does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * Registered artifact-store identifiers are not unique.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * An artifact store is misconfigured or returned invalid data.
+     */
+    500: ApiErrorResponse;
+    /**
+     * An artifact store is unavailable.
+     */
+    503: ApiErrorResponse;
 };
 
 export type GetArtifactApiArtifactsArtifactIdGetError = GetArtifactApiArtifactsArtifactIdGetErrors[keyof GetArtifactApiArtifactsArtifactIdGetErrors];
@@ -2916,6 +2958,69 @@ export type GetArtifactApiArtifactsArtifactIdGetResponses = {
 };
 
 export type GetArtifactApiArtifactsArtifactIdGetResponse = GetArtifactApiArtifactsArtifactIdGetResponses[keyof GetArtifactApiArtifactsArtifactIdGetResponses];
+
+export type GetArtifactContentApiArtifactsArtifactIdContentGetData = {
+    body?: never;
+    path: {
+        /**
+         * Artifact Id
+         */
+        artifact_id: string;
+    };
+    query: {
+        /**
+         * Artifact Store Id
+         */
+        artifact_store_id: string;
+        /**
+         * Disposition
+         */
+        disposition?: 'attachment' | 'inline';
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+    };
+    url: '/api/artifacts/{artifact_id}/content';
+};
+
+export type GetArtifactContentApiArtifactsArtifactIdContentGetErrors = {
+    /**
+     * The requested artifact store or artifact does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * Registered artifact-store identifiers are not unique.
+     */
+    409: ApiErrorResponse;
+    /**
+     * Artifact exceeds the direct content response limit.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * An artifact store is misconfigured or returned invalid data.
+     */
+    500: ApiErrorResponse;
+    /**
+     * An artifact store is unavailable.
+     */
+    503: ApiErrorResponse;
+};
+
+export type GetArtifactContentApiArtifactsArtifactIdContentGetError = GetArtifactContentApiArtifactsArtifactIdContentGetErrors[keyof GetArtifactContentApiArtifactsArtifactIdContentGetErrors];
+
+export type GetArtifactContentApiArtifactsArtifactIdContentGetResponses = {
+    /**
+     * Complete artifact bytes. The response Content-Type reflects validated stored artifact metadata.
+     */
+    200: Blob | File;
+};
+
+export type GetArtifactContentApiArtifactsArtifactIdContentGetResponse = GetArtifactContentApiArtifactsArtifactIdContentGetResponses[keyof GetArtifactContentApiArtifactsArtifactIdContentGetResponses];
 
 export type EstimateCausalBudgetCostApiCausalBudgetsCausalBudgetIdCostPostData = {
     body: SessionCostBody;

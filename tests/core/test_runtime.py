@@ -15,6 +15,7 @@ from pydantic import ValidationError
 import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
+    ArtifactStoreUnavailableError,
     LocalArtifactStore,
     file_attachment,
 )
@@ -21595,7 +21596,10 @@ def test_noteify_unresolvable_prompt_files_replaces_only_targeted_parts():
     assert "art_bad" in kept[2].text
 
 
-def test_resolved_file_attachments_fail_open_only_for_prompt_files(tmp_path):
+def test_resolved_file_attachments_fail_open_only_for_prompt_files(monkeypatch, tmp_path):
+    prompt_missing_id = f"art_{'a' * 32}"
+    tool_missing_id = f"art_{'b' * 32}"
+    shared_missing_id = f"art_{'c' * 32}"
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     app = CayuApp(enable_logging=False)
     app.register_environment(
@@ -21631,10 +21635,10 @@ def test_resolved_file_attachments_fail_open_only_for_prompt_files(tmp_path):
         )
 
     # Prompt file with a missing artifact: fails open into the unresolvable set (no raise).
-    prompt_only = [Message(role="user", content=[FilePart(attachment=missing("art_ghost"))])]
+    prompt_only = [Message(role="user", content=[FilePart(attachment=missing(prompt_missing_id))])]
     resolved, unresolvable = asyncio.run(resolve(prompt_only))
     assert resolved == {}
-    assert unresolvable == {"art_ghost"}
+    assert unresolvable == {prompt_missing_id}
 
     # A malformed artifact id (not an 'art_' id) raises ValueError on read but still fails open.
     bad_id = [Message(role="user", content=[FilePart(attachment=missing("nope"))])]
@@ -21648,7 +21652,7 @@ def test_resolved_file_attachments_fail_open_only_for_prompt_files(tmp_path):
             tool_call_id="c1",
             tool_name="read_file",
             content="x",
-            artifacts=[missing("art_toolghost")],
+            artifacts=[missing(tool_missing_id)],
         ),
     ]
     with pytest.raises(FileNotFoundError):
@@ -21657,17 +21661,38 @@ def test_resolved_file_attachments_fail_open_only_for_prompt_files(tmp_path):
     # An id referenced by BOTH a prompt file and a tool result stays fail-closed (the tool-result
     # provider path would brick on a missing resolved entry).
     shared = [
-        Message(role="user", content=[FilePart(attachment=missing("art_shared"))]),
+        Message(role="user", content=[FilePart(attachment=missing(shared_missing_id))]),
         Message.tool_call(tool_call_id="c2", tool_name="read_file"),
         Message.tool_result(
             tool_call_id="c2",
             tool_name="read_file",
             content="x",
-            artifacts=[missing("art_shared")],
+            artifacts=[missing(shared_missing_id)],
         ),
     ]
     with pytest.raises(FileNotFoundError):
         asyncio.run(resolve(shared))
+
+    async def permission_failure(_artifact_id, *, max_bytes=None):
+        raise PermissionError("Artifact backend permission denied.")
+
+    monkeypatch.setattr(store, "read_bytes", permission_failure)
+    with pytest.raises(PermissionError, match="permission denied"):
+        asyncio.run(resolve(prompt_only))
+
+    async def unavailable_failure(_artifact_id, *, max_bytes=None):
+        raise ArtifactStoreUnavailableError("Artifact backend unavailable.")
+
+    monkeypatch.setattr(store, "read_bytes", unavailable_failure)
+    with pytest.raises(ArtifactStoreUnavailableError, match="backend unavailable"):
+        asyncio.run(resolve(prompt_only))
+
+    async def invalid_store_failure(_artifact_id, *, max_bytes=None):
+        raise ValueError("Artifact store returned invalid data.")
+
+    monkeypatch.setattr(store, "read_bytes", invalid_store_failure)
+    with pytest.raises(ValueError, match="invalid data"):
+        asyncio.run(resolve(prompt_only))
 
 
 def test_run_fails_open_on_unresolvable_prompt_file(tmp_path):

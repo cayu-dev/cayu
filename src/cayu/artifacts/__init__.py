@@ -24,6 +24,9 @@ from cayu.artifacts.base import (
     ArtifactReadResult,
     ArtifactScope,
     ArtifactStore,
+    ArtifactStoreUnavailableError,
+    InvalidArtifactIdError,
+    copy_artifact_read_result,
 )
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.artifacts.workspace import (
@@ -48,12 +51,15 @@ __all__ = [
     "ArtifactReadResult",
     "ArtifactScope",
     "ArtifactStore",
+    "ArtifactStoreUnavailableError",
     "ArtifactToWorkspaceResult",
     "FileAttachment",
     "FileAttachmentKind",
+    "InvalidArtifactIdError",
     "LocalArtifactStore",
     "ResolvedFileAttachment",
     "WorkspaceToArtifactResult",
+    "copy_artifact_read_result",
     "copy_artifact_to_workspace",
     "copy_workspace_file_to_artifact",
     "file_attachment",

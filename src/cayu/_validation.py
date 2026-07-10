@@ -1,11 +1,159 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from math import isfinite
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Never
 
 _MAX_LABEL_KEY_LENGTH = 128
 _MAX_LABEL_VALUE_LENGTH = 512
 _RESERVED_LABEL_PREFIX = "cayu:"
+
+
+class FrozenJsonDict(Mapping[str, Any]):
+    """An immutable JSON object with mapping-compatible reads."""
+
+    _data: Mapping[str, Any]
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[str, Any] | Iterable[tuple[str, Any]] = ()) -> None:
+        object.__setattr__(self, "_data", MappingProxyType(dict(values)))
+
+    def __setattr__(self, name: str, value: Any) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __delattr__(self, name: str) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+    def __delitem__(self, key: str, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def __ior__(self, value: Any, /) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __setitem__(self, key: str, value: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def clear(self) -> None:
+        _raise_frozen_json_mutation()
+
+    def pop(self, key: str, default: Any = None, /) -> Any:
+        _raise_frozen_json_mutation()
+
+    def popitem(self) -> tuple[str, Any]:
+        _raise_frozen_json_mutation()
+
+    def setdefault(self, key: str, default: Any = None, /) -> Any:
+        _raise_frozen_json_mutation()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        _raise_frozen_json_mutation()
+
+    def __copy__(self) -> FrozenJsonDict:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenJsonDict:
+        return self
+
+    def __reduce__(self):
+        return type(self), (tuple(self._data.items()),)
+
+
+class FrozenJsonList(Sequence[Any]):
+    """An immutable JSON array with sequence-compatible reads."""
+
+    _items: tuple[Any, ...]
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Iterable[Any] = ()) -> None:
+        object.__setattr__(self, "_items", tuple(values))
+
+    def __setattr__(self, name: str, value: Any) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __delattr__(self, name: str) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __getitem__(self, index: int | slice) -> Any:
+        value = self._items[index]
+        if isinstance(index, slice):
+            return type(self)(value)
+        return value
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __repr__(self) -> str:
+        return repr(list(self._items))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence) or isinstance(other, str | bytes | bytearray):
+            return False
+        return tuple(self._items) == tuple(other)
+
+    def __delitem__(self, key: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def __iadd__(self, value: Any, /) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __imul__(self, value: Any, /) -> Never:
+        _raise_frozen_json_mutation()
+
+    def __setitem__(self, key: Any, value: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def append(self, value: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def clear(self) -> None:
+        _raise_frozen_json_mutation()
+
+    def extend(self, values: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def insert(self, index: Any, value: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def pop(self, index: Any = -1, /) -> Any:
+        _raise_frozen_json_mutation()
+
+    def remove(self, value: Any, /) -> None:
+        _raise_frozen_json_mutation()
+
+    def reverse(self) -> None:
+        _raise_frozen_json_mutation()
+
+    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+        _raise_frozen_json_mutation()
+
+    def __copy__(self) -> FrozenJsonList:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenJsonList:
+        return self
+
+    def __reduce__(self):
+        return type(self), (self._items,)
+
+
+def _raise_frozen_json_mutation() -> Never:
+    raise TypeError("Frozen JSON values cannot be mutated.")
 
 
 def require_nonblank(value: str, field_name: str) -> str:
@@ -20,6 +168,59 @@ def require_clean_nonblank(value: str, field_name: str) -> str:
     value = require_nonblank(value, field_name)
     if value != value.strip():
         raise ValueError(f"`{field_name}` must not start or end with whitespace.")
+    return value
+
+
+def require_unicode_scalar_text(value: str, field_name: str) -> str:
+    """Reject lone UTF-16 surrogate code points from a validated string."""
+
+    if type(value) is not str:
+        raise ValueError(f"`{field_name}` must be a string.")
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError(f"`{field_name}` must not contain Unicode surrogate code points.")
+    return value
+
+
+def require_unicode_scalar_json(value: Any, field_name: str) -> Any:
+    """Reject lone UTF-16 surrogates recursively from a JSON-compatible value."""
+
+    if type(value) is str:
+        return require_unicode_scalar_text(value, field_name)
+    if type(value) is list:
+        for index, item in enumerate(value):
+            require_unicode_scalar_json(item, f"{field_name}[{index}]")
+        return value
+    if type(value) is dict:
+        for key, item in value.items():
+            require_unicode_scalar_text(key, f"{field_name} key")
+            require_unicode_scalar_json(item, f"{field_name}.{key}")
+        return value
+    return value
+
+
+def freeze_json_value(value: Any) -> Any:
+    """Recursively freeze an already validated JSON-compatible value."""
+
+    if type(value) is FrozenJsonDict or type(value) is FrozenJsonList:
+        return value
+    if type(value) is dict:
+        return FrozenJsonDict({key: freeze_json_value(item) for key, item in value.items()})
+    if type(value) is list:
+        return FrozenJsonList(freeze_json_value(item) for item in value)
+    return value
+
+
+def thaw_json_value(value: Any) -> Any:
+    """Return ordinary JSON containers from recursively frozen JSON data."""
+
+    if type(value) is FrozenJsonDict:
+        return {key: thaw_json_value(item) for key, item in value.items()}
+    if type(value) is FrozenJsonList:
+        return [thaw_json_value(item) for item in value]
+    if type(value) is dict:
+        return {key: thaw_json_value(item) for key, item in value.items()}
+    if type(value) is list:
+        return [thaw_json_value(item) for item in value]
     return value
 
 
@@ -124,7 +325,7 @@ def _copy_json_value(value: Any, field_name: str, seen: set[int]) -> Any:
         if isfinite(value):
             return value
         raise ValueError(f"`{field_name}` must contain finite JSON numbers.")
-    if type(value) is list:
+    if type(value) in {list, FrozenJsonList}:
         value_id = id(value)
         if value_id in seen:
             raise ValueError(f"`{field_name}` must not contain circular references.")
@@ -136,7 +337,7 @@ def _copy_json_value(value: Any, field_name: str, seen: set[int]) -> Any:
             ]
         finally:
             seen.remove(value_id)
-    if type(value) is dict:
+    if type(value) in {dict, FrozenJsonDict}:
         value_id = id(value)
         if value_id in seen:
             raise ValueError(f"`{field_name}` must not contain circular references.")

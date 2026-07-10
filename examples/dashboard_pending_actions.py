@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import struct
+import zlib
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
@@ -62,6 +64,82 @@ DEMO_PRICING = PricingCatalog(
         ),
     )
 )
+
+
+def _demo_png_bytes() -> bytes:
+    """Build a simple visible PNG fixture without image dependencies."""
+    width = 640
+    height = 360
+
+    def color_at(x: int, y: int) -> tuple[int, int, int]:
+        if 56 <= y <= 136 and 44 <= x <= 596:
+            if x < 204:
+                return (224, 242, 254)
+            if x < 400:
+                return (204, 251, 241)
+            return (255, 237, 213)
+        if 216 <= y <= 304 and 144 <= x <= 496:
+            if x < 320:
+                return (207, 250, 254)
+            return (237, 233, 254)
+        if abs(y - 180) <= 2 or abs(x - 320) <= 2:
+            return (51, 65, 85)
+        return (248, 250, 252)
+
+    raw_rows = bytearray()
+    for y in range(height):
+        raw_rows.append(0)
+        for x in range(width):
+            raw_rows.extend(color_at(x, y))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(raw_rows), level=9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _demo_pdf_bytes() -> bytes:
+    """Build a tiny valid PDF without adding a test dependency."""
+    stream = (
+        b"BT\n/F1 20 Tf\n72 720 Td\n(Cayu dashboard demo PDF artifact) Tj\n"
+        b"0 -32 Td\n(Use Open raw or Download to inspect native bytes.) Tj\nET\n"
+    )
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode()
+        + stream
+        + b"endstream\nendobj\n",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for item in objects:
+        offsets.append(len(output))
+        output.extend(item)
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(offsets)}\n".encode())
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode())
+    output.extend(
+        f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    return bytes(output)
 
 
 class DashboardDemoProvider(ModelProvider):
@@ -568,7 +646,27 @@ async def seed_artifacts(app: CayuApp) -> None:
         environment_name="demo-local",
         metadata={"demo": True, "purpose": "control-plane inventory"},
     )
-    print("Seeded artifact examples: 3", flush=True)
+    await artifact_store.put_bytes(
+        _demo_png_bytes(),
+        filename="dashboard-session-map.png",
+        content_type="image/png",
+        scope=ArtifactScope.SESSION,
+        session_id="sess_dashboard_completed",
+        agent_name="demo-completed",
+        environment_name="demo-local",
+        metadata={"demo": True, "source": "visual_fixture"},
+    )
+    await artifact_store.put_bytes(
+        _demo_pdf_bytes(),
+        filename="dashboard-run-report.pdf",
+        content_type="application/pdf",
+        scope=ArtifactScope.SESSION,
+        session_id="sess_dashboard_completed",
+        agent_name="demo-completed",
+        environment_name="demo-local",
+        metadata={"demo": True, "source": "pdf_fixture"},
+    )
+    print("Seeded artifact examples: 5", flush=True)
 
 
 def build_app() -> CayuApp:

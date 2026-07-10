@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+    require_unicode_scalar_text,
+)
 from cayu.artifacts import ArtifactStore
 from cayu.environments.bindings import WorkspaceBinding
 from cayu.mcp import McpServerSpec
@@ -158,6 +163,12 @@ class Environment:
             raise TypeError("workspace must be a Workspace.")
         if artifact_store is not None and not isinstance(artifact_store, ArtifactStore):
             raise TypeError("artifact_store must be an ArtifactStore.")
+        if artifact_store is not None:
+            artifact_store_id = getattr(artifact_store, "id", None)
+            if type(artifact_store_id) is not str:
+                raise ValueError("`artifact_store.id` must be a string.")
+            artifact_store_id = require_clean_nonblank(artifact_store_id, "artifact_store.id")
+            require_unicode_scalar_text(artifact_store_id, "artifact_store.id")
         if runner is not None and not isinstance(runner, Runner):
             raise TypeError("runner must be a Runner.")
         if vault is not None and not isinstance(vault, Vault):

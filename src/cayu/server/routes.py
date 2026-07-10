@@ -6,10 +6,13 @@ import asyncio
 import base64
 import contextlib
 from collections.abc import AsyncIterator, Callable
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
+from unicodedata import category as unicode_category
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -21,8 +24,20 @@ from pydantic import (
 )
 from sse_starlette.sse import EventSourceResponse
 
-from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
-from cayu.artifacts import ArtifactScope, ArtifactStore
+from cayu._validation import (
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_unicode_scalar_text,
+)
+from cayu.artifacts import (
+    ArtifactListResult,
+    ArtifactScope,
+    ArtifactStore,
+    ArtifactStoreUnavailableError,
+    InvalidArtifactIdError,
+    copy_artifact_read_result,
+)
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
@@ -83,6 +98,8 @@ from cayu.runtime.user_input import (
 )
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
+    ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
+    ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
     AgentsResponse,
@@ -122,6 +139,7 @@ from cayu.storage import (
 )
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
 # Server-entrypoint step budget. The default preserves the historical value while the
 # ceiling matches the runtime's own ``max_steps`` bound (RunRequest/ResumeRequest and the
 # tool-approval bodies all cap at 256) so a request cannot ask for an unbounded run.
@@ -131,6 +149,11 @@ _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
 _ARTIFACT_PAGE_OFFSET_MAX = 10_000
+_ARTIFACT_CONTENT_BYTES_MAX = 64 * 1024 * 1024
+_ARTIFACT_FILENAME_HEADER_UTF8_MAX_BYTES = 512
+_ARTIFACT_FILENAME_HEADER_ASCII_MAX_CHARS = 255
+_ARTIFACT_ID_HEADER_MAX_CHARS = 512
+_ARTIFACT_UNSAFE_FILENAME_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
 _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
 _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
@@ -170,6 +193,19 @@ _REPLAY_POLL_INTERVAL_S = 0.05
 # cancel agent work), so hold strong references until each pump finishes — the event
 # loop only keeps weak references to tasks.
 _detached_event_pumps: set[asyncio.Task[None]] = set()
+_ARTIFACT_SAFE_INLINE_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/pdf",
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "text/csv",
+        "text/markdown",
+        "text/plain",
+    }
+)
 
 
 async def _fail_task_on_prestream_error(
@@ -690,16 +726,24 @@ def _artifact_stores_by_id(cayu_app: Any) -> dict[str, ArtifactStore]:
     for record in cayu_app.list_environment_registrations():
         store = record.environment.artifact_store
         if isinstance(store, ArtifactStore):
-            existing = stores.get(store.id)
+            try:
+                store_id = require_clean_nonblank(store.id, "artifact_store.id")
+                store_id = require_unicode_scalar_text(store_id, "artifact_store.id")
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="An artifact store has an invalid id configuration.",
+                ) from exc
+            existing = stores.get(store_id)
             if existing is not None and existing is not store:
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "Multiple registered environments use the same artifact_store_id: "
-                        f"{store.id}. Configure unique artifact store ids."
+                        f"{store_id}. Configure unique artifact store ids."
                     ),
                 )
-            stores[store.id] = store
+            stores[store_id] = store
     return stores
 
 
@@ -728,7 +772,8 @@ def _artifact_sort_key(artifact: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def _decode_artifact_text(content: bytes, content_type: str) -> str | None:
-    if content_type.startswith("text/") or content_type in {
+    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+    if normalized_content_type.startswith("text/") or normalized_content_type in {
         "application/json",
         "application/xml",
         "application/yaml",
@@ -749,6 +794,66 @@ def _artifact_read_preview(cayu_app: Any, read: Any) -> tuple[str, str | None]:
     if not isinstance(redacted_preview, str):
         raise TypeError("Artifact text preview redaction must return a string.")
     return base64.b64encode(redacted_preview.encode("utf-8")).decode("ascii"), redacted_preview
+
+
+def _artifact_content_disposition(filename: str, disposition: str) -> str:
+    safe_filename = "".join(
+        "_"
+        if char in {"/", "\\"}
+        or unicode_category(char) in _ARTIFACT_UNSAFE_FILENAME_UNICODE_CATEGORIES
+        else char
+        for char in filename
+    ).strip()
+    if not safe_filename:
+        safe_filename = "artifact"
+    safe_filename = _truncate_utf8_filename(
+        safe_filename,
+        max_bytes=_ARTIFACT_FILENAME_HEADER_UTF8_MAX_BYTES,
+    )
+    ascii_filename = "".join(
+        char if 0x20 <= ord(char) < 0x7F and char not in {'"', "/", "\\"} else "_"
+        for char in safe_filename
+    ).strip()
+    if not ascii_filename:
+        ascii_filename = "artifact"
+    ascii_filename = ascii_filename[:_ARTIFACT_FILENAME_HEADER_ASCII_MAX_CHARS]
+    encoded_filename = quote(safe_filename, safe="", encoding="utf-8", errors="replace")
+    return f"{disposition}; filename=\"{ascii_filename}\"; filename*=UTF-8''{encoded_filename}"
+
+
+def _truncate_utf8_filename(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    stem, separator, extension = value.rpartition(".")
+    if not separator:
+        stem = value
+    suffix = f".{extension}" if separator and 0 < len(extension) <= 32 else ""
+    suffix_bytes = suffix.encode("utf-8")
+    if len(suffix_bytes) >= max_bytes:
+        suffix = ""
+        suffix_bytes = b""
+        stem = value
+    prefix_bytes = stem.encode("utf-8")[: max_bytes - len(suffix_bytes)]
+    prefix = prefix_bytes.decode("utf-8", errors="ignore")
+    return f"{prefix}{suffix}" or "artifact"
+
+
+def _artifact_content_disposition_kind(content_type: str, requested: str) -> str:
+    if requested != "inline":
+        return "attachment"
+    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+    if normalized_content_type in _ARTIFACT_SAFE_INLINE_CONTENT_TYPES:
+        return "inline"
+    return "attachment"
+
+
+def _artifact_header_value(value: str, fallback: str) -> str:
+    for candidate in (value, fallback, "unknown"):
+        stripped = candidate.strip()
+        if stripped and all(0x20 <= ord(char) < 0x7F for char in stripped):
+            return stripped[:_ARTIFACT_ID_HEADER_MAX_CHARS]
+    return "unknown"
 
 
 def _object_payload(value: Any) -> dict[str, Any] | None:
@@ -2124,7 +2229,12 @@ def create_router(
             raise HTTPException(status_code=404, detail="Environment not found")
         return {"environments": [_serialize_environment(cayu_app, record)], "total_count": 1}
 
-    @router.get("/artifacts", response_model=ArtifactsResponse, dependencies=protected)
+    @router.get(
+        "/artifacts",
+        response_model=ArtifactsResponse,
+        responses=ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+        dependencies=protected,
+    )
     async def list_artifacts(
         limit: Annotated[int, Query(ge=1, le=_ARTIFACT_PAGE_LIMIT_MAX)] = 100,
         offset: Annotated[int, Query(ge=0, le=_ARTIFACT_PAGE_OFFSET_MAX)] = 0,
@@ -2158,13 +2268,31 @@ def create_router(
         truncated = False
         per_store_limit = offset + limit
         for store_id, store in selected_stores.items():
-            page = await store.list(
-                scope=scope,
-                session_id=requested_session_id,
-                agent_name=requested_agent_name,
-                environment_name=requested_environment_name,
-                limit=per_store_limit,
-            )
+            try:
+                result = await store.list(
+                    scope=scope,
+                    session_id=requested_session_id,
+                    agent_name=requested_agent_name,
+                    environment_name=requested_environment_name,
+                    limit=per_store_limit,
+                )
+                if type(result) is not ArtifactListResult:
+                    raise TypeError("Artifact stores must return ArtifactListResult from list().")
+                page = ArtifactListResult(
+                    artifacts=result.artifacts,
+                    total_count=result.total_count,
+                    truncated=result.truncated,
+                )
+            except (ArtifactStoreUnavailableError, OSError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Artifact store is unavailable.",
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Artifact store returned invalid artifact data.",
+                ) from exc
             artifacts.extend(
                 _serialize_artifact(cayu_app, artifact, artifact_store_id=store_id)
                 for artifact in page.artifacts
@@ -2207,6 +2335,10 @@ def create_router(
         *,
         max_bytes: int | None = None,
     ):
+        try:
+            artifact_id = require_clean_nonblank(artifact_id, "artifact_id")
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found") from exc
         stores = _artifact_stores_by_id(cayu_app)
         requested_store_id = _clean_optional_query_value(
             artifact_store_id,
@@ -2217,18 +2349,53 @@ def create_router(
             if store is None:
                 raise HTTPException(status_code=404, detail="Artifact store not found")
             try:
-                return requested_store_id, await store.read_bytes(artifact_id, max_bytes=max_bytes)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
+                read = await store.read_bytes(artifact_id, max_bytes=max_bytes)
+                return requested_store_id, copy_artifact_read_result(
+                    read,
+                    expected_artifact_id=artifact_id,
+                    max_content_bytes=max_bytes,
+                )
+            except InvalidArtifactIdError as exc:
+                raise HTTPException(status_code=404, detail="Artifact not found") from exc
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=404, detail="Artifact not found") from exc
+            except (ArtifactStoreUnavailableError, OSError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Artifact store is unavailable.",
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Artifact store returned invalid artifact data.",
+                ) from exc
 
         matches = []
         for store_id, store in stores.items():
             try:
-                matches.append((store_id, await store.read_bytes(artifact_id, max_bytes=max_bytes)))
-            except (FileNotFoundError, ValueError):
+                read = await store.read_bytes(artifact_id, max_bytes=max_bytes)
+                matches.append(
+                    (
+                        store_id,
+                        copy_artifact_read_result(
+                            read,
+                            expected_artifact_id=artifact_id,
+                            max_content_bytes=max_bytes,
+                        ),
+                    )
+                )
+            except (FileNotFoundError, InvalidArtifactIdError):
                 continue
+            except (ArtifactStoreUnavailableError, OSError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Artifact store is unavailable.",
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Artifact store returned invalid artifact data.",
+                ) from exc
         if not matches:
             raise HTTPException(status_code=404, detail="Artifact not found")
         if len(matches) > 1:
@@ -2241,10 +2408,11 @@ def create_router(
     @router.get(
         "/artifacts/{artifact_id}",
         response_model=ArtifactReadResponse,
+        responses=ARTIFACT_ENDPOINT_ERROR_RESPONSES,
         dependencies=protected,
     )
     async def get_artifact(
-        artifact_id: NonBlankString,
+        artifact_id: ArtifactIdPath,
         artifact_store_id: Annotated[str | None, Query()] = None,
         max_bytes: Annotated[int, Query(ge=1, le=262_144)] = 64_000,
     ):
@@ -2261,6 +2429,54 @@ def create_router(
             "total_bytes": read.total_bytes,
             "truncated": read.truncated,
         }
+
+    @router.get(
+        "/artifacts/{artifact_id}/content",
+        response_class=Response,
+        responses=ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
+        dependencies=protected,
+    )
+    async def get_artifact_content(
+        artifact_id: ArtifactIdPath,
+        artifact_store_id: Annotated[str, Query(min_length=1)],
+        disposition: Annotated[Literal["attachment", "inline"], Query()] = "attachment",
+        max_bytes: Annotated[int, Query(ge=1, le=_ARTIFACT_CONTENT_BYTES_MAX)] = (
+            _ARTIFACT_CONTENT_BYTES_MAX
+        ),
+    ):
+        store_id, read = await _read_artifact_from_request(
+            artifact_id,
+            artifact_store_id,
+            max_bytes=max_bytes,
+        )
+        if read.truncated or read.total_bytes > max_bytes or len(read.content) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Artifact exceeds the requested max_bytes for direct content "
+                    "response. Use the bounded artifact preview, increase max_bytes "
+                    "up to the server maximum, or use a store-native streaming/range "
+                    "reader for artifacts above that maximum."
+                ),
+            )
+        response_disposition = _artifact_content_disposition_kind(
+            read.metadata.content_type,
+            disposition,
+        )
+        return Response(
+            content=read.content,
+            media_type=read.metadata.content_type,
+            headers={
+                "Content-Disposition": _artifact_content_disposition(
+                    read.metadata.filename,
+                    response_disposition,
+                ),
+                "X-Content-Type-Options": "nosniff",
+                "X-Cayu-Artifact-Id": _artifact_header_value(read.metadata.id, artifact_id),
+                "X-Cayu-Artifact-Store-Id": _artifact_header_value(store_id, "artifact-store"),
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     @router.get(
         "/pending-actions",

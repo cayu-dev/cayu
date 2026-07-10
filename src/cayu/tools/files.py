@@ -18,6 +18,7 @@ from cayu.artifacts import (
     ArtifactScope,
     ArtifactStore,
     FileAttachmentKind,
+    copy_artifact_read_result,
     file_attachment,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -551,7 +552,11 @@ async def _read_artifact(
     artifact_store = _require_artifact_store(ctx)
     if artifact_store is None:
         return _missing_artifact_store_result()
-    result = await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes)
+    result = await _read_artifact_store(
+        artifact_store,
+        artifact_id,
+        max_bytes=max_bytes,
+    )
     artifact = result.metadata
     access_error = _artifact_access_error(ctx, artifact)
     if access_error is not None:
@@ -628,13 +633,15 @@ class ImageArtifactReader:
                 structured=request.structured,
                 is_error=True,
             )
-        result = await artifact_store.read_bytes(
+        result = await _read_artifact_store(
+            artifact_store,
             artifact.id,
             max_bytes=request.options.max_attachment_bytes,
         )
         attachment_artifact = artifact
         if result.truncated:
-            source = await artifact_store.read_bytes(
+            source = await _read_artifact_store(
+                artifact_store,
                 artifact.id,
                 max_bytes=MAX_IMAGE_SOURCE_BYTES,
             )
@@ -782,7 +789,8 @@ class PdfArtifactReader:
             request.options.pages is None
             and artifact.size_bytes <= request.options.max_attachment_bytes
         ):
-            result = await artifact_store.read_bytes(
+            result = await _read_artifact_store(
+                artifact_store,
                 artifact.id,
                 max_bytes=request.options.max_attachment_bytes,
             )
@@ -807,8 +815,10 @@ class PdfArtifactReader:
             attachment_artifact = None
         if attachment_artifact is None:
             if source_content is None:
-                source = await artifact_store.read_bytes(
-                    artifact.id, max_bytes=MAX_PDF_SOURCE_BYTES
+                source = await _read_artifact_store(
+                    artifact_store,
+                    artifact.id,
+                    max_bytes=MAX_PDF_SOURCE_BYTES,
                 )
                 if source.truncated:
                     return ToolResult(
@@ -1165,6 +1175,19 @@ def _require_artifact_store(ctx: ToolContext) -> ArtifactStore | None:
     if not isinstance(ctx.artifact_store, ArtifactStore):
         raise TypeError("Tool context artifact_store must implement ArtifactStore.")
     return ctx.artifact_store
+
+
+async def _read_artifact_store(
+    artifact_store: ArtifactStore,
+    artifact_id: str,
+    *,
+    max_bytes: int,
+) -> ArtifactReadResult:
+    return copy_artifact_read_result(
+        await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes),
+        expected_artifact_id=artifact_id,
+        max_content_bytes=max_bytes,
+    )
 
 
 def _missing_workspace_result() -> ToolResult:

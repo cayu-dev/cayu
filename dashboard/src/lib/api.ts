@@ -19,6 +19,7 @@ import type {
   ArtifactsResponse,
   EnvironmentsResponse,
   GetArtifactApiArtifactsArtifactIdGetData,
+  GetArtifactContentApiArtifactsArtifactIdContentGetData,
   GetContractApiContractGetResponse,
   GetSessionApiSessionsSessionIdGetResponse,
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
@@ -74,6 +75,9 @@ export type ArtifactsPage = ArtifactsResponse
 export type ArtifactRead = ArtifactReadResponse
 export type ArtifactsQuery = NonNullable<ListArtifactsApiArtifactsGetData["query"]>
 export type ArtifactReadQuery = NonNullable<GetArtifactApiArtifactsArtifactIdGetData["query"]>
+export type ArtifactContentQuery = NonNullable<
+  GetArtifactContentApiArtifactsArtifactIdContentGetData["query"]
+>
 export type Session = ApiSessionBase
 export type SessionEvent = ApiSessionDetailEvent
 export type TranscriptMessage = ApiSessionDetailTranscriptMessage
@@ -236,6 +240,10 @@ export async function fetchArtifact(
   return requestJson<ArtifactRead>(
     `/artifacts/${encodeURIComponent(artifactId)}${queryString(query)}`,
   )
+}
+
+export function artifactContentUrl(artifactId: string, query: ArtifactContentQuery): string {
+  return apiUrl(`/artifacts/${encodeURIComponent(artifactId)}/content${queryString(query)}`)
 }
 
 export async function fetchSessions(query: SessionListQuery = {}): Promise<Session[]> {

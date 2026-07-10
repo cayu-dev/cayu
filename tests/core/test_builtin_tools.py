@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import sys
 from collections.abc import AsyncIterator
@@ -264,6 +265,7 @@ class SyntheticArtifactStore(ArtifactStore):
         if artifact_id != self.artifact_id:
             raise FileNotFoundError(artifact_id)
         self.read_limits.append(max_bytes)
+        read_size = self.size_bytes if max_bytes is None else min(self.size_bytes, max_bytes)
         return ArtifactReadResult(
             metadata=ArtifactMetadata(
                 id=artifact_id,
@@ -272,9 +274,9 @@ class SyntheticArtifactStore(ArtifactStore):
                 size_bytes=self.size_bytes,
                 session_id="sess_attachments",
             ),
-            content=b"x",
-            total_bytes=1,
-            truncated=False,
+            content=b"x" * read_size,
+            total_bytes=self.size_bytes,
+            truncated=read_size < self.size_bytes,
         )
 
     async def list(self, **kwargs):
@@ -1905,10 +1907,10 @@ def test_runtime_allows_configured_file_attachment_byte_limit():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert artifact_store.read_limits == [size_bytes]
-    assert (
-        provider.requests[1].options[RESOLVED_FILE_ATTACHMENTS_OPTION]["art_large"]["data_base64"]
-        == "eA=="
-    )
+    encoded_content = provider.requests[1].options[RESOLVED_FILE_ATTACHMENTS_OPTION]["art_large"][
+        "data_base64"
+    ]
+    assert len(base64.b64decode(encoded_content)) == size_bytes
 
 
 def test_runtime_rejects_total_file_attachment_bytes(tmp_path):

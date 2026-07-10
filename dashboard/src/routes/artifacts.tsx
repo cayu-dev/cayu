@@ -1,7 +1,18 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
-import { ChevronLeft, ChevronRight, FileArchive, FileText, ImageIcon, Search } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Download,
+  ExternalLink,
+  FileArchive,
+  FileText,
+  ImageIcon,
+  Search,
+} from "lucide-react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   DataCard,
   Page,
@@ -24,6 +35,7 @@ import {
   type ArtifactRead,
   type ArtifactSummary,
   type ArtifactsQuery,
+  artifactContentUrl,
   fetchArtifact,
   fetchArtifacts,
 } from "../lib/api"
@@ -32,10 +44,26 @@ import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../l
 import { cn } from "../lib/utils"
 
 type ArtifactScopeFilter = "all" | "session" | "environment"
+type ArtifactCopyFeedback = {
+  artifactRef: string
+  status: "copied" | "failed"
+}
 
 const PAGE_LIMIT = 100
 const selectClassName =
   "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+const safeInlineContentTypes = new Set([
+  "application/json",
+  "application/pdf",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "text/csv",
+  "text/markdown",
+  "text/plain",
+])
+const safePreviewImageContentTypes = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"])
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value)
@@ -62,20 +90,39 @@ function artifactMatchesSearch(artifact: ArtifactSummary, query: string) {
 }
 
 function artifactIcon(artifact: ArtifactSummary) {
-  if (artifact.content_type.startsWith("image/")) return ImageIcon
-  if (artifact.content_type.startsWith("text/") || artifact.content_type.includes("json")) {
+  const contentType = normalizedContentType(artifact.content_type)
+  if (contentType.startsWith("image/")) return ImageIcon
+  if (contentType.startsWith("text/") || contentType.includes("json")) {
     return FileText
   }
   return FileArchive
 }
 
+function artifactReference(artifact: ArtifactSummary) {
+  return JSON.stringify({
+    artifact_store_id: artifact.artifact_store_id,
+    artifact_id: artifact.id,
+  })
+}
+
 function artifactKey(artifact: ArtifactSummary) {
-  return `${artifact.artifact_store_id}:${artifact.id}`
+  return artifactReference(artifact)
+}
+
+function normalizedContentType(contentType: string) {
+  return contentType.split(";", 1)[0]?.trim().toLowerCase() ?? contentType
 }
 
 function artifactDataUrl(read: ArtifactRead) {
-  if (!read.artifact.content_type.startsWith("image/") || read.truncated) return null
-  return `data:${read.artifact.content_type};base64,${read.preview_base64}`
+  const contentType = normalizedContentType(read.artifact.content_type)
+  if (!safePreviewImageContentTypes.has(contentType) || read.truncated) {
+    return null
+  }
+  return `data:${contentType};base64,${read.preview_base64}`
+}
+
+function artifactCanOpenInline(artifact: ArtifactSummary) {
+  return safeInlineContentTypes.has(normalizedContentType(artifact.content_type))
 }
 
 function artifactInventoryDescription(
@@ -175,6 +222,13 @@ function optionalFilter(value: string) {
   return trimmed === "" ? undefined : trimmed
 }
 
+async function copyText(value: string): Promise<void> {
+  if (!navigator.clipboard?.writeText) {
+    throw new Error("The Clipboard API is unavailable.")
+  }
+  await navigator.clipboard.writeText(value)
+}
+
 function ArtifactPreview({ read }: { read: ArtifactRead | null }) {
   if (read === null) {
     return (
@@ -194,7 +248,13 @@ function ArtifactPreview({ read }: { read: ArtifactRead | null }) {
     )
   }
   if (read.text_preview !== null) {
-    return <PayloadViewer value={read.text_preview} maxHeight="max-h-96" />
+    return (
+      <div className="overflow-auto rounded-md border border-border bg-muted/20 p-3">
+        <pre className="max-h-96 whitespace-pre-wrap break-words font-mono text-sm leading-relaxed">
+          {read.text_preview}
+        </pre>
+      </div>
+    )
   }
   return (
     <StateMessage className="rounded-md border border-border py-12">
@@ -214,6 +274,24 @@ function ArtifactDetail({
   isLoading: boolean
   error: string | null
 }) {
+  const artifactRef = artifact === null ? null : artifactReference(artifact)
+  const [copyFeedback, setCopyFeedback] = useState<ArtifactCopyFeedback | null>(null)
+  const copyResetTimer = useRef<number | null>(null)
+  const activeArtifactRef = useRef(artifactRef)
+  const copyAttempt = useRef(0)
+
+  useEffect(() => {
+    activeArtifactRef.current = artifactRef
+    return () => {
+      activeArtifactRef.current = null
+      copyAttempt.current += 1
+      if (copyResetTimer.current !== null) {
+        window.clearTimeout(copyResetTimer.current)
+        copyResetTimer.current = null
+      }
+    }
+  }, [artifactRef])
+
   if (artifact === null) {
     return (
       <StateMessage className="py-16">
@@ -221,14 +299,88 @@ function ArtifactDetail({
       </StateMessage>
     )
   }
+  const contentQuery = {
+    artifact_store_id: artifact.artifact_store_id,
+  }
+  const artifactId = artifact.id
+  const downloadUrl = artifactContentUrl(artifactId, {
+    ...contentQuery,
+    disposition: "attachment",
+  })
+  const inlineUrl = artifactContentUrl(artifactId, {
+    ...contentQuery,
+    disposition: "inline",
+  })
+  const selectedArtifactRef = artifactReference(artifact)
+  const selectedCopyFeedback =
+    copyFeedback?.artifactRef === selectedArtifactRef ? copyFeedback.status : null
+
+  function showCopyFeedback(status: ArtifactCopyFeedback["status"], attempt: number) {
+    if (activeArtifactRef.current !== selectedArtifactRef || copyAttempt.current !== attempt) return
+    if (copyResetTimer.current !== null) {
+      window.clearTimeout(copyResetTimer.current)
+    }
+    setCopyFeedback({ artifactRef: selectedArtifactRef, status })
+    copyResetTimer.current = window.setTimeout(() => {
+      setCopyFeedback(null)
+      copyResetTimer.current = null
+    }, 1200)
+  }
+
+  async function copyArtifactRef() {
+    const attempt = copyAttempt.current + 1
+    copyAttempt.current = attempt
+    try {
+      await copyText(selectedArtifactRef)
+      showCopyFeedback("copied", attempt)
+    } catch {
+      showCopyFeedback("failed", attempt)
+    }
+  }
 
   return (
     <div className="space-y-5 p-4 sm:p-5">
       <div>
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <Badge variant="secondary">{artifact.scope}</Badge>
-          <Badge variant="outline">{artifact.content_type}</Badge>
-          {read?.truncated && <Badge variant="outline">preview truncated</Badge>}
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <Badge variant="secondary">{artifact.scope}</Badge>
+            <Badge variant="outline">{artifact.content_type}</Badge>
+            {read?.truncated && <Badge variant="outline">preview truncated</Badge>}
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={copyArtifactRef}>
+              {selectedCopyFeedback === "copied" ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <Copy className="h-4 w-4" />
+              )}
+              {selectedCopyFeedback === "copied"
+                ? "Copied"
+                : selectedCopyFeedback === "failed"
+                  ? "Copy failed"
+                  : "Copy reference"}
+            </Button>
+            {artifactCanOpenInline(artifact) && (
+              <a
+                href={inlineUrl}
+                target="_blank"
+                rel="noreferrer"
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                <ExternalLink className="h-4 w-4" />
+                Open raw
+              </a>
+            )}
+            <a
+              href={downloadUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={buttonVariants({ variant: "default", size: "sm" })}
+            >
+              <Download className="h-4 w-4" />
+              Download
+            </a>
+          </div>
         </div>
         <h2 className="mt-3 break-words text-xl font-semibold">{artifact.filename}</h2>
         <div className="mt-1 font-mono text-xs text-muted-foreground">{artifact.id}</div>
@@ -259,7 +411,14 @@ function ArtifactDetail({
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.7fr)]">
         <div>
-          <div className="mb-2 text-sm font-medium">Preview</div>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="text-sm font-medium">Preview</div>
+            {read?.truncated && (
+              <span className="text-xs text-muted-foreground">
+                Preview is truncated; raw open/download is bounded by the server content limit.
+              </span>
+            )}
+          </div>
           {isLoading ? (
             <StateMessage className="rounded-md border border-border py-12">
               Loading preview...
@@ -494,7 +653,7 @@ export function ArtifactsPage() {
                     const Icon = artifactIcon(artifact)
                     return (
                       <TableRow
-                        key={`${artifact.artifact_store_id}:${artifact.id}`}
+                        key={artifactKey(artifact)}
                         className={cn(
                           "cursor-pointer",
                           selectedArtifactKey === artifactKey(artifact) && "bg-muted/60",

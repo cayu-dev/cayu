@@ -28,6 +28,10 @@ class HealthResponse(ApiBaseModel):
     ok: StrictBool
 
 
+class ApiErrorResponse(ApiBaseModel):
+    detail: str
+
+
 class SseEventEnvelope(ApiBaseModel):
     """JSON payload in each runtime event SSE ``data:`` frame."""
 
@@ -482,4 +486,69 @@ STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
             }
         },
     }
+}
+
+
+ARTIFACT_ENDPOINT_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": "The requested artifact store or artifact does not exist.",
+        "model": ApiErrorResponse,
+    },
+    409: {
+        "description": "Registered artifact-store identifiers are not unique.",
+        "model": ApiErrorResponse,
+    },
+    500: {
+        "description": "An artifact store is misconfigured or returned invalid data.",
+        "model": ApiErrorResponse,
+    },
+    503: {
+        "description": "An artifact store is unavailable.",
+        "model": ApiErrorResponse,
+    },
+}
+
+
+ARTIFACT_CONTENT_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": (
+            "Complete artifact bytes. The response Content-Type reflects validated stored "
+            "artifact metadata."
+        ),
+        "content": {
+            "application/octet-stream": {
+                "schema": {
+                    "type": "string",
+                    "format": "binary",
+                }
+            }
+        },
+        "headers": {
+            "Content-Disposition": {
+                "description": "Sanitized inline or attachment disposition and filename.",
+                "schema": {"type": "string"},
+            },
+            "X-Content-Type-Options": {
+                "description": "Always nosniff.",
+                "schema": {"type": "string", "enum": ["nosniff"]},
+            },
+            "X-Cayu-Artifact-Id": {
+                "description": "Sanitized artifact identifier.",
+                "schema": {"type": "string"},
+            },
+            "X-Cayu-Artifact-Store-Id": {
+                "description": "Sanitized artifact-store identifier.",
+                "schema": {"type": "string"},
+            },
+            "Cache-Control": {
+                "description": "Prevents authenticated artifact bytes from being cached.",
+                "schema": {"type": "string", "enum": ["private, no-store"]},
+            },
+        },
+    },
+    413: {
+        "description": "Artifact exceeds the direct content response limit.",
+        "model": ApiErrorResponse,
+    },
+    **ARTIFACT_ENDPOINT_ERROR_RESPONSES,
 }

@@ -6,7 +6,12 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from cayu._validation import copy_json_value, require_nonblank
-from cayu.artifacts.base import ArtifactMetadata, ArtifactScope, ArtifactStore
+from cayu.artifacts.base import (
+    ArtifactMetadata,
+    ArtifactScope,
+    ArtifactStore,
+    copy_artifact_read_result,
+)
 from cayu.workspaces import Workspace
 
 DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES = 64 * 1024 * 1024
@@ -73,7 +78,11 @@ async def copy_artifact_to_workspace(
     max_bytes = _validate_optional_positive_int(max_bytes, "max_bytes")
     allow_truncated = _validate_bool(allow_truncated, "allow_truncated")
 
-    result = await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes)
+    result = copy_artifact_read_result(
+        await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes),
+        expected_artifact_id=artifact_id,
+        max_content_bytes=max_bytes,
+    )
     if result.truncated and not allow_truncated:
         raise ValueError(
             "Artifact exceeds max_bytes; refusing to write a partial workspace copy. "
