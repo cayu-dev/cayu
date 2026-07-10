@@ -15,7 +15,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_nonblank,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import Event
 from cayu.core.messages import Message
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
@@ -23,10 +23,8 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
-    LabelSelectorOperator,
     RunRequest,
     Session,
-    SessionDebugState,
     SessionIdentity,
     SessionListResult,
     SessionOutcome,
@@ -37,20 +35,19 @@ from cayu.runtime.sessions import (
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    _copy_session_event_batch,
+    _prepare_session_fork_request,
+    _validate_session_fork_source,
     _validate_status_set,
     copy_event_query,
     copy_run_request,
-    copy_session,
     copy_session_identity,
     copy_session_query,
     copy_transcript_messages,
     copy_transcript_query,
-    decode_session_cursor,
     filter_transcript_records,
     session_next_cursor,
-    session_order_is_descending,
     session_outcome,
-    session_sort_column,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -70,10 +67,16 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
 )
+from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
+_SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
+    placeholder="?",
+    contains_style="sqlite_nocase_like",
+    datetime_param=sqlite_support.format_datetime,
+)
 
 _T = TypeVar("_T")
 
@@ -350,34 +353,24 @@ class SQLiteSessionStore(SessionStore):
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
     ) -> Session:
-        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
-        fork = copy_session(fork)
-        allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
-        if fork.parent_session_id != source_session_id:
-            raise ValueError("Fork parent_session_id must match source_session_id.")
-        if transcript_cursor is not None and transcript_cursor < 0:
-            raise ValueError("transcript_cursor must be greater than or equal to 0.")
+        source_session_id, fork, allowed_statuses, transcript_cursor = (
+            _prepare_session_fork_request(
+                source_session_id=source_session_id,
+                fork=fork,
+                source_statuses=source_statuses,
+                transcript_cursor=transcript_cursor,
+            )
+        )
 
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                source_session = self._load_unlocked(source_session_id)
-                if source_session is None:
-                    raise KeyError(f"Session not found: {source_session_id}")
-                if source_session.status not in allowed_statuses:
-                    raise ValueError(
-                        f"Source session status is not forkable: {source_session.status}"
-                    )
-                if fork.status != source_session.status:
-                    raise ValueError(
-                        "Fork status must match source session status: "
-                        f"{fork.status} != {source_session.status}"
-                    )
-                if fork.provider_name != source_session.provider_name:
-                    raise ValueError(
-                        "Fork provider_name must match source session provider_name: "
-                        f"{fork.provider_name} != {source_session.provider_name}"
-                    )
+                source_session = _validate_session_fork_source(
+                    source_session=self._load_unlocked(source_session_id),
+                    source_session_id=source_session_id,
+                    fork=fork,
+                    allowed_statuses=allowed_statuses,
+                )
                 transcript_rows = self._connection.execute(
                     """
                     SELECT message_json
@@ -745,24 +738,7 @@ class SQLiteSessionStore(SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        if type(events) is not list:
-            raise TypeError("Session events must be a list.")
-
-        copied_events: list[Event] = []
-        seen_event_ids: set[str] = set()
-        for event in events:
-            if type(event) is not Event:
-                raise TypeError("Session events must be Event instances.")
-            copied_event = copy_event(event)
-            if copied_event.session_id != session_id:
-                raise ValueError("Event session_id does not match target session.")
-            if copied_event.id in seen_event_ids:
-                raise ValueError(
-                    f"Event already exists for session {session_id}: {copied_event.id}"
-                )
-            seen_event_ids.add(copied_event.id)
-            copied_events.append(copied_event)
+        session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         def statement(connection: sqlite3.Connection) -> None:
             if not _session_exists(connection, session_id):
@@ -840,51 +816,8 @@ class SQLiteSessionStore(SessionStore):
         if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
             return await self._query_events_by_session_id_batches(query)
 
-        clauses: list[str] = []
-        params: list[object] = []
-
-        if query.after_sequence is not None:
-            clauses.append("cayu_events.sequence > ?")
-            params.append(query.after_sequence)
-        if query.session_id is not None:
-            clauses.append("cayu_events.session_id = ?")
-            params.append(query.session_id)
-        if query.session_ids:
-            placeholders = ", ".join("?" for _ in query.session_ids)
-            clauses.append(f"cayu_events.session_id IN ({placeholders})")
-            params.extend(query.session_ids)
-        if query.causal_budget_id is not None:
-            clauses.append("cayu_sessions.causal_budget_id = ?")
-            params.append(query.causal_budget_id)
-        if query.since is not None:
-            clauses.append("cayu_events.timestamp >= ?")
-            params.append(sqlite_support.format_datetime(query.since))
-        if query.until is not None:
-            clauses.append("cayu_events.timestamp < ?")
-            params.append(sqlite_support.format_datetime(query.until))
-        if query.event_type is not None:
-            clauses.append("cayu_events.event_type = ?")
-            params.append(str(query.event_type))
-        if query.event_types:
-            placeholders = ", ".join("?" for _ in query.event_types)
-            clauses.append(f"cayu_events.event_type IN ({placeholders})")
-            params.extend(str(event_type) for event_type in query.event_types)
-        if query.agent_name is not None:
-            clauses.append("cayu_events.agent_name = ?")
-            params.append(query.agent_name)
-        if query.environment_name is not None:
-            clauses.append("cayu_events.environment_name = ?")
-            params.append(query.environment_name)
-        if query.workflow_name is not None:
-            clauses.append("cayu_events.workflow_name = ?")
-            params.append(query.workflow_name)
-        if query.tool_name is not None:
-            clauses.append("cayu_events.tool_name = ?")
-            params.append(query.tool_name)
-
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_direction = "DESC" if query.order_by.value == "sequence_desc" else "ASC"
-        params.append(query.limit)
+        plan = session_store_sql.build_event_query_sql(query, dialect=_SQL_DIALECT)
+        params = [*plan.params, query.limit]
 
         def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
             event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
@@ -893,8 +826,8 @@ class SQLiteSessionStore(SessionStore):
                 SELECT cayu_events.sequence, {event_columns}
                 FROM cayu_events
                 JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                {where_sql}
-                ORDER BY cayu_events.sequence {order_direction}
+                {plan.where_sql}
+                ORDER BY cayu_events.sequence {plan.order_direction}
                 LIMIT ?
                 """,
                 params,
@@ -1089,178 +1022,14 @@ class SQLiteSessionStore(SessionStore):
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         query = copy_session_query(query)
-        clauses: list[str] = []
-        params: list[object] = []
-
-        if query.q is not None:
-            like = _like_contains_pattern(query.q)
-            clauses.append(
-                """
-                (
-                    id COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR agent_name COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR provider_name COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR model COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR environment_name COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR parent_session_id COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR causal_budget_id COLLATE NOCASE LIKE ? ESCAPE '\\'
-                    OR EXISTS (
-                        SELECT 1
-                        FROM cayu_session_labels
-                        WHERE cayu_session_labels.session_id = cayu_sessions.id
-                          AND (
-                            cayu_session_labels.key COLLATE NOCASE LIKE ? ESCAPE '\\'
-                            OR cayu_session_labels.value COLLATE NOCASE LIKE ? ESCAPE '\\'
-                          )
-                    )
-                )
-                """
-            )
-            params.extend([like, like, like, like, like, like, like, like, like])
-        if query.status is not None:
-            clauses.append("status = ?")
-            params.append(str(query.status))
-        if query.debug_state is not None:
-            tool_debug_sql = """
-                EXISTS (
-                    SELECT 1
-                    FROM cayu_events
-                    WHERE cayu_events.session_id = cayu_sessions.id
-                      AND cayu_events.event_type IN (?, ?)
-                )
-                """
-            if query.debug_state == SessionDebugState.TOOL_ISSUE:
-                clauses.append(tool_debug_sql)
-                params.extend(
-                    [
-                        str(EventType.TOOL_CALL_FAILED),
-                        str(EventType.TOOL_CALL_BLOCKED),
-                    ]
-                )
-            elif query.debug_state == SessionDebugState.SESSION_FAILURE:
-                clauses.append("status = ?")
-                params.append(str(SessionStatus.FAILED))
-            elif query.debug_state == SessionDebugState.INTERRUPTION:
-                clauses.append("status = ?")
-                params.append(str(SessionStatus.INTERRUPTED))
-            elif query.debug_state == SessionDebugState.NEEDS_ATTENTION:
-                clauses.append(f"(status IN (?, ?) OR {tool_debug_sql})")
-                params.extend(
-                    [
-                        str(SessionStatus.FAILED),
-                        str(SessionStatus.INTERRUPTED),
-                        str(EventType.TOOL_CALL_FAILED),
-                        str(EventType.TOOL_CALL_BLOCKED),
-                    ]
-                )
-            else:
-                raise ValueError(f"Unsupported session debug_state: {query.debug_state}")
-        if query.agent_name is not None:
-            clauses.append("agent_name = ?")
-            params.append(query.agent_name)
-        if query.provider_name is not None:
-            clauses.append("provider_name = ?")
-            params.append(query.provider_name)
-        if query.model is not None:
-            clauses.append("model = ?")
-            params.append(query.model)
-        if query.environment_name is not None:
-            clauses.append("environment_name = ?")
-            params.append(query.environment_name)
-        if query.parent_session_id is not None:
-            clauses.append("parent_session_id = ?")
-            params.append(query.parent_session_id)
-        if query.causal_budget_id is not None:
-            clauses.append("causal_budget_id = ?")
-            params.append(query.causal_budget_id)
-        for key, value in query.labels.items():
-            clauses.append(
-                """
-                EXISTS (
-                    SELECT 1
-                    FROM cayu_session_labels
-                    WHERE cayu_session_labels.session_id = cayu_sessions.id
-                      AND cayu_session_labels.key = ?
-                      AND cayu_session_labels.value = ?
-                )
-                """
-            )
-            params.extend([key, value])
-        for selector in query.label_selectors:
-            if selector.operator == LabelSelectorOperator.EXISTS:
-                clauses.append(
-                    """
-                    EXISTS (
-                        SELECT 1
-                        FROM cayu_session_labels
-                        WHERE cayu_session_labels.session_id = cayu_sessions.id
-                          AND cayu_session_labels.key = ?
-                    )
-                    """
-                )
-                params.append(selector.key)
-            elif selector.operator == LabelSelectorOperator.NOT_EXISTS:
-                clauses.append(
-                    """
-                    NOT EXISTS (
-                        SELECT 1
-                        FROM cayu_session_labels
-                        WHERE cayu_session_labels.session_id = cayu_sessions.id
-                          AND cayu_session_labels.key = ?
-                    )
-                    """
-                )
-                params.append(selector.key)
-            else:
-                placeholders = ", ".join("?" for _ in selector.values)
-                exists_sql = f"""
-                    EXISTS (
-                        SELECT 1
-                        FROM cayu_session_labels
-                        WHERE cayu_session_labels.session_id = cayu_sessions.id
-                          AND cayu_session_labels.key = ?
-                          AND cayu_session_labels.value IN ({placeholders})
-                    )
-                    """
-                if selector.operator == LabelSelectorOperator.IN:
-                    clauses.append(exists_sql)
-                elif selector.operator == LabelSelectorOperator.NOT_IN:
-                    clauses.append(f"NOT {exists_sql}")
-                else:
-                    raise ValueError(f"Unsupported label selector operator: {selector.operator}")
-                params.extend([selector.key, *selector.values])
-
-        where_filter = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_sql = sqlite_support.session_order_sql(query.order_by)
-
-        # The paged query reuses the filters plus, when a cursor is given, a keyset
-        # predicate; the COUNT uses only the filters so total_count is page-stable.
-        page_clauses = list(clauses)
-        page_params = list(params)
-        sort_column = session_sort_column(query.order_by)
-        if query.cursor is not None:
-            cursor_dt, cursor_id = decode_session_cursor(query.cursor)
-            # SQLite compares timestamps as TEXT; format the cursor datetime with the
-            # same encoder used to store the column so the comparison is byte-exact.
-            cursor_value = sqlite_support.format_datetime(cursor_dt)
-            comparison = "<" if session_order_is_descending(query.order_by) else ">"
-            page_clauses.append(
-                f"(({sort_column} {comparison} ?) OR ({sort_column} = ? AND id > ?))"
-            )
-            page_params.extend([cursor_value, cursor_value, cursor_id])
-            page_params.append(query.limit + 1)
-            pagination_sql = "LIMIT ?"
-        else:
-            page_params.extend([query.limit + 1, query.offset])
-            pagination_sql = "LIMIT ? OFFSET ?"
-        where_page = f"WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
+        plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
         async with self._lock:
             total_count: int | None = None
             if query.include_total_count:
                 total_count = self._connection.execute(
-                    f"SELECT COUNT(*) FROM cayu_sessions {where_filter}",
-                    params,
+                    f"SELECT COUNT(*) FROM cayu_sessions {plan.filter_where_sql}",
+                    plan.filter_params,
                 ).fetchone()[0]
             rows = self._connection.execute(
                 f"""
@@ -1269,11 +1038,11 @@ class SQLiteSessionStore(SessionStore):
                        status, created_at,
                        updated_at, metadata_json
                 FROM cayu_sessions
-                {where_page}
-                ORDER BY {order_sql}, id ASC
-                {pagination_sql}
+                {plan.page_where_sql}
+                ORDER BY {plan.order_sql}, id ASC
+                {plan.pagination_sql}
                 """,
-                page_params,
+                plan.page_params,
             ).fetchall()
             has_more = len(rows) > query.limit
             rows = rows[: query.limit]

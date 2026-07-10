@@ -17,10 +17,9 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionOrder,
     SessionStatus,
-    session_order_is_descending,
-    session_sort_column,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
+from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 
 
@@ -721,10 +720,7 @@ def json_dumps(value: Any) -> str:
 
 
 def session_order_sql(order_by: SessionOrder) -> str:
-    # Derived from the same helpers the keyset cursor uses, so the ORDER BY direction
-    # can never drift from the cursor comparison.
-    direction = "DESC" if session_order_is_descending(order_by) else "ASC"
-    return f"{session_sort_column(order_by)} {direction}"
+    return session_store_sql.session_order_sql(order_by)
 
 
 def task_order_sql(order_by: TaskOrder) -> str:

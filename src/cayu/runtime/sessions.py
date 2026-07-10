@@ -1103,29 +1103,21 @@ class InMemorySessionStore(SessionStore):
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
     ) -> Session:
-        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
-        fork = copy_session(fork)
-        allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
-        if fork.parent_session_id != source_session_id:
-            raise ValueError("Fork parent_session_id must match source_session_id.")
-        if transcript_cursor is not None and transcript_cursor < 0:
-            raise ValueError("transcript_cursor must be greater than or equal to 0.")
+        source_session_id, fork, allowed_statuses, transcript_cursor = (
+            _prepare_session_fork_request(
+                source_session_id=source_session_id,
+                fork=fork,
+                source_statuses=source_statuses,
+                transcript_cursor=transcript_cursor,
+            )
+        )
         async with self._lock:
-            source_session = self._sessions.get(source_session_id)
-            if source_session is None:
-                raise KeyError(f"Session not found: {source_session_id}")
-            if source_session.status not in allowed_statuses:
-                raise ValueError(f"Source session status is not forkable: {source_session.status}")
-            if fork.status != source_session.status:
-                raise ValueError(
-                    "Fork status must match source session status: "
-                    f"{fork.status} != {source_session.status}"
-                )
-            if fork.provider_name != source_session.provider_name:
-                raise ValueError(
-                    "Fork provider_name must match source session provider_name: "
-                    f"{fork.provider_name} != {source_session.provider_name}"
-                )
+            source_session = _validate_session_fork_source(
+                source_session=self._sessions.get(source_session_id),
+                source_session_id=source_session_id,
+                fork=fork,
+                allowed_statuses=allowed_statuses,
+            )
             if fork.id in self._sessions:
                 raise ValueError(f"Session already exists: {fork.id}")
 
@@ -1335,23 +1327,7 @@ class InMemorySessionStore(SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        if type(events) is not list:
-            raise TypeError("Session events must be a list.")
-        copied_events: list[Event] = []
-        seen_event_ids: set[str] = set()
-        for event in events:
-            if type(event) is not Event:
-                raise TypeError("Session events must be Event instances.")
-            copied_event = _validate_event(event)
-            if copied_event.session_id != session_id:
-                raise ValueError("Event session_id does not match target session.")
-            if copied_event.id in seen_event_ids:
-                raise ValueError(
-                    f"Event already exists for session {session_id}: {copied_event.id}"
-                )
-            seen_event_ids.add(copied_event.id)
-            copied_events.append(copied_event)
+        session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         async with self._lock:
             if session_id not in self._sessions:
@@ -1575,10 +1551,6 @@ class InMemorySessionStore(SessionStore):
             if checkpoint is None:
                 return None
             return deepcopy(checkpoint)
-
-
-def _validate_event(event: Event) -> Event:
-    return copy_event(event)
 
 
 def event_summary_from_records(
@@ -1940,6 +1912,67 @@ def _validate_status_set(
         if not isinstance(status, SessionStatus):
             raise ValueError(f"{field_name} must contain SessionStatus values.")
     return set(statuses)
+
+
+def _prepare_session_fork_request(
+    *,
+    source_session_id: str,
+    fork: Session,
+    source_statuses: set[SessionStatus],
+    transcript_cursor: int | None,
+) -> tuple[str, Session, set[SessionStatus], int | None]:
+    source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+    fork = copy_session(fork)
+    allowed_statuses = _validate_status_set(source_statuses, "source_statuses")
+    if fork.parent_session_id != source_session_id:
+        raise ValueError("Fork parent_session_id must match source_session_id.")
+    if transcript_cursor is not None and transcript_cursor < 0:
+        raise ValueError("transcript_cursor must be greater than or equal to 0.")
+    return source_session_id, fork, allowed_statuses, transcript_cursor
+
+
+def _validate_session_fork_source(
+    *,
+    source_session: Session | None,
+    source_session_id: str,
+    fork: Session,
+    allowed_statuses: set[SessionStatus],
+) -> Session:
+    if source_session is None:
+        raise KeyError(f"Session not found: {source_session_id}")
+    if source_session.status not in allowed_statuses:
+        raise ValueError(f"Source session status is not forkable: {source_session.status}")
+    if fork.status != source_session.status:
+        raise ValueError(
+            "Fork status must match source session status: "
+            f"{fork.status} != {source_session.status}"
+        )
+    if fork.provider_name != source_session.provider_name:
+        raise ValueError(
+            "Fork provider_name must match source session provider_name: "
+            f"{fork.provider_name} != {source_session.provider_name}"
+        )
+    return source_session
+
+
+def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(events) is not list:
+        raise TypeError("Session events must be a list.")
+
+    copied_events: list[Event] = []
+    seen_event_ids: set[str] = set()
+    for event in events:
+        if type(event) is not Event:
+            raise TypeError("Session events must be Event instances.")
+        copied_event = copy_event(event)
+        if copied_event.session_id != session_id:
+            raise ValueError("Event session_id does not match target session.")
+        if copied_event.id in seen_event_ids:
+            raise ValueError(f"Event already exists for session {session_id}: {copied_event.id}")
+        seen_event_ids.add(copied_event.id)
+        copied_events.append(copied_event)
+    return session_id, copied_events
 
 
 def copy_session_query(query: SessionQuery | None) -> SessionQuery:
