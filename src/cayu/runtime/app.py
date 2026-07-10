@@ -95,6 +95,7 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -6483,17 +6484,17 @@ class CayuApp:
                     continue
 
                 if stream_event.type == ModelStreamEventType.ERROR:
-                    overflow_error = _stream_error_context_overflow(
+                    provider_error = model_provider_error_from_payload(
                         stream_event.payload,
                         fallback_provider=registered_provider.name,
                     )
-                    if overflow_error is not None:
+                    if isinstance(provider_error, ModelContextOverflowError):
                         # A provider flattened a context overflow into an error
                         # event instead of raising it. Rehydrate the typed
                         # exception so overflow recovery can shrink context and
                         # retry instead of burning generic retries on a request
                         # that can never fit.
-                        raise overflow_error
+                        raise provider_error
 
                 event = _model_stream_event_to_runtime_event(
                     stream_event,
@@ -6508,14 +6509,18 @@ class CayuApp:
                 )
                 emitted_event = await self._emit(event)
                 if stream_event.type == ModelStreamEventType.ERROR:
+                    message = str(stream_event.payload.get("error") or "Model provider error")
+                    provider_error = model_provider_error_from_payload(
+                        stream_event.payload,
+                        fallback_provider=registered_provider.name,
+                        fallback_message=message,
+                    )
                     yield emitted_event, None
                     raise _ModelAttemptFailed(
-                        message=str(stream_event.payload.get("error") or "Model provider error"),
+                        message=message,
                         payload=copy_json_value(stream_event.payload, "payload"),
                         emitted_error_event=True,
-                        cause=RuntimeError(
-                            str(stream_event.payload.get("error") or "Model provider error")
-                        ),
+                        cause=provider_error or RuntimeError(message),
                     )
                 yield emitted_event, None
         except _SessionInterruptedByRequest:
@@ -12552,46 +12557,6 @@ def _context_overflow_event_payload(
     if recovery_message_count is not None:
         payload["recovery_message_count"] = recovery_message_count
     return payload
-
-
-def _stream_error_context_overflow(
-    payload: dict[str, Any],
-    *,
-    fallback_provider: str,
-) -> ModelContextOverflowError | None:
-    """Rehydrate a typed overflow from an error stream event payload.
-
-    Providers must raise `ModelContextOverflowError` from `stream()`, but a
-    provider that flattens the overflow into `ModelStreamEvent.error(...)`
-    still carries the typed identity (`context_overflow` plus the structured
-    `provider_error_*` fields). Rebuilding the exception here routes such
-    events into context-overflow recovery instead of the generic retry path.
-    All fields are read defensively: the payload crosses a provider trust
-    boundary and must not be able to crash classification.
-    """
-    if payload.get("context_overflow") is not True:
-        return None
-    return ModelContextOverflowError(
-        _clean_payload_string(payload.get("error")) or "Model provider context overflow",
-        provider=_clean_payload_string(payload.get("provider")) or fallback_provider,
-        status_code=_payload_status_code(payload.get("status_code")),
-        error_type=_clean_payload_string(payload.get("provider_error_type")),
-        error_code=_clean_payload_string(payload.get("provider_error_code")),
-        request_id=_clean_payload_string(payload.get("request_id")),
-    )
-
-
-def _clean_payload_string(value: Any) -> str | None:
-    if type(value) is not str:
-        return None
-    stripped = value.strip()
-    return stripped if stripped else None
-
-
-def _payload_status_code(value: Any) -> int | None:
-    if type(value) is not int or value < 100:
-        return None
-    return value
 
 
 def _retry_attempt_payload(

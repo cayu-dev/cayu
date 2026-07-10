@@ -12265,6 +12265,42 @@ def test_cayu_app_recovers_pending_tool_round_from_recorded_terminal_event():
     assert provider.requests[1].messages[-1].content[0].text == "continue"
 
 
+def test_recorded_tool_outcomes_rejects_terminal_event_without_result_payload():
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.runtime import _tool_round_recovery as tool_round_recovery
+
+    _, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+        None,
+        agent_name="assistant",
+        environment_name=None,
+        task_id=None,
+        tool_calls=[
+            runtime_records.ToolCallRequest(
+                id="call_1",
+                name="side_effect",
+                arguments={},
+            )
+        ],
+        policy_outcomes=None,
+        structured_output=None,
+    )
+
+    with pytest.raises(ValueError, match="Terminal tool event is missing result payload"):
+        tool_round_recovery.recorded_tool_outcomes(
+            events=[
+                Event(
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="sess_1",
+                    payload={
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": "call_1",
+                    },
+                )
+            ],
+            pending_round=pending_round,
+        )
+
+
 def test_cayu_app_recovers_pending_tool_round_before_tool_started():
     store = FailingAfterPendingToolRoundCheckpointStore()
     tool = SideEffectTool()
@@ -17622,6 +17658,43 @@ def test_model_compactor_retries_transient_provider_errors():
     assert len(provider.requests) == 2
 
 
+def test_model_compactor_retries_transient_provider_error_events():
+    typed_error = ModelProviderError(
+        "provider overloaded",
+        provider="fake",
+        status_code=529,
+        retryable=True,
+        retry_after_s=0.0,
+    )
+    provider = FakeProvider(
+        [
+            [ModelStreamEvent.error("provider overloaded", cause=typed_error)],
+            [
+                ModelStreamEvent.text_delta("recovered summary"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert result.summary == "recovered summary"
+    assert len(provider.requests) == 2
+
+
 def test_model_compactor_does_not_retry_by_default():
     provider = FlakyCompactionProvider(
         failures=1,
@@ -17644,6 +17717,73 @@ def test_model_compactor_does_not_retry_by_default():
                 )
             )
         )
+    assert len(provider.requests) == 1
+
+
+def test_model_compactor_does_not_retry_non_retryable_provider_error_events():
+    typed_error = ModelProviderError(
+        "request timed out",
+        provider="fake",
+        status_code=503,
+        retryable=False,
+        retry_after_s=2.5,
+    )
+    provider = FakeProvider([[ModelStreamEvent.error("request timed out", cause=typed_error)]])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=3, initial_delay_s=0.0),
+    )
+
+    with pytest.raises(ModelProviderError, match="request timed out") as exc_info:
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retry_after_s == 2.5
+    assert len(provider.requests) == 1
+
+
+def test_model_compactor_keeps_provider_only_error_events_untyped():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent(
+                    type=ModelStreamEventType.ERROR,
+                    payload={"error": "provider unavailable", "provider": "fake"},
+                )
+            ],
+            [
+                ModelStreamEvent.text_delta("should not retry"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
     assert len(provider.requests) == 1
 
 

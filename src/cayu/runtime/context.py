@@ -43,6 +43,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
     copy_model_stream_event,
 )
+from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
 from cayu.runtime.usage import normalize_usage_metrics, usage_metrics_payload
@@ -1738,6 +1739,13 @@ class ModelCompactor(ContextCompactor):
             elif event.type == ModelStreamEventType.TOOL_CALL:
                 raise RuntimeError("Compaction model must not call tools.")
             elif event.type == ModelStreamEventType.ERROR:
+                provider_error = model_provider_error_from_payload(
+                    event.payload,
+                    fallback_provider=provider_name,
+                    fallback_message="Compaction model provider error",
+                )
+                if provider_error is not None:
+                    raise provider_error
                 raise RuntimeError(
                     str(event.payload.get("error") or "Compaction model provider error")
                 )

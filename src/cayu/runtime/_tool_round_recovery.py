@@ -8,8 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     copy_pending_tool_call_approval,
@@ -19,9 +19,17 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
-from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.runtime.tool_policy import ToolPolicyResult
 
 PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
+_TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
 
 
 class PendingToolRound(BaseModel):
@@ -169,34 +177,13 @@ def recorded_tool_outcomes(
     events: list[Event],
     pending_round: PendingToolRound,
 ) -> tuple[dict[str, runtime_records.ToolCallOutcome], set[str]]:
-    pending_calls = {call.tool_call_id: call for call in pending_round.tool_calls}
-    started_ids: set[str] = set()
-    outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-
-    for event in events:
-        if event.payload.get("tool_round_id") != pending_round.round_id:
-            continue
-        tool_call_id = event.payload.get("tool_call_id")
-        if type(tool_call_id) is not str or tool_call_id not in pending_calls:
-            continue
-
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started_ids.add(tool_call_id)
-            continue
-
-        if event.type in terminal_event_types:
-            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
-                event=event,
-                pending_tool_call=pending_calls[tool_call_id],
-            )
-
-    return outcomes, started_ids
+    ledger = resume_ledger.scan_tool_call_events(
+        events=events,
+        pending_calls=pending_round.tool_calls,
+        in_scope=lambda event: event.payload.get("tool_round_id") == pending_round.round_id,
+        terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
+    )
+    return ledger.outcomes, ledger.started_ids
 
 
 def validate_tool_round_recovery_target(
@@ -212,30 +199,19 @@ def validate_tool_round_recovery_target(
     accepts is exactly one the automatic close would otherwise synthesize an
     unknown outcome for.
     """
-    started = False
-    terminal = False
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-    for event in events:
-        if event.payload.get("tool_round_id") != pending_round.round_id:
-            continue
-        if event.payload.get("tool_call_id") != tool_call_id:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started = True
-        elif event.type in terminal_event_types:
-            terminal = True
+    state = resume_ledger.tool_call_recovery_state(
+        events=events,
+        tool_call_id=tool_call_id,
+        in_scope=lambda event: event.payload.get("tool_round_id") == pending_round.round_id,
+        terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
+    )
 
-    if terminal:
+    if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}. "
             "Resume the session to close the round from the persisted outcome."
         )
-    if not started:
+    if not state.started:
         raise RuntimeError(
             f"Tool round recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
@@ -347,37 +323,4 @@ def recovered_subagent_tool_result(
             "outcome_unknown": not terminal,
         },
         is_error=status is not SessionStatus.COMPLETED,
-    )
-
-
-def policy_result_from_pending_tool_call(
-    pending_tool_call: PendingToolCallApproval,
-) -> ToolPolicyResult | None:
-    if pending_tool_call.policy_decision is None:
-        return None
-    return ToolPolicyResult(
-        decision=ToolPolicyDecision(pending_tool_call.policy_decision),
-        reason=pending_tool_call.reason,
-        metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
-    )
-
-
-def _tool_call_outcome_from_terminal_event(
-    *,
-    event: Event,
-    pending_tool_call: PendingToolCallApproval,
-) -> runtime_records.ToolCallOutcome:
-    result_payload = event.payload.get("result")
-    if type(result_payload) is not dict:
-        raise ValueError(
-            f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
-        )
-    result = tool_results.tool_result_from_payload(result_payload)
-    return runtime_records.ToolCallOutcome(
-        call=runtime_records.ToolCallRequest(
-            id=pending_tool_call.tool_call_id,
-            name=pending_tool_call.tool_name,
-            arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-        ),
-        result=result,
     )

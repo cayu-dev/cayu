@@ -8,8 +8,8 @@ from typing import Any, NamedTuple
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -21,9 +21,24 @@ from cayu.runtime.approvals import (
     resolution_actor_payload,
 )
 from cayu.runtime.sessions import Session
-from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.runtime.tool_policy import ToolPolicyResult
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
+_APPROVAL_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
+_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+    }
+)
 
 
 def pending_approval_expired(approval: PendingToolApproval, now: datetime) -> bool:
@@ -236,35 +251,21 @@ def recorded_round_tool_outcomes(
     failure, without colliding with a prior round that reused the same ids.
     """
     pending_by_id = {call.tool_call_id: call for call in pending_calls}
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-    }
-    started_ids: set[str] = set()
-    outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
-    for event in user_input_resume_events(events, input_id):
-        tool_call_id = event.payload.get("tool_call_id")
-        if type(tool_call_id) is not str or tool_call_id not in pending_by_id:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started_ids.add(tool_call_id)
-            continue
-        if event.type in terminal_event_types:
-            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
-                event=event,
-                pending_tool_call=pending_by_id[tool_call_id],
-            )
+    ledger = resume_ledger.scan_tool_call_events(
+        events=user_input_resume_events(events, input_id),
+        pending_calls=pending_calls,
+        in_scope=lambda event: True,
+        terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
+    )
     # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
     # cannot be safely re-run — fail loudly instead of silently double-executing a side effect.
-    for tool_call_id in started_ids:
-        if tool_call_id not in outcomes:
-            pending_call = pending_by_id[tool_call_id]
-            raise RoundToolManualRecoveryRequired(
-                tool_call_id=tool_call_id,
-                tool_name=pending_call.tool_name,
-            )
-    return outcomes
+    for tool_call_id in ledger.started_without_terminal_ids:
+        pending_call = pending_by_id[tool_call_id]
+        raise RoundToolManualRecoveryRequired(
+            tool_call_id=tool_call_id,
+            tool_name=pending_call.tool_name,
+        )
+    return ledger.outcomes
 
 
 def recorded_tool_outcomes(
@@ -272,43 +273,23 @@ def recorded_tool_outcomes(
     events: list[Event],
     approval: PendingToolApproval,
 ) -> dict[str, runtime_records.ToolCallOutcome]:
-    pending_calls = {call.tool_call_id: call for call in pending_round_tool_calls(approval)}
-    started_ids: set[str] = set()
-    outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
+    pending_calls = pending_round_tool_calls(approval)
+    pending_by_id = {call.tool_call_id: call for call in pending_calls}
+    ledger = resume_ledger.scan_tool_call_events(
+        events=events,
+        pending_calls=pending_calls,
+        in_scope=lambda event: event.payload.get("approval_id") == approval.approval_id,
+        terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
+    )
 
-    for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
-            continue
+    for tool_call_id in ledger.started_without_terminal_ids:
+        pending_tool_call = pending_by_id[tool_call_id]
+        raise ToolApprovalManualRecoveryRequired(
+            tool_call_id=tool_call_id,
+            tool_name=pending_tool_call.tool_name,
+        )
 
-        tool_call_id = event.payload.get("tool_call_id")
-        if type(tool_call_id) is not str or tool_call_id not in pending_calls:
-            continue
-
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started_ids.add(tool_call_id)
-            continue
-
-        if event.type in terminal_event_types:
-            outcomes[tool_call_id] = _tool_call_outcome_from_terminal_event(
-                event=event,
-                pending_tool_call=pending_calls[tool_call_id],
-            )
-
-    for tool_call_id in started_ids:
-        if tool_call_id not in outcomes:
-            pending_tool_call = pending_calls[tool_call_id]
-            raise ToolApprovalManualRecoveryRequired(
-                tool_call_id=tool_call_id,
-                tool_name=pending_tool_call.tool_name,
-            )
-
-    return outcomes
+    return ledger.outcomes
 
 
 def approval_resolution_history(
@@ -372,29 +353,18 @@ def validate_recovery_target(
     approval: PendingToolApproval,
     tool_call_id: str,
 ) -> None:
-    started = False
-    terminal = False
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-    for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
-            continue
-        if event.payload.get("tool_call_id") != tool_call_id:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started = True
-        elif event.type in terminal_event_types:
-            terminal = True
+    state = resume_ledger.tool_call_recovery_state(
+        events=events,
+        tool_call_id=tool_call_id,
+        in_scope=lambda event: event.payload.get("approval_id") == approval.approval_id,
+        terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
+    )
 
-    if terminal:
+    if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
         )
-    if not started:
+    if not state.started:
         raise RuntimeError(
             f"Tool approval recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
@@ -423,26 +393,18 @@ def validate_round_recovery_target(
     # recorded_round_tool_outcomes) — a prior round reusing this id must not be seen here.
     if tool_call_id not in {call.tool_call_id for call in pending_calls}:
         raise ValueError(f"Tool call is not part of the paused round: {tool_call_id}")
-    started = False
-    terminal = False
-    terminal_event_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-    }
-    for event in user_input_resume_events(events, input_id):
-        if event.payload.get("tool_call_id") != tool_call_id:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started = True
-        elif event.type in terminal_event_types:
-            terminal = True
+    state = resume_ledger.tool_call_recovery_state(
+        events=user_input_resume_events(events, input_id),
+        tool_call_id=tool_call_id,
+        in_scope=lambda event: True,
+        terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
+    )
 
-    if terminal:
+    if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
         )
-    if not started:
+    if not state.started:
         raise RuntimeError(
             f"User input recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
@@ -518,13 +480,7 @@ def pending_round_tool_calls(
 def policy_result_from_pending_tool_call(
     pending_tool_call: PendingToolCallApproval,
 ) -> ToolPolicyResult | None:
-    if pending_tool_call.policy_decision is None:
-        return None
-    return ToolPolicyResult(
-        decision=ToolPolicyDecision(pending_tool_call.policy_decision),
-        reason=pending_tool_call.reason,
-        metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
-    )
+    return resume_ledger.policy_result_from_pending_tool_call(pending_tool_call)
 
 
 def taint_labels_from_pending_tool_call(
@@ -533,24 +489,3 @@ def taint_labels_from_pending_tool_call(
     """Active taint labels persisted for this call, restored so the resumed tool is gated with the
     same taint the policy used before the pause."""
     return frozenset(pending_tool_call.active_taint_labels)
-
-
-def _tool_call_outcome_from_terminal_event(
-    *,
-    event: Event,
-    pending_tool_call: PendingToolCallApproval,
-) -> runtime_records.ToolCallOutcome:
-    result_payload = event.payload.get("result")
-    if type(result_payload) is not dict:
-        raise ValueError(
-            f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
-        )
-    result = tool_results.tool_result_from_payload(result_payload)
-    return runtime_records.ToolCallOutcome(
-        call=runtime_records.ToolCallRequest(
-            id=pending_tool_call.tool_call_id,
-            name=pending_tool_call.tool_name,
-            arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-        ),
-        result=result,
-    )
