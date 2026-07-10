@@ -1,4 +1,4 @@
-"""Live provider-token-counting smoke test.
+"""Demo-only live provider-token-counting smoke test.
 
 OpenAI:
     CAYU_PROVIDER=openai PYTHONPATH=src .venv/bin/python examples/context_counting_live.py

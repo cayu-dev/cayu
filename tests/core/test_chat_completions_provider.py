@@ -17,7 +17,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import FilePart, MessageRole, TextPart, ToolCallPart
+from cayu.core.messages import FilePart, MessageRole, ProviderStatePart, TextPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     ChatCompletionsAPIError,
@@ -172,6 +172,53 @@ def test_build_chat_completions_payload_translates_cayu_messages() -> None:
         "tool_call_id": "call_1",
         "content": "file contents",
     }
+
+
+def test_build_chat_completions_payload_round_trips_tool_call_extra_content() -> None:
+    request = ModelRequest(
+        model="gemini-test",
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ToolCallPart(
+                        tool_call_id="call_1",
+                        tool_name="read_file",
+                        arguments={"path": "README.md"},
+                    ),
+                    ProviderStatePart(
+                        provider="chat_completions",
+                        state={
+                            "type": "tool_call_extra_content",
+                            "tool_call_id": "call_1",
+                            "extra_content": {
+                                "google": {"thought_signature": "signature-1"},
+                            },
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    payload = build_chat_completions_payload(request)
+
+    assert payload["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                    "extra_content": {
+                        "google": {"thought_signature": "signature-1"},
+                    },
+                }
+            ],
+        }
+    ]
 
 
 def test_build_chat_completions_payload_nests_and_cleans_tool_schemas() -> None:
@@ -645,6 +692,9 @@ async def test_provider_round_trips_runtime_tool_results() -> None:
                                         "index": 0,
                                         "id": "call_1",
                                         "type": "function",
+                                        "extra_content": {
+                                            "google": {"thought_signature": "signature-1"}
+                                        },
                                         "function": {
                                             "name": "echo",
                                             "arguments": '{"text":"hello from gemini"}',
@@ -656,7 +706,7 @@ async def test_provider_round_trips_runtime_tool_results() -> None:
                         }
                     ]
                 },
-                _finish_chunk("tool_calls"),
+                _finish_chunk("stop"),
             ],
             [
                 _text_chunk("final answer"),
@@ -702,6 +752,7 @@ async def test_provider_round_trips_runtime_tool_results() -> None:
                 {
                     "id": "call_1",
                     "type": "function",
+                    "extra_content": {"google": {"thought_signature": "signature-1"}},
                     "function": {
                         "name": "echo",
                         "arguments": '{"text":"hello from gemini"}',
@@ -795,6 +846,69 @@ async def test_chat_completions_stream_events_handles_gemini_tool_call_without_i
     }
     assert events[1].completion is not None
     assert events[1].completion.finish_reason == ModelFinishReason.TOOL_CALLS
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_preserves_gemini_tool_call_extra_content() -> None:
+    async def raw_events():
+        yield {
+            "id": "gemini-1",
+            "model": "gemini-3.1-flash-lite",
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "function-call-123",
+                                "type": "function",
+                                "extra_content": {"google": {"thought_signature": "signature-1"}},
+                                "function": {"name": "echo", "arguments": '{"text":"hi"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield {
+            "id": "gemini-1",
+            "model": "gemini-3.1-flash-lite",
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload == {
+        "id": "function-call-123",
+        "name": "echo",
+        "arguments": {"text": "hi"},
+    }
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.TOOL_CALLS
+    assert events[1].payload["provider_state"] == [
+        {
+            "provider": "chat_completions",
+            "state": {
+                "type": "tool_call_extra_content",
+                "tool_call_id": "function-call-123",
+                "extra_content": {"google": {"thought_signature": "signature-1"}},
+            },
+        }
+    ]
 
 
 @pytest.mark.anyio

@@ -23,8 +23,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --python 3.11
-      - run: uv run ruff check src/ tests/ examples/
-      - run: uv run ruff format --check src/ tests/ examples/
+      - run: uv run ruff check src/ tests/ examples/ scripts/
+      - run: uv run ruff format --check src/ tests/ examples/ scripts/
 
   typecheck:
     name: Type diagnostics (ty)
@@ -52,6 +52,19 @@ jobs:
       - run: uv run pytest -q
         env:
           CAYU_REQUIRE_POSTGRES: "1"
+
+  docker-runner:
+    name: Docker runner live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv sync --frozen --extra dev --python 3.12
+      - run: uv run pytest tests/runners/test_docker_live.py -q
+        env:
+          CAYU_REQUIRE_DOCKER_RUNNER: "1"
 
   lockfile:
     name: Lockfile sync

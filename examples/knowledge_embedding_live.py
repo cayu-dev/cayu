@@ -1,3 +1,9 @@
+"""Demo-only live embedding example.
+
+This exercises OpenAI embeddings and semantic lookup, but it is not a stable
+assertion harness. Treat it as smoke coverage in nightly reports.
+"""
+
 from __future__ import annotations
 
 import asyncio

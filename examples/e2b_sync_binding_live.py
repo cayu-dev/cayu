@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from _live_checks import require_equal
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -149,14 +150,25 @@ async def main() -> None:
                     event.payload,
                 )
 
-            print("source_files", (await source.list("**/*.txt")).paths)
+            source_files = (await source.list("**/*.txt")).paths
+            require_equal(
+                sorted(source_files),
+                ["notes/input.txt", "notes/output.txt"],
+                "source_files",
+            )
+            print("source_files", source_files)
+            source_input = (source_root / "notes" / "input.txt").read_text(encoding="utf-8")
+            source_output = (source_root / "notes" / "output.txt").read_text(encoding="utf-8")
+            require_equal(source_input, "updated in e2b workspace", "source_input")
+            require_equal(source_output, "created in e2b workspace", "source_output")
+            require_equal(len(provider.requests), 2, "model_requests")
             print(
                 "source_input",
-                (source_root / "notes" / "input.txt").read_text(encoding="utf-8"),
+                source_input,
             )
             print(
                 "source_output",
-                (source_root / "notes" / "output.txt").read_text(encoding="utf-8"),
+                source_output,
             )
             print("model_requests", len(provider.requests))
             print("closing sandbox")

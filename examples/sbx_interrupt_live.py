@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import os
 
-from cayu.runners import ExecCommand, RunnerCancelledError, SbxRunner
+from _live_checks import require_cleanup_artifact, require_equal, require_exec_success
+from cayu.runners import ExecCommand, SbxRunner
 
 
 async def _line_count(runner: SbxRunner, path: str) -> int:
@@ -53,10 +54,11 @@ async def main() -> None:
         task.cancel()
         try:
             await task
-        except RunnerCancelledError as exc:
-            print(f"cancel_cleanup_artifacts {exc.artifacts}")
-        except asyncio.CancelledError:
-            print("cancelled without RunnerCancelledError")
+            raise RuntimeError("sbx command cancellation did not cancel the task")
+        except asyncio.CancelledError as exc:
+            artifacts = getattr(exc, "artifacts", [])
+            require_cleanup_artifact(artifacts, adapter="sbx", action="kill_command")
+            print(f"cancel_cleanup_artifacts {artifacts}")
 
         probe = SbxRunner(
             name,
@@ -67,6 +69,7 @@ async def main() -> None:
         )
         await _assert_stopped(probe, cancel_log)
         after_cancel = await probe.exec(ExecCommand.bash("printf after-cancel"), timeout_s=10)
+        require_exec_success(after_cancel, stdout="after-cancel", label="after_cancel")
         print(f"after_cancel stdout={after_cancel.stdout!r} exit_code={after_cancel.exit_code}")
 
         timeout_log = "/workspace/cayu-timeout.log"
@@ -88,6 +91,8 @@ async def main() -> None:
             f"exit_code={timeout_result.exit_code} "
             f"artifacts={timeout_result.artifacts}"
         )
+        require_equal(timeout_result.timed_out, True, "timeout_result timed_out")
+        require_cleanup_artifact(timeout_result.artifacts, adapter="sbx", action="kill_command")
         timeout_probe = SbxRunner(
             name,
             mount_path=runner.mount_path,
@@ -99,6 +104,7 @@ async def main() -> None:
         after_timeout = await timeout_probe.exec(
             ExecCommand.bash("printf after-timeout"), timeout_s=10
         )
+        require_exec_success(after_timeout, stdout="after-timeout", label="after_timeout")
         print(f"after_timeout stdout={after_timeout.stdout!r} exit_code={after_timeout.exit_code}")
     finally:
         print("removing sandbox")

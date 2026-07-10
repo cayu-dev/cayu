@@ -4,6 +4,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 
+from _live_checks import require_equal
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -123,7 +124,10 @@ async def main() -> None:
             )
 
         direct_read = await workspace.read_bytes("notes/result.txt")
-        print(f"direct_workspace_read {direct_read.content.decode('utf-8')}")
+        direct_text = direct_read.content.decode("utf-8")
+        require_equal(direct_text, "sandbox workspace", "direct_workspace_read")
+        require_equal(len(provider.requests), 2, "model_requests")
+        print(f"direct_workspace_read {direct_text}")
         print("model_requests", len(provider.requests))
         print("closing sandbox")
 

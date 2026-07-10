@@ -512,23 +512,30 @@ async def chat_completions_stream_events(
     # Tool calls are emitted once, after the stream, before the terminal completed
     # event. The finish_reason chunk is terminal for these providers, so nothing
     # follows it that would need an earlier flush.
+    provider_state = tool_calls.provider_state_items()
     if tool_calls.has_pending():
         for tool_call_event in tool_calls.events():
             yield tool_call_event
+        # Gemini's OpenAI-compatible endpoint can return finish_reason="stop"
+        # on a chunk that also carries tool_calls. Cayu's runtime needs the
+        # provider-neutral completion reason to reflect the actual next step.
+        if finish_reason in {"stop", "end_turn"}:
+            finish_reason = "tool_calls"
 
     if finish_reason is None:
         raise ChatCompletionsProtocolError(
             "Chat Completions streaming response ended before a finish_reason."
         )
 
-    yield ModelStreamEvent.completed(
-        {
-            "id": response_id,
-            "model": model,
-            "finish_reason": finish_reason,
-            "usage": copy_json_value(usage, "usage"),
-        }
-    )
+    completed_payload = {
+        "id": response_id,
+        "model": model,
+        "finish_reason": finish_reason,
+        "usage": copy_json_value(usage, "usage"),
+    }
+    if provider_state:
+        completed_payload["provider_state"] = provider_state
+    yield ModelStreamEvent.completed(completed_payload)
 
 
 def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
@@ -563,6 +570,7 @@ class _PendingToolCall:
         self.call_id: str | None = None
         self.name: str | None = None
         self.arguments_parts: list[str] = []
+        self.extra_content: dict[str, Any] | None = None
 
     @property
     def arguments(self) -> str:
@@ -597,6 +605,13 @@ class _ToolCallAccumulator:
             pending = self._pending.setdefault(key, _PendingToolCall())
             if call_id is not None:
                 pending.call_id = call_id
+            extra_content = tool_call.get("extra_content")
+            if extra_content is not None:
+                if not isinstance(extra_content, Mapping):
+                    raise ChatCompletionsProtocolError(
+                        "Chat Completions tool_call extra_content must be an object."
+                    )
+                pending.extra_content = copy_json_value(extra_content, "tool_call.extra_content")
             function = tool_call.get("function")
             if function is None:
                 continue
@@ -672,6 +687,29 @@ class _ToolCallAccumulator:
             )
         return tool_call_events
 
+    def provider_state_items(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for pending in self._pending.values():
+            if pending.extra_content is None:
+                continue
+            if pending.call_id is None or not pending.call_id.strip():
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions tool_call with extra_content is missing an id."
+                )
+            items.append(
+                {
+                    "provider": "chat_completions",
+                    "state": {
+                        "type": "tool_call_extra_content",
+                        "tool_call_id": pending.call_id,
+                        "extra_content": copy_json_value(
+                            pending.extra_content, "tool_call.extra_content"
+                        ),
+                    },
+                }
+            )
+        return items
+
 
 def _system_text(messages: list[Message]) -> str:
     system_parts: list[str] = []
@@ -731,20 +769,23 @@ def _chat_completions_messages(
 def _assistant_message(message: Message) -> dict[str, Any]:
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    tool_call_extra_content = _tool_call_extra_content_by_id(message)
     for part in message.content:
         if type(part) is TextPart:
             text_parts.append(part.text)
         elif type(part) is ToolCallPart:
-            tool_calls.append(
-                {
-                    "id": part.tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": part.tool_name,
-                        "arguments": _json_arguments(part.arguments),
-                    },
-                }
-            )
+            tool_call = {
+                "id": part.tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": part.tool_name,
+                    "arguments": _json_arguments(part.arguments),
+                },
+            }
+            extra_content = tool_call_extra_content.get(part.tool_call_id)
+            if extra_content is not None:
+                tool_call["extra_content"] = extra_content
+            tool_calls.append(tool_call)
         elif type(part) not in {ProviderStatePart, ThinkingPart}:
             raise ChatCompletionsProtocolError(
                 "Assistant messages can only contain text, tool_call, provider_state, "
@@ -756,6 +797,30 @@ def _assistant_message(message: Message) -> dict[str, Any]:
     if tool_calls:
         assistant["tool_calls"] = tool_calls
     return assistant
+
+
+def _tool_call_extra_content_by_id(message: Message) -> dict[str, dict[str, Any]]:
+    extra_content_by_id: dict[str, dict[str, Any]] = {}
+    for part in message.content:
+        if type(part) is not ProviderStatePart or part.provider != "chat_completions":
+            continue
+        state = part.state
+        if state.get("type") != "tool_call_extra_content":
+            continue
+        tool_call_id = state.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise ChatCompletionsProtocolError(
+                "Chat Completions provider_state tool_call_id must be a non-empty string."
+            )
+        extra_content = state.get("extra_content")
+        if not isinstance(extra_content, Mapping):
+            raise ChatCompletionsProtocolError(
+                "Chat Completions provider_state extra_content must be an object."
+            )
+        extra_content_by_id[tool_call_id] = copy_json_value(
+            extra_content, "provider_state.extra_content"
+        )
+    return extra_content_by_id
 
 
 def _user_message(

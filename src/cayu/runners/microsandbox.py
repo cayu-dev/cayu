@@ -241,7 +241,7 @@ class MicrosandboxRunner(Runner):
         if self._sftp is not None:
             return self._sftp
         ssh = self._sandbox.ssh()
-        client = await ssh.open_client(sftp=True)
+        client = await ssh.connect(sftp=True)
         try:
             sftp = await client.sftp()
         except BaseException:

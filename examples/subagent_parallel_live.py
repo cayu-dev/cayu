@@ -1,3 +1,9 @@
+"""Demo-only live parallel-subagent example.
+
+This exercises real provider background subagents, but it does not assert model
+prose. Treat it as smoke coverage in nightly reports.
+"""
+
 from __future__ import annotations
 
 import asyncio

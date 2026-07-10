@@ -1,3 +1,9 @@
+"""Demo-only live provider example for file-backed artifacts.
+
+This exercises a real provider and artifact attachment path, but it does not
+assert model prose. Treat it as smoke coverage in nightly reports.
+"""
+
 from __future__ import annotations
 
 import asyncio

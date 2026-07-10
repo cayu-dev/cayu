@@ -29,7 +29,7 @@ class FakeMicrosandboxFs:
         self.symlinks: dict[str, str] = {}
         self.fail_list_paths: set[str] = set()
         self.fail_real_path_paths: set[str] = set()
-        self.open_client_calls = 0
+        self.connect_calls = 0
         self.sftp_calls = 0
         self.closed_clients = 0
         self.closed_sftps = 0
@@ -116,10 +116,10 @@ class FakeSsh:
     def __init__(self, fs: FakeMicrosandboxFs) -> None:
         self.fs = fs
 
-    async def open_client(
+    async def connect(
         self, *, user: str = "root", term: str | None = None, sftp: bool = True
     ) -> FakeSshClient:
-        self.fs.open_client_calls += 1
+        self.fs.connect_calls += 1
         return FakeSshClient(self.fs)
 
 
@@ -376,7 +376,7 @@ def test_microsandbox_list_reuses_single_sftp_handshake() -> None:
     assert list_result.total_count == 20
     # The whole listing resolves ~20 paths (plus the root) through one cached
     # SSH client and one SFTP channel instead of a handshake per path.
-    assert fs.open_client_calls == 1
+    assert fs.connect_calls == 1
     assert fs.sftp_calls == 1
 
 
@@ -385,14 +385,14 @@ def test_microsandbox_real_path_reconnects_after_dropped_session() -> None:
     fs.files["/workspace/a.txt"] = b"x"
     # Prime the cached session.
     asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
-    assert fs.open_client_calls == 1
+    assert fs.connect_calls == 1
 
     # A dropped session is retried once against a fresh handshake.
     fs.drop_session_once = True
     resolved = asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
 
     assert resolved == "/workspace/a.txt"
-    assert fs.open_client_calls == 2
+    assert fs.connect_calls == 2
     assert fs.sftp_calls == 2
     assert fs.closed_clients == 1
     assert fs.closed_sftps == 1
@@ -402,7 +402,7 @@ def test_microsandbox_close_tears_down_cached_sftp_session() -> None:
     workspace, fs = _workspace()
     fs.files["/workspace/a.txt"] = b"x"
     asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
-    assert fs.open_client_calls == 1
+    assert fs.connect_calls == 1
 
     asyncio.run(workspace.runner.close())
 

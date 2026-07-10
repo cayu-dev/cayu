@@ -4,6 +4,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 
+from _live_checks import require_equal
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -125,6 +126,7 @@ async def main() -> None:
                 event.payload,
             )
 
+        require_equal(len(provider.requests), 2, "model_requests")
         print("model_requests", len(provider.requests))
         print("closing sandbox")
 

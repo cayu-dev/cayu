@@ -1346,7 +1346,7 @@ def test_run_then_save_reload_replay(tmp_path):
 )
 def test_integration_eval_against_gemini(tmp_path):
     # Integration mode: run the normal eval path against a REAL provider + real workspace, and
-    # assert over the runtime-native surface (session status, events, workspace file, steps, output).
+    # assert over the runtime-native surface rather than model prose.
     # Credential-gated (skips without GEMINI_API_KEY), like the Docker-gated Postgres suite.
     from cayu.providers import ChatCompletionsProvider
 
@@ -1372,9 +1372,7 @@ def test_integration_eval_against_gemini(tmp_path):
         request=RunRequest(
             agent_name="assistant",
             messages=[
-                Message.text(
-                    "user", "Reply with only the single word ACKNOWLEDGED in capital letters."
-                )
+                Message.text("user", "Reply briefly that the live eval reached the real provider.")
             ],
             max_steps=3,
         ),
@@ -1383,7 +1381,6 @@ def test_integration_eval_against_gemini(tmp_path):
             EventOccurred(EventType.MODEL_COMPLETED),
             WorkspaceFileContains("README.md", "Installation"),
             MaxModelSteps(3),
-            FinalOutputContains("ACKNOWLEDGED"),
         ],
     )
     result = asyncio.run(run_eval_case(app, case, suite_id="integration", retain_trajectory=True))

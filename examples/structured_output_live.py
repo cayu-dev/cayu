@@ -1,3 +1,9 @@
+"""Demo-only live structured-output provider example.
+
+This exercises real provider structured output, but it does not assert the final
+payload. Treat it as smoke coverage in nightly reports.
+"""
+
 from __future__ import annotations
 
 import asyncio

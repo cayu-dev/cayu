@@ -1,3 +1,9 @@
+"""Demo-only live subagent example.
+
+This exercises real provider subagent execution, but it does not assert model
+prose. Treat it as smoke coverage in nightly reports.
+"""
+
 from __future__ import annotations
 
 import asyncio

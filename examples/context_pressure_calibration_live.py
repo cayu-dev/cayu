@@ -1,4 +1,4 @@
-"""Live local context-pressure calibration.
+"""Demo-only live local context-pressure calibration.
 
 OpenAI:
     CAYU_PROVIDER=openai PYTHONPATH=src .venv/bin/python examples/context_pressure_calibration_live.py
@@ -19,6 +19,8 @@ The script builds one realistic model request with:
 It then compares Cayu's local context-pressure estimate with:
 - official provider input-token count, when available
 - actual provider-reported input tokens from the real model call
+
+Treat it as smoke/calibration coverage in nightly reports.
 """
 
 from __future__ import annotations
