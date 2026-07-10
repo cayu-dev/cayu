@@ -43,6 +43,13 @@ def add_eval_parser(subparsers: Any) -> None:
     )
     run.add_argument("--output", "-o", metavar="FILE", help="Write JSON results to FILE.")
     run.add_argument("--html-output", metavar="FILE", help="Also write an HTML report to FILE.")
+    run.add_argument(
+        "--case-timeout-seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Limit each eval case to SECONDS (default: no timeout).",
+    )
 
     report = inner.add_parser("report", help="Render a JSON or HTML report from eval results.")
     report.add_argument("input", metavar="RESULTS_JSON", help="Eval JSON results file.")
@@ -94,7 +101,11 @@ async def _run(args: argparse.Namespace) -> int:
     if inspect.isawaitable(loaded):
         loaded = await loaded
     plan = _coerce_plan(loaded)
-    run = await run_eval_suite(plan.app, plan.suite)
+    run = await run_eval_suite(
+        plan.app,
+        plan.suite,
+        case_timeout_seconds=args.case_timeout_seconds,
+    )
     output = eval_run_to_json(run)
     _write_or_print(output, args.output)
     if args.html_output is not None:

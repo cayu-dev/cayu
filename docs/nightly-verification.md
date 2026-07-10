@@ -38,6 +38,7 @@ list the check IDs:
 ```bash
 uv run python scripts/nightly_verification.py --list
 uv run python scripts/nightly_verification.py --check core-pytest --strict
+uv run python scripts/nightly_verification.py --check internal-evals-hermetic --strict
 uv run python scripts/nightly_verification.py --check docker-runner --strict
 ```
 
@@ -72,7 +73,7 @@ Allowed statuses:
 
 | status | meaning |
 | --- | --- |
-| `hermetic` | verified without external infrastructure |
+| `hermetic` | verified with deterministic local dependencies only: no live provider credentials, network access, external sandbox quota, or LLM judge |
 | `verified` | exercised against the target dependency and asserted behavior |
 | `smoke` | exercised a live dependency, but expected behavior is not fully asserted |
 | `skipped` | did not run because a prerequisite was missing |
@@ -86,7 +87,7 @@ or in CI.
 
 | Lane | Needs | Spend | Current check |
 | --- | --- | ---: | --- |
-| Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest` |
+| Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest`, `internal-evals-hermetic` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
@@ -108,6 +109,7 @@ high level:
 | Capability | Status class | Check |
 | --- | --- | --- |
 | runtime loop, model steps, tool rounds, approvals, interrupts, subagents, evals, stores, server, local runner | verified baseline | `core-pytest` |
+| first-party tool, workspace, context, knowledge, subagent, usage, and budget eval workflows | hermetic | `internal-evals-hermetic` |
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real Docker container exec, timeout cleanup, and sync binding | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync` |
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
@@ -163,13 +165,28 @@ Run only the local required lanes:
 ```bash
 uv run python scripts/nightly_verification.py \
   --check core-pytest \
+  --check internal-evals-hermetic \
   --check postgres-required \
   --check docker-runner \
   --strict
 ```
 
-`core-pytest` and `postgres-required` unset live-provider credentials before
-running. Use the dedicated live lanes when model or sandbox spend is intended.
+`core-pytest`, `internal-evals-hermetic`, and `postgres-required` unset
+live-provider credentials before running. `internal-evals-hermetic` executes:
+
+```bash
+uv run cayu eval run cayu.evals.internal.runtime_acceptance:build \
+  --case-timeout-seconds 30 \
+  --output .cayu-internal-runtime-acceptance.json
+```
+
+The ignored, repo-local output path avoids collisions with files owned by other
+users in a shared system temporary directory. The check reports `hermetic` only
+when all seven structural cases pass. That status
+does not claim multi-phase approval resume, live-provider promotion, browser
+behavior, `SIGKILL` recovery, provider billing reconciliation, LLM-judged
+quality, or baseline release gating. Use the dedicated live lanes when model or
+sandbox spend is intended.
 
 Run credential-gated lanes only when the credential and quota are intentionally
 available:

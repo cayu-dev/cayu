@@ -339,77 +339,97 @@ async def _run_case_once(
     emitted_events: list[Event] = []
     session_id: str | None = None
     run_error: str | None = None
+    session: Session | None = None
+    events: tuple[Event, ...] = ()
+    transcript: tuple[Message, ...] = ()
+    usage_summary: SessionUsageSummary | None = None
+    final_output = ""
+    trajectory: Trajectory | None = None
+    assertion_results: list[EvalAssertionResult] = []
+    deadline: asyncio.Timeout | None = None
 
+    # asyncio.timeout(None) never expires, so the unbounded default shares the path.
+    # Keep the deadline around the full case lifecycle: runtime execution, state/probe
+    # capture, child traversal, and assertion evaluation all belong to one trial.
     try:
-        # asyncio.timeout(None) never expires, so the unbounded default shares the path.
         async with asyncio.timeout(timeout_seconds) as deadline:
-            async for event in app.run(case.request):
-                emitted_events.append(event)
-                if session_id is None:
-                    session_id = event.session_id
+            try:
+                async for event in app.run(case.request):
+                    emitted_events.append(event)
+                    if session_id is None:
+                        session_id = event.session_id
+            except TimeoutError as exc:
+                # A provider-originated TimeoutError is an eval run error, not the case
+                # deadline. Deadline expiry arrives as cancellation and is handled below.
+                run_error = _format_exception(exc)
+            except Exception as exc:
+                run_error = _format_exception(exc)
+
+            if session_id is None:
+                session_id = case.request.session_id
+
+            events = tuple(emitted_events)
+            if session_id is not None:
+                try:
+                    session = await app.session_store.load(session_id)
+                    events, transcript, usage_summary = await _load_session_records(app, session_id)
+                except Exception as exc:
+                    if run_error is None:
+                        run_error = f"Failed to load eval session state: {_format_exception(exc)}"
+
+            # app.run() does not raise on a model/tool failure; it ends the session as
+            # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
+            # crashed run is never scored as PASSED — unless the case explicitly asserts
+            # on session status, in which case the assertion owns the outcome.
+            if (
+                run_error is None
+                and session is not None
+                and session.status == SessionStatus.FAILED
+                and not any(isinstance(assertion, SessionStatusIs) for assertion in case.assertions)
+            ):
+                run_error = _session_failure_reason(events)
+
+            final_output = final_output_text(transcript)
+            probe_requirements = _collect_probe_requirements(case.assertions)
+            probes = await _capture_probes(app, session, probe_requirements)
+            children_incomplete = _IncompleteFlag()
+            children = await _build_child_trajectories(
+                app,
+                session_id,
+                visited={session_id} if session_id is not None else set(),
+                incomplete=children_incomplete,
+            )
+            trajectory = Trajectory(
+                session=session,
+                events=events,
+                transcript=transcript,
+                usage_summary=usage_summary,
+                final_output=final_output,
+                probes=probes,
+                children=children,
+                children_incomplete=children_incomplete.value,
+                metadata=case.metadata,
+            )
+            context = EvalContext(
+                trajectory=trajectory,
+                suite_id=suite_id,
+                case_id=case.id,
+                metadata=case.metadata,
+            )
+            assertion_results = list(await _evaluate_assertions(case.assertions, context))
     except TimeoutError as exc:
-        if deadline.expired():
+        if deadline is not None and deadline.expired():
             run_error = f"Eval case timed out after {timeout_seconds} seconds."
         else:
             run_error = _format_exception(exc)
-    except Exception as exc:
-        run_error = _format_exception(exc)
+        # _evaluate_assertions builds its result list incrementally. Never expose a
+        # partial prefix as passing when the case timed out before evaluation completed.
+        assertion_results = []
 
     if session_id is None:
         session_id = case.request.session_id
-
-    session: Session | None = None
-    events: tuple[Event, ...] = tuple(emitted_events)
-    transcript: tuple[Message, ...] = ()
-    usage_summary: SessionUsageSummary | None = None
-    if session_id is not None:
-        try:
-            session = await app.session_store.load(session_id)
-            events, transcript, usage_summary = await _load_session_records(app, session_id)
-        except Exception as exc:
-            if run_error is None:
-                run_error = f"Failed to load eval session state: {_format_exception(exc)}"
-
-    # app.run() does not raise on a model/tool failure; it ends the session as
-    # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
-    # crashed run is never scored as PASSED — unless the case explicitly asserts
-    # on session status, in which case the assertion owns the outcome.
-    if (
-        run_error is None
-        and session is not None
-        and session.status == SessionStatus.FAILED
-        and not any(isinstance(assertion, SessionStatusIs) for assertion in case.assertions)
-    ):
-        run_error = _session_failure_reason(events)
-
-    final_output = final_output_text(transcript)
-    probe_requirements = _collect_probe_requirements(case.assertions)
-    probes = await _capture_probes(app, session, probe_requirements)
-    children_incomplete = _IncompleteFlag()
-    children = await _build_child_trajectories(
-        app,
-        session_id,
-        visited={session_id} if session_id is not None else set(),
-        incomplete=children_incomplete,
-    )
-    trajectory = Trajectory(
-        session=session,
-        events=events,
-        transcript=transcript,
-        usage_summary=usage_summary,
-        final_output=final_output,
-        probes=probes,
-        children=children,
-        children_incomplete=children_incomplete.value,
-        metadata=case.metadata,
-    )
-    context = EvalContext(
-        trajectory=trajectory,
-        suite_id=suite_id,
-        case_id=case.id,
-        metadata=case.metadata,
-    )
-    assertion_results = list(await _evaluate_assertions(case.assertions, context))
+    if not events:
+        events = tuple(emitted_events)
     completed_at = datetime.now(UTC)
     status = _case_status(run_error, assertion_results)
     return EvalCaseResult(

@@ -9,6 +9,7 @@ build/
 *.egg-info/
 .DS_Store
 .cayu/
+.cayu-internal-runtime-acceptance.json
 .examples-workspaces/
 node_modules/
 dashboard/dist/

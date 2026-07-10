@@ -340,3 +340,55 @@ def test_strict_policy_accepts_verified_statuses() -> None:
     ]
 
     assert nightly._strict_failed(results) is False
+
+
+def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
+
+    assert check.lane == "python"
+    assert check.command == (
+        "uv",
+        "run",
+        "cayu",
+        "eval",
+        "run",
+        "cayu.evals.internal.runtime_acceptance:build",
+        "--case-timeout-seconds",
+        "30",
+        "--output",
+        ".cayu-internal-runtime-acceptance.json",
+    )
+    assert check.status_on_success == nightly.STATUS_HERMETIC
+    assert set(check.unset_env) == {
+        "ANTHROPIC_API_KEY",
+        "E2B_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+    }
+
+
+def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
+    environ = {
+        "ANTHROPIC_API_KEY": "must-not-reach-command",
+        "E2B_API_KEY": "must-not-reach-command",
+        "GEMINI_API_KEY": "must-not-reach-command",
+        "OPENAI_API_KEY": "must-not-reach-command",
+    }
+
+    def runner(command, effective_env):
+        assert tuple(command) == check.command
+        assert not set(environ).intersection(effective_env)
+        return nightly.CommandOutcome(returncode=0)
+
+    result = nightly.run_checks([check], environ=environ, runner=runner)[0]
+
+    assert result == nightly.VerificationResult(
+        capability=check.capability,
+        check_id="internal-evals-hermetic",
+        lane="python",
+        status=nightly.STATUS_HERMETIC,
+        command=check.command,
+        prerequisites=(),
+        evidence={"returncode": 0},
+    )

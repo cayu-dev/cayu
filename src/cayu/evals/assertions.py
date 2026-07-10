@@ -112,6 +112,51 @@ class SessionInterrupted(SessionStatusIs):
         super().__init__(SessionStatus.INTERRUPTED)
 
 
+class ChildSessionCompleted(EvalAssertion):
+    def __init__(self, *, agent_name: str | None = None, min_count: int = 1) -> None:
+        self.agent_name = None if agent_name is None else _require_text(agent_name, "agent_name")
+        self.min_count = _nonnegative_int(min_count, "min_count")
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        observed_children = [
+            {
+                "session_id": child.session.id if child.session is not None else None,
+                "status": child.session.status.value if child.session is not None else None,
+                "agent_name": child.session.agent_name if child.session is not None else None,
+            }
+            for child in context.trajectory.children
+        ]
+        matching_session_ids = [
+            child.session.id
+            for child in context.trajectory.children
+            if child.session is not None
+            and child.session.status == SessionStatus.COMPLETED
+            and (self.agent_name is None or child.session.agent_name == self.agent_name)
+        ]
+        matching_count = len(matching_session_ids)
+        metadata = {
+            "agent_name": self.agent_name,
+            "minimum": self.min_count,
+            "matching_count": matching_count,
+            "matching_session_ids": matching_session_ids,
+            "observed_children": observed_children,
+            "children_incomplete": context.trajectory.children_incomplete,
+        }
+        agent_filter = f" for agent {self.agent_name}" if self.agent_name is not None else ""
+        if matching_count >= self.min_count:
+            return self.passed(
+                f"Observed {matching_count} completed direct child session(s){agent_filter}.",
+                metadata=metadata,
+            )
+        message = (
+            f"Expected at least {self.min_count} completed direct child session(s){agent_filter}, "
+            f"got {matching_count}."
+        )
+        if context.trajectory.children_incomplete:
+            message += " Child capture is incomplete; additional matching sessions may exist."
+        return self.failed(message, metadata=metadata)
+
+
 class FinalOutputContains(EvalAssertion):
     def __init__(self, text: str) -> None:
         self.text = _require_text(text, "text")
@@ -199,6 +244,47 @@ class EventNotOccurred(EventOccurred):
         return self.failed(
             f"Event {self.event_type} occurred but was expected not to.",
             metadata=result.metadata,
+        )
+
+
+class EventPayloadContains(EvalAssertion):
+    def __init__(
+        self,
+        event_type: EventType | str,
+        expected: Mapping[str, Any],
+        *,
+        min_count: int = 1,
+    ) -> None:
+        self.event_type = _event_type_value(event_type)
+        if not isinstance(expected, Mapping):
+            raise TypeError("expected must be a mapping.")
+        self.expected = dict(expected)
+        self.min_count = _nonnegative_int(min_count, "min_count")
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        observed_payloads = [
+            event.payload
+            for event in context.events
+            if _event_type_value(event.type) == self.event_type
+        ]
+        matching_count = sum(
+            1 for payload in observed_payloads if _mapping_contains(payload, self.expected)
+        )
+        metadata = {
+            "expected": self.expected,
+            "event_type": self.event_type,
+            "matching_count": matching_count,
+        }
+        if matching_count >= self.min_count:
+            return self.passed(
+                f"Observed {matching_count} {self.event_type} event payload(s) "
+                "containing expected values.",
+                metadata=metadata,
+            )
+        return self.failed(
+            f"Expected at least {self.min_count} {self.event_type} event payload(s) "
+            f"containing expected values, got {matching_count}.",
+            metadata={**metadata, "observed_payloads": observed_payloads},
         )
 
 
@@ -333,6 +419,26 @@ class MaxModelSteps(EvalAssertion):
         return self.failed(
             f"Model step count {count} exceeded limit {self.maximum}.",
             metadata={"model_steps": count, "maximum": self.maximum},
+        )
+
+
+class UsageRecorded(EvalAssertion):
+    def __init__(self, *, min_total_tokens: int = 1) -> None:
+        self.min_total_tokens = _nonnegative_int(min_total_tokens, "min_total_tokens")
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        if context.usage_summary is None:
+            return self.failed("Cannot verify token usage because no usage summary was recorded.")
+        total_tokens = context.usage_summary.usage.total_tokens
+        metadata = {"total_tokens": total_tokens, "minimum": self.min_total_tokens}
+        if total_tokens >= self.min_total_tokens:
+            return self.passed(
+                f"Total tokens {total_tokens} meets minimum {self.min_total_tokens}.",
+                metadata=metadata,
+            )
+        return self.failed(
+            f"Total tokens {total_tokens} is below minimum {self.min_total_tokens}.",
+            metadata=metadata,
         )
 
 

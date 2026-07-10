@@ -2,9 +2,11 @@
 
 from cayu.evals.assertions import (
     ArtifactCreated,
+    ChildSessionCompleted,
     EvalAssertion,
     EventNotOccurred,
     EventOccurred,
+    EventPayloadContains,
     FinalOutputContains,
     FinalOutputMatches,
     MaxEstimatedCost,
@@ -20,6 +22,7 @@ from cayu.evals.assertions import (
     ToolNotCalled,
     ToolResultContains,
     TranscriptContains,
+    UsageRecorded,
     WorkspaceFileContains,
     WorkspaceFileExists,
 )
@@ -68,6 +71,7 @@ __all__ = [
     "EVAL_SCHEMA_VERSION",
     "WORKSPACE_PROBE_MAX_BYTES",
     "ArtifactCreated",
+    "ChildSessionCompleted",
     "EvalAssertion",
     "EvalAssertionResult",
     "EvalCase",
@@ -81,6 +85,7 @@ __all__ = [
     "EvalSuite",
     "EventNotOccurred",
     "EventOccurred",
+    "EventPayloadContains",
     "FinalOutputContains",
     "FinalOutputMatches",
     "LLMJudge",
@@ -101,6 +106,7 @@ __all__ = [
     "Trajectory",
     "TrajectoryProbes",
     "TranscriptContains",
+    "UsageRecorded",
     "WorkspaceFileContains",
     "WorkspaceFileExists",
     "WorkspaceFileProbe",

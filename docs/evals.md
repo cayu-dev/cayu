@@ -84,6 +84,45 @@ cayu eval compare baseline.json results.json --output comparison.json
 The command exits with `0` when all cases pass and `1` when the run fails,
 errors, or a comparison detects regressions.
 
+## First-party runtime acceptance suite
+
+Cayu ships an importable, hermetic target for exercising runtime-native evals
+without relying on the caller's current working directory:
+
+```bash
+uv run cayu eval run cayu.evals.internal.runtime_acceptance:build \
+  --case-timeout-seconds 30 \
+  --output /tmp/cayu-internal-runtime-acceptance.json
+```
+
+The target builds the stable `cayu-internal-runtime-acceptance-v1` suite. Its
+cases are:
+
+- `tool_roundtrip` — tool arguments, result propagation, and final use;
+- `workspace_roundtrip` — isolated write/read calls, results, and file content;
+- `context_observability` — deterministic pressure estimates, provider token
+  counts, and both reconciliation event families;
+- `knowledge_tool_roundtrip` — search and read of one deterministic fact that
+  is seeded pending and approved before the suite runs;
+- `subagent_roundtrip` — a foreground direct child with an independent model
+  script, completed-child evidence, and parent result use;
+- `usage_accounting` — explicit positive model usage under a token ceiling;
+- `budget_interrupt` — caller-supplied pricing that interrupts the session
+  before a queued side-effect tool starts.
+
+Every independent workflow has its own named `ScriptedModelProvider`, selected
+through `AgentSpec.provider_name`. An environment factory retained by the app
+creates a separate temporary `LocalWorkspace` for every session, so a file from
+one case cannot satisfy another case. The suite uses structural assertions only:
+it reads no provider credentials, makes no network calls, consumes no external
+sandbox quota, and does not use `LLMJudge`.
+
+This first slice does not cover multi-phase approval resume, live-provider
+promotion, browser behavior, `SIGKILL` recovery, provider billing
+reconciliation, LLM-judged quality, or baseline release gating. Those require
+different dependencies or release policy and should not be inferred from a
+passing hermetic report.
+
 ## Built-In Assertion Areas
 
 Current assertions cover:

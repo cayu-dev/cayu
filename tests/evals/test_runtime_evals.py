@@ -392,6 +392,24 @@ class _HangingProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class _SlowAssertion(EvalAssertion):
+    def __init__(self) -> None:
+        self.completed = False
+
+    async def evaluate(self, context):
+        await asyncio.sleep(0.2)
+        self.completed = True
+        return self.passed("Slow assertion completed.")
+
+
+class _ProviderTimeout(ModelProvider):
+    name = "provider-timeout"
+
+    async def stream(self, request):
+        raise TimeoutError("provider stream timed out")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 class _OverlapProbeProvider(ModelProvider):
     """Blocks every stream until `expected` are in flight — proves cases overlapped."""
 
@@ -446,6 +464,53 @@ def test_case_timeout_records_error_instead_of_hanging():
     assert result.status == EvalStatus.ERROR
     assert result.cases[0].status == EvalStatus.ERROR
     assert "timed out after 0.05 seconds" in result.cases[0].error
+
+
+def test_case_timeout_bounds_assertion_evaluation():
+    assertion = _SlowAssertion()
+    app = _app_with_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+    )
+    case = EvalCase(
+        id="slow-assertion",
+        request=RunRequest(
+            agent_name="agent",
+            session_id="slow-assertion-session",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[assertion],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=0.01))
+
+    assert result.case_id == "slow-assertion"
+    assert result.status == EvalStatus.ERROR
+    assert result.session_id == "slow-assertion-session"
+    assert result.error == "Eval case timed out after 0.01 seconds."
+    assert result.assertions == ()
+    assert assertion.completed is False
+    assert result.completed_at >= result.started_at
+    assert result.duration_ms >= 0
+
+
+def test_provider_timeout_is_not_misclassified_as_case_deadline():
+    result = asyncio.run(
+        run_eval_case(
+            _app_with_provider(_ProviderTimeout()),
+            _case("provider-timeout"),
+            suite_id="timeout",
+            timeout_seconds=1.0,
+        )
+    )
+
+    assert result.status == EvalStatus.ERROR
+    assert result.error == "Session failed: provider stream timed out"
 
 
 def test_max_concurrency_runs_cases_in_parallel_and_keeps_order():
