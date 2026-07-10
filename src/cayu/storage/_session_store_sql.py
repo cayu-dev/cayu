@@ -79,6 +79,9 @@ def build_event_query_sql(
         clauses.append(f"cayu_events.sequence > {dialect.placeholder}")
         params.append(query.after_sequence)
     _append_clauses(clauses, params, extra_after_sequence_clauses)
+    if query.event_id is not None:
+        clauses.append(f"cayu_events.event_id = {dialect.placeholder}")
+        params.append(query.event_id)
     if query.session_id is not None:
         clauses.append(f"cayu_events.session_id = {dialect.placeholder}")
         params.append(query.session_id)
@@ -184,6 +187,9 @@ def build_session_query_sql(
         column="causal_budget_id",
         value=query.causal_budget_id,
     )
+    if query.last_activity_before is not None:
+        clauses.append(f"last_activity_at <= {dialect.placeholder}")
+        params.append(dialect.datetime_param(query.last_activity_before))
     for key, value in query.labels.items():
         clauses.append(_label_exact_clause(dialect))
         params.extend([key, value])

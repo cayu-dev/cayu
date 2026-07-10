@@ -239,6 +239,7 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    _current_session_run_epoch,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -1915,6 +1916,10 @@ class CayuApp:
                 task_started=False,
                 task_finished=False,
             )
+        # The run fence belongs to this pre-run setup until control is handed to
+        # _run_session. Every earlier exit must revoke it, including cancellation
+        # and failures while recording the original setup failure.
+        release_before_run = True
         try:
             resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
@@ -1955,6 +1960,7 @@ class CayuApp:
                 workspace_instructions = await _load_registered_workspace_instructions(
                     registered_environment,
                 )
+            release_before_run = False
         except asyncio.CancelledError:
             if await self._session_interrupt_requested(session.id):
                 async for event in self._handle_session_interrupted(
@@ -1993,36 +1999,44 @@ class CayuApp:
             await self._finalize_abandoned_session_by_id(session.id)
             raise
         finally:
-            if current_task is not None and active_factory_run is not None:
-                self._unregister_active_session_task(session.id, current_task)
+            try:
+                if release_before_run:
+                    await self.session_store.release_run_fence(session.id)
+            finally:
+                if current_task is not None and active_factory_run is not None:
+                    self._unregister_active_session_task(session.id, current_task)
 
-        messages = transcript_helpers.initial_messages(
-            system_prompt=_render_initial_system_prompt(
-                agent_system_prompt=registered_agent.spec.system_prompt,
-                workspace_instructions=workspace_instructions,
-            ),
-            request_messages=request.messages,
-        )
-        session_stream = self._run_session(
-            session=session,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            messages=messages,
-            messages_to_append=messages,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=self._effective_retry_policy(request.retry_policy),
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            request_loop_policies=request.loop_policies,
-            request_metadata=request.metadata,
-            task_id=request.task_id,
-            task_worker_id=request.task_worker_id,
-            start_event_type=EventType.SESSION_STARTED,
-            start_event_payload={"agent_name": registered_agent.spec.name},
-        )
+        try:
+            messages = transcript_helpers.initial_messages(
+                system_prompt=_render_initial_system_prompt(
+                    agent_system_prompt=registered_agent.spec.system_prompt,
+                    workspace_instructions=workspace_instructions,
+                ),
+                request_messages=request.messages,
+            )
+            session_stream = self._run_session(
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                messages=messages,
+                messages_to_append=messages,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                request_loop_policies=request.loop_policies,
+                request_metadata=request.metadata,
+                task_id=request.task_id,
+                task_worker_id=request.task_worker_id,
+                start_event_type=EventType.SESSION_STARTED,
+                start_event_payload={"agent_name": registered_agent.spec.name},
+            )
+        except BaseException:
+            await self.session_store.release_run_fence(session.id)
+            raise
         try:
             async for event in self._stream_with_out_of_band_session_events(
                 session.id,
@@ -2263,8 +2277,9 @@ class CayuApp:
         session = await self.session_store.load(request.session_id)
         if session is None:
             raise KeyError(f"Session not found: {request.session_id}") from None
-        return await self._recover_incomplete_session(
+        return await self._recover_incomplete_session_scoped(
             session=session,
+            inactive_before=request.inactive_before,
             reason=request.reason,
             metadata=request.metadata,
         )
@@ -2300,10 +2315,19 @@ class CayuApp:
                 break
             candidates = (
                 await self.session_store.list_sessions(
-                    SessionQuery(status=status, limit=min(1000, request.limit - len(sessions)))
+                    SessionQuery(
+                        status=status,
+                        last_activity_before=request.inactive_before,
+                        limit=min(1000, request.limit - len(sessions)),
+                    )
                 )
             ).sessions
             for candidate in candidates:
+                if (
+                    request.inactive_before is not None
+                    and candidate.last_activity_at > request.inactive_before
+                ):
+                    continue
                 if candidate.id in seen_session_ids:
                     continue
                 seen_session_ids.add(candidate.id)
@@ -2316,8 +2340,9 @@ class CayuApp:
             # Isolate per-session errors: one broken session must not strand
             # the sweep (see docstring).
             try:
-                result = await self._recover_incomplete_session(
+                result = await self._recover_incomplete_session_scoped(
                     session=session,
+                    inactive_before=request.inactive_before,
                     reason=request.reason,
                     metadata=request.metadata,
                 )
@@ -2757,20 +2782,26 @@ class CayuApp:
                 session = await self.session_store.update_model(session.id, request.model)
             transcript = await self.session_store.load_transcript(session.id)
         except Exception as exc:
-            await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            yield await self._emit(
-                Event(
-                    type=EventType.SESSION_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    },
+            try:
+                await self.session_store.update_status(session.id, SessionStatus.FAILED)
+                yield await self._emit(
+                    Event(
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload={
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                 )
-            )
+            finally:
+                await self.session_store.release_run_fence(session.id)
             return
+        except BaseException:
+            await self.session_store.release_run_fence(session.id)
+            raise
         messages = transcript + request.messages
 
         session_stream = self._run_session(
@@ -2967,6 +2998,8 @@ class CayuApp:
         except GeneratorExit:
             await self._finalize_abandoned_session_by_id(session.id)
             raise
+        finally:
+            await self.session_store.release_run_fence(session.id)
 
     async def _continue_user_input_resolution(
         self,
@@ -3228,12 +3261,17 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
+                release_run_fence_on_exit=False,
             )
-            async for event in self._stream_with_out_of_band_session_events(
-                session.id,
-                session_stream,
-            ):
-                yield event
+            try:
+                async for event in self._stream_with_out_of_band_session_events(
+                    session.id,
+                    session_stream,
+                ):
+                    yield event
+            except GeneratorExit:
+                await session_stream.aclose()
+                raise
         except Exception as exc:
             if not pending_cleared:
                 # The pending_user_input checkpoint is still present, so restore the resumable
@@ -3330,19 +3368,19 @@ class CayuApp:
             from_statuses={SessionStatus.INTERRUPTED},
             to_status=SessionStatus.RUNNING,
         )
-        recovered_result = ToolResult(
-            content=request.message,
-            structured=request.structured,
-            artifacts=request.artifacts,
-            is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
-        )
-        event_type = (
-            EventType.TOOL_CALL_FAILED
-            if recovered_result.is_error
-            else EventType.TOOL_CALL_COMPLETED
-        )
-
+        recovery_prepared = False
         try:
+            recovered_result = ToolResult(
+                content=request.message,
+                structured=request.structured,
+                artifacts=request.artifacts,
+                is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
+            )
+            event_type = (
+                EventType.TOOL_CALL_FAILED
+                if recovered_result.is_error
+                else EventType.TOOL_CALL_COMPLETED
+            )
             events = await self.session_store.load_events(session.id)
             approval_support.validate_round_recovery_target(
                 events=events,
@@ -3447,30 +3485,34 @@ class CayuApp:
                 allow_modification=False,
             ):
                 yield event
+            recovery_prepared = True
         except GeneratorExit:
             await self._finalize_abandoned_session_by_id(session.id)
             raise
         except Exception:
             await self.session_store.update_status(session.id, loaded_session.status)
             raise
+        finally:
+            if not recovery_prepared:
+                await self.session_store.release_run_fence(session.id)
 
-        response = UserInputResponse(
-            session_id=request.session_id,
-            input_id=request.input_id,
-            answer=request.answer,
-            structured=request.structured,
-            artifacts=request.artifacts,
-            metadata=request.metadata,
-            resolved_by=request.resolved_by,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=request.retry_policy,
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            loop_policies=request.loop_policies,
-        )
         try:
+            response = UserInputResponse(
+                session_id=request.session_id,
+                input_id=request.input_id,
+                answer=request.answer,
+                structured=request.structured,
+                artifacts=request.artifacts,
+                metadata=request.metadata,
+                resolved_by=request.resolved_by,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=request.retry_policy,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                loop_policies=request.loop_policies,
+            )
             async for event in self._continue_user_input_resolution(
                 response=response,
                 session=session,
@@ -3486,6 +3528,8 @@ class CayuApp:
             # leaking a RUNNING session (mirrors resolve_user_input's continuation guard).
             await self._finalize_abandoned_session_by_id(session.id)
             raise
+        finally:
+            await self.session_store.release_run_fence(session.id)
 
     async def resolve_tool_approval(
         self,
@@ -3538,6 +3582,8 @@ class CayuApp:
         except GeneratorExit:
             await self._finalize_abandoned_session_by_id(session.id)
             raise
+        finally:
+            await self.session_store.release_run_fence(session.id)
 
     async def _continue_tool_approval_resolution(
         self,
@@ -3944,12 +3990,17 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
+                release_run_fence_on_exit=False,
             )
-            async for event in self._stream_with_out_of_band_session_events(
-                session.id,
-                session_stream,
-            ):
-                yield event
+            try:
+                async for event in self._stream_with_out_of_band_session_events(
+                    session.id,
+                    session_stream,
+                ):
+                    yield event
+            except GeneratorExit:
+                await session_stream.aclose()
+                raise
         except GeneratorExit:
             await self._finalize_abandoned_session_by_id(session.id)
             raise
@@ -4099,23 +4150,23 @@ class CayuApp:
             from_statuses={SessionStatus.INTERRUPTED},
             to_status=SessionStatus.RUNNING,
         )
-        recovered_result = approval_support.recovered_tool_result(
-            request=request,
-        )
-        event_type = (
-            EventType.TOOL_CALL_FAILED
-            if recovered_result.is_error
-            else EventType.TOOL_CALL_COMPLETED
-        )
-        # Recovery reconciles an externally executed side effect that was
-        # authorized before the crash, so an expired window does not block it
-        # (an expired-never-approved approval has no started tool to recover).
-        # The out-of-window reconciliation is still stamped for the audit trail.
-        recovered_after_expiry = approval_support.pending_approval_expired(
-            pending_approval, self._clock()
-        )
-
+        recovery_prepared = False
         try:
+            recovered_result = approval_support.recovered_tool_result(
+                request=request,
+            )
+            event_type = (
+                EventType.TOOL_CALL_FAILED
+                if recovered_result.is_error
+                else EventType.TOOL_CALL_COMPLETED
+            )
+            # Recovery reconciles an externally executed side effect that was
+            # authorized before the crash, so an expired window does not block it
+            # (an expired-never-approved approval has no started tool to recover).
+            # The out-of-window reconciliation is still stamped for the audit trail.
+            recovered_after_expiry = approval_support.pending_approval_expired(
+                pending_approval, self._clock()
+            )
             events = await self.session_store.load_events(session.id)
             approval_support.validate_recovery_target(
                 events=events,
@@ -4218,6 +4269,7 @@ class CayuApp:
                 allow_modification=False,
             ):
                 yield event
+            recovery_prepared = True
         except GeneratorExit:
             # Abandonment: finalize to INTERRUPTED (do NOT roll back to a live status).
             await self._finalize_abandoned_session_by_id(session.id)
@@ -4225,33 +4277,39 @@ class CayuApp:
         except Exception:
             await self.session_store.update_status(session.id, loaded_session.status)
             raise
+        finally:
+            if not recovery_prepared:
+                await self.session_store.release_run_fence(session.id)
 
-        approval_request = ToolApprovalRequest(
-            session_id=request.session_id,
-            approval_id=request.approval_id,
-            decision=ToolApprovalDecision.APPROVE,
-            reason=request.reason,
-            metadata=request.metadata,
-            resolved_by=request.resolved_by,
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=request.retry_policy,
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            loop_policies=request.loop_policies,
-        )
-        async for event in self._continue_tool_approval_resolution(
-            request=approval_request,
-            session=session,
-            pending_approval=pending_approval,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            emit_resume_event=False,
-            enforce_expiry=False,
-        ):
-            yield event
+        try:
+            approval_request = ToolApprovalRequest(
+                session_id=request.session_id,
+                approval_id=request.approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+                reason=request.reason,
+                metadata=request.metadata,
+                resolved_by=request.resolved_by,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=request.retry_policy,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                loop_policies=request.loop_policies,
+            )
+            async for event in self._continue_tool_approval_resolution(
+                request=approval_request,
+                session=session,
+                pending_approval=pending_approval,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                emit_resume_event=False,
+                enforce_expiry=False,
+            ):
+                yield event
+        finally:
+            await self.session_store.release_run_fence(session.id)
 
     async def recover_tool_round(
         self,
@@ -4314,33 +4372,28 @@ class CayuApp:
         )
         if self._has_active_session_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
-        session = await self.session_store.transition_status(
-            loaded_session.id,
-            from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
-            to_status=SessionStatus.RUNNING,
-        )
-        # Claim the session in the in-process registry (as run/resume do) so a
-        # concurrent recover_tool_round or the recovery sweep cannot double-claim
-        # the now-RUNNING session while this recovery streams. Registration and
-        # the other-owner re-check are await-free, so the pair is atomic on the
-        # event loop; the pre-transition check above cannot see a claimant that
-        # registers while our transition awaits.
+        # Reserve the in-process slot before awaiting the durable transition. The
+        # check and registration are await-free, so another local recovery cannot
+        # advance the run epoch while this claimant is waiting on storage.
         current_task = asyncio.current_task()
         if current_task is not None:
             self._register_active_session_task(
-                session.id,
+                loaded_session.id,
                 current_task,
                 task_id=None,
                 task_started=False,
                 task_finished=False,
             )
-            if any(
-                record.runtime_task is not current_task and not record.runtime_task.done()
-                for record in self._active_session_run_records(session.id)
-            ):
-                # Another in-process owner holds the session; it owns the status.
-                self._unregister_active_session_task(session.id, current_task)
-                raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
+        try:
+            session = await self.session_store.transition_status(
+                loaded_session.id,
+                from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
+                to_status=SessionStatus.RUNNING,
+            )
+        except BaseException:
+            if current_task is not None:
+                self._unregister_active_session_task(loaded_session.id, current_task)
+            raise
         try:
             async for event in self._recover_tool_round_claimed(
                 request=request,
@@ -4355,8 +4408,11 @@ class CayuApp:
             ):
                 yield event
         finally:
-            if current_task is not None:
-                self._unregister_active_session_task(session.id, current_task)
+            try:
+                await self.session_store.release_run_fence(session.id)
+            finally:
+                if current_task is not None:
+                    self._unregister_active_session_task(session.id, current_task)
 
     async def _recover_tool_round_claimed(
         self,
@@ -4580,7 +4636,7 @@ class CayuApp:
             # event persisted above, closes never-started calls as not-executed errors,
             # appends the round's tool results, clears the checkpoint atomically, and
             # continues the model loop.
-            async for event in self._run_session(
+            session_stream = self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -4600,8 +4656,14 @@ class CayuApp:
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
-            ):
-                yield event
+                release_run_fence_on_exit=False,
+            )
+            try:
+                async for event in session_stream:
+                    yield event
+            except GeneratorExit:
+                await session_stream.aclose()
+                raise
         except GeneratorExit:
             # Abandonment while continuing the round: finalize to INTERRUPTED instead
             # of leaking a RUNNING session (mirrors recover_user_input's guard).
@@ -4630,6 +4692,7 @@ class CayuApp:
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
+        release_run_fence_on_exit: bool = True,
     ) -> AsyncGenerator[Event, None]:
         provider = registered_provider.provider
         # Per-run thinking override (RunRequest/ResumeRequest) wins over the agent's
@@ -5574,8 +5637,12 @@ class CayuApp:
                 yield event
         finally:
             self._discard_session_interrupt_signal(session.id)
-            if current_task is not None:
-                self._unregister_active_session_task(session.id, current_task)
+            try:
+                if release_run_fence_on_exit:
+                    await self.session_store.release_run_fence(session.id)
+            finally:
+                if current_task is not None:
+                    self._unregister_active_session_task(session.id, current_task)
 
     async def _emit_turn_completed(
         self,
@@ -8233,10 +8300,36 @@ class CayuApp:
             session = await self._require_session(session.id)
         return session
 
+    async def _recover_incomplete_session_scoped(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> IncompleteSessionRecoveryResult:
+        owned_epoch_before = _current_session_run_epoch(session.id)
+        try:
+            return await self._recover_incomplete_session(
+                session=session,
+                inactive_before=inactive_before,
+                reason=reason,
+                metadata=metadata,
+            )
+        finally:
+            owned_epoch_after = _current_session_run_epoch(session.id)
+            if (
+                inactive_before is not None
+                and owned_epoch_after is not None
+                and owned_epoch_after != owned_epoch_before
+            ):
+                await self.session_store.release_run_fence(session.id)
+
     async def _recover_incomplete_session(
         self,
         *,
         session: Session,
+        inactive_before: datetime | None = None,
         reason: str,
         metadata: dict[str, Any],
     ) -> IncompleteSessionRecoveryResult:
@@ -8292,6 +8385,41 @@ class CayuApp:
             session.environment_name
         )
         environment_name = _environment_name(registered_environment)
+
+        if inactive_before is not None:
+            fenced = await self.session_store.fence_stalled_run(
+                session.id,
+                statuses={session.status},
+                inactive_before=inactive_before,
+            )
+            if fenced is None:
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=(),
+                    message="Session activity changed during recovery; recovery skipped.",
+                )
+            events.append(
+                await self._emit(
+                    Event(
+                        type=EventType.SESSION_RUN_FENCED,
+                        session_id=session.id,
+                        agent_name=session.agent_name,
+                        environment_name=environment_name,
+                        payload={
+                            "previous_run_epoch": session.run_epoch,
+                            "run_epoch": fenced.run_epoch,
+                            "inactive_before": inactive_before.isoformat(),
+                            "reason": reason,
+                            "metadata": metadata,
+                        },
+                    )
+                )
+            )
+            session = fenced
 
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
@@ -8491,7 +8619,9 @@ class CayuApp:
         windows where the run-body finalizer (``_finalize_abandoned_session_run``) never
         runs — e.g. a consumer that closes the stream during environment-factory
         resolution or a tool-approval continuation. Idempotent and never raises: a
-        session already terminal (or gone) is a no-op. MUST NOT yield.
+        session already terminal (or gone) is a no-op. The caller retains run ownership
+        and releases its fence in the surrounding ``finally`` after this returns. MUST
+        NOT yield.
         """
         try:
             session = await self.session_store.load(session_id)

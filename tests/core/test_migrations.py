@@ -67,3 +67,11 @@ def test_additive_revision_inherits_floor_breaking_raises_it():
     breaking = m.Revision(revision=3, kind=m.RevisionKind.BREAKING, compatible_from=3)
     assert base.compatible_from == 1  # additive keeps the prior floor
     assert breaking.compatible_from == breaking.revision  # breaking floors at itself
+
+
+def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
+    m.validate(
+        m.SchemaState(revision=14, compatible_from=10),
+        app_latest=13,
+        app_min_supported=10,
+    )

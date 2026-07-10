@@ -79,6 +79,16 @@ class _EchoTool(Tool):
         return ToolResult(content=args["text"])
 
 
+class _RecordingReleaseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls: dict[str, int] = {}
+
+    async def release_run_fence(self, session_id: str) -> None:
+        self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
+        await super().release_run_fence(session_id)
+
+
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
@@ -88,8 +98,8 @@ def _tool_result_parts(transcript) -> list[ToolResultPart]:
     return [part for part in tool_message.content if isinstance(part, ToolResultPart)]
 
 
-def _build(first_round, *, tools=None, final_text="done"):
-    store = InMemorySessionStore()
+def _build(first_round, *, tools=None, final_text="done", store=None):
+    store = InMemorySessionStore() if store is None else store
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(_ScriptedProvider(first_round, final_text=final_text), default=True)
     app.register_agent(
@@ -174,6 +184,47 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     assert ask_part.content == "prod"
     assert ask_part.is_error is False
     assert "pending_user_input" not in asyncio.run(store.load_checkpoint("s_resume"))
+
+
+def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:
+    async def resolve(*, close_after_handoff: bool) -> tuple[int, SessionStatus]:
+        session_id = "s_release_close" if close_after_handoff else "s_release_success"
+        store = _RecordingReleaseStore()
+        app, _ = _build(
+            [("call_1", "ask_user", {"question": "Which env?"})],
+            store=store,
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        releases_before_resolution = store.release_calls[session_id]
+        stream = app.resolve_user_input(
+            UserInputResponse(session_id=session_id, input_id=input_id, answer="prod")
+        )
+        if close_after_handoff:
+            while (await anext(stream)).type != EventType.MODEL_STARTED:
+                pass
+            await stream.aclose()
+        else:
+            await _drain(stream)
+        session = await store.load(session_id)
+        assert session is not None
+        return store.release_calls[session_id] - releases_before_resolution, session.status
+
+    success_releases, success_status = asyncio.run(resolve(close_after_handoff=False))
+    close_releases, close_status = asyncio.run(resolve(close_after_handoff=True))
+
+    assert (success_releases, success_status) == (1, SessionStatus.COMPLETED)
+    assert (close_releases, close_status) == (1, SessionStatus.INTERRUPTED)
 
 
 def test_resolve_user_input_events_carry_resolved_by_actor() -> None:

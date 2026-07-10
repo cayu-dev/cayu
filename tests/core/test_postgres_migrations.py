@@ -133,12 +133,12 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 13")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 14")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 13"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 14"):
                 await validator.ensure_schema()
         finally:
             await validator.close()

@@ -125,3 +125,12 @@ extra-paths = ["src"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/cayu"]
 artifacts = ["src/cayu/server/dashboard/**"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/cayu",
+  "/LICENSE",
+  "/NOTICE",
+  "/README.md",
+  "/pyproject.toml",
+]

@@ -29,13 +29,18 @@ from cayu.runtime.sessions import (
     SessionListResult,
     SessionOutcome,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    _activate_session_run_fence,
+    _assert_session_run_epoch,
     _copy_session_event_batch,
+    _current_session_run_epoch,
+    _deactivate_session_run_fence,
     _prepare_session_fork_request,
     _validate_session_fork_source,
     _validate_status_set,
@@ -72,6 +77,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 14
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -94,6 +100,45 @@ def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
     return row is not None
 
 
+def _raise_session_write_conflict(
+    connection: sqlite3.Connection,
+    session_id: str,
+    expected_run_epoch: int,
+) -> None:
+    row = connection.execute(
+        "SELECT run_epoch FROM cayu_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Session not found: {session_id}")
+    raise SessionRunFenced(
+        f"Session run epoch no longer owns {session_id}: expected {expected_run_epoch}, "
+        f"current {row['run_epoch']}."
+    )
+
+
+def _touch_session_activity(
+    connection: sqlite3.Connection,
+    session_id: str,
+    activity_at: datetime,
+) -> None:
+    expected_run_epoch = _current_session_run_epoch(session_id)
+    if expected_run_epoch is None:
+        cursor = connection.execute(
+            "UPDATE cayu_sessions SET last_activity_at = ? WHERE id = ?",
+            (sqlite_support.format_datetime(activity_at), session_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Session not found: {session_id}")
+        return
+    cursor = connection.execute(
+        "UPDATE cayu_sessions SET last_activity_at = ? WHERE id = ? AND run_epoch = ?",
+        (sqlite_support.format_datetime(activity_at), session_id, expected_run_epoch),
+    )
+    if cursor.rowcount != 1:
+        _raise_session_write_conflict(connection, session_id, expected_run_epoch)
+
+
 def _load_labels(connection: sqlite3.Connection, session_id: str) -> dict[str, str]:
     rows = connection.execute(
         """
@@ -112,8 +157,8 @@ def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | 
         """
         SELECT id, agent_name, provider_name, model, parent_session_id,
                causal_budget_id, runtime_name, runtime_version, environment_name,
-               status, created_at,
-               updated_at, metadata_json
+               status, created_at, updated_at, last_activity_at, run_epoch,
+               metadata_json
         FROM cayu_sessions
         WHERE id = ?
         """,
@@ -175,6 +220,7 @@ def _event_query_with_session_ids(
 ) -> EventQuery:
     return EventQuery(
         session_ids=session_ids,
+        event_id=query.event_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -304,9 +350,11 @@ class SQLiteSessionStore(SessionStore):
                             status,
                             created_at,
                             updated_at,
+                            last_activity_at,
+                            run_epoch,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
@@ -321,6 +369,8 @@ class SQLiteSessionStore(SessionStore):
                             str(session.status),
                             sqlite_support.format_datetime(session.created_at),
                             sqlite_support.format_datetime(session.updated_at),
+                            sqlite_support.format_datetime(session.last_activity_at),
+                            session.run_epoch,
                             sqlite_support.json_dumps(session.metadata),
                         ),
                     )
@@ -420,9 +470,11 @@ class SQLiteSessionStore(SessionStore):
                         status,
                         created_at,
                         updated_at,
+                        last_activity_at,
+                        run_epoch,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
@@ -502,17 +554,29 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         model = require_clean_nonblank(model, "model")
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
             with self._connection:
+                epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
+                params: list[object] = [
+                    model,
+                    sqlite_support.format_datetime(updated_at),
+                    sqlite_support.format_datetime(updated_at),
+                    session_id,
+                ]
+                if expected_run_epoch is not None:
+                    params.append(expected_run_epoch)
                 cursor = self._connection.execute(
-                    """
+                    f"""
                     UPDATE cayu_sessions
-                    SET model = ?, updated_at = ?
-                    WHERE id = ?
+                    SET model = ?, updated_at = ?, last_activity_at = ?
+                    WHERE id = ?{epoch_clause}
                     """,
-                    (model, sqlite_support.format_datetime(updated_at), session_id),
+                    params,
                 )
             if cursor.rowcount != 1:
+                if expected_run_epoch is not None:
+                    _raise_session_write_conflict(self._connection, session_id, expected_run_epoch)
                 raise KeyError(f"Session not found: {session_id}")
 
             loaded = self._load_unlocked(session_id)
@@ -557,13 +621,27 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
             with self._connection:
+                epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
+                params: list[object] = [
+                    sqlite_support.format_datetime(updated_at),
+                    sqlite_support.format_datetime(updated_at),
+                    session_id,
+                ]
+                if expected_run_epoch is not None:
+                    params.append(expected_run_epoch)
                 cursor = self._connection.execute(
-                    "UPDATE cayu_sessions SET updated_at = ? WHERE id = ?",
-                    (sqlite_support.format_datetime(updated_at), session_id),
+                    "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? "
+                    f"WHERE id = ?{epoch_clause}",
+                    params,
                 )
                 if cursor.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        _raise_session_write_conflict(
+                            self._connection, session_id, expected_run_epoch
+                        )
                     raise KeyError(f"Session not found: {session_id}")
                 self._connection.execute(
                     "DELETE FROM cayu_session_labels WHERE session_id = ?",
@@ -588,17 +666,28 @@ class SQLiteSessionStore(SessionStore):
         if type(new_metadata) is not dict:
             raise TypeError("Session metadata must be an object.")
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
             with self._connection:
+                epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
+                params: list[object] = [
+                    sqlite_support.json_dumps(new_metadata),
+                    sqlite_support.format_datetime(updated_at),
+                    sqlite_support.format_datetime(updated_at),
+                    session_id,
+                ]
+                if expected_run_epoch is not None:
+                    params.append(expected_run_epoch)
                 cursor = self._connection.execute(
-                    "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",
-                    (
-                        sqlite_support.json_dumps(new_metadata),
-                        sqlite_support.format_datetime(updated_at),
-                        session_id,
-                    ),
+                    "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ?, "
+                    f"last_activity_at = ? WHERE id = ?{epoch_clause}",
+                    params,
                 )
                 if cursor.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        _raise_session_write_conflict(
+                            self._connection, session_id, expected_run_epoch
+                        )
                     raise KeyError(f"Session not found: {session_id}")
             loaded = self._load_unlocked(session_id)
             if loaded is None:
@@ -619,19 +708,27 @@ class SQLiteSessionStore(SessionStore):
 
         updated_at = datetime.now(UTC)
         async with self._lock:
+            expected_run_epoch = _current_session_run_epoch(session_id)
             placeholders = ", ".join("?" for _ in allowed_statuses)
             params: list[object] = [
                 str(to_status),
                 sqlite_support.format_datetime(updated_at),
+                sqlite_support.format_datetime(updated_at),
+                1 if to_status == SessionStatus.RUNNING else 0,
                 session_id,
                 *[str(status) for status in allowed_statuses],
             ]
+            epoch_clause = ""
+            if expected_run_epoch is not None:
+                epoch_clause = " AND run_epoch = ?"
+                params.append(expected_run_epoch)
             with self._connection:
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_sessions
-                    SET status = ?, updated_at = ?
-                    WHERE id = ? AND status IN ({placeholders})
+                    SET status = ?, updated_at = ?, last_activity_at = ?,
+                        run_epoch = run_epoch + ?
+                    WHERE id = ? AND status IN ({placeholders}){epoch_clause}
                     """,
                     params,
                 )
@@ -639,6 +736,11 @@ class SQLiteSessionStore(SessionStore):
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
+                    raise SessionRunFenced(
+                        f"Session run epoch no longer owns {session_id}: expected "
+                        f"{expected_run_epoch}, current {loaded.run_epoch}."
+                    )
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {loaded.status} -> {to_status}"
                 )
@@ -646,6 +748,8 @@ class SQLiteSessionStore(SessionStore):
             loaded = self._load_unlocked(session_id)
             if loaded is None:
                 raise KeyError(f"Session not found: {session_id}")
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(loaded)
             return loaded
 
     async def transition_status_and_checkpoint(
@@ -670,11 +774,11 @@ class SQLiteSessionStore(SessionStore):
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, loaded)
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
-
                 transformed_checkpoint = checkpoint_transform(
                     loaded,
                     self._load_checkpoint_unlocked(session_id),
@@ -689,12 +793,15 @@ class SQLiteSessionStore(SessionStore):
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_sessions
-                    SET status = ?, updated_at = ?
+                    SET status = ?, updated_at = ?, last_activity_at = ?,
+                        run_epoch = run_epoch + ?
                     WHERE id = ? AND status IN ({placeholders})
                     """,
                     (
                         str(to_status),
                         sqlite_support.format_datetime(updated_at),
+                        sqlite_support.format_datetime(updated_at),
+                        1 if to_status == SessionStatus.RUNNING else 0,
                         session_id,
                         *(str(status) for status in allowed_statuses),
                     ),
@@ -726,13 +833,71 @@ class SQLiteSessionStore(SessionStore):
                     update={
                         "status": to_status,
                         "updated_at": updated_at,
+                        "last_activity_at": updated_at,
+                        "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
                     }
                 )
             except Exception:
                 self._connection.rollback()
                 raise
 
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(transitioned)
             return transitioned
+
+    async def fence_stalled_run(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_before: datetime,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
+            raise ValueError("inactive_before must be timezone-aware.")
+        now = datetime.now(UTC)
+        placeholders = ", ".join("?" for _ in allowed_statuses)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE cayu_sessions
+                    SET run_epoch = run_epoch + 1, last_activity_at = ?
+                    WHERE id = ? AND status IN ({placeholders}) AND last_activity_at <= ?
+                    """,
+                    (
+                        sqlite_support.format_datetime(now),
+                        session_id,
+                        *(str(status) for status in allowed_statuses),
+                        sqlite_support.format_datetime(inactive_before),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                if not self._session_exists_unlocked(session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                return None
+            loaded = self._load_unlocked(session_id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _activate_session_run_fence(loaded)
+            return loaded
+
+    async def release_run_fence(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        if expected_run_epoch is None:
+            return
+        try:
+            async with self._lock:
+                with self._connection:
+                    self._connection.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch + 1 "
+                        "WHERE id = ? AND run_epoch = ?",
+                        (session_id, expected_run_epoch),
+                    )
+        finally:
+            _deactivate_session_run_fence(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -748,6 +913,7 @@ class SQLiteSessionStore(SessionStore):
 
             try:
                 with connection:
+                    _touch_session_activity(connection, session_id, datetime.now(UTC))
                     connection.executemany(
                         """
                         INSERT INTO cayu_events (
@@ -1035,8 +1201,8 @@ class SQLiteSessionStore(SessionStore):
                 f"""
                 SELECT id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at,
-                       updated_at, metadata_json
+                       status, created_at, updated_at, last_activity_at, run_epoch,
+                       metadata_json
                 FROM cayu_sessions
                 {plan.page_where_sql}
                 ORDER BY {plan.order_sql}, id ASC
@@ -1075,6 +1241,7 @@ class SQLiteSessionStore(SessionStore):
             if not copied_messages:
                 return
             with connection:
+                _touch_session_activity(connection, session_id, datetime.now(UTC))
                 connection.executemany(
                     """
                     INSERT INTO cayu_transcript_messages (
@@ -1113,6 +1280,7 @@ class SQLiteSessionStore(SessionStore):
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             with connection:
+                _touch_session_activity(connection, session_id, updated_at)
                 if copied_messages:
                     connection.executemany(
                         """
@@ -1242,6 +1410,7 @@ class SQLiteSessionStore(SessionStore):
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             with connection:
+                _touch_session_activity(connection, session_id, updated_at)
                 connection.execute(
                     """
                     INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
@@ -1283,6 +1452,13 @@ class SQLiteSessionStore(SessionStore):
 
     def _initialize_schema(self) -> None:
         sqlite_support.reconcile_schema(self._connection, self._schema_mode)
+        state = sqlite_support.read_schema_state(self._connection)
+        if state.revision < _SQLITE_SESSION_MIN_REQUIRED_REVISION:
+            raise schema.SchemaTooOld(
+                f"SQLite session schema is at revision {state.revision}; this build requires "
+                f">= {_SQLITE_SESSION_MIN_REQUIRED_REVISION}. Run `cayu storage migrate` before "
+                "starting."
+            )
 
     def _load_unlocked(self, session_id: str) -> Session | None:
         return _load_session(self._connection, session_id)

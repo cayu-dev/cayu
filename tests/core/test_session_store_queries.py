@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +23,7 @@ from cayu.runtime import (
     Session,
     SessionDebugState,
     SessionIdentity,
+    SessionRunFenced,
     SessionStatus,
     SessionStore,
 )
@@ -41,6 +42,15 @@ def test_session_store_lifecycle_methods_are_not_abstract() -> None:
     assert {"delete_session", "update_labels", "update_metadata"}.isdisjoint(
         SessionStore.__abstractmethods__
     )
+
+
+def test_session_store_requires_run_fencing_implementation() -> None:
+    assert {"fence_stalled_run", "release_run_fence"} <= SessionStore.__abstractmethods__
+
+
+def test_event_query_requires_session_id_for_event_id() -> None:
+    with pytest.raises(ValidationError, match="event_id requires session_id"):
+        EventQuery(event_id="event_1")
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -85,6 +95,54 @@ def test_session_stores_default_causal_budget_id_from_task_or_session(
         await _close_store(store)
 
     asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_filter_sessions_by_last_activity(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        for session_id in ("sess_activity_stale", "sess_activity_recent"):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", session_id)],
+                ),
+                identity=_identity(),
+            )
+        inactive_before = datetime.now(UTC)
+        await asyncio.sleep(0.001)
+        await store.append_event(
+            "sess_activity_recent",
+            Event(
+                id="event_recent_activity",
+                type=EventType.SESSION_STARTED,
+                session_id="sess_activity_recent",
+            ),
+        )
+
+        sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    last_activity_before=inactive_before,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+        ).sessions
+
+        assert [session.id for session in sessions] == ["sess_activity_stale"]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_session_query_rejects_naive_last_activity_cutoff() -> None:
+    with pytest.raises(ValidationError, match="last_activity_before must be timezone-aware"):
+        SessionQuery(last_activity_before=datetime.now())
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -576,6 +634,9 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
         causal_records = await store.query_events(EventQuery(causal_budget_id="job_build"))
+        event_id_records = await store.query_events(
+            EventQuery(session_id="sess_builder", event_id="event_2")
+        )
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
@@ -611,6 +672,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_2",
             "event_3",
         ]
+        assert [record.event.id for record in event_id_records] == ["event_2"]
         assert [record.event.id for record in cursor_records] == [
             "event_3",
             "event_4",
@@ -1316,7 +1378,223 @@ def test_session_stores_transition_status_atomically(
         loaded = await store.load("sess_transition")
         assert loaded is not None
         assert loaded.status == SessionStatus.RUNNING
+        assert loaded.run_epoch == 1
+        assert loaded.last_activity_at >= transitioned.last_activity_at
 
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_fence_writes_from_stalled_run(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_fenced",
+                messages=[Message.text("user", "build")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_fenced", SessionStatus.COMPLETED)
+
+        running = asyncio.Event()
+        release_stale_writer = asyncio.Event()
+
+        async def stale_writer() -> None:
+            claimed = await store.transition_status(
+                "sess_fenced",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            assert claimed.run_epoch == 1
+            running.set()
+            await release_stale_writer.wait()
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.append_event(
+                    "sess_fenced",
+                    Event(
+                        id="event_from_stale_run",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id="sess_fenced",
+                        agent_name="builder",
+                    ),
+                )
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.append_transcript_messages(
+                    "sess_fenced",
+                    [Message.text("assistant", "late answer")],
+                )
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.checkpoint("sess_fenced", {"late": True})
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.transition_status(
+                    "sess_fenced",
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+        task = asyncio.create_task(stale_writer())
+        await running.wait()
+        fenced = await store.fence_stalled_run(
+            "sess_fenced",
+            statuses={SessionStatus.RUNNING},
+            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        assert fenced is not None
+        assert fenced.run_epoch == 2
+        recovered = await store.transition_status(
+            "sess_fenced",
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.INTERRUPTED,
+        )
+        assert recovered.status == SessionStatus.INTERRUPTED
+        await store.release_run_fence("sess_fenced")
+
+        release_stale_writer.set()
+        await task
+        assert await store.load_events("sess_fenced") == []
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_release_run_ownership_after_terminal_status(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_sequential_runs",
+                messages=[Message.text("user", "build")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_sequential_runs", SessionStatus.COMPLETED)
+        await store.transition_status(
+            "sess_sequential_runs",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+        await store.transition_status(
+            "sess_sequential_runs",
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.COMPLETED,
+        )
+        await store.checkpoint("sess_sequential_runs", {"terminal_write": True})
+        await store.release_run_fence("sess_sequential_runs")
+
+        async def second_run() -> None:
+            claimed = await store.transition_status(
+                "sess_sequential_runs",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            assert claimed.run_epoch == 3
+            release_child = asyncio.Event()
+
+            async def inherited_child() -> None:
+                await release_child.wait()
+                with pytest.raises(SessionRunFenced, match="no longer owns"):
+                    await store.checkpoint("sess_sequential_runs", {"late_child": True})
+
+            child = asyncio.create_task(inherited_child())
+            await store.transition_status(
+                "sess_sequential_runs",
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            await store.release_run_fence("sess_sequential_runs")
+            release_child.set()
+            await child
+
+        await asyncio.create_task(second_run())
+        updated = await store.update_metadata("sess_sequential_runs", {"runs": 2})
+        assert updated.metadata == {"runs": 2}
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_reject_old_trailing_writes_after_new_run_claim(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_terminal_race",
+                messages=[Message.text("user", "build")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_terminal_race", SessionStatus.COMPLETED)
+        terminal_committed = asyncio.Event()
+        new_run_claimed = asyncio.Event()
+        old_write_checked = asyncio.Event()
+
+        async def old_run() -> None:
+            await store.transition_status(
+                "sess_terminal_race",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.transition_status(
+                "sess_terminal_race",
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            terminal_committed.set()
+            await new_run_claimed.wait()
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.append_event(
+                    "sess_terminal_race",
+                    Event(
+                        id="old_terminal_event",
+                        type=EventType.SESSION_COMPLETED,
+                        session_id="sess_terminal_race",
+                        agent_name="builder",
+                    ),
+                )
+            await store.release_run_fence("sess_terminal_race")
+            old_write_checked.set()
+
+        async def new_run() -> None:
+            await terminal_committed.wait()
+            claimed = await store.transition_status(
+                "sess_terminal_race",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            assert claimed.run_epoch == 2
+            new_run_claimed.set()
+            await old_write_checked.wait()
+            await store.transition_status(
+                "sess_terminal_race",
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            await store.release_run_fence("sess_terminal_race")
+
+        old_task = asyncio.create_task(old_run())
+        new_task = asyncio.create_task(new_run())
+        await asyncio.gather(old_task, new_task)
+        assert await store.load_events("sess_terminal_race") == []
         await _close_store(store)
 
     asyncio.run(run_store_operations())

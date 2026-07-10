@@ -21,10 +21,13 @@ Usage::
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from cayu.runtime.app import CayuApp
+from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 
 try:
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
@@ -74,6 +77,9 @@ def create_server(
     dev: bool = False,
     expose_docs: bool | None = None,
     dashboard_config: dict[str, Any] | None = None,
+    replay_idle_timeout_s: float = 300.0,
+    startup_recovery_statuses: set[SessionStatus] | None = None,
+    recovery_inactive_after_seconds: int = 300,
     **fastapi_kwargs: Any,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -108,6 +114,13 @@ def create_server(
         dashboard_config: Optional JSON-serializable runtime config injected
             into the bundled dashboard shell. ``basePath`` and ``apiBaseUrl``
             are owned by the server mount and cannot be overridden here.
+        replay_idle_timeout_s: Maximum time a replay stream waits without a
+            persisted event before emitting an error and closing.
+        startup_recovery_statuses: Explicit statuses for a bounded recovery sweep
+            during server startup. ``None`` disables it. Include ``pending`` or
+            ``running`` only when the deployment boundary proves they are abandoned.
+        recovery_inactive_after_seconds: Minimum inactivity required before the
+            startup sweep atomically fences and recovers a session.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
     """
     from fastapi import FastAPI
@@ -118,9 +131,39 @@ def create_server(
             "create_server requires auth=... for protected deployments. "
             "Pass dev=True only for local development or tests."
         )
+    if type(recovery_inactive_after_seconds) is not int or recovery_inactive_after_seconds < 0:
+        raise ValueError("recovery_inactive_after_seconds must be a non-negative integer.")
 
     docs_enabled = dev if expose_docs is None else expose_docs
     fastapi_options = dict(fastapi_kwargs)
+    if startup_recovery_statuses is not None:
+        recovery_statuses = IncompleteSessionsRecoveryRequest(
+            statuses=startup_recovery_statuses
+        ).statuses
+        user_lifespan = fastapi_options.pop("lifespan", None)
+
+        async def recover_incomplete_sessions() -> None:
+            await app.recover_incomplete_sessions(
+                IncompleteSessionsRecoveryRequest(
+                    statuses=recovery_statuses,
+                    inactive_before=datetime.now(UTC)
+                    - timedelta(seconds=recovery_inactive_after_seconds),
+                    reason="server_startup_recovery",
+                    metadata={"source": "create_server"},
+                )
+            )
+
+        @asynccontextmanager
+        async def cayu_lifespan(server):
+            if user_lifespan is None:
+                await recover_incomplete_sessions()
+                yield
+                return
+            async with user_lifespan(server) as state:
+                await recover_incomplete_sessions()
+                yield state
+
+        fastapi_options["lifespan"] = cayu_lifespan
     if docs_enabled:
         fastapi_options.setdefault("docs_url", "/docs")
         fastapi_options.setdefault("redoc_url", "/redoc")
@@ -160,6 +203,7 @@ def create_server(
         auth=auth,
         api_path=control_plane_path,
         openapi_url=server.openapi_url,
+        replay_idle_timeout_s=replay_idle_timeout_s,
     )
     server.include_router(router)
 
@@ -185,6 +229,7 @@ def mount_cayu(
     auth: AuthDependency | None = None,
     dev: bool = False,
     dashboard_config: dict[str, Any] | None = None,
+    replay_idle_timeout_s: float = 300.0,
     name: str = "cayu-dashboard",
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
@@ -211,6 +256,7 @@ def mount_cayu(
         auth=auth,
         api_path=api_path,
         openapi_url=getattr(server, "openapi_url", None),
+        replay_idle_timeout_s=replay_idle_timeout_s,
     )
     server.include_router(router)
     if dashboard:

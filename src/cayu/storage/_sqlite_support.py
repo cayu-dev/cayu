@@ -66,6 +66,8 @@ _BASELINE_DDL = """
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        run_epoch INTEGER NOT NULL DEFAULT 0,
         metadata_json TEXT NOT NULL
     );
 
@@ -373,6 +375,14 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_tasks", "status_reason", "TEXT"),
         ("cayu_tasks", "status_payload_json", "TEXT"),
     ),
+    14: (
+        (
+            "cayu_sessions",
+            "last_activity_at",
+            "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+        ),
+        ("cayu_sessions", "run_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -417,11 +427,16 @@ def _migrate_legacy_budget_reservations(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE budget_reservations")
 
 
+def _backfill_session_activity(connection: sqlite3.Connection) -> None:
+    connection.execute("UPDATE cayu_sessions SET last_activity_at = updated_at")
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
 _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_legacy_budget_reservations,
+    14: _backfill_session_activity,
 }
 
 
@@ -591,6 +606,7 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         status=SessionStatus.PENDING,
         created_at=now,
         updated_at=now,
+        last_activity_at=now,
         metadata=copy_json_value(request.metadata, "metadata"),
         labels=copy_label_map(request.labels, "labels"),
     )
@@ -610,6 +626,8 @@ def session_to_row_values(session: Session) -> tuple[object, ...]:
         str(session.status),
         format_datetime(session.created_at),
         format_datetime(session.updated_at),
+        format_datetime(session.last_activity_at),
+        session.run_epoch,
         json_dumps(session.metadata),
     )
 
@@ -685,6 +703,8 @@ def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> 
         status=SessionStatus(row["status"]),
         created_at=parse_datetime(row["created_at"]),
         updated_at=parse_datetime(row["updated_at"]),
+        last_activity_at=parse_datetime(row["last_activity_at"]),
+        run_epoch=row["run_epoch"],
         metadata=json.loads(row["metadata_json"]),
         labels=copy_label_map(labels, "labels"),
     )

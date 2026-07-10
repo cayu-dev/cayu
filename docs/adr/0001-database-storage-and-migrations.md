@@ -143,9 +143,10 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
   patch releases (Q3), validate-at-startup (Q4), and opt-in migrate (Q5) cost
   nothing to adopt today but are expensive to retrofit after the first real release
   — so they go into the baseline contract.
-- Relation to cayu#32: this ADR addresses **schema** evolution. The **code**
-  contract evolution (F1: new `SessionStore` abstract methods break out-of-tree
-  stores) is a separate concern handled via default method implementations.
+- Relation to cayu#32: this ADR addresses **schema** evolution. Before 1.0,
+  correctness-critical `SessionStore` operations can be required abstract methods
+  so incomplete stores fail at instantiation instead of later in a recovery path;
+  optional lifecycle additions can still use explicit default implementations.
 
 ## Roadmap (incremental)
 

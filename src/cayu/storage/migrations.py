@@ -111,6 +111,10 @@ REVISIONS: tuple[Revision, ...] = (
     # transactions. This is a Postgres-only additive DDL revision; SQLite has no
     # DDL for it and older SQLite DBs remain compatible with this binary.
     Revision(revision=13, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Activity timestamps and run epochs are additive columns. New SessionStore
+    # implementations still require this revision before use, while older binaries
+    # can continue operating against the expanded schema.
+    Revision(revision=14, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

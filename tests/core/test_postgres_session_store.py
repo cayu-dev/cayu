@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -25,6 +25,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionOrder,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     TranscriptQuery,
 )
@@ -240,6 +241,77 @@ def test_postgres_session_store_rejects_stale_atomic_status_checkpoint_transitio
         assert session.status == SessionStatus.RUNNING
         # Failed transition must NOT have written a checkpoint (atomic rollback).
         assert checkpoint is None
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_fences_stale_run_writes(postgres_dsn):
+    async def ops(store):
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_fenced",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.update_status("sess_pg_fenced", SessionStatus.COMPLETED)
+        running = asyncio.Event()
+        release_stale_writer = asyncio.Event()
+
+        async def stale_writer() -> None:
+            claimed = await store.transition_status(
+                "sess_pg_fenced",
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            assert claimed.run_epoch == 1
+            running.set()
+            await release_stale_writer.wait()
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.append_event(
+                    "sess_pg_fenced",
+                    Event(
+                        id="event_from_stale_pg_run",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id="sess_pg_fenced",
+                        agent_name="assistant",
+                    ),
+                )
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.append_transcript_messages(
+                    "sess_pg_fenced",
+                    [Message.text("assistant", "late answer")],
+                )
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.checkpoint("sess_pg_fenced", {"late": True})
+            with pytest.raises(SessionRunFenced, match="no longer owns"):
+                await store.transition_status(
+                    "sess_pg_fenced",
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+        task = asyncio.create_task(stale_writer())
+        await running.wait()
+        fenced = await store.fence_stalled_run(
+            "sess_pg_fenced",
+            statuses={SessionStatus.RUNNING},
+            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        assert fenced is not None
+        assert fenced.run_epoch == 2
+        recovered = await store.transition_status(
+            "sess_pg_fenced",
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.INTERRUPTED,
+        )
+        assert recovered.status == SessionStatus.INTERRUPTED
+        await store.release_run_fence("sess_pg_fenced")
+
+        release_stale_writer.set()
+        await task
+        assert await store.load_events("sess_pg_fenced") == []
 
     _run(postgres_dsn, ops)
 
@@ -585,6 +657,42 @@ def test_postgres_session_store_lists_sessions_with_filters_and_pagination(postg
     _run(postgres_dsn, ops)
 
 
+def test_postgres_session_store_filters_sessions_by_last_activity(postgres_dsn):
+    async def ops(store):
+        for session_id in ("sess_pg_activity_stale", "sess_pg_activity_recent"):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", session_id)],
+                ),
+                identity=_identity(),
+            )
+        inactive_before = datetime.now(UTC)
+        await asyncio.sleep(0.001)
+        await store.append_event(
+            "sess_pg_activity_recent",
+            Event(
+                id="event_pg_recent_activity",
+                type=EventType.SESSION_STARTED,
+                session_id="sess_pg_activity_recent",
+            ),
+        )
+
+        sessions = (
+            await store.list_sessions(
+                SessionQuery(
+                    last_activity_before=inactive_before,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                )
+            )
+        ).sessions
+
+        assert [session.id for session in sessions] == ["sess_pg_activity_stale"]
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_session_store_preserves_and_filters_session_labels(postgres_dsn):
     async def ops(store):
         created = await store.create(
@@ -783,6 +891,9 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
             EventQuery(session_ids=("sess_reviewer", "sess_builder"), limit=10)
         )
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
+        event_id_records = await store.query_events(
+            EventQuery(session_id="sess_builder", event_id="event_2")
+        )
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
         multi_type_records = await store.query_events(
             EventQuery(
@@ -807,6 +918,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
             "event_4",
         ]
         assert [r.event.id for r in read_file_records] == ["event_2"]
+        assert [r.event.id for r in event_id_records] == ["event_2"]
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]
         assert [r.event.id for r in multi_type_records] == ["event_1", "event_2", "event_4"]
         assert [r.event.id for r in cursor_records] == ["event_3", "event_4"]

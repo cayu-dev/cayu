@@ -775,9 +775,9 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
-def test_sqlite_session_store_revision_twelve_remains_compatible(tmp_path):
-    # Revision 13 is Postgres-only DDL. SQLite databases at revision 12 still satisfy
-    # this binary's compatibility floor and should not require a no-op migrate before use.
+def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(tmp_path):
+    # Revision 14 adds the activity timestamp and run epoch required for safe
+    # stalled-session recovery, so revision 13 databases must migrate before use.
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
 
@@ -796,13 +796,16 @@ def test_sqlite_session_store_revision_twelve_remains_compatible(tmp_path):
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 13")
-        connection.execute("PRAGMA user_version = 12")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 14")
+        connection.execute("PRAGMA user_version = 13")
         connection.commit()
     finally:
         connection.close()
 
-    reopened = SQLiteSessionStore(db_path)
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 14"):
+        SQLiteSessionStore(db_path)
+
+    reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
 
     async def assert_compatible() -> None:
         loaded = await reopened.load("sess_sqlite_rev12")
@@ -927,8 +930,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-13 are purely additive, so they inherit the prior floor;
-    # only the breaking revisions (1, 8, 9, 10) raise compatible_from to themselves.
+    # Revisions 2-7 and 11-14 are additive and keep the prior compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
         (1, 1),
@@ -944,6 +946,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (11, 10),
         (12, 10),
         (13, 10),
+        (14, 10),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -1462,10 +1465,11 @@ def test_sqlite_migrate_drops_legacy_event_json_column(tmp_path):
             INSERT INTO cayu_sessions (
                 id, agent_name, provider_name, model, parent_session_id,
                 causal_budget_id, runtime_name, runtime_version, environment_name,
-                status, created_at, updated_at, metadata_json
+                status, created_at, updated_at, last_activity_at, run_epoch, metadata_json
             ) VALUES ('sess_legacy', 'assistant', 'fake', 'fake-model', NULL,
                 'sess_legacy', 'cayu', NULL, NULL, 'pending',
-                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '{}')
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00', 0, '{}')
             """
         )
         connection.execute(

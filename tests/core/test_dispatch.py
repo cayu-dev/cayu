@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 import pytest
 
-from cayu.core import AgentSpec, Message
+from cayu.core import AgentSpec, EventType, Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -208,6 +209,46 @@ def test_busy_session_conflict_leaves_fresh_session_alone() -> None:
     assert session.status == SessionStatus.RUNNING  # untouched
 
 
+def test_busy_session_with_old_status_timestamp_but_recent_progress_is_not_recovered() -> None:
+    h = _build(
+        [_batch("first answer")],
+        recover_stalled_sessions_after_seconds=60,
+    )
+    _create_resumable_session(h.app, "sess_recent_progress")
+    asyncio.run(h.app.dispatch(_dispatch_request("sess_recent_progress", "d_recent_progress")))
+    asyncio.run(
+        h.store.transition_status(
+            "sess_recent_progress",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+    )
+
+    async def age_status_then_record_progress() -> None:
+        old = datetime.now(UTC) - timedelta(hours=1)
+        async with h.store._lock:
+            session = h.store._sessions["sess_recent_progress"]
+            h.store._sessions[session.id] = session.model_copy(
+                update={"updated_at": old, "last_activity_at": old}
+            )
+        await h.store.checkpoint("sess_recent_progress", {"step": 2})
+
+    asyncio.run(age_status_then_record_progress())
+    before = asyncio.run(h.store.load("sess_recent_progress"))
+    assert before is not None
+    assert before.updated_at < datetime.now(UTC) - timedelta(minutes=30)
+    assert before.last_activity_at > datetime.now(UTC) - timedelta(seconds=5)
+
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+
+    assert result is not None
+    assert result.metadata.get("requeued") is True
+    assert "recovered_session" not in result.metadata
+    after = asyncio.run(h.store.load("sess_recent_progress"))
+    assert after is not None
+    assert after.status == SessionStatus.RUNNING
+
+
 def test_conflict_after_worker_crash_recovers_stalled_session_and_reruns() -> None:
     # A worker crashed mid-run: its queue task was reclaimed, but the session row is
     # stranded RUNNING, so every re-claim conflicts. With the recovery horizon elapsed
@@ -238,6 +279,10 @@ def test_conflict_after_worker_crash_recovers_stalled_session_and_reruns() -> No
     session = asyncio.run(h.store.load("sess_crash"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+    recovery_events = asyncio.run(h.store.load_events("sess_crash"))
+    fenced = next(event for event in recovery_events if event.type == EventType.SESSION_RUN_FENCED)
+    assert fenced.payload["previous_run_epoch"] == 3
+    assert fenced.payload["run_epoch"] == 4
 
     second = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_b"))
 

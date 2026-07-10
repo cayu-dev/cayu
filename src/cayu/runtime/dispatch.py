@@ -5,7 +5,7 @@ import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import uuid4
@@ -23,7 +23,6 @@ from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
-    SessionStatus,
     SessionStatusConflict,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -178,11 +177,6 @@ class InlineDispatcher(Dispatcher):
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
 DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 
-_STALLED_RECOVERABLE_SESSION_STATUSES = {
-    SessionStatus.PENDING,
-    SessionStatus.RUNNING,
-    SessionStatus.INTERRUPTING,
-}
 _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
     IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
@@ -380,27 +374,22 @@ class TaskStoreDispatcher(Dispatcher):
         """Best-effort finalization of a session stranded in a live status by a crashed worker.
 
         Uses the runtime's incomplete-session recovery when available (duck-typed so the
-        ``DispatchRuntime`` protocol stays minimal). Only sessions with no store activity
-        for at least the recovery horizon are touched — a genuinely live run on another
-        worker keeps updating the session (status transitions, transcript appends,
-        checkpoints) and is left alone; the runtime additionally skips sessions with
-        active work in this process. Returns True when the session was recovered out of
-        its stranded status.
+        ``DispatchRuntime`` protocol stays minimal). The store atomically checks the
+        durable activity horizon and increments the run epoch before recovery, so a
+        genuinely live run is left alone and an evicted worker cannot write after the
+        decision. Returns True when the session was recovered out of its stranded status.
         """
         recover = getattr(runtime, "recover_incomplete_session", None)
-        session_store = getattr(runtime, "session_store", None)
-        if recover is None or session_store is None:
+        if recover is None:
             return False
         try:
-            session = await session_store.load(request.session_id)
-            if session is None or session.status not in _STALLED_RECOVERABLE_SESSION_STATUSES:
-                return False
-            stalled_seconds = (datetime.now(UTC) - session.updated_at).total_seconds()
-            if stalled_seconds < self._recover_stalled_after_seconds:
-                return False
+            inactive_before = datetime.now(UTC) - timedelta(
+                seconds=self._recover_stalled_after_seconds
+            )
             result = await recover(
                 IncompleteSessionRecoveryRequest(
                     session_id=request.session_id,
+                    inactive_before=inactive_before,
                     reason=DISPATCH_CONFLICT_RECOVERY_REASON,
                     metadata={"dispatch_id": request.dispatch_id},
                 )

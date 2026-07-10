@@ -35,6 +35,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         status TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL,
+        last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        run_epoch BIGINT NOT NULL DEFAULT 0,
         event_seq BIGINT NOT NULL DEFAULT 0,
         metadata JSONB NOT NULL
     )
@@ -195,6 +197,8 @@ def session_insert_values(session: Session) -> tuple[object, ...]:
         str(session.status),
         to_utc(session.created_at),
         to_utc(session.updated_at),
+        to_utc(session.last_activity_at),
+        session.run_epoch,
         _dumps(session.metadata),
     )
 
@@ -217,7 +221,9 @@ def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None)
         status=SessionStatus(row[9]),
         created_at=to_utc(row[10]),
         updated_at=to_utc(row[11]),
-        metadata=_loads(row[12]),
+        last_activity_at=to_utc(row[12]),
+        run_epoch=row[13],
+        metadata=_loads(row[14]),
         labels=copy_label_map(labels, "labels"),
     )
 
@@ -225,7 +231,7 @@ def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None)
 SESSION_COLUMNS = (
     "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
-    "metadata"
+    "last_activity_at, run_epoch, metadata"
 )
 
 

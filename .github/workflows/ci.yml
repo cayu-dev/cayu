@@ -75,6 +75,29 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv lock --check
 
+  package:
+    name: Release artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.11
+      - run: uv build --out-dir dist/first
+      - run: uv build --out-dir dist/second
+      - name: Check reproducible archives
+        run: |
+          cmp dist/first/*.tar.gz dist/second/*.tar.gz
+          cmp dist/first/*.whl dist/second/*.whl
+      - run: uv run python scripts/check_release_artifacts.py dist/first/*
+      - run: uv venv --python 3.11 .release-venv
+      - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+      - run: .release-venv/bin/python -c "import cayu; assert cayu.__name__ == 'cayu'"
+      - name: Check installed CLI version
+        run: |
+          expected_version="$(.release-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$(.release-venv/bin/cayu version)" = "cayu ${expected_version}"
+
   dashboard:
     name: Dashboard
     runs-on: ubuntu-latest

@@ -41,9 +41,19 @@ class FakeProvider(ModelProvider):
             yield event
 
 
+class RecordingReleaseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls: dict[str, int] = {}
+
+    async def release_run_fence(self, session_id: str) -> None:
+        self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
+        await super().release_run_fence(session_id)
+
+
 class Harness(NamedTuple):
     app: CayuApp
-    store: InMemorySessionStore
+    store: RecordingReleaseStore
     provider: FakeProvider
 
 
@@ -55,7 +65,7 @@ def _batch(text: str) -> list[ModelStreamEvent]:
 
 
 def _build(batches: list[list[ModelStreamEvent]]) -> Harness:
-    store = InMemorySessionStore()
+    store = RecordingReleaseStore()
     provider = FakeProvider(batches)
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
@@ -111,6 +121,7 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
         "reason": "event_stream_closed",
         "abandoned": True,
     }
+    assert h.store.release_calls["sess_abandoned_run"] == 1
 
     # The finalized session is resumable — it was not stranded in RUNNING.
     async def resume() -> None:
@@ -186,22 +197,25 @@ def test_finalize_abandoned_session_by_id_finalizes_and_is_idempotent() -> None:
             to_status=SessionStatus.RUNNING,
         )
 
-        await h.app._finalize_abandoned_session_by_id("sess_strand")
-        first = await h.store.load("sess_strand")
-        assert first is not None and first.status == SessionStatus.INTERRUPTED
+        try:
+            await h.app._finalize_abandoned_session_by_id("sess_strand")
+            first = await h.store.load("sess_strand")
+            assert first is not None and first.status == SessionStatus.INTERRUPTED
 
-        # Idempotent: a second call (e.g. also reached by _run_session's finalizer) no-ops.
-        await h.app._finalize_abandoned_session_by_id("sess_strand")
-        second = await h.store.load("sess_strand")
-        assert second is not None and second.status == SessionStatus.INTERRUPTED
+            # Idempotent: a second call (e.g. also reached by _run_session's finalizer) no-ops.
+            await h.app._finalize_abandoned_session_by_id("sess_strand")
+            second = await h.store.load("sess_strand")
+            assert second is not None and second.status == SessionStatus.INTERRUPTED
 
-        # Unknown session id is a safe no-op.
-        await h.app._finalize_abandoned_session_by_id("does-not-exist")
+            # Unknown session id is a safe no-op.
+            await h.app._finalize_abandoned_session_by_id("does-not-exist")
 
-        events = await h.store.load_events("sess_strand")
-        interrupted = [e for e in events if e.type == EventType.SESSION_INTERRUPTED]
-        assert len(interrupted) == 1
-        assert interrupted[0].payload["abandoned"] is True
+            events = await h.store.load_events("sess_strand")
+            interrupted = [e for e in events if e.type == EventType.SESSION_INTERRUPTED]
+            assert len(interrupted) == 1
+            assert interrupted[0].payload["abandoned"] is True
+        finally:
+            await h.store.release_run_fence("sess_strand")
 
     asyncio.run(scenario())
 

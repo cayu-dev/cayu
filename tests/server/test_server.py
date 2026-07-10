@@ -5,6 +5,8 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -3805,6 +3807,14 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
 
     # A reconnect with Last-Event-ID replays the persisted events the client missed
     # instead of starting a new run.
+    queries = []
+    original_query_events = app.session_store.query_events
+
+    async def query_events(query=None):
+        queries.append(query)
+        return await original_query_events(query)
+
+    app.session_store.query_events = query_events
     with client.stream(
         "POST",
         "/api/run",
@@ -3818,6 +3828,19 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
         frame["data"]["id"] for frame in frames[1:]
     ]
     assert replayed[-1]["data"]["type"] == "session.completed"
+    assert queries[0].event_id == frames[0]["data"]["id"]
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": frames[0]["id"]},
+    ) as response:
+        assert response.status_code == 200
+        resume_replayed = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in resume_replayed] == [
+        frame["data"]["id"] for frame in frames[1:]
+    ]
     # No new session was created by the replay request.
     sessions = client.get("/api/sessions").json()["sessions"]
     assert [session["id"] for session in sessions] == [session_id]
@@ -3842,6 +3865,226 @@ def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> Non
         headers={"Last-Event-ID": "missing_session:event_1"},
     )
     assert unknown.status_code == 404
+
+
+def test_replay_of_active_session_times_out_with_structured_error() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_stranded",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status("session_stranded", SessionStatus.RUNNING)
+        await app.session_store.append_event(
+            "session_stranded",
+            Event(
+                id="event_seen",
+                type=EventType.SESSION_STARTED,
+                session_id="session_stranded",
+                agent_name="assistant",
+            ),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored during replay"},
+        headers={"Last-Event-ID": "session_stranded:event_seen"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames[-1]["event"] == "error"
+    assert frames[-1]["data"]["error_type"] == "TimeoutError"
+    assert "session_stranded" in frames[-1]["data"]["error"]
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "/api/tool-approvals/resolve",
+            {
+                "session_id": "session_approval_replay",
+                "approval_id": "approval_1",
+                "decision": "approve",
+            },
+        ),
+        (
+            "/api/tool-approvals/recover",
+            {
+                "session_id": "session_approval_replay",
+                "approval_id": "approval_1",
+                "tool_call_id": "call_1",
+                "outcome": "completed",
+                "message": "confirmed externally",
+            },
+        ),
+        (
+            "/api/tool-rounds/recover",
+            {
+                "session_id": "session_approval_replay",
+                "round_id": "round_1",
+                "tool_call_id": "call_1",
+                "outcome": "completed",
+                "message": "confirmed externally",
+            },
+        ),
+        (
+            "/api/user-input/resolve",
+            {
+                "session_id": "session_approval_replay",
+                "input_id": "input_1",
+                "answer": "continue",
+            },
+        ),
+        (
+            "/api/user-input/recover",
+            {
+                "session_id": "session_approval_replay",
+                "input_id": "input_1",
+                "answer": "continue",
+                "tool_call_id": "call_1",
+                "outcome": "completed",
+                "message": "confirmed externally",
+            },
+        ),
+        (
+            "/api/sessions/session_approval_replay/interrupt",
+            {},
+        ),
+    ],
+)
+def test_mutation_routes_replay_without_reexecuting(path: str, body: dict) -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_approval_replay",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "session_approval_replay",
+            [
+                Event(
+                    id="event_seen",
+                    type=EventType.SESSION_STARTED,
+                    session_id="session_approval_replay",
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_missed",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="session_approval_replay",
+                    agent_name="assistant",
+                ),
+            ],
+        )
+        await app.session_store.update_status("session_approval_replay", SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+    executed = []
+
+    async def unexpected_execution(request):
+        executed.append(request)
+        if False:
+            yield None
+
+    app.resolve_tool_approval = unexpected_execution
+    app.recover_tool_approval = unexpected_execution
+    app.recover_tool_round = unexpected_execution
+    app.resolve_user_input = unexpected_execution
+    app.recover_user_input = unexpected_execution
+    app.interrupt_session = unexpected_execution
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream(
+        "POST",
+        path,
+        json=body,
+        headers={"Last-Event-ID": "session_approval_replay:event_seen"},
+    ) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    assert [frame["data"]["id"] for frame in frames] == ["event_missed"]
+    assert executed == []
+
+
+def test_session_scoped_replay_rejects_marker_for_different_session() -> None:
+    app = CayuApp()
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.post(
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_requested",
+            "approval_id": "approval_1",
+            "decision": "approve",
+        },
+        headers={"Last-Event-ID": "session_other:event_seen"},
+    )
+
+    assert response.status_code == 422
+    assert "does not match" in response.json()["detail"]
+
+
+def test_create_server_startup_recovery_composes_user_lifespan() -> None:
+    app = CayuApp()
+    calls: list[str] = []
+    requests = []
+
+    @asynccontextmanager
+    async def user_lifespan(server):
+        calls.append("user_start")
+        yield
+        calls.append("user_stop")
+
+    async def recover(request):
+        calls.append("recover")
+        requests.append(request)
+        return []
+
+    app.recover_incomplete_sessions = recover
+    server = create_server(
+        app,
+        dev=True,
+        lifespan=user_lifespan,
+        startup_recovery_statuses={
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        },
+        recovery_inactive_after_seconds=60,
+    )
+
+    with TestClient(server):
+        assert calls == ["user_start", "recover"]
+
+    assert calls == ["user_start", "recover", "user_stop"]
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.statuses == {
+        SessionStatus.PENDING,
+        SessionStatus.RUNNING,
+        SessionStatus.INTERRUPTING,
+    }
+    assert request.reason == "server_startup_recovery"
+    assert request.metadata == {"source": "create_server"}
+    assert request.inactive_before is not None
+    assert request.inactive_before < datetime.now(UTC)
 
 
 def test_client_disconnect_does_not_cancel_detached_run() -> None:

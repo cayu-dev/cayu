@@ -5,6 +5,7 @@ import base64
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -39,6 +40,45 @@ class SessionStatusConflict(ValueError):
     running). Subclasses ``ValueError`` so existing ``except ValueError`` handlers
     keep working; callers that need to react specifically (e.g. requeue) catch this.
     """
+
+
+class SessionRunFenced(RuntimeError):
+    """A durable write was rejected because its run no longer owns the session epoch."""
+
+
+_SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
+    "cayu_session_run_fence",
+    default=None,
+)
+
+
+def _current_session_run_epoch(session_id: str) -> int | None:
+    fences = _SESSION_RUN_FENCES.get()
+    return None if fences is None else fences.get(session_id)
+
+
+def _activate_session_run_fence(session: Session) -> None:
+    fences = dict(_SESSION_RUN_FENCES.get() or {})
+    fences[session.id] = session.run_epoch
+    _SESSION_RUN_FENCES.set(fences)
+
+
+def _deactivate_session_run_fence(session_id: str) -> None:
+    fences = _SESSION_RUN_FENCES.get()
+    if fences is None or session_id not in fences:
+        return
+    remaining = dict(fences)
+    remaining.pop(session_id)
+    _SESSION_RUN_FENCES.set(remaining or None)
+
+
+def _assert_session_run_epoch(session_id: str, session: Session) -> None:
+    expected = _current_session_run_epoch(session_id)
+    if expected is not None and session.run_epoch != expected:
+        raise SessionRunFenced(
+            f"Session run epoch no longer owns {session_id}: expected {expected}, "
+            f"current {session.run_epoch}."
+        )
 
 
 class SessionStatus(StrEnum):
@@ -318,6 +358,8 @@ class Session(BaseModel):
     status: SessionStatus = SessionStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    last_activity_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    run_epoch: StrictInt = Field(default=0, ge=0)
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -471,6 +513,7 @@ class SessionQuery(BaseModel):
     environment_name: str | None = None
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
+    last_activity_before: datetime | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     label_selectors: tuple[LabelSelectorRequirement, ...] = Field(default_factory=tuple)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
@@ -512,6 +555,15 @@ class SessionQuery(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("last_activity_before")
+    @classmethod
+    def validate_last_activity_before(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("last_activity_before must be timezone-aware.")
+        return value.astimezone(UTC)
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -601,6 +653,7 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
+    inactive_before: datetime | None = None
     reason: str = "worker_recovered_incomplete_session"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -608,6 +661,15 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("inactive_before")
+    @classmethod
+    def validate_inactive_before(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("inactive_before must be timezone-aware.")
+        return value.astimezone(UTC)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -620,6 +682,7 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
 
     statuses: set[SessionStatus]
     limit: StrictInt = Field(default=100, ge=1, le=1000)
+    inactive_before: datetime | None = None
     reason: str = "worker_recovered_incomplete_session"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -657,6 +720,15 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
     def validate_reason(cls, value: str) -> str:
         return require_clean_nonblank(value, "reason")
 
+    @field_validator("inactive_before")
+    @classmethod
+    def validate_inactive_before(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("inactive_before must be timezone-aware.")
+        return value.astimezone(UTC)
+
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
@@ -691,6 +763,7 @@ class EventQuery(BaseModel):
 
     session_id: str | None = None
     session_ids: tuple[str, ...] = Field(default_factory=tuple)
+    event_id: str | None = None
     causal_budget_id: str | None = None
     event_type: EventType | str | None = None
     event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
@@ -706,6 +779,7 @@ class EventQuery(BaseModel):
 
     @field_validator(
         "session_id",
+        "event_id",
         "causal_budget_id",
         "agent_name",
         "environment_name",
@@ -776,6 +850,8 @@ class EventQuery(BaseModel):
     def validate_time_range(self) -> EventQuery:
         if self.session_id is not None and self.session_ids:
             raise ValueError("Use either `session_id` or `session_ids`, not both.")
+        if self.event_id is not None and self.session_id is None:
+            raise ValueError("EventQuery event_id requires session_id.")
         if self.event_type is not None and self.event_types:
             raise ValueError("Use either `event_type` or `event_types`, not both.")
         if self.since is not None and self.until is not None and self.since >= self.until:
@@ -868,7 +944,14 @@ def filter_transcript_records(
 
 
 class SessionStore(ABC):
-    """Persistent store for sessions and append-only events."""
+    """Persistent store for sessions and append-only events.
+
+    Implementations own the run-epoch contract. A successful transition to
+    ``RUNNING`` claims a new epoch for the current execution context. Runtime
+    progress writes made by that context must reject a stale epoch with
+    ``SessionRunFenced``. Releasing the claim revokes the durable epoch before
+    clearing task-local ownership so inherited child contexts cannot write late.
+    """
 
     @abstractmethod
     async def create(
@@ -911,7 +994,7 @@ class SessionStore(ABC):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
     ) -> Session:
-        """Atomically transition a session status when its current status is allowed."""
+        """Atomically transition status, claiming a new epoch when entering RUNNING."""
 
     @abstractmethod
     async def transition_status_and_checkpoint(
@@ -922,7 +1005,27 @@ class SessionStore(ABC):
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
     ) -> Session:
-        """Atomically transition status and persist transformed checkpoint state."""
+        """Atomically persist a transition/checkpoint and claim RUNNING when requested."""
+
+    @abstractmethod
+    async def fence_stalled_run(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_before: datetime,
+    ) -> Session | None:
+        """Atomically evict a stale run and claim its newly incremented epoch.
+
+        Returns ``None`` when the session is no longer in one of ``statuses`` or
+        has activity newer than ``inactive_before``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def release_run_fence(self, session_id: str) -> None:
+        """Revoke this task's epoch after all trailing writes finish."""
+        _deactivate_session_run_fence(require_clean_nonblank(session_id, "session_id"))
 
     async def append_event(self, session_id: str, event: Event) -> None:
         """Append one event to a session."""
@@ -1042,6 +1145,7 @@ class InMemorySessionStore(SessionStore):
         # queries — including the per-step budget read path — stop scanning the global
         # event list. Keyed by session id and by ``str(event.type)`` respectively.
         self._session_event_records: dict[str, list[EventRecord]] = {}
+        self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
         self._event_ids: dict[str, set[str]] = {}
         self._next_event_sequence = 1
@@ -1084,6 +1188,7 @@ class InMemorySessionStore(SessionStore):
                 status=SessionStatus.PENDING,
                 created_at=now,
                 updated_at=now,
+                last_activity_at=now,
                 labels=request.labels,
                 metadata=deepcopy(request.metadata),
             )
@@ -1180,11 +1285,13 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
-
+            _assert_session_run_epoch(session_id, session)
+            now = datetime.now(UTC)
             updated = session.model_copy(
                 update={
                     "model": model,
-                    "updated_at": datetime.now(UTC),
+                    "updated_at": now,
+                    "last_activity_at": now,
                 }
             )
             self._sessions[session_id] = updated
@@ -1210,6 +1317,11 @@ class InMemorySessionStore(SessionStore):
             self._event_records = [
                 record for record in self._event_records if record.event.session_id != session_id
             ]
+            self._event_records_by_id = {
+                key: record
+                for key, record in self._event_records_by_id.items()
+                if key[0] != session_id
+            }
             for event_type, records in list(self._type_event_records.items()):
                 remaining = [record for record in records if record.event.session_id != session_id]
                 if remaining:
@@ -1228,8 +1340,10 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            now = datetime.now(UTC)
             updated = session.model_copy(
-                update={"labels": new_labels, "updated_at": datetime.now(UTC)}
+                update={"labels": new_labels, "updated_at": now, "last_activity_at": now}
             )
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
@@ -1243,8 +1357,10 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            now = datetime.now(UTC)
             updated = session.model_copy(
-                update={"metadata": new_metadata, "updated_at": datetime.now(UTC)}
+                update={"metadata": new_metadata, "updated_at": now, "last_activity_at": now}
             )
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
@@ -1264,19 +1380,26 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
 
+            now = datetime.now(UTC)
             updated = session.model_copy(
                 update={
                     "status": to_status,
-                    "updated_at": datetime.now(UTC),
+                    "updated_at": now,
+                    "last_activity_at": now,
+                    "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
                 }
             )
             self._sessions[session_id] = updated
-            return updated.model_copy(deep=True)
+            result = updated.model_copy(deep=True)
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(result)
+            return result
 
     async def transition_status_and_checkpoint(
         self,
@@ -1296,6 +1419,7 @@ class InMemorySessionStore(SessionStore):
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
@@ -1312,16 +1436,65 @@ class InMemorySessionStore(SessionStore):
                     "checkpoint",
                 )
 
+            now = datetime.now(UTC)
             updated = session.model_copy(
                 update={
                     "status": to_status,
-                    "updated_at": datetime.now(UTC),
+                    "updated_at": now,
+                    "last_activity_at": now,
+                    "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
                 }
             )
             self._sessions[session_id] = updated
             if transformed_checkpoint is not None:
                 self._checkpoints[session_id] = transformed_checkpoint
-            return updated.model_copy(deep=True)
+            result = updated.model_copy(deep=True)
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(result)
+            return result
+
+    async def fence_stalled_run(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_before: datetime,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
+            raise ValueError("inactive_before must be timezone-aware.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.status not in allowed_statuses or session.last_activity_at > inactive_before:
+                return None
+            fenced = session.model_copy(
+                update={
+                    "run_epoch": session.run_epoch + 1,
+                    "last_activity_at": datetime.now(UTC),
+                }
+            )
+            self._sessions[session_id] = fenced
+            result = fenced.model_copy(deep=True)
+            _activate_session_run_fence(result)
+            return result
+
+    async def release_run_fence(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        if expected_run_epoch is None:
+            return
+        try:
+            async with self._lock:
+                session = self._sessions.get(session_id)
+                if session is not None and session.run_epoch == expected_run_epoch:
+                    self._sessions[session_id] = session.model_copy(
+                        update={"run_epoch": session.run_epoch + 1}
+                    )
+        finally:
+            _deactivate_session_run_fence(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -1330,8 +1503,10 @@ class InMemorySessionStore(SessionStore):
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         async with self._lock:
-            if session_id not in self._sessions:
+            session = self._sessions.get(session_id)
+            if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             existing_ids = self._event_ids[session_id]
             for event in copied_events:
                 if event.id in existing_ids:
@@ -1346,12 +1521,17 @@ class InMemorySessionStore(SessionStore):
                     event=stored_event,
                 )
                 self._event_records.append(record)
+                self._event_records_by_id[(session_id, stored_event.id)] = record
                 # Share the same EventRecord across the secondary indexes; records are
                 # immutable in practice and query paths copy before returning.
                 session_records.append(record)
                 self._type_event_records.setdefault(str(stored_event.type), []).append(record)
                 existing_ids.add(stored_event.id)
                 self._next_event_sequence += 1
+            if copied_events:
+                self._sessions[session_id] = session.model_copy(
+                    update={"last_activity_at": datetime.now(UTC)}
+                )
 
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1396,6 +1576,9 @@ class InMemorySessionStore(SessionStore):
         All returned lists stay sequence-ascending so downstream ordering and
         ``after_sequence`` paging behave exactly as a full scan would.
         """
+        if query.event_id is not None and query.session_id is not None:
+            record = self._event_records_by_id.get((query.session_id, query.event_id))
+            return [] if record is None else [record]
         if query.session_id is not None:
             return self._session_event_records.get(query.session_id, [])
         if query.session_ids:
@@ -1475,11 +1658,16 @@ class InMemorySessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = _detach_transcript_messages(messages)
         async with self._lock:
-            if session_id not in self._sessions:
+            session = self._sessions.get(session_id)
+            if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             if not copied_messages:
                 return
             self._transcripts[session_id].extend(copied_messages)
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
 
     async def append_transcript_messages_and_checkpoint(
         self,
@@ -1493,11 +1681,16 @@ class InMemorySessionStore(SessionStore):
             raise ValueError("Checkpoint state must be a dictionary.")
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
         async with self._lock:
-            if session_id not in self._sessions:
+            session = self._sessions.get(session_id)
+            if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
             self._checkpoints[session_id] = copied_checkpoint
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1540,9 +1733,14 @@ class InMemorySessionStore(SessionStore):
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         async with self._lock:
-            if session_id not in self._sessions:
+            session = self._sessions.get(session_id)
+            if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             self._checkpoints[session_id] = copy_json_value(state, "checkpoint")
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1833,6 +2031,7 @@ def copy_incomplete_session_recovery_request(
         raise TypeError("Incomplete session recovery requires an IncompleteSessionRecoveryRequest.")
     return IncompleteSessionRecoveryRequest(
         session_id=request.session_id,
+        inactive_before=request.inactive_before,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
     )
@@ -1848,6 +2047,7 @@ def copy_incomplete_sessions_recovery_request(
     return IncompleteSessionsRecoveryRequest(
         statuses=set(request.statuses),
         limit=request.limit,
+        inactive_before=request.inactive_before,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
     )
@@ -1884,6 +2084,8 @@ def copy_session(session: Session) -> Session:
         status=session.status,
         created_at=session.created_at,
         updated_at=session.updated_at,
+        last_activity_at=session.last_activity_at,
+        run_epoch=session.run_epoch,
         labels=copy_label_map(session.labels, "labels"),
         metadata=copy_json_value(session.metadata, "metadata"),
     )
@@ -1990,6 +2192,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         environment_name=query.environment_name,
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
+        last_activity_before=query.last_activity_before,
         labels=copy_label_map(query.labels, "labels"),
         label_selectors=copy_label_selector_requirements(query.label_selectors),
         limit=query.limit,
@@ -2008,6 +2211,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
     return EventQuery(
         session_id=query.session_id,
         session_ids=query.session_ids,
+        event_id=query.event_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -2051,6 +2255,11 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.parent_session_id is not None and session.parent_session_id != query.parent_session_id:
         return False
     if query.causal_budget_id is not None and session.causal_budget_id != query.causal_budget_id:
+        return False
+    if (
+        query.last_activity_before is not None
+        and session.last_activity_at > query.last_activity_before
+    ):
         return False
     for key, value in query.labels.items():
         if session.labels.get(key) != value:
@@ -2222,6 +2431,8 @@ def _event_record_matches(
     if query.session_id is not None and event.session_id != query.session_id:
         return False
     if query.session_ids and event.session_id not in query.session_ids:
+        return False
+    if query.event_id is not None and event.id != query.event_id:
         return False
     event_timestamp = event.timestamp.astimezone(UTC)
     if query.since is not None and event_timestamp < query.since:

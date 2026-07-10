@@ -67,13 +67,18 @@ from cayu.runtime.sessions import (
     SessionListResult,
     SessionOutcome,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    _activate_session_run_fence,
+    _assert_session_run_epoch,
     _copy_session_event_batch,
+    _current_session_run_epoch,
+    _deactivate_session_run_fence,
     _prepare_session_fork_request,
     _validate_session_fork_source,
     _validate_status_set,
@@ -146,7 +151,7 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
-_POSTGRES_MIN_REQUIRED_REVISION = 13
+_POSTGRES_MIN_REQUIRED_REVISION = 14
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -183,6 +188,39 @@ def _ilike_contains_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
+async def _raise_session_write_conflict(
+    cur: Any,
+    session_id: str,
+    expected_run_epoch: int,
+) -> None:
+    await cur.execute("SELECT run_epoch FROM cayu_sessions WHERE id = %s", (session_id,))
+    row = await cur.fetchone()
+    if row is None:
+        raise KeyError(f"Session not found: {session_id}")
+    raise SessionRunFenced(
+        f"Session run epoch no longer owns {session_id}: expected {expected_run_epoch}, "
+        f"current {row[0]}."
+    )
+
+
+async def _touch_session_activity(cur: Any, session_id: str, activity_at: datetime) -> None:
+    expected_run_epoch = _current_session_run_epoch(session_id)
+    if expected_run_epoch is None:
+        await cur.execute(
+            "UPDATE cayu_sessions SET last_activity_at = %s WHERE id = %s",
+            (activity_at, session_id),
+        )
+        if cur.rowcount != 1:
+            raise KeyError(f"Session not found: {session_id}")
+        return
+    await cur.execute(
+        "UPDATE cayu_sessions SET last_activity_at = %s WHERE id = %s AND run_epoch = %s",
+        (activity_at, session_id, expected_run_epoch),
+    )
+    if cur.rowcount != 1:
+        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
+
+
 @dataclass(frozen=True)
 class PostgresEmbeddingBackfillResult:
     """Result of a bounded Postgres knowledge embedding backfill."""
@@ -210,6 +248,7 @@ def _event_query_with_session_ids(
 ) -> EventQuery:
     return EventQuery(
         session_ids=session_ids,
+        event_id=query.event_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -433,6 +472,11 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_events "
         "ADD COLUMN IF NOT EXISTS insert_xid xid8 NOT NULL DEFAULT pg_current_xact_id()",
         "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
+    ),
+    14: (
+        "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS "
+        "last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS run_epoch BIGINT NOT NULL DEFAULT 0",
     ),
 }
 
@@ -3089,6 +3133,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             status=SessionStatus.PENDING,
             created_at=now,
             updated_at=now,
+            last_activity_at=now,
             metadata=copy_json_value(request.metadata, "metadata"),
             labels=request.labels,
         )
@@ -3100,7 +3145,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(session),
                     )
@@ -3188,7 +3233,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(fork),
                     )
@@ -3248,38 +3293,41 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
             raise ValueError("Session status must be a SessionStatus.")
-        await self._ensure_ready()
-        updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE cayu_sessions SET status = %s, updated_at = %s WHERE id = %s
-                    """,
-                    (str(status), updated_at, session_id),
-                )
-                if cur.rowcount != 1:
-                    raise KeyError(f"Session not found: {session_id}")
-                loaded = await self._load(cur, session_id)
-            await conn.commit()
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
-            return loaded
+        return await self.transition_status(
+            session_id,
+            from_statuses=set(SessionStatus),
+            to_status=status,
+        )
 
     async def update_model(self, session_id: str, model: str) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         model = require_clean_nonblank(model, "model")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE cayu_sessions SET model = %s, updated_at = %s WHERE id = %s
-                    """,
-                    (model, updated_at, session_id),
-                )
+                if expected_run_epoch is None:
+                    await cur.execute(
+                        """
+                        UPDATE cayu_sessions
+                        SET model = %s, updated_at = %s, last_activity_at = %s
+                        WHERE id = %s
+                        """,
+                        (model, updated_at, updated_at, session_id),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE cayu_sessions
+                        SET model = %s, updated_at = %s, last_activity_at = %s
+                        WHERE id = %s AND run_epoch = %s
+                        """,
+                        (model, updated_at, updated_at, session_id, expected_run_epoch),
+                    )
                 if cur.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
                     raise KeyError(f"Session not found: {session_id}")
                 loaded = await self._load(cur, session_id)
             await conn.commit()
@@ -3341,13 +3389,24 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "UPDATE cayu_sessions SET updated_at = %s WHERE id = %s",
-                    (updated_at, session_id),
-                )
+                if expected_run_epoch is None:
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
+                        "WHERE id = %s",
+                        (updated_at, updated_at, session_id),
+                    )
+                else:
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
+                        "WHERE id = %s AND run_epoch = %s",
+                        (updated_at, updated_at, session_id, expected_run_epoch),
+                    )
                 if cur.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
                     raise KeyError(f"Session not found: {session_id}")
                 await cur.execute(
                     "DELETE FROM cayu_session_labels WHERE session_id = %s",
@@ -3374,13 +3433,30 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise TypeError("Session metadata must be an object.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
-                    (_dumps(new_metadata), updated_at, session_id),
-                )
+                if expected_run_epoch is None:
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s, "
+                        "last_activity_at = %s WHERE id = %s",
+                        (_dumps(new_metadata), updated_at, updated_at, session_id),
+                    )
+                else:
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s, "
+                        "last_activity_at = %s WHERE id = %s AND run_epoch = %s",
+                        (
+                            _dumps(new_metadata),
+                            updated_at,
+                            updated_at,
+                            session_id,
+                            expected_run_epoch,
+                        ),
+                    )
                 if cur.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
                     raise KeyError(f"Session not found: {session_id}")
                 loaded = await self._load(cur, session_id)
             await conn.commit()
@@ -3401,25 +3477,39 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("to_status must be a SessionStatus.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                params: list[object] = [
+                    str(to_status),
+                    updated_at,
+                    updated_at,
+                    1 if to_status == SessionStatus.RUNNING else 0,
+                    session_id,
+                    [str(status) for status in allowed_statuses],
+                ]
+                epoch_clause = ""
+                if expected_run_epoch is not None:
+                    epoch_clause = " AND run_epoch = %s"
+                    params.append(expected_run_epoch)
                 await cur.execute(
-                    """
+                    f"""
                     UPDATE cayu_sessions
-                    SET status = %s, updated_at = %s
-                    WHERE id = %s AND status = ANY(%s)
+                    SET status = %s, updated_at = %s, last_activity_at = %s,
+                        run_epoch = run_epoch + %s
+                    WHERE id = %s AND status = ANY(%s){epoch_clause}
                     """,
-                    (
-                        str(to_status),
-                        updated_at,
-                        session_id,
-                        [str(status) for status in allowed_statuses],
-                    ),
+                    params,
                 )
                 if cur.rowcount != 1:
                     loaded = await self._load(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
+                        raise SessionRunFenced(
+                            f"Session run epoch no longer owns {session_id}: expected "
+                            f"{expected_run_epoch}, current {loaded.run_epoch}."
+                        )
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
@@ -3427,6 +3517,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             await conn.commit()
             if loaded is None:
                 raise KeyError(f"Session not found: {session_id}")
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(loaded)
             return loaded
 
     async def transition_status_and_checkpoint(
@@ -3451,11 +3543,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
                         )
-
                     transformed_checkpoint = checkpoint_transform(
                         loaded,
                         await self._load_checkpoint(cur, session_id),
@@ -3467,9 +3559,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
                     await cur.execute(
                         """
-                        UPDATE cayu_sessions SET status = %s, updated_at = %s WHERE id = %s
+                        UPDATE cayu_sessions
+                        SET status = %s, updated_at = %s, last_activity_at = %s,
+                            run_epoch = run_epoch + %s
+                        WHERE id = %s
                         """,
-                        (str(to_status), updated_at, session_id),
+                        (
+                            str(to_status),
+                            updated_at,
+                            updated_at,
+                            1 if to_status == SessionStatus.RUNNING else 0,
+                            session_id,
+                        ),
                     )
                     if transformed_checkpoint is not None:
                         await self._upsert_checkpoint(
@@ -3479,7 +3580,78 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             except Exception:
                 await conn.rollback()
                 raise
-            return loaded.model_copy(update={"status": to_status, "updated_at": updated_at})
+            transitioned = loaded.model_copy(
+                update={
+                    "status": to_status,
+                    "updated_at": updated_at,
+                    "last_activity_at": updated_at,
+                    "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
+                }
+            )
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(transitioned)
+            return transitioned
+
+    async def fence_stalled_run(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_before: datetime,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
+            raise ValueError("inactive_before must be timezone-aware.")
+        await self._ensure_ready()
+        now = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE cayu_sessions
+                    SET run_epoch = run_epoch + 1, last_activity_at = %s
+                    WHERE id = %s AND status = ANY(%s) AND last_activity_at <= %s
+                    RETURNING run_epoch
+                    """,
+                    (
+                        now,
+                        session_id,
+                        [str(status) for status in allowed_statuses],
+                        inactive_before,
+                    ),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    loaded = await self._load(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await conn.commit()
+                    return None
+                loaded = await self._load(cur, session_id)
+            await conn.commit()
+            if loaded is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _activate_session_run_fence(loaded)
+            return loaded
+
+    async def release_run_fence(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        if expected_run_epoch is None:
+            return
+        await self._ensure_ready()
+        try:
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch + 1 "
+                        "WHERE id = %s AND run_epoch = %s",
+                        (session_id, expected_run_epoch),
+                    )
+                await conn.commit()
+        finally:
+            _deactivate_session_run_fence(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -3488,6 +3660,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         await self._ensure_ready()
+        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -3498,17 +3671,36 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     # trip, replacing a SELECT ... FOR UPDATE + COALESCE(MAX())
                     # scan on this hot write path. A no-op (+0) update on an empty
                     # batch still returns the row, so a missing session is caught.
-                    await cur.execute(
-                        """
-                        UPDATE cayu_sessions
-                        SET event_seq = event_seq + %s
-                        WHERE id = %s
-                        RETURNING event_seq
-                        """,
-                        (len(copied_events), session_id),
-                    )
+                    activity_at = datetime.now(UTC)
+                    if expected_run_epoch is None:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + %s, last_activity_at = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (len(copied_events), activity_at, session_id),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + %s, last_activity_at = %s
+                            WHERE id = %s AND run_epoch = %s
+                            RETURNING event_seq
+                            """,
+                            (
+                                len(copied_events),
+                                activity_at,
+                                session_id,
+                                expected_run_epoch,
+                            ),
+                        )
                     order_row = await cur.fetchone()
                     if order_row is None:
+                        if expected_run_epoch is not None:
+                            await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
                         raise KeyError(f"Session not found: {session_id}")
                     if not copied_events:
                         await conn.commit()
@@ -3842,6 +4034,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 if await cur.fetchone() is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if copied_messages:
+                    await _touch_session_activity(cur, session_id, datetime.now(UTC))
                     await cur.executemany(
                         """
                         INSERT INTO cayu_transcript_messages (session_id, message)
@@ -3876,6 +4069,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if await cur.fetchone() is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    await _touch_session_activity(cur, session_id, updated_at)
                     if copied_messages:
                         await cur.executemany(
                             """
@@ -3984,6 +4178,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
                 if await cur.fetchone() is None:
                     raise KeyError(f"Session not found: {session_id}")
+                await _touch_session_activity(cur, session_id, updated_at)
                 await self._upsert_checkpoint(cur, session_id, copied, updated_at)
             await conn.commit()
 

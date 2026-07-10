@@ -1571,6 +1571,7 @@ def create_router(
     auth: AuthDependency | None = None,
     api_path: str = SERVER_API_PREFIX,
     openapi_url: str | None = "/openapi.json",
+    replay_idle_timeout_s: float = 300.0,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -1586,7 +1587,17 @@ def create_router(
             ``/api``.
         openapi_url: Public OpenAPI schema URL advertised by ``/contract`` for
             client generation. Pass ``None`` when generated OpenAPI is disabled.
+        replay_idle_timeout_s: Maximum time an active replay stream may wait
+            without seeing a new persisted event before emitting an error and closing.
     """
+
+    if (
+        isinstance(replay_idle_timeout_s, bool)
+        or not isinstance(replay_idle_timeout_s, (int, float))
+        or replay_idle_timeout_s <= 0
+    ):
+        raise ValueError("replay_idle_timeout_s must be a positive number.")
+    replay_idle_timeout_s = float(replay_idle_timeout_s)
 
     api_prefix = _normalize_api_path(api_path)
     router = APIRouter(prefix=api_prefix)
@@ -1627,23 +1638,16 @@ def create_router(
         Returns ``None`` when the marker event is unknown, so the caller replays the
         full history (at-least-once delivery beats silently dropping events).
         """
-        after_sequence: int | None = None
-        while True:
-            page = await session_store.query_events(
-                EventQuery(
-                    session_id=session_id,
-                    after_sequence=after_sequence,
-                    limit=_EVENT_PAGE_LIMIT_MAX,
-                )
-            )
-            for record in page:
-                if record.event.id == event_id:
-                    return record.sequence
-            if len(page) < _EVENT_PAGE_LIMIT_MAX:
-                return None
-            after_sequence = page[-1].sequence
+        records = await session_store.query_events(
+            EventQuery(session_id=session_id, event_id=event_id, limit=1)
+        )
+        return records[0].sequence if records else None
 
-    async def _replay_events_response(http_request: Request) -> EventSourceResponse | None:
+    async def _replay_events_response(
+        http_request: Request,
+        *,
+        expected_session_id: str | None = None,
+    ) -> EventSourceResponse | None:
         """SSE resume for reconnecting clients (``Last-Event-ID`` header).
 
         Instead of starting new work, replay the session's persisted events after the
@@ -1660,6 +1664,11 @@ def create_router(
                 detail="Last-Event-ID must use `session_id:event_id`.",
             )
         session_id, last_seen_event_id = marker
+        if expected_session_id is not None and session_id != expected_session_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Last-Event-ID session does not match the request session_id.",
+            )
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
@@ -1669,6 +1678,8 @@ def create_router(
 
         async def replay() -> AsyncIterator[dict[str, str]]:
             after_sequence = await _marker_sequence(session_id, last_seen_event_id)
+            loop = asyncio.get_running_loop()
+            idle_deadline = loop.time() + replay_idle_timeout_s
             while True:
                 page = await session_store.query_events(
                     EventQuery(
@@ -1680,12 +1691,23 @@ def create_router(
                 for record in page:
                     after_sequence = record.sequence
                     yield event_to_sse_message(record.event)
+                if page:
+                    idle_deadline = loop.time() + replay_idle_timeout_s
                 if len(page) == _EVENT_PAGE_LIMIT_MAX:
                     continue
                 current = await session_store.load(session_id)
                 if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
                     return
-                await asyncio.sleep(_REPLAY_POLL_INTERVAL_S)
+                remaining = idle_deadline - loop.time()
+                if remaining <= 0:
+                    yield error_to_sse_message(
+                        TimeoutError(
+                            f"Replay for session {session_id} received no events for "
+                            f"{replay_idle_timeout_s:g} seconds."
+                        )
+                    )
+                    return
+                await asyncio.sleep(min(_REPLAY_POLL_INTERVAL_S, remaining))
 
         return EventSourceResponse(replay())
 
@@ -1753,7 +1775,10 @@ def create_router(
         http_request: Request,
         trace_metadata: TraceContextMetadata,
     ):
-        replay = await _replay_events_response(http_request)
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
         if replay is not None:
             return replay
         session = await session_store.load(body.session_id)
@@ -1785,8 +1810,15 @@ def create_router(
     )
     async def interrupt_session(
         session_id: NonBlankString,
+        http_request: Request,
         body: InterruptSessionBody | None = None,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
@@ -1841,8 +1873,15 @@ def create_router(
     )
     async def resolve_tool_approval(
         body: ToolApprovalBody,
+        http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1874,8 +1913,15 @@ def create_router(
     )
     async def recover_tool_approval(
         body: ToolApprovalRecoveryBody,
+        http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1911,8 +1957,15 @@ def create_router(
     )
     async def recover_tool_round(
         body: ToolRoundRecoveryBody,
+        http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1948,8 +2001,15 @@ def create_router(
     )
     async def resolve_user_input(
         body: UserInputResolveBody,
+        http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
@@ -1982,8 +2042,15 @@ def create_router(
     )
     async def recover_user_input(
         body: UserInputRecoveryBody,
+        http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
     ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
+        if replay is not None:
+            return replay
         session = await session_store.load(body.session_id)
         if session is None:
             raise HTTPException(
