@@ -98,6 +98,7 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.approvals import (
     PendingToolApproval,
@@ -872,8 +873,8 @@ class _ToolRoundRunner:
                     budget_limits=self._budget_limits,
                     retry_policy=self._retry_policy,
                 )
-                yield await app._emit(checkpoint_event)
-                yield await app._emit(
+                yield await app._event_writer.emit(checkpoint_event)
+                yield await app._event_writer.emit(
                     Event(
                         type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                         session_id=session.id,
@@ -929,8 +930,8 @@ class _ToolRoundRunner:
                 question=question,
                 options=options,
             )
-            yield await app._emit(checkpoint_event)
-            yield await app._emit(
+            yield await app._event_writer.emit(checkpoint_event)
+            yield await app._event_writer.emit(
                 Event(
                     type=EventType.SESSION_AWAITING_USER_INPUT,
                     session_id=session.id,
@@ -1463,7 +1464,11 @@ class CayuApp:
         self._loop_policies = tuple(policies)
         self._mcp_manifest_policy = manifest_policy
         self._context_counting = context_counting_config
-        self._event_sinks = sinks
+        self._event_writer = RuntimeEventWriter(
+            session_store=self.session_store,
+            budget_store=self.budget_store,
+            event_sinks=sinks,
+        )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
@@ -2752,7 +2757,7 @@ class CayuApp:
             session_id=session_id,
             payload=copy_json_value(payload or {}, "payload"),
         )
-        return await self._emit(event)
+        return await self._event_writer.emit(event)
 
     async def _resume_session(
         self,
@@ -2798,7 +2803,7 @@ class CayuApp:
         except Exception as exc:
             try:
                 await self.session_store.update_status(session.id, SessionStatus.FAILED)
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     Event(
                         type=EventType.SESSION_FAILED,
                         session_id=session.id,
@@ -2934,7 +2939,7 @@ class CayuApp:
             transcript_cursor=request.transcript_cursor,
             checkpoint_transform=checkpoint_transform,
         )
-        yield await self._emit(
+        yield await self._event_writer.emit(
             Event(
                 type=EventType.SESSION_FORKED,
                 session_id=created.id,
@@ -3066,7 +3071,7 @@ class CayuApp:
             if factory_resolution.error is not None:
                 raise factory_resolution.error
             if emit_resume_event:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     Event(
                         type=EventType.SESSION_RESUMED,
                         session_id=session.id,
@@ -3141,7 +3146,7 @@ class CayuApp:
                     }
                     if registered_tool is not None:
                         started_payload["effect"] = registered_tool.effect.value
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         Event(
                             type=EventType.TOOL_CALL_STARTED,
                             session_id=session.id,
@@ -3477,7 +3482,9 @@ class CayuApp:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            emitted_recovery_events = await self._event_writer.emit_many(
+                session.id, recovery_events
+            )
             for event in emitted_recovery_events:
                 yield event
             tool_call = runtime_records.ToolCallRequest(
@@ -3696,7 +3703,7 @@ class CayuApp:
             if factory_resolution.error is not None:
                 raise factory_resolution.error
             if emit_resume_event:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     approval_support.resumed_event(
                         session=session,
                         agent_name=registered_agent.spec.name,
@@ -3708,7 +3715,7 @@ class CayuApp:
                     )
                 )
             if expired:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     Event(
                         type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
                         session_id=session.id,
@@ -3879,7 +3886,7 @@ class CayuApp:
                     and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
                     and request.decision == ToolApprovalDecision.APPROVE
                 ):
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         Event(
                             type=EventType.TOOL_CALL_APPROVED,
                             session_id=session.id,
@@ -3968,7 +3975,7 @@ class CayuApp:
                 cleared_checkpoint,
             )
             pending_approval_cleared = True
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 approval_support.cleared_event(
                     session=session,
                     agent_name=registered_agent.spec.name,
@@ -4088,7 +4095,7 @@ class CayuApp:
                             "approval_id": pending_approval.approval_id,
                         },
                     )
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _task_event(
                             event_type=EventType.TASK_FAILED,
                             task=task,
@@ -4261,7 +4268,9 @@ class CayuApp:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            emitted_recovery_events = await self._event_writer.emit_many(
+                session.id, recovery_events
+            )
             for event in emitted_recovery_events:
                 yield event
             tool_call = runtime_records.ToolCallRequest(
@@ -4537,7 +4546,9 @@ class CayuApp:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._emit_many(session.id, recovery_events)
+            emitted_recovery_events = await self._event_writer.emit_many(
+                session.id, recovery_events
+            )
             recovery_persisted = True
             for event in emitted_recovery_events:
                 yield event
@@ -4799,7 +4810,7 @@ class CayuApp:
             ):
                 yield event
             if start_event_type is not None:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     Event(
                         type=start_event_type,
                         session_id=session.id,
@@ -4834,7 +4845,7 @@ class CayuApp:
                 task_started = True
                 if active_run is not None:
                     active_run.task_started = True
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _task_event(
                         event_type=EventType.TASK_STARTED,
                         task=task,
@@ -4936,7 +4947,7 @@ class CayuApp:
                     )
                 except ContextBuildError as exc:
                     for telemetry in exc.compaction_telemetry:
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _context_compaction_telemetry_event(
                                 telemetry=telemetry,
                                 session=session,
@@ -4945,7 +4956,7 @@ class CayuApp:
                             )
                         )
                     for telemetry in exc.knowledge_telemetry:
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _context_knowledge_telemetry_event(
                                 telemetry=telemetry,
                                 session=session,
@@ -4962,7 +4973,7 @@ class CayuApp:
                             session_id=session.id,
                             checkpoint=exc.checkpoint,
                         )
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             Event(
                                 type=EventType.SESSION_CHECKPOINTED,
                                 session_id=session.id,
@@ -4973,7 +4984,7 @@ class CayuApp:
                         )
                     raise exc.cause from exc
                 for telemetry in context_compaction_telemetry:
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _context_compaction_telemetry_event(
                             telemetry=telemetry,
                             session=session,
@@ -4982,7 +4993,7 @@ class CayuApp:
                         )
                     )
                 for telemetry in context_knowledge_telemetry:
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _context_knowledge_telemetry_event(
                             telemetry=telemetry,
                             session=session,
@@ -4999,7 +5010,7 @@ class CayuApp:
                         session_id=session.id,
                         checkpoint=checkpoint_update,
                     )
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         Event(
                             type=EventType.SESSION_CHECKPOINTED,
                             session_id=session.id,
@@ -5178,7 +5189,7 @@ class CayuApp:
                     and structured_output.strategy == StructuredOutputStrategy.TOOL
                     and _has_structured_output_tool_call(tool_calls)
                 ):
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _structured_output_validating_event(
                             session=session,
                             registered_agent=registered_agent,
@@ -5210,7 +5221,7 @@ class CayuApp:
                         tool_result_messages,
                     )
                     if validation.valid:
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
                                 session=session,
@@ -5224,7 +5235,7 @@ class CayuApp:
                             )
                         )
                         break
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _structured_output_event(
                             event_type=EventType.STRUCTURED_OUTPUT_FAILED,
                             session=session,
@@ -5249,7 +5260,7 @@ class CayuApp:
                             "maximum model steps reached before repair."
                         )
                     structured_output_retries += 1
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _structured_output_event(
                             event_type=EventType.STRUCTURED_OUTPUT_RETRY,
                             session=session,
@@ -5266,7 +5277,7 @@ class CayuApp:
 
                 if not tool_calls:
                     if structured_output is not None:
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _structured_output_validating_event(
                                 session=session,
                                 registered_agent=registered_agent,
@@ -5287,7 +5298,7 @@ class CayuApp:
                                 structured_output,
                             )
                             if validation.valid:
-                                yield await self._emit(
+                                yield await self._event_writer.emit(
                                     _structured_output_event(
                                         event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
                                         session=session,
@@ -5303,7 +5314,7 @@ class CayuApp:
                                 break
                         else:
                             validation = structured_output_tool_required_validation()
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_FAILED,
                                 session=session,
@@ -5344,7 +5355,7 @@ class CayuApp:
                             session.id,
                             [repair_message],
                         )
-                        yield await self._emit(
+                        yield await self._event_writer.emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_RETRY,
                                 session=session,
@@ -5458,7 +5469,7 @@ class CayuApp:
                 task_finished = True
                 if active_run is not None:
                     active_run.task_finished = True
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _task_event(
                         event_type=EventType.TASK_COMPLETED,
                         task=task,
@@ -5608,7 +5619,7 @@ class CayuApp:
                     task_finished = True
                     if active_run is not None:
                         active_run.task_finished = True
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _task_event(
                             event_type=EventType.TASK_FAILED,
                             task=task,
@@ -5672,7 +5683,7 @@ class CayuApp:
         usage_events = await usage_tracker.usage_events()
         summary = session_usage_summary(session.id, usage_events)
         duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
-        return await self._emit(
+        return await self._event_writer.emit(
             Event(
                 type=EventType.TURN_COMPLETED,
                 session_id=session.id,
@@ -5928,7 +5939,7 @@ class CayuApp:
                 raise
 
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.CONTEXT_OVERFLOW_DETECTED,
                         session_id=session.id,
@@ -5987,7 +5998,7 @@ class CayuApp:
         except ContextBuildError as build_exc:
             for telemetry in build_exc.compaction_telemetry:
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _context_compaction_telemetry_event(
                             telemetry=telemetry,
                             session=session,
@@ -5999,7 +6010,7 @@ class CayuApp:
                 )
             for telemetry in build_exc.knowledge_telemetry:
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _context_knowledge_telemetry_event(
                             telemetry=telemetry,
                             session=session,
@@ -6019,7 +6030,7 @@ class CayuApp:
                     checkpoint=build_exc.checkpoint,
                 )
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         Event(
                             type=EventType.SESSION_CHECKPOINTED,
                             session_id=session.id,
@@ -6031,7 +6042,7 @@ class CayuApp:
                     None,
                 )
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.CONTEXT_OVERFLOW_FAILED,
                         session_id=session.id,
@@ -6051,7 +6062,7 @@ class CayuApp:
             raise build_exc.cause from build_exc
         for telemetry in context_compaction_telemetry:
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     _context_compaction_telemetry_event(
                         telemetry=telemetry,
                         session=session,
@@ -6063,7 +6074,7 @@ class CayuApp:
             )
         for telemetry in context_knowledge_telemetry:
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     _context_knowledge_telemetry_event(
                         telemetry=telemetry,
                         session=session,
@@ -6081,7 +6092,7 @@ class CayuApp:
                 checkpoint=checkpoint_update,
             )
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.SESSION_CHECKPOINTED,
                         session_id=session.id,
@@ -6103,7 +6114,7 @@ class CayuApp:
             step=step,
         )
         yield (
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.CONTEXT_OVERFLOW_RECOVERING,
                     session_id=session.id,
@@ -6134,7 +6145,7 @@ class CayuApp:
                 yield event, result
         except ModelContextOverflowError as exc:
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.CONTEXT_OVERFLOW_FAILED,
                         session_id=session.id,
@@ -6201,7 +6212,7 @@ class CayuApp:
             if context_count_event is not None:
                 yield context_count_event, None
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.MODEL_STARTED,
                         session_id=session.id,
@@ -6239,7 +6250,7 @@ class CayuApp:
                             and context_pressure_observation is not None
                         ):
                             yield (
-                                await self._emit(
+                                await self._event_writer.emit(
                                     _context_pressure_reconciled_event(
                                         event,
                                         observation=context_pressure_observation,
@@ -6259,7 +6270,7 @@ class CayuApp:
                             and context_count_observation is not None
                         ):
                             yield (
-                                await self._emit(
+                                await self._event_writer.emit(
                                     _context_count_reconciled_event(
                                         event,
                                         observation=context_count_observation,
@@ -6292,7 +6303,7 @@ class CayuApp:
                 )
                 if decision.reason is not None and not exc.emitted_error_event:
                     yield (
-                        await self._emit(
+                        await self._event_writer.emit(
                             Event(
                                 type=EventType.MODEL_ERROR,
                                 session_id=session.id,
@@ -6313,7 +6324,7 @@ class CayuApp:
                         raise exc.cause from exc
                     raise RuntimeError(exc.message) from exc
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _model_retry_event(
                             session=session,
                             registered_agent=registered_agent,
@@ -6331,7 +6342,7 @@ class CayuApp:
                 # output from the event stream drop this attempt's deltas before
                 # the retry emits fresh ones.
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _model_attempt_discarded_event(
                             session=session,
                             registered_agent=registered_agent,
@@ -6373,7 +6384,7 @@ class CayuApp:
             estimate=estimate,
             observation_id=observation_id,
         )
-        event = await self._emit(
+        event = await self._event_writer.emit(
             Event(
                 type=EventType.CONTEXT_PRESSURE_ESTIMATED,
                 session_id=session.id,
@@ -6433,7 +6444,7 @@ class CayuApp:
                 )
             )
         except Exception as exc:
-            event = await self._emit(
+            event = await self._event_writer.emit(
                 Event(
                     type=EventType.CONTEXT_COUNT_FAILED,
                     session_id=session.id,
@@ -6452,7 +6463,7 @@ class CayuApp:
             result=result,
             observation_id=observation_id,
         )
-        event = await self._emit(
+        event = await self._event_writer.emit(
             Event(
                 type=EventType.CONTEXT_COUNTED,
                 session_id=session.id,
@@ -6582,7 +6593,7 @@ class CayuApp:
                         ),
                         usage_dialect=registered_provider.provider.usage_dialect,
                     )
-                    yield await self._emit(event), None
+                    yield await self._event_writer.emit(event), None
                     continue
 
                 if stream_event.type == ModelStreamEventType.ERROR:
@@ -6609,7 +6620,7 @@ class CayuApp:
                     max_attempts=max_attempts,
                     usage_dialect=registered_provider.provider.usage_dialect,
                 )
-                emitted_event = await self._emit(event)
+                emitted_event = await self._event_writer.emit(event)
                 if stream_event.type == ModelStreamEventType.ERROR:
                     message = str(stream_event.payload.get("error") or "Model provider error")
                     provider_error = model_provider_error_from_payload(
@@ -6831,7 +6842,7 @@ class CayuApp:
                 model=session.model,
             )
             emitted_events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.BUDGET_CHECKED,
                         session_id=session.id,
@@ -6908,7 +6919,7 @@ class CayuApp:
         environment_name: str | None,
         check: BudgetCheck,
     ) -> Event:
-        return await self._emit(
+        return await self._event_writer.emit(
             Event(
                 type=EventType.BUDGET_LIMIT_REACHED,
                 session_id=session.id,
@@ -6961,7 +6972,7 @@ class CayuApp:
                 else EventType.BUDGET_RESERVATION_FAILED
             )
             emitted_events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=event_type,
                         session_id=session.id,
@@ -7014,7 +7025,7 @@ class CayuApp:
                 reason=reason,
                 occurred_at=model_completed_event.timestamp,
             )
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 Event(
                     type=EventType.BUDGET_RECONCILED,
                     session_id=session.id,
@@ -7038,7 +7049,7 @@ class CayuApp:
                 reservation_id=reservation.record.reservation_id,
                 reason=reason,
             )
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 Event(
                     type=EventType.BUDGET_RESERVATION_RELEASED,
                     session_id=session.id,
@@ -7072,7 +7083,7 @@ class CayuApp:
             usage_summary=usage_summary,
             cost_summary=cost_summary,
         )
-        yield await self._emit(
+        yield await self._event_writer.emit(
             Event(
                 type=EventType.SESSION_LIMIT_REACHED,
                 session_id=session.id,
@@ -7142,7 +7153,7 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         payload = budget_reservation_payload(result)
-        yield await self._emit(
+        yield await self._event_writer.emit(
             Event(
                 type=EventType.BUDGET_LIMIT_REACHED,
                 session_id=session.id,
@@ -7193,7 +7204,7 @@ class CayuApp:
         active_run: _ActiveSessionRun | None = None,
     ) -> AsyncIterator[Event]:
         payload = _budget_limit_reached_payload(check)
-        yield await self._emit(
+        yield await self._event_writer.emit(
             Event(
                 type=EventType.BUDGET_LIMIT_REACHED,
                 session_id=session.id,
@@ -7248,7 +7259,7 @@ class CayuApp:
                     session.id
                 )
                 await self.session_store.checkpoint(session.id, cleared_checkpoint)
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     approval_support.cleared_event(
                         session=session,
                         agent_name=registered_agent.spec.name,
@@ -7275,7 +7286,7 @@ class CayuApp:
             self._secret_redactor,
         )
         for skipped_outcome in skipped_outcomes:
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 _limit_reached_tool_call_event(
                     session=session,
                     registered_agent=registered_agent,
@@ -7298,7 +7309,7 @@ class CayuApp:
                 tool_result_messages,
                 cleared_checkpoint,
             )
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 approval_support.cleared_event(
                     session=session,
                     agent_name=registered_agent.spec.name,
@@ -7492,7 +7503,7 @@ class CayuApp:
                 payload["approval_id"] = approval_id
             if input_id is not None:
                 payload["input_id"] = input_id
-            started_event = await self._emit(
+            started_event = await self._event_writer.emit(
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
                     session_id=session.id,
@@ -7604,9 +7615,9 @@ class CayuApp:
                     budget_limits=None,
                     retry_policy=None,
                 )
-                yield (await self._emit(checkpoint_event), None)
+                yield (await self._event_writer.emit(checkpoint_event), None)
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         Event(
                             type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                             session_id=session.id,
@@ -7975,7 +7986,7 @@ class CayuApp:
         ]
         if blocked_checks:
             for payload, _ in blocked_checks:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     Event(
                         type=EventType.MCP_MANIFEST_BLOCKED,
                         session_id=session.id,
@@ -7988,7 +7999,7 @@ class CayuApp:
             raise McpManifestPolicyError(reasons)
 
         for payload, _ in checks:
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 Event(
                     type=EventType.MCP_MANIFEST_CHECKED,
                     session_id=session.id,
@@ -8041,7 +8052,7 @@ class CayuApp:
                         "Proxy authorization redaction returned non-object payload."
                     )
                 payload = redacted_payload
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 Event(
                     type=EventType.CREDENTIAL_PROXY_CHECKED,
                     session_id=session.id,
@@ -8438,7 +8449,7 @@ class CayuApp:
                     message="Session activity changed during recovery; recovery skipped.",
                 )
             events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.SESSION_RUN_FENCED,
                         session_id=session.id,
@@ -8807,7 +8818,7 @@ class CayuApp:
             return
         if not terminal_event_exists:
             for interrupted_result in interrupted_results:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _interrupted_tool_call_event(
                         session=session,
                         registered_agent=registered_agent,
@@ -8940,7 +8951,7 @@ class CayuApp:
         pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         if await self._tool_round_has_result_messages(session.id, pending_tool_calls):
             await self._clear_pending_tool_round_if_matches(session.id, pending_round)
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 Event(
                     type=EventType.SESSION_CHECKPOINTED,
                     session_id=session.id,
@@ -9041,7 +9052,7 @@ class CayuApp:
             tool_result_messages,
             cleared_checkpoint,
         )
-        yield await self._emit(
+        yield await self._event_writer.emit(
             Event(
                 type=EventType.SESSION_CHECKPOINTED,
                 session_id=session.id,
@@ -9300,6 +9311,18 @@ class CayuApp:
 
         return emit
 
+    def _workflow_event_emitter(
+        self,
+        session_id: str,
+    ) -> Callable[[list[Event]], Awaitable[list[Event]]]:
+        """Return a workflow/custom emitter that permits Cayu-owned markers."""
+
+        async def emit(events: list[Event]) -> list[Event]:
+            _validate_workflow_event_batch(events, allow_cayu_internal=True)
+            return await self._event_writer.emit_many(session_id, events)
+
+        return emit
+
     async def emit_event(self, event: Event) -> Event:
         """Publish an event to the session store and all sinks.
 
@@ -9309,35 +9332,9 @@ class CayuApp:
         """
         if not isinstance(event, Event):
             raise TypeError("emit_event requires an Event instance.")
-        emitted = await self._emit(event)
+        emitted = await self._event_writer.emit(event)
         self._queue_out_of_band_session_event(emitted)
         return emitted
-
-    async def _emit(self, event: Event) -> Event:
-        await self.session_store.append_event(event.session_id, event)
-        if event.type == EventType.MODEL_COMPLETED:
-            await self.budget_store.append_event(event)
-        for sink in self._event_sinks:
-            try:
-                await sink.emit(event.model_copy(deep=True))
-            except Exception as exc:
-                await self.session_store.append_event(
-                    event.session_id,
-                    Event(
-                        type=EventType.RUNTIME_SINK_FAILED,
-                        session_id=event.session_id,
-                        agent_name=event.agent_name,
-                        environment_name=event.environment_name,
-                        payload={
-                            "sink": type(sink).__name__,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "event_id": event.id,
-                            "event_type": str(event.type),
-                        },
-                    ),
-                )
-        return event
 
     async def _resolve_registered_environment_factory_for_session(
         self,
@@ -9362,7 +9359,7 @@ class CayuApp:
             "labels": copy_label_map(session.labels, "labels"),
         }
         events: list[Event] = [
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.ENVIRONMENT_FACTORY_STARTED,
                     session_id=session.id,
@@ -9407,7 +9404,7 @@ class CayuApp:
                 reconnect_metadata=reconnect_metadata,
             )
             events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
                         session_id=session.id,
@@ -9428,7 +9425,7 @@ class CayuApp:
             if not isinstance(exc, Exception):
                 raise
             events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.ENVIRONMENT_FACTORY_FAILED,
                         session_id=session.id,
@@ -9550,7 +9547,7 @@ class CayuApp:
         events: list[Event] = []
         base_payload = _binding_base_payload(registered_environment)
         events.append(
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.ENVIRONMENT_BINDING_STARTED,
                     session_id=session.id,
@@ -9570,7 +9567,7 @@ class CayuApp:
             )
         except Exception as exc:
             events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.ENVIRONMENT_BINDING_FAILED,
                         session_id=session.id,
@@ -9594,7 +9591,7 @@ class CayuApp:
         bound_environment.workspace = bound.workspace
         bound_environment.runner = bound.runner
         events.append(
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.ENVIRONMENT_BINDING_COMPLETED,
                     session_id=session.id,
@@ -9638,7 +9635,7 @@ class CayuApp:
             "outcome": outcome,
         }
         events: list[Event] = [
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
                     session_id=session.id,
@@ -9665,7 +9662,7 @@ class CayuApp:
                 "error_type": type(exc).__name__,
             }
             events.append(
-                await self._emit(
+                await self._event_writer.emit(
                     Event(
                         type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
                         session_id=session.id,
@@ -9697,7 +9694,7 @@ class CayuApp:
             )
 
         events.append(
-            await self._emit(
+            await self._event_writer.emit(
                 Event(
                     type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
                     session_id=session.id,
@@ -9728,7 +9725,7 @@ class CayuApp:
         )
         for binding_event in finalize_result.events:
             yield binding_event
-        terminal_event = await self._emit(finalize_result.event)
+        terminal_event = await self._event_writer.emit(finalize_result.event)
         yield terminal_event
         async for hook_event in self._run_runtime_hooks(
             phase=phase,
@@ -9823,7 +9820,7 @@ class CayuApp:
                 ):
                     continue
                 hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_STARTED,
                         hook_name=hook_name,
@@ -9853,7 +9850,7 @@ class CayuApp:
                     decision = await hook.before_tool_call(context)
                     stop = _resolve_before_tool_call_decision(decision, resolution)
                 except Exception as exc:
-                    yield await self._emit(
+                    yield await self._event_writer.emit(
                         _runtime_hook_event(
                             event_type=EventType.HOOK_FAILED,
                             hook_name=hook_name,
@@ -9873,7 +9870,7 @@ class CayuApp:
                         )
                     )
                     continue
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_COMPLETED,
                         hook_name=hook_name,
@@ -9941,7 +9938,7 @@ class CayuApp:
                 result=final_result,
                 redactor=resolved_redactor,
             )
-        tool_event = await self._emit(event)
+        tool_event = await self._event_writer.emit(event)
         outcome = runtime_records.ToolCallOutcome(call=tool_call, result=final_result)
         yield tool_event, outcome
 
@@ -10007,7 +10004,7 @@ class CayuApp:
                 continue
             hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_STARTED,
                         hook_name=hook_name,
@@ -10049,7 +10046,7 @@ class CayuApp:
                 modified = resolved if allow_modification else None
             except Exception as exc:
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _runtime_hook_event(
                             event_type=EventType.HOOK_FAILED,
                             hook_name=hook_name,
@@ -10074,7 +10071,7 @@ class CayuApp:
             if modified is not None:
                 current_result = modified
             yield (
-                await self._emit(
+                await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_COMPLETED,
                         hook_name=hook_name,
@@ -10112,7 +10109,7 @@ class CayuApp:
             ):
                 continue
             hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_STARTED,
                     hook_name=hook_name,
@@ -10135,7 +10132,7 @@ class CayuApp:
             try:
                 await _call_runtime_hook(hook=hook, phase=phase, context=context)
             except Exception as exc:
-                yield await self._emit(
+                yield await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_FAILED,
                         hook_name=hook_name,
@@ -10153,7 +10150,7 @@ class CayuApp:
                     )
                 )
                 continue
-            yield await self._emit(
+            yield await self._event_writer.emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_COMPLETED,
                     hook_name=hook_name,
@@ -10199,7 +10196,7 @@ class CayuApp:
                     continue
                 policy_name = require_clean_nonblank(policy.name, "loop_policy.name")
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _before_stop_policy_event(
                             event_type="custom.loop.before_stop.started",
                             policy_name=policy_name,
@@ -10226,7 +10223,7 @@ class CayuApp:
                     decision = copy_before_stop_decision(await policy.before_stop(context))
                 except Exception as exc:
                     yield (
-                        await self._emit(
+                        await self._event_writer.emit(
                             _before_stop_policy_event(
                                 event_type="custom.loop.before_stop.failed",
                                 policy_name=policy_name,
@@ -10246,7 +10243,7 @@ class CayuApp:
                     )
                     raise
                 yield (
-                    await self._emit(
+                    await self._event_writer.emit(
                         _before_stop_policy_event(
                             event_type="custom.loop.before_stop.completed",
                             policy_name=policy_name,
@@ -10267,7 +10264,7 @@ class CayuApp:
                 )
                 if decision.action != BeforeStopAction.COMPLETE:
                     yield (
-                        await self._emit(
+                        await self._event_writer.emit(
                             _before_stop_policy_event(
                                 event_type="custom.loop.before_stop.selected",
                                 policy_name=policy_name,
@@ -10299,54 +10296,28 @@ class CayuApp:
         budget accounting that only the runtime's own paths apply, so letting
         them through here would silently skip those.
         """
-        if type(events) is not list:
-            raise TypeError("Runtime events must be a list.")
-        for event in events:
-            if type(event) is not Event:
-                raise TypeError("Runtime events must be Event instances.")
-            if not str(event.type).startswith(("workflow.", "custom.")):
-                raise ValueError(
-                    "emit_events only accepts workflow. or custom. namespace "
-                    f"events; got {str(event.type)!r}."
-                )
-            if str(event.type).startswith("custom.cayu."):
-                raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
-        return await self._emit_many(session_id, events)
+        _validate_workflow_event_batch(events, allow_cayu_internal=False)
+        return await self._event_writer.emit_many(session_id, events)
 
-    async def _emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
-        if type(events) is not list:
-            raise TypeError("Runtime events must be a list.")
-        copied_events: list[Event] = []
-        for event in events:
-            if type(event) is not Event:
-                raise TypeError("Runtime events must be Event instances.")
-            if event.session_id != session_id:
-                raise ValueError("Event session_id does not match target session.")
-            copied_events.append(event.model_copy(deep=True))
 
-        await self.session_store.append_events(session_id, copied_events)
-        for event in copied_events:
-            for sink in self._event_sinks:
-                try:
-                    await sink.emit(event.model_copy(deep=True))
-                except Exception as exc:
-                    await self.session_store.append_event(
-                        event.session_id,
-                        Event(
-                            type=EventType.RUNTIME_SINK_FAILED,
-                            session_id=event.session_id,
-                            agent_name=event.agent_name,
-                            environment_name=event.environment_name,
-                            payload={
-                                "sink": type(sink).__name__,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
-                                "event_id": event.id,
-                                "event_type": str(event.type),
-                            },
-                        ),
-                    )
-        return copied_events
+def _validate_workflow_event_batch(
+    events: list[Event],
+    *,
+    allow_cayu_internal: bool,
+) -> None:
+    if type(events) is not list:
+        raise TypeError("Runtime events must be a list.")
+    for event in events:
+        if type(event) is not Event:
+            raise TypeError("Runtime events must be Event instances.")
+        event_type = str(event.type)
+        if not event_type.startswith(("workflow.", "custom.")):
+            raise ValueError(
+                "emit_events only accepts workflow. or custom. namespace "
+                f"events; got {event_type!r}."
+            )
+        if not allow_cayu_internal and event_type.startswith("custom.cayu."):
+            raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
 
 
 def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_records.RegisteredTool:

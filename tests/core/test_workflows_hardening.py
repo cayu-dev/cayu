@@ -579,6 +579,57 @@ def test_custom_journal_factory_receives_runtime_event_emitter():
     assert "custom.workflow.factory.emitted" in [event.type for event in sink.events]
 
 
+def test_custom_journal_runtime_event_emitter_rejects_runtime_namespace():
+    app = CayuApp(enable_logging=False)
+    contexts: list[WorkflowJournalContext] = []
+
+    def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
+        contexts.append(context)
+        return EventStoreJournal(
+            context.session_store,
+            context.session_id,
+            context.workflow_name,
+            event_emitter=context.emit_events,
+        )
+
+    TinyWorkflow(app, journal_factory=journal_factory).context("wf-custom-runtime-event")
+
+    async def emit_runtime_event():
+        await contexts[0].emit_events(
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="wf-custom-runtime-event",
+                )
+            ]
+        )
+
+    with pytest.raises(ValueError, match="workflow. or custom."):
+        asyncio.run(emit_runtime_event())
+
+
+def test_custom_journal_runtime_event_emitter_allows_cayu_attempt_marker():
+    sink = InMemoryEventSink()
+    app = CayuApp(enable_logging=False, event_sinks=[sink])
+
+    def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
+        return EventStoreJournal(
+            context.session_store,
+            context.session_id,
+            context.workflow_name,
+            event_emitter=context.emit_events,
+        )
+
+    ctx = TinyWorkflow(app, journal_factory=journal_factory).context("wf-custom-reserved-event")
+
+    asyncio.run(ctx.start())
+
+    assert [event.type for event in sink.events] == [
+        WORKFLOW_ATTEMPT_EVENT_TYPE,
+        EventType.WORKFLOW_STARTED,
+    ]
+
+
 def test_workflow_journal_completed_steps_are_filtered_by_workflow_name():
     app = CayuApp(enable_logging=False)
     store = app.session_store

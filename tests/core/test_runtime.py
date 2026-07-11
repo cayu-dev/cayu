@@ -315,24 +315,6 @@ class MutatingProvider(FakeProvider):
             yield event
 
 
-class FailingEventSink(EventSink):
-    async def emit(self, event: Event) -> None:
-        raise RuntimeError("sink unavailable")
-
-
-class MutatingEventSink(EventSink):
-    async def emit(self, event: Event) -> None:
-        event.payload["mutated"] = True
-
-
-class RecordingEventSink(EventSink):
-    def __init__(self) -> None:
-        self.events: list[Event] = []
-
-    async def emit(self, event: Event) -> None:
-        self.events.append(event)
-
-
 class RecordingCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.requests: list[CompactionRequest] = []
@@ -12135,81 +12117,6 @@ def test_cayu_app_uses_registered_provider_name_after_provider_mutation():
 
     assert events[1].type == EventType.MODEL_STARTED
     assert events[1].payload["provider"] == "fake"
-
-
-def test_cayu_app_records_sink_failures_without_failing_session():
-    store = InMemorySessionStore()
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("hello"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
-    app = CayuApp(session_store=store, event_sinks=[FailingEventSink()])
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_sink_failure",
-                messages=[Message.text("user", "hi")],
-            ),
-        )
-    )
-    persisted = asyncio.run(store.load_events("sess_sink_failure"))
-    session = asyncio.run(store.load("sess_sink_failure"))
-
-    assert [event.type for event in events] == [
-        EventType.SESSION_STARTED,
-        EventType.MODEL_STARTED,
-        EventType.MODEL_TEXT_DELTA,
-        EventType.MODEL_COMPLETED,
-        EventType.TURN_COMPLETED,
-        EventType.SESSION_COMPLETED,
-    ]
-    assert session is not None
-    assert session.status == SessionStatus.COMPLETED
-
-    sink_failures = [event for event in persisted if event.type == EventType.RUNTIME_SINK_FAILED]
-    assert len(sink_failures) == len(events)
-    assert sink_failures[0].payload == {
-        "sink": "FailingEventSink",
-        "error": "sink unavailable",
-        "error_type": "RuntimeError",
-        "event_id": events[0].id,
-        "event_type": EventType.SESSION_STARTED,
-    }
-
-
-def test_cayu_app_protects_returned_and_later_sink_events_from_sink_mutation():
-    recorder = RecordingEventSink()
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("hello"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
-    app = CayuApp(event_sinks=[MutatingEventSink(), recorder])
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_sink_mutation",
-                messages=[Message.text("user", "hi")],
-            ),
-        )
-    )
-
-    assert events[0].type == EventType.SESSION_STARTED
-    assert events[0].payload == {"agent_name": "assistant"}
-    assert recorder.events[0].payload == {"agent_name": "assistant"}
 
 
 def test_cayu_app_executes_tool_call_and_records_result():

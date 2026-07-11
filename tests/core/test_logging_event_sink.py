@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.observability import TRACE_LEVEL, LoggingEventSink
@@ -332,23 +332,64 @@ def test_logging_event_sink_redacts_before_truncating_errors(
 
 def test_logging_event_sink_rejects_invalid_redactor() -> None:
     try:
-        LoggingEventSink(redactor="not-a-redactor")  # type: ignore[arg-type]
+        LoggingEventSink(redactor=cast("SecretRedactor", "not-a-redactor"))
     except TypeError as exc:
         assert "redactor" in str(exc)
     else:
         raise AssertionError("Expected TypeError.")
 
 
-def test_cayu_app_registers_logging_sink_by_default() -> None:
+def test_cayu_app_emits_to_logging_sink_by_default(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     app = CayuApp()
+    app.register_provider(
+        FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    caplog.set_level(logging.INFO, logger="cayu")
 
-    assert any(isinstance(sink, LoggingEventSink) for sink in app._event_sinks)
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_default_logging",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert any(
+        record.message.startswith("session.started") and "sess_default_logging" in record.message
+        for record in caplog.records
+    )
 
 
-def test_cayu_app_can_disable_default_logging_sink() -> None:
+def test_cayu_app_can_disable_default_logging_sink(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     app = CayuApp(enable_logging=False)
+    app.register_provider(
+        FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    caplog.set_level(logging.INFO, logger="cayu")
 
-    assert not any(isinstance(sink, LoggingEventSink) for sink in app._event_sinks)
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_logging_disabled",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert all("sess_logging_disabled" not in record.message for record in caplog.records)
 
 
 def test_default_logging_sink_does_not_replace_custom_sinks() -> None:

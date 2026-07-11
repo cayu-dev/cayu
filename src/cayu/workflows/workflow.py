@@ -404,7 +404,7 @@ class WorkflowBase(Workflow):
             session_store=self.app.session_store,
             session_id=session_id,
             workflow_name=self.spec.name,
-            emit_events=lambda events: self.app._emit_many(session_id, events),
+            emit_events=self.app._workflow_event_emitter(session_id),
         )
         journal = self._journal_factory(journal_context)
         return WorkflowContext(
