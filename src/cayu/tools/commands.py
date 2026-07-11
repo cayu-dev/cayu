@@ -207,6 +207,7 @@ class ExecCommandTool(Tool):
                 "cancelled": result.cancelled,
                 "artifacts": copy_json_value(result.artifacts, "artifacts"),
             },
+            artifacts=result.artifacts,
             is_error=result.timed_out or result.cancelled,
         )
 

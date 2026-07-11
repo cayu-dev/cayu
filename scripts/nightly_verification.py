@@ -466,6 +466,22 @@ CHECKS: tuple[VerificationCheck, ...] = (
         prerequisites=("SQLite triggers", "durable filesystem"),
         unset_env=_LIVE_CREDENTIAL_ENV,
     ),
+    VerificationCheck(
+        id="runner-cleanup-failure",
+        capability="runner command cleanup failure with unknown subprocess state",
+        lane="fault-injection",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/faults/test_runner_cleanup_failure.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("POSIX process groups",),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+        requires_sigkill=True,
+    ),
 )
 
 
