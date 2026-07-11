@@ -532,6 +532,22 @@ def test_runner_cleanup_failure_check_is_verified_and_credential_free() -> None:
     assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
 
 
+def test_workspace_sync_failure_check_is_verified_and_credential_free() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "workspace-sync-failure")
+
+    assert check.command == (
+        "uv",
+        "run",
+        "pytest",
+        "tests/faults/test_workspace_sync_failure.py",
+        "-q",
+    )
+    assert check.lane == "fault-injection"
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.prerequisites == ("SQLite", "durable filesystem")
+    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
+
+
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
     environ = {

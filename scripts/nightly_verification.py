@@ -482,6 +482,21 @@ CHECKS: tuple[VerificationCheck, ...] = (
         unset_env=_LIVE_CREDENTIAL_ENV,
         requires_sigkill=True,
     ),
+    VerificationCheck(
+        id="workspace-sync-failure",
+        capability="partial workspace sync finalization and convergent retry",
+        lane="fault-injection",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/faults/test_workspace_sync_failure.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("SQLite", "durable filesystem"),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+    ),
 )
 
 

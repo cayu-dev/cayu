@@ -90,7 +90,7 @@ or in CI.
 | --- | --- | ---: | --- |
 | Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest`, `internal-evals-hermetic` |
 | Process-death recovery | POSIX `SIGKILL`; deterministic SQLite stores and scripted providers | $0 | `sigkill-recovery` |
-| Controlled fault injection | loopback TCP, durable SQLite, and POSIX process groups | $0 | `provider-stream-abort`, `sqlite-write-failure`, `runner-cleanup-failure` |
+| Controlled fault injection | loopback TCP, durable SQLite/filesystems, and POSIX process groups | $0 | `provider-stream-abort`, `sqlite-write-failure`, `runner-cleanup-failure`, `workspace-sync-failure` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
@@ -128,6 +128,7 @@ high level:
 | real provider adapter transport abort with durable terminal state | verified on loopback TCP and SQLite | `provider-stream-abort` |
 | real SQLite terminal-event transaction failure and manual recovery | verified on durable SQLite | `sqlite-write-failure` |
 | real subprocess cleanup failure, closed runner latch, and leak-free teardown | verified on POSIX | `runner-cleanup-failure` |
+| real partial workspace sync failure, durable diagnostics, and convergent retry | verified on local filesystems and SQLite | `workspace-sync-failure` |
 | packaged dashboard sessions list, session detail, and event detail | verified when Playwright Chromium is installed | `dashboard-behavior` |
 | budgets under real provider spend | verified when `OPENAI_API_KEY` is present | `real-spend-budgets` |
 
@@ -230,14 +231,14 @@ recovery; it does not claim operating-system supervision, arbitrary external
 exactly-once behavior, live-provider behavior, remote sandbox restart, machine
 reboot, or cross-region failover.
 
-Run the credential-free provider transport-abort, SQLite write-failure, and
-runner cleanup-failure contracts independently:
+Run the credential-free controlled-failure contracts independently:
 
 ```bash
 uv run python scripts/nightly_verification.py \
   --check provider-stream-abort \
   --check sqlite-write-failure \
   --check runner-cleanup-failure \
+  --check workspace-sync-failure \
   --strict
 ```
 
@@ -257,6 +258,12 @@ forces command cleanup to report failure at the timeout boundary, and verifies
 that the cleanup artifact reaches the tool transcript and the runner refuses a
 second command while state is unknown. Test-owned teardown then sends `SIGKILL`
 and reaps the child so a failing assertion cannot leak it.
+
+The workspace sync check mutates a real bound local workspace, then fails one
+deterministic write after an earlier file has already copied back. SQLite must
+retain the binding-finalize failure on the completed session; retrying the same
+binding state must copy every intended file, remove the stale file, and release
+the target for reuse.
 
 Run credential-gated lanes only when the credential and quota are intentionally
 available:
@@ -286,8 +293,8 @@ values.
 
 ## Known Holes
 
-No capability in the current runner is classified as `unclaimed`. Issue #200
-tracks the remaining controlled fault-injection additions.
+No capability in the current runner is classified as `unclaimed`, and the
+controlled fault-injection checks documented above are implemented.
 
 Scheduled automation in #174 should decide which skipped or unclaimed statuses
 are accepted for the nightly environment and which should fail the workflow.
