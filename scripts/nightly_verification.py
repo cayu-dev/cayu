@@ -63,6 +63,7 @@ class VerificationCheck:
     requires_docker: bool = False
     requires_postgres: bool = False
     requires_sigkill: bool = False
+    requires_playwright_chromium: bool = False
     requires_structured_evidence: bool = False
     timeout_s: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     reason: str | None = None
@@ -398,8 +399,13 @@ CHECKS: tuple[VerificationCheck, ...] = (
         id="dashboard-behavior",
         capability="dashboard browser behavior",
         lane="dashboard",
-        status_on_success=STATUS_UNCLAIMED,
-        reason="No browser or component behavior check is currently defined.",
+        command=("uv", "run", "python", "examples/dashboard_behavior_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("Playwright Chromium", "Cayu server extra"),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+        required_modules=("playwright", "fastapi", "uvicorn"),
+        requires_playwright_chromium=True,
+        requires_structured_evidence=True,
     ),
     VerificationCheck(
         id="sigkill-recovery",
@@ -649,11 +655,8 @@ def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str])
         for names in check.required_any_env
         if not any(environ.get(name) for name in names)
     ]
-    missing += [
-        f"Python module {name!r} is unavailable"
-        for name in check.required_modules
-        if _module_missing(name)
-    ]
+    missing_modules = [name for name in check.required_modules if _module_missing(name)]
+    missing += [f"Python module {name!r} is unavailable" for name in missing_modules]
     missing += [
         f"command {name!r} is unavailable"
         for name in check.required_commands
@@ -667,6 +670,12 @@ def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str])
         missing.append("Postgres is unavailable: set CAYU_TEST_POSTGRES_DSN or run Docker")
     if check.requires_sigkill and not _sigkill_available():
         missing.append("POSIX SIGKILL is unavailable")
+    if (
+        check.requires_playwright_chromium
+        and "playwright" not in missing_modules
+        and not _playwright_chromium_available()
+    ):
+        missing.append("Playwright Chromium is unavailable")
     return missing
 
 
@@ -674,6 +683,16 @@ def _module_missing(name: str) -> bool:
     import importlib.util
 
     return importlib.util.find_spec(name) is None
+
+
+def _playwright_chromium_available() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).is_file()
+    except Exception:
+        return False
 
 
 def _sigkill_available() -> bool:

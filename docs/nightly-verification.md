@@ -98,7 +98,7 @@ or in CI.
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live` |
 | OpenAI/Anthropic smoke | provider API key | provider-dependent | `*-live` provider-smoke checks |
-| Known holes | dashboard browser behavior | varies | `unclaimed` check |
+| Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
 package build, and packaged-asset status checks. It still does not run dashboard
@@ -124,7 +124,7 @@ high level:
 | OpenAI/Anthropic knowledge, subagent, context-pressure, and structured-output demos | smoke | remaining provider-smoke checks |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
-| dashboard browser behavior | unclaimed | `dashboard-behavior` |
+| packaged dashboard sessions list, session detail, and event detail | verified when Playwright Chromium is installed | `dashboard-behavior` |
 | budgets under real provider spend | verified when `OPENAI_API_KEY` is present | `real-spend-budgets` |
 
 Do not update this document with exact pass counts. Counts move as tests are
@@ -132,7 +132,7 @@ added and dependencies change; the generated report records current counts.
 
 ## Live Examples
 
-There are 22 `examples/*_live.py` files:
+There are 23 `examples/*_live.py` files:
 
 | prerequisite | examples |
 | --- | --- |
@@ -141,6 +141,7 @@ There are 22 `examples/*_live.py` files:
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
+| Playwright Chromium | `dashboard_behavior_live.py` |
 | OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
 | OpenAI key | `knowledge_embedding_live.py`, `real_spend_budget_live.py` |
 
@@ -157,6 +158,16 @@ the `*_live.py` glob. The asserted Gemini contract check is
 `examples/chat_completions_contract_live.py`.
 
 ## Manual Runbook
+
+Install the browser and server optional dependencies plus Chromium before
+running the packaged dashboard contract. Chromium is intentionally not
+installed by CI:
+
+```bash
+uv sync --extra browser --extra server
+uv run playwright install chromium
+uv run python scripts/nightly_verification.py --check dashboard-behavior --strict
+```
 
 Run the full visible map:
 
@@ -243,7 +254,8 @@ values.
 
 ## Known Holes
 
-Dashboard runtime/browser behavior remains intentionally visible as `unclaimed`.
+No capability in the current runner is classified as `unclaimed`. Issue #200
+tracks the remaining controlled fault-injection additions.
 
 Scheduled automation in #174 should decide which skipped or unclaimed statuses
 are accepted for the nightly environment and which should fail the workflow.

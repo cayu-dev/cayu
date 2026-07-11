@@ -455,6 +455,32 @@ def test_real_spend_budget_check_requires_credentials_and_structured_evidence() 
     assert check.requires_structured_evidence is True
 
 
+def test_dashboard_behavior_check_skips_when_playwright_chromium_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "dashboard-behavior")
+    called = False
+
+    monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
+    monkeypatch.setattr(nightly, "_playwright_chromium_available", lambda: False)
+
+    def runner(command, env):
+        nonlocal called
+        called = True
+        return nightly.CommandOutcome(returncode=0)
+
+    result = nightly.run_checks([check], environ={}, runner=runner)[0]
+
+    assert check.command == ("uv", "run", "python", "examples/dashboard_behavior_live.py")
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.required_modules == ("playwright", "fastapi", "uvicorn")
+    assert check.requires_playwright_chromium is True
+    assert check.requires_structured_evidence is True
+    assert called is False
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason == "Playwright Chromium is unavailable"
+
+
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
     environ = {
