@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from cayu import Event, EventType, ScriptedModelProvider
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
 from cayu.providers import ModelStreamEvent, build_openai_payload
+from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.storage import KnowledgeEntry, KnowledgeHit, KnowledgeQuery, KnowledgeSearchResult
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
 
@@ -39,10 +49,30 @@ def _load_example(name: str) -> ModuleType:
 
 artifact_file_live = _load_example("artifact_file_live")
 context_counting_live = _load_example("context_counting_live")
+knowledge_embedding_live = _load_example("knowledge_embedding_live")
 real_spend_budget_live = _load_example("real_spend_budget_live")
+structured_output_live = _load_example("structured_output_live")
+
+DEMO_ONLY_EXAMPLES = (
+    "context_pressure_calibration_live",
+    "knowledge_recall_live",
+    "knowledge_recall_many_live",
+    "subagent_live",
+    "subagent_parallel_live",
+)
 
 
 def test_live_example_imports_do_not_modify_process_module_search_path() -> None:
+    assert str(EXAMPLES_DIR) not in sys.path
+
+
+@pytest.mark.parametrize("example_name", DEMO_ONLY_EXAMPLES)
+def test_demo_only_live_example_imports_and_exposes_main_without_sys_path_mutation(
+    example_name: str,
+) -> None:
+    example = _load_example(example_name)
+
+    assert callable(example.main)
     assert str(EXAMPLES_DIR) not in sys.path
 
 
@@ -221,6 +251,274 @@ def test_artifact_file_contract_fails_when_provider_configuration_is_missing(
 
     with pytest.raises(SystemExit, match="provider configuration missing"):
         asyncio.run(artifact_file_live.main())
+
+
+def test_structured_output_contract_validates_expected_invoice_and_usage() -> None:
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_structured_output",
+                name=STRUCTURED_OUTPUT_TOOL_NAME,
+                arguments={"output": structured_output_live.EXPECTED_OUTPUT},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "model": "structured-live-model-2026-01-01",
+                    "usage": {
+                        "input_tokens": 30,
+                        "output_tokens": 12,
+                        "total_tokens": 42,
+                    },
+                }
+            ),
+        ],
+        name="structured-live-test",
+    )
+
+    evidence = asyncio.run(
+        structured_output_live._run_contract(
+            provider=provider,
+            provider_name="structured-live-test",
+            model="structured-live-model",
+            strategy=structured_output_live.StructuredOutputStrategy.TOOL,
+        )
+    )
+
+    assert evidence == {
+        "provider": "structured-live-test",
+        "model": "structured-live-model",
+        "resolved_model": "structured-live-model-2026-01-01",
+        "strategy": "tool",
+        "invoice_number": "INV-1042",
+        "invoice_status": "paid",
+        "total_tokens": 42,
+    }
+    prompt = provider.requests[0].messages[-1].content[0].text
+    assert "Use the exact line-item description 'Managed hosting'." in prompt
+
+
+def test_structured_output_schema_rejects_paraphrased_line_item_description() -> None:
+    output = copy.deepcopy(structured_output_live.EXPECTED_OUTPUT)
+    output["invoice"]["line_items"][0]["description"] = "Managed hosting for 125.50 USD"
+
+    errors = list(Draft202012Validator(structured_output_live.INVOICE_SCHEMA).iter_errors(output))
+
+    assert len(errors) == 1
+    assert list(errors[0].path) == ["invoice", "line_items", 0, "description"]
+
+
+def test_structured_output_contract_rejects_semantically_wrong_valid_output() -> None:
+    events = [
+        _event(
+            EventType.MODEL_COMPLETED,
+            payload={
+                "usage_metrics": {
+                    "provider_name": "structured-live-test",
+                    "requested_model": "structured-live-model",
+                    "input_tokens": 30,
+                    "output_tokens": 12,
+                    "total_tokens": 42,
+                }
+            },
+        ),
+        _event(
+            EventType.STRUCTURED_OUTPUT_VALIDATED,
+            payload={
+                "output": {
+                    **structured_output_live.EXPECTED_OUTPUT,
+                    "invoice": {
+                        **structured_output_live.EXPECTED_OUTPUT["invoice"],
+                        "status": "unpaid",
+                    },
+                }
+            },
+        ),
+        _event(EventType.SESSION_COMPLETED),
+    ]
+
+    with pytest.raises(RuntimeError, match="validated invoice output"):
+        structured_output_live._validate_runtime_events(
+            events,
+            provider_name="structured-live-test",
+            model="structured-live-model",
+            strategy=structured_output_live.StructuredOutputStrategy.TOOL,
+        )
+
+
+def test_structured_output_contract_rejects_unexpected_resolved_model() -> None:
+    events = [
+        _event(
+            EventType.MODEL_COMPLETED,
+            payload={
+                "usage_metrics": {
+                    "provider_name": "structured-live-test",
+                    "requested_model": "structured-live-model",
+                    "model": "structured-live-model-mini",
+                    "input_tokens": 30,
+                    "output_tokens": 12,
+                    "total_tokens": 42,
+                }
+            },
+        ),
+        _event(
+            EventType.STRUCTURED_OUTPUT_VALIDATED,
+            payload={"output": structured_output_live.EXPECTED_OUTPUT},
+        ),
+        _event(EventType.SESSION_COMPLETED),
+    ]
+
+    with pytest.raises(RuntimeError, match="resolved model"):
+        structured_output_live._validate_runtime_events(
+            events,
+            provider_name="structured-live-test",
+            model="structured-live-model",
+            strategy=structured_output_live.StructuredOutputStrategy.TOOL,
+        )
+
+
+@pytest.mark.parametrize(
+    ("requested", "resolved"),
+    [
+        ("gpt-5.5", "gpt-5.5"),
+        ("gpt-5.5", "gpt-5.5-2026-01-01"),
+        ("claude-sonnet-4-6", "claude-sonnet-4-6-20250514"),
+    ],
+)
+def test_structured_output_contract_accepts_exact_or_date_versioned_model(
+    requested: str,
+    resolved: str,
+) -> None:
+    assert structured_output_live._resolved_model_matches(requested, resolved) is True
+
+
+def test_structured_output_contract_fails_when_provider_key_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+
+    with pytest.raises(SystemExit, match="Set OPENAI_API_KEY"):
+        asyncio.run(structured_output_live.main())
+
+
+class _KeywordEmbeddingProvider(TextEmbeddingProvider):
+    name = "embedding-live-test"
+
+    def __init__(self) -> None:
+        self.calls: list[TextEmbeddingRequest] = []
+
+    async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+        self.calls.append(request)
+        return TextEmbeddingResult(
+            model=request.model,
+            embeddings=[
+                TextEmbedding(index=index, vector=_embedding_vector(text))
+                for index, text in enumerate(request.texts)
+            ],
+        )
+
+
+def _embedding_vector(text: str) -> list[float]:
+    folded = text.casefold()
+    return [
+        1.0
+        if any(
+            term in folded for term in ("auth", "broker", "credential", "github", "proxy", "git")
+        )
+        else 0.0,
+        1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
+        1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
+    ]
+
+
+def test_knowledge_embedding_contract_requires_expected_semantic_top_hit() -> None:
+    provider = _KeywordEmbeddingProvider()
+
+    evidence = asyncio.run(
+        knowledge_embedding_live._run_contract(
+            provider=provider,
+            embedding_model="embedding-live-model",
+            dimensions=None,
+        )
+    )
+
+    assert evidence["provider"] == "embedding-live-test"
+    assert evidence["embedding_model"] == "embedding-live-model"
+    assert evidence["top_entry_id"] == "remote_git_credentials"
+    assert evidence["score_kind"] == "inmemory_semantic"
+    assert evidence["score_normalized"] == 1.0
+    assert evidence["hit_count"] > 0
+    assert provider.calls
+    assert {request.model for request in provider.calls} == {"embedding-live-model"}
+    assert provider.calls[-1].texts == [knowledge_embedding_live.QUERY]
+
+
+def test_knowledge_embedding_contract_rejects_wrong_top_hit() -> None:
+    result = KnowledgeSearchResult(
+        query=KnowledgeQuery(
+            text=knowledge_embedding_live.QUERY,
+            limit=5,
+            max_bytes=4_000,
+        ),
+        hits=[
+            KnowledgeHit(
+                entry=KnowledgeEntry(id="wrong", text="Wrong entry."),
+                score=1.0,
+                score_kind="inmemory_semantic",
+                score_normalized=1.0,
+                reason="semantic entry match",
+                rank=1,
+            )
+        ],
+        limit=5,
+        max_bytes=4_000,
+        total_hits_known=1,
+    )
+
+    with pytest.raises(RuntimeError, match="remote_git_credentials"):
+        knowledge_embedding_live._validate_search_result(result)
+
+
+def test_knowledge_embedding_validator_trusts_store_threshold_for_returned_hit() -> None:
+    result = KnowledgeSearchResult(
+        query=KnowledgeQuery(
+            text=knowledge_embedding_live.QUERY,
+            limit=5,
+            max_bytes=4_000,
+        ),
+        hits=[
+            KnowledgeHit(
+                entry=KnowledgeEntry(
+                    id="remote_git_credentials",
+                    text="Use a brokered Git HTTP proxy.",
+                ),
+                score=1.0,
+                score_kind="inmemory_semantic",
+                score_normalized=None,
+                reason="semantic entry match",
+                rank=1,
+            )
+        ],
+        limit=5,
+        max_bytes=4_000,
+        total_hits_known=1,
+    )
+
+    top_hit = knowledge_embedding_live._validate_search_result(result)
+
+    assert top_hit.entry.id == "remote_git_credentials"
+
+
+def test_knowledge_embedding_contract_fails_when_openai_key_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+
+    with pytest.raises(SystemExit, match="Set OPENAI_API_KEY"):
+        asyncio.run(knowledge_embedding_live.main())
 
 
 def test_real_spend_budget_contract_allows_one_call_then_rejects_next_reservation() -> None:

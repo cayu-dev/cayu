@@ -20,7 +20,9 @@ It then compares Cayu's local context-pressure estimate with:
 - official provider input-token count, when available
 - actual provider-reported input tokens from the real model call
 
-Treat it as smoke/calibration coverage in nightly reports.
+It remains manually runnable but is not executed by the verification runner,
+because its output is diagnostic calibration rather than a stable product
+contract.
 """
 
 from __future__ import annotations

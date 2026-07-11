@@ -18,7 +18,6 @@ from typing import Any
 
 STATUS_HERMETIC = "hermetic"
 STATUS_VERIFIED = "verified"
-STATUS_SMOKE = "smoke"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 STATUS_UNCLAIMED = "unclaimed"
@@ -33,12 +32,7 @@ _LIVE_CREDENTIAL_ENV = (
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
 )
-_STRICT_FAILURE_STATUSES = {
-    STATUS_FAILED,
-    STATUS_SKIPPED,
-    STATUS_SMOKE,
-    STATUS_UNCLAIMED,
-}
+_SUCCESS_STATUSES = frozenset({STATUS_HERMETIC, STATUS_VERIFIED})
 _PATH_ENV = {
     "docker": "CAYU_DOCKER_PATH",
     "sbx": "CAYU_SBX_PATH",
@@ -67,6 +61,17 @@ class VerificationCheck:
     requires_structured_evidence: bool = False
     timeout_s: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status_on_success in _SUCCESS_STATUSES:
+            return
+        if self.status_on_success == STATUS_UNCLAIMED and not self.command:
+            return
+        raise ValueError(
+            "status_on_success must be verified or hermetic for executable checks, "
+            "or unclaimed for a check without a command; "
+            f"got {self.status_on_success!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -299,14 +304,14 @@ CHECKS: tuple[VerificationCheck, ...] = (
     ),
     VerificationCheck(
         id="structured-output-live",
-        capability="OpenAI/Anthropic live structured-output demo",
-        lane="provider-smoke",
+        capability="OpenAI/Anthropic structured-output contract",
+        lane="provider-contract",
         command=("uv", "run", "python", "examples/structured_output_live.py"),
-        status_on_success=STATUS_SMOKE,
+        status_on_success=STATUS_VERIFIED,
         prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
         required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
         requires_provider_api_key=True,
-        reason="Demo-only example; it exercises a provider path without stable output assertions.",
+        requires_structured_evidence=True,
     ),
     VerificationCheck(
         id="artifact-file-live",
@@ -330,70 +335,15 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_provider_api_key=True,
     ),
     VerificationCheck(
-        id="context-pressure-calibration-live",
-        capability="OpenAI/Anthropic context pressure calibration demo",
-        lane="provider-smoke",
-        command=("uv", "run", "python", "examples/context_pressure_calibration_live.py"),
-        status_on_success=STATUS_SMOKE,
-        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
-        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
-        requires_provider_api_key=True,
-        reason="Demo-only calibration example.",
-    ),
-    VerificationCheck(
-        id="knowledge-recall-live",
-        capability="OpenAI/Anthropic knowledge recall demo",
-        lane="provider-smoke",
-        command=("uv", "run", "python", "examples/knowledge_recall_live.py"),
-        status_on_success=STATUS_SMOKE,
-        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
-        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
-        requires_provider_api_key=True,
-        reason="Demo-only example; it exercises a provider path without stable output assertions.",
-    ),
-    VerificationCheck(
-        id="knowledge-recall-many-live",
-        capability="OpenAI/Anthropic many-entry knowledge recall demo",
-        lane="provider-smoke",
-        command=("uv", "run", "python", "examples/knowledge_recall_many_live.py"),
-        status_on_success=STATUS_SMOKE,
-        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
-        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
-        requires_provider_api_key=True,
-        reason="Demo-only example; it exercises a provider path without stable output assertions.",
-    ),
-    VerificationCheck(
-        id="subagent-live",
-        capability="OpenAI/Anthropic subagent demo",
-        lane="provider-smoke",
-        command=("uv", "run", "python", "examples/subagent_live.py"),
-        status_on_success=STATUS_SMOKE,
-        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
-        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
-        requires_provider_api_key=True,
-        reason="Demo-only example; it exercises a provider path without stable output assertions.",
-    ),
-    VerificationCheck(
-        id="subagent-parallel-live",
-        capability="OpenAI/Anthropic parallel subagent demo",
-        lane="provider-smoke",
-        command=("uv", "run", "python", "examples/subagent_parallel_live.py"),
-        status_on_success=STATUS_SMOKE,
-        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
-        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
-        requires_provider_api_key=True,
-        reason="Demo-only example; it exercises a provider path without stable output assertions.",
-    ),
-    VerificationCheck(
         id="knowledge-embedding-live",
-        capability="OpenAI live embeddings demo",
-        lane="provider-smoke",
+        capability="OpenAI embedding and semantic-retrieval contract",
+        lane="provider-embedding",
         command=("uv", "run", "python", "examples/knowledge_embedding_live.py"),
-        status_on_success=STATUS_SMOKE,
+        status_on_success=STATUS_VERIFIED,
         prerequisites=("OPENAI_API_KEY",),
         env={"CAYU_PROVIDER": "openai"},
         required_env=("OPENAI_API_KEY",),
-        reason="Demo-only example; it exercises live embeddings without a stable nightly assertion.",
+        requires_structured_evidence=True,
     ),
     VerificationCheck(
         id="dashboard-behavior",
@@ -544,7 +494,6 @@ def render_markdown(results: Sequence[VerificationResult]) -> str:
         STATUS_FAILED,
         STATUS_SKIPPED,
         STATUS_UNCLAIMED,
-        STATUS_SMOKE,
         STATUS_VERIFIED,
         STATUS_HERMETIC,
     ):
@@ -599,7 +548,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit nonzero on failed, skipped, smoke, or unclaimed checks.",
+        help="Exit nonzero on failed, skipped, or unclaimed checks.",
     )
     args = parser.parse_args(argv)
 
@@ -931,7 +880,7 @@ def _markdown_cell(value: str) -> str:
 
 
 def _strict_failed(results: Sequence[VerificationResult]) -> bool:
-    return any(result.status in _STRICT_FAILURE_STATUSES for result in results)
+    return any(result.status not in _SUCCESS_STATUSES for result in results)
 
 
 if __name__ == "__main__":

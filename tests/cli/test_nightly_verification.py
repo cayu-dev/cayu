@@ -48,8 +48,8 @@ def test_missing_required_env_skips_without_running_command() -> None:
 
 def test_any_env_requirement_accepts_either_key() -> None:
     check = nightly.VerificationCheck(
-        id="provider-smoke",
-        capability="provider smoke",
+        id="provider-contract",
+        capability="provider contract",
         lane="provider",
         command=("python", "example.py"),
         required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
@@ -67,8 +67,8 @@ def test_any_env_requirement_accepts_either_key() -> None:
 def test_provider_api_key_requirement_matches_selected_provider() -> None:
     called = False
     check = nightly.VerificationCheck(
-        id="provider-smoke",
-        capability="provider smoke",
+        id="provider-contract",
+        capability="provider contract",
         lane="provider",
         command=("python", "example.py"),
         required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
@@ -94,8 +94,8 @@ def test_provider_api_key_requirement_matches_selected_provider() -> None:
 def test_provider_api_key_requirement_accepts_matching_selected_provider() -> None:
     called = False
     check = nightly.VerificationCheck(
-        id="provider-smoke",
-        capability="provider smoke",
+        id="provider-contract",
+        capability="provider contract",
         lane="provider",
         command=("python", "example.py"),
         required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
@@ -320,7 +320,6 @@ def test_strict_policy_fails_on_unaccepted_statuses() -> None:
         for status in (
             nightly.STATUS_FAILED,
             nightly.STATUS_SKIPPED,
-            nightly.STATUS_SMOKE,
             nightly.STATUS_UNCLAIMED,
         )
     ]
@@ -342,6 +341,29 @@ def test_strict_policy_accepts_verified_statuses() -> None:
     ]
 
     assert nightly._strict_failed(results) is False
+
+
+def test_check_rejects_unknown_success_status() -> None:
+    with pytest.raises(ValueError, match="status_on_success"):
+        nightly.VerificationCheck(
+            id="invalid-status",
+            capability="invalid status",
+            lane="test",
+            status_on_success="smoke",
+        )
+
+
+def test_strict_policy_rejects_unknown_result_status() -> None:
+    result = nightly.VerificationResult(
+        capability="unknown",
+        check_id="unknown",
+        lane="test",
+        status="smoke",
+        command=(),
+        prerequisites=(),
+    )
+
+    assert nightly._strict_failed([result]) is True
 
 
 def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials() -> None:
@@ -374,6 +396,12 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
     [
         ("context-counting-live", "provider-contract", "examples/context_counting_live.py"),
         ("artifact-file-live", "provider-contract", "examples/artifact_file_live.py"),
+        ("structured-output-live", "provider-contract", "examples/structured_output_live.py"),
+        (
+            "knowledge-embedding-live",
+            "provider-embedding",
+            "examples/knowledge_embedding_live.py",
+        ),
         ("real-spend-budgets", "provider-spend", "examples/real_spend_budget_live.py"),
         ("dashboard-behavior", "dashboard", "examples/dashboard_behavior_live.py"),
         ("provider-stream-abort", "fault-injection", "tests/faults/test_provider_stream_abort.py"),
@@ -410,13 +438,31 @@ def test_delivery_checks_are_verified_at_their_execution_boundary(
     elif lane == "provider-contract":
         assert check.requires_provider_api_key is True
         assert check.required_any_env == (("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),)
-    elif lane == "provider-spend":
+    elif lane in {"provider-embedding", "provider-spend"}:
         assert check.required_env == ("OPENAI_API_KEY",)
         assert check.requires_structured_evidence is True
     elif lane == "dashboard":
         assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
         assert check.requires_playwright_chromium is True
         assert check.requires_structured_evidence is True
+
+
+@pytest.mark.parametrize(
+    "check_id",
+    [
+        "context-pressure-calibration-live",
+        "knowledge-recall-live",
+        "knowledge-recall-many-live",
+        "subagent-live",
+        "subagent-parallel-live",
+    ],
+)
+def test_demo_only_example_is_not_registered(check_id: str) -> None:
+    assert check_id not in {check.id for check in nightly.CHECKS}
+
+
+def test_smoke_status_constant_is_not_exposed() -> None:
+    assert not hasattr(nightly, "STATUS_SMOKE")
 
 
 def test_structured_harness_evidence_is_added_to_successful_result() -> None:

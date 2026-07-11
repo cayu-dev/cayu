@@ -1,7 +1,8 @@
 """Demo-only live subagent example.
 
-This exercises real provider subagent execution, but it does not assert model
-prose. Treat it as smoke coverage in nightly reports.
+This remains manually runnable but is not executed by the verification runner,
+because deterministic subagent behavior is covered by the hermetic runtime
+acceptance suite.
 """
 
 from __future__ import annotations

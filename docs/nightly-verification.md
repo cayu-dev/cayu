@@ -23,9 +23,9 @@ The report is the product. A pass count without a capability map is not enough.
 3. **Hermetic and live coverage are different.** Fake-provider tests can verify
    Cayu runtime contracts. They cannot verify vendor APIs, sandbox CLIs, or
    database extensions.
-4. **Smoke is not verified behavior.** A live example that exits 0 is useful,
-   but it is reported as `smoke` until it checks expected output, files,
-   artifacts, events, or usage.
+4. **Demos are not verification.** A live example belongs in the capability
+   report only when it checks expected output, files, artifacts, events, or
+   usage. Unasserted examples remain runnable demos outside the registry.
 5. **Costs and prerequisites are separate.** "No LLM spend" does not mean "no
    external service." E2B needs `E2B_API_KEY` even when no model is called.
 
@@ -44,7 +44,7 @@ uv run python scripts/nightly_verification.py --check docker-runner --strict
 ```
 
 `--strict` exits nonzero when any selected check reports `failed`, `skipped`,
-`smoke`, or `unclaimed`. Omit `--strict` for exploratory capability maps where
+or `unclaimed`. Omit `--strict` for exploratory capability maps where
 missing credentials or known holes are expected.
 
 While checks run, the script logs per-check start, status, and duration to
@@ -76,7 +76,6 @@ Allowed statuses:
 | --- | --- |
 | `hermetic` | verified with deterministic local dependencies only: no live provider credentials, network access, external sandbox quota, or LLM judge |
 | `verified` | exercised against the target dependency and asserted behavior |
-| `smoke` | exercised a live dependency, but expected behavior is not fully asserted |
 | `skipped` | did not run because a prerequisite was missing |
 | `failed` | ran and failed |
 | `unclaimed` | no current check covers the capability |
@@ -97,8 +96,8 @@ or in CI.
 | microsandbox live | `cayu[microsandbox]` runtime support | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY` | E2B quota | `e2b-live-*` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
-| OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live` |
-| OpenAI/Anthropic smoke | provider API key | provider-dependent | `*-live` provider-smoke checks |
+| OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
+| OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
@@ -121,8 +120,8 @@ high level:
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
-| OpenAI/Anthropic artifact-file and context-counting contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live` |
-| OpenAI/Anthropic knowledge, subagent, context-pressure, and structured-output demos | smoke | remaining provider-smoke checks |
+| OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
+| OpenAI embedding and semantic-retrieval contract | verified when `OPENAI_API_KEY` is present | `knowledge-embedding-live` |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | real provider adapter transport abort with durable terminal state | verified on loopback TCP and SQLite | `provider-stream-abort` |
@@ -152,11 +151,15 @@ There are 23 `examples/*_live.py` files:
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
 outputs, missing cleanup artifacts, missing files, or missing model/tool rounds.
-`artifact_file_live.py` and `context_counting_live.py` also assert structural
-provider/runtime behavior and report `verified`. The remaining model-backed
-OpenAI/Anthropic demos are explicitly marked demo-only and report `smoke`.
-All OpenAI/Anthropic live checks respect `CAYU_PROVIDER`; when it is set, the
-matching API key must be present.
+`artifact_file_live.py`, `context_counting_live.py`, and
+`structured_output_live.py` assert structural provider/runtime behavior and
+report `verified`; `knowledge_embedding_live.py` verifies a real OpenAI embedding
+and semantic-retrieval result. The context-pressure, knowledge-recall, and
+subagent examples remain manually runnable demos but are not executed by the
+verification runner; import-only tests catch basic module drift, while their
+deterministic runtime behavior is covered hermetically. All registered
+OpenAI/Anthropic live checks respect `CAYU_PROVIDER`; when it is set, the matching
+API key must be present.
 
 `examples/chat_completions_local_tools.py` remains a manual Gemini demo outside
 the `*_live.py` glob. The asserted Gemini contract check is
@@ -279,6 +282,16 @@ E2B_API_KEY=... uv run python scripts/nightly_verification.py \
   --check e2b-live-workspace \
   --check e2b-live-sync \
   --strict
+
+OPENAI_API_KEY=... uv run python scripts/nightly_verification.py \
+  --check structured-output-live \
+  --check knowledge-embedding-live \
+  --strict
+
+ANTHROPIC_API_KEY=... CAYU_PROVIDER=anthropic \
+  uv run python scripts/nightly_verification.py \
+  --check structured-output-live \
+  --strict
 ```
 
 `chat-completions-contract` uses `CAYU_CHAT_COMPLETIONS_CONTRACT_MODEL`
@@ -293,8 +306,9 @@ values.
 
 ## Known Holes
 
-No capability in the current runner is classified as `unclaimed`, and the
-controlled fault-injection checks documented above are implemented.
+No capability in the current runner is classified as `unclaimed`, every
+registered successful check reports `hermetic` or `verified`, and the controlled
+fault-injection checks documented above are implemented.
 
 Scheduled automation in #174 should decide which skipped or unclaimed statuses
 are accepted for the nightly environment and which should fail the workflow.

@@ -1,7 +1,8 @@
 """Demo-only live knowledge-recall example.
 
-This exercises a real provider with knowledge tools, but it does not assert
-model prose. Treat it as smoke coverage in nightly reports.
+This remains manually runnable but is not executed by the verification runner,
+because deterministic knowledge behavior is covered by the hermetic runtime
+acceptance suite.
 """
 
 from __future__ import annotations

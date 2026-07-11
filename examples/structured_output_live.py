@@ -1,24 +1,28 @@
-"""Demo-only live structured-output provider example.
-
-This exercises real provider structured output, but it does not assert the final
-payload. Treat it as smoke coverage in nightly reports.
-"""
+"""Verified live structured-output provider contract."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 
+from _live_checks import require, require_positive_model_usage, require_successful_terminal
 from cayu import (
     AgentSpec,
     AnthropicProvider,
     CayuApp,
+    Event,
+    EventType,
     Message,
     OpenAIProvider,
     RunRequest,
     StructuredOutputSpec,
     StructuredOutputStrategy,
 )
+from cayu.providers import ModelProvider
+
+EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 
 INVOICE_SCHEMA = {
     "type": "object",
@@ -35,7 +39,10 @@ INVOICE_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "enum": ["Managed hosting"],
+                            },
                             "amount": {"type": "number"},
                         },
                         "required": ["description", "amount"],
@@ -52,6 +59,16 @@ INVOICE_SCHEMA = {
     "additionalProperties": False,
 }
 
+EXPECTED_OUTPUT = {
+    "invoice": {
+        "number": "INV-1042",
+        "vendor": "Acme Cloud",
+        "status": "paid",
+        "confidence": 0.91,
+        "line_items": [{"description": "Managed hosting", "amount": 125.50}],
+    }
+}
+
 
 async def main() -> None:
     provider_name = _provider_name()
@@ -59,19 +76,31 @@ async def main() -> None:
     strategy = _strategy()
     if strategy == StructuredOutputStrategy.NATIVE and provider_name != "openai":
         raise RuntimeError("Native structured output in this example currently requires OpenAI.")
+    _require_api_key(provider_name)
 
-    app = CayuApp()
-    if provider_name == "openai":
-        if not os.environ.get("OPENAI_API_KEY"):
-            print("Set OPENAI_API_KEY or choose CAYU_PROVIDER=anthropic.")
-            return
-        app.register_provider(OpenAIProvider(), default=True)
-    else:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            print("Set ANTHROPIC_API_KEY or choose CAYU_PROVIDER=openai.")
-            return
-        app.register_provider(AnthropicProvider(), default=True)
+    print("provider", provider_name)
+    print("model", model)
+    print("strategy", strategy.value)
 
+    evidence = await _run_contract(
+        provider=_provider(provider_name),
+        provider_name=provider_name,
+        model=model,
+        strategy=strategy,
+    )
+    print(EVIDENCE_PREFIX + json.dumps(evidence, sort_keys=True))
+    print("status ok")
+
+
+async def _run_contract(
+    *,
+    provider: ModelProvider,
+    provider_name: str,
+    model: str,
+    strategy: StructuredOutputStrategy,
+) -> dict[str, object]:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(
             name="assistant",
@@ -80,19 +109,17 @@ async def main() -> None:
         )
     )
 
-    print("provider", provider_name)
-    print("model", model)
-    print("strategy", strategy)
-
     request = RunRequest(
         agent_name="assistant",
-        session_id=f"demo_{provider_name}_structured_output",
+        session_id=f"contract_{provider_name}_structured_output",
+        max_steps=3,
         messages=[
             Message.text(
                 "user",
                 (
                     "Invoice INV-1042 from Acme Cloud is marked PAID. "
                     "It has one line item: Managed hosting for 125.50 USD. "
+                    "Use the exact line-item description 'Managed hosting'. "
                     "Return the invoice status with confidence 0.91."
                 ),
             )
@@ -111,13 +138,89 @@ async def main() -> None:
         ),
     )
 
+    events: list[Event] = []
     async for event in app.run(request):
+        events.append(event)
         print(
             event.type,
             event.environment_name or "-",
             event.tool_name or "-",
             event.payload,
         )
+    return _validate_runtime_events(
+        events,
+        provider_name=provider_name,
+        model=model,
+        strategy=strategy,
+    )
+
+
+def _validate_runtime_events(
+    events: list[Event],
+    *,
+    provider_name: str,
+    model: str,
+    strategy: StructuredOutputStrategy,
+) -> dict[str, object]:
+    require_successful_terminal(events)
+    completed_events = require_positive_model_usage(events)
+    validated_events = [
+        event for event in events if event.type == EventType.STRUCTURED_OUTPUT_VALIDATED
+    ]
+    require(
+        len(validated_events) == 1,
+        f"expected one structured_output.validated event, got {len(validated_events)}",
+    )
+    require(
+        validated_events[0].payload.get("output") == EXPECTED_OUTPUT,
+        "validated invoice output did not match the requested invoice facts: "
+        f"{validated_events[0].payload.get('output')!r}",
+    )
+
+    total_tokens = 0
+    resolved_models: set[str] = set()
+    for event in completed_events:
+        usage = event.payload["usage_metrics"]
+        require(
+            usage.get("provider_name") == provider_name,
+            "completed usage provider did not match the configured provider",
+        )
+        require(
+            usage.get("requested_model") == model,
+            "completed usage model did not match the requested model",
+        )
+        resolved_model = usage.get("model")
+        require(
+            isinstance(resolved_model, str) and bool(resolved_model.strip()),
+            f"completed usage did not report a resolved model: {resolved_model!r}",
+        )
+        require(
+            _resolved_model_matches(model, resolved_model),
+            f"provider resolved model {resolved_model!r} does not match requested model {model!r}",
+        )
+        resolved_models.add(resolved_model)
+        total_tokens += usage["total_tokens"]
+    require(
+        len(resolved_models) == 1,
+        f"provider reported inconsistent resolved models: {sorted(resolved_models)!r}",
+    )
+
+    return {
+        "provider": provider_name,
+        "model": model,
+        "resolved_model": next(iter(resolved_models)),
+        "strategy": strategy.value,
+        "invoice_number": EXPECTED_OUTPUT["invoice"]["number"],
+        "invoice_status": EXPECTED_OUTPUT["invoice"]["status"],
+        "total_tokens": total_tokens,
+    }
+
+
+def _resolved_model_matches(requested_model: str, resolved_model: str) -> bool:
+    if resolved_model == requested_model:
+        return True
+    versioned_model = rf"{re.escape(requested_model)}-(?:\d{{8}}|\d{{4}}-\d{{2}}-\d{{2}})"
+    return re.fullmatch(versioned_model, resolved_model) is not None
 
 
 def _provider_name() -> str:
@@ -138,6 +241,19 @@ def _model(provider_name: str) -> str:
     if provider_name == "openai":
         return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
     return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+
+def _provider(provider_name: str) -> ModelProvider:
+    if provider_name == "openai":
+        return OpenAIProvider()
+    return AnthropicProvider()
+
+
+def _require_api_key(provider_name: str) -> None:
+    if provider_name == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit("Set OPENAI_API_KEY or choose CAYU_PROVIDER=anthropic.")
+    if provider_name == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+        raise SystemExit("Set ANTHROPIC_API_KEY or choose CAYU_PROVIDER=openai.")
 
 
 def _strategy() -> StructuredOutputStrategy:
