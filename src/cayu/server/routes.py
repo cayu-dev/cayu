@@ -318,6 +318,7 @@ class ResumeBody(BaseModel):
 class InterruptSessionBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    requested_by: ResolutionActor | None = None
 
 
 class UpdateSessionLabelsBody(BaseModel):
@@ -506,11 +507,13 @@ class UserInputRecoveryBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-def _request_resolution_actor(
+def _request_actor(
     auth_context: AuthContext | None,
-    body_resolved_by: ResolutionActor | None,
+    body_actor: ResolutionActor | None,
+    *,
+    field_name: Literal["requested_by", "resolved_by"],
 ) -> ResolutionActor | None:
-    """Derive the typed resolution actor for an approval/user-input route.
+    """Derive a typed operator actor for an authenticated control-plane route.
 
     With auth configured, provenance comes from the verified caller and a
     body-supplied actor is rejected loudly (mirroring the reserved ``cayu:``
@@ -520,13 +523,11 @@ def _request_resolution_actor(
     server-verified (``http_auth``) or system provenance.
     """
     if auth_context is not None:
-        if body_resolved_by is not None:
+        if body_actor is not None:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "resolved_by is derived from the authenticated caller and "
-                    "cannot be supplied in the request body."
-                ),
+                detail=f"{field_name} is derived from the authenticated caller and "
+                "cannot be supplied in the request body.",
             )
         try:
             return ResolutionActor(
@@ -540,17 +541,31 @@ def _request_resolution_actor(
             # back a reserved ``cayu:``-prefixed subject; surface that as a
             # clean 400 instead of an unhandled 500.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if body_resolved_by is None:
+    if body_actor is None:
         return None
     try:
         return ResolutionActor(
-            subject=body_resolved_by.subject,
-            tenant=body_resolved_by.tenant,
+            subject=body_actor.subject,
+            tenant=body_actor.tenant,
             source=ResolutionActorSource.REQUEST,
-            claims=body_resolved_by.claims,
+            claims=body_actor.claims,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _request_resolution_actor(
+    auth_context: AuthContext | None,
+    body_resolved_by: ResolutionActor | None,
+) -> ResolutionActor | None:
+    return _request_actor(auth_context, body_resolved_by, field_name="resolved_by")
+
+
+def _request_interruption_actor(
+    auth_context: AuthContext | None,
+    body_requested_by: ResolutionActor | None,
+) -> ResolutionActor | None:
+    return _request_actor(auth_context, body_requested_by, field_name="requested_by")
 
 
 def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
@@ -1713,10 +1728,10 @@ def create_router(
     protected: list[Any] = [Depends(auth_dependency)] if auth_dependency is not None else []
 
     async def _optional_auth_context(request: Request) -> AuthContext | None:
-        # The four approval/user-input resolution routes take this as a
+        # The interruption and approval/user-input resolution routes take this as a
         # handler parameter INSTEAD of `dependencies=protected`: one callable
         # both guards the route (its 401/403 raises before the handler body)
-        # and yields the verified caller identity for typed `resolved_by`
+        # and yields the verified caller identity for typed operator
         # provenance. Splitting guard and extraction into two differently
         # wrapped callables would invoke the user's auth dependency twice per
         # request (FastAPI caches per-callable, not per-underlying-auth).
@@ -1909,7 +1924,6 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/interrupt",
-        dependencies=protected,
         response_class=EventSourceResponse,
         responses=STREAMING_ENDPOINT_RESPONSES,
     )
@@ -1917,6 +1931,7 @@ def create_router(
         session_id: NonBlankString,
         http_request: Request,
         body: InterruptSessionBody | None = None,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -1940,6 +1955,10 @@ def create_router(
             session_id=session_id,
             reason=body.reason if body is not None else None,
             metadata=body.metadata if body is not None else {},
+            requested_by=_request_interruption_actor(
+                auth_context,
+                body.requested_by if body is not None else None,
+            ),
         )
         event_stream = cayu_app.interrupt_session(request)
         try:
@@ -3101,9 +3120,11 @@ def create_router(
 
         events = await session_store.load_events(session_id)
         transcript = await session_store.load_transcript(session_id)
+        interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
 
         return {
             "session": _serialize_session(session),
+            "interruption_cascade": interruption_cascade,
             "events": [
                 {
                     "id": e.id,

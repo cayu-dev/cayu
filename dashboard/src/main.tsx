@@ -72,6 +72,7 @@ const artifactsRoute = createRoute({
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
+  remountDeps: ({ params }) => ({ sessionId: params.sessionId }),
   component: SessionDetailPage,
 })
 

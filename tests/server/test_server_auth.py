@@ -493,3 +493,79 @@ def test_authenticated_resolution_rejects_body_resolved_by() -> None:
     assert response.status_code == 400
     assert "derived from the authenticated caller" in response.json()["detail"]
     assert captured == []
+
+
+def _interrupt_capture_app() -> tuple[CayuApp, list]:
+    import asyncio
+
+    from cayu import Event, EventType, Message, RunRequest
+    from cayu.runtime import SessionIdentity
+
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_pending_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_interrupt_actor",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(create_pending_session())
+    captured: list = []
+
+    async def interrupt_session(request):
+        captured.append(request)
+        yield Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=request.session_id,
+            agent_name="assistant",
+            payload={"interruption_type": "operator_requested"},
+        )
+
+    app.interrupt_session = interrupt_session
+    return app, captured
+
+
+def test_authenticated_interruption_derives_requested_by_from_auth_context() -> None:
+    from cayu import ResolutionActorSource
+
+    app, captured = _interrupt_capture_app()
+    client = TestClient(create_server(app, auth=_require_bearer_token))
+
+    with client.stream(
+        "POST",
+        "/api/sessions/session_interrupt_actor/interrupt",
+        headers=_AUTH_HEADERS,
+        json={"reason": "operator stop"},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    actor = captured[0].requested_by
+    assert actor is not None
+    assert actor.subject == "test-user"
+    assert actor.source is ResolutionActorSource.HTTP_AUTH
+    assert actor.claims == {"scheme": "bearer"}
+
+
+def test_authenticated_interruption_rejects_body_requested_by() -> None:
+    app, captured = _interrupt_capture_app()
+    client = TestClient(create_server(app, auth=_require_bearer_token))
+
+    response = client.post(
+        "/api/sessions/session_interrupt_actor/interrupt",
+        headers=_AUTH_HEADERS,
+        json={"requested_by": {"subject": "someone-else"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "requested_by is derived from the authenticated caller and "
+        "cannot be supplied in the request body."
+    )
+    assert captured == []

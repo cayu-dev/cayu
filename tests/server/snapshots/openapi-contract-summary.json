@@ -2773,6 +2773,16 @@
             }
           ],
           "title": "Reason"
+        },
+        "requested_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "title": "InterruptSessionBody",
@@ -3279,7 +3289,7 @@
     },
     "ResolutionActor": {
       "additionalProperties": false,
-      "description": "Typed actor identity for approval and user-input resolutions.\n\nStamped into resolution event payloads so the audit trail answers who\nresolved a pause without consulting app-side state. ``reason`` and\n``metadata`` on resolution requests remain caller-claimed free-form data;\nthis model is the provenance field.",
+      "description": "Typed actor identity for trusted runtime operator actions.\n\nStamped into approval, user-input, recovery, and interruption event payloads\nso the audit trail answers who performed an operator action without\nconsulting app-side state. ``reason`` and ``metadata`` on requests remain\ncaller-claimed free-form data; this model is the provenance field.",
       "properties": {
         "claims": {
           "additionalProperties": true,
@@ -3760,6 +3770,15 @@
           "title": "Events",
           "type": "array"
         },
+        "interruption_cascade": {
+          "enum": [
+            "none",
+            "pending",
+            "failed"
+          ],
+          "title": "Interruption Cascade",
+          "type": "string"
+        },
         "session": {
           "$ref": "#/components/schemas/ApiSession"
         },
@@ -3773,6 +3792,7 @@
       },
       "required": [
         "session",
+        "interruption_cascade",
         "events",
         "transcript"
       ],

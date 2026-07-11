@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -3623,6 +3623,67 @@ def test_mount_cayu_can_disable_dashboard_for_api_only_services() -> None:
     assert client.get("/cayu/").status_code == 404
 
 
+def test_mount_cayu_composes_background_interruption_drain() -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+    drain_timeouts = []
+    resume_calls = []
+
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
+        resume_calls.append(interrupting_inactive_before)
+        return 0
+
+    async def drain_background_interruptions(*, timeout_s):
+        drain_timeouts.append(timeout_s)
+        return True
+
+    cayu_app.drain_background_interruptions = drain_background_interruptions
+    cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
+    mount_cayu(
+        server,
+        cayu_app,
+        path="/cayu",
+        dashboard=False,
+        dev=True,
+        interruption_shutdown_grace_seconds=2.5,
+    )
+
+    with TestClient(server):
+        pass
+
+    assert drain_timeouts == [2.5]
+    assert len(resume_calls) == 1
+    assert resume_calls[0] < datetime.now(UTC)
+
+
+def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+    calls: list[str] = []
+
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
+        assert interrupting_inactive_before < datetime.now(UTC)
+        calls.append("recover")
+        raise RuntimeError("mounted recovery failed")
+
+    async def drain_background_interruptions(*, timeout_s):
+        assert timeout_s == 10.0
+        calls.append("drain")
+        return True
+
+    cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
+    cayu_app.drain_background_interruptions = drain_background_interruptions
+    mount_cayu(server, cayu_app, path="/cayu", dashboard=False, dev=True)
+
+    with (
+        pytest.raises(RuntimeError, match="mounted recovery failed"),
+        TestClient(server),
+    ):
+        pass
+
+    assert calls == ["recover", "drain"]
+
+
 def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -3965,7 +4026,15 @@ def test_interrupt_session_endpoint_streams_interrupted_event() -> None:
     with client.stream(
         "POST",
         "/api/sessions/session_interrupt_endpoint/interrupt",
-        json={"reason": "operator requested stop", "metadata": {"actor": "operator"}},
+        json={
+            "reason": "operator requested stop",
+            "metadata": {"ticket": "incident-42"},
+            "requested_by": {
+                "subject": "dev-operator",
+                "source": "http_auth",
+                "claims": {"role": "operator"},
+            },
+        },
     ) as response:
         assert response.status_code == 200
         lines = list(response.iter_lines())
@@ -3973,6 +4042,14 @@ def test_interrupt_session_endpoint_streams_interrupted_event() -> None:
     body = "\n".join(lines)
     assert "session.interrupted" in body
     assert "operator requested stop" in body
+    data_line = next(line for line in lines if line.startswith("data: "))
+    event = json.loads(data_line.removeprefix("data: "))
+    assert event["payload"]["requested_by"] == {
+        "subject": "dev-operator",
+        "tenant": None,
+        "source": "request",
+    }
+    assert "claims" not in event["payload"]["requested_by"]
 
     session = asyncio.run(app.session_store.load("session_interrupt_endpoint"))
     assert session is not None
@@ -4247,6 +4324,62 @@ def test_server_list_omits_metadata_but_detail_includes_it() -> None:
     # ...but the single-session detail view includes it.
     detail = client.get("/api/sessions/sess_m").json()
     assert detail["session"]["metadata"] == {"secret": "value"}
+
+
+def test_server_session_detail_exposes_typed_interruption_cascade_state() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_cascade_state")
+
+    store, client = _lifecycle_store_and_client(seed)
+
+    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "none"
+
+    async def set_marker(*, failed: bool) -> None:
+        marker = {
+            "attempt_id": "cascade-attempt",
+            "interrupt_payload": {"interruption_type": "operator_requested"},
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        if failed:
+            marker["failure_recorded"] = True
+        else:
+            marker.update(
+                {
+                    "generation": 1,
+                    "claim_id": "cascade-claim",
+                    "claim_expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+                }
+            )
+        await store.checkpoint(
+            "sess_cascade_state",
+            {"pending_interruption_cascade": marker},
+        )
+
+    asyncio.run(set_marker(failed=False))
+    assert (
+        client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "pending"
+    )
+
+    asyncio.run(set_marker(failed=True))
+    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "failed"
+
+    async def set_malformed_active_marker() -> None:
+        await store.checkpoint(
+            "sess_cascade_state",
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-attempt",
+                    "interrupt_payload": {"interruption_type": "operator_requested"},
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "generation": "invalid",
+                    "claim_id": "cascade-claim",
+                    "claim_expires_at": (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+                }
+            },
+        )
+
+    asyncio.run(set_malformed_active_marker())
+    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "failed"
 
 
 def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
@@ -4592,7 +4725,19 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         requests.append(request)
         return []
 
+    async def drain_background_interruptions(*, timeout_s):
+        calls.append("drain")
+        assert timeout_s == 10.0
+        return True
+
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
+        calls.append("resume_cascades")
+        assert interrupting_inactive_before < datetime.now(UTC)
+        return 0
+
     app.recover_incomplete_sessions = recover
+    app.drain_background_interruptions = drain_background_interruptions
+    app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     server = create_server(
         app,
         dev=True,
@@ -4606,9 +4751,9 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     )
 
     with TestClient(server):
-        assert calls == ["user_start", "recover"]
+        assert calls == ["user_start", "recover", "resume_cascades"]
 
-    assert calls == ["user_start", "recover", "user_stop"]
+    assert calls == ["user_start", "recover", "resume_cascades", "drain", "user_stop"]
     assert len(requests) == 1
     request = requests[0]
     assert request.statuses == {
@@ -4620,6 +4765,55 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     assert request.metadata == {"source": "create_server"}
     assert request.inactive_before is not None
     assert request.inactive_before < datetime.now(UTC)
+
+
+def test_create_server_drains_cascades_when_startup_recovery_fails() -> None:
+    app = CayuApp()
+    calls: list[str] = []
+
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
+        assert interrupting_inactive_before < datetime.now(UTC)
+        calls.append("recover")
+        raise RuntimeError("recovery failed after scheduling work")
+
+    async def drain_background_interruptions(*, timeout_s):
+        assert timeout_s == 10.0
+        calls.append("drain")
+        return True
+
+    app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
+    app.drain_background_interruptions = drain_background_interruptions
+    server = create_server(app, dev=True)
+
+    with (
+        pytest.raises(RuntimeError, match="recovery failed after scheduling work"),
+        TestClient(server),
+    ):
+        pass
+
+    assert calls == ["recover", "drain"]
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf")])
+def test_create_server_rejects_invalid_interruption_shutdown_grace(value) -> None:
+    with pytest.raises(ValueError, match="interruption_shutdown_grace_seconds"):
+        create_server(
+            CayuApp(),
+            dev=True,
+            interruption_shutdown_grace_seconds=value,
+        )
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_mount_cayu_rejects_invalid_interruption_recovery_inactivity(value) -> None:
+    with pytest.raises(ValueError, match="interruption_recovery_inactive_after_seconds"):
+        mount_cayu(
+            FastAPI(),
+            CayuApp(),
+            dashboard=False,
+            dev=True,
+            interruption_recovery_inactive_after_seconds=value,
+        )
 
 
 def test_client_disconnect_does_not_cancel_detached_run() -> None:

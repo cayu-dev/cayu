@@ -151,7 +151,7 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
-_POSTGRES_MIN_REQUIRED_REVISION = 14
+_POSTGRES_MIN_REQUIRED_REVISION = 15
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -477,6 +477,11 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS "
         "last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
         "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS run_epoch BIGINT NOT NULL DEFAULT 0",
+    ),
+    15: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade "
+        "ON cayu_checkpoints(session_id) "
+        "WHERE state ? 'pending_interruption_cascade'",
     ),
 }
 
@@ -3970,7 +3975,34 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             )
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=False)
+
+    async def list_sessions_with_pending_interruption_cascade(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=True)
+
+    async def _list_sessions(
+        self,
+        query: SessionQuery | None,
+        *,
+        pending_interruption_cascade_only: bool,
+    ) -> SessionListResult:
         query = copy_session_query(query)
+        session_source_sql = (
+            """
+            (
+                SELECT session_id
+                FROM cayu_checkpoints
+                WHERE state ? 'pending_interruption_cascade'
+            ) AS pending_interruption_cascades
+            INNER JOIN cayu_sessions
+                ON cayu_sessions.id = pending_interruption_cascades.session_id
+            """
+            if pending_interruption_cascade_only
+            else "cayu_sessions"
+        )
         plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
         await self._ensure_ready()
@@ -3982,7 +4014,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await cur.execute(
                     cast(
                         "LiteralString",
-                        f"SELECT COUNT(*) FROM cayu_sessions {plan.filter_where_sql}",
+                        f"SELECT COUNT(*) FROM {session_source_sql} {plan.filter_where_sql}",
                     ),
                     plan.filter_params,
                 )
@@ -3993,7 +4025,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     "LiteralString",
                     f"""
                     SELECT {pg_support.SESSION_COLUMNS}
-                    FROM cayu_sessions
+                    FROM {session_source_sql}
                     {plan.page_where_sql}
                     ORDER BY {plan.order_sql}, id ASC
                     {plan.pagination_sql}
@@ -4047,28 +4079,32 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
             await conn.commit()
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict[str, Any],
+        checkpoint_transform: CheckpointTransform,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
-        if not isinstance(checkpoint, dict):
-            raise ValueError("Checkpoint state must be a dictionary.")
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
-                        (session_id,),
-                    )
-                    if await cur.fetchone() is None:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, session)
+                    transformed = checkpoint_transform(
+                        session,
+                        await self._load_checkpoint(cur, session_id),
+                    )
+                    if transformed is None:
+                        raise ValueError("Checkpoint transform must return a checkpoint.")
+                    transformed = copy_json_value(transformed, "checkpoint")
                     await _touch_session_activity(cur, session_id, updated_at)
                     if copied_messages:
                         await cur.executemany(
@@ -4081,7 +4117,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 for message in copied_messages
                             ],
                         )
-                    await self._upsert_checkpoint(cur, session_id, copied_checkpoint, updated_at)
+                    await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4175,12 +4211,41 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
-                if await cur.fetchone() is None:
+                if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
                 await _touch_session_activity(cur, session_id, updated_at)
                 await self._upsert_checkpoint(cur, session_id, copied, updated_at)
             await conn.commit()
+
+    async def transform_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_transform: CheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        await self._ensure_ready()
+        updated_at = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, session)
+                    transformed = checkpoint_transform(
+                        session,
+                        await self._load_checkpoint(cur, session_id),
+                    )
+                    if transformed is not None:
+                        transformed = copy_json_value(transformed, "checkpoint")
+                        await _touch_session_activity(cur, session_id, updated_at)
+                        await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")

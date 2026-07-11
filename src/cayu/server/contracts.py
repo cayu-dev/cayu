@@ -379,6 +379,7 @@ class ApiSessionDetailTranscriptMessage(ApiBaseModel):
 
 class SessionDetailResponse(ApiBaseModel):
     session: ApiSession
+    interruption_cascade: Literal["none", "pending", "failed"]
     events: list[ApiSessionDetailEvent]
     transcript: list[ApiSessionDetailTranscriptMessage]
 

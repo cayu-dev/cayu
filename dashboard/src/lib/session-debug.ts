@@ -19,6 +19,7 @@ export type SessionDebugSummary = {
 export function isFailureEventType(type: string): boolean {
   return (
     type === "session.failed" ||
+    type === "session.interruption_cascade_failed" ||
     type === "tool.call.failed" ||
     type === "tool.call.blocked" ||
     type.endsWith(".failed") ||
@@ -27,7 +28,38 @@ export function isFailureEventType(type: string): boolean {
 }
 
 export function latestFailureEvent<T extends DebugEvent>(events: readonly T[]): T | null {
+  const latestCascadeGeneration = new Map<string, number>()
+  for (const event of events) {
+    if (!event.type.startsWith("session.interruption_cascade_")) continue
+    const payload = objectPayload(event.payload)
+    const attemptId = optionalString(payload?.attempt_id)
+    const generation = payload?.generation
+    if (!attemptId || typeof generation !== "number" || !Number.isInteger(generation)) continue
+    latestCascadeGeneration.set(
+      attemptId,
+      Math.max(latestCascadeGeneration.get(attemptId) ?? generation, generation),
+    )
+  }
+  const completedInterruptionCascadeGenerations = new Set<string>()
   for (const event of [...events].reverse()) {
+    if (event.type === "session.interruption_cascade_completed") {
+      const payload = objectPayload(event.payload)
+      const attemptId = optionalString(payload?.attempt_id)
+      const generation = payload?.generation
+      if (attemptId && typeof generation === "number" && Number.isInteger(generation)) {
+        completedInterruptionCascadeGenerations.add(`${attemptId}:${generation}`)
+      }
+      continue
+    }
+    if (event.type === "session.interruption_cascade_failed") {
+      const payload = objectPayload(event.payload)
+      const attemptId = optionalString(payload?.attempt_id)
+      const generation = payload?.generation
+      if (attemptId && typeof generation === "number" && Number.isInteger(generation)) {
+        if ((latestCascadeGeneration.get(attemptId) ?? generation) > generation) continue
+        if (completedInterruptionCascadeGenerations.has(`${attemptId}:${generation}`)) continue
+      }
+    }
     if (isFailureEventType(event.type)) return event
   }
   return null
@@ -40,6 +72,20 @@ export function summarizeFailureEvent(event: DebugEvent): SessionDebugSummary {
   const message = optionalString(payload?.message)
   const reason = optionalString(payload?.reason)
   const detail = error || message || reason || "Inspect the event payload for details."
+
+  if (event.type === "session.interruption_cascade_failed") {
+    const failureCount = typeof payload?.failure_count === "number" ? payload.failure_count : null
+    return {
+      kind: "failure",
+      label: "Background interruption incomplete",
+      detail:
+        failureCount === null
+          ? "One or more background sessions could not be interrupted."
+          : `${failureCount} background interruption ${failureCount === 1 ? "request needs" : "requests need"} attention.`,
+      eventType: event.type,
+      toolName: null,
+    }
+  }
 
   if (event.type === "tool.call.failed") {
     const toolName = event.tool_name || optionalString(payload?.tool_name)

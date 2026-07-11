@@ -133,15 +133,61 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 14")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 14")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 14"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 15"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
+
+    asyncio.run(runner())
+
+
+def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 15")
+                await cur.execute(
+                    "DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade"
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 15"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() "
+                "AND indexname = "
+                "'idx_cayu_checkpoints_pending_interruption_cascade'"
+            )
+            assert await cur.fetchone() is not None
 
     asyncio.run(runner())
 

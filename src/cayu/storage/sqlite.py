@@ -77,7 +77,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 14
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 15
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -1187,14 +1187,45 @@ class SQLiteSessionStore(SessionStore):
         return await self._run_write(statement)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=False)
+
+    async def list_sessions_with_pending_interruption_cascade(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=True)
+
+    async def _list_sessions(
+        self,
+        query: SessionQuery | None,
+        *,
+        pending_interruption_cascade_only: bool,
+    ) -> SessionListResult:
         query = copy_session_query(query)
+        session_source_sql = (
+            """
+            (
+                SELECT session_id
+                FROM cayu_checkpoints
+                    INDEXED BY idx_cayu_checkpoints_pending_interruption_cascade
+                WHERE json_type(
+                    state_json,
+                    '$.pending_interruption_cascade'
+                ) IS NOT NULL
+            ) AS pending_interruption_cascades
+            CROSS JOIN cayu_sessions
+                ON cayu_sessions.id = pending_interruption_cascades.session_id
+            """
+            if pending_interruption_cascade_only
+            else "cayu_sessions"
+        )
         plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
         async with self._lock:
             total_count: int | None = None
             if query.include_total_count:
                 total_count = self._connection.execute(
-                    f"SELECT COUNT(*) FROM cayu_sessions {plan.filter_where_sql}",
+                    f"SELECT COUNT(*) FROM {session_source_sql} {plan.filter_where_sql}",
                     plan.filter_params,
                 ).fetchone()[0]
             rows = self._connection.execute(
@@ -1203,7 +1234,7 @@ class SQLiteSessionStore(SessionStore):
                        causal_budget_id, runtime_name, runtime_version, environment_name,
                        status, created_at, updated_at, last_activity_at, run_epoch,
                        metadata_json
-                FROM cayu_sessions
+                FROM {session_source_sql}
                 {plan.page_where_sql}
                 ORDER BY {plan.order_sql}, id ASC
                 {plan.pagination_sql}
@@ -1263,23 +1294,32 @@ class SQLiteSessionStore(SessionStore):
 
         await self._run_write(statement)
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict[str, Any],
+        checkpoint_transform: CheckpointTransform,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
-        if not isinstance(checkpoint, dict):
-            raise ValueError("Checkpoint state must be a dictionary.")
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
         updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            with connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                transformed = checkpoint_transform(
+                    session,
+                    self._load_checkpoint_unlocked(session_id),
+                )
+                if transformed is None:
+                    raise ValueError("Checkpoint transform must return a checkpoint.")
+                transformed = copy_json_value(transformed, "checkpoint")
                 _touch_session_activity(connection, session_id, updated_at)
                 if copied_messages:
                     connection.executemany(
@@ -1310,10 +1350,14 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     (
                         session_id,
-                        sqlite_support.json_dumps(copied_checkpoint),
+                        sqlite_support.json_dumps(transformed),
                         sqlite_support.format_datetime(updated_at),
                     ),
                 )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
         await self._run_write(statement)
 
@@ -1425,6 +1469,51 @@ class SQLiteSessionStore(SessionStore):
                         sqlite_support.format_datetime(updated_at),
                     ),
                 )
+
+        await self._run_write(statement)
+
+    async def transform_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_transform: CheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        updated_at = datetime.now(UTC)
+
+        def statement(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                transformed = checkpoint_transform(
+                    session,
+                    self._load_checkpoint_unlocked(session_id),
+                )
+                if transformed is not None:
+                    transformed = copy_json_value(transformed, "checkpoint")
+                    _touch_session_activity(connection, session_id, updated_at)
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_checkpoints (session_id, state_json, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            session_id,
+                            sqlite_support.json_dumps(transformed),
+                            sqlite_support.format_datetime(updated_at),
+                        ),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
         await self._run_write(statement)
 

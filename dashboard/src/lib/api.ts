@@ -26,6 +26,7 @@ import type {
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetTaskApiTasksTaskIdGetResponse,
+  InterruptSessionBody,
   ListArtifactsApiArtifactsGetData,
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
@@ -109,6 +110,7 @@ export type KnowledgePendingQuery = NonNullable<
   ListPendingKnowledgeApiKnowledgePendingGetData["query"]
 >
 export type SSEEvent = SseEventEnvelope
+export type SessionInterrupt = InterruptSessionBody
 
 type ErrorEnvelope = {
   detail?: unknown
@@ -369,6 +371,22 @@ export async function streamResume(
   await streamJsonPost("/resume", { session_id: sessionId, prompt }, onEvent, onDone, onError)
 }
 
+export async function streamInterruptSession(
+  sessionId: string,
+  body: SessionInterrupt,
+  onEvent: (event: SSEEvent) => void,
+  onDone: () => void,
+  onError: (message: string, error?: unknown) => void,
+) {
+  await streamJsonPost(
+    `/sessions/${encodeURIComponent(sessionId)}/interrupt`,
+    body,
+    onEvent,
+    onDone,
+    onError,
+  )
+}
+
 export async function streamResolveToolApproval(
   body: ToolApprovalBody,
   onEvent: (event: SSEEvent) => void,
@@ -419,7 +437,7 @@ async function streamJsonPost(
   body: Record<string, unknown>,
   onEvent: (event: SSEEvent) => void,
   onDone: () => void,
-  onError: (message: string) => void,
+  onError: (message: string, error?: unknown) => void,
 ) {
   const { fetchEventSource } = await import("@microsoft/fetch-event-source")
   try {
@@ -446,7 +464,7 @@ async function streamJsonPost(
       },
     })
   } catch (error) {
-    onError(error instanceof Error ? error.message : String(error))
+    onError(error instanceof Error ? error.message : String(error), error)
   } finally {
     onDone()
   }

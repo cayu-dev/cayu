@@ -98,6 +98,10 @@ _BASELINE_DDL = """
         updated_at TEXT NOT NULL
     );
 
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
+        ON cayu_checkpoints(session_id)
+        WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
@@ -357,6 +361,11 @@ _MIGRATION_STEPS: dict[int, str] = {
 
         CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_dead_letters_unresolved
             ON cayu_event_watcher_dead_letters(watcher_name, resolved_at, event_sequence);
+    """,
+    15: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
+            ON cayu_checkpoints(session_id)
+            WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
     """,
 }
 

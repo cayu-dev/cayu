@@ -115,6 +115,9 @@ REVISIONS: tuple[Revision, ...] = (
     # implementations still require this revision before use, while older binaries
     # can continue operating against the expanded schema.
     Revision(revision=14, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Index durable interruption-cascade markers so server startup discovers
+    # recoverable roots without scanning every historical interrupted session.
+    Revision(revision=15, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

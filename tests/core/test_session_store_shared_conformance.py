@@ -14,6 +14,7 @@ from cayu.runtime import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionOrder,
     SessionQuery,
     SessionStatus,
     SessionStore,
@@ -80,6 +81,152 @@ async def _open_store(case) -> SessionStore:
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")
     await _truncate_postgres(postgres_dsn)
     return _new_postgres_store(postgres_dsn)
+
+
+def test_session_store_conformance_atomically_transforms_checkpoint(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_checkpoint_transform",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await store.checkpoint("sess_atomic_checkpoint_transform", {"original": True})
+
+            def add_key(key: str):
+                def transform(_session: Session, checkpoint: dict[str, Any] | None):
+                    updated = {} if checkpoint is None else dict(checkpoint)
+                    updated[key] = True
+                    return updated
+
+                return transform
+
+            await asyncio.gather(
+                store.transform_checkpoint(
+                    "sess_atomic_checkpoint_transform",
+                    add_key("first"),
+                ),
+                store.transform_checkpoint(
+                    "sess_atomic_checkpoint_transform",
+                    add_key("second"),
+                ),
+            )
+            await asyncio.gather(
+                store.transform_checkpoint(
+                    "sess_atomic_checkpoint_transform",
+                    add_key("third"),
+                ),
+                store.append_transcript_messages_and_transform_checkpoint(
+                    "sess_atomic_checkpoint_transform",
+                    [Message.text("assistant", "done")],
+                    add_key("fourth"),
+                ),
+            )
+
+            assert await store.load_checkpoint("sess_atomic_checkpoint_transform") == {
+                "original": True,
+                "first": True,
+                "second": True,
+                "third": True,
+                "fourth": True,
+            }
+            assert [
+                message.content[0].text
+                for message in await store.load_transcript("sess_atomic_checkpoint_transform")
+            ] == ["done"]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_lists_pending_interruption_cascades(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            for session_id in (
+                "sess_cascade_index_a",
+                "sess_cascade_index_b",
+                "sess_cascade_index_none",
+                "sess_cascade_index_running",
+            ):
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", session_id)],
+                    ),
+                    identity=_identity(),
+                )
+            for session_id in (
+                "sess_cascade_index_a",
+                "sess_cascade_index_b",
+                "sess_cascade_index_none",
+            ):
+                await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await store.update_status(
+                "sess_cascade_index_running",
+                SessionStatus.RUNNING,
+            )
+            for session_id in (
+                "sess_cascade_index_a",
+                "sess_cascade_index_b",
+                "sess_cascade_index_running",
+            ):
+                await store.checkpoint(
+                    session_id,
+                    {
+                        "pending_interruption_cascade": {
+                            "attempt_id": session_id,
+                            "interrupt_payload": {
+                                "interruption_type": "operator_requested"
+                            },
+                        }
+                    },
+                )
+            await store.checkpoint(
+                "sess_cascade_index_none",
+                {"unrelated_checkpoint": True},
+            )
+
+            first = await store.list_sessions_with_pending_interruption_cascade(
+                SessionQuery(
+                    status=SessionStatus.INTERRUPTED,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                    limit=1,
+                    include_total_count=True,
+                )
+            )
+            second = await store.list_sessions_with_pending_interruption_cascade(
+                SessionQuery(
+                    status=SessionStatus.INTERRUPTED,
+                    order_by=SessionOrder.CREATED_AT_ASC,
+                    limit=1,
+                    cursor=first.next_cursor,
+                )
+            )
+            running = await store.list_sessions_with_pending_interruption_cascade(
+                SessionQuery(status=SessionStatus.RUNNING)
+            )
+
+            assert first.total_count == 2
+            assert first.next_cursor is not None
+            assert [session.id for session in first.sessions + second.sessions] == [
+                "sess_cascade_index_a",
+                "sess_cascade_index_b",
+            ]
+            assert second.next_cursor is None
+            assert [session.id for session in running.sessions] == [
+                "sess_cascade_index_running"
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_applies_query_filters(session_store_case) -> None:

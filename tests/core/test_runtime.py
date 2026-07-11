@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -342,19 +343,19 @@ class FailingApprovalCloseStore(InMemorySessionStore):
         super().__init__()
         self.failed_close_once = False
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict,
+        checkpoint_transform,
     ) -> None:
         if not self.failed_close_once and any(message.role == "tool" for message in messages):
             self.failed_close_once = True
             raise RuntimeError("approval close unavailable")
-        await super().append_transcript_messages_and_checkpoint(
+        await super().append_transcript_messages_and_transform_checkpoint(
             session_id,
             messages,
-            checkpoint,
+            checkpoint_transform,
         )
 
 
@@ -382,21 +383,21 @@ class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
         super().__init__()
         self.failed_tool_round_close_once = False
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict,
+        checkpoint_transform,
     ) -> None:
         if not self.failed_tool_round_close_once and any(
             message.role == "tool" for message in messages
         ):
             self.failed_tool_round_close_once = True
             raise RuntimeError("ordinary tool round close unavailable")
-        await super().append_transcript_messages_and_checkpoint(
+        await super().append_transcript_messages_and_transform_checkpoint(
             session_id,
             messages,
-            checkpoint,
+            checkpoint_transform,
         )
 
 
@@ -405,20 +406,28 @@ class FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
         super().__init__()
         self.failed_pending_tool_round_once = False
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict,
+        checkpoint_transform,
     ) -> None:
-        await super().append_transcript_messages_and_checkpoint(
+        transformed_checkpoint = None
+
+        def capture_transform(session, checkpoint):
+            nonlocal transformed_checkpoint
+            transformed_checkpoint = checkpoint_transform(session, checkpoint)
+            return transformed_checkpoint
+
+        await super().append_transcript_messages_and_transform_checkpoint(
             session_id,
             messages,
-            checkpoint,
+            capture_transform,
         )
         if (
             not self.failed_pending_tool_round_once
-            and "pending_tool_round" in checkpoint
+            and transformed_checkpoint is not None
+            and "pending_tool_round" in transformed_checkpoint
             and any(message.role == "assistant" for message in messages)
         ):
             self.failed_pending_tool_round_once = True
@@ -892,6 +901,12 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     return [event async for event in app.resume(request)]
+
+
+def interruption_payload_without_request_id(payload: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(payload)
+    assert UUID(copied.pop("interruption_request_id"))
+    return copied
 
 
 def test_context_counting_is_off_by_default() -> None:
@@ -3217,10 +3232,17 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_fails()
             await super().close()
 
     class FailingReconnectCheckpointStore(InMemorySessionStore):
-        async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
-            if runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state:
-                raise RuntimeError("reconnect checkpoint unavailable")
-            await super().checkpoint(session_id, state)
+        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+            def fail_reconnect(session, checkpoint):
+                state = checkpoint_transform(session, checkpoint)
+                if (
+                    state is not None
+                    and runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state
+                ):
+                    raise RuntimeError("reconnect checkpoint unavailable")
+                return state
+
+            await super().transform_checkpoint(session_id, fail_reconnect)
 
     async def run() -> tuple[list[Event], ClosingRunner, FakeProvider]:
         runner = ClosingRunner()
@@ -3290,10 +3312,17 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_is_canc
             await super().close()
 
     class CancellingReconnectCheckpointStore(InMemorySessionStore):
-        async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
-            if runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state:
-                raise asyncio.CancelledError()
-            await super().checkpoint(session_id, state)
+        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+            def cancel_reconnect(session, checkpoint):
+                state = checkpoint_transform(session, checkpoint)
+                if (
+                    state is not None
+                    and runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state
+                ):
+                    raise asyncio.CancelledError()
+                return state
+
+            await super().transform_checkpoint(session_id, cancel_reconnect)
 
     async def run() -> tuple[ClosingRunner, Session]:
         runner = ClosingRunner()
@@ -8413,7 +8442,17 @@ def test_subagent_result_tool_can_wait_for_all_background_children():
     assert result_texts == {"task a done", "task b done"}
 
 
-def test_interrupting_parent_interrupts_running_background_subagents():
+@pytest.mark.parametrize("delay_parent_finalization", [False, True])
+def test_interrupting_parent_interrupts_running_background_subagents(
+    monkeypatch,
+    delay_parent_finalization,
+):
+    active_wait_attempts = runtime_app_module._ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS
+    active_wait_interval_s = runtime_app_module._ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S
+    if delay_parent_finalization:
+        monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+        monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+
     class BackgroundInterruptProvider(ModelProvider):
         name = "fake"
 
@@ -8421,6 +8460,7 @@ def test_interrupting_parent_interrupts_running_background_subagents():
             self.requests: list[ModelRequest] = []
             self.child_model_started = asyncio.Event()
             self.parent_second_step_started = asyncio.Event()
+            self.release_parent_after_cancel = asyncio.Event()
 
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
             self.requests.append(request)
@@ -8442,7 +8482,13 @@ def test_interrupting_parent_interrupts_running_background_subagents():
                 return
             if first_text == "parent task" and request.messages[-1].role == "tool":
                 self.parent_second_step_started.set()
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if not delay_parent_finalization:
+                        raise
+                    await self.release_parent_after_cancel.wait()
+                    yield ModelStreamEvent.completed({"finish_reason": "stop"})
                 return
             raise AssertionError("Unexpected background interrupt provider request.")
 
@@ -8480,16 +8526,39 @@ def test_interrupting_parent_interrupts_running_background_subagents():
         )
         await asyncio.wait_for(provider.child_model_started.wait(), timeout=1)
         await asyncio.wait_for(provider.parent_second_step_started.wait(), timeout=1)
-        interrupt_events = [
-            event
-            async for event in app.interrupt_session(
-                InterruptSessionRequest(
-                    session_id="sess_background_parent_interrupt",
-                    reason="stop parent and background children",
+        interrupt_request = InterruptSessionRequest(
+            session_id="sess_background_parent_interrupt",
+            reason="stop parent and background children",
+            requested_by=ResolutionActor(
+                subject="operator-42",
+                source=ResolutionActorSource.REQUEST,
+            ),
+        )
+        if delay_parent_finalization:
+            with pytest.raises(TimeoutError, match="interruption is still finalizing"):
+                _ = [event async for event in app.interrupt_session(interrupt_request)]
+            children_before_parent_release = (
+                await store.list_sessions(
+                    SessionQuery(parent_session_id="sess_background_parent_interrupt")
                 )
+            ).sessions
+            assert children_before_parent_release[0].status == SessionStatus.RUNNING
+            monkeypatch.setattr(
+                runtime_app_module,
+                "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+                active_wait_attempts,
             )
-        ]
+            monkeypatch.setattr(
+                runtime_app_module,
+                "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
+                active_wait_interval_s,
+            )
+            provider.release_parent_after_cancel.set()
+            interrupt_events = []
+        else:
+            interrupt_events = [event async for event in app.interrupt_session(interrupt_request)]
         parent_events = await asyncio.wait_for(parent_task, timeout=2)
+        assert await app.drain_background_interruptions(timeout_s=1) is True
         child_sessions = (
             await store.list_sessions(
                 SessionQuery(parent_session_id="sess_background_parent_interrupt")
@@ -8500,7 +8569,10 @@ def test_interrupting_parent_interrupts_running_background_subagents():
 
     interrupt_events, parent_events, child_sessions, child_events = asyncio.run(run())
 
-    assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
+    if delay_parent_finalization:
+        assert interrupt_events == []
+    else:
+        assert interrupt_events[-1].type == EventType.SESSION_INTERRUPTED
     assert parent_events[-1].type == EventType.SESSION_INTERRUPTED
     assert len(child_sessions) == 1
     assert child_sessions[0].status == SessionStatus.INTERRUPTED
@@ -8511,6 +8583,2387 @@ def test_interrupting_parent_interrupts_running_background_subagents():
     assert child_interrupted[0].payload["metadata"]["source"] == (
         "background_subagent_parent_interrupt"
     )
+    assert child_interrupted[0].payload["requested_by"] == {
+        "subject": "operator-42",
+        "tenant": None,
+        "source": "request",
+    }
+
+
+def test_retried_parent_interruption_cascades_original_durable_provenance():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_interrupted_parent_retry",
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_interrupted_parent_retry_child",
+                parent_session_id="sess_interrupted_parent_retry",
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        await store.update_status(
+            "sess_interrupted_parent_retry",
+            SessionStatus.INTERRUPTED,
+        )
+        durable_payload = {
+            "reason": "original operator stop",
+            "metadata": {"ticket": "incident-a"},
+            "requested_by": {
+                "subject": "operator-a",
+                "tenant": "tenant-7",
+                "source": "http_auth",
+            },
+            "interruption_type": "operator_requested",
+        }
+        await store.append_event(
+            "sess_interrupted_parent_retry",
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id="sess_interrupted_parent_retry",
+                agent_name="parent",
+                payload=durable_payload,
+            ),
+        )
+        await store.checkpoint(
+            "sess_interrupted_parent_retry",
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "retry-durable-provenance",
+                    "interrupt_payload": durable_payload,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "failure_recorded": True,
+                }
+            },
+        )
+
+        repeated_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupted_parent_retry",
+                    reason="retry from another operator",
+                    metadata={"ticket": "incident-b"},
+                    requested_by=ResolutionActor(
+                        subject="operator-b",
+                        tenant="tenant-7",
+                        source=ResolutionActorSource.HTTP_AUTH,
+                    ),
+                )
+            )
+        ]
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        child_events = await store.load_events("sess_interrupted_parent_retry_child")
+        parent_events = await store.load_events("sess_interrupted_parent_retry")
+        return repeated_events, child_events, parent_events
+
+    repeated_events, child_events, parent_events = asyncio.run(run())
+
+    assert repeated_events[0].payload["requested_by"]["subject"] == "operator-a"
+    assert repeated_events[1].type == EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED
+    retry_request_id = repeated_events[1].payload["retry_request_id"]
+    assert UUID(retry_request_id)
+    assert repeated_events[1].payload["retry_reason"] == "retry from another operator"
+    assert repeated_events[1].payload["retry_metadata"] == {"ticket": "incident-b"}
+    assert repeated_events[1].payload["retry_requested_by"]["subject"] == "operator-b"
+    child_interrupted = [
+        event for event in child_events if event.type == EventType.SESSION_INTERRUPTED
+    ]
+    assert len(child_interrupted) == 1
+    assert child_interrupted[0].payload["reason"] == "original operator stop"
+    assert child_interrupted[0].payload["metadata"]["parent_metadata"] == {"ticket": "incident-a"}
+    assert child_interrupted[0].payload["requested_by"] == {
+        "subject": "operator-a",
+        "tenant": "tenant-7",
+        "source": "http_auth",
+    }
+    completed = next(
+        event
+        for event in parent_events
+        if event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
+    )
+    assert completed.payload["retry_request_id"] == retry_request_id
+    assert completed.payload["retry_reason"] == "retry from another operator"
+    assert completed.payload["retry_requested_by"]["subject"] == "operator-b"
+
+
+def test_interrupted_session_cascade_retry_uses_durable_identity_when_agent_is_unregistered():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_retry_removed_agent"
+        durable_payload = {
+            "reason": "original operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="removed-agent",
+                session_id=session_id,
+                messages=[Message.text("user", "historical work")],
+            ),
+            identity=SessionIdentity(provider_name="removed-provider", model="old-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        interrupted = Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=session_id,
+            agent_name="removed-agent",
+            payload=durable_payload,
+        )
+        await store.append_event(session_id, interrupted)
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "removed-agent-retry",
+                    "interrupt_payload": durable_payload,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "failure_recorded": True,
+                }
+            },
+        )
+        retry_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="retry after deployment",
+                    requested_by=ResolutionActor(
+                        subject="operator-b",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                )
+            )
+        ]
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return retry_events, await store.load_events(session_id)
+
+    retry_events, stored_events = asyncio.run(run())
+
+    assert [event.type for event in retry_events] == [
+        EventType.SESSION_INTERRUPTED,
+        EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
+    ]
+    assert retry_events[1].agent_name == "removed-agent"
+    assert retry_events[1].payload["retry_requested_by"]["subject"] == "operator-b"
+    completed = next(
+        event
+        for event in stored_events
+        if event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
+    )
+    assert completed.agent_name == "removed-agent"
+    assert completed.payload["retry_request_id"] == retry_events[1].payload["retry_request_id"]
+
+
+def test_finalizing_background_child_does_not_fail_parent_cascade(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_parent_with_finalizing_child",
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id="sess_finalizing_background_child",
+                parent_session_id="sess_parent_with_finalizing_child",
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        captured_requests = []
+
+        async def finalizing_interrupt_session(request):
+            captured_requests.append(request)
+            raise TimeoutError(f"Session interruption is still finalizing: {request.session_id}")
+            yield
+
+        monkeypatch.setattr(app, "interrupt_session", finalizing_interrupt_session)
+        await app._interrupt_background_subagent_children(
+            parent_session_id="sess_parent_with_finalizing_child",
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": {
+                    "subject": "operator-a",
+                    "tenant": None,
+                    "source": "http_auth",
+                },
+                "interruption_type": "operator_requested",
+            },
+        )
+        return captured_requests
+
+    captured_requests = asyncio.run(run())
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].session_id == "sess_finalizing_background_child"
+    assert captured_requests[0].requested_by.subject == "operator-a"
+
+
+def test_background_interruption_reconciles_child_already_interrupting_elsewhere():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_reconcile_interrupting_parent"
+        child_id = "sess_reconcile_interrupting_child"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "child")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        await store.update_status(child_id, SessionStatus.INTERRUPTING)
+
+        async def finish_other_owner():
+            await asyncio.sleep(0.01)
+            await store.update_status(child_id, SessionStatus.INTERRUPTED)
+            await store.append_event(
+                child_id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=child_id,
+                    agent_name="reviewer",
+                    payload={"interruption_type": "operator_requested"},
+                ),
+            )
+
+        other_owner = asyncio.create_task(finish_other_owner())
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        await other_owner
+        return (
+            await store.load(child_id),
+            await store.load_checkpoint(parent_id),
+            await store.load_events(parent_id),
+        )
+
+    child, parent_checkpoint, parent_events = asyncio.run(run())
+
+    assert child.status == SessionStatus.INTERRUPTED
+    assert all(
+        event.type != EventType.SESSION_INTERRUPTION_CASCADE_FAILED for event in parent_events
+    )
+    assert parent_checkpoint == {}
+
+
+def test_background_interruption_cascade_isolates_child_completion_race(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id="sess_parent_child_completion_race",
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        for child_id in ("sess_child_completes", "sess_child_interrupts"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id=child_id,
+                    parent_session_id="sess_parent_child_completion_race",
+                    messages=[Message.text("user", "background task")],
+                    metadata={"subagent": {"mode": "background"}},
+                ),
+                identity=identity,
+            )
+
+        original_interrupt_session = app.interrupt_session
+
+        async def racing_interrupt_session(request):
+            if request.session_id == "sess_child_completes":
+                await store.update_status(request.session_id, SessionStatus.COMPLETED)
+            async for event in original_interrupt_session(request):
+                yield event
+
+        monkeypatch.setattr(app, "interrupt_session", racing_interrupt_session)
+        await app._interrupt_background_subagent_children(
+            parent_session_id="sess_parent_child_completion_race",
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        return (
+            await store.load("sess_child_completes"),
+            await store.load("sess_child_interrupts"),
+        )
+
+    completed_child, interrupted_child = asyncio.run(run())
+
+    assert completed_child.status == SessionStatus.COMPLETED
+    assert interrupted_child.status == SessionStatus.INTERRUPTED
+
+
+def test_background_interruption_cascade_persists_partial_failure(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_session_id = "sess_parent_partial_interrupt_failure"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_session_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        for child_id in ("sess_child_interrupt_fails", "sess_child_interrupt_succeeds"):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id=child_id,
+                    parent_session_id=parent_session_id,
+                    messages=[Message.text("user", "background task")],
+                    metadata={"subagent": {"mode": "background"}},
+                ),
+                identity=identity,
+            )
+
+        captured_child_ids = []
+
+        async def partially_failing_interrupt_session(request):
+            captured_child_ids.append(request.session_id)
+            if request.session_id == "sess_child_interrupt_fails":
+                raise RuntimeError("sensitive provider detail")
+            yield Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=request.session_id,
+                agent_name="reviewer",
+            )
+
+        monkeypatch.setattr(app, "interrupt_session", partially_failing_interrupt_session)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_session_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        return captured_child_ids, await store.load_events(parent_session_id)
+
+    captured_child_ids, parent_events = asyncio.run(run())
+
+    assert set(captured_child_ids) == {
+        "sess_child_interrupt_fails",
+        "sess_child_interrupt_succeeds",
+    }
+    failure_event = parent_events[-1]
+    assert failure_event.type == EventType.SESSION_INTERRUPTION_CASCADE_FAILED
+    assert UUID(failure_event.payload["attempt_id"])
+    assert {key: value for key, value in failure_event.payload.items() if key != "attempt_id"} == {
+        "interruption_type": "operator_requested",
+        "generation": 1,
+        "failure_count": 1,
+        "failures": [
+            {
+                "scope": "child",
+                "session_id": "sess_child_interrupt_fails",
+                "status": "pending",
+                "reason": "interruption_request_failed",
+                "error_type": "RuntimeError",
+            }
+        ],
+        "failures_truncated": False,
+    }
+    assert "sensitive provider detail" not in str(failure_event.payload)
+
+
+def test_background_interruption_cascade_success_resolves_prior_failure(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_session_id = "sess_parent_cascade_retry"
+        child_session_id = "sess_child_cascade_retry"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_session_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_session_id,
+                parent_session_id=parent_session_id,
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        attempts = 0
+
+        async def retrying_interrupt_session(request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary failure")
+            yield Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=request.session_id,
+                agent_name="reviewer",
+            )
+
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        monkeypatch.setattr(app, "interrupt_session", retrying_interrupt_session)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_session_id,
+            interrupt_payload=payload,
+        )
+        failed_checkpoint = await store.load_checkpoint(parent_session_id)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_session_id,
+            interrupt_payload=payload,
+        )
+        return (
+            failed_checkpoint,
+            await store.load_checkpoint(parent_session_id),
+            await store.load_events(parent_session_id),
+        )
+
+    failed_checkpoint, completed_checkpoint, parent_events = asyncio.run(run())
+
+    assert "pending_interruption_cascade" in failed_checkpoint
+    assert "pending_interruption_cascade" not in completed_checkpoint
+    assert [event.type for event in parent_events] == [
+        EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+        EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+    ]
+    assert parent_events[0].payload["attempt_id"] == parent_events[1].payload["attempt_id"]
+    assert [event.payload["generation"] for event in parent_events] == [1, 2]
+
+
+def test_background_interruption_cascade_retains_marker_while_child_is_interrupting(
+    monkeypatch,
+):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_parent_child_still_interrupting"
+        child_id = "sess_child_still_interrupting"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "child")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        async def still_finalizing_interrupt(request):
+            await store.update_status(request.session_id, SessionStatus.INTERRUPTING)
+            raise TimeoutError("still finalizing")
+            yield
+
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        monkeypatch.setattr(app, "interrupt_session", still_finalizing_interrupt)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+        )
+        failed_checkpoint = await store.load_checkpoint(parent_id)
+        failed_events = await store.load_events(parent_id)
+
+        await store.update_status(child_id, SessionStatus.INTERRUPTED)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+        )
+        return (
+            failed_checkpoint,
+            await store.load_checkpoint(parent_id),
+            failed_events,
+            await store.load_events(parent_id),
+        )
+
+    failed_checkpoint, completed_checkpoint, failed_events, completed_events = asyncio.run(run())
+
+    assert failed_checkpoint["pending_interruption_cascade"]["failure_recorded"] is True
+    assert "pending_interruption_cascade" not in completed_checkpoint
+    assert failed_events[-1].type == EventType.SESSION_INTERRUPTION_CASCADE_FAILED
+    assert failed_events[-1].payload["failures"][0]["status"] == "interrupting"
+    assert completed_events[-1].type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
+
+
+def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marker(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_parent_shutdown_cascade"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        for index in range(3):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id=f"sess_shutdown_child_{index}",
+                    parent_session_id=parent_id,
+                    messages=[Message.text("user", "child")],
+                    metadata={"subagent": {"mode": "background"}},
+                ),
+                identity=identity,
+            )
+        started = asyncio.Event()
+
+        async def blocked_interrupt(_request):
+            started.set()
+            await asyncio.Event().wait()
+            yield
+
+        monkeypatch.setattr(app, "interrupt_session", blocked_interrupt)
+        app._schedule_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+            create_if_missing=True,
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        drained = await asyncio.wait_for(
+            app.drain_background_interruptions(timeout_s=0.001),
+            timeout=1,
+        )
+        return (
+            drained,
+            app._background_interruption_tasks,
+            app._background_interruption_workers,
+            await store.load_checkpoint(parent_id),
+        )
+
+    drained, tasks, workers, checkpoint = asyncio.run(run())
+
+    assert drained is False
+    assert tasks == set()
+    assert workers == set()
+    assert "pending_interruption_cascade" in checkpoint
+
+
+def test_pending_interruption_startup_waits_for_dead_claim_expiry(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_startup_dead_claim"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-dead-claim-attempt",
+                    "interrupt_payload": payload,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "generation": 1,
+                    "claim_id": "dead-process-claim",
+                    "claim_expires_at": (datetime.now(UTC) + timedelta(seconds=0.05)).isoformat(),
+                }
+            },
+        )
+
+        scheduled = await app.resume_pending_interruption_cascades()
+        await asyncio.sleep(0.06)
+        drained = await app.drain_background_interruptions(timeout_s=1)
+        return scheduled, drained, await store.load_checkpoint(parent_id)
+
+    scheduled, drained, checkpoint = asyncio.run(run())
+
+    assert scheduled == 1
+    assert drained is True
+    assert "pending_interruption_cascade" not in checkpoint
+
+
+def test_pending_interruption_startup_bounds_healthy_external_claim_recovery():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        root_count = runtime_app_module._BACKGROUND_INTERRUPTION_CONCURRENCY * 3
+        for index in range(root_count):
+            session_id = f"sess_external_claim_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="parent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "parent")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await store.checkpoint(
+                session_id,
+                {
+                    "pending_interruption_cascade": {
+                        "attempt_id": f"cascade-external-claim-{index}",
+                        "interrupt_payload": payload,
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "generation": 1,
+                        "claim_id": f"external-owner-{index}",
+                        "claim_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            )
+
+        scheduled = await asyncio.wait_for(
+            app.resume_pending_interruption_cascades(),
+            timeout=0.2,
+        )
+        active_tasks = len(app._background_interruption_tasks)
+        drained = await app.drain_background_interruptions(timeout_s=0.01)
+        return root_count, scheduled, active_tasks, drained
+
+    root_count, scheduled, active_tasks, drained = asyncio.run(run())
+
+    assert scheduled == root_count
+    assert active_tasks <= runtime_app_module._BACKGROUND_INTERRUPTION_CONCURRENCY
+    assert drained is True
+
+
+def test_background_interruption_shutdown_drains_locally_queued_roots(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 1)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        old_created_at = datetime.now(UTC) - timedelta(minutes=5)
+        for index in range(2):
+            session_id = f"sess_locally_queued_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="parent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "parent")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await store.checkpoint(
+                session_id,
+                {
+                    "pending_interruption_cascade": {
+                        "attempt_id": f"locally-queued-{index}",
+                        "interrupt_payload": payload,
+                        "created_at": old_created_at.isoformat(),
+                    }
+                },
+            )
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        processed: list[str] = []
+
+        async def controlled_cascade(
+            *, parent_session_id, interrupt_payload, create_if_missing=False
+        ):
+            assert interrupt_payload == payload
+            assert create_if_missing is False
+            processed.append(parent_session_id)
+            if parent_session_id == "sess_locally_queued_0":
+                first_started.set()
+                await release_first.wait()
+
+        monkeypatch.setattr(app, "_interrupt_background_subagent_children", controlled_cascade)
+        for index in range(2):
+            app._schedule_background_interruption_cascade(
+                parent_session_id=f"sess_locally_queued_{index}",
+                interrupt_payload=payload,
+                create_if_missing=False,
+            )
+        await first_started.wait()
+        queued_status = await app.interruption_cascade_status("sess_locally_queued_1")
+        drain_task = asyncio.create_task(app.drain_background_interruptions(timeout_s=1))
+        await asyncio.sleep(0)
+        drain_finished_before_release = drain_task.done()
+        release_first.set()
+        drained = await drain_task
+        return queued_status, drain_finished_before_release, drained, processed
+
+    queued_status, drain_finished_before_release, drained, processed = asyncio.run(run())
+
+    assert queued_status == "pending"
+    assert drain_finished_before_release is False
+    assert drained is True
+    assert processed == ["sess_locally_queued_0", "sess_locally_queued_1"]
+
+
+def test_background_interruption_shutdown_does_not_restart_external_lease_waiter(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_shutdown_external_lease_race"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "shutdown-external-lease-race",
+                    "interrupt_payload": payload,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "generation": 1,
+                    "claim_id": "external-owner",
+                    "claim_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                }
+            },
+        )
+        claim_started = asyncio.Event()
+        release_claim = asyncio.Event()
+
+        async def blocked_claim(*_args, **_kwargs):
+            claim_started.set()
+            await release_claim.wait()
+            return None
+
+        monkeypatch.setattr(app, "_claim_pending_interruption_cascade", blocked_claim)
+        app._schedule_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+            create_if_missing=False,
+        )
+        await claim_started.wait()
+        drain_task = asyncio.create_task(app.drain_background_interruptions(timeout_s=1))
+        await asyncio.sleep(0)
+        release_claim.set()
+        drained = await drain_task
+        await asyncio.sleep(0)
+        return (
+            drained,
+            app._background_interruption_deferred,
+            app._background_interruption_deferred_task,
+        )
+
+    drained, deferred, deferred_task = asyncio.run(run())
+
+    assert drained is True
+    assert deferred == {}
+    assert deferred_task is None
+
+
+def test_background_interruption_drain_cancellation_cleans_up_owned_work(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_cancelled_drain_parent"
+        child_id = "sess_cancelled_drain_child"
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "child")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        child_started = asyncio.Event()
+
+        async def blocked_interrupt(_request):
+            child_started.set()
+            await asyncio.Event().wait()
+            yield
+
+        monkeypatch.setattr(app, "interrupt_session", blocked_interrupt)
+        app._schedule_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+            create_if_missing=True,
+        )
+        await child_started.wait()
+        drain_task = asyncio.create_task(app.drain_background_interruptions(timeout_s=10))
+        await asyncio.sleep(0)
+        drain_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain_task
+        checkpoint = await store.load_checkpoint(parent_id)
+        return (
+            app._background_interruption_draining,
+            app._background_interruption_tasks,
+            app._background_interruption_workers,
+            app._background_interruption_deferred_task,
+            checkpoint,
+        )
+
+    draining, tasks, workers, deferred_task, checkpoint = asyncio.run(run())
+
+    assert draining is False
+    assert tasks == set()
+    assert workers == set()
+    assert deferred_task is None
+    marker = checkpoint["pending_interruption_cascade"]
+    assert marker["attempt_id"]
+
+
+def test_background_interruption_shutdown_grace_detaches_cancellation_resistant_worker(
+    monkeypatch,
+):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_stubborn_shutdown_parent"
+        child_id = "sess_stubborn_shutdown_child"
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "child")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+        child_finished = asyncio.Event()
+
+        async def cancellation_resistant_interrupt(_request):
+            child_started.set()
+            try:
+                while not release_child.is_set():
+                    try:
+                        await release_child.wait()
+                    except asyncio.CancelledError:
+                        continue
+                yield Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=child_id,
+                    agent_name="reviewer",
+                )
+            finally:
+                child_finished.set()
+
+        monkeypatch.setattr(app, "interrupt_session", cancellation_resistant_interrupt)
+        app._schedule_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+            create_if_missing=True,
+        )
+        await child_started.wait()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        drained = await asyncio.wait_for(
+            app.drain_background_interruptions(timeout_s=0.01),
+            timeout=0.2,
+        )
+        elapsed = loop.time() - started_at
+        tracked_after_drain = (
+            app._background_interruption_tasks,
+            app._background_interruption_workers,
+            app._background_interruption_states,
+        )
+        release_child.set()
+        await asyncio.wait_for(child_finished.wait(), timeout=1)
+        await asyncio.sleep(0)
+        return drained, elapsed, tracked_after_drain
+
+    drained, elapsed, tracked_after_drain = asyncio.run(run())
+
+    assert drained is False
+    assert elapsed < 0.2
+    assert tracked_after_drain == (set(), set(), {})
+
+
+def test_background_interruption_shutdown_fences_cancellation_resistant_claim(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_stubborn_shutdown_claim"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+
+        claim_started = asyncio.Event()
+        release_claim = asyncio.Event()
+        claim_returned = asyncio.Event()
+        claimed_runs: list[str] = []
+        original_claim = app._claim_pending_interruption_cascade
+        original_run_claimed = app._run_claimed_background_interruption_cascade
+
+        async def cancellation_resistant_claim(*args, **kwargs):
+            claim_started.set()
+            while not release_claim.is_set():
+                try:
+                    await release_claim.wait()
+                except asyncio.CancelledError:
+                    continue
+            marker = await original_claim(*args, **kwargs)
+            claim_returned.set()
+            return marker
+
+        async def record_claimed_run(state):
+            claimed_runs.append(state.parent_session_id)
+            await original_run_claimed(state)
+
+        monkeypatch.setattr(
+            app,
+            "_claim_pending_interruption_cascade",
+            cancellation_resistant_claim,
+        )
+        monkeypatch.setattr(
+            app,
+            "_run_claimed_background_interruption_cascade",
+            record_claimed_run,
+        )
+        task = app._schedule_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+            create_if_missing=True,
+        )
+        assert task is not None
+        await claim_started.wait()
+
+        drained = await asyncio.wait_for(
+            app.drain_background_interruptions(timeout_s=0.01),
+            timeout=0.2,
+        )
+        tracked_after_drain = (
+            app._background_interruption_tasks,
+            app._background_interruption_workers,
+            app._background_interruption_states,
+        )
+        release_claim.set()
+        await asyncio.wait_for(claim_returned.wait(), timeout=1)
+        await asyncio.wait_for(task, timeout=1)
+        checkpoint = await store.load_checkpoint(parent_id)
+        return drained, tracked_after_drain, claimed_runs, checkpoint
+
+    drained, tracked_after_drain, claimed_runs, checkpoint = asyncio.run(run())
+
+    assert drained is False
+    assert tracked_after_drain == (set(), set(), {})
+    assert claimed_runs == []
+    marker = checkpoint["pending_interruption_cascade"]
+    assert marker["claim_id"]
+    assert marker["claim_expires_at"]
+
+
+def test_interruption_cascade_status_prefers_cleared_durable_marker_over_stale_defer():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_stale_external_defer"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "stale-external-defer",
+                    "interrupt_payload": payload,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "generation": 1,
+                    "claim_id": "external-owner",
+                    "claim_expires_at": (datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+                }
+            },
+        )
+        app._defer_background_interruption_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+            retry_at=datetime.now(UTC) + timedelta(seconds=30),
+            drain_required=False,
+            retry_request=None,
+        )
+        await store.checkpoint(parent_id, {})
+        status = await app.interruption_cascade_status(parent_id)
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return status
+
+    assert asyncio.run(run()) == "none"
+
+
+def test_background_interruption_heartbeat_retries_transient_store_error(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.1)
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS", 0.01)
+        monkeypatch.setattr(
+            runtime_app_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
+            0.005,
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_transient_heartbeat_parent"
+        child_id = "sess_transient_heartbeat_child"
+        for session_id, parent_session_id, metadata in (
+            (parent_id, None, {}),
+            (child_id, parent_id, {"subagent": {"mode": "background"}}),
+        ):
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id=session_id,
+                    parent_session_id=parent_session_id,
+                    messages=[Message.text("user", "task")],
+                    metadata=metadata,
+                ),
+                identity=identity,
+            )
+
+        async def delayed_interrupt(request):
+            await asyncio.sleep(0.04)
+            await store.update_status(request.session_id, SessionStatus.INTERRUPTED)
+            yield Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=request.session_id,
+                agent_name="reviewer",
+            )
+
+        monkeypatch.setattr(app, "interrupt_session", delayed_interrupt)
+        original_renew = app._renew_pending_interruption_cascade_claim
+        renew_attempts = 0
+
+        async def transient_renew(*args):
+            nonlocal renew_attempts
+            renew_attempts += 1
+            if renew_attempts == 1:
+                raise RuntimeError("temporary store outage")
+            return await original_renew(*args)
+
+        monkeypatch.setattr(app, "_renew_pending_interruption_cascade_claim", transient_renew)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        await app.drain_background_interruptions(timeout_s=1)
+        return renew_attempts, await store.load_checkpoint(parent_id)
+
+    renew_attempts, checkpoint = asyncio.run(run())
+
+    assert renew_attempts >= 2
+    assert "pending_interruption_cascade" not in checkpoint
+
+
+def test_background_interruption_concurrency_is_app_wide_across_nested_trees(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_ids = ("sess_nested_parent_a", "sess_nested_parent_b")
+        expected_child_ids = set()
+        for parent_id in parent_ids:
+            await store.create(
+                RunRequest(
+                    agent_name="parent",
+                    session_id=parent_id,
+                    messages=[Message.text("user", "parent task")],
+                ),
+                identity=identity,
+            )
+            for child_index in range(3):
+                child_id = f"{parent_id}_child_{child_index}"
+                expected_child_ids.add(child_id)
+                await store.create(
+                    RunRequest(
+                        agent_name="reviewer",
+                        session_id=child_id,
+                        parent_session_id=parent_id,
+                        messages=[Message.text("user", "background task")],
+                        metadata={"subagent": {"mode": "background"}},
+                    ),
+                    identity=identity,
+                )
+                grandchild_id = f"{child_id}_grandchild"
+                expected_child_ids.add(grandchild_id)
+                await store.create(
+                    RunRequest(
+                        agent_name="reviewer",
+                        session_id=grandchild_id,
+                        parent_session_id=child_id,
+                        messages=[Message.text("user", "nested background task")],
+                        metadata={"subagent": {"mode": "background"}},
+                    ),
+                    identity=identity,
+                )
+
+        captured_child_ids = set()
+        active_requests = 0
+        peak_active_requests = 0
+
+        async def capture_interrupt_session(request):
+            nonlocal active_requests, peak_active_requests
+            active_requests += 1
+            peak_active_requests = max(peak_active_requests, active_requests)
+            try:
+                captured_child_ids.add(request.session_id)
+                await asyncio.sleep(0.01)
+                yield Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=request.session_id,
+                    agent_name="reviewer",
+                )
+            finally:
+                active_requests -= 1
+
+        monkeypatch.setattr(app, "interrupt_session", capture_interrupt_session)
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await asyncio.gather(
+            *(
+                app._interrupt_background_subagent_children(
+                    parent_session_id=parent_id,
+                    interrupt_payload=payload,
+                )
+                for parent_id in parent_ids
+            )
+        )
+        worker_count = len(app._background_interruption_workers)
+        await app.drain_background_interruptions(timeout_s=1)
+        return expected_child_ids, captured_child_ids, peak_active_requests, worker_count
+
+    expected_child_ids, captured_child_ids, peak_active_requests, worker_count = asyncio.run(run())
+
+    assert captured_child_ids == expected_child_ids
+    assert peak_active_requests == 2
+    assert worker_count == 2
+
+
+def test_background_interruption_traverses_foreground_nodes_to_background_descendants():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_mixed_tree_parent"
+        foreground_id = "sess_mixed_tree_foreground"
+        background_id = "sess_mixed_tree_background"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=foreground_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "foreground")],
+                metadata={"subagent": {"mode": "foreground"}},
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=background_id,
+                parent_session_id=foreground_id,
+                messages=[Message.text("user", "background")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        return await store.load(foreground_id), await store.load(background_id)
+
+    foreground, background = asyncio.run(run())
+
+    assert foreground.status == SessionStatus.PENDING
+    assert background.status == SessionStatus.INTERRUPTED
+
+
+def test_background_interruption_cascade_paginates_all_children(monkeypatch):
+    async def run():
+        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 4)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_session_id = "sess_parent_many_background_children"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_session_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        expected_child_ids = {
+            f"sess_paginated_background_child_{index:04d}" for index in range(1001)
+        }
+        for child_id in expected_child_ids:
+            await store.create(
+                RunRequest(
+                    agent_name="reviewer",
+                    session_id=child_id,
+                    parent_session_id=parent_session_id,
+                    messages=[Message.text("user", "background task")],
+                    metadata={"subagent": {"mode": "background"}},
+                ),
+                identity=identity,
+            )
+
+        captured_child_ids = set()
+        active_requests = 0
+        peak_active_requests = 0
+
+        async def capture_interrupt_session(request):
+            nonlocal active_requests, peak_active_requests
+            active_requests += 1
+            peak_active_requests = max(peak_active_requests, active_requests)
+            try:
+                captured_child_ids.add(request.session_id)
+                await asyncio.sleep(0)
+                yield Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=request.session_id,
+                    agent_name="reviewer",
+                )
+            finally:
+                active_requests -= 1
+
+        monkeypatch.setattr(app, "interrupt_session", capture_interrupt_session)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_session_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        return expected_child_ids, captured_child_ids, peak_active_requests
+
+    expected_child_ids, captured_child_ids, peak_active_requests = asyncio.run(run())
+
+    assert captured_child_ids == expected_child_ids
+    assert peak_active_requests == 4
+
+
+def test_interrupt_waits_for_actual_terminal_event_before_checkpoint_cleanup(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_terminal_prefix",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+        cascade_payloads = []
+        checkpoint_before_terminal = []
+
+        async def capture_cascade(*, parent_session_id, interrupt_payload, create_if_missing=False):
+            assert parent_session_id == "sess_interrupt_terminal_prefix"
+            assert create_if_missing is False
+            cascade_payloads.append(interrupt_payload)
+
+        async def terminal_stream(**kwargs):
+            yield await app._event_writer.emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+                    session_id="sess_interrupt_terminal_prefix",
+                    agent_name="assistant",
+                    payload={"outcome": "interrupted"},
+                )
+            )
+            checkpoint_before_terminal.append(
+                await store.load_checkpoint("sess_interrupt_terminal_prefix")
+            )
+            yield await app._event_writer.emit(kwargs["event"])
+
+        monkeypatch.setattr(app, "_interrupt_background_subagent_children", capture_cascade)
+        monkeypatch.setattr(app, "_emit_terminal_event_with_hooks", terminal_stream)
+        events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id="sess_interrupt_terminal_prefix",
+                    reason="operator stop",
+                )
+            )
+        ]
+        return (
+            events,
+            cascade_payloads,
+            checkpoint_before_terminal,
+            await store.load_checkpoint("sess_interrupt_terminal_prefix"),
+        )
+
+    events, cascade_payloads, checkpoint_before_terminal, final_checkpoint = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert checkpoint_before_terminal[0]["pending_session_interrupt"]["reason"] == "operator stop"
+    assert "pending_session_interrupt" not in final_checkpoint
+    assert "pending_interruption_cascade" in final_checkpoint
+    assert len(cascade_payloads) == 1
+    assert all(payload["interruption_type"] == "operator_requested" for payload in cascade_payloads)
+
+
+def test_interrupt_stream_does_not_wait_for_background_cascade(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        fixed_now = datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
+        app = CayuApp(session_store=store, enable_logging=False, clock=lambda: fixed_now)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_cancelled_request_cascade",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        cascade_started = asyncio.Event()
+        release_cascade = asyncio.Event()
+
+        async def delayed_cascade(**_kwargs):
+            cascade_started.set()
+            await release_cascade.wait()
+
+        monkeypatch.setattr(app, "_interrupt_background_subagent_children", delayed_cascade)
+        event_stream = app.interrupt_session(
+            InterruptSessionRequest(
+                session_id="sess_interrupt_cancelled_request_cascade",
+                reason="operator stop",
+            )
+        )
+        request_task = asyncio.create_task(anext(event_stream))
+        await asyncio.wait_for(cascade_started.wait(), timeout=1)
+        interrupted_event = await asyncio.wait_for(request_task, timeout=1)
+        assert interrupted_event.type == EventType.SESSION_INTERRUPTED
+        assert len(app._background_interruption_tasks) == 1
+        await event_stream.aclose()
+        assert len(app._background_interruption_tasks) == 1
+        checkpoint = await store.load_checkpoint("sess_interrupt_cancelled_request_cascade")
+        release_cascade.set()
+        drained = await app.drain_background_interruptions(timeout_s=1)
+        return drained, app._background_interruption_tasks, checkpoint, fixed_now
+
+    drained, remaining_tasks, checkpoint, fixed_now = asyncio.run(run())
+
+    assert drained is True
+    assert remaining_tasks == set()
+    assert checkpoint["pending_interruption_cascade"]["created_at"] == fixed_now.isoformat()
+
+
+def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "sess_cascade_after_terminal"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        terminal_started = asyncio.Event()
+        release_terminal = asyncio.Event()
+
+        async def delayed_terminal_stream(**kwargs):
+            terminal_started.set()
+            await release_terminal.wait()
+            yield await app._event_writer.emit(kwargs["event"])
+
+        monkeypatch.setattr(app, "_emit_terminal_event_with_hooks", delayed_terminal_stream)
+        stream = app.interrupt_session(
+            InterruptSessionRequest(session_id=session_id, reason="operator stop")
+        )
+        first_event_task = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(terminal_started.wait(), timeout=1)
+        checkpoint_before_terminal = await store.load_checkpoint(session_id)
+        tasks_before_terminal = len(app._background_interruption_tasks)
+
+        release_terminal.set()
+        first_event = await asyncio.wait_for(first_event_task, timeout=1)
+        await stream.aclose()
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return (
+            first_event,
+            checkpoint_before_terminal,
+            tasks_before_terminal,
+            await store.load_checkpoint(session_id),
+        )
+
+    first_event, checkpoint_before_terminal, tasks_before_terminal, final_checkpoint = asyncio.run(
+        run()
+    )
+
+    assert first_event.type == EventType.SESSION_INTERRUPTED
+    assert "pending_interruption_cascade" in checkpoint_before_terminal
+    assert tasks_before_terminal == 0
+    assert final_checkpoint == {}
+
+
+def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_durable_cascade_parent"
+        child_id = "sess_durable_cascade_child"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {"ticket": "incident-7"},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-attempt-7",
+                    "interrupt_payload": payload,
+                }
+            },
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        scheduled = await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=datetime.now(UTC)
+        )
+        drained = await app.drain_background_interruptions(timeout_s=1)
+        return (
+            scheduled,
+            drained,
+            await store.load(child_id),
+            await store.load_checkpoint(parent_id),
+            await store.load_events(parent_id),
+        )
+
+    scheduled, drained, child, checkpoint, parent_events = asyncio.run(run())
+
+    assert scheduled == 1
+    assert drained is True
+    assert child.status == SessionStatus.INTERRUPTED
+    assert "pending_interruption_cascade" not in checkpoint
+    assert parent_events == []
+
+
+def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatch):
+    class RecoveryDiscoveryStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_queries: list[SessionQuery] = []
+            self.loaded_checkpoint_ids: list[str] = []
+
+        async def list_sessions(self, query=None):
+            raise AssertionError("Recovery must not scan the general session history.")
+
+        async def list_sessions_with_pending_interruption_cascade(self, query=None):
+            copied_query = SessionQuery() if query is None else query.model_copy(deep=True)
+            self.discovery_queries.append(copied_query)
+            return await super().list_sessions_with_pending_interruption_cascade(query)
+
+        async def load_checkpoint(self, session_id):
+            self.loaded_checkpoint_ids.append(session_id)
+            return await super().load_checkpoint(session_id)
+
+    async def run():
+        store = RecoveryDiscoveryStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        for index in range(5):
+            session_id = f"sess_historical_interrupted_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="parent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "historical")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        parent_id = "sess_indexed_interruption_cascade"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "indexed-recovery-attempt",
+                    "interrupt_payload": payload,
+                }
+            },
+        )
+        scheduled_parent_ids: list[str] = []
+
+        def record_schedule(**kwargs):
+            scheduled_parent_ids.append(kwargs["parent_session_id"])
+            return None
+
+        monkeypatch.setattr(app, "_schedule_background_interruption_cascade", record_schedule)
+        cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        scheduled = await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=cutoff
+        )
+        return (
+            scheduled,
+            scheduled_parent_ids,
+            store.discovery_queries,
+            store.loaded_checkpoint_ids,
+        )
+
+    scheduled, scheduled_parent_ids, discovery_queries, loaded_checkpoint_ids = asyncio.run(run())
+
+    assert scheduled == 1
+    assert scheduled_parent_ids == ["sess_indexed_interruption_cascade"]
+    assert [query.status for query in discovery_queries] == [
+        SessionStatus.INTERRUPTING,
+        SessionStatus.INTERRUPTED,
+    ]
+    assert discovery_queries[0].last_activity_before is not None
+    assert discovery_queries[1].last_activity_before is None
+    assert loaded_checkpoint_ids == ["sess_indexed_interruption_cascade"]
+
+
+def test_pending_interruption_cascade_finalizes_interrupting_parent_after_restart():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_restart_interrupting_parent"
+        child_id = "sess_restart_interrupting_child"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {"ticket": "incident-8"},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=identity,
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTING)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_session_interrupt": payload,
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-attempt-restart",
+                    "interrupt_payload": payload,
+                },
+            },
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        scheduled = await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=datetime.now(UTC)
+        )
+        drained = await app.drain_background_interruptions(timeout_s=1)
+        return (
+            scheduled,
+            drained,
+            await store.load(parent_id),
+            await store.load(child_id),
+            await store.load_checkpoint(parent_id),
+            await store.load_events(parent_id),
+        )
+
+    scheduled, drained, parent, child, checkpoint, parent_events = asyncio.run(run())
+
+    assert scheduled == 1
+    assert drained is True
+    assert parent.status == SessionStatus.INTERRUPTED
+    assert child.status == SessionStatus.INTERRUPTED
+    assert "pending_session_interrupt" not in checkpoint
+    assert "pending_interruption_cascade" not in checkpoint
+    assert [event.type for event in parent_events] == [
+        EventType.SESSION_RUN_FENCED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+
+
+def test_pending_interruption_restart_admits_parent_once_across_status_scans(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        parent_id = "sess_restart_single_admission"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTING)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_session_interrupt": payload,
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-attempt-single-admission",
+                    "interrupt_payload": payload,
+                },
+            },
+        )
+        attempts = 0
+
+        async def record_attempt(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+
+        monkeypatch.setattr(app, "_interrupt_background_subagent_children", record_attempt)
+        scheduled = await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=datetime.now(UTC)
+        )
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return scheduled, attempts
+
+    scheduled, attempts = asyncio.run(run())
+
+    assert scheduled == 1
+    assert attempts == 1
+
+
+def test_pending_interruption_restart_does_not_fence_fresh_remote_owner():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="parent", model="fake-model"))
+        parent_id = "sess_restart_fresh_remote_owner"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        created = await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent task")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(parent_id, SessionStatus.INTERRUPTING)
+        await store.checkpoint(
+            parent_id,
+            {
+                "pending_session_interrupt": payload,
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-attempt-fresh-owner",
+                    "interrupt_payload": payload,
+                },
+            },
+        )
+
+        scheduled = await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=created.last_activity_at - timedelta(seconds=1)
+        )
+        return (
+            scheduled,
+            await store.load(parent_id),
+            await store.load_checkpoint(parent_id),
+            await store.load_events(parent_id),
+        )
+
+    scheduled, parent, checkpoint, events = asyncio.run(run())
+
+    assert scheduled == 0
+    assert parent.status == SessionStatus.INTERRUPTING
+    assert "pending_interruption_cascade" in checkpoint
+    assert events == []
+
+
+def test_background_interruption_does_not_cross_fork_lineage():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        parent_id = "sess_cascade_fork_source"
+        fork_id = "sess_cascade_independent_fork"
+        fork_background_id = "sess_cascade_fork_background"
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "source")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=fork_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "independent fork")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=fork_background_id,
+                parent_session_id=fork_id,
+                messages=[Message.text("user", "fork background")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        await app._interrupt_background_subagent_children(
+            parent_session_id=parent_id,
+            interrupt_payload={
+                "reason": "operator stop",
+                "metadata": {},
+                "requested_by": None,
+                "interruption_type": "operator_requested",
+            },
+        )
+        return await store.load(fork_background_id)
+
+    fork_background = asyncio.run(run())
+
+    assert fork_background.status == SessionStatus.PENDING
+
+
+def test_interruption_cascade_generation_rejects_stale_worker_results():
+    async def run():
+        store = InMemorySessionStore()
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now[0])
+        session_id = "sess_cascade_generation_claim"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=session_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-generation-attempt",
+                    "interrupt_payload": payload,
+                }
+            },
+        )
+
+        first = await app._claim_pending_interruption_cascade(session_id, payload)
+        first_claim_status = await app.interruption_cascade_status(session_id)
+        overlapping = await app._claim_pending_interruption_cascade(session_id, payload)
+        now[0] += timedelta(seconds=20)
+        renewed = await app._renew_pending_interruption_cascade_claim(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        now[0] += timedelta(seconds=15)
+        protected_by_heartbeat = await app._claim_pending_interruption_cascade(
+            session_id,
+            payload,
+        )
+        now[0] += timedelta(seconds=16)
+        second = await app._claim_pending_interruption_cascade(session_id, payload)
+        stale_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        current_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+            session_id,
+            second["attempt_id"],
+            second["generation"],
+            second["claim_id"],
+        )
+        failed_status = await app.interruption_cascade_status(session_id)
+        stale_completion = await app._complete_pending_interruption_cascade(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        failed_generation_completion = await app._complete_pending_interruption_cascade(
+            session_id,
+            second["attempt_id"],
+            second["generation"],
+            second["claim_id"],
+        )
+        third = await app._claim_pending_interruption_cascade(session_id, payload)
+        retry_status = await app.interruption_cascade_status(session_id)
+        current_completion = await app._complete_pending_interruption_cascade(
+            session_id,
+            third["attempt_id"],
+            third["generation"],
+            third["claim_id"],
+        )
+        return (
+            first,
+            first_claim_status,
+            overlapping,
+            renewed,
+            protected_by_heartbeat,
+            second,
+            third,
+            retry_status,
+            stale_failure_recorded,
+            current_failure_recorded,
+            failed_status,
+            stale_completion,
+            failed_generation_completion,
+            current_completion,
+            await store.load_checkpoint(session_id),
+        )
+
+    (
+        first,
+        first_claim_status,
+        overlapping,
+        renewed,
+        protected_by_heartbeat,
+        second,
+        third,
+        retry_status,
+        stale_failure_recorded,
+        current_failure_recorded,
+        failed_status,
+        stale_completion,
+        failed_generation_completion,
+        current_completion,
+        checkpoint,
+    ) = asyncio.run(run())
+
+    assert first["generation"] == 1
+    assert first_claim_status == "pending"
+    assert overlapping is None
+    assert renewed is True
+    assert protected_by_heartbeat is None
+    assert second["generation"] == 2
+    assert third["generation"] == 3
+    assert failed_status == "failed"
+    assert retry_status == "pending"
+    assert stale_failure_recorded is False
+    assert current_failure_recorded is True
+    assert stale_completion == (False, False)
+    assert failed_generation_completion == (False, False)
+    assert current_completion == (True, True)
+    assert checkpoint == {}
+
+
+def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_cascade_completion_publish_failure"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=session_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-completion-publish-attempt",
+                    "interrupt_payload": payload,
+                    "failure_recorded": True,
+                }
+            },
+        )
+        original_emit = app._event_writer.emit
+
+        async def fail_completion_event(event):
+            if event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED:
+                raise RuntimeError("event store unavailable")
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", fail_completion_event)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=session_id,
+            interrupt_payload=payload,
+        )
+        return (
+            await store.load_checkpoint(session_id),
+            await app.interruption_cascade_status(session_id),
+            await store.load_events(session_id),
+        )
+
+    checkpoint, status, events = asyncio.run(run())
+
+    marker = checkpoint["pending_interruption_cascade"]
+    assert marker["failure_recorded"] is True
+    assert "claim_id" not in marker
+    assert "claim_expires_at" not in marker
+    assert status == "failed"
+    assert all(event.type != EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED for event in events)
+
+
+def test_interruption_cascade_completion_clear_failure_is_durably_reported(monkeypatch):
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_cascade_completion_clear_failure"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=session_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-completion-clear-attempt",
+                    "interrupt_payload": payload,
+                    "failure_recorded": True,
+                }
+            },
+        )
+
+        async def fail_checkpoint_clear(*_args):
+            raise RuntimeError("checkpoint store unavailable")
+
+        monkeypatch.setattr(app, "_complete_pending_interruption_cascade", fail_checkpoint_clear)
+        await app._interrupt_background_subagent_children(
+            parent_session_id=session_id,
+            interrupt_payload=payload,
+        )
+        return (
+            await store.load_checkpoint(session_id),
+            await app.interruption_cascade_status(session_id),
+            await store.load_events(session_id),
+        )
+
+    checkpoint, status, events = asyncio.run(run())
+
+    marker = checkpoint["pending_interruption_cascade"]
+    assert marker["failure_recorded"] is True
+    assert "claim_id" not in marker
+    assert status == "failed"
+    assert [event.type for event in events] == [
+        EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+        EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+    ]
+    failure = events[-1].payload["failures"][0]
+    assert failure == {
+        "scope": "parent",
+        "session_id": "sess_cascade_completion_clear_failure",
+        "reason": "completion_checkpoint_clear_failed",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurrection():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_preserve_current_cascade_marker"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        current_marker = {
+            "attempt_id": "current-attempt",
+            "interrupt_payload": {"interruption_type": "operator_requested"},
+        }
+        stale_marker = {
+            "attempt_id": "stale-attempt",
+            "interrupt_payload": {"interruption_type": "operator_requested"},
+        }
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_session_interrupt": {
+                    "reason": "current reason",
+                    "interruption_type": "operator_requested",
+                },
+                "pending_interruption_cascade": current_marker,
+                "current": True,
+            },
+        )
+        stale_replacement = {
+            "pending_session_interrupt": {
+                "reason": "stale reason",
+                "interruption_type": "operator_requested",
+            },
+            "pending_interruption_cascade": stale_marker,
+            "replacement": True,
+        }
+        await store.transform_checkpoint(
+            session_id,
+            runtime_app_module._replace_checkpoint_preserving_interruption_cascade(
+                stale_replacement
+            ),
+        )
+        preserved = await store.load_checkpoint(session_id)
+        await app._clear_pending_session_interrupt(session_id)
+        await app._clear_pending_interruption_cascade(session_id)
+        await store.transform_checkpoint(
+            session_id,
+            runtime_app_module._replace_checkpoint_preserving_interruption_cascade(
+                stale_replacement
+            ),
+        )
+        return preserved, await store.load_checkpoint(session_id)
+
+    preserved, after_clear = asyncio.run(run())
+
+    assert preserved == {
+        "pending_session_interrupt": {
+            "reason": "current reason",
+            "interruption_type": "operator_requested",
+        },
+        "pending_interruption_cascade": {
+            "attempt_id": "current-attempt",
+            "interrupt_payload": {"interruption_type": "operator_requested"},
+        },
+        "replacement": True,
+    }
+    assert after_clear == {"replacement": True}
+
+
+def test_pending_interruption_cascade_blocks_resume_and_fork():
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "sess_pending_cascade_continuation_guard"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "pending-cascade-attempt",
+                    "interrupt_payload": {"interruption_type": "operator_requested"},
+                }
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="incomplete background interruption cascade"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            ]
+        with pytest.raises(RuntimeError, match="incomplete background interruption cascade"):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=session_id,
+                        session_id="sess_pending_cascade_fork",
+                    )
+                )
+            ]
+        return await store.load(session_id), await store.load("sess_pending_cascade_fork")
+
+    source, fork = asyncio.run(run())
+
+    assert source.status == SessionStatus.INTERRUPTED
+    assert fork is None
 
 
 def test_subagent_tool_background_reports_start_failure_as_tool_error():
@@ -13645,7 +16098,7 @@ def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_sessio
     assert result.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
     assert events[-1].type == EventType.SESSION_INTERRUPTED
-    assert events[-1].payload == {
+    assert interruption_payload_without_request_id(events[-1].payload) == {
         "reason": "worker restart",
         "metadata": {"worker": "w1"},
         "interruption_type": "runtime_interrupted",
@@ -13706,9 +16159,11 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
                 }
             },
         )
-        return await app.recover_incomplete_session(
+        result = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="sess_stale_interrupting")
         )
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return result
 
     result = asyncio.run(setup_and_recover())
     session = asyncio.run(store.load("sess_stale_interrupting"))
@@ -13719,7 +16174,7 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
     assert checkpoint == {}
     assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
-    assert result.events[0].payload == {
+    assert interruption_payload_without_request_id(result.events[0].payload) == {
         "reason": "deploy",
         "metadata": {"worker": "old"},
         "interruption_type": "operator_requested",
@@ -20568,7 +23023,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
 
 def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
     class BrokenCheckpointStore(InMemorySessionStore):
-        async def checkpoint(self, session_id: str, state: dict) -> None:
+        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
             raise RuntimeError("checkpoint unavailable")
 
     store = BrokenCheckpointStore()
@@ -25730,6 +28185,12 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
                     session_id="sess_interrupt_direct",
                     reason="operator requested stop",
                     metadata={"actor": "operator"},
+                    requested_by=ResolutionActor(
+                        subject="operator-42",
+                        tenant="tenant-7",
+                        source=ResolutionActorSource.REQUEST,
+                        claims={"role": "operator"},
+                    ),
                 )
             )
         ]
@@ -25740,9 +28201,14 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
     assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
-    assert events[0].payload == {
+    assert interruption_payload_without_request_id(events[0].payload) == {
         "reason": "operator requested stop",
         "metadata": {"actor": "operator"},
+        "requested_by": {
+            "subject": "operator-42",
+            "tenant": "tenant-7",
+            "source": "request",
+        },
         "interruption_type": "operator_requested",
     }
 
@@ -25812,18 +28278,93 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
         await asyncio.sleep(0)
         store.allow_transition_return.set()
         first_events, second_events = await asyncio.gather(first_interrupt, second_interrupt)
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        third_events = await interrupt("idempotent retry after cascade completion")
+        assert await app.drain_background_interruptions(timeout_s=1) is True
         stored_events = await store.load_events("sess_interrupt_race_idempotent")
-        return first_events, second_events, stored_events
+        checkpoint = await store.load_checkpoint("sess_interrupt_race_idempotent")
+        return first_events, second_events, third_events, stored_events, checkpoint
 
-    first_events, second_events, stored_events = asyncio.run(run())
+    first_events, second_events, third_events, stored_events, checkpoint = asyncio.run(run())
 
     assert [event.type for event in first_events] == [EventType.SESSION_INTERRUPTED]
     assert [event.type for event in second_events] == [EventType.SESSION_INTERRUPTED]
-    assert first_events[0].id == second_events[0].id
+    assert [event.type for event in third_events] == [EventType.SESSION_INTERRUPTED]
+    assert first_events[0].id == second_events[0].id == third_events[0].id
     assert first_events[0].payload["reason"] == "first request"
     assert [event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED] == [
         first_events[0]
     ]
+    assert checkpoint == {}
+
+
+def test_new_interruption_does_not_reuse_terminal_event_from_before_resume():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    old_request_id = "11111111-1111-4111-8111-111111111111"
+    new_request_id = "22222222-2222-4222-8222-222222222222"
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interrupt_after_resume",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_interrupt_after_resume", SessionStatus.INTERRUPTED)
+        old_event = Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id="sess_interrupt_after_resume",
+            agent_name="assistant",
+            payload={
+                "reason": "first interruption",
+                "interruption_type": "operator_requested",
+                "interruption_request_id": old_request_id,
+            },
+        )
+        await store.append_event("sess_interrupt_after_resume", old_event)
+        await store.update_status("sess_interrupt_after_resume", SessionStatus.RUNNING)
+        await store.checkpoint(
+            "sess_interrupt_after_resume",
+            {
+                "pending_session_interrupt": {
+                    "reason": "second interruption",
+                    "interruption_type": "operator_requested",
+                    "interruption_request_id": new_request_id,
+                }
+            },
+        )
+        session = await store.update_status(
+            "sess_interrupt_after_resume",
+            SessionStatus.INTERRUPTING,
+        )
+        events = [
+            event
+            async for event in app._handle_session_interrupted(
+                session=session,
+                registered_agent=app._get_registered_agent("assistant"),
+                registered_environment=None,
+                environment_name=None,
+            )
+        ]
+        await app.drain_background_interruptions(timeout_s=1)
+        return old_event, events, await store.load_events(session.id)
+
+    old_event, events, stored_events = asyncio.run(run())
+
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert events[-1].id != old_event.id
+    assert events[-1].payload["reason"] == "second interruption"
+    assert events[-1].payload["interruption_request_id"] == new_request_id
+    assert [
+        event.payload["interruption_request_id"]
+        for event in stored_events
+        if event.type == EventType.SESSION_INTERRUPTED
+    ] == [old_request_id, new_request_id]
 
 
 def test_run_stops_after_session_is_interrupted_before_tool_execution():
@@ -26239,6 +28780,12 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
                     session_id="sess_cross_app_interrupt",
                     reason="operator stop from api",
                     metadata={"actor": "operator"},
+                    requested_by=ResolutionActor(
+                        subject="api-operator",
+                        tenant="tenant-7",
+                        source=ResolutionActorSource.HTTP_AUTH,
+                        claims={"scope": "sessions:interrupt"},
+                    ),
                 ),
             )
         )
@@ -26250,6 +28797,8 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         provider.release.set()
 
         run_events, interrupt_events = await asyncio.gather(run_task, interrupt_task)
+        assert await worker_app.drain_background_interruptions(timeout_s=1) is True
+        assert await api_app.drain_background_interruptions(timeout_s=1) is True
         checkpoint = await store.load_checkpoint("sess_cross_app_interrupt")
         return run_events, interrupt_events, checkpoint
 
@@ -26257,9 +28806,14 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
 
     assert run_events[-1].type == EventType.SESSION_INTERRUPTED
     assert interrupt_events == [run_events[-1]]
-    assert run_events[-1].payload == {
+    assert interruption_payload_without_request_id(run_events[-1].payload) == {
         "reason": "operator stop from api",
         "metadata": {"actor": "operator"},
+        "requested_by": {
+            "subject": "api-operator",
+            "tenant": "tenant-7",
+            "source": "http_auth",
+        },
         "interruption_type": "operator_requested",
     }
     assert checkpoint == {}
@@ -26288,14 +28842,17 @@ def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event(
         )
         first_event = await anext(stream)
         await stream.aclose()
-        checkpoint = await store.load_checkpoint("sess_interrupt_direct_stream_closed")
-        return first_event, checkpoint
+        checkpoint_after_event = await store.load_checkpoint("sess_interrupt_direct_stream_closed")
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        final_checkpoint = await store.load_checkpoint("sess_interrupt_direct_stream_closed")
+        return first_event, checkpoint_after_event, final_checkpoint
 
-    first_event, checkpoint = asyncio.run(run())
+    first_event, checkpoint_after_event, final_checkpoint = asyncio.run(run())
 
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert first_event.payload["reason"] == "operator stop"
-    assert checkpoint == {}
+    assert "pending_session_interrupt" not in checkpoint_after_event
+    assert final_checkpoint == {}
 
 
 def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
@@ -26347,16 +28904,19 @@ def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
             )
         ]
         run_event = await run_task
-        checkpoint = await store.load_checkpoint("sess_interrupt_active_stream_closed")
-        return run_event, interrupt_events, checkpoint
+        checkpoint_after_event = await store.load_checkpoint("sess_interrupt_active_stream_closed")
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        final_checkpoint = await store.load_checkpoint("sess_interrupt_active_stream_closed")
+        return run_event, interrupt_events, checkpoint_after_event, final_checkpoint
 
-    run_event, interrupt_events, checkpoint = asyncio.run(run())
+    run_event, interrupt_events, checkpoint_after_event, final_checkpoint = asyncio.run(run())
 
     assert run_event.type == EventType.SESSION_INTERRUPTED
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     assert run_event.id == interrupt_events[0].id
     assert run_event.payload["reason"] == "operator stop"
-    assert checkpoint == {}
+    assert "pending_session_interrupt" not in checkpoint_after_event
+    assert final_checkpoint == {}
 
 
 def test_interrupt_session_persists_payload_atomically_with_interrupting_status():
@@ -26769,9 +29329,10 @@ def test_interrupt_session_stops_in_flight_tool_call():
     run_events, interrupt_events, stored_events, transcript = asyncio.run(run())
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
-    assert interrupt_events[0].payload == {
+    assert interruption_payload_without_request_id(interrupt_events[0].payload) == {
         "reason": "operator stop",
         "metadata": {},
+        "requested_by": None,
         "interruption_type": "operator_requested",
     }
     assert run_events[-1].type == EventType.SESSION_INTERRUPTED
@@ -27513,9 +30074,10 @@ def test_repeated_interrupt_waits_for_active_interruption_terminal_event():
     assert [event.type for event in second_events] == [EventType.SESSION_INTERRUPTED]
     assert run_events[-1].type == EventType.SESSION_INTERRUPTED
     assert first_events[0].id == second_events[0].id == run_events[-1].id
-    assert first_events[0].payload == {
+    assert interruption_payload_without_request_id(first_events[0].payload) == {
         "reason": "first interrupt",
         "metadata": {},
+        "requested_by": None,
         "interruption_type": "operator_requested",
     }
     stored_event_types = [event.type for event in stored_events]
@@ -27797,16 +30359,16 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
             await super().append_transcript_messages(session_id, messages)
             await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
 
-        async def append_transcript_messages_and_checkpoint(
+        async def append_transcript_messages_and_transform_checkpoint(
             self,
             session_id: str,
             messages: list[Message],
-            checkpoint: dict,
+            checkpoint_transform,
         ) -> None:
-            await super().append_transcript_messages_and_checkpoint(
+            await super().append_transcript_messages_and_transform_checkpoint(
                 session_id,
                 messages,
-                checkpoint,
+                checkpoint_transform,
             )
             await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
 
@@ -27942,17 +30504,17 @@ def test_interrupt_session_preserves_tool_results_when_interrupted_before_append
             await self._maybe_interrupt_before_tool_result_append(session_id, messages)
             await super().append_transcript_messages(session_id, messages)
 
-        async def append_transcript_messages_and_checkpoint(
+        async def append_transcript_messages_and_transform_checkpoint(
             self,
             session_id: str,
             messages: list[Message],
-            checkpoint: dict,
+            checkpoint_transform,
         ) -> None:
             await self._maybe_interrupt_before_tool_result_append(session_id, messages)
-            await super().append_transcript_messages_and_checkpoint(
+            await super().append_transcript_messages_and_transform_checkpoint(
                 session_id,
                 messages,
-                checkpoint,
+                checkpoint_transform,
             )
 
         async def _maybe_interrupt_before_tool_result_append(

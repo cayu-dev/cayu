@@ -27,6 +27,7 @@ from cayu._validation import copy_json_value, copy_label_map, require_clean_nonb
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime.approvals import ResolutionActor, copy_resolution_actor
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -263,6 +264,7 @@ class InterruptSessionRequest(BaseModel):
     session_id: str
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    requested_by: ResolutionActor | None = None
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -280,6 +282,11 @@ class InterruptSessionRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
 
 
 class ForkSessionRequest(BaseModel):
@@ -1055,6 +1062,18 @@ class SessionStore(ABC):
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         """List sessions (filtered/sorted/paginated) with a keyset cursor and total count."""
 
+    @abstractmethod
+    async def list_sessions_with_pending_interruption_cascade(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        """List only sessions carrying a pending interruption cascade marker.
+
+        Implementations should filter at the storage layer. This is the
+        restart-discovery path, so scanning all historical sessions and loading
+        their checkpoints individually is not an acceptable implementation.
+        """
+
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and cascade to its events, transcript, and checkpoint.
 
@@ -1097,15 +1116,16 @@ class SessionStore(ABC):
         """
 
     @abstractmethod
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict[str, Any],
+        checkpoint_transform: CheckpointTransform,
     ) -> None:
-        """Append transcript messages and persist a checkpoint atomically.
+        """Append transcript messages and atomically transform the current checkpoint.
 
-        Same isolation contract as `append_transcript_messages`.
+        The transform must be synchronous and thread-safe; a store may execute
+        it on a worker thread while holding its transactional write boundary.
         """
 
     @abstractmethod
@@ -1126,6 +1146,20 @@ class SessionStore(ABC):
     @abstractmethod
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         """Persist a checkpoint for resume/replay."""
+
+    @abstractmethod
+    async def transform_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_transform: CheckpointTransform,
+    ) -> None:
+        """Atomically transform the latest checkpoint for a session.
+
+        The transform runs while the store owns its session/checkpoint write
+        boundary and must be synchronous and thread-safe because a store may
+        execute it on a worker thread. Returning ``None`` leaves the checkpoint
+        unchanged.
+        """
 
     @abstractmethod
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -1617,12 +1651,36 @@ class InMemorySessionStore(SessionStore):
             return session_outcome_from_records(session, records)
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=False)
+
+    async def list_sessions_with_pending_interruption_cascade(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await self._list_sessions(query, pending_interruption_cascade_only=True)
+
+    async def _list_sessions(
+        self,
+        query: SessionQuery | None,
+        *,
+        pending_interruption_cascade_only: bool,
+    ) -> SessionListResult:
         query = copy_session_query(query)
         base_query = query.model_copy(update={"debug_state": None})
         async with self._lock:
+            candidates = (
+                (
+                    self._sessions[session_id]
+                    for session_id, checkpoint in self._checkpoints.items()
+                    if "pending_interruption_cascade" in checkpoint
+                    and session_id in self._sessions
+                )
+                if pending_interruption_cascade_only
+                else self._sessions.values()
+            )
             matching = [
                 session
-                for session in self._sessions.values()
+                for session in candidates
                 if _session_matches(session, base_query)
                 and _session_matches_debug_state(
                     session,
@@ -1669,22 +1727,29 @@ class InMemorySessionStore(SessionStore):
                 update={"last_activity_at": datetime.now(UTC)}
             )
 
-    async def append_transcript_messages_and_checkpoint(
+    async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
-        checkpoint: dict[str, Any],
+        checkpoint_transform: CheckpointTransform,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = _detach_transcript_messages(messages)
-        if not isinstance(checkpoint, dict):
-            raise ValueError("Checkpoint state must be a dictionary.")
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            current = self._checkpoints.get(session_id)
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current is None else deepcopy(current),
+            )
+            if transformed is None:
+                raise ValueError("Checkpoint transform must return a checkpoint.")
+            copied_checkpoint = copy_json_value(transformed, "checkpoint")
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
             self._checkpoints[session_id] = copied_checkpoint
@@ -1738,6 +1803,31 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             self._checkpoints[session_id] = copy_json_value(state, "checkpoint")
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
+
+    async def transform_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_transform: CheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            current = self._checkpoints.get(session_id)
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current is None else deepcopy(current),
+            )
+            if transformed is None:
+                return
+            self._checkpoints[session_id] = copy_json_value(transformed, "checkpoint")
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
             )
@@ -2021,6 +2111,7 @@ def copy_interrupt_session_request(request: InterruptSessionRequest) -> Interrup
         session_id=request.session_id,
         reason=request.reason,
         metadata=copy_json_value(request.metadata, "metadata"),
+        requested_by=copy_resolution_actor(request.requested_by),
     )
 
 

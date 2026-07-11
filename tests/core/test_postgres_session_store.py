@@ -160,7 +160,9 @@ def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgre
     _run(postgres_dsn, ops)
 
 
-def test_postgres_session_store_atomically_appends_transcript_and_checkpoint(postgres_dsn):
+def test_postgres_session_store_atomically_appends_transcript_and_transforms_checkpoint(
+    postgres_dsn,
+):
     async def ops(store):
         await store.create(
             RunRequest(
@@ -171,10 +173,10 @@ def test_postgres_session_store_atomically_appends_transcript_and_checkpoint(pos
             identity=_identity(),
         )
         await store.checkpoint("sess_atomic", {"pending_tool_approval": {"approval_id": "a1"}})
-        await store.append_transcript_messages_and_checkpoint(
+        await store.append_transcript_messages_and_transform_checkpoint(
             "sess_atomic",
             [Message.text("assistant", "done")],
-            {"closed": True},
+            lambda _session, _checkpoint: {"closed": True},
         )
         transcript = await store.load_transcript("sess_atomic")
         checkpoint = await store.load_checkpoint("sess_atomic")

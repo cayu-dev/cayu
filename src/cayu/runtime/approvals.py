@@ -47,12 +47,12 @@ class ResolutionActorSource(StrEnum):
 
 
 class ResolutionActor(BaseModel):
-    """Typed actor identity for approval and user-input resolutions.
+    """Typed actor identity for trusted runtime operator actions.
 
-    Stamped into resolution event payloads so the audit trail answers who
-    resolved a pause without consulting app-side state. ``reason`` and
-    ``metadata`` on resolution requests remain caller-claimed free-form data;
-    this model is the provenance field.
+    Stamped into approval, user-input, recovery, and interruption event payloads
+    so the audit trail answers who performed an operator action without
+    consulting app-side state. ``reason`` and ``metadata`` on requests remain
+    caller-claimed free-form data; this model is the provenance field.
     """
 
     model_config = ConfigDict(extra="forbid")

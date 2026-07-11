@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useParams } from "@tanstack/react-router"
 import {
   Activity,
@@ -8,12 +8,15 @@ import {
   Bot,
   CheckCircle,
   ChevronRight,
+  CircleStop,
   Clock,
   Cpu,
   Database,
   Hash,
+  LoaderCircle,
   type LucideIcon,
   MessageSquare,
+  RefreshCw,
   Send,
   ShieldCheck,
   UserRound,
@@ -26,6 +29,16 @@ import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import { Input } from "../components/ui/input"
 import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "../components/ui/sheet"
+import { Textarea } from "../components/ui/textarea"
+import {
+  ApiClientError,
   type PendingAction as ApiPendingAction,
   type ArtifactSummary,
   fetchArtifacts,
@@ -36,6 +49,7 @@ import {
   type SessionEvent,
   type SessionSummary,
   type SSEEvent,
+  streamInterruptSession,
   streamRecoverToolApproval,
   streamRecoverToolRound,
   streamRecoverUserInput,
@@ -60,6 +74,12 @@ import {
   summarizeFailureEvent,
 } from "../lib/session-debug"
 import { cn } from "../lib/utils"
+
+const INTERRUPTIBLE_SESSION_STATUSES = new Set(["pending", "running"])
+
+function isInterruptionConflict(error: unknown) {
+  return error instanceof ApiClientError && error.status === 409
+}
 
 function EventIcon({ type }: { type: string }) {
   if (type.includes("tool.call.started")) return <Wrench className="h-3.5 w-3.5 text-primary" />
@@ -782,10 +802,24 @@ function SessionArtifacts({
 
 export function SessionDetailPage({ live }: { live?: boolean }) {
   const { sessionId } = useParams({ from: "/sessions/$sessionId" })
+  const queryClient = useQueryClient()
+  const [interruptSheetOpen, setInterruptSheetOpen] = useState(false)
+  const [interruptReason, setInterruptReason] = useState("")
+  const [interruptRequested, setInterruptRequested] = useState(false)
+  const [interruptError, setInterruptError] = useState<string | null>(null)
+  const [retryingCascade, setRetryingCascade] = useState(false)
+  const [cascadeRetryError, setCascadeRetryError] = useState<string | null>(null)
   const { data, error, isError, isLoading, refetch } = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => fetchSession(sessionId),
-    refetchInterval: live ? 2000 : 5000,
+    refetchInterval: (query) =>
+      interruptRequested ||
+      query.state.data?.session.status === "interrupting" ||
+      query.state.data?.interruption_cascade === "pending"
+        ? 1000
+        : live
+          ? 2000
+          : 5000,
   })
   const summaryQuery = useQuery({
     queryKey: ["session-summary", sessionId],
@@ -830,6 +864,60 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     }
   }, [resuming, transcriptCount])
 
+  useEffect(() => {
+    if (!interruptRequested) return
+    const status = data?.session.status
+    if (status && !["pending", "running", "interrupting"].includes(status)) {
+      setInterruptRequested(false)
+      setInterruptReason("")
+    }
+  }, [data?.session.status, interruptRequested])
+
+  const refreshAfterInterrupt = () =>
+    Promise.all([
+      refetch(),
+      summaryQuery.refetch(),
+      pendingActionQuery.refetch(),
+      queryClient.invalidateQueries({ queryKey: ["sessions-summary"] }),
+      queryClient.invalidateQueries({ queryKey: ["pending-actions"] }),
+      queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+    ])
+
+  const handleInterrupt = async () => {
+    let streamFailed = false
+    setInterruptRequested(true)
+    setInterruptError(null)
+    setLiveEvents([])
+    const reason = interruptReason.trim()
+
+    await streamInterruptSession(
+      sessionId,
+      reason ? { reason } : {},
+      (event) => setLiveEvents((previous) => [...previous, event]),
+      () => {
+        if (!streamFailed) {
+          setInterruptSheetOpen(false)
+          setInterruptReason("")
+        }
+        void refreshAfterInterrupt().finally(() => {
+          setLiveEvents([])
+          if (streamFailed) setInterruptRequested(false)
+        })
+      },
+      (message, streamError) => {
+        if (isInterruptionConflict(streamError)) {
+          setInterruptSheetOpen(false)
+          setInterruptReason("")
+          setInterruptRequested(true)
+          return
+        }
+        streamFailed = true
+        setInterruptRequested(false)
+        setInterruptError(message)
+      },
+    )
+  }
+
   const handleResume = async () => {
     if (!resumePrompt.trim()) return
     let streamFailed = false
@@ -856,6 +944,30 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         setResumeError(message)
       },
     )
+  }
+
+  const handleRetryCascade = async () => {
+    let streamFailed = false
+    setRetryingCascade(true)
+    setCascadeRetryError(null)
+    setLiveEvents([])
+    await streamInterruptSession(
+      sessionId,
+      { reason: "Retry incomplete background interruption." },
+      (event) => setLiveEvents((previous) => [...previous, event]),
+      () => {
+        void refreshAfterInterrupt().finally(() => {
+          setRetryingCascade(false)
+          setLiveEvents([])
+        })
+      },
+      (message) => {
+        streamFailed = true
+        setRetryingCascade(false)
+        setCascadeRetryError(message)
+      },
+    )
+    if (streamFailed) setLiveEvents([])
   }
 
   const finishContinuation = (streamFailed: boolean) => {
@@ -1011,6 +1123,8 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   if (!data) return <div className="text-destructive">Session not found</div>
 
   const { session, events, transcript } = data
+  const canInterrupt = INTERRUPTIBLE_SESSION_STATUSES.has(session.status) && !interruptRequested
+  const interruptionFinalizing = session.status === "interrupting" || interruptRequested
   const summary = summaryQuery.data
   const allEvents = [...events, ...liveEvents.map((e, i) => ({ ...e, id: `live-${i}` }))]
   const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
@@ -1018,11 +1132,19 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const pendingAction = pendingActionFromApi(pendingActionQuery.data?.actions[0])
   const pendingActionStateUnknown =
     session.status === "interrupted" && (pendingActionQuery.isLoading || pendingActionQuery.isError)
-  const failureEvent = latestFailureEvent(filteredEvents)
+  const hasPendingInterruptionCascade = data.interruption_cascade !== "none"
+  const failureEvent = latestFailureEvent(
+    data.interruption_cascade === "failed"
+      ? filteredEvents
+      : filteredEvents.filter((event) => event.type !== "session.interruption_cascade_failed"),
+  )
+  const canRetryCascade = session.status === "interrupted" && data.interruption_cascade === "failed"
+  const cascadePending = session.status === "interrupted" && data.interruption_cascade === "pending"
   const canResume =
     ["completed", "failed", "interrupted"].includes(session.status) &&
     !pendingAction &&
-    !pendingActionStateUnknown
+    !pendingActionStateUnknown &&
+    !hasPendingInterruptionCascade
   const eventUsage = fallbackUsage(filteredEvents)
   const models = summaryModels(summary)
   const modelSteps = summary?.usage.model_steps ?? fallbackModelSteps(filteredEvents)
@@ -1096,9 +1218,78 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
             >
               Artifacts
             </a>
+            {canInterrupt && (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => {
+                  setInterruptError(null)
+                  setInterruptSheetOpen(true)
+                }}
+              >
+                <CircleStop className="mr-1.5 h-4 w-4" />
+                Interrupt session
+              </Button>
+            )}
+            {interruptionFinalizing && (
+              <Button variant="outline" size="sm" disabled>
+                <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" />
+                Interruption finalizing...
+              </Button>
+            )}
+            {cascadePending && (
+              <Button variant="outline" size="sm" disabled>
+                <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" />
+                Stopping background sessions...
+              </Button>
+            )}
+            {canRetryCascade && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={retryingCascade}
+                onClick={handleRetryCascade}
+              >
+                {retryingCascade ? (
+                  <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-1.5 h-4 w-4" />
+                )}
+                {retryingCascade ? "Retrying interruption..." : "Retry background interruption"}
+              </Button>
+            )}
           </div>
+          {cascadeRetryError && (
+            <p className="mt-2 text-sm text-destructive">{cascadeRetryError}</p>
+          )}
         </div>
       </div>
+
+      {interruptionFinalizing && (
+        <div className="flex items-start gap-3 rounded-md border border-chart-1/30 bg-chart-1/5 px-4 py-3 text-sm">
+          <LoaderCircle className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-chart-1" />
+          <div>
+            <div className="font-medium">Cayu is stopping active runtime work.</div>
+            <div className="mt-1 text-muted-foreground">
+              This session cannot be resumed until its durable status becomes interrupted. Any
+              linked task remains application-owned and is not cancelled automatically.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cascadePending && (
+        <div className="flex items-start gap-3 rounded-md border border-chart-1/30 bg-chart-1/5 px-4 py-3 text-sm">
+          <LoaderCircle className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-chart-1" />
+          <div>
+            <div className="font-medium">The parent session is interrupted.</div>
+            <div className="mt-1 text-muted-foreground">
+              Cayu is still stopping background subagent sessions. Resume becomes available after
+              that durable cascade completes; linked application tasks remain application-owned.
+            </div>
+          </div>
+        </div>
+      )}
 
       <Card className="flex-shrink-0 gap-0 py-0">
         <CardContent className="grid grid-cols-1 p-0 md:grid-cols-2 xl:grid-cols-6">
@@ -1339,6 +1530,74 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           </Card>
         </div>
       )}
+
+      <Sheet
+        open={interruptSheetOpen}
+        onOpenChange={(open) => {
+          if (interruptRequested) return
+          setInterruptSheetOpen(open)
+          if (!open) {
+            setInterruptError(null)
+            setInterruptReason("")
+          }
+        }}
+      >
+        <SheetContent side="right" showCloseButton={!interruptRequested}>
+          <SheetHeader className="border-b border-border">
+            <SheetTitle>Interrupt session?</SheetTitle>
+            <SheetDescription>
+              Stop Cayu-owned execution for this session and finalize it as interrupted.
+            </SheetDescription>
+          </SheetHeader>
+          <div className="space-y-4 overflow-auto px-4">
+            <div className="rounded-md border border-destructive/25 bg-destructive/5 p-3 text-sm">
+              <div className="font-medium text-destructive">This is a runtime interruption.</div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
+                <li>It does not cancel any linked task or business operation.</li>
+                <li>
+                  It does not reverse tool calls or external side effects that already completed.
+                </li>
+                <li>Active background child sessions owned by this run may also be interrupted.</li>
+              </ul>
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="interrupt-reason" className="text-sm font-medium">
+                Reason <span className="font-normal text-muted-foreground">(optional)</span>
+              </label>
+              <Textarea
+                id="interrupt-reason"
+                value={interruptReason}
+                onChange={(event) => setInterruptReason(event.target.value)}
+                placeholder="Why is this session being interrupted?"
+                rows={4}
+                disabled={interruptRequested}
+              />
+            </div>
+            {interruptError && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {interruptError}
+              </div>
+            )}
+          </div>
+          <SheetFooter className="border-t border-border">
+            <Button
+              variant="outline"
+              disabled={interruptRequested}
+              onClick={() => setInterruptSheetOpen(false)}
+            >
+              Keep running
+            </Button>
+            <Button variant="destructive" disabled={interruptRequested} onClick={handleInterrupt}>
+              {interruptRequested ? (
+                <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" />
+              ) : (
+                <CircleStop className="mr-1.5 h-4 w-4" />
+              )}
+              {interruptRequested ? "Interrupting..." : "Interrupt session"}
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
     </Page>
   )
 }

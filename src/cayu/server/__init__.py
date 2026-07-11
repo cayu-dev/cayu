@@ -21,8 +21,10 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,8 @@ __all__ = [
     "mount_dashboard",
 ]
 
+logger = logging.getLogger(__name__)
+
 
 def create_server(
     app: CayuApp,
@@ -80,6 +84,7 @@ def create_server(
     replay_idle_timeout_s: float = 300.0,
     startup_recovery_statuses: set[SessionStatus] | None = None,
     recovery_inactive_after_seconds: int = 300,
+    interruption_shutdown_grace_seconds: float = 10.0,
     **fastapi_kwargs: Any,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
@@ -121,6 +126,8 @@ def create_server(
             ``running`` only when the deployment boundary proves they are abandoned.
         recovery_inactive_after_seconds: Minimum inactivity required before the
             startup sweep atomically fences and recovers a session.
+        interruption_shutdown_grace_seconds: Maximum server-shutdown wait for
+            accepted background interruption cascades.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
     """
     from fastapi import FastAPI
@@ -133,16 +140,21 @@ def create_server(
         )
     if type(recovery_inactive_after_seconds) is not int or recovery_inactive_after_seconds < 0:
         raise ValueError("recovery_inactive_after_seconds must be a non-negative integer.")
+    interruption_shutdown_grace_seconds = _validate_interruption_shutdown_grace_seconds(
+        interruption_shutdown_grace_seconds
+    )
 
     docs_enabled = dev if expose_docs is None else expose_docs
     fastapi_options = dict(fastapi_kwargs)
+    user_lifespan = fastapi_options.pop("lifespan", None)
+    recovery_statuses = None
     if startup_recovery_statuses is not None:
         recovery_statuses = IncompleteSessionsRecoveryRequest(
             statuses=startup_recovery_statuses
         ).statuses
-        user_lifespan = fastapi_options.pop("lifespan", None)
 
-        async def recover_incomplete_sessions() -> None:
+    async def recover_incomplete_sessions() -> None:
+        if recovery_statuses is not None:
             await app.recover_incomplete_sessions(
                 IncompleteSessionsRecoveryRequest(
                     statuses=recovery_statuses,
@@ -152,18 +164,34 @@ def create_server(
                     metadata={"source": "create_server"},
                 )
             )
+        await app.resume_pending_interruption_cascades(
+            interrupting_inactive_before=datetime.now(UTC)
+            - timedelta(seconds=recovery_inactive_after_seconds)
+        )
 
-        @asynccontextmanager
-        async def cayu_lifespan(server):
-            if user_lifespan is None:
+    @asynccontextmanager
+    async def cayu_lifespan(server):
+        if user_lifespan is None:
+            try:
                 await recover_incomplete_sessions()
                 yield
-                return
-            async with user_lifespan(server) as state:
+            finally:
+                await _drain_background_interruptions(
+                    app,
+                    timeout_s=interruption_shutdown_grace_seconds,
+                )
+            return
+        async with user_lifespan(server) as state:
+            try:
                 await recover_incomplete_sessions()
                 yield state
+            finally:
+                await _drain_background_interruptions(
+                    app,
+                    timeout_s=interruption_shutdown_grace_seconds,
+                )
 
-        fastapi_options["lifespan"] = cayu_lifespan
+    fastapi_options["lifespan"] = cayu_lifespan
     if docs_enabled:
         fastapi_options.setdefault("docs_url", "/docs")
         fastapi_options.setdefault("redoc_url", "/redoc")
@@ -230,19 +258,41 @@ def mount_cayu(
     dev: bool = False,
     dashboard_config: dict[str, Any] | None = None,
     replay_idle_timeout_s: float = 300.0,
+    interruption_shutdown_grace_seconds: float = 10.0,
+    interruption_recovery_inactive_after_seconds: int = 300,
     name: str = "cayu-dashboard",
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
 
     This is the high-level adapter for product apps that already own their
     server. It mounts API routes at ``{path}/api`` and the dashboard shell at
-    ``{path}``, so the browser can use one same-origin product path.
+    ``{path}``, so the browser can use one same-origin product path. Its
+    composed lifespan recovers cascade parents inactive for at least
+    ``interruption_recovery_inactive_after_seconds`` and drains accepted
+    background interruption cascades for up to
+    ``interruption_shutdown_grace_seconds`` before the host shuts down.
     """
     if auth is None and not dev:
         raise ValueError(
             "mount_cayu requires auth=... for protected deployments. "
             "Pass dev=True only for local development or tests."
         )
+    interruption_shutdown_grace_seconds = _validate_interruption_shutdown_grace_seconds(
+        interruption_shutdown_grace_seconds
+    )
+    if (
+        type(interruption_recovery_inactive_after_seconds) is not int
+        or interruption_recovery_inactive_after_seconds < 0
+    ):
+        raise ValueError(
+            "interruption_recovery_inactive_after_seconds must be a non-negative integer."
+        )
+    _compose_interruption_drain_lifespan(
+        server,
+        app,
+        timeout_s=interruption_shutdown_grace_seconds,
+        recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
+    )
 
     mount_path = _normalize_dashboard_path(path, api_path=None)
     api_path = _join_public_paths(mount_path, "api")
@@ -315,6 +365,54 @@ def mount_dashboard(
         name=name,
     )
     return True
+
+
+def _validate_interruption_shutdown_grace_seconds(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError("interruption_shutdown_grace_seconds must be a finite positive number.")
+    return float(value)
+
+
+async def _drain_background_interruptions(app: CayuApp, *, timeout_s: float) -> None:
+    try:
+        drained = await app.drain_background_interruptions(timeout_s=timeout_s)
+    except Exception:
+        logger.exception("Failed to drain background interruption cascades during shutdown.")
+        return
+    if not drained:
+        logger.warning(
+            "Background interruption cascades exceeded the %.3fs shutdown grace period.",
+            timeout_s,
+        )
+
+
+def _compose_interruption_drain_lifespan(
+    server: Any,
+    app: CayuApp,
+    *,
+    timeout_s: float,
+    recovery_inactive_after_seconds: int,
+) -> None:
+    existing_lifespan = server.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(server_app):
+        async with existing_lifespan(server_app) as state:
+            try:
+                await app.resume_pending_interruption_cascades(
+                    interrupting_inactive_before=datetime.now(UTC)
+                    - timedelta(seconds=recovery_inactive_after_seconds)
+                )
+                yield state
+            finally:
+                await _drain_background_interruptions(app, timeout_s=timeout_s)
+
+    server.router.lifespan_context = lifespan
 
 
 def _normalize_dashboard_path(path: str, *, api_path: str | None) -> str:

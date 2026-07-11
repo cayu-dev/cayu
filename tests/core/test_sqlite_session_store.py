@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -155,7 +156,7 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
     asyncio.run(assert_reopened_state())
 
 
-def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_path):
+def test_sqlite_session_store_atomically_appends_transcript_and_transforms_checkpoint(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
 
@@ -172,10 +173,10 @@ def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_p
             "sess_atomic_transcript_checkpoint",
             {"pending_tool_approval": {"approval_id": "approval_1"}},
         )
-        await store.append_transcript_messages_and_checkpoint(
+        await store.append_transcript_messages_and_transform_checkpoint(
             "sess_atomic_transcript_checkpoint",
             [Message.text("assistant", "done")],
-            {"closed": True},
+            lambda _session, _checkpoint: {"closed": True},
         )
         await _close(store)
 
@@ -193,6 +194,40 @@ def test_sqlite_session_store_atomically_appends_transcript_and_checkpoint(tmp_p
         await _close(reopened)
 
     asyncio.run(assert_reopened_state())
+
+
+def test_sqlite_checkpoint_transforms_run_off_the_event_loop(tmp_path):
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+
+    async def run_store_operations() -> tuple[int, list[int]]:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_checkpoint_transform_thread",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        event_loop_thread = threading.get_ident()
+        transform_threads: list[int] = []
+
+        def transform(_session, checkpoint):
+            transform_threads.append(threading.get_ident())
+            return {} if checkpoint is None else checkpoint
+
+        await store.transform_checkpoint("sess_checkpoint_transform_thread", transform)
+        await store.append_transcript_messages_and_transform_checkpoint(
+            "sess_checkpoint_transform_thread",
+            [Message.text("assistant", "done")],
+            transform,
+        )
+        await _close(store)
+        return event_loop_thread, transform_threads
+
+    event_loop_thread, transform_threads = asyncio.run(run_store_operations())
+
+    assert len(transform_threads) == 2
+    assert all(thread_id != event_loop_thread for thread_id in transform_threads)
 
 
 def test_sqlite_session_store_atomically_transitions_status_and_checkpoint(tmp_path):
@@ -796,13 +831,13 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 14")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 14")
         connection.execute("PRAGMA user_version = 13")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 14"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 15"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -813,6 +848,55 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
         await _close(reopened)
 
     asyncio.run(assert_compatible())
+
+
+def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def create() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_sqlite_rev14",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await _close(store)
+
+    asyncio.run(create())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 15")
+        connection.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
+        connection.execute("PRAGMA user_version = 14")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 15"):
+        SQLiteSessionStore(db_path)
+
+    reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def assert_compatible() -> None:
+        loaded = await reopened.load("sess_sqlite_rev14")
+        assert loaded is not None
+        await _close(reopened)
+
+    asyncio.run(assert_compatible())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        index = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_checkpoints_pending_interruption_cascade'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert index is not None
 
 
 def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
@@ -930,7 +1014,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-14 are additive and keep the prior compatibility floor.
+    # Revisions 2-7 and 11-15 are additive and keep the prior compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
         (1, 1),
@@ -947,6 +1031,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (12, 10),
         (13, 10),
         (14, 10),
+        (15, 10),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

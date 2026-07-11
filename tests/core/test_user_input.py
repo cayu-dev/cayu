@@ -699,12 +699,14 @@ class _FailOnceAppendStore(InMemorySessionStore):
         super().__init__()
         self.armed = False
 
-    async def append_transcript_messages_and_checkpoint(self, session_id, messages, checkpoint):
+    async def append_transcript_messages_and_transform_checkpoint(
+        self, session_id, messages, checkpoint_transform
+    ):
         if self.armed:
             self.armed = False
             raise RuntimeError("simulated append failure")
-        return await super().append_transcript_messages_and_checkpoint(
-            session_id, messages, checkpoint
+        return await super().append_transcript_messages_and_transform_checkpoint(
+            session_id, messages, checkpoint_transform
         )
 
 
