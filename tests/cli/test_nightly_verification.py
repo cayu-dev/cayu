@@ -500,6 +500,21 @@ def test_provider_stream_abort_check_is_verified_and_credential_free() -> None:
     }
 
 
+def test_sqlite_write_failure_check_is_verified_and_credential_free() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "sqlite-write-failure")
+
+    assert check.command == (
+        "uv",
+        "run",
+        "pytest",
+        "tests/faults/test_sqlite_write_failure.py",
+        "-q",
+    )
+    assert check.lane == "fault-injection"
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
+
+
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
     environ = {

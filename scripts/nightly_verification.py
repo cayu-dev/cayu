@@ -451,6 +451,21 @@ CHECKS: tuple[VerificationCheck, ...] = (
         prerequisites=("loopback TCP", "SQLite"),
         unset_env=_LIVE_CREDENTIAL_ENV,
     ),
+    VerificationCheck(
+        id="sqlite-write-failure",
+        capability="SQLite terminal-event write failure and manual recovery",
+        lane="fault-injection",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/faults/test_sqlite_write_failure.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("SQLite triggers", "durable filesystem"),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+    ),
 )
 
 
