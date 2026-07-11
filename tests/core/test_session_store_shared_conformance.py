@@ -182,9 +182,7 @@ def test_session_store_conformance_lists_pending_interruption_cascades(session_s
                     {
                         "pending_interruption_cascade": {
                             "attempt_id": session_id,
-                            "interrupt_payload": {
-                                "interruption_type": "operator_requested"
-                            },
+                            "interrupt_payload": {"interruption_type": "operator_requested"},
                         }
                     },
                 )
@@ -220,9 +218,7 @@ def test_session_store_conformance_lists_pending_interruption_cascades(session_s
                 "sess_cascade_index_b",
             ]
             assert second.next_cursor is None
-            assert [session.id for session in running.sessions] == [
-                "sess_cascade_index_running"
-            ]
+            assert [session.id for session in running.sessions] == ["sess_cascade_index_running"]
         finally:
             await _close_store(store)
 

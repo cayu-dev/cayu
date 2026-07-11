@@ -1672,8 +1672,7 @@ class InMemorySessionStore(SessionStore):
                 (
                     self._sessions[session_id]
                     for session_id, checkpoint in self._checkpoints.items()
-                    if "pending_interruption_cascade" in checkpoint
-                    and session_id in self._sessions
+                    if "pending_interruption_cascade" in checkpoint and session_id in self._sessions
                 )
                 if pending_interruption_cascade_only
                 else self._sessions.values()

@@ -160,9 +160,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 15")
-                await cur.execute(
-                    "DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade"
-                )
+                await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)

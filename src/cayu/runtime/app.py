@@ -7,7 +7,6 @@ import logging
 import mimetypes
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextvars import ContextVar, copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -100,11 +99,20 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._interruption_coordinator import (
+    BackgroundInterruptionCoordinator,
+    _copy_interruption_cascade_retry_request,
+    _interruption_cascade_marker_datetime,
+    _interruption_cascade_retry_event_payload,
+    _is_background_subagent_session,
+    interruption_cascade_lease_seconds,
+    interruption_cascade_suppressed,
+    suppress_interruption_cascade,
+)
 from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
-    ResolutionActor,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -246,7 +254,6 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     _current_session_run_epoch,
-    _deactivate_session_run_fence,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -430,40 +437,6 @@ class _EnvironmentBindingFinalizeResult:
     events: list[Event]
 
 
-@dataclass
-class _BackgroundInterruptionCascadeState:
-    parent_session_id: str
-    attempt_id: str
-    generation: int
-    claim_id: str
-    reason: str | None
-    metadata: dict[str, Any]
-    requested_by: ResolutionActor | None
-    retry_request: dict[str, Any] | None = None
-    outstanding: int = 0
-    failure_count: int = 0
-    failure_details: list[dict[str, Any]] = field(default_factory=list)
-    seen_child_ids: set[str] = field(default_factory=set)
-    cascade_session_ids: set[str] = field(default_factory=set)
-    done: asyncio.Event = field(default_factory=asyncio.Event)
-    claim_lost: asyncio.Event = field(default_factory=asyncio.Event)
-
-
-@dataclass(frozen=True)
-class _BackgroundInterruptionNode:
-    state: _BackgroundInterruptionCascadeState
-    session_id: str
-    session: Session | None
-
-
-@dataclass(frozen=True)
-class _DeferredBackgroundInterruption:
-    interrupt_payload: dict[str, Any]
-    retry_at: datetime
-    drain_required: bool
-    retry_request: dict[str, Any] | None = None
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -495,11 +468,6 @@ _INTERRUPTED_EVENT_WAIT_ATTEMPTS = 10
 _INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
 _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 600
 _ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
-_BACKGROUND_INTERRUPTION_CONCURRENCY = 32
-_BACKGROUND_INTERRUPTION_FAILURE_DETAIL_LIMIT = 100
-_BACKGROUND_INTERRUPTION_LEASE_SECONDS = 30.0
-_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS = 10.0
-_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS = 1.0
 _STREAM_INTERRUPT_POLL_INTERVAL_S = 0.05
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
@@ -514,85 +482,6 @@ _ABANDONED_RUN_REASON = "event_stream_closed"
 # persisted on PendingToolApproval (the historical ToolApprovalRequest default).
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
-
-
-_SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE: ContextVar[bool] = ContextVar(
-    "cayu_suppress_background_interruption_cascade",
-    default=False,
-)
-_BACKGROUND_INTERRUPTION_COORDINATOR_STOP: ContextVar[asyncio.Event | None] = ContextVar(
-    "cayu_background_interruption_coordinator_stop",
-    default=None,
-)
-
-
-def _is_background_subagent_session(session: Session) -> bool:
-    subagent = session.metadata.get("subagent")
-    return isinstance(subagent, dict) and subagent.get("mode") == "background"
-
-
-def _is_subagent_session(session: Session) -> bool:
-    subagent = session.metadata.get("subagent")
-    return isinstance(subagent, dict) and subagent.get("mode") in {"foreground", "background"}
-
-
-def _interruption_cascade_marker_datetime(marker: dict[str, Any], key: str) -> datetime | None:
-    value = marker.get(key)
-    if value is None:
-        return None
-    if type(value) is not str:
-        raise ValueError(f"Pending interruption cascade {key} must be an ISO datetime.")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise ValueError(f"Pending interruption cascade {key} must be an ISO datetime.") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"Pending interruption cascade {key} must be timezone-aware.")
-    return parsed.astimezone(UTC)
-
-
-def _copy_interruption_cascade_retry_request(
-    value: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if type(value) is not dict:
-        raise ValueError("Interruption cascade retry request must be an object.")
-    copied = copy_json_value(value, "retry_request")
-    retry_request_id = copied.get("retry_request_id")
-    if type(retry_request_id) is not str or not retry_request_id.strip():
-        raise ValueError("Interruption cascade retry request ID must be a non-blank string.")
-    reason = copied.get("reason")
-    if reason is not None and type(reason) is not str:
-        raise ValueError("Interruption cascade retry reason must be a string or null.")
-    metadata = copied.get("metadata", {})
-    if type(metadata) is not dict:
-        raise ValueError("Interruption cascade retry metadata must be an object.")
-    requested_by_payload = copied.get("requested_by")
-    requested_by = (
-        None
-        if requested_by_payload is None
-        else ResolutionActor.model_validate(requested_by_payload)
-    )
-    return {
-        "retry_request_id": retry_request_id,
-        "reason": reason,
-        "metadata": copy_json_value(metadata, "metadata"),
-        "requested_by": resolution_actor_payload(requested_by),
-    }
-
-
-def _interruption_cascade_retry_event_payload(
-    retry_request: dict[str, Any] | None,
-) -> dict[str, Any]:
-    if retry_request is None:
-        return {}
-    return {
-        "retry_request_id": retry_request["retry_request_id"],
-        "retry_reason": retry_request.get("reason"),
-        "retry_metadata": retry_request.get("metadata", {}),
-        "retry_requested_by": retry_request.get("requested_by"),
-    }
 
 
 class _SessionUsageTracker:
@@ -1592,21 +1481,26 @@ class CayuApp:
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
         self._active_session_runs: dict[str, dict[asyncio.Task[Any], _ActiveSessionRun]] = {}
-        self._background_interruption_tasks: set[asyncio.Task[None]] = set()
-        self._background_interruption_tasks_by_parent: dict[str, asyncio.Task[None]] = {}
-        self._background_interruption_coordinator_stop = asyncio.Event()
-        self._background_interruption_deferred: dict[str, _DeferredBackgroundInterruption] = {}
-        self._background_interruption_deferred_wakeup = asyncio.Event()
-        self._background_interruption_deferred_task: asyncio.Task[None] | None = None
-        self._background_interruption_queue: asyncio.Queue[_BackgroundInterruptionNode] = (
-            asyncio.Queue()
+        self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
+            session_store=self.session_store,
+            event_writer=self._event_writer,
+            clock=self._clock,
+            interrupt_session=self.interrupt_session,
+            load_pending_session_interrupt_payload=self._load_pending_session_interrupt_payload,
+            latest_session_interrupted_event=self._latest_session_interrupted_event,
+            load_pending_interruption_cascade=self._load_pending_interruption_cascade,
+            claim_pending_interruption_cascade=self._claim_pending_interruption_cascade,
+            mark_pending_interruption_cascade_failed=(
+                self._mark_pending_interruption_cascade_failed
+            ),
+            complete_pending_interruption_cascade=self._complete_pending_interruption_cascade,
+            renew_pending_interruption_cascade_claim=(
+                self._renew_pending_interruption_cascade_claim
+            ),
+            release_pending_interruption_cascade_claim=(
+                self._release_pending_interruption_cascade_claim
+            ),
         )
-        self._background_interruption_workers: set[asyncio.Task[None]] = set()
-        self._background_interruption_worker_stop = asyncio.Event()
-        self._background_interruption_states: dict[str, _BackgroundInterruptionCascadeState] = {}
-        self._background_interruption_draining = False
-        self._background_interruption_shutdown_active = False
-        self._background_interruption_workers_stopped = asyncio.Event()
         self._sessions_emitting_interrupted: set[str] = set()
         self._sessions_requesting_interruption: set[str] = set()
         self._session_interrupt_signals: dict[str, asyncio.Event] = {}
@@ -1622,125 +1516,7 @@ class CayuApp:
         and workers are then cancelled; their durable parent markers remain for
         the next process to recover.
         """
-
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, (int, float))
-            or not isfinite(timeout_s)
-            or timeout_s <= 0
-        ):
-            raise ValueError("timeout_s must be a finite positive number.")
-        self._background_interruption_draining = True
-        try:
-            return await self._drain_background_interruptions_started(float(timeout_s))
-        except asyncio.CancelledError:
-            _clear_current_task_cancellation()
-            await self._cancel_background_interruption_work()
-            raise
-        except BaseException:
-            await self._cancel_background_interruption_work()
-            raise
-        finally:
-            self._background_interruption_deferred.clear()
-            self._background_interruption_deferred_task = None
-            self._background_interruption_draining = False
-
-    async def _drain_background_interruptions_started(self, timeout_s: float) -> bool:
-        self._background_interruption_deferred = {
-            parent_session_id: deferred
-            for parent_session_id, deferred in self._background_interruption_deferred.items()
-            if deferred.drain_required
-        }
-        self._background_interruption_deferred_wakeup.set()
-        if self._background_interruption_deferred and (
-            self._background_interruption_deferred_task is None
-            or self._background_interruption_deferred_task.done()
-        ):
-            self._background_interruption_deferred_task = asyncio.create_task(
-                self._run_deferred_background_interruption_cascades()
-            )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_s
-        drained = True
-        while (
-            self._background_interruption_tasks
-            or self._has_drain_required_background_interruptions()
-        ):
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                drained = False
-                break
-            tasks: tuple[asyncio.Task[None], ...] = tuple(self._background_interruption_tasks)
-            deferred_task = self._background_interruption_deferred_task
-            if deferred_task is not None and not deferred_task.done():
-                tasks = (*tasks, deferred_task)
-            if not tasks:
-                await asyncio.sleep(0)
-                continue
-            await asyncio.wait(
-                tasks,
-                timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if loop.time() >= deadline and (
-                self._background_interruption_tasks
-                or self._has_drain_required_background_interruptions()
-            ):
-                drained = False
-                break
-        if not drained:
-            await self._cancel_background_interruption_work()
-        else:
-            await self._finish_background_interruption_work()
-        return drained
-
-    async def _cancel_background_interruption_work(self) -> None:
-        pending_tasks = tuple(self._background_interruption_tasks)
-        workers = tuple(self._background_interruption_workers)
-        deferred_task = self._background_interruption_deferred_task
-        self._background_interruption_deferred_task = None
-        self._background_interruption_deferred.clear()
-        self._background_interruption_coordinator_stop.set()
-        for state in self._background_interruption_states.values():
-            state.claim_lost.set()
-        self._background_interruption_worker_stop.set()
-        if deferred_task is not None:
-            deferred_task.cancel()
-        self._background_interruption_shutdown_active = True
-        self._background_interruption_workers_stopped.clear()
-        try:
-            for task in (*pending_tasks, *workers):
-                task.cancel()
-            self._discard_background_interruption_queue()
-            self._background_interruption_workers.clear()
-            self._background_interruption_workers_stopped.set()
-            # Give cooperative tasks one event-loop turn to run their finally
-            # blocks. Anything that suppresses cancellation is detached below;
-            # its captured stop event remains set and its durable claim is left
-            # to expire rather than extending the configured shutdown grace.
-            await asyncio.sleep(0)
-        finally:
-            self._background_interruption_tasks.clear()
-            self._background_interruption_tasks_by_parent.clear()
-            self._background_interruption_workers.clear()
-            self._background_interruption_states.clear()
-            self._background_interruption_coordinator_stop = asyncio.Event()
-            self._background_interruption_worker_stop = asyncio.Event()
-            self._background_interruption_shutdown_active = False
-            self._background_interruption_workers_stopped.clear()
-
-    async def _finish_background_interruption_work(self) -> None:
-        deferred_task = self._background_interruption_deferred_task
-        self._background_interruption_deferred_task = None
-        if deferred_task is not None and not deferred_task.done():
-            deferred_task.cancel()
-            await asyncio.gather(deferred_task, return_exceptions=True)
-        await self._stop_background_interruption_workers()
-
-    def _has_drain_required_background_interruptions(self) -> bool:
-        return any(
-            deferred.drain_required for deferred in self._background_interruption_deferred.values()
-        )
+        return await self._background_interruption_coordinator.drain(timeout_s=timeout_s)
 
     async def resume_pending_interruption_cascades(
         self,
@@ -1798,25 +1574,19 @@ class CayuApp:
                         continue
                     if marker is None:
                         continue
-                    existing_before_recovery = self._background_interruption_tasks_by_parent.get(
+                    already_scheduled = self._background_interruption_coordinator.is_admitted(
                         session.id
                     )
-                    already_scheduled = (
-                        existing_before_recovery is not None and not existing_before_recovery.done()
-                    ) or session.id in self._background_interruption_deferred
                     if session.status == SessionStatus.INTERRUPTING:
                         if interrupting_inactive_before is None:
                             continue
-                        suppression_token = _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.set(True)
-                        try:
+                        with suppress_interruption_cascade():
                             recovery = await self._recover_incomplete_session_scoped(
                                 session=session,
                                 inactive_before=interrupting_inactive_before,
                                 reason="interruption_cascade_startup_recovery",
                                 metadata={"source": "resume_pending_interruption_cascades"},
                             )
-                        finally:
-                            _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.reset(suppression_token)
                         session = await self._require_session(session.id)
                         if session.status != SessionStatus.INTERRUPTED:
                             logger.warning(
@@ -1884,19 +1654,17 @@ class CayuApp:
             created_at = _interruption_cascade_marker_datetime(marker, "created_at")
         except ValueError:
             return "failed"
-        active = self._background_interruption_tasks_by_parent.get(session_id)
-        if active is not None and not active.done():
-            return "pending"
-        deferred = self._background_interruption_deferred.get(session_id)
-        if deferred is not None and deferred.drain_required:
+        if self._background_interruption_coordinator.is_pending(session_id):
             return "pending"
         if claim_id is not None:
+            if claim_expires_at is None:
+                return "failed"
             return "pending" if claim_expires_at > self._clock() else "failed"
         if failure_recorded:
             return "failed"
         if created_at is None:
             return "failed"
-        unclaimed_grace = timedelta(seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS)
+        unclaimed_grace = timedelta(seconds=interruption_cascade_lease_seconds())
         return "pending" if created_at + unclaimed_grace > self._clock() else "failed"
 
     def _schedule_background_interruption_cascade(
@@ -1908,77 +1676,13 @@ class CayuApp:
         retry_request: dict[str, Any] | None = None,
         allow_during_drain: bool = False,
     ) -> asyncio.Task[None] | None:
-        retry_request = _copy_interruption_cascade_retry_request(retry_request)
-        existing = self._background_interruption_tasks_by_parent.get(parent_session_id)
-        if existing is not None and not existing.done():
-            return existing
-        deferred = self._background_interruption_deferred.get(parent_session_id)
-        if deferred is not None:
-            if retry_request is not None:
-                self._background_interruption_deferred[parent_session_id] = replace(
-                    deferred,
-                    retry_request=retry_request,
-                )
-            return None
-        if self._background_interruption_draining and not allow_during_drain:
-            return None
-        if len(self._background_interruption_tasks) >= _BACKGROUND_INTERRUPTION_CONCURRENCY:
-            self._defer_background_interruption_cascade(
-                parent_session_id=parent_session_id,
-                interrupt_payload=interrupt_payload,
-                retry_at=self._clock(),
-                drain_required=True,
-                retry_request=retry_request,
-            )
-            return None
-        # The cascade outlives its run/request task. Preserve tracing and other
-        # context, but detach the copied parent run fence so a later epoch change
-        # cannot reject durable marker updates from this background task.
-        task_context = copy_context()
-        task_context.run(_deactivate_session_run_fence, parent_session_id)
-        task_context.run(
-            _BACKGROUND_INTERRUPTION_COORDINATOR_STOP.set,
-            self._background_interruption_coordinator_stop,
+        return self._background_interruption_coordinator.schedule(
+            parent_session_id=parent_session_id,
+            interrupt_payload=interrupt_payload,
+            create_if_missing=create_if_missing,
+            retry_request=retry_request,
+            allow_during_drain=allow_during_drain,
         )
-        if create_if_missing and retry_request is None:
-            cascade = self._interrupt_background_subagent_children(
-                parent_session_id=parent_session_id,
-                interrupt_payload=interrupt_payload,
-            )
-        elif retry_request is None:
-            cascade = self._interrupt_background_subagent_children(
-                parent_session_id=parent_session_id,
-                interrupt_payload=interrupt_payload,
-                create_if_missing=False,
-            )
-        else:
-            cascade = self._interrupt_background_subagent_children(
-                parent_session_id=parent_session_id,
-                interrupt_payload=interrupt_payload,
-                create_if_missing=create_if_missing,
-                retry_request=retry_request,
-            )
-        task = asyncio.create_task(cascade, context=task_context)
-        self._background_interruption_tasks.add(task)
-        self._background_interruption_tasks_by_parent[parent_session_id] = task
-
-        def discard(completed: asyncio.Task[None]) -> None:
-            self._background_interruption_tasks.discard(completed)
-            if self._background_interruption_tasks_by_parent.get(parent_session_id) is completed:
-                self._background_interruption_tasks_by_parent.pop(parent_session_id, None)
-            self._background_interruption_deferred_wakeup.set()
-            if completed.cancelled():
-                return
-            exception = completed.exception()
-            if exception is not None:
-                logger.error(
-                    "Background interruption cascade for parent %s failed unexpectedly.",
-                    parent_session_id,
-                    exc_info=(type(exception), exception, exception.__traceback__),
-                )
-
-        task.add_done_callback(discard)
-        return task
 
     def _defer_background_interruption_cascade(
         self,
@@ -1989,127 +1693,13 @@ class CayuApp:
         drain_required: bool,
         retry_request: dict[str, Any] | None,
     ) -> None:
-        if self._background_interruption_draining and not drain_required:
-            return
-        existing = self._background_interruption_deferred.get(parent_session_id)
-        if existing is None:
-            self._background_interruption_deferred[parent_session_id] = (
-                _DeferredBackgroundInterruption(
-                    interrupt_payload=copy_json_value(
-                        interrupt_payload,
-                        "interrupt_payload",
-                    ),
-                    retry_at=retry_at,
-                    drain_required=drain_required,
-                    retry_request=_copy_interruption_cascade_retry_request(retry_request),
-                )
-            )
-        else:
-            self._background_interruption_deferred[parent_session_id] = (
-                _DeferredBackgroundInterruption(
-                    interrupt_payload=existing.interrupt_payload,
-                    retry_at=min(existing.retry_at, retry_at),
-                    drain_required=existing.drain_required or drain_required,
-                    retry_request=(
-                        _copy_interruption_cascade_retry_request(retry_request)
-                        if retry_request is not None
-                        else existing.retry_request
-                    ),
-                )
-            )
-        self._background_interruption_deferred_wakeup.set()
-        task = self._background_interruption_deferred_task
-        if task is None or task.done():
-            self._background_interruption_deferred_task = asyncio.create_task(
-                self._run_deferred_background_interruption_cascades()
-            )
-
-    async def _run_deferred_background_interruption_cascades(self) -> None:
-        try:
-            while self._background_interruption_deferred:
-                self._background_interruption_deferred_wakeup.clear()
-                now = self._clock()
-                available = max(
-                    0,
-                    _BACKGROUND_INTERRUPTION_CONCURRENCY - len(self._background_interruption_tasks),
-                )
-                due = sorted(
-                    (
-                        (parent_session_id, deferred)
-                        for parent_session_id, deferred in (
-                            self._background_interruption_deferred.items()
-                        )
-                        if deferred.retry_at <= now
-                    ),
-                    key=lambda item: item[1].retry_at,
-                )[:available]
-                for parent_session_id, deferred in due:
-                    self._background_interruption_deferred.pop(parent_session_id, None)
-                    self._schedule_background_interruption_cascade(
-                        parent_session_id=parent_session_id,
-                        interrupt_payload=deferred.interrupt_payload,
-                        create_if_missing=False,
-                        retry_request=deferred.retry_request,
-                        allow_during_drain=True,
-                    )
-                if not self._background_interruption_deferred:
-                    return
-                if due:
-                    continue
-                if available == 0:
-                    await self._background_interruption_deferred_wakeup.wait()
-                    continue
-                next_retry_at = min(
-                    deferred.retry_at
-                    for deferred in self._background_interruption_deferred.values()
-                )
-                delay = max(0.0, (next_retry_at - self._clock()).total_seconds())
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._background_interruption_deferred_wakeup.wait(),
-                        timeout=delay,
-                    )
-        finally:
-            if asyncio.current_task() is self._background_interruption_deferred_task:
-                self._background_interruption_deferred_task = None
-
-    def _ensure_background_interruption_workers(self) -> None:
-        self._background_interruption_workers = {
-            task for task in self._background_interruption_workers if not task.done()
-        }
-        if (
-            not self._background_interruption_workers
-            and self._background_interruption_worker_stop.is_set()
-        ):
-            self._background_interruption_worker_stop = asyncio.Event()
-        stop = self._background_interruption_worker_stop
-        missing = _BACKGROUND_INTERRUPTION_CONCURRENCY - len(self._background_interruption_workers)
-        for _ in range(missing):
-            worker = asyncio.create_task(self._background_interruption_worker(stop))
-            self._background_interruption_workers.add(worker)
-            worker.add_done_callback(self._background_interruption_workers.discard)
-
-    async def _stop_background_interruption_workers(self) -> None:
-        workers = tuple(self._background_interruption_workers)
-        self._background_interruption_worker_stop.set()
-        for worker in workers:
-            worker.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
-        self._background_interruption_workers.clear()
-        self._background_interruption_worker_stop = asyncio.Event()
-        self._discard_background_interruption_queue()
-
-    def _discard_background_interruption_queue(self) -> None:
-        while True:
-            try:
-                node = self._background_interruption_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            node.state.outstanding -= 1
-            if node.state.outstanding == 0:
-                node.state.done.set()
-            self._background_interruption_queue.task_done()
+        self._background_interruption_coordinator.defer(
+            parent_session_id=parent_session_id,
+            interrupt_payload=interrupt_payload,
+            retry_at=retry_at,
+            drain_required=drain_required,
+            retry_request=retry_request,
+        )
 
     def register_agent(
         self,
@@ -2738,7 +2328,7 @@ class CayuApp:
             if existing_interrupt_event is not None:
                 retry_event: Event | None = None
                 retry_request: dict[str, Any] | None = None
-                if not _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
+                if not interruption_cascade_suppressed():
                     marker = await self._load_pending_interruption_cascade(loaded_session.id)
                     if (
                         marker is not None
@@ -2792,7 +2382,7 @@ class CayuApp:
                 ),
             )
             if existing_interrupt_event is not None:
-                if not _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
+                if not interruption_cascade_suppressed():
                     self._schedule_background_interruption_cascade(
                         parent_session_id=loaded_session.id,
                         interrupt_payload=existing_interrupt_event.payload,
@@ -2816,7 +2406,7 @@ class CayuApp:
             "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
             "interruption_request_id": str(uuid4()),
         }
-        cascade_suppressed = _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get()
+        cascade_suppressed = interruption_cascade_suppressed()
         self._sessions_requesting_interruption.add(loaded_session.id)
         request_marker_active = True
         try:
@@ -2873,7 +2463,7 @@ class CayuApp:
                 if existing_interrupt_event is not None:
                     request_marker_active = False
                     self._sessions_requesting_interruption.discard(loaded_session.id)
-                    if not _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
+                    if not interruption_cascade_suppressed():
                         self._schedule_background_interruption_cascade(
                             parent_session_id=reloaded_session.id,
                             interrupt_payload=existing_interrupt_event.payload,
@@ -9164,7 +8754,7 @@ class CayuApp:
             marker["generation"] = generation + 1
             marker["claim_id"] = str(uuid4())
             marker["claim_expires_at"] = (
-                now + timedelta(seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS)
+                now + timedelta(seconds=interruption_cascade_lease_seconds())
             ).isoformat()
             copied_checkpoint[_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY] = marker
             resolved_marker = copy_json_value(marker, "pending_interruption_cascade")
@@ -9270,7 +8860,7 @@ class CayuApp:
             ):
                 return None
             marker["claim_expires_at"] = (
-                self._clock() + timedelta(seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS)
+                self._clock() + timedelta(seconds=interruption_cascade_lease_seconds())
             ).isoformat()
             renewed = True
             return copied_checkpoint
@@ -9747,7 +9337,7 @@ class CayuApp:
             )
             if existing_interrupt_event is not None:
                 await self._clear_pending_session_interrupt(session.id)
-                if not _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
+                if not interruption_cascade_suppressed():
                     self._schedule_background_interruption_cascade(
                         parent_session_id=session.id,
                         interrupt_payload=existing_interrupt_event.payload,
@@ -9794,7 +9384,7 @@ class CayuApp:
             )
 
             await self._clear_pending_session_interrupt(session.id)
-            if not _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
+            if not interruption_cascade_suppressed():
                 self._schedule_background_interruption_cascade(
                     parent_session_id=session.id,
                     interrupt_payload=interrupted_event.payload,
@@ -10293,527 +9883,12 @@ class CayuApp:
         create_if_missing: bool = True,
         retry_request: dict[str, Any] | None = None,
     ) -> None:
-        if _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.get():
-            return
-        coordinator_stop = _BACKGROUND_INTERRUPTION_COORDINATOR_STOP.get()
-        if coordinator_stop is None:
-            # Direct internal calls do not run in a scheduled coordinator's
-            # copied context, so bind them to the application's current
-            # generation.
-            coordinator_stop = self._background_interruption_coordinator_stop
-        if coordinator_stop.is_set():
-            return
-        if interrupt_payload.get("interruption_type") != _INTERRUPTION_TYPE_OPERATOR_REQUESTED:
-            return
-
-        try:
-            reason = interrupt_payload.get("reason")
-            if reason is not None and type(reason) is not str:
-                raise ValueError("Operator interruption reason must be a string or null.")
-            metadata = interrupt_payload.get("metadata", {})
-            if type(metadata) is not dict:
-                raise ValueError("Operator interruption metadata must be an object.")
-            requested_by_payload = interrupt_payload.get("requested_by")
-            requested_by = (
-                None
-                if requested_by_payload is None
-                else ResolutionActor.model_validate(requested_by_payload)
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "Background interruption cascade for parent %s has an invalid durable payload: %s",
-                parent_session_id,
-                exc,
-            )
-            return
-
-        if retry_request is None:
-            marker = await self._claim_pending_interruption_cascade(
-                parent_session_id,
-                interrupt_payload,
-                create_if_missing=create_if_missing,
-            )
-        else:
-            marker = await self._claim_pending_interruption_cascade(
-                parent_session_id,
-                interrupt_payload,
-                create_if_missing=create_if_missing,
-                retry_request=retry_request,
-            )
-        # A storage implementation may delay or suppress task cancellation.
-        # The captured generation event remains set after hard cleanup even
-        # after the application has installed a fresh event for future work.
-        if coordinator_stop.is_set():
-            return
-        if marker is None:
-            current_marker = await self._load_pending_interruption_cascade(parent_session_id)
-            if coordinator_stop.is_set():
-                return
-            if current_marker is None:
-                return
-            claim_expires_at = _interruption_cascade_marker_datetime(
-                current_marker,
-                "claim_expires_at",
-            )
-            retry_at = claim_expires_at if claim_expires_at is not None else self._clock()
-            self._defer_background_interruption_cascade(
-                parent_session_id=parent_session_id,
-                interrupt_payload=current_marker["interrupt_payload"],
-                retry_at=retry_at,
-                drain_required=False,
-                retry_request=retry_request,
-            )
-            return
-        state = _BackgroundInterruptionCascadeState(
+        await self._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_session_id,
-            attempt_id=marker["attempt_id"],
-            generation=marker["generation"],
-            claim_id=marker["claim_id"],
-            reason=reason,
-            metadata=copy_json_value(metadata, "metadata"),
-            requested_by=requested_by,
-            retry_request=_copy_interruption_cascade_retry_request(marker.get("retry_request")),
-            cascade_session_ids={parent_session_id},
+            interrupt_payload=interrupt_payload,
+            create_if_missing=create_if_missing,
+            retry_request=retry_request,
         )
-        self._background_interruption_states[parent_session_id] = state
-        heartbeat = asyncio.create_task(self._heartbeat_background_interruption_claim(state))
-        try:
-            await self._run_claimed_background_interruption_cascade(state)
-        finally:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-            if self._background_interruption_shutdown_active:
-                await self._background_interruption_workers_stopped.wait()
-            with contextlib.suppress(Exception):
-                await self._release_pending_interruption_cascade_claim(
-                    state.parent_session_id,
-                    state.attempt_id,
-                    state.generation,
-                    state.claim_id,
-                )
-            if self._background_interruption_states.get(parent_session_id) is state:
-                self._background_interruption_states.pop(parent_session_id, None)
-
-    async def _run_claimed_background_interruption_cascade(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-    ) -> None:
-        parent_session_id = state.parent_session_id
-        self._ensure_background_interruption_workers()
-        self._enqueue_background_interruption_node(
-            state,
-            session_id=parent_session_id,
-            session=None,
-        )
-        await state.done.wait()
-        if state.claim_lost.is_set():
-            return
-
-        if state.failure_count:
-            try:
-                recorded = await self._mark_pending_interruption_cascade_failed(
-                    parent_session_id,
-                    state.attempt_id,
-                    state.generation,
-                    state.claim_id,
-                )
-                if not recorded:
-                    return
-                parent = await self.session_store.load(parent_session_id)
-                if parent is None:
-                    return
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
-                        session_id=parent.id,
-                        agent_name=parent.agent_name,
-                        environment_name=parent.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                            "attempt_id": state.attempt_id,
-                            "generation": state.generation,
-                            "failure_count": state.failure_count,
-                            "failures": state.failure_details,
-                            "failures_truncated": state.failure_count > len(state.failure_details),
-                            **_interruption_cascade_retry_event_payload(state.retry_request),
-                        },
-                    )
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Could not persist background interruption cascade failure for parent %s: %s",
-                    parent_session_id,
-                    exc,
-                )
-            return
-
-        try:
-            parent = await self.session_store.load(parent_session_id)
-            if parent is None:
-                return
-            marker = await self._load_pending_interruption_cascade(parent_session_id)
-            if (
-                marker is None
-                or marker.get("attempt_id") != state.attempt_id
-                or marker.get("generation") != state.generation
-                or marker.get("claim_id") != state.claim_id
-            ):
-                return
-            failure_recorded = marker.get("failure_recorded", False)
-            if failure_recorded:
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
-                        session_id=parent.id,
-                        agent_name=parent.agent_name,
-                        environment_name=parent.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                            "attempt_id": state.attempt_id,
-                            "generation": state.generation,
-                            "descendant_count": len(state.cascade_session_ids) - 1,
-                            **_interruption_cascade_retry_event_payload(state.retry_request),
-                        },
-                    )
-                )
-            try:
-                await self._complete_pending_interruption_cascade(
-                    parent_session_id,
-                    state.attempt_id,
-                    state.generation,
-                    state.claim_id,
-                )
-            except Exception as exc:
-                await self._record_background_interruption_completion_failure(
-                    state,
-                    parent,
-                    exc,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Could not persist background interruption cascade completion for parent %s: %s",
-                parent_session_id,
-                exc,
-            )
-
-    async def _record_background_interruption_completion_failure(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-        parent: Session,
-        exc: Exception,
-    ) -> None:
-        try:
-            recorded = await self._mark_pending_interruption_cascade_failed(
-                state.parent_session_id,
-                state.attempt_id,
-                state.generation,
-                state.claim_id,
-            )
-            if not recorded:
-                return
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
-                    session_id=parent.id,
-                    agent_name=parent.agent_name,
-                    environment_name=parent.environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                        "attempt_id": state.attempt_id,
-                        "generation": state.generation,
-                        "failure_count": 1,
-                        "failures": [
-                            {
-                                "scope": "parent",
-                                "session_id": parent.id,
-                                "reason": "completion_checkpoint_clear_failed",
-                                "error_type": type(exc).__name__,
-                            }
-                        ],
-                        "failures_truncated": False,
-                        **_interruption_cascade_retry_event_payload(state.retry_request),
-                    },
-                )
-            )
-        except Exception as record_exc:
-            logger.warning(
-                "Could not persist background interruption completion failure for parent %s: %s",
-                state.parent_session_id,
-                record_exc,
-            )
-
-    async def _heartbeat_background_interruption_claim(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-    ) -> None:
-        claim_expires_at = self._clock() + timedelta(seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS)
-        sleep_seconds = _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS
-        while True:
-            await asyncio.sleep(sleep_seconds)
-            try:
-                renewed = await self._renew_pending_interruption_cascade_claim(
-                    state.parent_session_id,
-                    state.attempt_id,
-                    state.generation,
-                    state.claim_id,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Could not renew background interruption claim for parent %s: %s",
-                    state.parent_session_id,
-                    exc,
-                )
-                if self._clock() >= claim_expires_at:
-                    state.claim_lost.set()
-                    return
-                remaining = max(0.0, (claim_expires_at - self._clock()).total_seconds())
-                sleep_seconds = min(
-                    _BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS,
-                    remaining,
-                )
-                continue
-            if not renewed:
-                state.claim_lost.set()
-                return
-            claim_expires_at = self._clock() + timedelta(
-                seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS
-            )
-            sleep_seconds = _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS
-
-    def _enqueue_background_interruption_node(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-        *,
-        session_id: str,
-        session: Session | None,
-    ) -> None:
-        state.outstanding += 1
-        self._background_interruption_queue.put_nowait(
-            _BackgroundInterruptionNode(
-                state=state,
-                session_id=session_id,
-                session=session,
-            )
-        )
-
-    async def _background_interruption_worker(self, stop: asyncio.Event) -> None:
-        while not stop.is_set():
-            node = await self._background_interruption_queue.get()
-            try:
-                await self._process_background_interruption_node(node)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._record_background_interruption_failure(
-                    node.state,
-                    {
-                        "scope": "worker",
-                        "session_id": node.session_id,
-                        "reason": "unexpected_worker_failure",
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                logger.exception(
-                    "Unexpected background interruption worker failure for %s.",
-                    node.session_id,
-                )
-            finally:
-                node.state.outstanding -= 1
-                if node.state.outstanding == 0:
-                    node.state.done.set()
-                self._background_interruption_queue.task_done()
-            if stop.is_set():
-                return
-
-    async def _process_background_interruption_node(
-        self,
-        node: _BackgroundInterruptionNode,
-    ) -> None:
-        state = node.state
-        if state.claim_lost.is_set():
-            return
-        session = node.session
-        if (
-            session is not None
-            and _is_background_subagent_session(session)
-            and session.status
-            in {
-                *_INTERRUPTIBLE_SESSION_STATUSES,
-                SessionStatus.INTERRUPTING,
-            }
-        ):
-            await self._interrupt_background_session(state, session)
-        if state.claim_lost.is_set():
-            return
-        await self._enqueue_background_descendants(state, node.session_id)
-
-    async def _interrupt_background_session(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-        session: Session,
-    ) -> None:
-        if session.status == SessionStatus.INTERRUPTING:
-            reconciled = await self._wait_for_background_session_interruption(session.id)
-            if reconciled:
-                return
-            await self._record_background_interruption_error(
-                state,
-                session,
-                TimeoutError(f"Session interruption is still finalizing: {session.id}"),
-            )
-            return
-        token = _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.set(True)
-        try:
-            async for _event in self.interrupt_session(
-                InterruptSessionRequest(
-                    session_id=session.id,
-                    reason=state.reason or "Parent session interrupted.",
-                    metadata={
-                        "source": "background_subagent_parent_interrupt",
-                        "parent_session_id": state.parent_session_id,
-                        "parent_metadata": copy_json_value(state.metadata, "metadata"),
-                    },
-                    requested_by=state.requested_by,
-                )
-            ):
-                pass
-        except TimeoutError as exc:
-            await self._record_background_interruption_error(state, session, exc)
-        except (KeyError, ValueError) as exc:
-            await self._record_background_interruption_error(state, session, exc)
-        except Exception as exc:
-            await self._record_background_interruption_error(state, session, exc)
-        finally:
-            _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.reset(token)
-
-    async def _wait_for_background_session_interruption(self, session_id: str) -> bool:
-        pending_interrupt_payload = await self._load_pending_session_interrupt_payload(
-            session_id,
-            default={},
-        )
-        interruption_request_id = _interruption_request_id_from_payload(pending_interrupt_payload)
-        for attempt in range(_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
-            if (
-                await self._latest_session_interrupted_event(
-                    session_id,
-                    interruption_request_id=interruption_request_id,
-                )
-                is not None
-            ):
-                return True
-            session = await self.session_store.load(session_id)
-            if session is None or session.status in {
-                SessionStatus.COMPLETED,
-                SessionStatus.FAILED,
-            }:
-                return True
-            if session.status != SessionStatus.INTERRUPTING:
-                return False
-            if attempt < _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS - 1:
-                await asyncio.sleep(_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S)
-        return False
-
-    async def _record_background_interruption_error(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-        session: Session,
-        exc: Exception,
-    ) -> None:
-        try:
-            reloaded = await self.session_store.load(session.id)
-        except Exception as reload_exc:
-            self._record_background_interruption_failure(
-                state,
-                {
-                    "scope": "child",
-                    "session_id": session.id,
-                    "reason": "status_unknown_after_interruption_error",
-                    "error_type": type(exc).__name__,
-                    "reload_error_type": type(reload_exc).__name__,
-                },
-            )
-            return
-        if reloaded is None or reloaded.status not in {
-            *_INTERRUPTIBLE_SESSION_STATUSES,
-            SessionStatus.INTERRUPTING,
-        }:
-            return
-        self._record_background_interruption_failure(
-            state,
-            {
-                "scope": "child",
-                "session_id": session.id,
-                "status": reloaded.status.value,
-                "reason": (
-                    "interruption_still_finalizing"
-                    if reloaded.status == SessionStatus.INTERRUPTING
-                    else "interruption_request_failed"
-                ),
-                "error_type": type(exc).__name__,
-            },
-        )
-
-    async def _enqueue_background_descendants(
-        self,
-        state: _BackgroundInterruptionCascadeState,
-        parent_session_id: str,
-    ) -> None:
-        offset = 0
-        try:
-            while True:
-                if state.claim_lost.is_set():
-                    return
-                page = (
-                    await self.session_store.list_sessions(
-                        SessionQuery(
-                            parent_session_id=parent_session_id,
-                            limit=1000,
-                            offset=offset,
-                            order_by=SessionOrder.CREATED_AT_ASC,
-                        )
-                    )
-                ).sessions
-                if not page:
-                    break
-                for child in page:
-                    if state.claim_lost.is_set():
-                        return
-                    if not _is_subagent_session(child):
-                        continue
-                    if child.id in state.seen_child_ids:
-                        continue
-                    state.seen_child_ids.add(child.id)
-                    if _is_background_subagent_session(child):
-                        state.cascade_session_ids.add(child.id)
-                    self._enqueue_background_interruption_node(
-                        state,
-                        session_id=child.id,
-                        session=child,
-                    )
-                if len(page) < 1000:
-                    break
-                offset += len(page)
-        except Exception as exc:
-            self._record_background_interruption_failure(
-                state,
-                {
-                    "scope": "listing",
-                    "parent_session_id": parent_session_id,
-                    "reason": "child_listing_failed",
-                    "error_type": type(exc).__name__,
-                },
-            )
-
-    @staticmethod
-    def _record_background_interruption_failure(
-        state: _BackgroundInterruptionCascadeState,
-        detail: dict[str, Any],
-    ) -> None:
-        state.failure_count += 1
-        if len(state.failure_details) < _BACKGROUND_INTERRUPTION_FAILURE_DETAIL_LIMIT:
-            state.failure_details.append(detail)
 
     def _active_session_run_records(self, session_id: str) -> tuple[_ActiveSessionRun, ...]:
         return tuple(self._active_session_runs.get(session_id, {}).values())

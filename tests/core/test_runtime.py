@@ -145,6 +145,7 @@ from cayu.runtime import (
     trim_context_messages,
     trim_context_turns,
 )
+from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime.app import _require_native_structured_output_support
 from cayu.runtime.context import (
@@ -8803,7 +8804,11 @@ def test_finalizing_background_child_does_not_fail_parent_cascade(monkeypatch):
             raise TimeoutError(f"Session interruption is still finalizing: {request.session_id}")
             yield
 
-        monkeypatch.setattr(app, "interrupt_session", finalizing_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            finalizing_interrupt_session,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id="sess_parent_with_finalizing_child",
             interrupt_payload={
@@ -8931,7 +8936,9 @@ def test_background_interruption_cascade_isolates_child_completion_race(monkeypa
             async for event in original_interrupt_session(request):
                 yield event
 
-        monkeypatch.setattr(app, "interrupt_session", racing_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "_interrupt_session", racing_interrupt_session
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id="sess_parent_child_completion_race",
             interrupt_payload={
@@ -8990,7 +8997,11 @@ def test_background_interruption_cascade_persists_partial_failure(monkeypatch):
                 agent_name="reviewer",
             )
 
-        monkeypatch.setattr(app, "interrupt_session", partially_failing_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            partially_failing_interrupt_session,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=parent_session_id,
             interrupt_payload={
@@ -9073,7 +9084,11 @@ def test_background_interruption_cascade_success_resolves_prior_failure(monkeypa
             "requested_by": None,
             "interruption_type": "operator_requested",
         }
-        monkeypatch.setattr(app, "interrupt_session", retrying_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            retrying_interrupt_session,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=parent_session_id,
             interrupt_payload=payload,
@@ -9140,7 +9155,11 @@ def test_background_interruption_cascade_retains_marker_while_child_is_interrupt
             "requested_by": None,
             "interruption_type": "operator_requested",
         }
-        monkeypatch.setattr(app, "interrupt_session", still_finalizing_interrupt)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            still_finalizing_interrupt,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=parent_id,
             interrupt_payload=payload,
@@ -9171,7 +9190,9 @@ def test_background_interruption_cascade_retains_marker_while_child_is_interrupt
 
 def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marker(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2)
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         identity = SessionIdentity(provider_name="fake", model="fake-model")
@@ -9202,7 +9223,9 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
             await asyncio.Event().wait()
             yield
 
-        monkeypatch.setattr(app, "interrupt_session", blocked_interrupt)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
+        )
         app._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
@@ -9220,8 +9243,8 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
         )
         return (
             drained,
-            app._background_interruption_tasks,
-            app._background_interruption_workers,
+            app._background_interruption_coordinator._tasks,
+            app._background_interruption_coordinator._workers,
             await store.load_checkpoint(parent_id),
         )
 
@@ -9235,7 +9258,9 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
 
 def test_pending_interruption_startup_waits_for_dead_claim_expiry(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05)
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         parent_id = "sess_startup_dead_claim"
@@ -9290,7 +9315,7 @@ def test_pending_interruption_startup_bounds_healthy_external_claim_recovery():
             "requested_by": None,
             "interruption_type": "operator_requested",
         }
-        root_count = runtime_app_module._BACKGROUND_INTERRUPTION_CONCURRENCY * 3
+        root_count = interruption_coordinator_module._BACKGROUND_INTERRUPTION_CONCURRENCY * 3
         for index in range(root_count):
             session_id = f"sess_external_claim_{index}"
             await store.create(
@@ -9320,20 +9345,22 @@ def test_pending_interruption_startup_bounds_healthy_external_claim_recovery():
             app.resume_pending_interruption_cascades(),
             timeout=0.2,
         )
-        active_tasks = len(app._background_interruption_tasks)
+        active_tasks = len(app._background_interruption_coordinator._tasks)
         drained = await app.drain_background_interruptions(timeout_s=0.01)
         return root_count, scheduled, active_tasks, drained
 
     root_count, scheduled, active_tasks, drained = asyncio.run(run())
 
     assert scheduled == root_count
-    assert active_tasks <= runtime_app_module._BACKGROUND_INTERRUPTION_CONCURRENCY
+    assert active_tasks <= interruption_coordinator_module._BACKGROUND_INTERRUPTION_CONCURRENCY
     assert drained is True
 
 
 def test_background_interruption_shutdown_drains_locally_queued_roots(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 1)
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 1
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         payload = {
@@ -9379,7 +9406,9 @@ def test_background_interruption_shutdown_drains_locally_queued_roots(monkeypatc
                 first_started.set()
                 await release_first.wait()
 
-        monkeypatch.setattr(app, "_interrupt_background_subagent_children", controlled_cascade)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "run_cascade", controlled_cascade
+        )
         for index in range(2):
             app._schedule_background_interruption_cascade(
                 parent_session_id=f"sess_locally_queued_{index}",
@@ -9444,7 +9473,11 @@ def test_background_interruption_shutdown_does_not_restart_external_lease_waiter
             await release_claim.wait()
             return None
 
-        monkeypatch.setattr(app, "_claim_pending_interruption_cascade", blocked_claim)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_claim_pending_interruption_cascade",
+            blocked_claim,
+        )
         app._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
@@ -9458,8 +9491,8 @@ def test_background_interruption_shutdown_does_not_restart_external_lease_waiter
         await asyncio.sleep(0)
         return (
             drained,
-            app._background_interruption_deferred,
-            app._background_interruption_deferred_task,
+            app._background_interruption_coordinator._deferred,
+            app._background_interruption_coordinator._deferred_task,
         )
 
     drained, deferred, deferred_task = asyncio.run(run())
@@ -9501,7 +9534,9 @@ def test_background_interruption_drain_cancellation_cleans_up_owned_work(monkeyp
             await asyncio.Event().wait()
             yield
 
-        monkeypatch.setattr(app, "interrupt_session", blocked_interrupt)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
+        )
         app._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
@@ -9520,10 +9555,10 @@ def test_background_interruption_drain_cancellation_cleans_up_owned_work(monkeyp
             await drain_task
         checkpoint = await store.load_checkpoint(parent_id)
         return (
-            app._background_interruption_draining,
-            app._background_interruption_tasks,
-            app._background_interruption_workers,
-            app._background_interruption_deferred_task,
+            app._background_interruption_coordinator._draining,
+            app._background_interruption_coordinator._tasks,
+            app._background_interruption_coordinator._workers,
+            app._background_interruption_coordinator._deferred_task,
             checkpoint,
         )
 
@@ -9584,7 +9619,11 @@ def test_background_interruption_shutdown_grace_detaches_cancellation_resistant_
             finally:
                 child_finished.set()
 
-        monkeypatch.setattr(app, "interrupt_session", cancellation_resistant_interrupt)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            cancellation_resistant_interrupt,
+        )
         app._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
@@ -9604,9 +9643,9 @@ def test_background_interruption_shutdown_grace_detaches_cancellation_resistant_
         )
         elapsed = loop.time() - started_at
         tracked_after_drain = (
-            app._background_interruption_tasks,
-            app._background_interruption_workers,
-            app._background_interruption_states,
+            app._background_interruption_coordinator._tasks,
+            app._background_interruption_coordinator._workers,
+            app._background_interruption_coordinator._states,
         )
         release_child.set()
         await asyncio.wait_for(child_finished.wait(), timeout=1)
@@ -9646,7 +9685,9 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
         claim_returned = asyncio.Event()
         claimed_runs: list[str] = []
         original_claim = app._claim_pending_interruption_cascade
-        original_run_claimed = app._run_claimed_background_interruption_cascade
+        original_run_claimed = (
+            app._background_interruption_coordinator._run_claimed_background_interruption_cascade
+        )
 
         async def cancellation_resistant_claim(*args, **kwargs):
             claim_started.set()
@@ -9664,12 +9705,12 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
             await original_run_claimed(state)
 
         monkeypatch.setattr(
-            app,
+            app._background_interruption_coordinator,
             "_claim_pending_interruption_cascade",
             cancellation_resistant_claim,
         )
         monkeypatch.setattr(
-            app,
+            app._background_interruption_coordinator,
             "_run_claimed_background_interruption_cascade",
             record_claimed_run,
         )
@@ -9686,9 +9727,9 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
             timeout=0.2,
         )
         tracked_after_drain = (
-            app._background_interruption_tasks,
-            app._background_interruption_workers,
-            app._background_interruption_states,
+            app._background_interruption_coordinator._tasks,
+            app._background_interruption_coordinator._workers,
+            app._background_interruption_coordinator._states,
         )
         release_claim.set()
         await asyncio.wait_for(claim_returned.wait(), timeout=1)
@@ -9756,10 +9797,14 @@ def test_interruption_cascade_status_prefers_cleared_durable_marker_over_stale_d
 
 def test_background_interruption_heartbeat_retries_transient_store_error(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.1)
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS", 0.01)
         monkeypatch.setattr(
-            runtime_app_module,
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.1
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS", 0.01
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
             "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
             0.005,
         )
@@ -9792,7 +9837,9 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
                 agent_name="reviewer",
             )
 
-        monkeypatch.setattr(app, "interrupt_session", delayed_interrupt)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "_interrupt_session", delayed_interrupt
+        )
         original_renew = app._renew_pending_interruption_cascade_claim
         renew_attempts = 0
 
@@ -9803,7 +9850,11 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
                 raise RuntimeError("temporary store outage")
             return await original_renew(*args)
 
-        monkeypatch.setattr(app, "_renew_pending_interruption_cascade_claim", transient_renew)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_renew_pending_interruption_cascade_claim",
+            transient_renew,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=parent_id,
             interrupt_payload={
@@ -9824,7 +9875,9 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
 
 def test_background_interruption_concurrency_is_app_wide_across_nested_trees(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2)
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 2
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         identity = SessionIdentity(provider_name="fake", model="fake-model")
@@ -9884,7 +9937,11 @@ def test_background_interruption_concurrency_is_app_wide_across_nested_trees(mon
             finally:
                 active_requests -= 1
 
-        monkeypatch.setattr(app, "interrupt_session", capture_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            capture_interrupt_session,
+        )
         payload = {
             "reason": "operator stop",
             "metadata": {},
@@ -9900,7 +9957,7 @@ def test_background_interruption_concurrency_is_app_wide_across_nested_trees(mon
                 for parent_id in parent_ids
             )
         )
-        worker_count = len(app._background_interruption_workers)
+        worker_count = len(app._background_interruption_coordinator._workers)
         await app.drain_background_interruptions(timeout_s=1)
         return expected_child_ids, captured_child_ids, peak_active_requests, worker_count
 
@@ -9970,7 +10027,9 @@ def test_background_interruption_traverses_foreground_nodes_to_background_descen
 
 def test_background_interruption_cascade_paginates_all_children(monkeypatch):
     async def run():
-        monkeypatch.setattr(runtime_app_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 4)
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_CONCURRENCY", 4
+        )
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         identity = SessionIdentity(provider_name="fake", model="fake-model")
@@ -10017,7 +10076,11 @@ def test_background_interruption_cascade_paginates_all_children(monkeypatch):
             finally:
                 active_requests -= 1
 
-        monkeypatch.setattr(app, "interrupt_session", capture_interrupt_session)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            capture_interrupt_session,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=parent_session_id,
             interrupt_payload={
@@ -10072,7 +10135,9 @@ def test_interrupt_waits_for_actual_terminal_event_before_checkpoint_cleanup(mon
             )
             yield await app._event_writer.emit(kwargs["event"])
 
-        monkeypatch.setattr(app, "_interrupt_background_subagent_children", capture_cascade)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "run_cascade", capture_cascade
+        )
         monkeypatch.setattr(app, "_emit_terminal_event_with_hooks", terminal_stream)
         events = [
             event
@@ -10125,7 +10190,9 @@ def test_interrupt_stream_does_not_wait_for_background_cascade(monkeypatch):
             cascade_started.set()
             await release_cascade.wait()
 
-        monkeypatch.setattr(app, "_interrupt_background_subagent_children", delayed_cascade)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator, "run_cascade", delayed_cascade
+        )
         event_stream = app.interrupt_session(
             InterruptSessionRequest(
                 session_id="sess_interrupt_cancelled_request_cascade",
@@ -10136,13 +10203,13 @@ def test_interrupt_stream_does_not_wait_for_background_cascade(monkeypatch):
         await asyncio.wait_for(cascade_started.wait(), timeout=1)
         interrupted_event = await asyncio.wait_for(request_task, timeout=1)
         assert interrupted_event.type == EventType.SESSION_INTERRUPTED
-        assert len(app._background_interruption_tasks) == 1
+        assert len(app._background_interruption_coordinator._tasks) == 1
         await event_stream.aclose()
-        assert len(app._background_interruption_tasks) == 1
+        assert len(app._background_interruption_coordinator._tasks) == 1
         checkpoint = await store.load_checkpoint("sess_interrupt_cancelled_request_cascade")
         release_cascade.set()
         drained = await app.drain_background_interruptions(timeout_s=1)
-        return drained, app._background_interruption_tasks, checkpoint, fixed_now
+        return drained, app._background_interruption_coordinator._tasks, checkpoint, fixed_now
 
     drained, remaining_tasks, checkpoint, fixed_now = asyncio.run(run())
 
@@ -10181,7 +10248,7 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
         first_event_task = asyncio.create_task(anext(stream))
         await asyncio.wait_for(terminal_started.wait(), timeout=1)
         checkpoint_before_terminal = await store.load_checkpoint(session_id)
-        tasks_before_terminal = len(app._background_interruption_tasks)
+        tasks_before_terminal = len(app._background_interruption_coordinator._tasks)
 
         release_terminal.set()
         first_event = await asyncio.wait_for(first_event_task, timeout=1)
@@ -10470,7 +10537,7 @@ def test_pending_interruption_restart_admits_parent_once_across_status_scans(mon
             nonlocal attempts
             attempts += 1
 
-        monkeypatch.setattr(app, "_interrupt_background_subagent_children", record_attempt)
+        monkeypatch.setattr(app._background_interruption_coordinator, "run_cascade", record_attempt)
         scheduled = await app.resume_pending_interruption_cascades(
             interrupting_inactive_before=datetime.now(UTC)
         )
@@ -10809,7 +10876,11 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
         async def fail_checkpoint_clear(*_args):
             raise RuntimeError("checkpoint store unavailable")
 
-        monkeypatch.setattr(app, "_complete_pending_interruption_cascade", fail_checkpoint_clear)
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_complete_pending_interruption_cascade",
+            fail_checkpoint_clear,
+        )
         await app._interrupt_background_subagent_children(
             parent_session_id=session_id,
             interrupt_payload=payload,
