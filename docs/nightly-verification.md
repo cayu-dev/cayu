@@ -98,7 +98,7 @@ or in CI.
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live` |
 | OpenAI/Anthropic smoke | provider API key | provider-dependent | `*-live` provider-smoke checks |
-| Known holes | dashboard browser behavior and real provider spend | varies | `unclaimed` checks |
+| Known holes | dashboard browser behavior | varies | `unclaimed` check |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
 package build, and packaged-asset status checks. It still does not run dashboard
@@ -125,14 +125,14 @@ high level:
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | dashboard browser behavior | unclaimed | `dashboard-behavior` |
-| budgets under real provider spend | unclaimed | `real-spend-budgets` |
+| budgets under real provider spend | verified when `OPENAI_API_KEY` is present | `real-spend-budgets` |
 
 Do not update this document with exact pass counts. Counts move as tests are
 added and dependencies change; the generated report records current counts.
 
 ## Live Examples
 
-There are 21 `examples/*_live.py` files:
+There are 22 `examples/*_live.py` files:
 
 | prerequisite | examples |
 | --- | --- |
@@ -142,7 +142,7 @@ There are 21 `examples/*_live.py` files:
 | E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
-| OpenAI key | `knowledge_embedding_live.py` |
+| OpenAI key | `knowledge_embedding_live.py`, `real_spend_budget_live.py` |
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
 outputs, missing cleanup artifacts, missing files, or missing model/tool rounds.
@@ -243,10 +243,7 @@ values.
 
 ## Known Holes
 
-These are intentionally still visible as `unclaimed`:
-
-- dashboard runtime/browser behavior;
-- budgets under real provider spend with an explicit cap.
+Dashboard runtime/browser behavior remains intentionally visible as `unclaimed`.
 
 Scheduled automation in #174 should decide which skipped or unclaimed statuses
 are accepted for the nightly environment and which should fail the workflow.

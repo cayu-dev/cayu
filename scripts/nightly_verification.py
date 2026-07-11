@@ -26,6 +26,7 @@ STATUS_UNCLAIMED = "unclaimed"
 DEFAULT_CHECK_TIMEOUT_SECONDS = 1800.0
 _TIMEOUT_RETURN_CODE = 124
 _COUNT_RE = re.compile(r"(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|error|errors)")
+_STRUCTURED_EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _LIVE_CREDENTIAL_ENV = (
     "ANTHROPIC_API_KEY",
     "E2B_API_KEY",
@@ -62,6 +63,7 @@ class VerificationCheck:
     requires_docker: bool = False
     requires_postgres: bool = False
     requires_sigkill: bool = False
+    requires_structured_evidence: bool = False
     timeout_s: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     reason: str | None = None
 
@@ -421,8 +423,12 @@ CHECKS: tuple[VerificationCheck, ...] = (
         id="real-spend-budgets",
         capability="budgets under real provider spend",
         lane="provider-spend",
-        status_on_success=STATUS_UNCLAIMED,
-        reason="No capped real-spend budget check is currently defined.",
+        command=("uv", "run", "python", "examples/real_spend_budget_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("OPENAI_API_KEY",),
+        env={"CAYU_PROVIDER": "openai"},
+        required_env=("OPENAI_API_KEY",),
+        requires_structured_evidence=True,
     ),
 )
 
@@ -590,6 +596,20 @@ def _run_check(
     if outcome.timed_out:
         evidence["timed_out"] = True
     if outcome.returncode == 0:
+        if check.requires_structured_evidence:
+            harness_evidence, evidence_error = _structured_evidence(outcome.stdout)
+            if evidence_error is not None:
+                return VerificationResult(
+                    capability=check.capability,
+                    check_id=check.id,
+                    lane=check.lane,
+                    status=STATUS_FAILED,
+                    command=check.command,
+                    prerequisites=check.prerequisites,
+                    reason=evidence_error,
+                    evidence=evidence,
+                )
+            evidence["harness"] = harness_evidence
         return VerificationResult(
             capability=check.capability,
             check_id=check.id,
@@ -752,6 +772,25 @@ def _pytest_counts(output: str) -> dict[str, int]:
             kind = "error"
         counts[kind] = counts.get(kind, 0) + int(match.group("count"))
     return counts
+
+
+def _structured_evidence(output: str) -> tuple[dict[str, Any] | None, str | None]:
+    encoded = [
+        line.removeprefix(_STRUCTURED_EVIDENCE_PREFIX)
+        for line in output.splitlines()
+        if line.startswith(_STRUCTURED_EVIDENCE_PREFIX)
+    ]
+    if not encoded:
+        return None, "required structured evidence was not emitted"
+    if len(encoded) > 1:
+        return None, "structured evidence was emitted more than once"
+    try:
+        evidence = json.loads(encoded[0])
+    except json.JSONDecodeError:
+        return None, "structured evidence is not valid JSON"
+    if type(evidence) is not dict:
+        return None, "structured evidence must be a JSON object"
+    return evidence, None
 
 
 def _failure_reason(outcome: CommandOutcome) -> str:

@@ -5,10 +5,8 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 
 def _load_nightly_verification() -> ModuleType:
@@ -384,6 +382,77 @@ def test_promoted_provider_contracts_report_verified() -> None:
         assert check.status_on_success == nightly.STATUS_VERIFIED
         assert check.reason is None
         assert "contract" in check.capability
+
+
+def test_structured_harness_evidence_is_added_to_successful_result() -> None:
+    check = nightly.VerificationCheck(
+        id="structured-evidence",
+        capability="structured evidence",
+        lane="live",
+        command=("live-check",),
+        requires_structured_evidence=True,
+    )
+    stdout = 'progress\nCAYU_NIGHTLY_EVIDENCE={"maximum":"0.01","enforcement":"blocked"}\n'
+
+    result = nightly.run_checks(
+        [check],
+        environ={},
+        runner=lambda command, env: nightly.CommandOutcome(returncode=0, stdout=stdout),
+    )[0]
+
+    assert result.status == nightly.STATUS_VERIFIED
+    assert result.evidence == {
+        "returncode": 0,
+        "harness": {"maximum": "0.01", "enforcement": "blocked"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("stdout", "reason"),
+    [
+        ("ordinary output\n", "required structured evidence was not emitted"),
+        ("CAYU_NIGHTLY_EVIDENCE=not-json\n", "structured evidence is not valid JSON"),
+        (
+            "CAYU_NIGHTLY_EVIDENCE=[]\n",
+            "structured evidence must be a JSON object",
+        ),
+        (
+            "CAYU_NIGHTLY_EVIDENCE={}\nCAYU_NIGHTLY_EVIDENCE={}\n",
+            "structured evidence was emitted more than once",
+        ),
+    ],
+)
+def test_required_structured_harness_evidence_fails_closed(
+    stdout: str,
+    reason: str,
+) -> None:
+    check = nightly.VerificationCheck(
+        id="structured-evidence",
+        capability="structured evidence",
+        lane="live",
+        command=("live-check",),
+        requires_structured_evidence=True,
+    )
+
+    result = nightly.run_checks(
+        [check],
+        environ={},
+        runner=lambda command, env: nightly.CommandOutcome(returncode=0, stdout=stdout),
+    )[0]
+
+    assert result.status == nightly.STATUS_FAILED
+    assert result.reason == reason
+    assert result.evidence == {"returncode": 0}
+
+
+def test_real_spend_budget_check_requires_credentials_and_structured_evidence() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "real-spend-budgets")
+
+    assert check.command == ("uv", "run", "python", "examples/real_spend_budget_live.py")
+    assert check.lane == "provider-spend"
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.required_env == ("OPENAI_API_KEY",)
+    assert check.requires_structured_evidence is True
 
 
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:

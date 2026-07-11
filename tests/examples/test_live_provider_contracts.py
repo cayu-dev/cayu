@@ -13,6 +13,9 @@ sys.path.insert(0, str(EXAMPLES_DIR))
 
 import artifact_file_live  # noqa: E402
 import context_counting_live  # noqa: E402
+import real_spend_budget_live  # noqa: E402
+from cayu import ScriptedModelProvider  # noqa: E402
+from cayu.providers import ModelStreamEvent, build_openai_payload  # noqa: E402
 
 
 def _event(
@@ -176,3 +179,89 @@ def test_artifact_file_contract_fails_when_provider_configuration_is_missing(
 
     with pytest.raises(SystemExit, match="provider configuration missing"):
         asyncio.run(artifact_file_live.main())
+
+
+def test_real_spend_budget_contract_allows_one_call_then_rejects_next_reservation() -> None:
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("bounded response"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 5,
+                        "total_tokens": 25,
+                    },
+                }
+            ),
+        ],
+        name="budget-live-test",
+    )
+
+    evidence = asyncio.run(
+        real_spend_budget_live._run_contract(
+            provider=provider,
+            provider_name="budget-live-test",
+            model="budget-live-model",
+            provider_options=real_spend_budget_live.OPENAI_PROVIDER_OPTIONS,
+        )
+    )
+
+    request_payload = build_openai_payload(provider.requests[0])
+    assert request_payload["max_output_tokens"] == real_spend_budget_live.MAX_OUTPUT_TOKENS
+
+    assert evidence == {
+        "provider": "budget-live-test",
+        "model": "budget-live-model",
+        "currency": "USD",
+        "max_estimated_cost": "0.00104",
+        "reserved_amount": "0.001040",
+        "actual_estimated_cost": "0.000025",
+        "input_tokens": 20,
+        "output_tokens": 5,
+        "total_tokens": 25,
+        "provider_calls_attempted": 1,
+        "provider_calls_completed": 1,
+        "enforcement": "second_reservation_rejected_before_provider",
+    }
+
+
+def test_real_spend_budget_contract_fails_when_openai_key_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit, match="Set OPENAI_API_KEY"):
+        asyncio.run(real_spend_budget_live.main())
+
+
+def test_real_spend_budget_contract_rejects_incorrect_reconciliation() -> None:
+    first_events = [
+        _event(EventType.BUDGET_RESERVED, payload={"actual": "0.001040"}),
+        _event(EventType.MODEL_STARTED),
+        _event(
+            EventType.MODEL_COMPLETED,
+            payload={
+                "usage_metrics": {
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                }
+            },
+        ),
+        _event(EventType.BUDGET_RECONCILED, payload={"actual_amount": "0.000099"}),
+        _event(EventType.SESSION_COMPLETED),
+    ]
+    second_events = [
+        _event(EventType.BUDGET_RESERVATION_FAILED),
+        _event(EventType.SESSION_INTERRUPTED),
+    ]
+
+    with pytest.raises(RuntimeError, match="reconciled amount"):
+        real_spend_budget_live._validate_contract(
+            first_events,
+            second_events,
+            provider_name="budget-live-test",
+            model="budget-live-model",
+        )
