@@ -1,4 +1,4 @@
-"""Demo-only live provider-token-counting smoke test.
+"""Verified live provider-token-counting contract.
 
 OpenAI:
     CAYU_PROVIDER=openai PYTHONPATH=src .venv/bin/python examples/context_counting_live.py
@@ -12,8 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any
 
+from _live_checks import require
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -58,9 +58,7 @@ async def main() -> None:
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model=model))
 
-    counted: dict[str, Any] | None = None
-    reconciled: dict[str, Any] | None = None
-    completed: dict[str, Any] | None = None
+    events: list[Event] = []
 
     request = RunRequest(
         agent_name="assistant",
@@ -70,24 +68,11 @@ async def main() -> None:
     )
 
     async for event in app.run(request):
+        events.append(event)
         if event.type in _INTERESTING_EVENTS:
             _print_event(event)
-        if event.type == EventType.CONTEXT_COUNTED:
-            counted = event.payload
-        elif event.type == EventType.CONTEXT_COUNT_RECONCILED:
-            reconciled = event.payload
-        elif event.type == EventType.MODEL_COMPLETED:
-            completed = event.payload
-        elif event.type == EventType.CONTEXT_COUNT_FAILED:
-            raise SystemExit(f"context count failed: {_json(event.payload)}")
-        elif event.type == EventType.MODEL_ERROR:
-            raise SystemExit(f"model call failed: {_json(event.payload)}")
 
-    _validate_runtime_events(
-        counted=counted,
-        reconciled=reconciled,
-        completed=completed,
-    )
+    _validate_runtime_events(events)
     print("status ok")
 
 
@@ -117,37 +102,69 @@ def _validate_direct_count(result: InputTokenCountResult) -> None:
         raise SystemExit(f"unexpected count endpoint metadata: {endpoint!r}")
 
 
-def _validate_runtime_events(
-    *,
-    counted: dict[str, Any] | None,
-    reconciled: dict[str, Any] | None,
-    completed: dict[str, Any] | None,
-) -> None:
-    if counted is None:
-        raise SystemExit("runtime did not emit context.counted")
-    if completed is None:
-        raise SystemExit("runtime did not emit model.completed")
-    if reconciled is None:
-        raise SystemExit("runtime did not emit context.count.reconciled")
+def _validate_runtime_events(events: list[Event]) -> None:
+    for event in events:
+        if event.type in _FAILURE_EVENTS:
+            raise RuntimeError(f"runtime emitted {event.type}: {_json(event.payload)}")
+
+    terminal_types = [event.type for event in events if event.type in _SESSION_TERMINALS]
+    require(
+        terminal_types == [EventType.SESSION_COMPLETED],
+        f"expected exactly one session.completed terminal, got {terminal_types!r}",
+    )
+
+    counted_events = [event for event in events if event.type == EventType.CONTEXT_COUNTED]
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    reconciled_events = [
+        event for event in events if event.type == EventType.CONTEXT_COUNT_RECONCILED
+    ]
+    require(len(counted_events) == 1, f"expected one context.counted, got {len(counted_events)}")
+    require(
+        len(completed_events) == 1, f"expected one model.completed, got {len(completed_events)}"
+    )
+    require(
+        len(reconciled_events) == 1,
+        f"expected one context.count.reconciled, got {len(reconciled_events)}",
+    )
+
+    counted = counted_events[0].payload
+    completed = completed_events[0].payload
+    reconciled = reconciled_events[0].payload
 
     count = counted.get("count")
     if not isinstance(count, dict):
-        raise SystemExit(f"context.counted has invalid count payload: {_json(counted)}")
+        raise RuntimeError(f"context.counted has invalid count payload: {_json(counted)}")
     if count.get("method") != "official":
-        raise SystemExit(f"runtime count method is not official: {_json(count)}")
+        raise RuntimeError(f"runtime count method is not official: {_json(count)}")
     if count.get("confidence") != "high":
-        raise SystemExit(f"runtime count confidence is not high: {_json(count)}")
+        raise RuntimeError(f"runtime count confidence is not high: {_json(count)}")
     if not isinstance(count.get("input_tokens"), int) or count["input_tokens"] <= 0:
-        raise SystemExit(f"runtime count input_tokens is invalid: {_json(count)}")
+        raise RuntimeError(f"runtime count input_tokens is invalid: {_json(count)}")
 
     if reconciled.get("observation_id") != counted.get("observation_id"):
-        raise SystemExit("reconciled event did not match counted observation_id")
+        raise RuntimeError("reconciled event did not match counted observation_id")
     if reconciled.get("reconciled") is not True:
-        raise SystemExit(f"context count did not reconcile: {_json(reconciled)}")
+        raise RuntimeError(f"context count did not reconcile: {_json(reconciled)}")
     if not isinstance(reconciled.get("actual_input_tokens"), int):
-        raise SystemExit(f"missing actual input token usage: {_json(reconciled)}")
+        raise RuntimeError(f"missing actual input token usage: {_json(reconciled)}")
     if not isinstance(reconciled.get("delta_tokens"), int):
-        raise SystemExit(f"missing token delta: {_json(reconciled)}")
+        raise RuntimeError(f"missing token delta: {_json(reconciled)}")
+
+    usage = completed.get("usage_metrics")
+    if not isinstance(usage, dict):
+        raise RuntimeError(f"model.completed missing normalized usage: {_json(completed)}")
+    require(
+        isinstance(usage.get("total_tokens"), int) and usage["total_tokens"] > 0,
+        f"model.completed total_tokens is invalid: {_json(usage)}",
+    )
+    require(
+        usage.get("provider_name") == counted.get("provider"),
+        "counted provider does not match completed usage provider",
+    )
+    require(
+        usage.get("requested_model") == counted.get("model"),
+        "counted model does not match completed requested model",
+    )
 
 
 def _provider_name() -> str:
@@ -192,6 +209,19 @@ _INTERESTING_EVENTS = {
     EventType.MODEL_ERROR,
     EventType.SESSION_COMPLETED,
     EventType.SESSION_FAILED,
+}
+
+_FAILURE_EVENTS = {
+    EventType.CONTEXT_COUNT_FAILED,
+    EventType.MODEL_ERROR,
+    EventType.SESSION_FAILED,
+    EventType.SESSION_INTERRUPTED,
+}
+
+_SESSION_TERMINALS = {
+    EventType.SESSION_COMPLETED,
+    EventType.SESSION_FAILED,
+    EventType.SESSION_INTERRUPTED,
 }
 
 

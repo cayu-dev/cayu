@@ -1,8 +1,4 @@
-"""Demo-only live provider example for file-backed artifacts.
-
-This exercises a real provider and artifact attachment path, but it does not
-assert model prose. Treat it as smoke coverage in nightly reports.
-"""
+"""Verified live provider contract for file-backed artifacts."""
 
 from __future__ import annotations
 
@@ -11,7 +7,9 @@ import io
 import os
 from importlib import import_module
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from _live_checks import require
 from cayu import (
     AgentSpec,
     AnthropicProvider,
@@ -19,12 +17,15 @@ from cayu import (
     CayuApp,
     Environment,
     EnvironmentSpec,
+    Event,
+    EventType,
     ListArtifactsTool,
     LocalArtifactStore,
     Message,
     OpenAIProvider,
     ReadFileTool,
     RunRequest,
+    file_attachment_from_payload,
 )
 
 TINY_PNG_BYTES = (
@@ -37,80 +38,141 @@ TINY_PNG_BYTES = (
 
 async def main() -> None:
     if not _has_file_reader_dependencies():
-        print("Install optional file readers first: uv sync --extra dev --extra files")
-        return
+        raise SystemExit("Install optional file readers first: uv sync --extra dev --extra files")
 
     try:
         provider_name, model = _provider_config()
     except RuntimeError as exc:
-        print(exc)
-        return
+        raise SystemExit(str(exc)) from exc
     session_id = f"demo_{provider_name}_artifact_file"
     artifact_kind = _artifact_kind()
     filename, content_type, content, prompt_description = _artifact_fixture(artifact_kind)
-    root = Path(__file__).resolve().parents[1] / ".examples-workspaces" / "artifact-file-live"
-    artifact_store = LocalArtifactStore(root / "artifacts", store_id="artifact-file-demo")
-    artifact = await artifact_store.put_bytes(
-        content,
-        filename=filename,
-        content_type=content_type,
-        scope=ArtifactScope.SESSION,
-        session_id=session_id,
-        agent_name="assistant",
-        environment_name="local-dev",
-        metadata={"example": "artifact_file_live", "artifact_kind": artifact_kind},
-    )
-
-    print("artifact_store_root", artifact_store.root)
-    print("artifact_id", artifact.id)
-    print("artifact_kind", artifact_kind)
-    print("provider", provider_name)
-    print("model", model)
-
-    app = CayuApp()
-    if provider_name == "openai":
-        app.register_provider(OpenAIProvider(), default=True)
-    else:
-        app.register_provider(AnthropicProvider(), default=True)
-    app.register_environment(
-        Environment(
-            EnvironmentSpec(name="local-dev", metadata={"kind": "local"}),
-            artifact_store=artifact_store,
-        ),
-        default=True,
-    )
-    app.register_agent(
-        AgentSpec(
-            name="assistant",
-            model=model,
-            system_prompt=(
-                "You are testing Cayu artifact file attachments. Use the read_file tool "
-                "with the provided artifact_id before answering. Keep the final answer short."
-            ),
-        ),
-        tools=[ReadFileTool(), ListArtifactsTool()],
-    )
-
-    request = RunRequest(
-        agent_name="assistant",
-        session_id=session_id,
-        messages=[
-            Message.text(
-                "user",
-                (
-                    f"Inspect artifact_id {artifact.id} with read_file. "
-                    f"After the tool result is returned, describe {prompt_description}."
-                ),
-            )
-        ],
-    )
-    async for event in app.run(request):
-        print(
-            event.type,
-            event.environment_name or "-",
-            event.tool_name or "-",
-            event.payload,
+    with TemporaryDirectory(prefix="cayu-artifact-file-live-") as temporary_directory:
+        artifact_store = LocalArtifactStore(
+            Path(temporary_directory) / "artifacts",
+            store_id="artifact-file-demo",
         )
+        artifact = await artifact_store.put_bytes(
+            content,
+            filename=filename,
+            content_type=content_type,
+            scope=ArtifactScope.SESSION,
+            session_id=session_id,
+            agent_name="assistant",
+            environment_name="local-dev",
+            metadata={"example": "artifact_file_live", "artifact_kind": artifact_kind},
+        )
+
+        print("artifact_store_root", artifact_store.root)
+        print("artifact_id", artifact.id)
+        print("artifact_kind", artifact_kind)
+        print("provider", provider_name)
+        print("model", model)
+
+        app = CayuApp(enable_logging=False)
+        if provider_name == "openai":
+            app.register_provider(OpenAIProvider(), default=True)
+        else:
+            app.register_provider(AnthropicProvider(), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local-dev", metadata={"kind": "local"}),
+                artifact_store=artifact_store,
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model=model,
+                system_prompt=(
+                    "You are testing Cayu artifact file attachments. Use the read_file tool "
+                    "with the provided artifact_id before answering. Keep the final answer short."
+                ),
+            ),
+            tools=[ReadFileTool(), ListArtifactsTool()],
+        )
+
+        request = RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[
+                Message.text(
+                    "user",
+                    (
+                        f"Inspect artifact_id {artifact.id} with read_file. "
+                        f"After the tool result is returned, describe {prompt_description}."
+                    ),
+                )
+            ],
+        )
+        events: list[Event] = []
+        async for event in app.run(request):
+            events.append(event)
+            print(
+                event.type,
+                event.environment_name or "-",
+                event.tool_name or "-",
+                event.payload,
+            )
+
+        _validate_runtime_events(events, artifact_id=artifact.id)
+        print("status ok")
+
+
+def _validate_runtime_events(events: list[Event], *, artifact_id: str) -> None:
+    for event in events:
+        if event.type in _FAILURE_EVENTS:
+            raise RuntimeError(f"runtime emitted {event.type}: {event.payload!r}")
+
+    terminal_types = [event.type for event in events if event.type in _SESSION_TERMINALS]
+    require(
+        terminal_types == [EventType.SESSION_COMPLETED],
+        f"expected exactly one session.completed terminal, got {terminal_types!r}",
+    )
+
+    read_events = [
+        event
+        for event in events
+        if event.type == EventType.TOOL_CALL_COMPLETED and event.tool_name == "read_file"
+    ]
+    require(bool(read_events), "read_file did not complete")
+    attachments = [
+        attachment
+        for event in read_events
+        for item in event.payload.get("result", {}).get("artifacts", [])
+        if (attachment := file_attachment_from_payload(item)) is not None
+    ]
+    require(
+        any(attachment.artifact_id == artifact_id for attachment in attachments),
+        "read_file result did not include a canonical file attachment for "
+        f"expected artifact {artifact_id!r}: {attachments!r}",
+    )
+
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    require(bool(completed_events), "runtime did not emit model.completed")
+    total_tokens = sum(
+        usage["total_tokens"]
+        for event in completed_events
+        if isinstance((usage := event.payload.get("usage_metrics")), dict)
+        and isinstance(usage.get("total_tokens"), int)
+    )
+    require(total_tokens > 0, "model.completed events did not contain positive normalized usage")
+
+
+_FAILURE_EVENTS = {
+    EventType.MODEL_ERROR,
+    EventType.TOOL_CALL_FAILED,
+    EventType.TOOL_CALL_BLOCKED,
+    EventType.SESSION_FAILED,
+    EventType.SESSION_INTERRUPTED,
+}
+
+_SESSION_TERMINALS = {
+    EventType.SESSION_COMPLETED,
+    EventType.SESSION_FAILED,
+    EventType.SESSION_INTERRUPTED,
+}
 
 
 def _provider_config() -> tuple[str, str]:

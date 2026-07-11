@@ -96,6 +96,7 @@ or in CI.
 | microsandbox live | `cayu[microsandbox]` runtime support | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY` | E2B quota | `e2b-live-*` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
+| OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live` |
 | OpenAI/Anthropic smoke | provider API key | provider-dependent | `*-live` provider-smoke checks |
 | Known holes | dashboard browser behavior and real provider spend | varies | `unclaimed` checks |
 
@@ -119,7 +120,8 @@ high level:
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
-| OpenAI/Anthropic artifact, context, knowledge, subagent, and structured-output demos | smoke | provider-smoke checks |
+| OpenAI/Anthropic artifact-file and context-counting contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live` |
+| OpenAI/Anthropic knowledge, subagent, context-pressure, and structured-output demos | smoke | remaining provider-smoke checks |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | dashboard browser behavior | unclaimed | `dashboard-behavior` |
@@ -142,12 +144,13 @@ There are 21 `examples/*_live.py` files:
 | OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
 | OpenAI key | `knowledge_embedding_live.py` |
 
-The deterministic runner examples now use `_live_checks.py` and raise on wrong
+The deterministic runner examples use `_live_checks.py` and raise on wrong
 outputs, missing cleanup artifacts, missing files, or missing model/tool rounds.
-The model-backed OpenAI/Anthropic demos are explicitly marked demo-only and are
-reported as `smoke`.
-Provider-smoke checks respect `CAYU_PROVIDER`; when it is set, the matching API
-key must be present.
+`artifact_file_live.py` and `context_counting_live.py` also assert structural
+provider/runtime behavior and report `verified`. The remaining model-backed
+OpenAI/Anthropic demos are explicitly marked demo-only and report `smoke`.
+All OpenAI/Anthropic live checks respect `CAYU_PROVIDER`; when it is set, the
+matching API key must be present.
 
 `examples/chat_completions_local_tools.py` remains a manual Gemini demo outside
 the `*_live.py` glob. The asserted Gemini contract check is

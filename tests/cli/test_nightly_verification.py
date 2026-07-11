@@ -371,6 +371,21 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
     }
 
 
+def test_promoted_provider_contracts_report_verified() -> None:
+    checks = {
+        check.id: check
+        for check in nightly.CHECKS
+        if check.id in {"context-counting-live", "artifact-file-live"}
+    }
+
+    assert set(checks) == {"context-counting-live", "artifact-file-live"}
+    for check in checks.values():
+        assert check.lane == "provider-contract"
+        assert check.status_on_success == nightly.STATUS_VERIFIED
+        assert check.reason is None
+        assert "contract" in check.capability
+
+
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
     environ = {
