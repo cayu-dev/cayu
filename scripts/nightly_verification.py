@@ -436,6 +436,21 @@ CHECKS: tuple[VerificationCheck, ...] = (
         required_env=("OPENAI_API_KEY",),
         requires_structured_evidence=True,
     ),
+    VerificationCheck(
+        id="provider-stream-abort",
+        capability="provider transport abort before terminal stream event",
+        lane="fault-injection",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/faults/test_provider_stream_abort.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("loopback TCP", "SQLite"),
+        unset_env=_LIVE_CREDENTIAL_ENV,
+    ),
 )
 
 

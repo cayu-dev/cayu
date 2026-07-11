@@ -90,6 +90,7 @@ or in CI.
 | --- | --- | ---: | --- |
 | Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest`, `internal-evals-hermetic` |
 | Process-death recovery | POSIX `SIGKILL`; deterministic SQLite stores and scripted providers | $0 | `sigkill-recovery` |
+| Controlled fault injection | loopback TCP and durable SQLite | $0 | `provider-stream-abort` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
@@ -124,6 +125,7 @@ high level:
 | OpenAI/Anthropic knowledge, subagent, context-pressure, and structured-output demos | smoke | remaining provider-smoke checks |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
+| real provider adapter transport abort with durable terminal state | verified on loopback TCP and SQLite | `provider-stream-abort` |
 | packaged dashboard sessions list, session detail, and event detail | verified when Playwright Chromium is installed | `dashboard-behavior` |
 | budgets under real provider spend | verified when `OPENAI_API_KEY` is present | `real-spend-budgets` |
 
@@ -225,6 +227,19 @@ Postgres-marked claim cases. This proves deterministic process-boundary
 recovery; it does not claim operating-system supervision, arbitrary external
 exactly-once behavior, live-provider behavior, remote sandbox restart, machine
 reboot, or cross-region failover.
+
+Run the credential-free provider transport-abort contract independently:
+
+```bash
+uv run python scripts/nightly_verification.py \
+  --check provider-stream-abort \
+  --strict
+```
+
+The check uses a local chunked HTTP response that carries a valid partial text
+and tool-call delta, then closes before the protocol's terminal event. It must
+persist a typed failure without completing an assistant turn or executing the
+tool, and the same terminal state must survive reopening SQLite.
 
 Run credential-gated lanes only when the credential and quota are intentionally
 available:
