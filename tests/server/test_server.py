@@ -3489,6 +3489,41 @@ def test_dashboard_uses_effective_paths_when_server_is_nested_under_asgi_mount()
         assert client.get(f"/cayu/{asset_path}").status_code == 404
 
 
+def test_dashboard_serves_lazy_route_chunks_under_nested_asgi_mount() -> None:
+    parent = FastAPI()
+    parent.mount("/product", create_server(CayuApp(), dev=True))
+
+    client = TestClient(parent)
+    shell = client.get("/product/cayu/sessions/deep-link")
+
+    assert shell.status_code == 200
+    entry_scripts = re.findall(r'src="\./(assets/[^"]+\.js)"', shell.text)
+    assert len(entry_scripts) == 1
+
+    pending_assets = list(entry_scripts)
+    visited_assets: set[str] = set()
+    entry_chunks: set[str] | None = None
+
+    while pending_assets:
+        asset_path = pending_assets.pop()
+        if asset_path in visited_assets:
+            continue
+        visited_assets.add(asset_path)
+
+        response = client.get(f"/product/cayu/{asset_path}")
+        assert response.status_code == 200, asset_path
+        assert "javascript" in response.headers["content-type"], asset_path
+
+        chunks = set(re.findall(r'["`]\./([^"`]+\.js)["`]', response.text))
+        if asset_path == entry_scripts[0]:
+            entry_chunks = chunks
+        pending_assets.extend(f"assets/{chunk}" for chunk in chunks)
+
+    assert entry_chunks is not None
+    assert any(chunk.startswith("session-detail-") for chunk in entry_chunks)
+    assert any(chunk.startswith("artifacts-") for chunk in entry_chunks)
+
+
 def test_dashboard_path_can_be_disabled_or_customized() -> None:
     disabled = TestClient(create_server(CayuApp(), dev=True, dashboard_path=None))
     assert disabled.get("/cayu/").status_code == 404

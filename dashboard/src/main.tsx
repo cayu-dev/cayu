@@ -1,21 +1,47 @@
 import "./index.css"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router"
+import {
+  createRootRoute,
+  createRoute,
+  createRouter,
+  lazyRouteComponent,
+  RouterProvider,
+} from "@tanstack/react-router"
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
-import { AgentsPage } from "./routes/agents"
-import { ArtifactsPage } from "./routes/artifacts"
-import { DashboardPage } from "./routes/dashboard"
-import { EnvironmentsPage } from "./routes/environments"
-import { KnowledgePage } from "./routes/knowledge"
-import { PendingActionsPage } from "./routes/pending-actions"
-import { RunPage } from "./routes/run"
-import { SessionDetailPage } from "./routes/session-detail"
-import { SessionsPage } from "./routes/sessions"
-import { TasksPage } from "./routes/tasks"
-import { UsagePage } from "./routes/usage"
+
+const AgentsPage = lazyRouteComponent(() => import("./routes/agents"), "AgentsPage")
+const ArtifactsPage = lazyRouteComponent(() => import("./routes/artifacts"), "ArtifactsPage")
+const DashboardPage = lazyRouteComponent(() => import("./routes/dashboard"), "DashboardPage")
+const EnvironmentsPage = lazyRouteComponent(
+  () => import("./routes/environments"),
+  "EnvironmentsPage",
+)
+const KnowledgePage = lazyRouteComponent(() => import("./routes/knowledge"), "KnowledgePage")
+const PendingActionsPage = lazyRouteComponent(
+  () => import("./routes/pending-actions"),
+  "PendingActionsPage",
+)
+const RunPage = lazyRouteComponent(() => import("./routes/run"), "RunPage")
+const SessionDetailPage = lazyRouteComponent(
+  () => import("./routes/session-detail"),
+  "SessionDetailPage",
+)
+const SessionsPage = lazyRouteComponent(() => import("./routes/sessions"), "SessionsPage")
+const TasksPage = lazyRouteComponent(() => import("./routes/tasks"), "TasksPage")
+const UsagePage = lazyRouteComponent(() => import("./routes/usage"), "UsagePage")
+
+function RoutePending() {
+  return (
+    <div className="space-y-4" role="status" aria-live="polite">
+      <div className="h-8 w-48 animate-pulse rounded bg-muted" />
+      <div className="h-32 animate-pulse rounded-lg border border-border bg-muted/40" />
+      <span className="sr-only">Loading page</span>
+    </div>
+  )
+}
 
 const queryClient = new QueryClient()
 
@@ -105,6 +131,8 @@ const routeTree = rootRoute.addChildren([
 const router = createRouter({
   routeTree,
   basepath: dashboardConfig.basePath === "/" ? undefined : dashboardConfig.basePath,
+  defaultPendingComponent: RoutePending,
+  defaultPreload: "intent",
 })
 
 declare module "@tanstack/react-router" {
