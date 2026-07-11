@@ -82,7 +82,7 @@ async def post_json(
     timeout_s: float,
     request_label: str,
     response_label: str,
-    api_error: type[Exception],
+    api_error: Callable[..., Exception],
     protocol_error: type[Exception],
     error_response_text: Callable[[httpx.Response], str],
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
@@ -122,7 +122,9 @@ async def post_json(
             raise api_error_from_response(exc.response, message) from exc
         raise api_error(message) from exc
     except httpx.RequestError as exc:
-        raise api_error(f"{request_label} request failed for {url}: {exc}") from exc
+        raise _request_api_error(
+            api_error, request_label=request_label, url=url, cause=exc
+        ) from exc
 
     try:
         decoded = response.json()
@@ -143,7 +145,7 @@ async def stream_sse_json_events(
     stream_idle_timeout_s: float,
     request_label: str,
     response_label: str,
-    api_error: type[Exception],
+    api_error: Callable[..., Exception],
     protocol_error: type[Exception],
     error_response_text: Callable[[httpx.Response], str],
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
@@ -189,7 +191,36 @@ async def stream_sse_json_events(
             ):
                 yield event
     except httpx.RequestError as exc:
-        raise api_error(f"{request_label} request failed for {url}: {exc}") from exc
+        raise _request_api_error(
+            api_error, request_label=request_label, url=url, cause=exc
+        ) from exc
+
+
+def _request_api_error(
+    api_error: Callable[..., Exception],
+    *,
+    request_label: str,
+    url: str,
+    cause: httpx.RequestError,
+) -> Exception:
+    return api_error(
+        f"{request_label} request failed for {url}: {cause}",
+        error_type=type(cause).__name__,
+        retryable=_is_retryable_transport_error(cause),
+    )
+
+
+def _is_retryable_transport_error(exc: httpx.RequestError) -> bool:
+    # Local protocol and proxy failures usually require request/configuration changes;
+    # only failures that can plausibly succeed unchanged are retried automatically.
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    )
 
 
 def validate_url(

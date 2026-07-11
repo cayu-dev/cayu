@@ -11,6 +11,7 @@ from cayu import (
     CayuApp,
     EventType,
     Message,
+    RetryPolicy,
     RunRequest,
     Tool,
     ToolContext,
@@ -103,6 +104,8 @@ class AbortingChatCompletionsServer:
                 b"Connection: close\r\n\r\n" + f"{len(sse):X}\r\n".encode() + sse + b"\r\n"
             )
             writer.write(response)
+            # drain() queues the valid delta before the loopback RST; the test's
+            # MODEL_TEXT_DELTA assertion fails closed if a platform reverses delivery.
             await writer.drain()
             writer.transport.abort()
         except BaseException as exc:
@@ -145,6 +148,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
                         session_id="provider-stream-abort",
                         max_steps=1,
                         messages=[Message.text("user", "Attempt the side effect.")],
+                        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
                     )
                 )
             ]
@@ -152,7 +156,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
             await provider.aclose()
 
     assert endpoint.handler_errors == []
-    assert len(endpoint.requests) == 1
+    assert len(endpoint.requests) == 2
     request = endpoint.requests[0]
     assert request["stream"] is True
     assert request["model"] == "abort-model"
@@ -160,6 +164,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
 
     event_types = [event.type for event in events]
     assert EventType.MODEL_TEXT_DELTA in event_types
+    assert event_types.count(EventType.MODEL_RETRY) == 1
     assert EventType.MODEL_COMPLETED not in event_types
     assert EventType.TOOL_CALL_STARTED not in event_types
     assert EventType.TOOL_CALL_COMPLETED not in event_types
@@ -169,6 +174,10 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
     model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
     assert model_error.payload["error_type"] == "ChatCompletionsAPIError"
     assert model_error.payload["provider"] == "chat_completions"
+    assert model_error.payload["retryable"] is True
+    assert isinstance(model_error.payload["provider_error_type"], str)
+    model_retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert model_retry.payload["reason"] == "connection"
 
     await store.close()
     reopened = SQLiteSessionStore(store_path)

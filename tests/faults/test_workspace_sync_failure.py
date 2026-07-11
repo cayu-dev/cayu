@@ -93,6 +93,8 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
     target_root = tmp_path / "target"
     source_root.mkdir()
     target_root.mkdir()
+    # LocalWorkspace.list() sorts paths, so the a-file copies before the injected
+    # b-file failure and makes the partial-finalization point deterministic.
     (source_root / "a-updated.txt").write_text("original-a", encoding="utf-8")
     (source_root / "b-fail.txt").write_text("original-b", encoding="utf-8")
     (source_root / "removed.txt").write_text("remove-me", encoding="utf-8")

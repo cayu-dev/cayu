@@ -10,14 +10,17 @@ error messages, and the shared URL validation.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any
 
+import httpx
 import pytest
 
 from cayu.providers import (
     ChatCompletionsProtocolError,
     HttpxChatCompletionsTransport,
     HttpxOpenAITransport,
+    OpenAIAPIError,
     OpenAIProtocolError,
 )
 from cayu.providers._http import SharedAsyncClient, validate_base_url, validate_url
@@ -76,6 +79,69 @@ def _client_factory(response: _StreamingResponse) -> type:
             return _StreamContext(response)
 
     return FakeClient
+
+
+def _request_error_client_factory(error_type: type[httpx.RequestError]) -> type:
+    class RequestErrorClient:
+        is_closed = False
+
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+            timeout: Any = None,
+        ) -> None:
+            request = httpx.Request("POST", url)
+            raise error_type("forced request failure", request=request)
+
+    return RequestErrorClient
+
+
+@pytest.mark.parametrize(
+    ("error_type", "retryable"),
+    [
+        (httpx.ConnectTimeout, True),
+        (httpx.ReadTimeout, True),
+        (httpx.WriteTimeout, True),
+        (httpx.PoolTimeout, True),
+        (httpx.ConnectError, True),
+        (httpx.ReadError, True),
+        (httpx.WriteError, True),
+        (httpx.CloseError, True),
+        (httpx.RemoteProtocolError, True),
+        (httpx.LocalProtocolError, False),
+        (httpx.ProxyError, False),
+        (httpx.UnsupportedProtocol, False),
+        (httpx.DecodingError, False),
+        (httpx.TooManyRedirects, False),
+    ],
+)
+@pytest.mark.anyio
+async def test_openai_transport_classifies_only_transient_request_errors_as_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.RequestError],
+    retryable: bool,
+) -> None:
+    monkeypatch.setattr(
+        "cayu.providers._http.httpx.AsyncClient",
+        _request_error_client_factory(error_type),
+    )
+
+    with pytest.raises(OpenAIAPIError) as captured:
+        await HttpxOpenAITransport().create_response(
+            url="https://api.openai.com/v1/responses",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+        )
+
+    assert captured.value.error_type == error_type.__name__
+    assert captured.value.retryable is retryable
 
 
 _KEEPALIVE_LINES = [
@@ -236,7 +302,7 @@ class _CountingClient:
         type(self).closed += 1
 
 
-async def _drain_stream(transport: HttpxOpenAITransport) -> list[dict[str, Any]]:
+async def _drain_stream(transport: HttpxOpenAITransport) -> list[Mapping[str, Any]]:
     return [
         event
         async for event in transport.stream_response_events(

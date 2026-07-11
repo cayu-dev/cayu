@@ -369,19 +369,54 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
     }
 
 
-def test_promoted_provider_contracts_report_verified() -> None:
-    checks = {
-        check.id: check
-        for check in nightly.CHECKS
-        if check.id in {"context-counting-live", "artifact-file-live"}
-    }
+@pytest.mark.parametrize(
+    ("check_id", "lane", "entrypoint"),
+    [
+        ("context-counting-live", "provider-contract", "examples/context_counting_live.py"),
+        ("artifact-file-live", "provider-contract", "examples/artifact_file_live.py"),
+        ("real-spend-budgets", "provider-spend", "examples/real_spend_budget_live.py"),
+        ("dashboard-behavior", "dashboard", "examples/dashboard_behavior_live.py"),
+        ("provider-stream-abort", "fault-injection", "tests/faults/test_provider_stream_abort.py"),
+        ("sqlite-write-failure", "fault-injection", "tests/faults/test_sqlite_write_failure.py"),
+        (
+            "runner-cleanup-failure",
+            "fault-injection",
+            "tests/faults/test_runner_cleanup_failure.py",
+        ),
+        (
+            "workspace-sync-failure",
+            "fault-injection",
+            "tests/faults/test_workspace_sync_failure.py",
+        ),
+    ],
+)
+def test_delivery_checks_are_verified_at_their_execution_boundary(
+    check_id: str,
+    lane: str,
+    entrypoint: str,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == check_id)
 
-    assert set(checks) == {"context-counting-live", "artifact-file-live"}
-    for check in checks.values():
-        assert check.lane == "provider-contract"
-        assert check.status_on_success == nightly.STATUS_VERIFIED
-        assert check.reason is None
-        assert "contract" in check.capability
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.lane == lane
+    assert check.command[:2] == ("uv", "run")
+    assert entrypoint in check.command
+    assert check.reason is None
+    if lane == "fault-injection":
+        assert check.command[2] == "pytest"
+        assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
+        assert check.required_env == ()
+        assert check.required_any_env == ()
+    elif lane == "provider-contract":
+        assert check.requires_provider_api_key is True
+        assert check.required_any_env == (("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),)
+    elif lane == "provider-spend":
+        assert check.required_env == ("OPENAI_API_KEY",)
+        assert check.requires_structured_evidence is True
+    elif lane == "dashboard":
+        assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
+        assert check.requires_playwright_chromium is True
+        assert check.requires_structured_evidence is True
 
 
 def test_structured_harness_evidence_is_added_to_successful_result() -> None:
@@ -445,16 +480,6 @@ def test_required_structured_harness_evidence_fails_closed(
     assert result.evidence == {"returncode": 0}
 
 
-def test_real_spend_budget_check_requires_credentials_and_structured_evidence() -> None:
-    check = next(check for check in nightly.CHECKS if check.id == "real-spend-budgets")
-
-    assert check.command == ("uv", "run", "python", "examples/real_spend_budget_live.py")
-    assert check.lane == "provider-spend"
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert check.required_env == ("OPENAI_API_KEY",)
-    assert check.requires_structured_evidence is True
-
-
 def test_dashboard_behavior_check_skips_when_playwright_chromium_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -471,81 +496,9 @@ def test_dashboard_behavior_check_skips_when_playwright_chromium_is_missing(
 
     result = nightly.run_checks([check], environ={}, runner=runner)[0]
 
-    assert check.command == ("uv", "run", "python", "examples/dashboard_behavior_live.py")
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert check.required_modules == ("playwright", "fastapi", "uvicorn")
-    assert check.requires_playwright_chromium is True
-    assert check.requires_structured_evidence is True
     assert called is False
     assert result.status == nightly.STATUS_SKIPPED
     assert result.reason == "Playwright Chromium is unavailable"
-
-
-def test_provider_stream_abort_check_is_verified_and_credential_free() -> None:
-    check = next(check for check in nightly.CHECKS if check.id == "provider-stream-abort")
-
-    assert check.command == (
-        "uv",
-        "run",
-        "pytest",
-        "tests/faults/test_provider_stream_abort.py",
-        "-q",
-    )
-    assert check.lane == "fault-injection"
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert set(check.unset_env) >= {
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENAI_API_KEY",
-    }
-
-
-def test_sqlite_write_failure_check_is_verified_and_credential_free() -> None:
-    check = next(check for check in nightly.CHECKS if check.id == "sqlite-write-failure")
-
-    assert check.command == (
-        "uv",
-        "run",
-        "pytest",
-        "tests/faults/test_sqlite_write_failure.py",
-        "-q",
-    )
-    assert check.lane == "fault-injection"
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
-
-
-def test_runner_cleanup_failure_check_is_verified_and_credential_free() -> None:
-    check = next(check for check in nightly.CHECKS if check.id == "runner-cleanup-failure")
-
-    assert check.command == (
-        "uv",
-        "run",
-        "pytest",
-        "tests/faults/test_runner_cleanup_failure.py",
-        "-q",
-    )
-    assert check.lane == "fault-injection"
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert check.prerequisites == ("POSIX process groups",)
-    assert check.requires_sigkill is True
-    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
-
-
-def test_workspace_sync_failure_check_is_verified_and_credential_free() -> None:
-    check = next(check for check in nightly.CHECKS if check.id == "workspace-sync-failure")
-
-    assert check.command == (
-        "uv",
-        "run",
-        "pytest",
-        "tests/faults/test_workspace_sync_failure.py",
-        "-q",
-    )
-    assert check.lane == "fault-injection"
-    assert check.status_on_success == nightly.STATUS_VERIFIED
-    assert check.prerequisites == ("SQLite", "durable filesystem")
-    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
 
 
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:

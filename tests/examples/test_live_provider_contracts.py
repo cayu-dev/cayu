@@ -1,21 +1,49 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
-from cayu import Event, EventType
+from cayu import Event, EventType, ScriptedModelProvider
+from cayu.providers import ModelStreamEvent, build_openai_payload
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
-sys.path.insert(0, str(EXAMPLES_DIR))
 
-import artifact_file_live  # noqa: E402
-import context_counting_live  # noqa: E402
-import real_spend_budget_live  # noqa: E402
-from cayu import ScriptedModelProvider  # noqa: E402
-from cayu.providers import ModelStreamEvent, build_openai_payload  # noqa: E402
+
+def _load_source(module_name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_live_checks = _load_source("cayu_test_live_checks", EXAMPLES_DIR / "_live_checks.py")
+
+
+def _load_example(name: str) -> ModuleType:
+    previous = sys.modules.get("_live_checks")
+    sys.modules["_live_checks"] = _live_checks
+    try:
+        return _load_source(f"cayu_test_{name}", EXAMPLES_DIR / f"{name}.py")
+    finally:
+        if previous is None:
+            sys.modules.pop("_live_checks", None)
+        else:
+            sys.modules["_live_checks"] = previous
+
+
+artifact_file_live = _load_example("artifact_file_live")
+context_counting_live = _load_example("context_counting_live")
+real_spend_budget_live = _load_example("real_spend_budget_live")
+
+
+def test_live_example_imports_do_not_modify_process_module_search_path() -> None:
+    assert str(EXAMPLES_DIR) not in sys.path
 
 
 def _event(
@@ -134,6 +162,20 @@ def _artifact_contract_events(artifact_id: str = "artifact-1") -> list[Event]:
 def test_artifact_file_contract_requires_read_usage_and_completion() -> None:
     artifact_file_live._validate_runtime_events(
         _artifact_contract_events(),
+        artifact_id="artifact-1",
+    )
+
+
+def test_artifact_file_contract_allows_recovered_tool_error_before_success() -> None:
+    artifact_file_live._validate_runtime_events(
+        [
+            _event(
+                EventType.TOOL_CALL_FAILED,
+                tool_name="read_file",
+                payload={"result": {"content": "invalid arguments", "is_error": True}},
+            ),
+            *_artifact_contract_events(),
+        ],
         artifact_id="artifact-1",
     )
 

@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 
-from _live_checks import require
+from _live_checks import require, require_positive_model_usage, require_successful_terminal
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -103,18 +103,13 @@ def _validate_direct_count(result: InputTokenCountResult) -> None:
 
 
 def _validate_runtime_events(events: list[Event]) -> None:
-    for event in events:
-        if event.type in _FAILURE_EVENTS:
-            raise RuntimeError(f"runtime emitted {event.type}: {_json(event.payload)}")
-
-    terminal_types = [event.type for event in events if event.type in _SESSION_TERMINALS]
-    require(
-        terminal_types == [EventType.SESSION_COMPLETED],
-        f"expected exactly one session.completed terminal, got {terminal_types!r}",
+    require_successful_terminal(
+        events,
+        additional_failure_types=(EventType.CONTEXT_COUNT_FAILED,),
     )
 
     counted_events = [event for event in events if event.type == EventType.CONTEXT_COUNTED]
-    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    completed_events = require_positive_model_usage(events)
     reconciled_events = [
         event for event in events if event.type == EventType.CONTEXT_COUNT_RECONCILED
     ]
@@ -209,19 +204,6 @@ _INTERESTING_EVENTS = {
     EventType.MODEL_ERROR,
     EventType.SESSION_COMPLETED,
     EventType.SESSION_FAILED,
-}
-
-_FAILURE_EVENTS = {
-    EventType.CONTEXT_COUNT_FAILED,
-    EventType.MODEL_ERROR,
-    EventType.SESSION_FAILED,
-    EventType.SESSION_INTERRUPTED,
-}
-
-_SESSION_TERMINALS = {
-    EventType.SESSION_COMPLETED,
-    EventType.SESSION_FAILED,
-    EventType.SESSION_INTERRUPTED,
 }
 
 

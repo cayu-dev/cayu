@@ -852,6 +852,9 @@ emits `model.error`, emits durable `model.retry` with attempt, next attempt,
 reason, status code, delay, provider, and model fields, waits for the configured
 backoff delay, and starts a new provider attempt. Retried failed attempts do not
 append assistant messages to the provider-neutral transcript.
+Built-in HTTP transports preserve concrete request exceptions in
+`provider_error_type` and mark transient transport failures as retryable, so
+classification survives provider error events without relying on message text.
 When retries are enabled, provider-derived `model.text.delta`, `model.error`,
 and `model.completed` events include `step`, `attempt`, and `max_attempts` so
 SSE consumers, dashboards, and replay tools can distinguish failed-attempt

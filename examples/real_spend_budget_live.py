@@ -32,6 +32,8 @@ MAX_OUTPUT_TOKENS = 16
 OPENAI_PROVIDER_OPTIONS = {"openai": {"max_output_tokens": MAX_OUTPUT_TOKENS}}
 INPUT_PER_MILLION = Decimal("1")
 OUTPUT_PER_MILLION = Decimal("1")
+# (1,024 input + 16 output) x $1 / 1M = $0.00104: one reservation fills the cap,
+# so a second reservation must fail before another provider request can start.
 MAX_ESTIMATED_COST = Decimal("0.00104")
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 

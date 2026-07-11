@@ -9,7 +9,7 @@ from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from _live_checks import require
+from _live_checks import require, require_positive_model_usage, require_successful_terminal
 from cayu import (
     AgentSpec,
     AnthropicProvider,
@@ -121,15 +121,7 @@ async def main() -> None:
 
 
 def _validate_runtime_events(events: list[Event], *, artifact_id: str) -> None:
-    for event in events:
-        if event.type in _FAILURE_EVENTS:
-            raise RuntimeError(f"runtime emitted {event.type}: {event.payload!r}")
-
-    terminal_types = [event.type for event in events if event.type in _SESSION_TERMINALS]
-    require(
-        terminal_types == [EventType.SESSION_COMPLETED],
-        f"expected exactly one session.completed terminal, got {terminal_types!r}",
-    )
+    require_successful_terminal(events)
 
     read_events = [
         event
@@ -149,30 +141,7 @@ def _validate_runtime_events(events: list[Event], *, artifact_id: str) -> None:
         f"expected artifact {artifact_id!r}: {attachments!r}",
     )
 
-    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
-    require(bool(completed_events), "runtime did not emit model.completed")
-    total_tokens = sum(
-        usage["total_tokens"]
-        for event in completed_events
-        if isinstance((usage := event.payload.get("usage_metrics")), dict)
-        and isinstance(usage.get("total_tokens"), int)
-    )
-    require(total_tokens > 0, "model.completed events did not contain positive normalized usage")
-
-
-_FAILURE_EVENTS = {
-    EventType.MODEL_ERROR,
-    EventType.TOOL_CALL_FAILED,
-    EventType.TOOL_CALL_BLOCKED,
-    EventType.SESSION_FAILED,
-    EventType.SESSION_INTERRUPTED,
-}
-
-_SESSION_TERMINALS = {
-    EventType.SESSION_COMPLETED,
-    EventType.SESSION_FAILED,
-    EventType.SESSION_INTERRUPTED,
-}
+    require_positive_model_usage(events)
 
 
 def _provider_config() -> tuple[str, str]:
