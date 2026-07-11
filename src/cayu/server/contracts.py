@@ -331,6 +331,14 @@ class SessionSummaryResponse(ApiBaseModel):
     usage: SessionUsageSummary
 
 
+class SessionStateResponse(ApiBaseModel):
+    session_id: str
+    status: Literal["pending", "running", "interrupting", "completed", "failed", "interrupted"]
+    updated_at: str
+    last_activity_at: str
+    interruption_cascade: Literal["none", "pending", "failed"]
+
+
 class CausalBudgetSummaryResponse(ApiBaseModel):
     causal_budget_id: str
     session_count: StrictInt = Field(ge=0)
@@ -342,7 +350,17 @@ class CausalBudgetSummaryResponse(ApiBaseModel):
 class ListSessionEventsResponse(ApiBaseModel):
     session_id: str
     events: list[ApiEventRecord]
-    next_sequence: StrictInt | None = Field(default=None, ge=0)
+    order_by: Literal["sequence_asc", "sequence_desc"] = Field(
+        description="Ordering applied to the returned event page."
+    )
+    next_sequence: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Exclusive sequence cursor for the next page in the returned order: pass it as "
+            "after_sequence for ascending pages or before_sequence for descending pages."
+        ),
+    )
     has_more: StrictBool
 
 

@@ -78,6 +78,9 @@ def build_event_query_sql(
     if query.after_sequence is not None:
         clauses.append(f"cayu_events.sequence > {dialect.placeholder}")
         params.append(query.after_sequence)
+    if query.before_sequence is not None:
+        clauses.append(f"cayu_events.sequence < {dialect.placeholder}")
+        params.append(query.before_sequence)
     _append_clauses(clauses, params, extra_after_sequence_clauses)
     if query.event_id is not None:
         clauses.append(f"cayu_events.event_id = {dialect.placeholder}")

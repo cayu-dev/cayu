@@ -118,6 +118,9 @@ REVISIONS: tuple[Revision, ...] = (
     # Index durable interruption-cascade markers so server startup discovers
     # recoverable roots without scanning every historical interrupted session.
     Revision(revision=15, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Index a session's durable global event sequence so newest-first history
+    # pages and exclusive before_sequence cursors do not scan other sessions.
+    Revision(revision=16, kind=RevisionKind.ADDITIVE, compatible_from=10),
 )
 
 #: The revision an empty database is initialized to.

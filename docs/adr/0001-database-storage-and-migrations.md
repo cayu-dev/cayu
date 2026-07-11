@@ -66,7 +66,10 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
 4. **Coordinate all schema work under a backend lock.** On Postgres, wrap
    create/migrate in a transaction-scoped advisory lock (`pg_advisory_xact_lock`)
    so concurrent creators/instances serialize: one runs the DDL, the rest wait and
-   then validate. (Fixes the shared-pool race above.)
+   then validate. Non-transactional DDL such as `CREATE INDEX CONCURRENTLY` runs
+   between locked bookkeeping transactions and coordinates through PostgreSQL's
+   catalog build state; this preserves transaction-pooled PgBouncer compatibility
+   without blocking writes to a hot table. (Fixes the shared-pool race above.)
 5. **Prefix Cayu tables with a configurable prefix, default `cayu_`.**
    `cayu_sessions`, `cayu_events`, `cayu_transcript_messages`, `cayu_checkpoints`,
    `cayu_tasks`, `cayu_schema_migrations`. No hyphens (they force quoted

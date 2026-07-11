@@ -1040,10 +1040,21 @@ tool-use loop, so that block stays in the transcript). Thinking tokens are bille
 
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
-`after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,
-`environment_name`, and `workflow_name` query parameters. Responses include each
-event's durable `sequence` plus `has_more` and `next_sequence`, so clients can
-poll or page without loading the full session transcript.
+`after_sequence`, `before_sequence`, `order_by`, `limit`, `event_type`,
+`tool_name`, `agent_name`, `environment_name`, and `workflow_name` query
+parameters. Ascending pages use `after_sequence` for forward polling. Descending
+pages start at the newest matching event and use `before_sequence` to load older
+history. Responses include each event's durable `sequence` plus `has_more` and
+`next_sequence`; pass `next_sequence` back using the cursor for the selected
+order to continue without loading the full session history.
+
+For frequent lifecycle polling, use
+`GET /api/sessions/{session_id}/state`. It returns only the session id, status,
+update/activity timestamps, and interruption-cascade state. The store projects
+those fields directly: it does not load session metadata, event history,
+transcript messages, usage events, or the full runtime checkpoint. Use the
+richer `/summary` endpoint for on-demand metrics rather than as a high-frequency
+status heartbeat.
 
 The provider-neutral transcript is exposed separately at
 `GET /api/sessions/{session_id}/transcript`. It supports `offset`, `limit`, and

@@ -12,7 +12,12 @@ from hashlib import sha256
 from typing import Any, LiteralString, cast
 
 try:
-    from psycopg.errors import ForeignKeyViolation, UniqueViolation
+    from psycopg.errors import (
+        DeadlockDetected,
+        DuplicateTable,
+        ForeignKeyViolation,
+        UniqueViolation,
+    )
     from psycopg_pool import AsyncConnectionPool
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without the extra
     raise RuntimeError(
@@ -68,6 +73,7 @@ from cayu.runtime.sessions import (
     SessionOutcome,
     SessionQuery,
     SessionRunFenced,
+    SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
@@ -80,6 +86,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_run_fence,
     _prepare_session_fork_request,
+    _project_interruption_cascade_marker_fields,
     _validate_session_fork_source,
     _validate_status_set,
     copy_event_query,
@@ -151,7 +158,7 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
-_POSTGRES_MIN_REQUIRED_REVISION = 15
+_POSTGRES_MIN_REQUIRED_REVISION = 16
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -259,6 +266,7 @@ def _event_query_with_session_ids(
         since=query.since,
         until=query.until,
         after_sequence=query.after_sequence,
+        before_sequence=query.before_sequence,
         limit=query.limit,
         order_by=query.order_by,
     )
@@ -485,6 +493,25 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
 }
 
+# These revisions cannot run inside the schema transaction. The baseline still
+# creates the same indexes normally because its tables are empty; existing hot
+# databases use CONCURRENTLY so event writes remain available during upgrades.
+_CONCURRENT_INDEX_MIGRATIONS: dict[
+    int,
+    tuple[tuple[str, str, tuple[str, ...], str, str], ...],
+] = {
+    16: (
+        (
+            "idx_cayu_events_session_sequence",
+            "cayu_events",
+            ("session_id", "sequence"),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_events_session_sequence "
+            "ON cayu_events(session_id, sequence)",
+            "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_session_sequence",
+        ),
+    ),
+}
+
 
 async def read_schema_state(cur: Any) -> schema.SchemaState:
     """Read the recorded schema state from an open cursor without applying DDL.
@@ -586,8 +613,11 @@ class _PostgresStoreBase:
     async def _reconcile_schema(self) -> None:
         """Reconcile the database schema with this binary per ``schema_mode``.
 
-        All work happens inside a transaction-scoped advisory lock so concurrent
-        stores serialize (ADR 0001, Decision 4):
+        Concurrent stores serialize transactional schema work on one
+        transaction-scoped advisory lock (ADR 0001, Decision 4). Concurrent index
+        DDL necessarily runs outside that transaction; its catalog state provides
+        coordination without relying on session locks, so migration remains safe
+        behind transaction-pooled PgBouncer:
 
         - ``validate``: read the recorded revision and fail fast unless this binary
           can operate against it. Never runs DDL.
@@ -595,6 +625,10 @@ class _PostgresStoreBase:
           validate. The dev/test/local default.
         - ``migrate``: apply pending forward revisions under the lock, then validate.
         """
+        if self._schema_mode is schema.SchemaMode.MIGRATE:
+            await self._migrate_schema()
+            return
+
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_ADVISORY_LOCK_KEY,))
@@ -610,12 +644,79 @@ class _PostgresStoreBase:
                     else:
                         schema.validate(state)
                         self._validate_postgres_schema(state)
-                else:  # MIGRATE
-                    await self._apply_pending(cur, state)
-                    state = await self._read_schema_state(cur)
-                    schema.validate(state)
-                    self._validate_postgres_schema(state)
             await conn.commit()
+
+    async def _migrate_schema(self) -> None:
+        while True:
+            concurrent_revision: schema.Revision | None = None
+            concurrent_indexes: tuple[
+                tuple[str, str, tuple[str, ...], str, str],
+                ...,
+            ] = ()
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (_SCHEMA_ADVISORY_LOCK_KEY,),
+                    )
+                    await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
+                    state = await self._read_schema_state(cur)
+                    current = state.revision
+                    if current == schema.UNINITIALIZED:
+                        await self._apply_baseline(cur)
+                        current = schema.BASELINE_REVISION
+                    pending = schema.pending(current)
+                    if not pending:
+                        current_state = await self._read_schema_state(cur)
+                        schema.validate(current_state)
+                        self._validate_postgres_schema(current_state)
+                    else:
+                        revision = pending[0]
+                        concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
+                            revision.revision,
+                            (),
+                        )
+                        if concurrent_indexes:
+                            concurrent_revision = revision
+                        else:
+                            for statement in _MIGRATION_STEPS.get(revision.revision, ()):
+                                await cur.execute(cast("LiteralString", statement))
+                            await self._record_revision(cur, revision)
+                await conn.commit()
+            if concurrent_revision is None:
+                if not pending:
+                    return
+                continue
+
+            for (
+                index_name,
+                table_name,
+                key_columns,
+                create_statement,
+                drop_statement,
+            ) in concurrent_indexes:
+                async with self._pool.connection() as conn:
+                    await self._ensure_concurrent_index(
+                        conn,
+                        index_name,
+                        table_name,
+                        key_columns,
+                        create_statement,
+                        drop_statement,
+                    )
+
+            # Record the revision only after every non-transactional object is
+            # valid. A competing migrator may have recorded it while this process
+            # built or waited for the same index, so re-read under the xact lock.
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (_SCHEMA_ADVISORY_LOCK_KEY,),
+                )
+                state = await self._read_schema_state(cur)
+                if state.revision < concurrent_revision.revision:
+                    await self._record_revision(cur, concurrent_revision)
+                await conn.commit()
 
     def _validate_postgres_schema(self, state: schema.SchemaState) -> None:
         if state.revision < _POSTGRES_MIN_REQUIRED_REVISION:
@@ -642,6 +743,125 @@ class _PostgresStoreBase:
             for statement in _MIGRATION_STEPS.get(rev.revision, ()):
                 await cur.execute(statement)
             await self._record_revision(cur, rev)
+
+    async def _ensure_concurrent_index(
+        self,
+        conn: Any,
+        index_name: str,
+        table_name: str,
+        key_columns: tuple[str, ...],
+        create_statement: str,
+        drop_statement: str,
+    ) -> None:
+        await conn.set_autocommit(True)
+        try:
+            while True:
+                async with conn.cursor() as cur:
+                    existing = await self._concurrent_index_state(
+                        cur,
+                        index_name,
+                        table_name,
+                        key_columns,
+                    )
+                    if existing == (True, False):
+                        return
+                    if existing is not None and existing[1]:
+                        # Another migrator is building this index. Wait for its
+                        # catalog entry to settle rather than dropping it mid-build.
+                        await asyncio.sleep(0.25)
+                        continue
+                    if existing is not None:
+                        # A cancelled/failed concurrent build leaves an invalid
+                        # index. IF NOT EXISTS would otherwise skip it forever.
+                        await cur.execute(drop_statement)
+                    try:
+                        await cur.execute(create_statement)
+                    except (DeadlockDetected, DuplicateTable, UniqueViolation):
+                        # A concurrent migrator won the catalog-name/lock race.
+                        # Its progress/validity is inspected atop the loop.
+                        continue
+                    created = await self._concurrent_index_state(
+                        cur,
+                        index_name,
+                        table_name,
+                        key_columns,
+                    )
+                    if created == (True, False):
+                        return
+                    if created is None or not created[1]:
+                        raise RuntimeError(
+                            f"Postgres migration did not create a valid index: {index_name}"
+                        )
+        finally:
+            await conn.set_autocommit(False)
+
+    async def _concurrent_index_state(
+        self,
+        cur: Any,
+        index_name: str,
+        table_name: str,
+        key_columns: tuple[str, ...],
+    ) -> tuple[bool, bool] | None:
+        await cur.execute(
+            """
+            SELECT
+                index_definition.indexrelid IS NOT NULL,
+                COALESCE(index_definition.indisvalid, FALSE),
+                COALESCE(
+                    table_class.relnamespace = namespace.oid
+                    AND table_class.relname = %s,
+                    FALSE
+                ),
+                COALESCE(
+                    ARRAY(
+                        SELECT attribute.attname::text
+                        FROM unnest(index_definition.indkey) WITH ORDINALITY
+                            AS index_key(attribute_number, position)
+                        JOIN pg_catalog.pg_attribute AS attribute
+                          ON attribute.attrelid = index_definition.indrelid
+                         AND attribute.attnum = index_key.attribute_number
+                        WHERE index_key.position <= index_definition.indnkeyatts
+                        ORDER BY index_key.position
+                    ) = %s::text[],
+                    FALSE
+                ),
+                COALESCE(access_method.amname = 'btree', FALSE),
+                COALESCE(
+                    index_definition.indpred IS NULL
+                    AND index_definition.indexprs IS NULL,
+                    FALSE
+                ),
+                EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_stat_progress_create_index AS progress
+                    WHERE progress.index_relid = index_class.oid
+                )
+            FROM pg_catalog.pg_class AS index_class
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = index_class.relnamespace
+            LEFT JOIN pg_catalog.pg_index AS index_definition
+              ON index_definition.indexrelid = index_class.oid
+            LEFT JOIN pg_catalog.pg_class AS table_class
+              ON table_class.oid = index_definition.indrelid
+            LEFT JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_class.relam
+            WHERE namespace.nspname = current_schema()
+              AND index_class.relname = %s
+            """,
+            (table_name, list(key_columns), index_name),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        expected_definition = bool(row[0]) and all(bool(value) for value in row[2:6])
+        if not expected_definition:
+            columns = ", ".join(key_columns)
+            raise RuntimeError(
+                f"Postgres schema object {index_name!r} conflicts with the required "
+                f"B-tree index on {table_name}({columns}). Remove or rename the "
+                "conflicting object, then rerun `cayu storage migrate`."
+            )
+        return bool(row[1]), bool(row[6])
 
     async def _record_revision(self, cur: Any, rev: schema.Revision) -> None:
         await cur.execute(
@@ -3294,6 +3514,28 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             return await self._load(cur, session_id)
 
+    async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, status, updated_at, last_activity_at
+                FROM cayu_sessions
+                WHERE id = %s
+                """,
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return SessionStateSnapshot(
+                id=row[0],
+                status=SessionStatus(row[1]),
+                updated_at=pg_support.to_utc(row[2]),
+                last_activity_at=pg_support.to_utc(row[3]),
+            )
+
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
@@ -4252,6 +4494,68 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             return await self._load_checkpoint(cur, session_id)
+
+    async def load_interruption_cascade_marker(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                WITH marker AS (
+                    SELECT state -> 'pending_interruption_cascade' AS value
+                    FROM cayu_checkpoints
+                    WHERE session_id = %s
+                )
+                SELECT
+                    jsonb_typeof(value),
+                    jsonb_typeof(value -> 'attempt_id'),
+                    left(value ->> 'attempt_id', 129),
+                    jsonb_typeof(value -> 'interrupt_payload'),
+                    jsonb_typeof(value -> 'generation'),
+                    left(value ->> 'generation', 33),
+                    jsonb_typeof(value -> 'failure_recorded'),
+                    CASE
+                        WHEN jsonb_typeof(value -> 'failure_recorded') = 'boolean'
+                        THEN (value ->> 'failure_recorded')::boolean
+                    END,
+                    jsonb_typeof(value -> 'claim_id'),
+                    left(value ->> 'claim_id', 129),
+                    jsonb_typeof(value -> 'claim_expires_at'),
+                    left(value ->> 'claim_expires_at', 65),
+                    jsonb_typeof(value -> 'created_at'),
+                    left(value ->> 'created_at', 65)
+                FROM marker
+                """,
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            field_types = {
+                "attempt_id": row[1],
+                "interrupt_payload": row[3],
+                "generation": row[4],
+                "failure_recorded": row[6],
+                "claim_id": row[8],
+                "claim_expires_at": row[10],
+                "created_at": row[12],
+            }
+            field_values = {
+                "attempt_id": row[2],
+                "generation": row[5],
+                "failure_recorded": row[7],
+                "claim_id": row[9],
+                "claim_expires_at": row[11],
+                "created_at": row[13],
+            }
+            return _project_interruption_cascade_marker_fields(
+                row[0],
+                field_types,
+                field_values,
+            )
 
     # -- internal helpers -------------------------------------------------
 

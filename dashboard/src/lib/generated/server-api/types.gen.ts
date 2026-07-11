@@ -1440,6 +1440,11 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EventOrder
+ */
+export type EventOrder = 'sequence_asc' | 'sequence_desc';
+
+/**
  * HTTPValidationError
  */
 export type HttpValidationError = {
@@ -1495,8 +1500,16 @@ export type ListSessionEventsResponse = {
     has_more: boolean;
     /**
      * Next Sequence
+     *
+     * Exclusive sequence cursor for the next page in the returned order: pass it as after_sequence for ascending pages or before_sequence for descending pages.
      */
     next_sequence?: number | null;
+    /**
+     * Order By
+     *
+     * Ordering applied to the returned event page.
+     */
+    order_by: 'sequence_asc' | 'sequence_desc';
     /**
      * Session Id
      */
@@ -2024,6 +2037,32 @@ export type SessionDetailResponse = {
  * SessionOrder
  */
 export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
+
+/**
+ * SessionStateResponse
+ */
+export type SessionStateResponse = {
+    /**
+     * Interruption Cascade
+     */
+    interruption_cascade: 'none' | 'pending' | 'failed';
+    /**
+     * Last Activity At
+     */
+    last_activity_at: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'pending' | 'running' | 'interrupting' | 'completed' | 'failed' | 'interrupted';
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
 
 /**
  * SessionStatus
@@ -3742,8 +3781,20 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
         workflow_name?: string | null;
         /**
          * After Sequence
+         *
+         * Return only events with a greater durable sequence.
          */
         after_sequence?: number | null;
+        /**
+         * Before Sequence
+         *
+         * Return only events with a smaller durable sequence.
+         */
+        before_sequence?: number | null;
+        /**
+         * Return events in durable sequence order.
+         */
+        order_by?: EventOrder;
         /**
          * Limit
          */
@@ -3862,6 +3913,36 @@ export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses = {
 };
 
 export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse = UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses[keyof UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponses];
+
+export type GetSessionStateApiSessionsSessionIdStateGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/state';
+};
+
+export type GetSessionStateApiSessionsSessionIdStateGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionStateApiSessionsSessionIdStateGetError = GetSessionStateApiSessionsSessionIdStateGetErrors[keyof GetSessionStateApiSessionsSessionIdStateGetErrors];
+
+export type GetSessionStateApiSessionsSessionIdStateGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionStateResponse;
+};
+
+export type GetSessionStateApiSessionsSessionIdStateGetResponse = GetSessionStateApiSessionsSessionIdStateGetResponses[keyof GetSessionStateApiSessionsSessionIdStateGetResponses];
 
 export type GetSessionSummaryApiSessionsSessionIdSummaryGetData = {
     body?: never;

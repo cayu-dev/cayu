@@ -2728,6 +2728,14 @@
       "title": "EnvironmentsResponse",
       "type": "object"
     },
+    "EventOrder": {
+      "enum": [
+        "sequence_asc",
+        "sequence_desc"
+      ],
+      "title": "EventOrder",
+      "type": "string"
+    },
     "HTTPValidationError": {
       "properties": {
         "detail": {
@@ -2825,7 +2833,17 @@
               "type": "null"
             }
           ],
+          "description": "Exclusive sequence cursor for the next page in the returned order: pass it as after_sequence for ascending pages or before_sequence for descending pages.",
           "title": "Next Sequence"
+        },
+        "order_by": {
+          "description": "Ordering applied to the returned event page.",
+          "enum": [
+            "sequence_asc",
+            "sequence_desc"
+          ],
+          "title": "Order By",
+          "type": "string"
         },
         "session_id": {
           "title": "Session Id",
@@ -2835,6 +2853,7 @@
       "required": [
         "session_id",
         "events",
+        "order_by",
         "has_more"
       ],
       "title": "ListSessionEventsResponse",
@@ -3808,6 +3827,53 @@
       ],
       "title": "SessionOrder",
       "type": "string"
+    },
+    "SessionStateResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "interruption_cascade": {
+          "enum": [
+            "none",
+            "pending",
+            "failed"
+          ],
+          "title": "Interruption Cascade",
+          "type": "string"
+        },
+        "last_activity_at": {
+          "title": "Last Activity At",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "interrupting",
+            "completed",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "status",
+        "updated_at",
+        "last_activity_at",
+        "interruption_cascade"
+      ],
+      "title": "SessionStateResponse",
+      "type": "object"
     },
     "SessionStatus": {
       "enum": [
@@ -7071,6 +7137,7 @@
                   "type": "null"
                 }
               ],
+              "description": "Return only events with a greater durable sequence.",
               "title": "After Sequence"
             }
           },
@@ -7088,6 +7155,24 @@
                 }
               ],
               "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only events with a smaller durable sequence.",
+              "title": "Before Sequence"
             }
           },
           {
@@ -7132,6 +7217,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/EventOrder",
+              "default": "sequence_asc",
+              "description": "Return events in durable sequence order."
             }
           },
           {
@@ -7306,6 +7401,42 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiSession"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/state": {
+      "get": {
+        "operation_id": "get_session_state_api_sessions__session_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionStateResponse"
               }
             }
           },

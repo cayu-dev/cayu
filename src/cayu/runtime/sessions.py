@@ -4,7 +4,8 @@ import asyncio
 import base64
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -417,6 +418,156 @@ class Session(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class SessionStateSnapshot(BaseModel):
+    """Bounded session state for status polling and control-plane coordination."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: SessionStatus
+    updated_at: datetime
+    last_activity_at: datetime
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "id")
+
+    @field_validator("updated_at", "last_activity_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
+_INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS = 128
+_INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS = 128
+_INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS = 64
+_INTERRUPTION_CASCADE_GENERATION_MAX_CHARS = 32
+_INTERRUPTION_CASCADE_MISSING = object()
+
+
+def _project_interruption_cascade_marker_fields(
+    marker_type: str | None,
+    field_types: Mapping[str, str | None],
+    field_values: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Build the bounded marker view used by control-plane status polling."""
+
+    if marker_type is None or marker_type == "null":
+        return None
+    if marker_type != "object":
+        return {}
+
+    projected: dict[str, Any] = {}
+
+    def required_string(field: str, max_chars: int) -> None:
+        value = field_values.get(field)
+        if (
+            field_types.get(field) == "string"
+            and type(value) is str
+            and value.strip()
+            and len(value) <= max_chars
+        ):
+            projected[field] = value
+        else:
+            projected[field] = None
+
+    def optional_string(field: str, max_chars: int) -> None:
+        field_type = field_types.get(field)
+        if field_type is None or field_type == "null":
+            return
+        value = field_values.get(field)
+        if type(value) is str and field_type == "string" and len(value) <= max_chars:
+            projected[field] = value
+        else:
+            projected[field] = 0
+
+    required_string("attempt_id", _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS)
+    projected["interrupt_payload"] = (
+        {} if field_types.get("interrupt_payload") == "object" else None
+    )
+
+    generation_type = field_types.get("generation")
+    if generation_type is not None:
+        generation = field_values.get("generation")
+        try:
+            if (
+                generation_type not in {"integer", "number"}
+                or type(generation) is not str
+                or len(generation) > _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS
+                or not generation.lstrip("-").isdigit()
+            ):
+                raise ValueError
+            projected["generation"] = int(generation)
+        except ValueError:
+            projected["generation"] = None
+
+    failure_type = field_types.get("failure_recorded")
+    if failure_type is not None:
+        failure = field_values.get("failure_recorded")
+        if failure_type == "boolean" and type(failure) is bool:
+            projected["failure_recorded"] = failure
+        else:
+            projected["failure_recorded"] = None
+
+    optional_string("claim_id", _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS)
+    optional_string("claim_expires_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
+    optional_string("created_at", _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS)
+    return projected
+
+
+def _project_interruption_cascade_marker(marker: Any) -> dict[str, Any] | None:
+    if marker is _INTERRUPTION_CASCADE_MISSING or marker is None:
+        return None
+    if type(marker) is not dict:
+        return {}
+
+    field_types: dict[str, str | None] = {}
+    field_values: dict[str, Any] = {}
+    for field in (
+        "attempt_id",
+        "interrupt_payload",
+        "generation",
+        "failure_recorded",
+        "claim_id",
+        "claim_expires_at",
+        "created_at",
+    ):
+        if field not in marker:
+            field_types[field] = None
+            continue
+        value = marker[field]
+        if value is None:
+            field_types[field] = "null"
+        elif type(value) is str:
+            field_types[field] = "string"
+            max_chars = {
+                "attempt_id": _INTERRUPTION_CASCADE_ATTEMPT_ID_MAX_CHARS,
+                "claim_id": _INTERRUPTION_CASCADE_CLAIM_ID_MAX_CHARS,
+                "claim_expires_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
+                "created_at": _INTERRUPTION_CASCADE_TIMESTAMP_MAX_CHARS,
+            }.get(field, _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS)
+            field_values[field] = value[: max_chars + 1]
+        elif type(value) is bool:
+            field_types[field] = "boolean"
+            field_values[field] = value
+        elif type(value) is int:
+            field_types[field] = "integer"
+            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
+        elif type(value) is float:
+            field_types[field] = "number"
+            field_values[field] = str(value)[: _INTERRUPTION_CASCADE_GENERATION_MAX_CHARS + 1]
+        elif type(value) is dict:
+            field_types[field] = "object"
+        elif type(value) is list:
+            field_types[field] = "array"
+        else:
+            field_types[field] = "other"
+    return _project_interruption_cascade_marker_fields("object", field_types, field_values)
+
+
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
@@ -781,6 +932,7 @@ class EventQuery(BaseModel):
     since: datetime | None = None
     until: datetime | None = None
     after_sequence: StrictInt | None = Field(default=None, ge=0)
+    before_sequence: StrictInt | None = Field(default=None, ge=1)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
     order_by: EventOrder = EventOrder.SEQUENCE_ASC
 
@@ -863,6 +1015,18 @@ class EventQuery(BaseModel):
             raise ValueError("Use either `event_type` or `event_types`, not both.")
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError("EventQuery since must be before until.")
+        if (
+            self.before_sequence is not None
+            and self.session_id is None
+            and len(self.session_ids) != 1
+        ):
+            raise ValueError("EventQuery before_sequence requires exactly one session.")
+        if (
+            self.after_sequence is not None
+            and self.before_sequence is not None
+            and self.after_sequence >= self.before_sequence
+        ):
+            raise ValueError("EventQuery after_sequence must be before before_sequence.")
         return self
 
 
@@ -984,6 +1148,10 @@ class SessionStore(ABC):
     @abstractmethod
     async def load(self, session_id: str) -> Session | None:
         """Load a session by id."""
+
+    @abstractmethod
+    async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
+        """Load bounded mutable state without labels or unbounded metadata."""
 
     @abstractmethod
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
@@ -1165,6 +1333,10 @@ class SessionStore(ABC):
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         """Load the latest checkpoint for a session."""
 
+    @abstractmethod
+    async def load_interruption_cascade_marker(self, session_id: str) -> dict[str, Any] | None:
+        """Load a bounded structural projection of the durable cascade marker."""
+
 
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
@@ -1298,6 +1470,19 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 return None
             return session.model_copy(deep=True)
+
+    async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            return SessionStateSnapshot(
+                id=session.id,
+                status=session.status,
+                updated_at=session.updated_at,
+                last_activity_at=session.last_activity_at,
+            )
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1584,21 +1769,37 @@ class InMemorySessionStore(SessionStore):
             event_types = frozenset(str(event_type) for event_type in query.event_types)
         async with self._lock:
             candidates = self._query_candidate_records(query, event_types)
-            records = [
-                record
-                for record in candidates
-                if _event_record_matches(record, query, event_types)
-                and _event_record_matches_session(record, query, self._sessions)
-            ]
-            if query.order_by == EventOrder.SEQUENCE_DESC:
-                records = list(reversed(records))
-            return [
-                EventRecord(
-                    sequence=record.sequence,
-                    event=record.event,
+            start = (
+                bisect_right(candidates, query.after_sequence, key=lambda record: record.sequence)
+                if query.after_sequence is not None
+                else 0
+            )
+            stop = (
+                bisect_left(candidates, query.before_sequence, key=lambda record: record.sequence)
+                if query.before_sequence is not None
+                else len(candidates)
+            )
+            indexes = (
+                range(stop - 1, start - 1, -1)
+                if query.order_by == EventOrder.SEQUENCE_DESC
+                else range(start, stop)
+            )
+            records: list[EventRecord] = []
+            for index in indexes:
+                record = candidates[index]
+                if not _event_record_matches(record, query, event_types):
+                    continue
+                if not _event_record_matches_session(record, query, self._sessions):
+                    continue
+                records.append(
+                    EventRecord(
+                        sequence=record.sequence,
+                        event=record.event,
+                    )
                 )
-                for record in records[: query.limit]
-            ]
+                if len(records) == query.limit:
+                    break
+            return records
 
     def _query_candidate_records(
         self,
@@ -1838,6 +2039,17 @@ class InMemorySessionStore(SessionStore):
             if checkpoint is None:
                 return None
             return deepcopy(checkpoint)
+
+    async def load_interruption_cascade_marker(self, session_id: str) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            checkpoint = self._checkpoints.get(session_id)
+            marker = (
+                _INTERRUPTION_CASCADE_MISSING
+                if checkpoint is None or "pending_interruption_cascade" not in checkpoint
+                else checkpoint["pending_interruption_cascade"]
+            )
+            return _project_interruption_cascade_marker(marker)
 
 
 def event_summary_from_records(
@@ -2312,6 +2524,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         since=query.since,
         until=query.until,
         after_sequence=query.after_sequence,
+        before_sequence=query.before_sequence,
         limit=query.limit,
         order_by=query.order_by,
     )
@@ -2517,6 +2730,8 @@ def _event_record_matches(
 ) -> bool:
     event = record.event
     if query.after_sequence is not None and record.sequence <= query.after_sequence:
+        return False
+    if query.before_sequence is not None and record.sequence >= query.before_sequence:
         return False
     if query.session_id is not None and event.session_id != query.session_id:
         return False

@@ -869,7 +869,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 15")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 15")
         connection.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
         connection.execute("PRAGMA user_version = 14")
         connection.commit()
@@ -1014,7 +1014,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-15 are additive and keep the prior compatibility floor.
+    # Revisions 2-7 and 11-16 are additive and keep the prior compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
         (1, 1),
@@ -1032,6 +1032,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (13, 10),
         (14, 10),
         (15, 10),
+        (16, 10),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

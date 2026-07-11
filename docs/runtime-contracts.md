@@ -208,6 +208,23 @@ Session stores expose two read surfaces:
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
 
+`after_sequence` is the forward cursor for event consumers. `before_sequence`
+is an exclusive backward bound for one-session history reads and requires
+exactly one `session_id` (or one value in `session_ids`). Pair it with
+`order_by=sequence_desc` to fetch the newest page and continue toward older
+history without scanning or transferring the complete session.
+
+Postgres schema revision 16 adds the matching `(session_id, sequence)` index.
+Existing Postgres deployments must run the normal `cayu storage migrate` deploy
+step before starting a binary that uses this contract; validation intentionally
+rejects revision 15 so the new history path cannot silently run without its
+required index. The migration builds this index concurrently on existing
+databases, keeping event writes available; interrupted builds are detected and
+retried before the revision is recorded. A same-named schema object with the
+wrong type, table, access method, columns, expression, or predicate fails with an
+actionable migration error rather than being accepted or retried indefinitely.
+SQLite already carries the equivalent index.
+
 Event ordering has two distinct cursors. The per-session event order is dense
 and gap-free within a session. The global `EventRecord.sequence` is the durable
 cross-session cursor used by dashboards, watchers, and outbox-style readers.
@@ -229,12 +246,26 @@ which the usage folding tolerates but is a wider read than intended.
 
 The optional FastAPI server exposes the session event query endpoint at
 `GET /api/sessions/{session_id}/events`. The endpoint validates the session,
-accepts `after_sequence`, `limit`, `event_type`, `tool_name`, `agent_name`,
-`environment_name`, and `workflow_name` filters, and returns durable event
-records with `sequence`, `has_more`, and `next_sequence`; `event_types` is a
-runtime/store-level query field and is not exposed here. Clients should use
-this endpoint for timelines, logs, replay panes, and polling instead of fetching
-the full session when they only need events.
+accepts `after_sequence`, `before_sequence`, `order_by`, `limit`, `event_type`,
+`tool_name`, `agent_name`, `environment_name`, and `workflow_name` filters, and
+returns durable event records with `sequence`, `has_more`, `order_by`, and
+`next_sequence`; `event_types` is a runtime/store-level query field and is not
+exposed here. For ascending pages, continue with
+`after_sequence=next_sequence`; for descending pages, continue with
+`before_sequence=next_sequence`. Clients should use this endpoint for timelines,
+logs, replay panes, and polling instead of fetching the full session when they
+only need events.
+
+`GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
+It returns the session id, status, update/activity timestamps, and typed
+interruption-cascade state. `SessionStore.load_state` projects the mutable
+session columns without labels or metadata, while
+`load_interruption_cascade_marker` projects only the bounded structural fields
+needed to classify the cascade and never reads its embedded interrupt payload.
+Built-in stores must not implement either
+method by loading and copying the full session or checkpoint. The richer
+`/summary` endpoint computes event, outcome, transcript, and usage metrics and
+is intentionally an on-demand/low-frequency read rather than a heartbeat.
 
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`

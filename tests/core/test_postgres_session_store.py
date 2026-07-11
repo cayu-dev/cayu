@@ -132,13 +132,28 @@ def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgre
         )
         await store.checkpoint(
             "sess_pg",
-            {"messages": [{"role": "user", "content": "hi"}], "step": 1},
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "step": 1,
+                "pending_interruption_cascade": {
+                    "attempt_id": "attempt_pg",
+                    "interrupt_payload": {
+                        "reason": "operator stop",
+                        "metadata": {"large": "x" * 100_000},
+                    },
+                    "generation": 0,
+                    "failure_recorded": False,
+                    "created_at": "2026-07-11T00:00:00+00:00",
+                },
+            },
         )
 
         loaded = await store.load("sess_pg")
         events = await store.load_events("sess_pg")
         transcript = await store.load_transcript("sess_pg")
         checkpoint = await store.load_checkpoint("sess_pg")
+        state = await store.load_state("sess_pg")
+        marker = await store.load_interruption_cascade_marker("sess_pg")
 
         assert loaded is not None
         assert loaded.agent_name == "assistant"
@@ -155,7 +170,37 @@ def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgre
         ]
         assert [message.role for message in transcript] == ["user", "assistant"]
         assert [message.content[0].text for message in transcript] == ["hi", "hello"]
-        assert checkpoint == {"messages": [{"role": "user", "content": "hi"}], "step": 1}
+        assert checkpoint == {
+            "messages": [{"role": "user", "content": "hi"}],
+            "step": 1,
+            "pending_interruption_cascade": {
+                "attempt_id": "attempt_pg",
+                "interrupt_payload": {
+                    "reason": "operator stop",
+                    "metadata": {"large": "x" * 100_000},
+                },
+                "generation": 0,
+                "failure_recorded": False,
+                "created_at": "2026-07-11T00:00:00+00:00",
+            },
+        }
+        assert state is not None
+        assert state.id == "sess_pg"
+        assert state.status == SessionStatus.RUNNING
+        assert not hasattr(state, "metadata")
+        assert marker == {
+            "attempt_id": "attempt_pg",
+            "interrupt_payload": {},
+            "generation": 0,
+            "failure_recorded": False,
+            "created_at": "2026-07-11T00:00:00+00:00",
+        }
+        assert len(repr(marker)) < 500
+        assert await store.load_interruption_cascade_marker("missing") is None
+        assert await store.load_state("missing") is None
+
+        await store.checkpoint("sess_pg", {"pending_interruption_cascade": None})
+        assert await store.load_interruption_cascade_marker("sess_pg") is None
 
     _run(postgres_dsn, ops)
 
@@ -906,6 +951,22 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
+        backward_records = await store.query_events(
+            EventQuery(
+                session_id="sess_builder",
+                before_sequence=all_records[3].sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
+        bounded_records = await store.query_events(
+            EventQuery(
+                session_id="sess_builder",
+                after_sequence=all_records[0].sequence,
+                before_sequence=all_records[3].sequence,
+                limit=10,
+            )
+        )
 
         assert [r.sequence for r in all_records] == [1, 2, 3, 4]
         assert [r.sequence for r in desc_records] == [4, 3]
@@ -924,6 +985,8 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]
         assert [r.event.id for r in multi_type_records] == ["event_1", "event_2", "event_4"]
         assert [r.event.id for r in cursor_records] == ["event_3", "event_4"]
+        assert [r.event.id for r in backward_records] == ["event_3", "event_2"]
+        assert [r.event.id for r in bounded_records] == ["event_2", "event_3"]
 
         # A batch containing a duplicate event id must roll back atomically.
         with pytest.raises(ValueError, match="Event already exists"):

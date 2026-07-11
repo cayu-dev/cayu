@@ -51,6 +51,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.server import create_server, mount_cayu, mount_dashboard
+from cayu.server.routes import _next_replay_poll_interval
 
 
 class OneShotProvider(ModelProvider):
@@ -2979,6 +2980,7 @@ def test_server_exposes_session_summary() -> None:
     assert body["session"]["provider_name"] == "fake"
     assert body["session"]["model"] == "fake-model"
     assert body["session"]["environment_name"] is None
+    assert "interruption_cascade" not in body
     assert body["events"]["total_events"] == 6
     assert body["events"]["counts_by_type"] == {
         "model.completed": 1,
@@ -3137,6 +3139,60 @@ def test_server_session_summary_rejects_blank_session_id() -> None:
     assert response.status_code == 422
 
 
+def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        session = await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="state_1",
+                messages=[Message.text("user", "hello")],
+                metadata={"unbounded": "must not be loaded"},
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session.id, SessionStatus.RUNNING)
+        await app.session_store.checkpoint(
+            session.id,
+            {"unrelated": {"large": "must not be loaded"}},
+        )
+
+    asyncio.run(seed())
+
+    async def fail_heavy_read(*_args, **_kwargs):
+        raise AssertionError("bounded state route must not use heavyweight loaders")
+
+    app.session_store.load = fail_heavy_read  # type: ignore[method-assign]
+    app.session_store.load_checkpoint = fail_heavy_read  # type: ignore[method-assign]
+    app.get_session_usage = fail_heavy_read  # type: ignore[method-assign]
+
+    client = TestClient(create_server(app, dev=True))
+    response = client.get("/api/sessions/state_1/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == "state_1"
+    assert body["status"] == "running"
+    assert body["interruption_cascade"] == "none"
+    assert body["updated_at"]
+    assert body["last_activity_at"]
+    assert set(body) == {
+        "session_id",
+        "status",
+        "updated_at",
+        "last_activity_at",
+        "interruption_cascade",
+    }
+
+
+def test_server_session_state_returns_404_and_validates_id() -> None:
+    client = TestClient(create_server(CayuApp(), dev=True))
+
+    assert client.get("/api/sessions/missing/state").status_code == 404
+    assert client.get("/api/sessions/%20/state").status_code == 422
+
+
 def test_server_exposes_paginated_session_events() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -3180,12 +3236,18 @@ def test_server_exposes_paginated_session_events() -> None:
 
     asyncio.run(seed_events())
 
+    async def fail_unbounded_session_load(*_args, **_kwargs):
+        raise AssertionError("event pagination must use the bounded state projection")
+
+    app.session_store.load = fail_unbounded_session_load  # type: ignore[method-assign]
+
     client = TestClient(create_server(app, dev=True))
 
     first_page = client.get("/api/sessions/events_1/events?limit=2")
     assert first_page.status_code == 200
     first_body = first_page.json()
     assert first_body["session_id"] == "events_1"
+    assert first_body["order_by"] == "sequence_asc"
     assert first_body["has_more"] is True
     assert first_body["next_sequence"] == 2
     assert [event["id"] for event in first_body["events"]] == ["event_1", "event_2"]
@@ -3206,8 +3268,39 @@ def test_server_exposes_paginated_session_events() -> None:
     assert second_page.status_code == 200
     second_body = second_page.json()
     assert second_body["has_more"] is False
+    assert second_body["order_by"] == "sequence_asc"
     assert second_body["next_sequence"] == 3
     assert [event["id"] for event in second_body["events"]] == ["event_3"]
+
+    latest_page = client.get("/api/sessions/events_1/events?order_by=sequence_desc&limit=2")
+    assert latest_page.status_code == 200
+    latest_body = latest_page.json()
+    assert latest_body["order_by"] == "sequence_desc"
+    assert latest_body["has_more"] is True
+    assert latest_body["next_sequence"] == 2
+    assert [event["id"] for event in latest_body["events"]] == ["event_3", "event_2"]
+
+    older_page = client.get(
+        "/api/sessions/events_1/events?order_by=sequence_desc&before_sequence=2&limit=2"
+    )
+    assert older_page.status_code == 200
+    older_body = older_page.json()
+    assert older_body["order_by"] == "sequence_desc"
+    assert older_body["has_more"] is False
+    assert older_body["next_sequence"] == 1
+    assert [event["id"] for event in older_body["events"]] == ["event_1"]
+
+    exhausted_page = client.get(
+        "/api/sessions/events_1/events?order_by=sequence_desc&before_sequence=1&limit=2"
+    )
+    assert exhausted_page.status_code == 200
+    assert exhausted_page.json() == {
+        "session_id": "events_1",
+        "events": [],
+        "order_by": "sequence_desc",
+        "next_sequence": 1,
+        "has_more": False,
+    }
 
 
 def test_server_filters_session_events() -> None:
@@ -3306,6 +3399,15 @@ def test_server_session_events_validates_query() -> None:
 
     assert client.get("/api/sessions/events_validation/events?limit=0").status_code == 422
     assert (
+        client.get(
+            "/api/sessions/events_validation/events?after_sequence=2&before_sequence=2"
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get("/api/sessions/events_validation/events?order_by=not_valid").status_code == 422
+    )
+    assert (
         client.get("/api/sessions/events_validation/events?event_type=not.valid").status_code == 422
     )
     assert client.get("/api/sessions/%20/events").status_code == 422
@@ -3344,6 +3446,11 @@ def test_server_exposes_paginated_session_transcript() -> None:
         )
 
     asyncio.run(seed_transcript())
+
+    async def fail_unbounded_session_load(*_args, **_kwargs):
+        raise AssertionError("transcript pagination must use the bounded state projection")
+
+    app.session_store.load = fail_unbounded_session_load  # type: ignore[method-assign]
 
     client = TestClient(create_server(app, dev=True))
     first_page = client.get("/api/sessions/transcript_1/transcript?limit=2")
@@ -4361,13 +4468,23 @@ def test_server_list_omits_metadata_but_detail_includes_it() -> None:
     assert detail["session"]["metadata"] == {"secret": "value"}
 
 
-def test_server_session_detail_exposes_typed_interruption_cascade_state() -> None:
+def test_server_session_detail_and_state_expose_typed_interruption_cascade_state() -> None:
     async def seed(store):
         await _create_session(store, "sess_cascade_state")
 
     store, client = _lifecycle_store_and_client(seed)
 
-    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "none"
+    def assert_cascade_state(expected: str) -> None:
+        assert (
+            client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"]
+            == expected
+        )
+        assert (
+            client.get("/api/sessions/sess_cascade_state/state").json()["interruption_cascade"]
+            == expected
+        )
+
+    assert_cascade_state("none")
 
     async def set_marker(*, failed: bool) -> None:
         marker = {
@@ -4391,12 +4508,10 @@ def test_server_session_detail_exposes_typed_interruption_cascade_state() -> Non
         )
 
     asyncio.run(set_marker(failed=False))
-    assert (
-        client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "pending"
-    )
+    assert_cascade_state("pending")
 
     asyncio.run(set_marker(failed=True))
-    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "failed"
+    assert_cascade_state("failed")
 
     async def set_malformed_active_marker() -> None:
         await store.checkpoint(
@@ -4414,7 +4529,7 @@ def test_server_session_detail_exposes_typed_interruption_cascade_state() -> Non
         )
 
     asyncio.run(set_malformed_active_marker())
-    assert client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"] == "failed"
+    assert_cascade_state("failed")
 
 
 def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
@@ -4492,6 +4607,17 @@ def _sse_frames(response) -> list[dict]:
     return frames
 
 
+def test_replay_polling_backs_off_and_resets_after_events() -> None:
+    interval = 0.05
+    observed = []
+    for _ in range(7):
+        observed.append(interval)
+        interval = _next_replay_poll_interval(interval, received_events=False)
+
+    assert observed == [0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0]
+    assert _next_replay_poll_interval(interval, received_events=True) == 0.05
+
+
 def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
@@ -4507,6 +4633,11 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     # Every frame carries a resumable id of the form `<session_id>:<event_id>`.
     for frame in frames:
         assert frame["id"] == f"{session_id}:{frame['data']['id']}"
+
+    async def fail_unbounded_session_load(*_args, **_kwargs):
+        raise AssertionError("SSE replay must use the bounded state projection")
+
+    app.session_store.load = fail_unbounded_session_load  # type: ignore[method-assign]
 
     # A reconnect with Last-Event-ID replays the persisted events the client missed
     # instead of starting a new run.

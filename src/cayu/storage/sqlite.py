@@ -30,6 +30,7 @@ from cayu.runtime.sessions import (
     SessionOutcome,
     SessionQuery,
     SessionRunFenced,
+    SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
@@ -42,6 +43,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_run_fence,
     _prepare_session_fork_request,
+    _project_interruption_cascade_marker_fields,
     _validate_session_fork_source,
     _validate_status_set,
     copy_event_query,
@@ -189,6 +191,120 @@ def _load_checkpoint_state(
     return copy_json_value(json.loads(row["state_json"]), "checkpoint")
 
 
+def _load_interruption_cascade_marker(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            json_type(state_json, '$.pending_interruption_cascade') AS marker_type,
+            json_type(state_json, '$.pending_interruption_cascade.attempt_id') AS attempt_id_type,
+            substr(
+                CAST(json_extract(
+                    state_json,
+                    '$.pending_interruption_cascade.attempt_id'
+                ) AS TEXT),
+                1,
+                129
+            ) AS attempt_id,
+            json_type(
+                state_json,
+                '$.pending_interruption_cascade.interrupt_payload'
+            ) AS interrupt_payload_type,
+            json_type(state_json, '$.pending_interruption_cascade.generation') AS generation_type,
+            substr(
+                CAST(json_extract(
+                    state_json,
+                    '$.pending_interruption_cascade.generation'
+                ) AS TEXT),
+                1,
+                33
+            ) AS generation,
+            json_type(
+                state_json,
+                '$.pending_interruption_cascade.failure_recorded'
+            ) AS failure_recorded_type,
+            json_extract(
+                state_json,
+                '$.pending_interruption_cascade.failure_recorded'
+            ) AS failure_recorded,
+            json_type(state_json, '$.pending_interruption_cascade.claim_id') AS claim_id_type,
+            substr(
+                CAST(json_extract(
+                    state_json,
+                    '$.pending_interruption_cascade.claim_id'
+                ) AS TEXT),
+                1,
+                129
+            ) AS claim_id,
+            json_type(
+                state_json,
+                '$.pending_interruption_cascade.claim_expires_at'
+            ) AS claim_expires_at_type,
+            substr(
+                CAST(json_extract(
+                    state_json,
+                    '$.pending_interruption_cascade.claim_expires_at'
+                ) AS TEXT),
+                1,
+                65
+            ) AS claim_expires_at,
+            json_type(state_json, '$.pending_interruption_cascade.created_at') AS created_at_type,
+            substr(
+                CAST(json_extract(
+                    state_json,
+                    '$.pending_interruption_cascade.created_at'
+                ) AS TEXT),
+                1,
+                65
+            ) AS created_at
+        FROM cayu_checkpoints
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    def sqlite_json_type(value: str | None) -> str | None:
+        if value == "text":
+            return "string"
+        if value == "real":
+            return "number"
+        if value in {"true", "false"}:
+            return "boolean"
+        return value
+
+    field_names = (
+        "attempt_id",
+        "interrupt_payload",
+        "generation",
+        "failure_recorded",
+        "claim_id",
+        "claim_expires_at",
+        "created_at",
+    )
+    field_types = {field: sqlite_json_type(row[f"{field}_type"]) for field in field_names}
+    field_values = {
+        "attempt_id": row["attempt_id"],
+        "generation": row["generation"],
+        "failure_recorded": (
+            bool(row["failure_recorded"])
+            if field_types["failure_recorded"] == "boolean"
+            else row["failure_recorded"]
+        ),
+        "claim_id": row["claim_id"],
+        "claim_expires_at": row["claim_expires_at"],
+        "created_at": row["created_at"],
+    }
+    return _project_interruption_cascade_marker_fields(
+        sqlite_json_type(row["marker_type"]),
+        field_types,
+        field_values,
+    )
+
+
 def _first_existing_event_id(
     connection: sqlite3.Connection,
     session_id: str,
@@ -231,6 +347,7 @@ def _event_query_with_session_ids(
         since=query.since,
         until=query.until,
         after_sequence=query.after_sequence,
+        before_sequence=query.before_sequence,
         limit=query.limit,
         order_by=query.order_by,
     )
@@ -535,6 +652,29 @@ class SQLiteSessionStore(SessionStore):
     async def load(self, session_id: str) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         return await self._run_read(lambda connection: _load_session(connection, session_id))
+
+    async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> SessionStateSnapshot | None:
+            row = connection.execute(
+                """
+                SELECT id, status, updated_at, last_activity_at
+                FROM cayu_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return SessionStateSnapshot(
+                id=row["id"],
+                status=SessionStatus(row["status"]),
+                updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+                last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+            )
+
+        return await self._run_read(query)
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1521,6 +1661,15 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         return await self._run_read(
             lambda connection: _load_checkpoint_state(connection, session_id)
+        )
+
+    async def load_interruption_cascade_marker(
+        self,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        return await self._run_read(
+            lambda connection: _load_interruption_cascade_marker(connection, session_id)
         )
 
     def _load_checkpoint_unlocked(self, session_id: str) -> dict[str, Any] | None:

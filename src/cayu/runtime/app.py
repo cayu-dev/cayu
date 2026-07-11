@@ -1613,10 +1613,7 @@ class CayuApp:
         """Return the public control-plane state of a session's durable cascade."""
 
         session_id = require_clean_nonblank(session_id, "session_id")
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        if checkpoint is None:
-            return "none"
-        marker = checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+        marker = await self.session_store.load_interruption_cascade_marker(session_id)
         if marker is None:
             return "none"
         if type(marker) is not dict:

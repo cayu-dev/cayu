@@ -144,6 +144,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
     "ON cayu_events(session_id, session_order)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence "
+    "ON cayu_events(session_id, sequence)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name ON cayu_events(agent_name)",

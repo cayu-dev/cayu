@@ -121,6 +121,7 @@ from cayu.server.contracts import (
     ServerContractResponse,
     SessionDetailResponse,
     SessionsSummaryResponse,
+    SessionStateResponse,
     SessionSummaryResponse,
     SessionTranscriptResponse,
     UsageBreakdownItem,
@@ -187,7 +188,17 @@ _PENDING_ACTION_SESSION_STATUSES = frozenset(
         SessionStatus.FAILED,
     }
 )
-_REPLAY_POLL_INTERVAL_S = 0.05
+# Replays check quickly after reconnect, then back off while a live session is
+# quiet so idle streams do not continuously hammer the durable stores.
+_REPLAY_POLL_INTERVAL_MIN_S = 0.05
+_REPLAY_POLL_INTERVAL_MAX_S = 1.0
+
+
+def _next_replay_poll_interval(current: float, *, received_events: bool) -> float:
+    if received_events:
+        return _REPLAY_POLL_INTERVAL_MIN_S
+    return min(current * 2, _REPLAY_POLL_INTERVAL_MAX_S)
+
 
 # Detached event pumps must outlive their SSE consumer (a client disconnect must not
 # cancel agent work), so hold strong references until each pump finishes — the event
@@ -1789,8 +1800,8 @@ def create_router(
                 status_code=422,
                 detail="Last-Event-ID session does not match the request session_id.",
             )
-        session = await session_store.load(session_id)
-        if session is None:
+        state = await session_store.load_state(session_id)
+        if state is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Session not found: {session_id}",
@@ -1800,6 +1811,7 @@ def create_router(
             after_sequence = await _marker_sequence(session_id, last_seen_event_id)
             loop = asyncio.get_running_loop()
             idle_deadline = loop.time() + replay_idle_timeout_s
+            poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
             while True:
                 page = await session_store.query_events(
                     EventQuery(
@@ -1813,9 +1825,10 @@ def create_router(
                     yield event_to_sse_message(record.event)
                 if page:
                     idle_deadline = loop.time() + replay_idle_timeout_s
+                    poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
                 if len(page) == _EVENT_PAGE_LIMIT_MAX:
                     continue
-                current = await session_store.load(session_id)
+                current = await session_store.load_state(session_id)
                 if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
                     return
                 remaining = idle_deadline - loop.time()
@@ -1827,7 +1840,11 @@ def create_router(
                         )
                     )
                     return
-                await asyncio.sleep(min(_REPLAY_POLL_INTERVAL_S, remaining))
+                await asyncio.sleep(min(poll_interval, remaining))
+                poll_interval = _next_replay_poll_interval(
+                    poll_interval,
+                    received_events=bool(page),
+                )
 
         return EventSourceResponse(replay())
 
@@ -2924,6 +2941,24 @@ def create_router(
         }
 
     @router.get(
+        "/sessions/{session_id}/state",
+        response_model=SessionStateResponse,
+        dependencies=protected,
+    )
+    async def get_session_state(session_id: NonBlankString):
+        state = await session_store.load_state(session_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
+        return {
+            "session_id": state.id,
+            "status": state.status,
+            "updated_at": state.updated_at.isoformat(),
+            "last_activity_at": state.last_activity_at.isoformat(),
+            "interruption_cascade": interruption_cascade,
+        }
+
+    @router.get(
         "/sessions/{session_id}/summary",
         response_model=SessionSummaryResponse,
         dependencies=protected,
@@ -3029,11 +3064,24 @@ def create_router(
         agent_name: str | None = None,
         environment_name: str | None = None,
         workflow_name: str | None = None,
-        after_sequence: int | None = Query(default=None, ge=0),
+        after_sequence: int | None = Query(
+            default=None,
+            ge=0,
+            description="Return only events with a greater durable sequence.",
+        ),
+        before_sequence: int | None = Query(
+            default=None,
+            ge=1,
+            description="Return only events with a smaller durable sequence.",
+        ),
+        order_by: Annotated[
+            EventOrder,
+            Query(description="Return events in durable sequence order."),
+        ] = EventOrder.SEQUENCE_ASC,
         limit: int = Query(default=100, ge=1, le=_EVENT_PAGE_LIMIT_MAX),
     ):
-        session = await session_store.load(session_id)
-        if session is None:
+        state = await session_store.load_state(session_id)
+        if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
         try:
@@ -3045,7 +3093,9 @@ def create_router(
                 environment_name=environment_name,
                 workflow_name=workflow_name,
                 after_sequence=after_sequence,
+                before_sequence=before_sequence,
                 limit=limit + 1,
+                order_by=order_by,
             )
         except ValidationError as exc:
             raise HTTPException(
@@ -3056,11 +3106,13 @@ def create_router(
         records = await session_store.query_events(query)
         page = records[:limit]
         has_more = len(records) > limit
-        next_sequence = page[-1].sequence if page else after_sequence
+        cursor = after_sequence if order_by == EventOrder.SEQUENCE_ASC else before_sequence
+        next_sequence = page[-1].sequence if page else cursor
 
         return {
             "session_id": session_id,
             "events": [_serialize_event_record(record) for record in page],
+            "order_by": order_by,
             "next_sequence": next_sequence,
             "has_more": has_more,
         }
@@ -3077,8 +3129,8 @@ def create_router(
         limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
         include_thinking: bool = Query(default=True),
     ):
-        session = await session_store.load(session_id)
-        if session is None:
+        state = await session_store.load_state(session_id)
+        if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
         transcript_page = await session_store.query_transcript(

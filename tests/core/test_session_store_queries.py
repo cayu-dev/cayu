@@ -53,6 +53,86 @@ def test_event_query_requires_session_id_for_event_id() -> None:
         EventQuery(event_id="event_1")
 
 
+def test_event_query_requires_ordered_sequence_bounds() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="before_sequence requires exactly one session",
+    ):
+        EventQuery(before_sequence=2)
+
+    with pytest.raises(
+        ValidationError,
+        match="after_sequence must be before before_sequence",
+    ):
+        EventQuery(session_id="session_1", after_sequence=2, before_sequence=2)
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_project_bounded_state_and_interruption_marker(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="state_projection",
+                messages=[Message.text("user", "hello")],
+                metadata={"unbounded": "not part of state"},
+            ),
+            identity=_identity(),
+        )
+        created_at = datetime.now(UTC).isoformat()
+        checkpoint = {
+            "pending_interruption_cascade": {
+                "attempt_id": "attempt_1",
+                "interrupt_payload": {
+                    "reason": "operator stop",
+                    "metadata": {"large": "x" * 100_000},
+                },
+                "generation": 2,
+                "failure_recorded": False,
+                "claim_id": "claim_1",
+                "claim_expires_at": created_at,
+                "created_at": created_at,
+                "unrelated": "x" * 100_000,
+            },
+            "unrelated": {"large": "x" * 100_000},
+        }
+        await store.checkpoint(session.id, checkpoint)
+
+        state = await store.load_state(session.id)
+        assert state is not None
+        assert state.id == session.id
+        assert state.status == SessionStatus.PENDING
+        assert state.updated_at == session.updated_at
+        assert not hasattr(state, "metadata")
+
+        marker = await store.load_interruption_cascade_marker(session.id)
+        assert marker == {
+            "attempt_id": "attempt_1",
+            "interrupt_payload": {},
+            "generation": 2,
+            "failure_recorded": False,
+            "claim_id": "claim_1",
+            "claim_expires_at": created_at,
+            "created_at": created_at,
+        }
+        assert len(repr(marker)) < 500
+        assert await store.load_state("missing") is None
+        assert await store.load_interruption_cascade_marker("missing") is None
+
+        await store.checkpoint(session.id, {"other": True})
+        assert await store.load_interruption_cascade_marker(session.id) is None
+
+        await store.checkpoint(session.id, {"pending_interruption_cascade": None})
+        assert await store.load_interruption_cascade_marker(session.id) is None
+
+    asyncio.run(run_store_operations())
+
+
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_default_causal_budget_id_from_task_or_session(
     store_factory: StoreFactory,
@@ -640,6 +720,22 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         cursor_records = await store.query_events(
             EventQuery(after_sequence=all_records[1].sequence, limit=10)
         )
+        backward_records = await store.query_events(
+            EventQuery(
+                session_id="sess_builder",
+                before_sequence=all_records[3].sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
+        bounded_records = await store.query_events(
+            EventQuery(
+                session_id="sess_builder",
+                after_sequence=all_records[0].sequence,
+                before_sequence=all_records[3].sequence,
+                limit=10,
+            )
+        )
         event_summary = await store.summarize_events("sess_builder")
 
         assert [record.sequence for record in all_records] == [1, 2, 3, 4]
@@ -677,6 +773,8 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_3",
             "event_4",
         ]
+        assert [record.event.id for record in backward_records] == ["event_3", "event_2"]
+        assert [record.event.id for record in bounded_records] == ["event_2", "event_3"]
         assert event_summary.total_events == 3
         assert event_summary.counts_by_type == {
             "model.completed": 1,

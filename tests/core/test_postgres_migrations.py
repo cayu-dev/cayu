@@ -138,7 +138,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 15"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 16"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -159,13 +159,13 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 15")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 15")
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 15"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 16"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -186,6 +186,124 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
                 "'idx_cayu_checkpoints_pending_interruption_cascade'"
             )
             assert await cur.fetchone() is not None
+
+    asyncio.run(runner())
+
+
+def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 16")
+                await cur.execute("DROP INDEX idx_cayu_events_session_sequence")
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 16"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        first_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        second_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await asyncio.gather(
+                first_migrator.ensure_schema(),
+                second_migrator.ensure_schema(),
+            )
+        finally:
+            await first_migrator.close()
+            await second_migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                """
+                SELECT index_definition.indisvalid
+                FROM pg_catalog.pg_class AS index_class
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = index_class.relnamespace
+                JOIN pg_catalog.pg_index AS index_definition
+                  ON index_definition.indexrelid = index_class.oid
+                WHERE namespace.nspname = current_schema()
+                  AND index_class.relname = 'idx_cayu_events_session_sequence'
+                """
+            )
+            assert await cur.fetchone() == (True,)
+
+            await cur.execute("SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 16")
+            assert await cur.fetchone() == (1,)
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(
+    ("conflict_ddl", "cleanup_ddl"),
+    [
+        (
+            "CREATE INDEX idx_cayu_events_session_sequence ON cayu_events(session_id)",
+            "DROP INDEX idx_cayu_events_session_sequence",
+        ),
+        (
+            "CREATE TABLE idx_cayu_events_session_sequence (id INTEGER)",
+            "DROP TABLE idx_cayu_events_session_sequence",
+        ),
+    ],
+    ids=["wrong-index-definition", "non-index-relation"],
+)
+def test_revision_sixteen_rejects_conflicting_schema_objects(
+    postgres_dsn: str,
+    conflict_ddl: str,
+    cleanup_ddl: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 16")
+                await cur.execute("DROP INDEX idx_cayu_events_session_sequence")
+                await cur.execute(conflict_ddl)
+            await conn.commit()
+
+        try:
+            migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+            try:
+                with pytest.raises(RuntimeError, match="conflicts with the required B-tree index"):
+                    await migrator.ensure_schema()
+            finally:
+                await migrator.close()
+
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute("SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 16")
+                assert await cur.fetchone() == (0,)
+        finally:
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(cleanup_ddl)
+                await conn.commit()
 
     asyncio.run(runner())
 
