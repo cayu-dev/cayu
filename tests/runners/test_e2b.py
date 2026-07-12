@@ -288,6 +288,44 @@ def test_e2b_runner_executes_process_with_shell_quoting_and_isolated_env(
     assert sandbox.commands.next_handle.stdin_closed is True
 
 
+def test_e2b_runner_pins_commands_to_configured_exec_user() -> None:
+    sandbox = FakeSandbox()
+    runner = E2BRunner(sandbox, exec_user="sandbox-user", e2b_module=FakeE2BModule)
+
+    asyncio.run(runner.exec(ExecCommand.process("whoami")))
+
+    assert sandbox.commands.calls[0]["user"] == "sandbox-user"
+
+
+def test_e2b_runner_applies_trusted_env_overlay_after_command_env() -> None:
+    sandbox = FakeSandbox()
+    runner = E2BRunner(
+        sandbox,
+        env_overlay={
+            "HTTPS_PROXY": "http://cayu-egress.example:8443",
+            "STRIPE_SECRET_KEY": "sk_test_cayu_virtual",
+        },
+        e2b_module=FakeE2BModule,
+    )
+
+    asyncio.run(
+        runner.exec(
+            ExecCommand.process("env"),
+            env={
+                "HTTPS_PROXY": "http://attacker.example:8080",
+                "STRIPE_SECRET_KEY": "attacker-value",
+                "VISIBLE": "1",
+            },
+        )
+    )
+
+    assert sandbox.commands.calls[0]["envs"] == {
+        "HTTPS_PROXY": "http://cayu-egress.example:8443",
+        "STRIPE_SECRET_KEY": "sk_test_cayu_virtual",
+        "VISIBLE": "1",
+    }
+
+
 def test_e2b_runner_returns_nonzero_exit_as_exec_result() -> None:
     sandbox = FakeSandbox()
     sandbox.commands.next_handle = FakeHandle(

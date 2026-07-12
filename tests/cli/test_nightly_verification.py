@@ -392,6 +392,112 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
 
 
 @pytest.mark.parametrize(
+    ("check_id", "lane", "test_path", "opt_in_env", "required_env"),
+    [
+        (
+            "microsandbox-live-virtual-egress",
+            "microsandbox",
+            "tests/egress/test_microsandbox_egress_e2e.py",
+            "CAYU_RUN_MICROSANDBOX_EGRESS_E2E",
+            (),
+        ),
+        (
+            "e2b-live-virtual-egress",
+            "e2b",
+            "tests/egress/test_e2b_egress_e2e.py",
+            "CAYU_RUN_E2B_EGRESS_E2E",
+            (
+                "E2B_API_KEY",
+                "CAYU_E2B_PROXY_EXPOSURE_COMMAND",
+                "CAYU_E2B_PROXY_URL",
+            ),
+        ),
+    ],
+)
+def test_virtual_egress_live_checks_are_registered_and_explicitly_gated(
+    check_id: str,
+    lane: str,
+    test_path: str,
+    opt_in_env: str,
+    required_env: tuple[str, ...],
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == check_id)
+
+    assert check.capability.endswith("virtual-egress enforcement")
+    assert check.lane == lane
+    assert check.command[:2] == ("uv", "run")
+    assert test_path in check.command
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.required_env == required_env
+    assert check.required_env_values == {opt_in_env: "1"}
+    assert check.required_modules == (lane,)
+
+    result = nightly.run_checks(
+        [check],
+        environ={},
+        runner=lambda command, env: pytest.fail("gated check unexpectedly ran"),
+    )[0]
+
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason is not None
+    assert f"{opt_in_env} is not set" in result.reason
+
+
+def test_virtual_egress_opt_in_flag_must_equal_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "e2b-live-virtual-egress")
+    called = False
+    monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
+
+    def runner(command, env):
+        nonlocal called
+        called = True
+        return nightly.CommandOutcome(returncode=0)
+
+    result = nightly.run_checks(
+        [check],
+        environ={
+            "CAYU_RUN_E2B_EGRESS_E2E": "0",
+            "E2B_API_KEY": "set",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND": "tunnel {host} {port}",
+            "CAYU_E2B_PROXY_URL": "http://proxy.example:8443",
+        },
+        runner=runner,
+    )[0]
+
+    assert called is False
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason == "CAYU_RUN_E2B_EGRESS_E2E must equal '1'"
+
+
+def test_microsandbox_virtual_egress_skips_when_runtime_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
+    )
+    called = False
+    monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
+    monkeypatch.setattr(nightly, "_microsandbox_runtime_available", lambda: False)
+
+    def runner(command, env):
+        nonlocal called
+        called = True
+        return nightly.CommandOutcome(returncode=0)
+
+    result = nightly.run_checks(
+        [check],
+        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        runner=runner,
+    )[0]
+
+    assert called is False
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason == "Microsandbox runtime is unavailable"
+
+
+@pytest.mark.parametrize(
     ("check_id", "lane", "entrypoint"),
     [
         ("context-counting-live", "provider-contract", "examples/context_counting_live.py"),

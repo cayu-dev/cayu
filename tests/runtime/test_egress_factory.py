@@ -111,10 +111,12 @@ class _RecordingAdapter(SandboxEgressAdapter):
         *,
         order: list[str] | None = None,
         env: dict[str, str] | None = None,
+        runner_factory: Any = None,
     ) -> None:
         self.runner_kind = runner_kind
         self.order = order
         self.env = env
+        self.runner_factory = runner_factory
         self.prepare_calls: list[dict[str, Any]] = []
         self.captured: dict[str, Any] = {}
         self.torn_down = 0
@@ -137,6 +139,14 @@ class _RecordingAdapter(SandboxEgressAdapter):
                 self.order.append("binding_teardown")
 
         return _egress_binding(self.runner_kind, teardown=teardown, env=self.env)
+
+    async def create_runner(self, request):  # type: ignore[no-untyped-def]
+        if self.runner_factory is not None:
+            runner = await self.runner_factory(request)
+        else:
+            runner = await _FakeDockerRunner.create(request.name)
+        self.captured["inner_runner"] = runner
+        return runner
 
 
 def _factory(emitter: Any) -> VirtualEgressEnvironmentFactory:
@@ -170,13 +180,9 @@ def _capturing_event_factory(
         async def send(self, request: CapturedRequest) -> CapturedResponse:
             return CapturedResponse(status_code=200, body=b"{}")
 
-    async def runner_factory(_request: Any) -> Runner:
-        return _FakeDockerRunner("runner")
-
     return (
         _virtual_factory(
             adapter=adapter,
-            runner_factory=runner_factory,
             event_emitter=emitter,
             upstream=_AllowedUpstream(),
         ),
@@ -194,7 +200,7 @@ def _broker_request(presented_value: str, path: str) -> CapturedRequest:
 
 
 def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", _FakeDockerRunner)
     events: list[Event] = []
 
     async def emitter(event: Event) -> Event:
@@ -286,25 +292,28 @@ def test_virtual_credential_spec_rejects_unsupported_credential_kind() -> None:
         )
 
 
-def test_factory_resolves_adapter_from_registry_and_uses_custom_runner_factory() -> None:
-    async def run() -> tuple[Any, _RecordingAdapter, Any]:
-        adapter = _RecordingAdapter("fake", env={"HTTPS_PROXY": "http://fake-egress:8080"})
-        registry = EgressAdapterRegistry()
-        registry.register(adapter)
-        runner_requests: list[Any] = []
+def test_factory_resolves_adapter_from_registry_and_uses_adapter_runner() -> None:
+    class _CreatingAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("fake", env={"HTTPS_PROXY": "http://fake-egress:8080"})
+            self.runner_requests: list[Any] = []
 
-        async def runner_factory(runner_request):  # type: ignore[no-untyped-def]
-            runner_requests.append(runner_request)
+        async def create_runner(self, runner_request):  # type: ignore[no-untyped-def]
+            self.runner_requests.append(runner_request)
             return _FakeDockerRunner(
                 runner_request.name,
                 credential_mode=CredentialMode.VIRTUAL_EGRESS,
                 env_overlay=dict(runner_request.env_overlay),
             )
 
+    async def run() -> tuple[Any, _CreatingAdapter, Any]:
+        adapter = _CreatingAdapter()
+        registry = EgressAdapterRegistry()
+        registry.register(adapter)
+
         factory = _virtual_factory(
             adapter_registry=registry,
             runner_kind="fake",
-            runner_factory=runner_factory,
         )
         request = EnvironmentFactoryRequest(
             session_id="sess_registry",
@@ -315,7 +324,7 @@ def test_factory_resolves_adapter_from_registry_and_uses_custom_runner_factory()
         runner = result.environment.runner
         assert runner is not None
         await runner.close()
-        return result, adapter, runner_requests[0]
+        return result, adapter, adapter.runner_requests[0]
 
     result, adapter, runner_request = asyncio.run(run())
 
@@ -329,17 +338,13 @@ def test_factory_resolves_adapter_from_registry_and_uses_custom_runner_factory()
     assert runner_request.env_overlay["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
 
 
-def test_create_tears_down_egress_when_runner_start_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_create_tears_down_egress_when_runner_start_fails() -> None:
     # If DockerRunner.create fails after adapter.prepare succeeded, the prepared
     # egress binding (proxy + network + sidecar) must be torn down, not leaked.
-    adapter = _RecordingAdapter()
-
     async def _boom_create(*_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("image pull failed")
 
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner.create", _boom_create)
+    adapter = _RecordingAdapter(runner_factory=_boom_create)
 
     async def run() -> None:
         factory = _virtual_factory(adapter=adapter)
@@ -360,6 +365,9 @@ def test_create_propagates_adapter_prepare_failure_without_binding_cleanup_error
         async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
             raise RuntimeError("prepare failed")
 
+        async def create_runner(self, request):  # type: ignore[no-untyped-def]
+            raise AssertionError("runner creation should not run")
+
     async def run() -> None:
         factory = _virtual_factory(adapter=_FailingPrepareAdapter())
         request = EnvironmentFactoryRequest(
@@ -373,10 +381,7 @@ def test_create_propagates_adapter_prepare_failure_without_binding_cleanup_error
     asyncio.run(run())
 
 
-def test_bind_failure_cleans_up_egress_resources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+def test_bind_failure_cleans_up_egress_resources() -> None:
     adapter = _RecordingAdapter()
 
     class _FailingBindBinding(WorkspaceBinding):
@@ -411,10 +416,7 @@ def test_bind_failure_cleans_up_egress_resources(
     assert adapter.torn_down == 1
 
 
-def test_runner_close_before_bind_cleans_up_egress_resources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+def test_runner_close_before_bind_cleans_up_egress_resources() -> None:
     adapter = _RecordingAdapter()
 
     async def run() -> Any:
@@ -457,11 +459,10 @@ def test_runner_close_revokes_grants_before_closing_inner_runner() -> None:
     async def runner_factory(_request: Any) -> Runner:
         return _InspectingRunner()
 
+    adapter.runner_factory = runner_factory
+
     async def run() -> None:
-        factory = _virtual_factory(
-            adapter=adapter,
-            runner_factory=runner_factory,
-        )
+        factory = _virtual_factory(adapter=adapter)
         request = EnvironmentFactoryRequest(
             session_id="sess_revoke_first",
             agent_name="agent",
@@ -486,10 +487,8 @@ def test_runner_close_defers_cancellation_until_grant_drain() -> None:
             adapter.captured["inner_runner"] = runner
             return runner
 
-        factory = _virtual_factory(
-            adapter=adapter,
-            runner_factory=runner_factory,
-        )
+        adapter.runner_factory = runner_factory
+        factory = _virtual_factory(adapter=adapter)
         result = await factory.create(
             EnvironmentFactoryRequest(
                 session_id="sess_1",
@@ -525,10 +524,7 @@ def test_runner_close_defers_cancellation_until_grant_drain() -> None:
     assert teardown_calls["count"] == 1
 
 
-def test_create_cleans_up_when_grant_event_emit_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+def test_create_cleans_up_when_grant_event_emit_is_cancelled() -> None:
     adapter = _RecordingAdapter()
 
     async def emitter(event: Event) -> Event:
@@ -556,10 +552,7 @@ def test_create_cleans_up_when_grant_event_emit_is_cancelled(
     assert adapter.torn_down == 1
 
 
-def test_finalize_revokes_grants_before_inner_finalize(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+def test_finalize_revokes_grants_before_inner_finalize() -> None:
     adapter = _RecordingAdapter()
     order: list[str] = []
 
@@ -601,10 +594,7 @@ def test_finalize_revokes_grants_before_inner_finalize(
     assert adapter.torn_down == 1
 
 
-def test_finalize_cleans_up_egress_when_inner_finalize_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("cayu.runtime.egress.DockerRunner", _FakeDockerRunner)
+def test_finalize_cleans_up_egress_when_inner_finalize_fails() -> None:
     adapter = _RecordingAdapter()
 
     class _FailingBinding(WorkspaceBinding):

@@ -93,8 +93,8 @@ or in CI.
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
-| microsandbox live | `cayu[microsandbox]` runtime support | $0 | `microsandbox-live-*` |
-| E2B live | `cayu[e2b]`, `E2B_API_KEY` | E2B quota | `e2b-live-*` |
+| microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for virtual egress | $0 | `microsandbox-live-*` |
+| E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
@@ -118,6 +118,8 @@ high level:
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
 | real microsandbox runner/workspace/runtime/sync binding | verified when microsandbox is available | `microsandbox-live-*` |
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
+| real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
+| real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
 | OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
@@ -283,6 +285,14 @@ E2B_API_KEY=... uv run python scripts/nightly_verification.py \
   --check e2b-live-sync \
   --strict
 
+CAYU_RUN_E2B_EGRESS_E2E=1 \
+E2B_API_KEY=... \
+CAYU_E2B_PROXY_EXPOSURE_COMMAND='...' \
+CAYU_E2B_PROXY_URL=http://IP:PORT \
+uv run python scripts/nightly_verification.py \
+  --check e2b-live-virtual-egress \
+  --strict
+
 OPENAI_API_KEY=... uv run python scripts/nightly_verification.py \
   --check structured-output-live \
   --check knowledge-embedding-live \
@@ -291,6 +301,16 @@ OPENAI_API_KEY=... uv run python scripts/nightly_verification.py \
 ANTHROPIC_API_KEY=... CAYU_PROVIDER=anthropic \
   uv run python scripts/nightly_verification.py \
   --check structured-output-live \
+  --strict
+```
+
+Run the local Microsandbox virtual-egress contract only when starting a real
+microVM is intended:
+
+```bash
+CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 \
+uv run python scripts/nightly_verification.py \
+  --check microsandbox-live-virtual-egress \
   --strict
 ```
 

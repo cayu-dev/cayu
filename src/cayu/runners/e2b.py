@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import posixpath
 import shlex
+from collections.abc import Mapping
 from types import ModuleType
 from typing import Any, Literal
 
@@ -61,6 +62,8 @@ class E2BRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
+        exec_user: str | None = None,
         e2b_module: ModuleType | Any | None = None,
     ) -> None:
         if sandbox is None:
@@ -76,6 +79,8 @@ class E2BRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.env_overlay = dict(env_overlay) if env_overlay else {}
+        self.exec_user = _validate_exec_user(exec_user)
         self._sandbox = sandbox
         self._e2b_module = e2b_module
         self._late_start_cleanup_timeout_s = self.cancel_timeout_s * (
@@ -97,6 +102,8 @@ class E2BRunner(Runner):
         ensure_default_cwd: bool = True,
         metadata: dict[str, str] | None = None,
         envs: dict[str, str] | None = None,
+        env_overlay: Mapping[str, str] | None = None,
+        exec_user: str | None = None,
         secure: bool = True,
         allow_internet_access: bool = True,
         network: Any | None = None,
@@ -169,6 +176,8 @@ class E2BRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            env_overlay=env_overlay,
+            exec_user=exec_user,
             e2b_module=module,
         )
 
@@ -184,6 +193,8 @@ class E2BRunner(Runner):
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         ensure_default_cwd: bool = True,
+        env_overlay: Mapping[str, str] | None = None,
+        exec_user: str | None = None,
         e2b_module: ModuleType | Any | None = None,
         **api_options: Any,
     ) -> E2BRunner:
@@ -217,6 +228,8 @@ class E2BRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            env_overlay=env_overlay,
+            exec_user=exec_user,
             e2b_module=module,
         )
 
@@ -242,6 +255,34 @@ class E2BRunner(Runner):
             raise RuntimeError("E2BRunner is closed.")
         return self._sandbox.files
 
+    async def _exec_admin(self, script: str, *, timeout_s: float = 60) -> Any:
+        """Run adapter-owned bootstrap code as root before guest handoff."""
+
+        if self._closed:
+            raise RuntimeError("E2BRunner is closed.")
+        if not script.strip():
+            raise ValueError("E2B admin script must be nonblank.")
+        return await self._sandbox.commands.run(
+            script,
+            user="root",
+            timeout=timeout_s,
+        )
+
+    async def _exec_guest_check(self, script: str, *, timeout_s: float = 30) -> Any:
+        """Run an adapter-owned hardening check as the eventual guest user."""
+
+        if self._closed:
+            raise RuntimeError("E2BRunner is closed.")
+        if not script.strip():
+            raise ValueError("E2B guest-check script must be nonblank.")
+        if self.exec_user is None:
+            raise RuntimeError("E2B guest checks require a pinned exec_user.")
+        return await self._sandbox.commands.run(
+            script,
+            user=self.exec_user,
+            timeout=timeout_s,
+        )
+
     async def exec(
         self,
         command: ExecCommand,
@@ -258,6 +299,8 @@ class E2BRunner(Runner):
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
+        if self.env_overlay:
+            environment.update(self.env_overlay)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
         output_limit = validate_output_limit(output_limit_bytes)
@@ -276,18 +319,18 @@ class E2BRunner(Runner):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if timeout is not None else None
         try:
-            start_task = asyncio.create_task(
-                self._sandbox.commands.run(
-                    script,
-                    background=True,
-                    envs=environment,
-                    cwd=working_dir,
-                    on_stdout=on_stdout,
-                    on_stderr=on_stderr,
-                    stdin=standard_input is not None,
-                    timeout=float(timeout) if timeout is not None else 0,
-                )
-            )
+            run_options: dict[str, Any] = {
+                "background": True,
+                "envs": environment,
+                "cwd": working_dir,
+                "on_stdout": on_stdout,
+                "on_stderr": on_stderr,
+                "stdin": standard_input is not None,
+                "timeout": float(timeout) if timeout is not None else 0,
+            }
+            if self.exec_user is not None:
+                run_options["user"] = self.exec_user
+            start_task = asyncio.create_task(self._sandbox.commands.run(script, **run_options))
             handle = await self._await_started_handle(start_task, deadline=deadline)
             if standard_input is not None:
                 await handle.send_stdin(standard_input)
@@ -568,6 +611,12 @@ def _validate_sandbox_id(sandbox_id: str) -> str:
     if len(value.encode("utf-8")) > E2B_SANDBOX_ID_MAX_BYTES:
         raise ValueError(f"`sandbox_id` must be at most {E2B_SANDBOX_ID_MAX_BYTES} UTF-8 bytes.")
     return value
+
+
+def _validate_exec_user(user: str | None) -> str | None:
+    if user is None:
+        return None
+    return require_clean_nonblank(user, "exec_user")
 
 
 def _validate_guest_root(path: str) -> str:

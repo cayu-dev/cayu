@@ -69,7 +69,9 @@ Most apps use the root-level setup API: `CredentialMode`, `HttpEgressPolicy`,
 
 Lower-level extension points live under `cayu.egress` and `cayu.runtime.egress`:
 custom `EgressPolicy` implementations, `SandboxEgressAdapter` registrations,
-custom runner factories, and the broker/proxy contracts used by adapters. Keep
+proxy exposure adapters, and the broker/proxy contracts used by adapters. Each
+egress adapter also creates its matching runner, so enforcement cannot be
+prepared and then accidentally discarded by an unrelated runner factory. Keep
 provider-specific business authorization in the app, provider-scoped
 credentials, or a custom policy.
 Supported credential shapes are closed for now: `stripe_bearer` and
@@ -130,9 +132,109 @@ Grant revocation is enforced against in-flight broker requests: teardown marks
 the grant revoked, waits for active request leases to drain, and the broker
 re-checks liveness after vault resolution before forwarding upstream.
 
-Docker is the default runtime path. Other sandbox runtimes need an enforcing
-`SandboxEgressAdapter` plus a custom runner factory. If no adapter is registered
-for the requested runner kind, setup fails closed.
+Docker is the default runtime path. E2B and Microsandbox use registered
+`SandboxEgressAdapter` implementations that both prepare the proxy and create
+the matching network-restricted runner. If no adapter is registered for the
+requested runner kind, setup fails closed.
+
+### Microsandbox
+
+Microsandbox runs locally and exposes the host as
+`host.microsandbox.internal`. Its adapter creates a deny-by-default network
+policy that allows only DNS to the host gateway and TCP to the per-session Cayu
+proxy port. The session CA is copied into the root filesystem before boot.
+
+The adapter binds the proxy to `0.0.0.0` by default so the microVM's reserved
+host gateway can reach it across supported host setups. That listener may also
+be reachable from the host's LAN interfaces while the session is active. It is
+credential- and destination-gated rather than an open relay, but it still adds
+an avoidable connection/DoS surface. Where the deployment has a stable
+guest-reachable bridge address, pass that address as `bind_host`; otherwise use
+host firewalling to keep the ephemeral proxy port off untrusted networks. A
+loopback-only bind is rejected because the microVM cannot reach it.
+
+```python
+from cayu.egress import EgressAdapterRegistry
+from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+
+registry = EgressAdapterRegistry()
+registry.register(MicrosandboxEgressAdapter())
+
+factory = VirtualEgressEnvironmentFactory(
+    resolver=vault,
+    policies=policies,
+    credentials=credentials,
+    runner_kind="microsandbox",
+    adapter_registry=registry,
+    image="python:3.13",  # Microsandbox OCI image
+)
+```
+
+Install both optional dependencies with
+`pip install 'cayu[egress,microsandbox]'`.
+
+### E2B
+
+E2B sandboxes run in E2B's cloud, so they cannot reach a loopback listener in
+the Cayu process. `E2BEgressAdapter` therefore requires a `ProxyExposure` that
+opens a raw TCP tunnel or private route to the local CONNECT proxy and returns
+an `ExposedProxy`. The advertised endpoint must be a dedicated IPv4 literal; E2B's
+hostname-aware filtering inspects the tunneled `CONNECT` destination, so a
+hostname allowlist cannot act as a transparent raw proxy relay. The adapter
+fails closed on hostname and IPv6 exposures and permits only the IPv4 endpoint.
+
+```python
+from cayu.egress import EgressAdapterRegistry
+from cayu.egress.e2b_adapter import E2BEgressAdapter
+from cayu.egress.proxy_exposure import ExposedProxy, ProxyExposure
+
+# Application-owned adapter that exposes the supplied local host/port through
+# a raw TCP tunnel and returns an IPv4-literal endpoint such as
+# ExposedProxy(proxy_url="http://203.0.113.10:8443").
+tunnel = MyE2BProxyExposure()
+
+registry = EgressAdapterRegistry()
+registry.register(E2BEgressAdapter(exposure=tunnel))
+
+factory = VirtualEgressEnvironmentFactory(
+    resolver=vault,
+    policies=policies,
+    credentials=credentials,
+    runner_kind="e2b",
+    adapter_registry=registry,
+    image="base",  # E2B template name or id
+)
+```
+
+Install with `pip install 'cayu[egress,e2b]'`. A normal HTTP reverse proxy is
+not sufficient: the endpoint must preserve raw HTTP CONNECT and tunneled TLS
+bytes. The adapter refuses to start without an exposure implementation.
+
+E2B exposes Firecracker MMDS at `169.254.169.254` inside the guest even when
+external internet access is denied. Before handoff, the adapter installs a root
+firewall reject for that address, removes the default user from the sudo group,
+and makes `sudo`/`su` root-only. A fresh guest process must prove it cannot
+remove the rule, and preflight must prove MMDS GET and token acquisition both
+fail. All later commands are pinned to that same verified guest user, regardless
+of the template's configured default. Missing hardening tools or retained guest
+privilege fail closed. This security mode intentionally removes guest privilege
+escalation; bake privileged setup into the E2B template rather than relying on
+`setup_commands` plus sudo.
+
+Both adapters run a per-session preflight before returning the environment. It
+must reach the proxy, complete TLS using the session CA, fail a raw public-IP
+socket, and fail a cloud-metadata socket. Any failure closes the sandbox,
+revokes grants, tears down the proxy/exposure, and aborts environment creation.
+Proxy environment variables alone are not a security boundary: without the
+runtime-native deny policy, a process can ignore them and open a direct socket.
+
+For a session with multiple grants, the positive proxy/TLS check samples the
+first configured destination; it does not connect to every provider during
+boot. Proxy reachability and CA trust are session-wide. The runtime-native
+deny-all policy permits only the proxy endpoint, while raw public-IP and metadata
+probes verify the general direct-egress boundary without relying on guest DNS.
+Provider-specific authorization is still enforced for every request by its
+grant and `EgressPolicy`.
 
 ## Audit events
 
@@ -240,7 +342,9 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | Runner | Status |
 | --- | --- |
 | `docker` | Enforced (internal network + sidecar + TLS MITM). |
-| `local`, `e2b`, `microsandbox`, `sbx` | Unsupported by the virtual-egress factory until a real enforcing adapter exists. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
+| `microsandbox` | Enforced with a deny-by-default host policy allowing only the Cayu proxy port. |
+| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. |
+| `local`, `sbx` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
 - The broker proxy binds a host-reachable interface so the sidecar can reach it via
@@ -262,3 +366,17 @@ Notes on the Docker adapter:
   the virtual value, a recursive search finds no real secret, the allowed call
   succeeds with the real key swapped upstream, direct egress is blocked, and the
   credential is rejected after the session closes.
+- Microsandbox E2E (manual/nightly): set
+  `CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1`, then run
+  `uv run python scripts/nightly_verification.py --check microsandbox-live-virtual-egress --strict`.
+- E2B E2E (manual/nightly): set `E2B_API_KEY`,
+  `CAYU_E2B_PROXY_EXPOSURE_COMMAND` (a raw TCP tunnel command template using
+  `{host}` and `{port}`), `CAYU_E2B_PROXY_URL`, and
+  `CAYU_RUN_E2B_EGRESS_E2E=1`, then run
+  `uv run python scripts/nightly_verification.py --check e2b-live-virtual-egress --strict`.
+
+The deterministic adapter, runner, preflight-failure, and teardown tests run in
+normal CI. E2B and Microsandbox E2Es are intentionally opt-in because they need
+cloud credentials, virtualization, or external tunnel infrastructure. The
+nightly registry reports them as `skipped` when an opt-in flag, runtime, API key,
+or E2B tunnel input is absent; a successful real-runtime run reports `verified`.

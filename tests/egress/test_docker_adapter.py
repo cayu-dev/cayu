@@ -86,6 +86,7 @@ def test_prepare_builds_internal_network_and_sidecar() -> None:
     assert ["network", "connect", network, sidecar] in docker.calls
     # Env overlay routes the sandbox through the sidecar and trusts the CA.
     assert binding.env["HTTPS_PROXY"] == f"http://{sidecar}:8080"
+    assert binding.proxy_url == binding.env["HTTPS_PROXY"]
     assert binding.env["https_proxy"] == f"http://{sidecar}:8080"
     assert "HTTP_PROXY" not in binding.env
     assert "http_proxy" not in binding.env

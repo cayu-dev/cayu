@@ -298,6 +298,36 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]
 
 
+def test_microsandbox_runner_applies_trusted_env_overlay_after_command_env() -> None:
+    sandbox = FakeSandbox("runner")
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        env_overlay={
+            "HTTPS_PROXY": "http://host.microsandbox.internal:8443",
+            "STRIPE_SECRET_KEY": "sk_test_cayu_virtual",
+        },
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    asyncio.run(
+        runner.exec(
+            ExecCommand.process("env"),
+            env={
+                "HTTPS_PROXY": "http://attacker.example:8080",
+                "STRIPE_SECRET_KEY": "attacker-value",
+                "VISIBLE": "1",
+            },
+        )
+    )
+
+    assert sandbox.exec_calls[0]["env"] == {
+        "HTTPS_PROXY": "http://host.microsandbox.internal:8443",
+        "STRIPE_SECRET_KEY": "sk_test_cayu_virtual",
+        "VISIBLE": "1",
+    }
+
+
 def test_microsandbox_runner_accepts_sdk_dataclass_events_without_wait() -> None:
     class WaitRaisesHandle(FakeHandle):
         async def wait(self) -> tuple[int, bool]:

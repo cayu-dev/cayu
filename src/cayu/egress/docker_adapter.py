@@ -7,11 +7,18 @@ import secrets
 import shutil
 from collections.abc import Awaitable, Callable, Sequence
 
-from cayu.egress.adapter import EgressBinding, SandboxEgressAdapter
+from cayu.credentials import CredentialMode
+from cayu.egress.adapter import (
+    EgressBinding,
+    SandboxEgressAdapter,
+    VirtualEgressRunnerRequest,
+)
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_server import TransparentEgressProxyServer
+from cayu.runners.base import Runner
+from cayu.runners.docker import DockerRunner
 
 _logger = logging.getLogger(__name__)
 
@@ -191,6 +198,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             network=network,
             sidecar=sidecar,
             guest_ca_path=GUEST_CA_PATH,
+            proxy_url=proxy_url,
             proxy_port=proxy_port,
             metadata={
                 "runner_kind": self.runner_kind,
@@ -200,6 +208,28 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 "proxy_port": proxy_port,
             },
             teardown=teardown,
+        )
+
+    async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
+        if request.runner_kind != self.runner_kind:
+            raise UnsupportedEgressError(
+                f"Docker egress adapter cannot create runner kind {request.runner_kind!r}."
+            )
+        network = request.binding.network
+        if network is None:
+            raise UnsupportedEgressError(
+                "Docker egress adapter did not return a network; refusing to start "
+                "a virtual-egress sandbox without enforced routing."
+            )
+        return await DockerRunner.create(
+            request.name,
+            image=request.image,
+            close_action="remove",
+            credential_mode=CredentialMode.VIRTUAL_EGRESS,
+            network=network,
+            env_overlay=dict(request.env_overlay),
+            ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
+            setup_commands=request.setup_commands,
         )
 
     async def _run(self, argv: Sequence[str]) -> None:

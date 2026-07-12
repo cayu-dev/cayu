@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
+from cayu.egress.proxy_exposure import HttpProxyEndpoint
+from cayu.runners.base import Runner
 
 
 @dataclass
@@ -26,10 +28,12 @@ class EgressBinding:
     network: str | None = None
     sidecar: str | None = None
     guest_ca_path: str | None = None
+    proxy_url: str | None = None
     proxy_port: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     teardown: Callable[[], Awaitable[None]] | None = None
     _closed: bool = field(default=False, init=False, repr=False)
+    _proxy_endpoint: HttpProxyEndpoint | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for field_name in ("runner_kind", "network", "sidecar", "guest_ca_path"):
@@ -38,6 +42,15 @@ class EgressBinding:
                 raise ValueError(f"{field_name} must be nonblank when set.")
         if self.proxy_port is not None and self.proxy_port <= 0:
             raise ValueError("proxy_port must be positive when set.")
+        if self.proxy_url is not None:
+            try:
+                self._proxy_endpoint = HttpProxyEndpoint.parse(self.proxy_url)
+            except ValueError as exc:
+                raise ValueError(f"proxy_url is invalid: {exc}") from exc
+
+    @property
+    def proxy_endpoint(self) -> HttpProxyEndpoint | None:
+        return self._proxy_endpoint
 
     async def close(self) -> None:
         if self._closed:
@@ -47,13 +60,30 @@ class EgressBinding:
         self._closed = True
 
 
+@dataclass(frozen=True)
+class VirtualEgressRunnerRequest:
+    """Inputs an egress adapter needs to start its enforced sandbox."""
+
+    name: str
+    runner_kind: str
+    image: str
+    binding: EgressBinding
+    env_overlay: Mapping[str, str]
+    ca_cert_host_path: str
+    guest_ca_path: str
+    setup_commands: tuple[str, ...]
+    egress_destinations: tuple[str, ...]
+
+
 class SandboxEgressAdapter(ABC):
-    """Configures enforced network capture and CA trust for one runner type.
+    """Configures egress and creates the matching enforced runner.
 
     An adapter must either return a binding that provably routes provider
     traffic through the broker (and blocks direct egress), or raise
     ``UnsupportedEgressError``. It must never return a binding that leaves
     direct egress open — that would silently downgrade the security boundary.
+    Runner creation lives on the same interface so a prepared binding cannot be
+    paired with an unrelated factory that ignores its network policy.
     """
 
     #: Identifier of the runner family this adapter enforces.
@@ -68,6 +98,10 @@ class SandboxEgressAdapter(ABC):
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
         """Configure enforced egress for the session or raise."""
+
+    @abstractmethod
+    async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
+        """Create a runner that applies this adapter's binding without downgrade."""
 
 
 class UnsupportedEgressAdapter(SandboxEgressAdapter):
@@ -89,6 +123,12 @@ class UnsupportedEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        raise UnsupportedEgressError(
+            f"Runner {self.runner_kind!r} cannot enforce virtual egress: {self._reason}. "
+            "Virtual credentials refuse to downgrade to raw secret injection."
+        )
+
+    async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         raise UnsupportedEgressError(
             f"Runner {self.runner_kind!r} cannot enforce virtual egress: {self._reason}. "
             "Virtual credentials refuse to downgrade to raw secret injection."

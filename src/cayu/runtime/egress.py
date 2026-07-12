@@ -2,8 +2,8 @@
 
 Turns the egress library into a first-class, session-lifecycle-managed mode: a
 ``VirtualEgressEnvironmentFactory`` mints per-session grants, stands up the
-broker + enforced Docker sandbox, and emits audit events; teardown (revoke +
-remove network/sidecar + stop proxy) runs from the workspace binding's
+broker + an adapter-enforced sandbox, and emits audit events; teardown (revoke +
+remove runtime network resources + stop proxy) runs from the workspace binding's
 ``finalize`` hook that the runtime already calls at session end.
 """
 
@@ -34,6 +34,7 @@ from cayu.egress import (
     UnsupportedEgressError,
     VirtualCredentialGrant,
     VirtualCredentialRegistry,
+    VirtualEgressRunnerRequest,
 )
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.environments.base import Environment, EnvironmentSpec
@@ -49,7 +50,6 @@ from cayu.environments.factory import (
     EnvironmentFactoryResult,
 )
 from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, ExecResult, Runner
-from cayu.runners.docker import DockerRunner
 from cayu.vaults import SecretRef, SecretResolver
 
 EventEmitter = Callable[[Event], Awaitable[Event]]
@@ -79,30 +79,13 @@ class VirtualCredentialSpec:
         object.__setattr__(self, "credential_kind", validate_credential_kind(self.credential_kind))
 
 
-@dataclass(frozen=True)
-class VirtualEgressRunnerRequest:
-    """Inputs a custom virtual-egress runner factory needs to start a sandbox."""
-
-    name: str
-    runner_kind: str
-    image: str
-    binding: EgressBinding
-    env_overlay: Mapping[str, str]
-    ca_cert_host_path: str
-    guest_ca_path: str
-    setup_commands: tuple[str, ...]
-
-
-VirtualEgressRunnerFactory = Callable[[VirtualEgressRunnerRequest], Awaitable[Runner]]
-
-
 class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     """Per-session environment factory that enforces virtual egress.
 
     ``create`` mints grants, builds a broker (wired to emit audit events),
-    prepares the Docker egress adapter, and returns an ``Environment`` whose
+    prepares the selected egress adapter, and returns an ``Environment`` whose
     runner is on the enforced network and whose binding tears everything down
-    at session end. All non-Docker enforcement fails closed inside the adapter.
+    at session end. Unsupported runners fail closed inside the adapter registry.
 
     Scope: virtual egress governs the **sandbox process** credential — the value
     the sandboxed app can read. It does not govern MCP servers: ``McpServerSpec``
@@ -122,7 +105,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         adapter: SandboxEgressAdapter | None = None,
         adapter_registry: EgressAdapterRegistry | None = None,
         runner_kind: str = "docker",
-        runner_factory: VirtualEgressRunnerFactory | None = None,
         inner_binding: WorkspaceBinding | None = None,
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
@@ -146,7 +128,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._adapter = adapter
         self._adapter_registry = adapter_registry
         self._runner_kind = adapter.runner_kind if adapter is not None else runner_kind
-        self._runner_factory = runner_factory
         self._inner_binding = inner_binding or NoWorkspaceBinding()
         self._emitter = event_emitter
         self._upstream = upstream
@@ -217,11 +198,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 ca_cert_host_path=ca_host,
                 guest_ca_path=guest_ca_path,
                 setup_commands=self._setup_commands,
+                egress_destinations=tuple(grant.destination for grant in grants),
             )
-            if self._runner_factory is not None:
-                runner = await self._runner_factory(runner_request)
-            else:
-                runner = await self._create_default_runner(runner_request)
+            runner = await adapter.create_runner(runner_request)
 
             managed_runner = _EgressManagedRunner(
                 runner=runner,
@@ -284,32 +263,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         registry = EgressAdapterRegistry()
         registry.register(DockerEgressAdapter(loop=loop))
         return registry.resolve(self._runner_kind)
-
-    async def _create_default_runner(
-        self,
-        request: VirtualEgressRunnerRequest,
-    ) -> Runner:
-        if request.runner_kind != "docker":
-            raise UnsupportedEgressError(
-                f"Runner {request.runner_kind!r} requires a custom runner_factory for "
-                "virtual egress."
-            )
-        network = request.binding.network
-        if network is None:
-            raise UnsupportedEgressError(
-                "Docker egress adapter did not return a network; refusing to start "
-                "a virtual-egress sandbox without enforced routing."
-            )
-        return await DockerRunner.create(
-            request.name,
-            image=request.image,
-            close_action="remove",
-            credential_mode=CredentialMode.VIRTUAL_EGRESS,
-            network=network,
-            env_overlay=dict(request.env_overlay),
-            ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
-            setup_commands=request.setup_commands,
-        )
 
     async def _emit_grant_events(
         self,

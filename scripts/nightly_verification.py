@@ -50,12 +50,14 @@ class VerificationCheck:
     env: Mapping[str, str] = field(default_factory=dict)
     unset_env: tuple[str, ...] = ()
     required_env: tuple[str, ...] = ()
+    required_env_values: Mapping[str, str] = field(default_factory=dict)
     required_any_env: tuple[tuple[str, ...], ...] = ()
     required_commands: tuple[str, ...] = ()
     required_modules: tuple[str, ...] = ()
     requires_provider_api_key: bool = False
     requires_docker: bool = False
     requires_postgres: bool = False
+    requires_microsandbox_runtime: bool = False
     requires_sigkill: bool = False
     requires_playwright_chromium: bool = False
     requires_structured_evidence: bool = False
@@ -248,6 +250,30 @@ CHECKS: tuple[VerificationCheck, ...] = (
         required_modules=("microsandbox",),
     ),
     VerificationCheck(
+        id="microsandbox-live-virtual-egress",
+        capability="Microsandbox virtual-egress enforcement",
+        lane="microsandbox",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "egress",
+            "--extra",
+            "microsandbox",
+            "pytest",
+            "tests/egress/test_microsandbox_egress_e2e.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1",
+            "microsandbox package/runtime",
+        ),
+        required_env_values={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        required_modules=("microsandbox",),
+        requires_microsandbox_runtime=True,
+    ),
+    VerificationCheck(
         id="e2b-live-runner",
         capability="E2BRunner real sandbox exec and cancellation cleanup",
         lane="e2b",
@@ -275,6 +301,37 @@ CHECKS: tuple[VerificationCheck, ...] = (
         status_on_success=STATUS_VERIFIED,
         prerequisites=("E2B_API_KEY", "e2b package"),
         required_env=("E2B_API_KEY",),
+        required_modules=("e2b",),
+    ),
+    VerificationCheck(
+        id="e2b-live-virtual-egress",
+        capability="E2B virtual-egress enforcement",
+        lane="e2b",
+        command=(
+            "uv",
+            "run",
+            "--extra",
+            "egress",
+            "--extra",
+            "e2b",
+            "pytest",
+            "tests/egress/test_e2b_egress_e2e.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_RUN_E2B_EGRESS_E2E=1",
+            "E2B_API_KEY",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND",
+            "CAYU_E2B_PROXY_URL with IPv4-literal host",
+            "e2b package",
+        ),
+        required_env=(
+            "E2B_API_KEY",
+            "CAYU_E2B_PROXY_EXPOSURE_COMMAND",
+            "CAYU_E2B_PROXY_URL",
+        ),
+        required_env_values={"CAYU_RUN_E2B_EGRESS_E2E": "1"},
         required_modules=("e2b",),
     ),
     VerificationCheck(
@@ -660,6 +717,12 @@ def _effective_env(
 
 def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str]) -> list[str]:
     missing = [f"{name} is not set" for name in check.required_env if not environ.get(name)]
+    for name, expected in check.required_env_values.items():
+        actual = environ.get(name)
+        if not actual:
+            missing.append(f"{name} is not set")
+        elif actual != expected:
+            missing.append(f"{name} must equal {expected!r}")
     missing += [
         f"one of {', '.join(names)} must be set"
         for names in check.required_any_env
@@ -678,6 +741,12 @@ def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str])
         missing.append("Docker daemon is unavailable")
     if check.requires_postgres and not _postgres_available(environ):
         missing.append("Postgres is unavailable: set CAYU_TEST_POSTGRES_DSN or run Docker")
+    if (
+        check.requires_microsandbox_runtime
+        and "microsandbox" not in missing_modules
+        and not _microsandbox_runtime_available()
+    ):
+        missing.append("Microsandbox runtime is unavailable")
     if check.requires_sigkill and not _sigkill_available():
         missing.append("POSIX SIGKILL is unavailable")
     if (
@@ -693,6 +762,15 @@ def _module_missing(name: str) -> bool:
     import importlib.util
 
     return importlib.util.find_spec(name) is None
+
+
+def _microsandbox_runtime_available() -> bool:
+    try:
+        import microsandbox
+
+        return bool(microsandbox.is_installed())
+    except Exception:
+        return False
 
 
 def _playwright_chromium_available() -> bool:

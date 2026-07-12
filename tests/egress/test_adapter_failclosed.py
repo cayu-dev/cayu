@@ -78,6 +78,9 @@ class _FakeEnforcedAdapter(SandboxEgressAdapter):
             teardown=teardown,
         )
 
+    async def create_runner(self, request):  # type: ignore[no-untyped-def]
+        raise NotImplementedError
+
 
 def test_registered_adapter_is_used() -> None:
     registry = EgressAdapterRegistry()
@@ -127,6 +130,11 @@ def test_binding_validates_typed_core_fields() -> None:
         EgressBinding(network=" ")
     with pytest.raises(ValueError, match="proxy_port"):
         EgressBinding(proxy_port=0)
+    with pytest.raises(ValueError, match="proxy_url"):
+        EgressBinding(proxy_url="https://cayu-egress.example:8443")
+
+    binding = EgressBinding(proxy_url="http://cayu-egress.example:8443")
+    assert binding.proxy_url == "http://cayu-egress.example:8443"
 
 
 def test_registry_rejects_non_adapter() -> None:

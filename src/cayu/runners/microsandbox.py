@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import importlib
 import posixpath
+from collections.abc import Mapping
 from types import ModuleType
 from typing import Any, Literal
 
@@ -57,6 +58,7 @@ class MicrosandboxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
     ) -> None:
         if sandbox is None:
@@ -69,6 +71,7 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.env_overlay = dict(env_overlay) if env_overlay else {}
         self._sandbox = sandbox
         self._sandbox_module = sandbox_module
         self._sftp_client: Any = None
@@ -87,6 +90,7 @@ class MicrosandboxRunner(Runner):
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         ensure_default_cwd: bool = True,
+        env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
         **sandbox_options: Any,
     ) -> MicrosandboxRunner:
@@ -141,6 +145,7 @@ class MicrosandboxRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            env_overlay=env_overlay,
             sandbox_module=module,
         )
 
@@ -154,6 +159,7 @@ class MicrosandboxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
     ) -> MicrosandboxRunner:
         """Attach to an existing Microsandbox sandbox by name."""
@@ -176,6 +182,7 @@ class MicrosandboxRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            env_overlay=env_overlay,
             sandbox_module=module,
         )
 
@@ -277,6 +284,8 @@ class MicrosandboxRunner(Runner):
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
+        if self.env_overlay:
+            environment.update(self.env_overlay)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
         sdk_stdin = standard_input.encode("utf-8") if standard_input is not None else None

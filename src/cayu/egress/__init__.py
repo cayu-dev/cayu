@@ -11,6 +11,7 @@ from cayu.egress.adapter import (
     EgressBinding,
     SandboxEgressAdapter,
     UnsupportedEgressAdapter,
+    VirtualEgressRunnerRequest,
 )
 from cayu.egress.broker import (
     CapturedRequest,
@@ -59,4 +60,5 @@ __all__ = [
     "VirtualCredentialGrant",
     "VirtualCredentialLease",
     "VirtualCredentialRegistry",
+    "VirtualEgressRunnerRequest",
 ]
