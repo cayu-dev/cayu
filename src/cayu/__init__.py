@@ -183,6 +183,7 @@ from cayu.mcp import (
 from cayu.observability import TRACE_LEVEL, LoggingEventSink, OpenTelemetryEventSink
 from cayu.providers import (
     AnthropicProvider,
+    BedrockProvider,
     CacheBreakpoint,
     CachePolicy,
     ChatCompletionsProvider,
@@ -632,6 +633,7 @@ __all__ = [
     "ArtifactStoreUnavailableError",
     "ArtifactToWorkspaceResult",
     "BackgroundSubagentTaskRegistry",
+    "BedrockProvider",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",

@@ -28,6 +28,14 @@ _COUNT_RE = re.compile(r"(?P<count>\d+)\s+(?P<kind>passed|failed|skipped|error|e
 _STRUCTURED_EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 _LIVE_CREDENTIAL_ENV = (
     "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "CAYU_BEDROCK_LIVE",
+    "CAYU_BEDROCK_MODEL",
     "E2B_API_KEY",
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
@@ -445,6 +453,23 @@ CHECKS: tuple[VerificationCheck, ...] = (
         prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
         required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
         requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
+        id="bedrock-provider-live",
+        capability="Amazon Bedrock text, tool structured output, usage, and token counting",
+        lane="provider-contract",
+        command=("uv", "run", "--extra", "aws", "python", "examples/bedrock_provider_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "CAYU_BEDROCK_LIVE=1",
+            "CAYU_BEDROCK_MODEL",
+            "AWS_REGION or AWS_DEFAULT_REGION",
+            "AWS credential chain",
+        ),
+        required_env=("CAYU_BEDROCK_MODEL",),
+        required_env_values={"CAYU_BEDROCK_LIVE": "1"},
+        required_any_env=(("AWS_REGION", "AWS_DEFAULT_REGION"),),
         requires_structured_evidence=True,
     ),
     VerificationCheck(

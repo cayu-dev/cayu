@@ -48,6 +48,7 @@ def _load_example(name: str) -> ModuleType:
 
 
 artifact_file_live = _load_example("artifact_file_live")
+bedrock_provider_live = _load_example("bedrock_provider_live")
 context_counting_live = _load_example("context_counting_live")
 knowledge_embedding_live = _load_example("knowledge_embedding_live")
 real_spend_budget_live = _load_example("real_spend_budget_live")
@@ -74,6 +75,47 @@ def test_demo_only_live_example_imports_and_exposes_main_without_sys_path_mutati
 
     assert callable(example.main)
     assert str(EXAMPLES_DIR) not in sys.path
+
+
+@pytest.mark.parametrize(
+    ("input_count", "token_counting"),
+    [(9, "validated"), (None, "unsupported")],
+)
+def test_bedrock_live_contract_requires_structured_output_usage_and_completion(
+    input_count: int | None,
+    token_counting: str,
+) -> None:
+    evidence = bedrock_provider_live._validate_events(
+        [
+            _event(
+                EventType.MODEL_COMPLETED,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "bedrock",
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                    }
+                },
+            ),
+            _event(
+                EventType.STRUCTURED_OUTPUT_VALIDATED,
+                payload={"output": {"answer": "bedrock-live"}},
+            ),
+            _event(EventType.SESSION_COMPLETED),
+        ],
+        model="anthropic.claude-test",
+        input_count=input_count,
+    )
+
+    assert evidence == {
+        "provider": "bedrock",
+        "model": "anthropic.claude-test",
+        "input_count": input_count,
+        "token_counting": token_counting,
+        "total_tokens": 12,
+        "structured_output": "validated",
+    }
 
 
 def _event(

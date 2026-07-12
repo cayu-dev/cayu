@@ -32,6 +32,15 @@ from cayu.providers.base import (
     copy_model_stream_event,
     normalize_model_completion,
 )
+from cayu.providers.bedrock import (
+    BedrockAPIError,
+    BedrockContextOverflowError,
+    BedrockError,
+    BedrockProtocolError,
+    BedrockProvider,
+    bedrock_converse_stream_events,
+    build_bedrock_converse_payload,
+)
 from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.chat_completions import (
     ChatCompletionsAPIError,
@@ -75,6 +84,11 @@ __all__ = [
     "AnthropicProtocolError",
     "AnthropicProvider",
     "AnthropicTransport",
+    "BedrockAPIError",
+    "BedrockContextOverflowError",
+    "BedrockError",
+    "BedrockProtocolError",
+    "BedrockProvider",
     "CacheBreakpoint",
     "CachePolicy",
     "ChatCompletionsAPIError",
@@ -115,7 +129,9 @@ __all__ = [
     "VertexTransport",
     "anthropic_response_events",
     "anthropic_stream_events",
+    "bedrock_converse_stream_events",
     "build_anthropic_payload",
+    "build_bedrock_converse_payload",
     "build_chat_completions_payload",
     "build_openai_embedding_payload",
     "build_openai_payload",

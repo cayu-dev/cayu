@@ -383,12 +383,7 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
         ".cayu-internal-runtime-acceptance.json",
     )
     assert check.status_on_success == nightly.STATUS_HERMETIC
-    assert set(check.unset_env) == {
-        "ANTHROPIC_API_KEY",
-        "E2B_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENAI_API_KEY",
-    }
+    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
 
 
 def test_console_pty_check_pins_standalone_nightly_command() -> None:
@@ -409,6 +404,46 @@ def test_console_pty_check_pins_standalone_nightly_command() -> None:
     assert check.prerequisites == ("POSIX PTY", "Cayu console extra")
     assert check.required_modules == ("pty",)
     assert check.requires_structured_evidence is True
+
+
+def test_live_credential_policy_contains_aws_inputs() -> None:
+    expected = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_DEFAULT_REGION",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CAYU_BEDROCK_LIVE",
+        "CAYU_BEDROCK_MODEL",
+    }
+
+    assert expected <= set(nightly._LIVE_CREDENTIAL_ENV)
+
+
+def test_bedrock_live_check_defers_credential_discovery_to_boto3(tmp_path: Path) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "bedrock-provider-live")
+    environ = {
+        "HOME": str(tmp_path),
+        "CAYU_BEDROCK_LIVE": "1",
+        "CAYU_BEDROCK_MODEL": "anthropic.claude-test",
+        "AWS_REGION": "us-west-2",
+    }
+
+    missing = nightly._missing_prerequisites(check, environ)
+
+    assert missing == []
+
+
+def test_bedrock_live_check_requires_explicit_enabled_value() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "bedrock-provider-live")
+    environ = {
+        "CAYU_BEDROCK_LIVE": "0",
+        "CAYU_BEDROCK_MODEL": "anthropic.claude-test",
+        "AWS_REGION": "us-west-2",
+    }
+
+    assert nightly._missing_prerequisites(check, environ) == ["CAYU_BEDROCK_LIVE must equal '1'"]
 
 
 @pytest.mark.parametrize(
@@ -716,12 +751,7 @@ def test_sigkill_recovery_check_pins_process_boundary_suite() -> None:
     assert check.status_on_success == nightly.STATUS_VERIFIED
     assert check.prerequisites == ("POSIX SIGKILL",)
     assert check.requires_sigkill is True
-    assert set(check.unset_env) == {
-        "ANTHROPIC_API_KEY",
-        "E2B_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENAI_API_KEY",
-    }
+    assert check.unset_env == nightly._LIVE_CREDENTIAL_ENV
 
 
 def test_baseline_and_postgres_checks_partition_the_recovery_suite() -> None:

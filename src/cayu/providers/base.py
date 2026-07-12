@@ -529,15 +529,26 @@ def _normalized_finish_reason(
         return ModelFinishReason.UNKNOWN
     if raw_finish_reason is None:
         return ModelFinishReason.UNKNOWN
-    if raw_finish_reason in {"stop", "end_turn"}:
+    if raw_finish_reason in {"stop", "end_turn", "stop_sequence"}:
         return ModelFinishReason.STOP
     if raw_finish_reason in {"tool_calls", "tool_use"}:
         return ModelFinishReason.TOOL_CALLS
-    if raw_finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+    if raw_finish_reason in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "model_context_window_exceeded",
+    }:
         return ModelFinishReason.LENGTH
-    if raw_finish_reason in {"content_filter", "safety", "refusal"}:
+    if raw_finish_reason in {
+        "content_filter",
+        "content_filtered",
+        "guardrail_intervened",
+        "safety",
+        "refusal",
+    }:
         return ModelFinishReason.CONTENT_FILTER
-    if raw_finish_reason in {"error", "failed"}:
+    if raw_finish_reason in {"error", "failed", "malformed_model_output"}:
         return ModelFinishReason.ERROR
     if isinstance(incomplete_details, dict):
         reason = _optional_payload_string(cast("dict[str, Any]", incomplete_details), "reason")

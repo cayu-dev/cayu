@@ -44,7 +44,7 @@ instead of debugging through framework abstractions.
 | Context pressure | Counting, estimation, compaction, overflow recovery |
 | Knowledge | Reviewed memory, indexing, recall tools, pgvector support |
 | Cost control | Usage events, budget policies, causal budget summaries |
-| Provider flexibility | OpenAI, Anthropic, Vertex, OpenAI-compatible providers |
+| Provider flexibility | OpenAI, Anthropic, Amazon Bedrock, Vertex, OpenAI-compatible providers |
 | Evals | Runtime trajectories, assertions, replay, LLM judges |
 
 ## Environments Are The Execution Boundary
@@ -723,6 +723,43 @@ async for event in app.run(
 Explicit `RunRequest.provider_name` and `AgentSpec.provider_name` still win. Ambiguous pattern
 matches fail before the session is created, and resume/fork paths keep the provider recorded on
 the stored session.
+
+To run Claude through **Amazon Bedrock**, install `cayu[aws]` and register an explicit
+`BedrockProvider`. It uses Boto3's standard AWS credential chain (including `profile_name=` when
+you need a named profile) and Bedrock's `ConverseStream` and `CountTokens` operations; it never
+requires or silently falls back to an Anthropic API key. The caller needs
+`bedrock:CountTokens` plus `bedrock:InvokeModel` for token counting and
+`bedrock:InvokeModelWithResponseStream` for streaming:
+
+```python
+from cayu import AgentSpec, BedrockProvider, CayuApp
+
+app = CayuApp()
+app.register_provider(
+    BedrockProvider(region_name="us-west-2", profile_name="production"),
+    default=True,
+)
+app.register_agent(
+    AgentSpec(
+        name="assistant",
+        model="us.anthropic.claude-sonnet-4-6",
+        provider_name="bedrock",
+    )
+)
+```
+
+Pass the exact Bedrock model ID or inference-profile ARN; Cayu does not rewrite regional model
+names. Text, reasoning (including signature/redacted-state round trips), tools/tool results,
+image/PDF attachments, tool-strategy structured output, usage, cache counters, finish reasons,
+and typed AWS failures use the same runtime contracts as the other built-in providers.
+Provider-specific Converse options go under
+`provider_options={"bedrock": {...}}`, except `modelId`, `messages`, `system`, and `toolConfig`,
+which the adapter owns. Register pricing rows under provider name `"bedrock"`.
+
+`CountTokens` availability is model-specific. Some Claude models offered only through
+cross-Region inference require Amazon's separate Bedrock Mantle token-counting endpoint, which
+this adapter does not currently call; inference still works, but official preflight token
+counting can fail for those models.
 
 To run Anthropic Claude models hosted on **Google Cloud Vertex AI** (enterprises mandated to
 GCP), use `VertexProvider` (install the optional `cayu[vertex]` extra). It sends the Anthropic
