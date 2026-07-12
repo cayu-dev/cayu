@@ -44,6 +44,7 @@ list the check IDs:
 uv run python scripts/nightly_verification.py --list
 uv run python scripts/nightly_verification.py --check core-pytest --strict
 uv run python scripts/nightly_verification.py --check internal-evals-hermetic --strict
+uv run python scripts/nightly_verification.py --check console-pty --strict
 uv run python scripts/nightly_verification.py --check sigkill-recovery --strict
 uv run python scripts/nightly_verification.py --check docker-runner --strict
 ```
@@ -93,6 +94,7 @@ or in CI.
 | Lane | Needs | Spend | Current check |
 | --- | --- | ---: | --- |
 | Python baseline | Python dev deps; provider keys are unset by the runner | $0 | `core-pytest`, `internal-evals-hermetic` |
+| Interactive CLI PTY | POSIX PTY and `cayu[console]`; provider keys are unset by the runner | $0 | `console-pty` |
 | Process-death recovery | POSIX `SIGKILL`; deterministic SQLite stores and scripted providers | $0 | `sigkill-recovery` |
 | Controlled fault injection | loopback TCP, durable SQLite/filesystems, and POSIX process groups | $0 | `provider-stream-abort`, `sqlite-write-failure`, `runner-cleanup-failure`, `workspace-sync-failure` |
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
@@ -119,6 +121,7 @@ high level:
 | --- | --- | --- |
 | runtime loop, model steps, tool rounds, approvals, interrupts, subagents, evals, stores, server, local runner | verified baseline | `core-pytest` |
 | first-party tool, workspace, context, knowledge, subagent, usage, and budget eval workflows | hermetic | `internal-evals-hermetic` |
+| real project discovery, IPython startup, top-level await, loop reuse, namespace aliases, and EOF exit | hermetic | `console-pty` |
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real Docker container exec, timeout cleanup, and sync binding | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync` |
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
@@ -283,6 +286,23 @@ deterministic write after an earlier file has already copied back. SQLite must
 retain the binding-finalize failure on the completed session; retrying the same
 binding state must copy every intended file, remove the stale file, and release
 the target for reuse.
+
+Run the real interactive-console contract independently on a POSIX host:
+
+```bash
+uv run python scripts/nightly_verification.py \
+  --check console-pty \
+  --strict
+```
+
+The check creates a temporary Cayu project, starts the installed `cayu console`
+executable from a nested directory through a real PTY, and drives real IPython.
+It asserts project-root discovery, project-relative state, the documented
+namespace aliases, awaited session/task store operations, event-loop reuse
+across async cells, and clean Ctrl-D exit. It emits structured evidence, uses no
+live provider credentials or network services, and is intentionally not part of
+the ordinary pytest/PR CI path; only its lightweight registry assertion runs
+there.
 
 Run credential-gated lanes only when the credential and quota are intentionally
 available:

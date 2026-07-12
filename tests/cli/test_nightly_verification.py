@@ -391,6 +391,26 @@ def test_internal_evals_hermetic_check_pins_command_and_unsets_live_credentials(
     }
 
 
+def test_console_pty_check_pins_standalone_nightly_command() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "console-pty")
+
+    assert check.lane == "cli"
+    assert check.command == (
+        "uv",
+        "run",
+        "--extra",
+        "console",
+        "--group",
+        "nightly",
+        "python",
+        "scripts/console_pty_verification.py",
+    )
+    assert check.status_on_success == nightly.STATUS_HERMETIC
+    assert check.prerequisites == ("POSIX PTY", "Cayu console extra")
+    assert check.required_modules == ("pty",)
+    assert check.requires_structured_evidence is True
+
+
 @pytest.mark.parametrize(
     ("check_id", "lane", "test_path", "opt_in_env", "required_env"),
     [

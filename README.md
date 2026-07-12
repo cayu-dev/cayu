@@ -132,6 +132,7 @@ reattach instead of guessing.
 ## Contents
 
 - [Quickstart](#quickstart)
+- [Application console](#application-console)
 - [Featured example: cloud PR reviewer](#featured-example-cloud-pr-reviewer)
 - [Advanced runtime examples](#advanced-runtime-examples)
 - [Further reading](#further-reading)
@@ -159,6 +160,13 @@ pip install cayu
 
 Scaffold a ready-to-edit project with `cayu new myagent` (an agent, a custom tool,
 and SQLite stores), or wire one up by hand:
+
+```bash
+pip install 'cayu[console]'
+cayu new myagent
+cd myagent
+cayu console
+```
 
 ```python
 import asyncio
@@ -189,6 +197,29 @@ For a version that runs with **no API key**, see
 provider plus a custom tool). To add tools, a filesystem workspace, and command
 execution, register an `Environment` — see
 [`examples/local_environment_runtime.py`](examples/local_environment_runtime.py).
+
+## Application console
+
+`cayu console` opens an IPython session around a freshly built `CayuApp`, similar
+to `rails console`. A project declares its synchronous, zero-argument factory in
+`pyproject.toml`:
+
+```toml
+[tool.cayu]
+factory = "app:build_app"
+```
+
+Run the command anywhere below that project root. The console exposes `app`,
+`sessions`, `tasks`, `knowledge`, and `cayu`; these are live objects connected to
+the application's configured stores. You can also bypass discovery explicitly:
+
+```bash
+cayu console package.module:build_app
+```
+
+Install the optional dependency with `pip install 'cayu[console]'` or
+`uv add 'cayu[console]'`. See [the console guide](docs/console.md) for factory
+rules, async behavior, and safety details.
 
 ## Getting the result and handling failure
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from cayu.cli import main
 
 
-def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path) -> None:
+def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
     assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
     proj = tmp_path / "myproj"
     for filename in ("app.py", "pyproject.toml", "README.md", ".gitignore"):
@@ -37,6 +37,16 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path) -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert hasattr(module, "build_app")
+
+    pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'dependencies = ["cayu"]' in pyproject
+    assert '[project.optional-dependencies]\nconsole = ["cayu[console]"]' in pyproject
+    assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
+    readme = (proj / "README.md").read_text(encoding="utf-8")
+    assert "cayu console" in readme
+    assert "pip install -e '.[console]'" in readme
+    assert "uv sync --extra console" in readme
+    assert "cayu console" in capsys.readouterr().out
 
 
 def test_cayu_new_refuses_a_nonempty_directory(tmp_path: Path) -> None:

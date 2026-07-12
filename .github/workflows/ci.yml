@@ -92,6 +92,14 @@ jobs:
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
       - run: .release-venv/bin/python -c "import cayu; assert cayu.__name__ == 'cayu'"
+      - run: .release-venv/bin/cayu console --help
+      - name: Check optional console dependency guidance
+        run: |
+          if output="$(.release-venv/bin/cayu console cayu.runtime.app:CayuApp 2>&1)"; then
+            echo "console unexpectedly started without the console extra"
+            exit 1
+          fi
+          test "$output" = 'error: Cayu console requires IPython. Install it with: pip install "cayu[console]"'
       - name: Check installed CLI version
         run: |
           expected_version="$(.release-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"

@@ -38,6 +38,9 @@ dev = [
   "ty>=0.0.1a8",
   "uvicorn>=0.30",
 ]
+console = [
+  "ipython>=9,<10",
+]
 browser = [
   "playwright>=1.61",
 ]
@@ -75,6 +78,7 @@ all = [
   "e2b>=2.28,<3",
   "fastapi>=0.115",
   "google-auth[requests]>=2,<3",
+  "ipython>=9,<10",
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
   "pillow>=10",
@@ -83,6 +87,11 @@ all = [
   "pypdf>=4",
   "uvicorn>=0.30",
   "sse-starlette>=2.0",
+]
+
+[dependency-groups]
+nightly = [
+  "pexpect>=4.9; sys_platform != 'win32' and sys_platform != 'emscripten'",
 ]
 
 [project.scripts]

@@ -42,7 +42,9 @@ def test_validate_wheel_rejects_unexpected_top_level_paths(tmp_path) -> None:
     dist_info = "cayu-0.1.0.dist-info"
     names = {
         "cayu/__init__.py": "",
+        "cayu/cli/_targets.py": "",
         "cayu/cli/__init__.py": "",
+        "cayu/cli/console.py": "",
         "cayu/server/dashboard/index.html": "",
         "cayu/server/dashboard/assets/app.js": "",
         "cayu/server/dashboard/assets/app.css": "",

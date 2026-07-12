@@ -27,7 +27,9 @@ _SDIST_ALLOWED_ROOTS = {
 _SDIST_ALLOWED_TREES = {"src"}
 _WHEEL_REQUIRED = {
     "cayu/__init__.py",
+    "cayu/cli/_targets.py",
     "cayu/cli/__init__.py",
+    "cayu/cli/console.py",
     "cayu/server/dashboard/index.html",
 }
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}

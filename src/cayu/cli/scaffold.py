@@ -18,6 +18,9 @@ _APP_PY = '''"""__PROJECT_NAME__: a Cayu agent.
 Run it:
     export OPENAI_API_KEY=sk-...
     python app.py
+
+Inspect it:
+    cayu console
 """
 
 import asyncio
@@ -112,6 +115,12 @@ name = "__PROJECT_NAME__"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["cayu"]
+
+[project.optional-dependencies]
+console = ["cayu[console]"]
+
+[tool.cayu]
+factory = "app:build_app"
 """
 
 _README = """# __PROJECT_NAME__
@@ -121,7 +130,7 @@ A Cayu agent, scaffolded with `cayu new`.
 ## Run
 
 ```bash
-pip install cayu            # or: uv add cayu
+pip install -e '.[console]' # or: uv sync --extra console
 export OPENAI_API_KEY=sk-...
 python app.py
 ```
@@ -129,6 +138,18 @@ python app.py
 `app.py` registers one agent with a custom `GreetTool` and the built-in
 `exec_command` tool, backed by SQLite session/task stores under `data/`. Edit
 `build_app()` to add tools, swap the provider, or bind a git checkout.
+
+## Console
+
+Open a live IPython console with the same booted application:
+
+```bash
+cayu console
+```
+
+The console exposes `app`, `sessions`, `tasks`, `knowledge`, and the `cayu`
+package. It is connected to the configured stores, so changes are live.
+The `console` project extra is for development; production installs can omit it.
 
 ## Layout
 
@@ -217,7 +238,8 @@ def run_new(args: argparse.Namespace) -> int:
 
     print(f"Scaffolded {target}/ — next steps:")
     print(f"  cd {target}")
-    print("  pip install cayu")
+    print("  pip install -e '.[console]'  # or: uv sync --extra console")
     print("  export OPENAI_API_KEY=sk-...")
+    print("  cayu console")
     print("  python app.py")
     return 0

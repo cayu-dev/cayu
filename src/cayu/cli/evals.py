@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib
 import inspect
 import sys
 from pathlib import Path
 from typing import Any
 
+from cayu.cli._targets import load_target
 from cayu.evals import (
     EvalPlan,
     EvalStatus,
@@ -95,7 +95,7 @@ def run_eval_command(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    loaded = _load_target(args.target)
+    loaded = load_target(args.target, label="Eval target")
     if callable(loaded):
         loaded = loaded()
     if inspect.isawaitable(loaded):
@@ -132,21 +132,6 @@ def _compare(args: argparse.Namespace) -> int:
     if comparison.regressions or current.status != EvalStatus.PASSED:
         return 1
     return 0
-
-
-def _load_target(target: str) -> Any:
-    if ":" not in target:
-        raise ValueError("Eval target must use module:attribute syntax.")
-    module_name, attr_path = target.split(":", 1)
-    if not module_name or not attr_path:
-        raise ValueError("Eval target must use module:attribute syntax.")
-    module = importlib.import_module(module_name)
-    value: Any = module
-    for part in attr_path.split("."):
-        if not part:
-            raise ValueError("Eval target attribute path contains an empty segment.")
-        value = getattr(value, part)
-    return value
 
 
 def _coerce_plan(value: Any) -> EvalPlan:
