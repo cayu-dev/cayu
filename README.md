@@ -348,7 +348,9 @@ src/cayu/
 behind the optional `cayu[microsandbox]` extra for local microVM-backed command
 execution. `E2BRunner` and `E2BWorkspace` are available behind the optional
 `cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
-access. `PostgresSessionStore` and `PostgresTaskStore` are production-grade,
+access. `LambdaMicroVMRunner` is available behind `cayu[aws]` for AWS-native,
+Firecracker-isolated, stateful execution and composes with `RunnerWorkspace`.
+`PostgresSessionStore` and `PostgresTaskStore` are production-grade,
 multi-worker durable stores behind the optional `cayu[postgres]` extra
 (`pip install "cayu[postgres]"`); pass them to `CayuApp(session_store=..., task_store=...)`.
 
@@ -566,6 +568,46 @@ Likewise, `E2BRunner.create(envs=...)` configures sandbox-level environment
 variables. Treat those values as visible to code running in the sandbox, and use
 them only for non-secret boot/config values.
 
+For AWS Lambda MicroVM execution, build the sidecar image under
+`examples/lambda_microvm_sidecar/`, install `cayu[aws]`, and pass the image ARN explicitly:
+
+```python
+from cayu import LambdaMicroVMRunner, RunnerWorkspace
+
+runner = await LambdaMicroVMRunner.create(
+    "arn:aws:lambda:us-west-2:123456789012:microvm-image:cayu-runner",
+    region_name="us-west-2",
+    ingress_network_connectors=[
+        "arn:aws:lambda:us-west-2:aws:network-connector:aws-network-connector:ALL_INGRESS"
+    ],
+    idle_policy={
+        "autoResumeEnabled": True,
+        "maxIdleDurationSeconds": 900,
+        "suspendedDurationSeconds": 300,
+    },
+)
+workspace = RunnerWorkspace(runner)
+```
+
+The runner uses Boto3's standard credential chain for control-plane calls and short-lived JWE
+tokens for the dedicated MicroVM HTTPS endpoint. Tokens remain in memory and are refreshed on
+rejection; they are never reconnect metadata. The first-party image and token are fixed to port
+8080, and readiness requires sidecar protocol version `1`. The sidecar preserves process-form
+argv, uses an explicit Bash process only for shell-form commands, does not inherit its own
+environment into guest commands, bounds output while draining pipes, and kills process groups
+before reporting
+timeouts or cancellation. The host also enforces the requested command timeout plus a bounded
+cleanup grace period if the supervisor remains stuck in `running`. `close_action` accepts
+`"terminate"`, `"suspend"`, or `"none"`.
+
+See [AWS credentials for Cayu](docs/aws-credentials.md) for secure developer, coding-agent,
+CI, and workload-role setup plus the required Lambda permissions.
+
+For one MicroVM per durable session, use the environment-factory recipe in
+`examples/environments/lambda_microvm.py`. It stores only MicroVM identity/region/image metadata,
+reattaches on resume, creates a fresh MicroVM for forks, suspends interrupted sessions, and
+terminates completed or failed sessions through binding finalization.
+
 Use `SyncBinding` when a durable source workspace should be staged into a
 separate bound workspace for one session, then copied back after the run. This is
 useful when the active runner has its own filesystem, such as E2B or
@@ -729,7 +771,10 @@ To run Claude through **Amazon Bedrock**, install `cayu[aws]` and register an ex
 you need a named profile) and Bedrock's `ConverseStream` and `CountTokens` operations; it never
 requires or silently falls back to an Anthropic API key. The caller needs
 `bedrock:CountTokens` plus `bedrock:InvokeModel` for token counting and
-`bedrock:InvokeModelWithResponseStream` for streaming:
+`bedrock:InvokeModelWithResponseStream` for streaming.
+
+See [AWS credentials for Cayu](docs/aws-credentials.md) for local profiles, coding-agent and CI
+roles, credential safety rules, and IAM policy templates.
 
 ```python
 from cayu import AgentSpec, BedrockProvider, CayuApp

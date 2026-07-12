@@ -102,7 +102,9 @@ or in CI.
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for virtual egress | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
+| AWS Lambda MicroVM live | `cayu[aws]`, AWS credentials/region, built sidecar image | AWS MicroVM charges | `lambda-microvm-live` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
+| Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
 | Advanced runtime examples | `GEMINI_API_KEY` for the primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
@@ -129,8 +131,10 @@ high level:
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
+| real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and a built sidecar image are available | `lambda-microvm-live` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
+| Amazon Bedrock text, tool structured output, usage, and token counting | verified when AWS and a Bedrock model are available | `bedrock-provider-live` |
 | OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
 | OpenAI embedding and semantic-retrieval contract | verified when `OPENAI_API_KEY` is present | `knowledge-embedding-live` |
 | cache-aware branching, counterfactual approval, repository tournament, and tainted incident response | verified when the selected provider key is present and every scenario assertion passes | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, and provider-suffixed portability checks |
@@ -155,7 +159,7 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 23 `examples/*_live.py` files:
+There are 25 `examples/*_live.py` files:
 
 | prerequisite | examples |
 | --- | --- |
@@ -163,6 +167,8 @@ There are 23 `examples/*_live.py` files:
 | `sbx` | `sbx_interrupt_live.py`, `sbx_sync_binding_live.py` |
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
+| AWS credentials, region, and Lambda MicroVM image | `lambda_microvm_runner_live.py` |
+| AWS credentials, region, and Bedrock model | `bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |
 | OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |

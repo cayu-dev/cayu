@@ -416,6 +416,8 @@ def test_live_credential_policy_contains_aws_inputs() -> None:
         "AWS_SESSION_TOKEN",
         "CAYU_BEDROCK_LIVE",
         "CAYU_BEDROCK_MODEL",
+        "CAYU_LAMBDA_MICROVM_IMAGE",
+        "CAYU_LAMBDA_MICROVM_LIVE",
     }
 
     assert expected <= set(nightly._LIVE_CREDENTIAL_ENV)
@@ -550,6 +552,42 @@ def test_microsandbox_virtual_egress_skips_when_runtime_is_unavailable(
     assert called is False
     assert result.status == nightly.STATUS_SKIPPED
     assert result.reason == "Microsandbox runtime is unavailable"
+
+
+def test_lambda_microvm_live_check_defers_credential_discovery_to_boto3(
+    tmp_path: Path,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "lambda-microvm-live")
+    environ = {
+        "HOME": str(tmp_path),
+        "CAYU_LAMBDA_MICROVM_LIVE": "1",
+        "CAYU_LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+        "AWS_REGION": "us-west-2",
+    }
+
+    missing = nightly._missing_prerequisites(check, environ)
+
+    assert missing == []
+
+
+def test_lambda_microvm_live_opt_in_flag_must_equal_one() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "lambda-microvm-live")
+    environ = {
+        "CAYU_LAMBDA_MICROVM_LIVE": "0",
+        "CAYU_LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+        "AWS_REGION": "us-west-2",
+    }
+
+    result = nightly.run_checks(
+        [check],
+        environ=environ,
+        runner=lambda command, env: pytest.fail(
+            "Lambda MicroVM live check ran without explicit opt-in"
+        ),
+    )[0]
+
+    assert result.status == nightly.STATUS_SKIPPED
+    assert result.reason == "CAYU_LAMBDA_MICROVM_LIVE must equal '1'"
 
 
 @pytest.mark.parametrize(

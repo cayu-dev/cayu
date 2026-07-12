@@ -25,6 +25,16 @@ from cayu.runners.e2b import (
     E2BCloseAction,
     E2BRunner,
 )
+from cayu.runners.lambda_microvm import (
+    DEFAULT_LAMBDA_MICROVM_CWD,
+    HttpxLambdaMicroVMEndpointTransport,
+    LambdaMicroVMCloseAction,
+    LambdaMicroVMEndpointTransport,
+    LambdaMicroVMEndpointUnauthorized,
+    LambdaMicroVMError,
+    LambdaMicroVMProtocolError,
+    LambdaMicroVMRunner,
+)
 from cayu.runners.local import LocalRunner
 from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_CWD,
@@ -44,6 +54,7 @@ __all__ = [
     "DEFAULT_DOCKER_IMAGE",
     "DEFAULT_E2B_CWD",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
+    "DEFAULT_LAMBDA_MICROVM_CWD",
     "DEFAULT_MICROSANDBOX_CWD",
     "DEFAULT_MICROSANDBOX_IMAGE",
     "DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY",
@@ -57,6 +68,13 @@ __all__ = [
     "E2BRunner",
     "ExecCommand",
     "ExecResult",
+    "HttpxLambdaMicroVMEndpointTransport",
+    "LambdaMicroVMCloseAction",
+    "LambdaMicroVMEndpointTransport",
+    "LambdaMicroVMEndpointUnauthorized",
+    "LambdaMicroVMError",
+    "LambdaMicroVMProtocolError",
+    "LambdaMicroVMRunner",
     "LocalRunner",
     "MicrosandboxCloseAction",
     "MicrosandboxRunner",

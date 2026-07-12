@@ -1073,6 +1073,30 @@ placeholder mechanism. A microVM boundary prevents ordinary workspace escape,
 but it does not make broad host mounts, host env inheritance, or unscoped secret
 injection safe.
 
+`LambdaMicroVMRunner` is the AWS-native Firecracker adapter behind the optional `cayu[aws]`
+extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for the authenticated
+sidecar health interface, and terminates a newly created MicroVM if setup fails or is cancelled.
+`from_existing(...)` restores identity from `get_microvm` and generates a fresh endpoint token;
+JWE tokens are memory-only and never belong in reconnect metadata. Both process and shell forms
+cross sidecar protocol version `1` without host-environment inheritance; readiness rejects an
+image that reports another version. Endpoint authentication and the first-party sidecar are
+fixed to port 8080. The guest supervisor
+owns process groups, drains bounded stdout/stderr, enforces timeouts, and confirms command or
+sandbox cleanup using the same `cayu.runner_cleanup.v1` artifacts as the other remote runners.
+The host independently caps a timed command at its requested timeout plus a bounded cleanup
+grace period, so a responsive but wedged supervisor cannot poll forever.
+`close_action` is `terminate`, `suspend`, or `none`, and explicit `suspend()` / `resume()` /
+`terminate()` methods support app-owned lifecycle policy.
+
+Lambda MicroVM files use the existing `RunnerWorkspace` module rather than a duplicate vendor
+workspace adapter. The first-party sidecar image guarantees `python3` and `/workspace`, so
+`RunnerWorkspace(LambdaMicroVMRunner(...))` keeps file and command operations in the same
+MicroVM while retaining the common path-safety and bounded-list/read behavior. The recipe in
+`examples/environments/lambda_microvm.py` composes that pair with an `EnvironmentFactory` and a
+lifecycle binding: resume reattaches from non-secret MicroVM id/endpoint/region/image metadata,
+forks allocate a fresh MicroVM, interrupted finalization suspends, and completed/failed
+finalization terminates.
+
 ## Workspace
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
