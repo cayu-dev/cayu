@@ -755,3 +755,79 @@ def test_strict_sigkill_selection_reports_command_failure(
     assert exit_code == 1
     assert "| sigkill-recovery | recovery | failed |" in output
     assert "SIGKILL recovery assertion failed" in output
+
+
+@pytest.mark.parametrize(
+    ("check_id", "module"),
+    [
+        ("advanced-research-council", "cache_aware_research_council"),
+        ("advanced-counterfactual-approval", "counterfactual_approval"),
+        ("advanced-repo-tournament", "repo_maintainer_tournament"),
+        ("advanced-tainted-incident", "tainted_incident_response"),
+    ],
+)
+def test_advanced_examples_are_verified_gemini_contracts(
+    check_id: str,
+    module: str,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == check_id)
+
+    assert check.lane == "advanced-runtime"
+    assert check.command == (
+        "uv",
+        "run",
+        "python",
+        "-m",
+        f"examples.{module}.app",
+        "--mode",
+        "live",
+        "--provider",
+        "gemini",
+        "--trials",
+        "5",
+    )
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.required_env == ("GEMINI_API_KEY",)
+    assert check.requires_provider_api_key is True
+    assert check.requires_structured_evidence is True
+    assert check.reason is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "key_name"),
+    [("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")],
+)
+@pytest.mark.parametrize(
+    ("check_id", "module"),
+    [
+        ("advanced-research-council", "cache_aware_research_council"),
+        ("advanced-counterfactual-approval", "counterfactual_approval"),
+        ("advanced-repo-tournament", "repo_maintainer_tournament"),
+        ("advanced-tainted-incident", "tainted_incident_response"),
+    ],
+)
+def test_advanced_examples_have_credential_gated_provider_portability_checks(
+    provider: str,
+    key_name: str,
+    check_id: str,
+    module: str,
+) -> None:
+    check = next(check for check in nightly.CHECKS if check.id == f"{check_id}-{provider}")
+
+    assert check.lane == "advanced-runtime-portability"
+    assert check.command == (
+        "uv",
+        "run",
+        "python",
+        "-m",
+        f"examples.{module}.app",
+        "--mode",
+        "live",
+        "--provider",
+        provider,
+        "--trials",
+        "1",
+    )
+    assert check.required_env == (key_name,)
+    assert check.requires_provider_api_key is True
+    assert check.requires_structured_evidence is True

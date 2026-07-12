@@ -10,6 +10,8 @@ build/
 .DS_Store
 .cayu/
 .cayu-internal-runtime-acceptance.json
+.cayu-example-results/
+.cayu-example-workspaces/
 .examples-workspaces/
 node_modules/
 dashboard/dist/

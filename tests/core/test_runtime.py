@@ -19221,6 +19221,7 @@ def test_in_memory_session_store_rejects_fork_status_mismatch():
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )
@@ -19253,6 +19254,7 @@ def test_in_memory_session_store_rejects_fork_provider_mismatch():
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )
@@ -19286,6 +19288,7 @@ def test_in_memory_session_store_transforms_current_checkpoint_during_fork():
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=None,
             checkpoint_transform=lambda _session, checkpoint: {
                 "copied_version": checkpoint["version"] if checkpoint else None

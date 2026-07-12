@@ -2366,6 +2366,7 @@ def test_fork_transcripts_do_not_alias_source_transcripts(
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=None,
             checkpoint_transform=None,
         )

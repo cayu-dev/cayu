@@ -27,6 +27,35 @@ src/cayu/
 
 This keeps framework dependency direction clear and avoids circular imports.
 
+## Example and Verification Surfaces
+
+Runnable examples are product and contributor surfaces, not miscellaneous test
+fixtures:
+
+```text
+examples/
+  ADVANCED_RUNTIME_EXAMPLES.md
+  _advanced_support/
+  cache_aware_research_council/
+  counterfactual_approval/
+  repo_maintainer_tournament/
+  tainted_incident_response/
+tests/advanced_examples/
+scripts/nightly_verification.py
+```
+
+Agents and developers changing advanced runtime behavior should start with
+[`examples/ADVANCED_RUNTIME_EXAMPLES.md`](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
+It routes to each scenario, the shared evidence envelope, deterministic
+specifications, live-provider registrations, and the relevant runtime contracts.
+The product narrative and measured proof boundaries live in
+[`docs/advanced-runtime-examples.md`](advanced-runtime-examples.md).
+
+Keep one provider-neutral `scenario.py` per advanced example. Deterministic and
+live modules construct backends around that scenario rather than implementing
+separate behavior. Shared runtime-facing helpers belong under
+`examples/_advanced_support/`; domain-specific code remains inside its example.
+
 ## Generated User Project
 
 Default user projects should be Rails-like and easy to understand:

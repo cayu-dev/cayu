@@ -536,6 +536,7 @@ def test_sqlite_session_store_rejects_fork_status_mismatch(tmp_path):
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )
@@ -570,6 +571,7 @@ def test_sqlite_session_store_rejects_fork_provider_mismatch(tmp_path):
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )
@@ -604,6 +606,7 @@ def test_sqlite_session_store_transforms_current_checkpoint_during_fork(tmp_path
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=None,
             checkpoint_transform=lambda _session, checkpoint: {
                 "copied_version": checkpoint["version"] if checkpoint else None
@@ -668,6 +671,7 @@ def test_sqlite_session_store_fork_reads_checkpoint_inside_write_transaction(tmp
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=None,
             checkpoint_transform=transform,
         )

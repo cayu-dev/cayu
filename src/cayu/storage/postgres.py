@@ -3403,6 +3403,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -3422,6 +3423,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         source_session_id=source_session_id,
                         fork=fork,
                         allowed_statuses=allowed_statuses,
+                        expected_source_run_epoch=expected_source_run_epoch,
                     )
 
                     await cur.execute(

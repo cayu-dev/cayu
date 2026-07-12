@@ -111,6 +111,62 @@ class VerificationResult:
 CommandRunner = Callable[[Sequence[str], Mapping[str, str]], CommandOutcome]
 ProgressReporter = Callable[[str], None]
 
+_ADVANCED_EXAMPLE_PORTABILITY_SPECS = (
+    (
+        "advanced-research-council",
+        "cache_aware_research_council",
+        "checkpoint forks, evaluator repair, causal budget, and cache-window policy",
+    ),
+    (
+        "advanced-counterfactual-approval",
+        "counterfactual_approval",
+        "authority-free approval futures and exactly-once protected execution",
+    ),
+    (
+        "advanced-repo-tournament",
+        "repo_maintainer_tournament",
+        "isolated repair tournament, evaluator gates, and idempotent PR promotion",
+    ),
+    (
+        "advanced-tainted-incident",
+        "tainted_incident_response",
+        "fork-taint propagation, quarantine policy, and sanitized handoff",
+    ),
+)
+_ADVANCED_PORTABILITY_PROVIDERS = (
+    ("openai", "OPENAI_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+)
+
+
+def _advanced_provider_portability_checks() -> tuple[VerificationCheck, ...]:
+    return tuple(
+        VerificationCheck(
+            id=f"{check_id}-{provider}",
+            capability=f"{capability} ({provider} portability)",
+            lane="advanced-runtime-portability",
+            command=(
+                "uv",
+                "run",
+                "python",
+                "-m",
+                f"examples.{module}.app",
+                "--mode",
+                "live",
+                "--provider",
+                provider,
+                "--trials",
+                "1",
+            ),
+            prerequisites=(key_name,),
+            required_env=(key_name,),
+            requires_provider_api_key=True,
+            requires_structured_evidence=True,
+        )
+        for provider, key_name in _ADVANCED_PORTABILITY_PROVIDERS
+        for check_id, module, capability in _ADVANCED_EXAMPLE_PORTABILITY_SPECS
+    )
+
 
 CHECKS: tuple[VerificationCheck, ...] = (
     VerificationCheck(
@@ -402,6 +458,99 @@ CHECKS: tuple[VerificationCheck, ...] = (
         required_env=("OPENAI_API_KEY",),
         requires_structured_evidence=True,
     ),
+    VerificationCheck(
+        id="advanced-research-council",
+        capability="checkpoint forks, evaluator repair, causal budget, and cache-window policy",
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.cache_aware_research_council.app",
+            "--mode",
+            "live",
+            "--provider",
+            "gemini",
+            "--trials",
+            "5",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("GEMINI_API_KEY",),
+        required_env=("GEMINI_API_KEY",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
+        id="advanced-counterfactual-approval",
+        capability="authority-free approval futures and exactly-once protected execution",
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.counterfactual_approval.app",
+            "--mode",
+            "live",
+            "--provider",
+            "gemini",
+            "--trials",
+            "5",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("GEMINI_API_KEY",),
+        required_env=("GEMINI_API_KEY",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
+        id="advanced-repo-tournament",
+        capability="isolated repair tournament, evaluator gates, and idempotent PR promotion",
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.repo_maintainer_tournament.app",
+            "--mode",
+            "live",
+            "--provider",
+            "gemini",
+            "--trials",
+            "5",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("GEMINI_API_KEY",),
+        required_env=("GEMINI_API_KEY",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
+        id="advanced-tainted-incident",
+        capability="fork-taint propagation, quarantine policy, and sanitized handoff",
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.tainted_incident_response.app",
+            "--mode",
+            "live",
+            "--provider",
+            "gemini",
+            "--trials",
+            "5",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("GEMINI_API_KEY",),
+        required_env=("GEMINI_API_KEY",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    *_advanced_provider_portability_checks(),
     VerificationCheck(
         id="dashboard-behavior",
         capability="dashboard browser behavior",

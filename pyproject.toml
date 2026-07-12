@@ -90,7 +90,7 @@ cayu = "cayu.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 markers = [
   "postgres_recovery: real process-death coverage requiring the Postgres lane",
   "sigkill_recovery: real process-death recovery coverage run in its own lane",

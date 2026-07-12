@@ -133,6 +133,7 @@ reattach instead of guessing.
 
 - [Quickstart](#quickstart)
 - [Featured example: cloud PR reviewer](#featured-example-cloud-pr-reviewer)
+- [Advanced runtime examples](#advanced-runtime-examples)
 - [Further reading](#further-reading)
 - [Design goals](#design-goals) · [Scope](#scope) · [Contract rules](#contract-rules) · [Repository layout](#repository-layout)
 - [Development](#development) · [Usage and cache metrics](#usage-and-cache-metrics) · [Thinking and reasoning](#thinking-and-reasoning) · [Examples](#example)
@@ -222,10 +223,29 @@ it posts one review comment back. Runnable code lives in
 [`examples/github_pr_reviewer/`](examples/github_pr_reviewer/); run the no-key demo
 with `PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py`.
 
+## Advanced runtime examples
+
+Cayu's advanced examples are executable runtime specifications for behavior that
+depends on programmable sessions, checkpoints, forks, authority, recovery, and
+durable evidence—not exact model prose.
+
+| Example | Runtime capability |
+| --- | --- |
+| [Cache-aware research council](examples/cache_aware_research_council/) | Compact shared context once, fork several strategies, evaluate them from another branch, and repair the selected result while measuring provider-reported input tokens. |
+| [Counterfactual approval](examples/counterfactual_approval/) | Compute authority-free approved and denied futures during a human wait, reject stale state, select one analysis as advisory continuation context, and recover exactly one protected mutation after `CayuApp` reconstruction. |
+| [Repository maintainer tournament](examples/repo_maintainer_tournament/) | Replay competing repairs in isolated worktrees, reject test weakening, select one winner, and optionally push exactly one verified PR to a real repository. |
+| [Tainted incident response](examples/tainted_incident_response/) | Carry origin-based taint through a generic fork and `CayuApp` reconstruction, block protected authority, and transfer only a sanitized artifact to a clean session. |
+
+Start with the [advanced example developer index](examples/ADVANCED_RUNTIME_EXAMPLES.md)
+for commands, evidence contracts, and verification lanes. See
+[Advanced runtime strategies](docs/advanced-runtime-examples.md) for the product
+story, measured observations, and explicit proof boundaries.
+
 ## Further reading
 
 User guides:
 
+- [Advanced runtime strategies](docs/advanced-runtime-examples.md) — programmable forks, speculative approval, evaluator branches, real-repository promotion, and taint-aware isolation with measured evidence.
 - [PR-reviewer recipe](docs/recipes/pr-reviewer.md) — the featured end-to-end example.
 - [Business approvals recipe](docs/recipes/business-approvals.md) — multi-tier approve/condition/decline on top of the binary approval primitive.
 - [Triggering runs](docs/triggering-runs.md) — which start verb (run / dispatch / task worker / subagent / event watcher) fits your trigger.

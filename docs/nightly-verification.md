@@ -29,6 +29,11 @@ The report is the product. A pass count without a capability map is not enough.
 5. **Costs and prerequisites are separate.** "No LLM spend" does not mean "no
    external service." E2B needs `E2B_API_KEY` even when no model is called.
 
+The four executable advanced scenarios and their assertion contract are indexed
+in [`examples/ADVANCED_RUNTIME_EXAMPLES.md`](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
+Their product story and dated live observations are documented in
+[`docs/advanced-runtime-examples.md`](advanced-runtime-examples.md).
+
 ## Runner
 
 `scripts/nightly_verification.py` emits both machine-readable JSON and
@@ -98,6 +103,7 @@ or in CI.
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
+| Advanced runtime examples | `GEMINI_API_KEY` for the primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
@@ -124,6 +130,7 @@ high level:
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
 | OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
 | OpenAI embedding and semantic-retrieval contract | verified when `OPENAI_API_KEY` is present | `knowledge-embedding-live` |
+| cache-aware branching, counterfactual approval, repository tournament, and tainted incident response | verified when the selected provider key is present and every scenario assertion passes | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, and provider-suffixed portability checks |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | real provider adapter transport abort with durable terminal state | verified on loopback TCP and SQLite | `provider-stream-abort` |
@@ -137,6 +144,13 @@ Do not update this document with exact pass counts. Counts move as tests are
 added and dependencies change; the generated report records current counts.
 
 ## Live Examples
+
+The advanced runtime suite uses package directories rather than the
+`examples/*_live.py` naming convention. Primary Gemini registrations run five
+trials when invoked; OpenAI and Anthropic portability registrations run one
+trial per scenario. Real GitHub promotion for the repository tournament remains
+an explicit manual check because it creates a branch and pull request in the
+configured disposable repository.
 
 There are 23 `examples/*_live.py` files:
 

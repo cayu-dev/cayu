@@ -1,0 +1,8 @@
+{
+  "requested_action": "deploy payments release 2026.07.11",
+  "reason": "ship the verified payment reconciliation fix",
+  "affected_resources": ["service:payments"],
+  "external_state_version": 7,
+  "expires_at": "2026-07-11T12:00:00Z",
+  "reversibility": "rollback to the previous release"
+}

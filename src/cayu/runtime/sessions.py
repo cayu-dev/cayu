@@ -1142,6 +1142,7 @@ class SessionStore(ABC):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
     ) -> Session:
         """Create a forked session with copied transcript/checkpoint state."""
 
@@ -1413,6 +1414,7 @@ class InMemorySessionStore(SessionStore):
         source_statuses: set[SessionStatus],
         transcript_cursor: int | None,
         checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -1428,6 +1430,7 @@ class InMemorySessionStore(SessionStore):
                 source_session_id=source_session_id,
                 fork=fork,
                 allowed_statuses=allowed_statuses,
+                expected_source_run_epoch=expected_source_run_epoch,
             )
             if fork.id in self._sessions:
                 raise ValueError(f"Session already exists: {fork.id}")
@@ -2441,11 +2444,17 @@ def _validate_session_fork_source(
     source_session_id: str,
     fork: Session,
     allowed_statuses: set[SessionStatus],
+    expected_source_run_epoch: int,
 ) -> Session:
     if source_session is None:
         raise KeyError(f"Session not found: {source_session_id}")
     if source_session.status not in allowed_statuses:
         raise ValueError(f"Source session status is not forkable: {source_session.status}")
+    if source_session.run_epoch != expected_source_run_epoch:
+        raise ValueError(
+            "Source session changed while the fork was being prepared: "
+            f"run_epoch {source_session.run_epoch} != {expected_source_run_epoch}"
+        )
     if fork.status != source_session.status:
         raise ValueError(
             "Fork status must match source session status: "

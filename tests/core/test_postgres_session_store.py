@@ -391,6 +391,7 @@ def test_postgres_session_store_transforms_current_checkpoint_during_fork(postgr
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=None,
             checkpoint_transform=lambda _s, ck: {"copied_version": ck["version"] if ck else None},
         )
@@ -504,6 +505,7 @@ def test_postgres_session_store_fork_honors_transcript_cursor(postgres_dsn):
                 status=SessionStatus.COMPLETED,
             ),
             source_statuses={SessionStatus.COMPLETED},
+            expected_source_run_epoch=source.run_epoch,
             transcript_cursor=2,
             checkpoint_transform=None,
         )
@@ -522,6 +524,7 @@ def test_postgres_session_store_fork_honors_transcript_cursor(postgres_dsn):
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=99,
                 checkpoint_transform=None,
             )
@@ -553,6 +556,7 @@ def test_postgres_session_store_rejects_fork_status_and_provider_mismatch(postgr
                     status=SessionStatus.RUNNING,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )
@@ -569,6 +573,7 @@ def test_postgres_session_store_rejects_fork_status_and_provider_mismatch(postgr
                     status=SessionStatus.COMPLETED,
                 ),
                 source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
                 transcript_cursor=None,
                 checkpoint_transform=None,
             )

@@ -382,6 +382,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
+                    expected_source_run_epoch=source.run_epoch,
                     transcript_cursor=None,
                     checkpoint_transform=None,
                 )
@@ -398,6 +399,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
+                    expected_source_run_epoch=source.run_epoch,
                     transcript_cursor=-1,
                     checkpoint_transform=None,
                 )
@@ -414,6 +416,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.COMPLETED},
+                    expected_source_run_epoch=source.run_epoch,
                     transcript_cursor=None,
                     checkpoint_transform=None,
                 )
@@ -430,6 +433,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         status=SessionStatus.COMPLETED,
                     ),
                     source_statuses={SessionStatus.PENDING},
+                    expected_source_run_epoch=source.run_epoch,
                     transcript_cursor=None,
                     checkpoint_transform=None,
                 )
@@ -446,6 +450,7 @@ def test_session_store_conformance_validates_fork_request_preamble(
                         status=SessionStatus.PENDING,
                     ),
                     source_statuses={SessionStatus.PENDING},
+                    expected_source_run_epoch=source.run_epoch,
                     transcript_cursor=None,
                     checkpoint_transform=None,
                 )

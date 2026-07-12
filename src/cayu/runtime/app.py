@@ -3173,6 +3173,13 @@ class CayuApp:
             )
 
         registered_provider = self._get_registered_provider(source_session.provider_name)
+        try:
+            source_registered_agent = self._get_registered_agent(source_session.agent_name)
+        except KeyError as exc:
+            raise KeyError(
+                "Source agent must be registered to derive inherited taint before forking: "
+                f"{source_session.agent_name}"
+            ) from exc
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
         if (
@@ -3224,6 +3231,18 @@ class CayuApp:
                     environment_name=environment_name,
                 )
 
+        inherited_taint_labels = await self._prior_taint_labels_for_policy(
+            session_id=source_session.id,
+            policy=source_registered_agent.tool_policy,
+            request_metadata=source_session.metadata,
+        )
+        fork_metadata = request.metadata
+        if inherited_taint_labels:
+            fork_metadata = metadata_with_taint_labels(
+                request.metadata,
+                inherited_taint_labels | taint_labels_from_metadata(request.metadata),
+            )
+
         fork_session = Session(
             id=request.session_id or str(uuid4()),
             agent_name=agent_name,
@@ -3236,7 +3255,7 @@ class CayuApp:
             environment_name=environment_name,
             status=source_session.status,
             labels=source_session.labels,
-            metadata=copy_json_value(request.metadata, "metadata"),
+            metadata=copy_json_value(fork_metadata, "metadata"),
         )
         created = await self.session_store.create_fork(
             source_session_id=source_session.id,
@@ -3244,6 +3263,7 @@ class CayuApp:
             source_statuses=_FORKABLE_SESSION_STATUSES,
             transcript_cursor=request.transcript_cursor,
             checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=source_session.run_epoch,
         )
         yield await self._event_writer.emit(
             Event(
@@ -3262,6 +3282,7 @@ class CayuApp:
                     "provider_name": created.provider_name,
                     "model": created.model,
                     "environment_name": created.environment_name,
+                    "inherited_taint_labels": sorted(inherited_taint_labels),
                 },
             )
         )
@@ -7743,11 +7764,15 @@ class CayuApp:
         policy: ToolPolicy,
         request_metadata: dict[str, Any],
     ) -> set[str]:
-        if not isinstance(policy, TaintAwareToolPolicy):
-            return set()
-        # Seed with any taint labels carried on the run request so a subagent inherits its
-        # parent session's taint (propagated at spawn); union the child session's own labels.
+        # Seed with labels persisted on the session plus labels supplied for this continuation.
+        # Session metadata is the durable trust boundary used by generic forks; request metadata
+        # remains the per-run path used by explicit subagent spawns.
         labels: set[str] = set(taint_labels_from_metadata(request_metadata))
+        session = await self.session_store.load(session_id)
+        if session is not None:
+            labels.update(taint_labels_from_metadata(session.metadata))
+        if not isinstance(policy, TaintAwareToolPolicy):
+            return labels
         for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
             records = await self._query_all_event_records(
                 EventQuery(
