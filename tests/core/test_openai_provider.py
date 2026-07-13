@@ -1561,6 +1561,76 @@ async def test_openai_stream_events_emits_incomplete_terminal_response() -> None
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("pending_item_type", ["function_call", "reasoning"])
+async def test_openai_stream_events_discards_unfinished_items_on_incomplete_response(
+    pending_item_type: str,
+) -> None:
+    if pending_item_type == "function_call":
+        item = {
+            "type": "function_call",
+            "id": "fc_partial",
+            "call_id": "call_partial",
+            "name": "echo",
+            "arguments": '{"text":',
+            "status": "incomplete",
+        }
+        partial_events = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**item, "arguments": "", "status": "in_progress"},
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_partial",
+                "output_index": 0,
+                "delta": '{"text":',
+            },
+        ]
+    else:
+        item = {
+            "type": "reasoning",
+            "id": "rs_partial",
+            "status": "incomplete",
+            "summary": [],
+        }
+        partial_events = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": item,
+            },
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "partial thought",
+            },
+        ]
+
+    async def raw_events():
+        for event in partial_events:
+            yield event
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_partial",
+                "model": "gpt-test",
+                "status": "incomplete",
+                "output": [item],
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert ModelStreamEventType.TOOL_CALL not in [event.type for event in events]
+    completed = [event for event in events if event.type == ModelStreamEventType.COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].completion is not None
+    assert completed[0].completion.finish_reason == ModelFinishReason.LENGTH
+    assert completed[0].payload["provider_state"] == []
+
+
+@pytest.mark.anyio
 async def test_openai_stream_events_uses_done_function_call_arguments() -> None:
     async def raw_events():
         yield {

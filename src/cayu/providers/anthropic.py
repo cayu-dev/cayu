@@ -641,6 +641,9 @@ def anthropic_response_events(
     content = response.get("content")
     if not isinstance(content, list):
         raise AnthropicProtocolError("Anthropic response content must be a list.")
+    usage = response.get("usage")
+    if usage is not None and not isinstance(usage, Mapping):
+        raise AnthropicProtocolError("Anthropic response usage must be an object.")
 
     events: list[ModelStreamEvent] = []
     for index, block in enumerate(content):
@@ -711,7 +714,7 @@ def anthropic_response_events(
                 "model": _optional_string(response, "model"),
                 "stop_reason": _optional_string(response, "stop_reason"),
                 "stop_sequence": _optional_string(response, "stop_sequence"),
-                "usage": copy_json_value(response.get("usage"), "usage"),
+                "usage": copy_json_value(None if usage is None else dict(usage), "usage"),
             }
         )
     )

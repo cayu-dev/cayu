@@ -645,6 +645,11 @@ def test_anthropic_response_events_rejects_malformed_tool_use() -> None:
         )
 
 
+def test_anthropic_response_events_rejects_non_object_usage() -> None:
+    with pytest.raises(AnthropicProtocolError, match="usage must be an object"):
+        anthropic_response_events({"content": [], "usage": []})
+
+
 def test_anthropic_options_must_not_override_reserved_payload_fields() -> None:
     request = ModelRequest(
         model="claude-test",

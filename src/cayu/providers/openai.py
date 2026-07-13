@@ -783,16 +783,26 @@ async def openai_stream_events(
             yield tool_call_event
             continue
         if event_type in {"response.completed", "response.incomplete"}:
-            if pending_function_calls:
+            unfinished_output_indexes = {
+                *pending_function_calls,
+                *pending_reasoning_items,
+            }
+            # A completed response promises complete output items. An incomplete
+            # response may end mid-item, so retain the terminal classification but
+            # exclude partial state that cannot be replayed or executed safely.
+            if event_type == "response.completed" and pending_function_calls:
                 raise OpenAIProtocolError(
                     "OpenAI streaming response completed with unfinished function calls."
                 )
-            if pending_reasoning_items:
+            if event_type == "response.completed" and pending_reasoning_items:
                 raise OpenAIProtocolError(
                     "OpenAI streaming response completed with unfinished reasoning items."
                 )
             yield _stream_completed_event(
-                event, fallback_output_items, reasoning_state=reasoning_state
+                event,
+                fallback_output_items,
+                excluded_output_indexes=unfinished_output_indexes,
+                reasoning_state=reasoning_state,
             )
             completed = True
             continue
@@ -994,18 +1004,35 @@ def _stream_completed_event(
     event: Mapping[str, Any],
     fallback_output_items: Mapping[int, Mapping[str, Any]],
     *,
+    excluded_output_indexes: set[int] | None = None,
     reasoning_state: str = "inline",
 ) -> ModelStreamEvent:
     response = _stream_response_object(event)
+    excluded_output_indexes = excluded_output_indexes or set()
     if response.get("output") is None:
-        provider_state_items = _provider_state_items_from_output_items(fallback_output_items)
-        completion_output_items = list(_sorted_output_items(fallback_output_items))
+        completed_output_items = {
+            index: item
+            for index, item in fallback_output_items.items()
+            if index not in excluded_output_indexes
+        }
+        provider_state_items = _provider_state_items_from_output_items(completed_output_items)
+        completion_output_items = list(_sorted_output_items(completed_output_items))
         return _completed_event_from_response(
             response,
             provider_state_items,
             completion_output_items=completion_output_items,
             reasoning_state=reasoning_state,
         )
+    output = response.get("output")
+    if excluded_output_indexes and isinstance(output, list):
+        response = {
+            **response,
+            "output": [
+                item
+                for output_index, item in enumerate(output)
+                if output_index not in excluded_output_indexes
+            ],
+        }
     return _completed_event_from_response(response, reasoning_state=reasoning_state)
 
 

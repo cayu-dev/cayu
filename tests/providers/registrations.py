@@ -24,6 +24,7 @@ from cayu.providers import (
     VertexContextOverflowError,
     VertexProvider,
 )
+from cayu.providers._sse import aiter_sse_json_events
 from tests.providers.conformance import (
     CapabilityClaim,
     ProviderCapabilities,
@@ -50,12 +51,19 @@ class _AsyncTransport:
             if idle_timeout_s is None:
                 await self._release.wait()
                 return
-            try:
-                await asyncio.wait_for(self._release.wait(), timeout=idle_timeout_s)
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"Conformance stream produced no event for {idle_timeout_s:g} seconds."
-                ) from exc
+
+            async def silent_lines() -> AsyncIterator[str]:
+                await self._release.wait()
+                if False:
+                    yield ""
+
+            async for _ in aiter_sse_json_events(
+                silent_lines(),
+                idle_timeout_s=idle_timeout_s,
+                provider_label="Conformance",
+                protocol_error=ValueError,
+            ):
+                pass
         finally:
             self.stopped.set()
 
@@ -137,7 +145,7 @@ class _OpenAITransport(_AsyncTransport):
         if self.scenario == "tool_round_trip":
             events = _openai_tool_events() if len(self.calls) == 1 else _openai_final_events()
             if len(self.calls) == 2:
-                _require_tool_result(payload, tool_call_id="call-conformance")
+                _require_openai_tool_result(payload, tool_call_id="call-conformance")
             for event in events:
                 yield event
             return
@@ -255,7 +263,7 @@ class _AnthropicShapeTransport(_AsyncTransport):
                 else _anthropic_text_events(model="claude-conformance", deltas=("tool-observed",))
             )
             if len(self.calls) == 2:
-                _require_tool_result(payload, tool_call_id="call-conformance")
+                _require_anthropic_tool_result(payload, tool_call_id="call-conformance")
             for event in events:
                 yield event
             return
@@ -381,7 +389,7 @@ class _ChatCompletionsTransport(_AsyncTransport):
                 else _chat_text_events(deltas=("tool-observed",))
             )
             if len(self.calls) == 2:
-                _require_tool_result(payload, tool_call_id="call-conformance")
+                _require_chat_completions_tool_result(payload, tool_call_id="call-conformance")
             for event in events:
                 yield event
             return
@@ -467,7 +475,7 @@ class _BedrockClient:
                 else _bedrock_text_events(deltas=("tool-observed",))
             )
             if len(self.calls) == 2:
-                _require_tool_result(kwargs, tool_call_id="call-conformance")
+                _require_bedrock_tool_result(kwargs, tool_call_id="call-conformance")
             return {"stream": iter(events)}
         if self.scenario not in {"text", "close"}:
             raise AssertionError(f"Bedrock scenario {self.scenario!r} is not implemented.")
@@ -494,8 +502,10 @@ class _BlockingBedrockStream:
 
     def __next__(self) -> dict[str, Any]:
         self.started.set()
-        self._release.wait()
+        released = self._release.wait(timeout=1.0)
         self.stopped.set()
+        if not released:
+            raise RuntimeError("The Bedrock conformance stream was not released.")
         raise StopIteration
 
     def close(self) -> None:
@@ -1235,9 +1245,73 @@ def _bedrock_cache_events() -> Iterable[dict[str, Any]]:
     }
 
 
-def _require_tool_result(payload: Mapping[str, Any], *, tool_call_id: str) -> None:
-    rendered = json.dumps(payload, sort_keys=True, default=str)
-    if tool_call_id not in rendered or "conformance-tool" not in rendered:
+def _require_openai_tool_result(payload: Mapping[str, Any], *, tool_call_id: str) -> None:
+    input_items = payload.get("input")
+    valid = isinstance(input_items, list) and any(
+        isinstance(item, Mapping)
+        and item.get("type") == "function_call_output"
+        and item.get("call_id") == tool_call_id
+        and item.get("output") == "conformance-tool"
+        for item in input_items
+    )
+    _require_completed_tool_result(valid)
+
+
+def _require_anthropic_tool_result(payload: Mapping[str, Any], *, tool_call_id: str) -> None:
+    messages = payload.get("messages")
+    valid = isinstance(messages, list) and any(
+        isinstance(message, Mapping)
+        and message.get("role") == "user"
+        and isinstance((content := message.get("content")), list)
+        and any(
+            isinstance(block, Mapping)
+            and block.get("type") == "tool_result"
+            and block.get("tool_use_id") == tool_call_id
+            and block.get("content") == "conformance-tool"
+            for block in content
+        )
+        for message in messages
+    )
+    _require_completed_tool_result(valid)
+
+
+def _require_chat_completions_tool_result(payload: Mapping[str, Any], *, tool_call_id: str) -> None:
+    messages = payload.get("messages")
+    valid = isinstance(messages, list) and any(
+        isinstance(message, Mapping)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id") == tool_call_id
+        and message.get("content") == "conformance-tool"
+        for message in messages
+    )
+    _require_completed_tool_result(valid)
+
+
+def _require_bedrock_tool_result(payload: Mapping[str, Any], *, tool_call_id: str) -> None:
+    messages = payload.get("messages")
+    valid = isinstance(messages, list) and any(
+        isinstance(message, Mapping)
+        and message.get("role") == "user"
+        and isinstance((content := message.get("content")), list)
+        and any(
+            isinstance(block, Mapping)
+            and isinstance((result := block.get("toolResult")), Mapping)
+            and result.get("toolUseId") == tool_call_id
+            and result.get("status") == "success"
+            and isinstance((result_content := result.get("content")), list)
+            and any(
+                isinstance(part, Mapping) and part.get("text") == "conformance-tool"
+                for part in result_content
+            )
+            for block in content
+        )
+        for message in messages
+    )
+    _require_completed_tool_result(valid)
+
+
+def _require_completed_tool_result(valid: bool) -> None:
+    if not valid:
         raise AssertionError("The second provider request omitted the completed tool result.")
 
 

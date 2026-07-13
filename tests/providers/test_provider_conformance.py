@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 import cayu.providers as providers_module
+import cayu.providers.openai as openai_module
+import tests.providers.registrations as registrations_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
@@ -53,6 +55,10 @@ class _NoopProvider(ModelProvider):
             yield ModelStreamEvent.completed()
 
 
+class _DifferentlyNamedAdapter(_NoopProvider):
+    name = "differently-named"
+
+
 async def _noop_factory(_scenario: str) -> ProviderHarness:
     return ProviderHarness(provider=_NoopProvider(), model="noop-model")
 
@@ -92,7 +98,7 @@ class _BrokenDuplicateToolProvider(ModelProvider):
         if self.calls == 1:
             for _ in range(2):
                 yield ModelStreamEvent.tool_call(
-                    id="call-duplicate",
+                    id="call-conformance",
                     name="echo",
                     arguments={"text": "conformance-tool"},
                 )
@@ -152,6 +158,15 @@ class _BrokenUnboundedCloseProvider(_NoopProvider):
 
     async def aclose(self) -> None:
         await asyncio.Event().wait()
+
+
+class _BrokenCollectionProvider(ModelProvider):
+    name = "broken-collection"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        raise RuntimeError("seeded collection failure")
+        yield ModelStreamEvent.completed()
 
 
 class _EchoTool(Tool):
@@ -386,7 +401,6 @@ async def _assert_close_contract(
     *,
     timeout_s: float = 0.5,
 ) -> None:
-    assert harness.is_closed is not None
     try:
         await asyncio.wait_for(harness.aclose(), timeout=timeout_s)
     except TimeoutError:
@@ -396,12 +410,50 @@ async def _assert_close_contract(
             scenario="close",
             observed=f"close exceeded {timeout_s:g} seconds",
         )
+    is_closed = harness.is_closed
     require_conformance(
-        harness.is_closed(),
+        is_closed is not None,
+        registration=registration,
+        scenario="close",
+        observed="close-state probe is not configured",
+    )
+    if is_closed is None:
+        return
+    require_conformance(
+        is_closed(),
         registration=registration,
         scenario="close",
         observed="owned resource remained open",
     )
+
+
+async def _collect_and_assert_close_contract(
+    registration: ProviderConformanceRegistration,
+    harness: ProviderHarness,
+) -> None:
+    try:
+        await harness.collect()
+    finally:
+        await _assert_close_contract(registration, harness)
+
+
+async def _collect_tool_round_trip_events(harness: ProviderHarness) -> list[Any]:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(harness.provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model=harness.model, system_prompt="Use the echo tool."),
+        tools=[_EchoTool()],
+    )
+    return [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Echo the text conformance-tool.")],
+                max_steps=3,
+            )
+        )
+    ]
 
 
 def test_provider_conformance_registration_requires_bounded_capability_reasons() -> None:
@@ -420,19 +472,157 @@ def test_provider_conformance_registration_requires_bounded_capability_reasons()
     assert registration.provider_type is _NoopProvider
 
 
-def test_provider_conformance_registry_covers_every_exported_builtin_provider() -> None:
-    registered = {registration.provider_type for registration in REGISTRATIONS}
-    exported = {
+def _exported_builtin_provider_types() -> set[type[ModelProvider]]:
+    return {
         value
         for name in providers_module.__all__
-        if name.endswith("Provider")
-        and isinstance((value := getattr(providers_module, name)), type)
+        if isinstance((value := getattr(providers_module, name)), type)
         and value is not ModelProvider
         and issubclass(value, ModelProvider)
     }
 
+
+def test_provider_conformance_registry_covers_every_exported_builtin_provider() -> None:
+    registered = {registration.provider_type for registration in REGISTRATIONS}
+    exported = _exported_builtin_provider_types()
+
     assert registered == exported
     assert len({registration.name for registration in REGISTRATIONS}) == len(REGISTRATIONS)
+
+
+def test_provider_registry_discovers_exported_adapter_without_provider_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    export_name = "DifferentlyNamedAdapter"
+    monkeypatch.setattr(providers_module, export_name, _DifferentlyNamedAdapter, raising=False)
+    monkeypatch.setattr(providers_module, "__all__", [*providers_module.__all__, export_name])
+
+    assert _DifferentlyNamedAdapter in _exported_builtin_provider_types()
+
+
+@pytest.mark.parametrize(
+    ("validator", "assistant_echo_only"),
+    [
+        (
+            registrations_module._require_openai_tool_result,
+            {
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-conformance",
+                        "name": "echo",
+                        "arguments": '{"text":"conformance-tool"}',
+                    }
+                ]
+            },
+        ),
+        (
+            registrations_module._require_anthropic_tool_result,
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call-conformance",
+                                "name": "echo",
+                                "input": {"text": "conformance-tool"},
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+        (
+            registrations_module._require_chat_completions_tool_result,
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-conformance",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text":"conformance-tool"}',
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+        (
+            registrations_module._require_bedrock_tool_result,
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "toolUse": {
+                                    "toolUseId": "call-conformance",
+                                    "name": "echo",
+                                    "input": {"text": "conformance-tool"},
+                                }
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+    ],
+    ids=("openai", "anthropic", "chat-completions", "bedrock"),
+)
+def test_tool_result_validators_reject_assistant_echo_without_result(
+    validator: Any,
+    assistant_echo_only: dict[str, Any],
+) -> None:
+    with pytest.raises(AssertionError, match="omitted the completed tool result"):
+        validator(assistant_echo_only, tool_call_id="call-conformance")
+
+
+@pytest.mark.anyio
+async def test_tool_round_trip_contract_rejects_request_builder_that_drops_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_builder = openai_module.build_openai_payload
+
+    def build_without_tool_result(
+        request: ModelRequest,
+        *,
+        stream: bool = False,
+        reasoning_state: str = "inline",
+        chain: bool = True,
+    ) -> dict[str, Any]:
+        payload = original_builder(
+            request,
+            stream=stream,
+            reasoning_state=reasoning_state,
+            chain=chain,
+        )
+        payload["input"] = [
+            item
+            for item in payload["input"]
+            if not (isinstance(item, dict) and item.get("type") == "function_call_output")
+        ]
+        return payload
+
+    monkeypatch.setattr(openai_module, "build_openai_payload", build_without_tool_result)
+    registration = registrations_module.OPENAI
+    harness = await registration.factory("tool_round_trip")
+    try:
+        events = await _collect_tool_round_trip_events(harness)
+    finally:
+        await harness.aclose()
+
+    with pytest.raises(
+        ProviderConformanceFailure,
+        match=r"adapter=openai scenario=tool_round_trip .*observed=",
+    ):
+        _assert_tool_round_trip_contract(registration, events)
 
 
 @pytest.mark.anyio
@@ -529,6 +719,14 @@ async def test_provider_conformance_seeded_duplicate_tool_reports_failure() -> N
             )
         )
     ]
+    tool_events = [
+        event
+        for event in events
+        if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
+    ]
+
+    assert tool_events
+    assert {event.payload.get("tool_call_id") for event in tool_events} == {"call-conformance"}
 
     with pytest.raises(
         ProviderConformanceFailure,
@@ -618,6 +816,33 @@ async def test_provider_conformance_seeded_unbounded_close_reports_failure() -> 
 
 
 @pytest.mark.anyio
+async def test_provider_conformance_closes_harness_after_collection_failure() -> None:
+    provider = _BrokenCollectionProvider()
+    closed = False
+
+    async def close() -> None:
+        nonlocal closed
+        closed = True
+
+    registration = _registration(
+        name="broken-collection",
+        provider_type=_BrokenCollectionProvider,
+        provider=provider,
+    )
+    harness = ProviderHarness(
+        provider=provider,
+        model="broken-model",
+        close=close,
+        is_closed=lambda: closed,
+    )
+
+    with pytest.raises(RuntimeError, match="seeded collection failure"):
+        await _collect_and_assert_close_contract(registration, harness)
+
+    assert closed is True
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
 async def test_provider_conformance_streams_ordered_text_and_normalized_usage(
     registration: ProviderConformanceRegistration,
@@ -637,23 +862,8 @@ async def test_provider_conformance_round_trips_one_logical_tool_call(
     registration: ProviderConformanceRegistration,
 ) -> None:
     harness = await registration.factory("tool_round_trip")
-    app = CayuApp(enable_logging=False)
-    app.register_provider(harness.provider, default=True)
-    app.register_agent(
-        AgentSpec(name="assistant", model=harness.model, system_prompt="Use the echo tool."),
-        tools=[_EchoTool()],
-    )
     try:
-        events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="assistant",
-                    messages=[Message.text("user", "Echo the text conformance-tool.")],
-                    max_steps=3,
-                )
-            )
-        ]
+        events = await _collect_tool_round_trip_events(harness)
     finally:
         await harness.aclose()
 
@@ -788,8 +998,12 @@ async def test_provider_conformance_idle_failure_is_bounded(
     finally:
         await harness.aclose()
 
-    assert events[-1].type == ModelStreamEventType.ERROR
-    assert "no event" in events[-1].payload["error"].lower()
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    expected_error_type = (
+        "BedrockProtocolError" if registration.name == "bedrock" else "TimeoutError"
+    )
+    assert events[0].payload["error_type"] == expected_error_type
+    assert events[0].payload["error"].strip()
 
 
 @pytest.mark.anyio
@@ -798,10 +1012,7 @@ async def test_provider_conformance_close_is_bounded_and_releases_owned_resource
     registration: ProviderConformanceRegistration,
 ) -> None:
     harness = await registration.factory("close")
-    assert harness.is_closed is not None
-    await harness.collect()
-
-    await _assert_close_contract(registration, harness)
+    await _collect_and_assert_close_contract(registration, harness)
 
 
 @pytest.mark.anyio
