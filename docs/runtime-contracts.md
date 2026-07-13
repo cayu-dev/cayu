@@ -354,14 +354,16 @@ which the usage folding tolerates but is a wider read than intended.
 
 The optional FastAPI server exposes the session event query endpoint at
 `GET /api/sessions/{session_id}/events`. The endpoint validates the session,
-accepts `after_sequence`, `before_sequence`, `order_by`, `limit`, `event_type`,
-`exclude_event_type`, `tool_name`, `agent_name`, `environment_name`, and
-`workflow_name` filters, and returns durable event records with `sequence`,
-`has_more`, `order_by`, `next_sequence`, and `scan_through_sequence`.
-Event-type inclusion and exclusion
-are applied by the store before the page limit; the plural `event_types` and
+accepts `after_sequence`, `before_sequence`, `order_by`, `limit`, `event_id`,
+`event_type`, `exclude_event_type`, `tool_name`, `agent_name`,
+`environment_name`, and `workflow_name` filters, and returns durable event
+records with `sequence`, `has_more`, `order_by`, `next_sequence`, and
+`scan_through_sequence`. Event-type inclusion and exclusion are applied by the
+store before the page limit; the plural `event_types` and
 `exclude_event_types` fields remain runtime/store-level query fields. For
-ascending pages, continue with
+exact lookup, `event_id` is matched within the path's session because event IDs
+are session-scoped; an existing session with no matching event returns an empty
+page. For ascending pages, continue with
 `after_sequence=next_sequence`; for descending pages, continue with
 `before_sequence=next_sequence`. Clients should use this endpoint for timelines,
 logs, replay panes, and polling instead of fetching the full session when they

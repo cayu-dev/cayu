@@ -3463,6 +3463,70 @@ def test_server_filters_session_events() -> None:
     assert [event["id"] for event in bounded_body["events"]] == ["event_filter_1"]
 
 
+def test_server_finds_exact_session_scoped_event_id() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    event_id = "shared/event?id=1"
+
+    async def seed_events() -> None:
+        for session_id, source in (
+            ("event_lookup", "selected"),
+            ("event_lookup_other", "other"),
+        ):
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await app.session_store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=event_id,
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        payload={"source": source},
+                    )
+                ],
+            )
+
+    asyncio.run(seed_events())
+
+    client = TestClient(create_server(app, dev=True))
+    response = client.get(
+        "/api/sessions/event_lookup/events",
+        params={"event_id": event_id},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_more"] is False
+    assert body["next_sequence"] == 1
+    assert body["scan_through_sequence"] == 1
+    assert [(event["id"], event["session_id"], event["payload"]) for event in body["events"]] == [
+        (event_id, "event_lookup", {"source": "selected"})
+    ]
+
+    missing_response = client.get(
+        "/api/sessions/event_lookup/events",
+        params={"event_id": "missing"},
+    )
+    assert missing_response.status_code == 200
+    assert missing_response.json() == {
+        "session_id": "event_lookup",
+        "events": [],
+        "order_by": "sequence_asc",
+        "next_sequence": None,
+        "scan_through_sequence": 1,
+        "has_more": False,
+    }
+
+
 def test_server_excludes_event_type_before_pagination() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -3605,6 +3669,7 @@ def test_server_session_events_validates_query() -> None:
     assert (
         client.get("/api/sessions/events_validation/events?event_type=not.valid").status_code == 422
     )
+    assert client.get("/api/sessions/events_validation/events?event_id=%20").status_code == 422
     assert (
         client.get(
             "/api/sessions/events_validation/events?exclude_event_type=not.valid"

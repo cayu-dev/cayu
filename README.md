@@ -1183,13 +1183,15 @@ tool-use loop, so that block stays in the transcript). Thinking tokens are bille
 
 For dashboards, CLIs, and audit views, the optional server exposes paginated
 durable events at `GET /api/sessions/{session_id}/events`. It supports
-`after_sequence`, `before_sequence`, `order_by`, `limit`, `event_type`,
+`after_sequence`, `before_sequence`, `order_by`, `limit`, `event_id`, `event_type`,
 `exclude_event_type`, `tool_name`, `agent_name`, `environment_name`, and
 `workflow_name` query parameters. Inclusion and exclusion filters are applied
-before pagination. Ascending pages use `after_sequence` for forward polling.
-Descending pages start at the newest matching event and use `before_sequence`
-to load older history. Responses include each event's durable `sequence` plus
-`has_more`, `next_sequence`, and `scan_through_sequence`. Pass `next_sequence`
+before pagination. `event_id` performs an exact lookup within the selected
+session; event IDs are session-scoped. Ascending pages use `after_sequence` for
+forward polling. Descending pages start at the newest matching event and use
+`before_sequence` to load older history. Responses include each event's durable
+`sequence` plus `has_more`, `next_sequence`, and `scan_through_sequence`. Pass
+`next_sequence`
 back using the cursor for the selected order to paginate matching history. A
 forward tail reader should instead pass `scan_through_sequence` as its next
 `after_sequence`; that watermark can advance across filtered-out events without

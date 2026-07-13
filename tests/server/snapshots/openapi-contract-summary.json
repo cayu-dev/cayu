@@ -7203,6 +7203,23 @@
           },
           {
             "in": "query",
+            "name": "event_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return the event with this exact session-scoped event ID, if it exists.",
+              "title": "Event Id"
+            }
+          },
+          {
+            "in": "query",
             "name": "event_type",
             "required": false,
             "schema": {

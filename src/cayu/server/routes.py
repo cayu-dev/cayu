@@ -2585,6 +2585,10 @@ def create_router(
     )
     async def list_session_events(
         session_id: NonBlankString,
+        event_id: str | None = Query(
+            default=None,
+            description="Return the event with this exact session-scoped event ID, if it exists.",
+        ),
         event_type: str | None = None,
         exclude_event_type: str | None = Query(
             default=None,
@@ -2617,6 +2621,7 @@ def create_router(
         has_event_filters = any(
             value is not None
             for value in (
+                event_id,
                 event_type,
                 exclude_event_type,
                 tool_name,
@@ -2628,6 +2633,7 @@ def create_router(
         try:
             query = EventQuery(
                 session_id=session_id,
+                event_id=event_id,
                 event_type=event_type,
                 exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
                 tool_name=tool_name,

@@ -3750,6 +3750,12 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
     };
     query?: {
         /**
+         * Event Id
+         *
+         * Return the event with this exact session-scoped event ID, if it exists.
+         */
+        event_id?: string | null;
+        /**
          * Event Type
          */
         event_type?: string | null;
