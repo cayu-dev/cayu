@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import inspect
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -95,22 +97,34 @@ def run_eval_command(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    loaded = load_target(args.target, label="Eval target")
-    if callable(loaded):
-        loaded = loaded()
-    if inspect.isawaitable(loaded):
-        loaded = await loaded
-    plan = _coerce_plan(loaded)
-    run = await run_eval_suite(
-        plan.app,
-        plan.suite,
-        case_timeout_seconds=args.case_timeout_seconds,
-    )
-    output = eval_run_to_json(run)
-    _write_or_print(output, args.output)
-    if args.html_output is not None:
-        Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
-    return 0 if run.status == EvalStatus.PASSED else 1
+    with _cwd_import_context():
+        loaded = load_target(args.target, label="Eval target")
+        if callable(loaded):
+            loaded = loaded()
+        if inspect.isawaitable(loaded):
+            loaded = await loaded
+        plan = _coerce_plan(loaded)
+        run = await run_eval_suite(
+            plan.app,
+            plan.suite,
+            case_timeout_seconds=args.case_timeout_seconds,
+        )
+        output = eval_run_to_json(run)
+        _write_or_print(output, args.output)
+        if args.html_output is not None:
+            Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
+        return 0 if run.status == EvalStatus.PASSED else 1
+
+
+@contextmanager
+def _cwd_import_context() -> Iterator[None]:
+    cwd = str(Path.cwd())
+    original_path = list(sys.path)
+    sys.path[:] = [cwd, *(entry for entry in original_path if entry != cwd)]
+    try:
+        yield
+    finally:
+        sys.path[:] = original_path
 
 
 def _report(args: argparse.Namespace) -> int:

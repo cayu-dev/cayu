@@ -73,6 +73,10 @@ async def main():
 - `(app, suite)`
 - an object or dict with `app` and `suite`
 
+For the duration of the run, the caller's current directory takes precedence
+on Python's import path, so repo-local modules shadow same-named installed
+packages. The original import path is restored when the command finishes.
+
 Example:
 
 ```bash
