@@ -11,6 +11,7 @@ import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
+import { validateSessionHistorySearch } from "./lib/session-history-search"
 
 const AgentsPage = lazyRouteComponent(() => import("./routes/agents"), "AgentsPage")
 const ArtifactsPage = lazyRouteComponent(() => import("./routes/artifacts"), "ArtifactsPage")
@@ -98,6 +99,7 @@ const artifactsRoute = createRoute({
 const sessionDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
+  validateSearch: validateSessionHistorySearch,
   remountDeps: ({ params }) => ({ sessionId: params.sessionId }),
   component: SessionDetailPage,
 })

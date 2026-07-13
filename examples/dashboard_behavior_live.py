@@ -19,7 +19,7 @@ from playwright.async_api import (  # ty: ignore[unresolved-import]
 )
 
 from _live_checks import require
-from cayu import CayuApp, Event, EventType, Message, RunRequest
+from cayu import CayuApp, Event, EventType, Message, MessageRole, RunRequest, ThinkingPart
 from cayu.runtime import InMemorySessionStore, SessionIdentity, SessionStatus
 from cayu.server import create_server
 
@@ -102,11 +102,30 @@ async def _seed_app() -> CayuApp:
                 },
             ),
             Event(
+                id="dashboard-tool-failed",
+                type=EventType.TOOL_CALL_FAILED,
+                session_id=SESSION_ID,
+                agent_name=AGENT_NAME,
+                tool_name="browser_contract_tool",
+                payload={"error": "dashboard contract tool failure"},
+            ),
+            Event(
                 id="dashboard-session-completed",
                 type=EventType.SESSION_COMPLETED,
                 session_id=SESSION_ID,
                 agent_name=AGENT_NAME,
             ),
+        ],
+    )
+    await store.append_transcript_messages(
+        SESSION_ID,
+        [
+            Message.text("user", "dashboard transcript user marker"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(ThinkingPart(text="dashboard transcript thinking marker"),),
+            ),
+            Message.text("assistant", "dashboard transcript assistant marker"),
         ],
     )
     await store.update_status(SESSION_ID, SessionStatus.COMPLETED)
@@ -148,7 +167,16 @@ async def _run_browser_contract(base_url: str) -> dict[str, object]:
         "browser": "chromium",
         "base_url": base_url,
         "session_id": SESSION_ID,
-        "interactions": ["sessions_list", "session_detail", "event_detail"],
+        "interactions": [
+            "sessions_list",
+            "session_detail",
+            "event_detail",
+            "event_filters",
+            "exact_event_lookup",
+            "filtered_failure_diagnostics",
+            "transcript_filters",
+            "history_navigation",
+        ],
         "console_errors": 0,
         "page_errors": 0,
         "request_failures": 0,
@@ -179,6 +207,50 @@ async def _exercise_dashboard(page: Page, base_url: str) -> None:
     await expect(page.get_by_text("Event Detail", exact=True)).to_be_visible()
     await expect(page.get_by_text("model.completed", exact=True).last).to_be_visible()
     await expect(page.locator("pre").filter(has_text=PAYLOAD_MARKER)).to_be_visible()
+
+    event_type_filter = page.get_by_label("Filter events by exact event type")
+    await event_type_filter.fill("model.completed")
+    await page.get_by_role("button", name="Apply filters").click()
+    await expect(page).to_have_url(re.compile(r"[?&]event_type=model\.completed(?:&|$)"))
+    await expect(page.get_by_role("button", name=re.compile(r"model\.completed"))).to_be_visible()
+    await expect(page.get_by_role("button", name=re.compile(r"model\.started"))).to_have_count(0)
+    await expect(page.get_by_text("Tool failed: browser_contract_tool", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="Inspect event").click()
+    await expect(page).to_have_url(re.compile(r"[?&]event_id=dashboard-tool-failed(?:&|$)"))
+    await expect(page.get_by_text("dashboard-tool-failed", exact=True)).to_be_visible()
+
+    event_id_filter = page.get_by_label("Filter events by exact event ID")
+    await event_id_filter.fill("dashboard-model-completed")
+    await event_type_filter.fill("model.completed")
+    await page.get_by_role("button", name="Apply filters").click()
+    await expect(page).to_have_url(re.compile(r"[?&]event_id=dashboard-model-completed(?:&|$)"))
+    await expect(page.get_by_text("dashboard-model-completed", exact=True)).to_be_visible()
+
+    transcript_role_filter = page.get_by_label("Filter transcript by role")
+    await transcript_role_filter.select_option("assistant")
+    await expect(page).to_have_url(re.compile(r"[?&]transcript_role=assistant(?:&|$)"))
+    await page.reload(wait_until="networkidle")
+    await expect(event_type_filter).to_have_value("model.completed")
+    await expect(event_id_filter).to_have_value("dashboard-model-completed")
+    await expect(transcript_role_filter).to_have_value("assistant")
+    await expect(
+        page.get_by_text("dashboard transcript assistant marker", exact=True)
+    ).to_be_visible()
+    await expect(page.get_by_text("dashboard transcript user marker", exact=True)).to_have_count(0)
+    thinking_payload = page.locator("pre").filter(has_text="dashboard transcript thinking marker")
+    await expect(thinking_payload).to_be_visible()
+
+    include_thinking = page.get_by_label("Include thinking")
+    await include_thinking.uncheck()
+    await expect(page).to_have_url(re.compile(r"[?&]include_thinking=false(?:&|$)"))
+    await expect(thinking_payload).to_have_count(0)
+    await expect(
+        page.get_by_text("dashboard transcript assistant marker", exact=True)
+    ).to_be_visible()
+
+    await page.go_back()
+    await expect(include_thinking).to_be_checked()
+    await expect(thinking_payload).to_be_visible()
 
 
 def _record_browser_failures(page: Page, failures: dict[str, list[str]]) -> None:

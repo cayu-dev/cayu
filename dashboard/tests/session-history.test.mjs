@@ -5,10 +5,19 @@ import {
   CoalescedAsyncRunner,
   durationDetail,
   durationEndTimestamp,
+  eventHistoryFilterCount,
+  eventHistoryFilterKey,
+  eventHistoryFilters,
+  eventHistoryQuery,
+  eventMatchesHistoryFilters,
   eventScanCursor,
+  hasEventHistoryFilters,
+  hasTranscriptHistoryFilters,
   historyModeLabel,
+  initialFilteredPageNavigation,
   initialPageNavigation,
   jumpToLatestPage,
+  latestTranscriptPageOffset,
   loadStableTranscriptTailPage,
   mergeLatestEventWindow,
   mergeLatestTranscriptWindow,
@@ -16,14 +25,22 @@ import {
   navigateToNewerPage,
   navigateToOlderPage,
   olderTranscriptPage,
+  pageNavigationForFilter,
   pendingTailCanReconcile,
   queryReadErrorIsFatal,
+  sessionHistorySearchWithEventFilters,
+  sessionHistorySearchWithTranscriptFilters,
   sessionMetadataNeedsRefresh,
   sessionSummaryRevision,
   statePollInterval,
   summaryStateIsStable,
   tailActivityAction,
+  transcriptDeltaRequiresTailReload,
+  transcriptHistoryFilterKey,
+  transcriptHistoryFilters,
+  transcriptHistoryQuery,
 } from "../src/lib/session-history.ts"
+import { validateSessionHistorySearch } from "../src/lib/session-history-search.ts"
 
 function deferred() {
   let resolve
@@ -121,6 +138,220 @@ test("page navigation keeps only cursors while moving older and newer", () => {
   assert.deepEqual(navigation, { current: null, newer: [] })
   assert.deepEqual(navigateToNewerPage(navigation), navigation)
   assert.deepEqual(jumpToLatestPage(null), { current: null, newer: [] })
+})
+
+test("history search validation canonicalizes supported shareable filters", () => {
+  const search = validateSessionHistorySearch({
+    event_id: "  event-1  ",
+    event_type: "tool.call.completed",
+    tool_name: ["invalid"],
+    agent_name: "builder",
+    environment_name: "  ",
+    workflow_name: "release",
+    transcript_role: "assistant",
+    include_thinking: "false",
+    unrelated: "ignored",
+  })
+
+  assert.deepEqual(search, {
+    event_id: "event-1",
+    event_type: "tool.call.completed",
+    tool_name: undefined,
+    agent_name: "builder",
+    environment_name: undefined,
+    workflow_name: "release",
+    transcript_role: "assistant",
+    include_thinking: false,
+  })
+  assert.deepEqual(validateSessionHistorySearch({ transcript_role: "invalid" }), {
+    event_id: undefined,
+    event_type: undefined,
+    tool_name: undefined,
+    agent_name: undefined,
+    environment_name: undefined,
+    workflow_name: undefined,
+    transcript_role: undefined,
+    include_thinking: undefined,
+  })
+})
+
+test("event filters round-trip through URL state without replacing transcript filters", () => {
+  const current = validateSessionHistorySearch({
+    event_type: "model.completed",
+    transcript_role: "tool",
+    include_thinking: false,
+  })
+  const filters = eventHistoryFilters(current)
+  assert.equal(hasEventHistoryFilters(filters), true)
+  assert.equal(eventHistoryFilterCount(filters), 1)
+
+  const next = sessionHistorySearchWithEventFilters(current, {
+    eventId: " event-9 ",
+    eventType: "",
+    toolName: "write_file",
+    agentName: "",
+    environmentName: "prod",
+    workflowName: "",
+  })
+  assert.deepEqual(next, {
+    event_id: "event-9",
+    event_type: undefined,
+    tool_name: "write_file",
+    agent_name: undefined,
+    environment_name: "prod",
+    workflow_name: undefined,
+    transcript_role: "tool",
+    include_thinking: false,
+  })
+  assert.equal(
+    eventHistoryFilterKey(eventHistoryFilters(next)),
+    eventHistoryFilterKey({
+      eventId: "event-9",
+      eventType: "",
+      toolName: "write_file",
+      agentName: "",
+      environmentName: "prod",
+      workflowName: "",
+    }),
+  )
+})
+
+test("event queries hide deltas by default but honor explicit identity and type lookups", () => {
+  const empty = {
+    eventId: "",
+    eventType: "",
+    toolName: "",
+    agentName: "",
+    environmentName: "",
+    workflowName: "",
+  }
+  assert.deepEqual(eventHistoryQuery(empty), { exclude_event_type: "model.text.delta" })
+  assert.deepEqual(eventHistoryQuery({ ...empty, toolName: "read_file" }), {
+    tool_name: "read_file",
+    exclude_event_type: "model.text.delta",
+  })
+  assert.deepEqual(eventHistoryQuery({ ...empty, eventId: "delta-1" }), {
+    event_id: "delta-1",
+  })
+  assert.deepEqual(eventHistoryQuery({ ...empty, eventType: "model.text.delta" }), {
+    event_type: "model.text.delta",
+  })
+})
+
+test("live events use the same exact filter semantics as stored event queries", () => {
+  const event = {
+    id: "event-1",
+    type: "tool.call.completed",
+    tool_name: "write_file",
+    agent_name: "builder",
+    environment_name: "prod",
+    workflow_name: "release",
+  }
+  const filters = {
+    eventId: "event-1",
+    eventType: "tool.call.completed",
+    toolName: "write_file",
+    agentName: "builder",
+    environmentName: "prod",
+    workflowName: "release",
+  }
+  assert.equal(eventMatchesHistoryFilters(event, filters), true)
+  assert.equal(eventMatchesHistoryFilters(event, { ...filters, workflowName: "other" }), false)
+  assert.equal(
+    eventMatchesHistoryFilters(
+      { ...event, id: "delta", type: "model.text.delta" },
+      { ...filters, eventId: "", eventType: "", toolName: "" },
+    ),
+    false,
+  )
+  assert.equal(
+    eventMatchesHistoryFilters(
+      { ...event, id: "delta", type: "model.text.delta" },
+      { ...filters, eventId: "delta", eventType: "model.text.delta", toolName: "" },
+    ),
+    true,
+  )
+})
+
+test("filter generations expose a fresh latest page before state reset effects run", () => {
+  const state = initialFilteredPageNavigation("old-filter", null)
+  state.navigation = navigateToOlderPage(state.navigation, 200)
+
+  assert.deepEqual(pageNavigationForFilter(state, "old-filter", null), {
+    current: 200,
+    newer: [null],
+  })
+  assert.deepEqual(pageNavigationForFilter(state, "new-filter", null), {
+    current: null,
+    newer: [],
+  })
+})
+
+test("transcript filters preserve event URL state and use role-relative query offsets", () => {
+  const current = validateSessionHistorySearch({ event_id: "event-1" })
+  const next = sessionHistorySearchWithTranscriptFilters(current, {
+    role: "assistant",
+    includeThinking: false,
+  })
+  const filters = transcriptHistoryFilters(next)
+
+  assert.deepEqual(next, {
+    event_id: "event-1",
+    event_type: undefined,
+    tool_name: undefined,
+    agent_name: undefined,
+    environment_name: undefined,
+    workflow_name: undefined,
+    transcript_role: "assistant",
+    include_thinking: false,
+  })
+  assert.deepEqual(filters, { role: "assistant", includeThinking: false })
+  assert.deepEqual(transcriptHistoryQuery(filters), {
+    role: "assistant",
+    include_thinking: false,
+  })
+  assert.equal(hasTranscriptHistoryFilters(filters), true)
+  assert.equal(transcriptHistoryFilterKey(filters), '["assistant",false]')
+  assert.equal(latestTranscriptPageOffset(235, 100), 135)
+})
+
+test("thinking-filtered transcript tails reload only when a bounded merge is ambiguous", () => {
+  assert.equal(
+    transcriptDeltaRequiresTailReload(
+      { offset: 0, total_messages: 100, messages: Array.from({ length: 100 }) },
+      { total_messages: 103, messages: [{ index: 100 }, { index: 102 }] },
+      false,
+      100,
+    ),
+    true,
+  )
+  assert.equal(
+    transcriptDeltaRequiresTailReload(
+      { offset: 100, total_messages: 200, messages: Array.from({ length: 75 }) },
+      { total_messages: 201, messages: [{}] },
+      false,
+      100,
+    ),
+    true,
+  )
+  assert.equal(
+    transcriptDeltaRequiresTailReload(
+      { offset: 0, total_messages: 90, messages: Array.from({ length: 70 }) },
+      { total_messages: 95, messages: [{}, {}, {}, {}, {}] },
+      false,
+      100,
+    ),
+    false,
+  )
+  assert.equal(
+    transcriptDeltaRequiresTailReload(
+      { offset: 0, total_messages: 100, messages: Array.from({ length: 90 }) },
+      { total_messages: 103, messages: [] },
+      true,
+      100,
+    ),
+    false,
+  )
 })
 
 test("transcript navigation creates non-overlapping partial oldest pages", () => {

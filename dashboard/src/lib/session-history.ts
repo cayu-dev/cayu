@@ -1,3 +1,5 @@
+import type { SessionHistorySearch, TranscriptRoleFilter } from "./session-history-search"
+
 const ACTIVE_SESSION_STATUSES = new Set(["pending", "running", "interrupting"])
 const TERMINAL_STATE_POLL_INTERVAL_MS = 15_000
 
@@ -6,7 +8,41 @@ export type PageNavigation<T> = {
   newer: T[]
 }
 
+export type FilteredPageNavigation<T> = {
+  filterKey: string
+  navigation: PageNavigation<T>
+}
+
 export type TranscriptPageParam = { offset: number; limit: number } | null
+
+export type EventHistoryFilters = {
+  eventId: string
+  eventType: string
+  toolName: string
+  agentName: string
+  environmentName: string
+  workflowName: string
+}
+
+export type TranscriptHistoryFilters = {
+  role: TranscriptRoleFilter | "all"
+  includeThinking: boolean
+}
+
+export type EventHistoryQuery = {
+  event_id?: string
+  event_type?: string
+  tool_name?: string
+  agent_name?: string
+  environment_name?: string
+  workflow_name?: string
+  exclude_event_type?: "model.text.delta"
+}
+
+export type TranscriptHistoryQuery = {
+  role?: TranscriptRoleFilter
+  include_thinking: boolean
+}
 
 export type SummaryRevisionState = {
   status: string
@@ -41,6 +77,15 @@ type IndexedRecord = {
 type TranscriptTailPage = {
   has_more: boolean
   total_messages: number
+}
+
+type TranscriptDeltaPage = {
+  messages: readonly unknown[]
+  total_messages: number
+}
+
+type TranscriptCurrentPage = TranscriptDeltaPage & {
+  offset: number
 }
 
 export type BoundedWindow<T> = {
@@ -106,8 +151,152 @@ export class CoalescedAsyncRunner {
   }
 }
 
+function optionalFilterValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed === "" ? undefined : trimmed
+}
+
+export function eventHistoryFilters(search: SessionHistorySearch): EventHistoryFilters {
+  return {
+    eventId: search.event_id ?? "",
+    eventType: search.event_type ?? "",
+    toolName: search.tool_name ?? "",
+    agentName: search.agent_name ?? "",
+    environmentName: search.environment_name ?? "",
+    workflowName: search.workflow_name ?? "",
+  }
+}
+
+export function transcriptHistoryFilters(search: SessionHistorySearch): TranscriptHistoryFilters {
+  return {
+    role: search.transcript_role ?? "all",
+    includeThinking: search.include_thinking !== false,
+  }
+}
+
+export function sessionHistorySearchWithEventFilters(
+  search: SessionHistorySearch,
+  filters: EventHistoryFilters,
+): SessionHistorySearch {
+  return {
+    ...search,
+    event_id: optionalFilterValue(filters.eventId),
+    event_type: optionalFilterValue(filters.eventType),
+    tool_name: optionalFilterValue(filters.toolName),
+    agent_name: optionalFilterValue(filters.agentName),
+    environment_name: optionalFilterValue(filters.environmentName),
+    workflow_name: optionalFilterValue(filters.workflowName),
+  }
+}
+
+export function sessionHistorySearchWithTranscriptFilters(
+  search: SessionHistorySearch,
+  filters: TranscriptHistoryFilters,
+): SessionHistorySearch {
+  return {
+    ...search,
+    transcript_role: filters.role === "all" ? undefined : filters.role,
+    include_thinking: filters.includeThinking ? undefined : false,
+  }
+}
+
+export function eventHistoryFilterKey(filters: EventHistoryFilters): string {
+  return JSON.stringify([
+    filters.eventId,
+    filters.eventType,
+    filters.toolName,
+    filters.agentName,
+    filters.environmentName,
+    filters.workflowName,
+  ])
+}
+
+export function transcriptHistoryFilterKey(filters: TranscriptHistoryFilters): string {
+  return JSON.stringify([filters.role, filters.includeThinking])
+}
+
+export function eventHistoryQuery(filters: EventHistoryFilters): EventHistoryQuery {
+  const query: EventHistoryQuery = {}
+  const eventId = optionalFilterValue(filters.eventId)
+  const eventType = optionalFilterValue(filters.eventType)
+  const toolName = optionalFilterValue(filters.toolName)
+  const agentName = optionalFilterValue(filters.agentName)
+  const environmentName = optionalFilterValue(filters.environmentName)
+  const workflowName = optionalFilterValue(filters.workflowName)
+  if (eventId !== undefined) query.event_id = eventId
+  if (eventType !== undefined) query.event_type = eventType
+  if (toolName !== undefined) query.tool_name = toolName
+  if (agentName !== undefined) query.agent_name = agentName
+  if (environmentName !== undefined) query.environment_name = environmentName
+  if (workflowName !== undefined) query.workflow_name = workflowName
+  if (eventId === undefined && eventType === undefined) {
+    query.exclude_event_type = "model.text.delta"
+  }
+  return query
+}
+
+export function transcriptHistoryQuery(filters: TranscriptHistoryFilters): TranscriptHistoryQuery {
+  return {
+    role: filters.role === "all" ? undefined : filters.role,
+    include_thinking: filters.includeThinking,
+  }
+}
+
+export function hasEventHistoryFilters(filters: EventHistoryFilters): boolean {
+  return Object.values(filters).some((value) => value !== "")
+}
+
+export function eventHistoryFilterCount(filters: EventHistoryFilters): number {
+  return Object.values(filters).filter((value) => value !== "").length
+}
+
+export function hasTranscriptHistoryFilters(filters: TranscriptHistoryFilters): boolean {
+  return filters.role !== "all" || !filters.includeThinking
+}
+
+export function eventMatchesHistoryFilters(
+  event: {
+    id: string
+    type: string
+    tool_name?: string | null
+    agent_name?: string | null
+    environment_name?: string | null
+    workflow_name?: string | null
+  },
+  filters: EventHistoryFilters,
+): boolean {
+  if (filters.eventId !== "" && event.id !== filters.eventId) return false
+  if (filters.eventType !== "" && event.type !== filters.eventType) return false
+  if (filters.toolName !== "" && event.tool_name !== filters.toolName) return false
+  if (filters.agentName !== "" && event.agent_name !== filters.agentName) return false
+  if (filters.environmentName !== "" && event.environment_name !== filters.environmentName) {
+    return false
+  }
+  if (filters.workflowName !== "" && event.workflow_name !== filters.workflowName) return false
+  return !(filters.eventId === "" && filters.eventType === "" && event.type === "model.text.delta")
+}
+
 export function initialPageNavigation<T>(current: T): PageNavigation<T> {
   return { current, newer: [] }
+}
+
+export function initialFilteredPageNavigation<T>(
+  filterKey: string,
+  current: T,
+): FilteredPageNavigation<T> {
+  return {
+    filterKey,
+    navigation: initialPageNavigation(current),
+  }
+}
+
+export function pageNavigationForFilter<T>(
+  state: FilteredPageNavigation<T>,
+  filterKey: string,
+  current: T,
+): PageNavigation<T> {
+  return state.filterKey === filterKey ? state.navigation : initialPageNavigation(current)
 }
 
 export function navigateToOlderPage<T>(navigation: PageNavigation<T>, next: T): PageNavigation<T> {
@@ -137,6 +326,31 @@ export function olderTranscriptPage(
   if (currentOffset <= 0) return undefined
   const offset = Math.max(0, currentOffset - pageSize)
   return { offset, limit: currentOffset - offset }
+}
+
+export function latestTranscriptPageOffset(totalMessages: number, pageSize: number): number {
+  return Math.max(0, totalMessages - pageSize)
+}
+
+export function transcriptDeltaRequiresTailReload(
+  current: TranscriptCurrentPage,
+  incremental: TranscriptDeltaPage,
+  includeThinking: boolean,
+  pageSize: number,
+): boolean {
+  if (includeThinking || incremental.total_messages <= current.total_messages) return false
+
+  const addedRecords = incremental.total_messages - current.total_messages
+  if (incremental.messages.length < addedRecords) return true
+
+  const currentRawWindowSize = Math.min(
+    pageSize,
+    Math.max(0, current.total_messages - current.offset),
+  )
+  const currentWindowHasFilteredRecords = current.messages.length < currentRawWindowSize
+  const rawTailBoundaryMoved =
+    latestTranscriptPageOffset(incremental.total_messages, pageSize) > current.offset
+  return currentWindowHasFilteredRecords && rawTailBoundaryMoved
 }
 
 export function sessionSummaryRevision(state: SummaryRevisionState): string {

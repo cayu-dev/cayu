@@ -1,5 +1,5 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Link, useParams } from "@tanstack/react-router"
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query"
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import {
   Activity,
   AlertCircle,
@@ -13,6 +13,7 @@ import {
   Cpu,
   Database,
   Hash,
+  ListFilter,
   LoaderCircle,
   type LucideIcon,
   MessageSquare,
@@ -83,10 +84,19 @@ import {
   CoalescedAsyncRunner,
   durationDetail,
   durationEndTimestamp,
+  type EventHistoryFilters,
+  eventHistoryFilterCount,
+  eventHistoryFilterKey,
+  eventHistoryFilters,
+  eventHistoryQuery,
+  eventMatchesHistoryFilters,
   eventScanCursor,
+  hasEventHistoryFilters,
+  hasTranscriptHistoryFilters,
   historyModeLabel,
-  initialPageNavigation,
+  initialFilteredPageNavigation,
   jumpToLatestPage,
+  latestTranscriptPageOffset,
   loadStableTranscriptTailPage,
   mergeLatestEventWindow,
   mergeLatestTranscriptWindow,
@@ -94,14 +104,23 @@ import {
   navigateToNewerPage,
   navigateToOlderPage,
   olderTranscriptPage,
+  pageNavigationForFilter,
   pendingTailCanReconcile,
   queryReadErrorIsFatal,
+  sessionHistorySearchWithEventFilters,
+  sessionHistorySearchWithTranscriptFilters,
   sessionMetadataNeedsRefresh,
   sessionSummaryRevision,
   statePollInterval,
   summaryStateIsStable,
+  type TranscriptHistoryFilters,
+  type TranscriptHistoryQuery,
   type TranscriptPageParam,
   tailActivityAction,
+  transcriptDeltaRequiresTailReload,
+  transcriptHistoryFilterKey,
+  transcriptHistoryFilters,
+  transcriptHistoryQuery,
 } from "../lib/session-history"
 import { cn } from "../lib/utils"
 
@@ -111,10 +130,13 @@ const PENDING_ACTION_SESSION_STATUSES = new Set(["interrupted", "failed", "compl
 const SESSION_EVENT_PAGE_SIZE = 100
 const SESSION_TRANSCRIPT_PAGE_SIZE = 100
 const SESSION_TRANSCRIPT_TAIL_READ_LIMIT = 3
+const historySelectClassName =
+  "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 
 async function fetchTranscriptTailPage(
   sessionId: string,
   totalMessages: number,
+  filters: TranscriptHistoryQuery,
   signal?: AbortSignal,
 ) {
   return loadStableTranscriptTailPage(
@@ -122,22 +144,27 @@ async function fetchTranscriptTailPage(
     SESSION_TRANSCRIPT_PAGE_SIZE,
     SESSION_TRANSCRIPT_TAIL_READ_LIMIT,
     (offset) =>
-      fetchSessionTranscript(sessionId, { offset, limit: SESSION_TRANSCRIPT_PAGE_SIZE }, signal),
+      fetchSessionTranscript(
+        sessionId,
+        { ...filters, offset, limit: SESSION_TRANSCRIPT_PAGE_SIZE },
+        signal,
+      ),
   )
 }
 
 async function fetchTranscriptPage(
   sessionId: string,
   pageParam: TranscriptPageParam,
+  filters: TranscriptHistoryQuery,
   signal?: AbortSignal,
 ) {
   if (pageParam !== null) {
-    return fetchSessionTranscript(sessionId, pageParam, signal)
+    return fetchSessionTranscript(sessionId, { ...filters, ...pageParam }, signal)
   }
 
-  const probe = await fetchSessionTranscript(sessionId, { offset: 0, limit: 1 }, signal)
+  const probe = await fetchSessionTranscript(sessionId, { ...filters, offset: 0, limit: 1 }, signal)
   if (probe.total_messages <= 1) return probe
-  return fetchTranscriptTailPage(sessionId, probe.total_messages, signal)
+  return fetchTranscriptTailPage(sessionId, probe.total_messages, filters, signal)
 }
 
 function isInterruptionConflict(error: unknown) {
@@ -173,6 +200,21 @@ function timestampMs(value: string | null | undefined) {
   if (!value) return null
   const time = new Date(value).getTime()
   return Number.isFinite(time) ? time : null
+}
+
+function eventSequence(event: SessionEvent): number | null {
+  const sequence = (event as SessionEvent & { sequence?: unknown }).sequence
+  return typeof sequence === "number" && Number.isFinite(sequence) ? sequence : null
+}
+
+function compareEventOrder(left: SessionEvent, right: SessionEvent) {
+  const leftSequence = eventSequence(left)
+  const rightSequence = eventSequence(right)
+  if (leftSequence !== null && rightSequence !== null) return leftSequence - rightSequence
+  return (
+    (timestampMs(left.timestamp) ?? Number.NEGATIVE_INFINITY) -
+    (timestampMs(right.timestamp) ?? Number.NEGATIVE_INFINITY)
+  )
 }
 
 function statusVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
@@ -457,6 +499,185 @@ function DetailPair({ label, value }: { label: string; value: string }) {
     <div className="grid grid-cols-[6.5rem_minmax(0,1fr)] gap-3">
       <div className="text-muted-foreground">{label}</div>
       <div className="min-w-0 break-words">{value}</div>
+    </div>
+  )
+}
+
+function EventHistoryFilterControls({
+  filters,
+  onApply,
+  onClear,
+}: {
+  filters: EventHistoryFilters
+  onApply: (filters: EventHistoryFilters) => void
+  onClear: () => void
+}) {
+  const [draft, setDraft] = useState(filters)
+
+  const activeCount = eventHistoryFilterCount(filters)
+  const dirty = eventHistoryFilterKey(draft) !== eventHistoryFilterKey(filters)
+  const update = (field: keyof EventHistoryFilters, value: string) => {
+    setDraft((current) => ({ ...current, [field]: value }))
+  }
+
+  return (
+    <form
+      className="space-y-3 border-b border-border bg-muted/20 p-3"
+      onSubmit={(event) => {
+        event.preventDefault()
+        const normalized = eventHistoryFilters(sessionHistorySearchWithEventFilters({}, draft))
+        setDraft(normalized)
+        onApply(normalized)
+      }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <ListFilter className="h-3.5 w-3.5" />
+          Exact event filters
+          {activeCount > 0 && <Badge variant="secondary">{activeCount} active</Badge>}
+        </div>
+        <div className="flex gap-2">
+          {activeCount > 0 && (
+            <Button type="button" variant="ghost" size="sm" onClick={onClear}>
+              Clear
+            </Button>
+          )}
+          <Button type="submit" variant="outline" size="sm" disabled={!dirty}>
+            Apply filters
+          </Button>
+        </div>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        <label
+          htmlFor="session-event-filter-id"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Event ID</span>
+          <Input
+            id="session-event-filter-id"
+            value={draft.eventId}
+            onChange={(event) => update("eventId", event.target.value)}
+            placeholder="Exact durable event ID"
+            aria-label="Filter events by exact event ID"
+          />
+        </label>
+        <label
+          htmlFor="session-event-filter-type"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Event type</span>
+          <Input
+            id="session-event-filter-type"
+            value={draft.eventType}
+            onChange={(event) => update("eventType", event.target.value)}
+            placeholder="tool.call.completed"
+            aria-label="Filter events by exact event type"
+          />
+        </label>
+        <label
+          htmlFor="session-event-filter-tool"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Tool</span>
+          <Input
+            id="session-event-filter-tool"
+            value={draft.toolName}
+            onChange={(event) => update("toolName", event.target.value)}
+            placeholder="read_file"
+            aria-label="Filter events by exact tool name"
+          />
+        </label>
+        <label
+          htmlFor="session-event-filter-agent"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Agent</span>
+          <Input
+            id="session-event-filter-agent"
+            value={draft.agentName}
+            onChange={(event) => update("agentName", event.target.value)}
+            placeholder="assistant"
+            aria-label="Filter events by exact agent name"
+          />
+        </label>
+        <label
+          htmlFor="session-event-filter-environment"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Environment</span>
+          <Input
+            id="session-event-filter-environment"
+            value={draft.environmentName}
+            onChange={(event) => update("environmentName", event.target.value)}
+            placeholder="production"
+            aria-label="Filter events by exact environment name"
+          />
+        </label>
+        <label
+          htmlFor="session-event-filter-workflow"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          <span>Workflow</span>
+          <Input
+            id="session-event-filter-workflow"
+            value={draft.workflowName}
+            onChange={(event) => update("workflowName", event.target.value)}
+            placeholder="release"
+            aria-label="Filter events by exact workflow name"
+          />
+        </label>
+      </div>
+    </form>
+  )
+}
+
+function TranscriptHistoryFilterControls({
+  filters,
+  onChange,
+  onClear,
+}: {
+  filters: TranscriptHistoryFilters
+  onChange: (filters: TranscriptHistoryFilters) => void
+  onClear: () => void
+}) {
+  const active = hasTranscriptHistoryFilters(filters)
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-border bg-muted/20 px-4 py-3">
+      <div className="mr-1 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+        <ListFilter className="h-3.5 w-3.5" />
+        Transcript filters
+      </div>
+      <select
+        value={filters.role}
+        onChange={(event) =>
+          onChange({
+            ...filters,
+            role: event.target.value as TranscriptHistoryFilters["role"],
+          })
+        }
+        className={historySelectClassName}
+        aria-label="Filter transcript by role"
+      >
+        <option value="all">All roles</option>
+        <option value="user">User</option>
+        <option value="assistant">Assistant</option>
+        <option value="system">System</option>
+        <option value="tool">Tool</option>
+      </select>
+      <label className="flex h-8 items-center gap-2 rounded-lg border border-input bg-background px-2.5 text-sm">
+        <input
+          type="checkbox"
+          checked={filters.includeThinking}
+          onChange={(event) => onChange({ ...filters, includeThinking: event.target.checked })}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        Include thinking
+      </label>
+      {active && (
+        <Button type="button" variant="ghost" size="sm" onClick={onClear}>
+          Clear
+        </Button>
+      )}
     </div>
   )
 }
@@ -844,6 +1065,41 @@ export function SessionDetailPage() {
 
 function SessionDetail({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate({ from: "/sessions/$sessionId" })
+  const historySearch = useSearch({ from: "/sessions/$sessionId" })
+  const activeEventFilters = useMemo(() => eventHistoryFilters(historySearch), [historySearch])
+  const activeTranscriptFilters = useMemo(
+    () => transcriptHistoryFilters(historySearch),
+    [historySearch],
+  )
+  const eventFiltersActive = hasEventHistoryFilters(activeEventFilters)
+  const transcriptFiltersActive = hasTranscriptHistoryFilters(activeTranscriptFilters)
+  const eventFilterKey = eventHistoryFilterKey(activeEventFilters)
+  const transcriptFilterKey = transcriptHistoryFilterKey(activeTranscriptFilters)
+  const eventRequestFilters = useMemo(
+    () => eventHistoryQuery(activeEventFilters),
+    [activeEventFilters],
+  )
+  const transcriptRequestFilters = useMemo(
+    () => transcriptHistoryQuery(activeTranscriptFilters),
+    [activeTranscriptFilters],
+  )
+  const eventQueryRoot = useMemo(
+    () => ["session-events", sessionId, eventFilterKey] as const,
+    [eventFilterKey, sessionId],
+  )
+  const transcriptQueryRoot = useMemo(
+    () => ["session-transcript", sessionId, transcriptFilterKey] as const,
+    [sessionId, transcriptFilterKey],
+  )
+  const latestEventQueryKey = useMemo(
+    () => [...eventQueryRoot, "latest"] as const,
+    [eventQueryRoot],
+  )
+  const latestTranscriptQueryKey = useMemo(
+    () => [...transcriptQueryRoot, "latest"] as const,
+    [transcriptQueryRoot],
+  )
   const [interruptSheetOpen, setInterruptSheetOpen] = useState(false)
   const [interruptReason, setInterruptReason] = useState("")
   const [interruptRequested, setInterruptRequested] = useState(false)
@@ -862,11 +1118,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [transcriptVisible, setTranscriptVisible] = useState(false)
   const [eventReconcileError, setEventReconcileError] = useState<string | null>(null)
   const [transcriptReconcileError, setTranscriptReconcileError] = useState<string | null>(null)
-  const [eventNavigation, setEventNavigation] = useState(() =>
-    initialPageNavigation<number | null>(null),
+  const [eventNavigationState, setEventNavigationState] = useState(() =>
+    initialFilteredPageNavigation<number | null>(eventFilterKey, null),
   )
-  const [transcriptNavigation, setTranscriptNavigation] = useState(() =>
-    initialPageNavigation<TranscriptPageParam>(null),
+  const [transcriptNavigationState, setTranscriptNavigationState] = useState(() =>
+    initialFilteredPageNavigation<TranscriptPageParam>(transcriptFilterKey, null),
+  )
+  const eventNavigation = pageNavigationForFilter(eventNavigationState, eventFilterKey, null)
+  const transcriptNavigation = pageNavigationForFilter(
+    transcriptNavigationState,
+    transcriptFilterKey,
+    null,
   )
   const mutationActive = resuming || resolvingAction || retryingCascade
   const detailQuery = useQuery({
@@ -909,14 +1171,14 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     refetchOnWindowFocus: false,
   })
   const eventsQuery = useQuery({
-    queryKey: ["session-events", sessionId, eventNavigation.current ?? "latest"],
+    queryKey: [...eventQueryRoot, eventNavigation.current ?? "latest"],
     queryFn: ({ signal }) =>
       fetchSessionEvents(
         sessionId,
         {
+          ...eventRequestFilters,
           order_by: "sequence_desc",
           limit: SESSION_EVENT_PAGE_SIZE,
-          exclude_event_type: "model.text.delta",
           ...(eventNavigation.current === null ? {} : { before_sequence: eventNavigation.current }),
         },
         signal,
@@ -929,9 +1191,34 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     refetchOnWindowFocus: false,
   })
   const transcriptQuery = useQuery({
-    queryKey: ["session-transcript", sessionId, transcriptNavigation.current ?? "latest"],
-    queryFn: ({ signal }) => fetchTranscriptPage(sessionId, transcriptNavigation.current, signal),
+    queryKey: [...transcriptQueryRoot, transcriptNavigation.current ?? "latest"],
+    queryFn: ({ signal }) =>
+      fetchTranscriptPage(
+        sessionId,
+        transcriptNavigation.current,
+        transcriptRequestFilters,
+        signal,
+      ),
     enabled: state !== undefined,
+    gcTime: 0,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+  })
+  const failureDiagnosticsEnabled = state !== undefined && eventFiltersActive
+  const failureEventsQuery = useQuery({
+    queryKey: ["session-failure-events", sessionId, state?.last_activity_at ?? null],
+    queryFn: ({ signal }) =>
+      fetchSessionEvents(
+        sessionId,
+        {
+          order_by: "sequence_desc",
+          limit: SESSION_EVENT_PAGE_SIZE,
+          exclude_event_type: "model.text.delta",
+        },
+        signal,
+      ),
+    enabled: failureDiagnosticsEnabled,
+    placeholderData: keepPreviousData,
     gcTime: 0,
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnWindowFocus: false,
@@ -1000,6 +1287,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const transcriptReconcilePendingRef = useRef(false)
   const eventScanCursorRef = useRef(0)
   const mutationActiveRef = useRef(mutationActive)
+  const eventFilterKeyRef = useRef(eventFilterKey)
+  const transcriptFilterKeyRef = useRef(transcriptFilterKey)
+  const latestEventQueryKeyRef = useRef(latestEventQueryKey)
+  const latestTranscriptQueryKeyRef = useRef(latestTranscriptQueryKey)
   const eventReconcileRunnerRef = useRef<CoalescedAsyncRunner | null>(null)
   const transcriptReconcileRunnerRef = useRef<CoalescedAsyncRunner | null>(null)
   if (eventReconcileRunnerRef.current === null) {
@@ -1016,8 +1307,50 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   transcriptPinnedToTailRef.current = transcriptPinnedToTail
   transcriptVisibleRef.current = transcriptVisible
   mutationActiveRef.current = mutationActive
+  eventFilterKeyRef.current = eventFilterKey
+  transcriptFilterKeyRef.current = transcriptFilterKey
+  latestEventQueryKeyRef.current = latestEventQueryKey
+  latestTranscriptQueryKeyRef.current = latestTranscriptQueryKey
   eventsPageRef.current = eventsQuery.data
   transcriptPageRef.current = transcriptQuery.data
+  useEffect(() => {
+    if (eventNavigationState.filterKey === eventFilterKey) return
+    const previousFilterKey = eventNavigationState.filterKey
+    eventReconcileRunner.clearPending()
+    eventReconcileAbortRef.current?.abort()
+    eventReconcilePendingRef.current = false
+    eventScanCursorRef.current = 0
+    setEventReconcileError(null)
+    setSelectedEventId(null)
+    setEventPinnedToTail(true)
+    setEventNavigationState(initialFilteredPageNavigation(eventFilterKey, null))
+    void queryClient.cancelQueries({
+      queryKey: ["session-events", sessionId, previousFilterKey],
+      exact: false,
+    })
+  }, [eventFilterKey, eventNavigationState.filterKey, eventReconcileRunner, queryClient, sessionId])
+
+  useEffect(() => {
+    if (transcriptNavigationState.filterKey === transcriptFilterKey) return
+    const previousFilterKey = transcriptNavigationState.filterKey
+    transcriptReconcileRunner.clearPending()
+    transcriptReconcileAbortRef.current?.abort()
+    transcriptReconcilePendingRef.current = false
+    setTranscriptReconcileError(null)
+    setTranscriptPinnedToTail(true)
+    setTranscriptNavigationState(initialFilteredPageNavigation(transcriptFilterKey, null))
+    void queryClient.cancelQueries({
+      queryKey: ["session-transcript", sessionId, previousFilterKey],
+      exact: false,
+    })
+  }, [
+    queryClient,
+    sessionId,
+    transcriptFilterKey,
+    transcriptNavigationState.filterKey,
+    transcriptReconcileRunner,
+  ])
+
   const events = useMemo(() => {
     return [...(eventsQuery.data?.events ?? [])].sort(
       (left, right) => left.sequence - right.sequence,
@@ -1028,20 +1361,42 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       (left, right) => left.index - right.index,
     )
   }, [transcriptQuery.data])
-  const liveTimelineEventCount = useMemo(
-    () => liveEvents.filter((event) => event.type !== "model.text.delta").length,
-    [liveEvents],
+  const diagnosticEvents = useMemo(() => {
+    return [...(failureEventsQuery.data?.events ?? [])].sort(
+      (left, right) => left.sequence - right.sequence,
+    )
+  }, [failureEventsQuery.data])
+  const filteredLiveEvents = useMemo(
+    () => liveEvents.filter((event) => eventMatchesHistoryFilters(event, activeEventFilters)),
+    [activeEventFilters, liveEvents],
   )
+  const liveTimelineEventCount = useMemo(() => filteredLiveEvents.length, [filteredLiveEvents])
+  useEffect(() => {
+    if (activeEventFilters.eventId === "") return
+    if (
+      events.some((event) => event.id === activeEventFilters.eventId) ||
+      filteredLiveEvents.some((event) => event.id === activeEventFilters.eventId)
+    ) {
+      setSelectedEventId(activeEventFilters.eventId)
+    }
+  }, [activeEventFilters.eventId, events, filteredLiveEvents])
   const eventTailRevision = events.at(-1)?.sequence ?? null
   const transcriptTailRevision = transcript.at(-1)?.index ?? null
 
   const performLatestEventReconciliation = useCallback(async (): Promise<boolean> => {
-    if (!eventAtLatestRef.current || mutationActiveRef.current) return false
+    if (
+      eventFilterKeyRef.current !== eventFilterKey ||
+      !eventAtLatestRef.current ||
+      mutationActiveRef.current
+    ) {
+      return false
+    }
     eventReconcilePendingRef.current = false
     setEventReconcileError(null)
     const current = eventsPageRef.current
     if (current === undefined) {
       const result = await eventsQuery.refetch()
+      if (eventFilterKeyRef.current !== eventFilterKey) return false
       eventReconcilePendingRef.current = result.isError
       return !result.isError
     }
@@ -1053,52 +1408,54 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       const incremental = await fetchSessionEvents(
         sessionId,
         {
+          ...eventRequestFilters,
           after_sequence: scanCursor,
           order_by: "sequence_asc",
           limit: SESSION_EVENT_PAGE_SIZE,
-          exclude_event_type: "model.text.delta",
         },
         controller.signal,
       )
-      if (controller.signal.aborted || !eventAtLatestRef.current) return false
+      if (
+        controller.signal.aborted ||
+        eventFilterKeyRef.current !== eventFilterKey ||
+        !eventAtLatestRef.current
+      ) {
+        return false
+      }
       if (incremental.has_more) {
         const result = await eventsQuery.refetch()
+        if (eventFilterKeyRef.current !== eventFilterKey) return false
         eventReconcilePendingRef.current = result.isError
         return !result.isError
       }
       const nextScanCursor = eventScanCursor(incremental, scanCursor)
       eventScanCursorRef.current = nextScanCursor
       if (incremental.events.length === 0) {
-        queryClient.setQueryData<SessionEventsPage>(
-          ["session-events", sessionId, "latest"],
-          (existing) =>
-            existing === undefined
-              ? existing
-              : { ...existing, scan_through_sequence: nextScanCursor },
+        queryClient.setQueryData<SessionEventsPage>(latestEventQueryKey, (existing) =>
+          existing === undefined
+            ? existing
+            : { ...existing, scan_through_sequence: nextScanCursor },
         )
         return true
       }
 
-      queryClient.setQueryData<SessionEventsPage>(
-        ["session-events", sessionId, "latest"],
-        (existing) => {
-          if (existing === undefined) return existing
-          const merged = mergeLatestEventWindow(
-            existing.events,
-            incremental.events,
-            SESSION_EVENT_PAGE_SIZE,
-          )
-          const oldest = merged.records.at(-1)
-          return {
-            ...existing,
-            events: merged.records,
-            order_by: "sequence_desc",
-            next_sequence: oldest?.sequence ?? null,
-            scan_through_sequence: nextScanCursor,
-            has_more: existing.has_more || merged.dropped,
-          }
-        },
-      )
+      queryClient.setQueryData<SessionEventsPage>(latestEventQueryKey, (existing) => {
+        if (existing === undefined) return existing
+        const merged = mergeLatestEventWindow(
+          existing.events,
+          incremental.events,
+          SESSION_EVENT_PAGE_SIZE,
+        )
+        const oldest = merged.records.at(-1)
+        return {
+          ...existing,
+          events: merged.records,
+          order_by: "sequence_desc",
+          next_sequence: oldest?.sequence ?? null,
+          scan_through_sequence: nextScanCursor,
+          has_more: existing.has_more || merged.dropped,
+        }
+      })
       return true
     } catch (error) {
       if (isAbortError(error)) return false
@@ -1108,18 +1465,25 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         eventReconcileAbortRef.current = null
       }
     }
-  }, [eventsQuery.refetch, queryClient, sessionId])
+  }, [
+    eventFilterKey,
+    eventRequestFilters,
+    eventsQuery.refetch,
+    latestEventQueryKey,
+    queryClient,
+    sessionId,
+  ])
 
   const reconcileLatestEvents = useCallback(
     () =>
       eventReconcileRunner.request(performLatestEventReconciliation).catch((error) => {
-        if (isAbortError(error)) return
+        if (isAbortError(error) || eventFilterKeyRef.current !== eventFilterKey) return
         eventReconcilePendingRef.current = true
         setEventReconcileError(
           error instanceof Error ? error.message : "Failed to refresh the event tail.",
         )
       }),
-    [eventReconcileRunner, performLatestEventReconciliation],
+    [eventFilterKey, eventReconcileRunner, performLatestEventReconciliation],
   )
 
   useEffect(() => {
@@ -1128,12 +1492,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   }, [eventNavigation.current, eventsQuery.data])
 
   const performLatestTranscriptReconciliation = useCallback(async (): Promise<boolean> => {
-    if (!transcriptAtLatestRef.current || mutationActiveRef.current) return false
+    if (
+      transcriptFilterKeyRef.current !== transcriptFilterKey ||
+      !transcriptAtLatestRef.current ||
+      mutationActiveRef.current
+    ) {
+      return false
+    }
     transcriptReconcilePendingRef.current = false
     setTranscriptReconcileError(null)
     const current = transcriptPageRef.current
     if (current === undefined) {
       const result = await transcriptQuery.refetch()
+      if (transcriptFilterKeyRef.current !== transcriptFilterKey) return false
       transcriptReconcilePendingRef.current = result.isError
       return !result.isError
     }
@@ -1143,22 +1514,44 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     try {
       const incremental = await fetchSessionTranscript(
         sessionId,
-        { offset: current.total_messages, limit: SESSION_TRANSCRIPT_PAGE_SIZE },
+        {
+          ...transcriptRequestFilters,
+          offset: current.total_messages,
+          limit: SESSION_TRANSCRIPT_PAGE_SIZE,
+        },
         controller.signal,
       )
-      if (controller.signal.aborted || !transcriptAtLatestRef.current) return false
+      if (
+        controller.signal.aborted ||
+        transcriptFilterKeyRef.current !== transcriptFilterKey ||
+        !transcriptAtLatestRef.current
+      ) {
+        return false
+      }
 
-      if (incremental.has_more) {
+      if (
+        incremental.has_more ||
+        transcriptDeltaRequiresTailReload(
+          current,
+          incremental,
+          activeTranscriptFilters.includeThinking,
+          SESSION_TRANSCRIPT_PAGE_SIZE,
+        )
+      ) {
         const tail = await fetchTranscriptTailPage(
           sessionId,
           incremental.total_messages,
+          transcriptRequestFilters,
           controller.signal,
         )
-        if (controller.signal.aborted || !transcriptAtLatestRef.current) return false
-        queryClient.setQueryData<SessionTranscriptPage>(
-          ["session-transcript", sessionId, "latest"],
-          tail,
-        )
+        if (
+          controller.signal.aborted ||
+          transcriptFilterKeyRef.current !== transcriptFilterKey ||
+          !transcriptAtLatestRef.current
+        ) {
+          return false
+        }
+        queryClient.setQueryData<SessionTranscriptPage>(latestTranscriptQueryKey, tail)
         transcriptReconcilePendingRef.current = false
         return true
       }
@@ -1167,33 +1560,30 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         incremental.total_messages === current.total_messages
       ) {
         queryClient.setQueryData<SessionTranscriptPage>(
-          ["session-transcript", sessionId, "latest"],
+          latestTranscriptQueryKey,
           (existing) => existing,
         )
         transcriptReconcilePendingRef.current = false
         return true
       }
 
-      queryClient.setQueryData<SessionTranscriptPage>(
-        ["session-transcript", sessionId, "latest"],
-        (existing) => {
-          if (existing === undefined) return existing
-          const merged = mergeLatestTranscriptWindow(
-            existing.messages,
-            incremental.messages,
-            SESSION_TRANSCRIPT_PAGE_SIZE,
-          )
-          const totalMessages = Math.max(existing.total_messages, incremental.total_messages)
-          return {
-            ...existing,
-            messages: merged.records,
-            offset: merged.records[0]?.index ?? totalMessages,
-            next_offset: totalMessages,
-            has_more: false,
-            total_messages: totalMessages,
-          }
-        },
-      )
+      queryClient.setQueryData<SessionTranscriptPage>(latestTranscriptQueryKey, (existing) => {
+        if (existing === undefined) return existing
+        const merged = mergeLatestTranscriptWindow(
+          existing.messages,
+          incremental.messages,
+          SESSION_TRANSCRIPT_PAGE_SIZE,
+        )
+        const totalMessages = Math.max(existing.total_messages, incremental.total_messages)
+        return {
+          ...existing,
+          messages: merged.records,
+          offset: latestTranscriptPageOffset(totalMessages, SESSION_TRANSCRIPT_PAGE_SIZE),
+          next_offset: totalMessages,
+          has_more: false,
+          total_messages: totalMessages,
+        }
+      })
       transcriptReconcilePendingRef.current = false
       return true
     } catch (error) {
@@ -1204,18 +1594,26 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         transcriptReconcileAbortRef.current = null
       }
     }
-  }, [queryClient, sessionId, transcriptQuery.refetch])
+  }, [
+    activeTranscriptFilters.includeThinking,
+    latestTranscriptQueryKey,
+    queryClient,
+    sessionId,
+    transcriptFilterKey,
+    transcriptQuery.refetch,
+    transcriptRequestFilters,
+  ])
 
   const reconcileLatestTranscript = useCallback(
     () =>
       transcriptReconcileRunner.request(performLatestTranscriptReconciliation).catch((error) => {
-        if (isAbortError(error)) return
+        if (isAbortError(error) || transcriptFilterKeyRef.current !== transcriptFilterKey) return
         transcriptReconcilePendingRef.current = true
         setTranscriptReconcileError(
           error instanceof Error ? error.message : "Failed to refresh the transcript tail.",
         )
       }),
-    [performLatestTranscriptReconciliation, transcriptReconcileRunner],
+    [performLatestTranscriptReconciliation, transcriptFilterKey, transcriptReconcileRunner],
   )
 
   useEffect(() => {
@@ -1405,7 +1803,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         eventReconcilePendingRef.current = false
         historyRefreshes.push(
           queryClient.refetchQueries({
-            queryKey: ["session-events", sessionId, "latest"],
+            queryKey: latestEventQueryKeyRef.current,
             exact: true,
           }),
         )
@@ -1420,7 +1818,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         transcriptReconcilePendingRef.current = false
         historyRefreshes.push(
           queryClient.refetchQueries({
-            queryKey: ["session-transcript", sessionId, "latest"],
+            queryKey: latestTranscriptQueryKeyRef.current,
             exact: true,
           }),
         )
@@ -1694,9 +2092,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const summary = summaryQuery.data
   const allEvents =
     eventNavigation.current === null && eventPinnedToTail
-      ? mergeStoredAndLiveRecords<SessionEvent>(events, liveEvents)
+      ? mergeStoredAndLiveRecords<SessionEvent>(events, filteredLiveEvents)
       : events
-  const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
+  const filteredEvents = allEvents
   const selectedEvent = filteredEvents.find((event) => event.id === selectedEventId) ?? null
   const pendingActionStatus = PENDING_ACTION_SESSION_STATUSES.has(session.status)
   const pendingAction = pendingActionStatus
@@ -1709,10 +2107,29 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       pendingActionQuery.isFetching ||
       pendingActionQuery.isError)
   const hasPendingInterruptionCascade = interruptionCascade !== "none"
+  const failureEventSource = eventFiltersActive
+    ? mergeStoredAndLiveRecords<SessionEvent>(
+        diagnosticEvents,
+        liveEvents.filter((event) => event.type !== "model.text.delta"),
+      )
+    : filteredEvents
+  const summaryFailureCandidates: SessionEvent[] = []
+  if (summary?.outcome.terminal_event) {
+    summaryFailureCandidates.push(summary.outcome.terminal_event)
+  }
+  if (summary?.events.latest_event) {
+    summaryFailureCandidates.push(summary.events.latest_event)
+  }
+  const failureEventCandidates = mergeStoredAndLiveRecords<SessionEvent>(
+    failureEventSource,
+    summaryFailureCandidates,
+  ).sort(compareEventOrder)
   const failureEvent = latestFailureEvent(
     interruptionCascade === "failed"
-      ? filteredEvents
-      : filteredEvents.filter((event) => event.type !== "session.interruption_cascade_failed"),
+      ? failureEventCandidates
+      : failureEventCandidates.filter(
+          (event) => event.type !== "session.interruption_cascade_failed",
+        ),
   )
   const canRetryCascade =
     stateIsFresh && session.status === "interrupted" && interruptionCascade === "failed"
@@ -1745,7 +2162,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const eventCounts = summaryIsCurrent ? sortedEventCounts(summary) : []
   const totalEvents = summaryIsCurrent ? summary.events.total_events : undefined
   const totalTranscriptMessages =
-    transcriptQuery.data?.total_messages ?? summary?.transcript.total_messages ?? transcript.length
+    transcriptQuery.data?.total_messages ??
+    (transcriptFiltersActive
+      ? transcript.length
+      : (summary?.transcript.total_messages ?? transcript.length))
   const statusDetail =
     summaryIsCurrent && summary.outcome.retry ? "retry recorded" : "current lifecycle state"
   const summaryUnavailableDetail = summaryQuery.isError ? "summary unavailable" : "loading summary"
@@ -1793,13 +2213,52 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     pinned: transcriptPinnedToTail,
   })
   const durationDetailText = durationDetail(session.status, terminalEventAt != null)
+  const applyEventFilters = (filters: EventHistoryFilters) => {
+    void navigate({
+      search: (current) => sessionHistorySearchWithEventFilters(current, filters),
+      resetScroll: false,
+    })
+  }
+  const clearEventFilters = () => {
+    applyEventFilters({
+      eventId: "",
+      eventType: "",
+      toolName: "",
+      agentName: "",
+      environmentName: "",
+      workflowName: "",
+    })
+  }
+  const inspectFailureEvent = (event: SessionEvent) => {
+    if (filteredEvents.some((candidate) => candidate.id === event.id)) {
+      setSelectedEventId(event.id)
+      return
+    }
+    applyEventFilters({
+      eventId: event.id,
+      eventType: "",
+      toolName: "",
+      agentName: "",
+      environmentName: "",
+      workflowName: "",
+    })
+  }
+  const applyTranscriptFilters = (filters: TranscriptHistoryFilters) => {
+    void navigate({
+      search: (current) => sessionHistorySearchWithTranscriptFilters(current, filters),
+      resetScroll: false,
+    })
+  }
+  const clearTranscriptFilters = () => {
+    applyTranscriptFilters({ role: "all", includeThinking: true })
+  }
   const showNewerEvents = () => {
     eventReconcileRunner.clearPending()
     eventReconcileAbortRef.current?.abort()
     eventReconcilePendingRef.current = false
     const next = navigateToNewerPage(eventNavigation)
     setEventReconcileError(null)
-    setEventNavigation(next)
+    setEventNavigationState({ filterKey: eventFilterKey, navigation: next })
     if (next.current === null) setEventPinnedToTail(true)
   }
   const showOlderEvents = () => {
@@ -1809,7 +2268,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     eventReconcilePendingRef.current = false
     setEventReconcileError(null)
     setEventPinnedToTail(false)
-    setEventNavigation(navigateToOlderPage(eventNavigation, olderEventCursor))
+    setEventNavigationState({
+      filterKey: eventFilterKey,
+      navigation: navigateToOlderPage(eventNavigation, olderEventCursor),
+    })
   }
   const jumpToEventTail = () => {
     eventReconcileRunner.clearPending()
@@ -1817,7 +2279,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     if (eventNavigation.current !== null) eventReconcilePendingRef.current = false
     setEventReconcileError(null)
     setEventPinnedToTail(true)
-    setEventNavigation(jumpToLatestPage(null))
+    setEventNavigationState({ filterKey: eventFilterKey, navigation: jumpToLatestPage(null) })
     const viewport = eventsViewportRef.current
     if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
   }
@@ -1827,7 +2289,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     transcriptReconcilePendingRef.current = false
     const next = navigateToNewerPage(transcriptNavigation)
     setTranscriptReconcileError(null)
-    setTranscriptNavigation(next)
+    setTranscriptNavigationState({ filterKey: transcriptFilterKey, navigation: next })
     if (next.current === null) setTranscriptPinnedToTail(true)
   }
   const showOlderTranscript = () => {
@@ -1837,7 +2299,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     transcriptReconcilePendingRef.current = false
     setTranscriptReconcileError(null)
     setTranscriptPinnedToTail(false)
-    setTranscriptNavigation(navigateToOlderPage(transcriptNavigation, olderTranscript))
+    setTranscriptNavigationState({
+      filterKey: transcriptFilterKey,
+      navigation: navigateToOlderPage(transcriptNavigation, olderTranscript),
+    })
   }
   const jumpToTranscriptTail = () => {
     transcriptReconcileRunner.clearPending()
@@ -1845,7 +2310,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     if (transcriptNavigation.current !== null) transcriptReconcilePendingRef.current = false
     setTranscriptReconcileError(null)
     setTranscriptPinnedToTail(true)
-    setTranscriptNavigation(jumpToLatestPage(null))
+    setTranscriptNavigationState({
+      filterKey: transcriptFilterKey,
+      navigation: jumpToLatestPage(null),
+    })
     const viewport = transcriptViewportRef.current
     if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
   }
@@ -2154,7 +2622,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         <FailureDebugBanner
           event={failureEvent}
           selected={selectedEventId === failureEvent.id}
-          onInspect={() => setSelectedEventId(failureEvent.id)}
+          onInspect={() => inspectFailureEvent(failureEvent)}
         />
       )}
 
@@ -2166,7 +2634,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 <div>
                   <CardTitle className="text-base">Event Timeline</CardTitle>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Stored runtime events, excluding streaming text deltas.
+                    Stored runtime events. Streaming text deltas are hidden unless selected by ID or
+                    type.
                   </p>
                 </div>
                 <div className="flex max-w-[62%] flex-wrap justify-end gap-1.5">
@@ -2223,6 +2692,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 </div>
               </div>
             </CardHeader>
+            <EventHistoryFilterControls
+              key={eventFilterKey}
+              filters={activeEventFilters}
+              onApply={applyEventFilters}
+              onClear={clearEventFilters}
+            />
             <CardContent className="min-h-0 flex-1 p-0">
               <div
                 ref={eventsViewportRef}
@@ -2236,7 +2711,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                     eventReconcileRunner.clearPending()
                     eventReconcileAbortRef.current?.abort()
                     void queryClient.cancelQueries({
-                      queryKey: ["session-events", sessionId, "latest"],
+                      queryKey: latestEventQueryKey,
                       exact: true,
                     })
                   }
@@ -2281,10 +2756,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                   <p className="px-4 py-6 text-sm text-muted-foreground">
                     {eventsQuery.isLoading
                       ? "Loading events..."
-                      : allEvents.length > 0
-                        ? olderEventCursor !== null
-                          ? "This page contains only hidden streaming text deltas. Load older events to continue."
-                          : "Only streaming text deltas were recorded; they are hidden from this timeline."
+                      : eventFiltersActive
+                        ? "No events match the current filters."
                         : "No events yet"}
                   </p>
                 )}
@@ -2361,6 +2834,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             </div>
           </div>
         </CardHeader>
+        <TranscriptHistoryFilterControls
+          filters={activeTranscriptFilters}
+          onChange={applyTranscriptFilters}
+          onClear={clearTranscriptFilters}
+        />
         <CardContent className="min-h-0 flex-1 p-0">
           <div
             ref={transcriptViewportRef}
@@ -2374,7 +2852,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 transcriptReconcileRunner.clearPending()
                 transcriptReconcileAbortRef.current?.abort()
                 void queryClient.cancelQueries({
-                  queryKey: ["session-transcript", sessionId, "latest"],
+                  queryKey: latestTranscriptQueryKey,
                   exact: true,
                 })
               }
@@ -2432,7 +2910,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             ))}
             {transcript.length === 0 && !transcriptQuery.isError && !transcriptReconcileError && (
               <p className="text-sm text-muted-foreground">
-                {transcriptQuery.isLoading ? "Loading transcript..." : "No transcript yet"}
+                {transcriptQuery.isLoading
+                  ? "Loading transcript..."
+                  : transcriptFiltersActive
+                    ? "No transcript messages match the current filters."
+                    : "No transcript yet"}
               </p>
             )}
           </div>
