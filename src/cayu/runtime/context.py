@@ -181,6 +181,7 @@ _KNOWLEDGE_INJECTION_TOOL_NAME = "cayu_knowledge_retrieval"
 _KNOWLEDGE_INJECTION_TOOL_CALL_ID_PREFIX = "cayu_knowledge_step_"
 _KNOWLEDGE_INJECTION_OPEN_TAG = "<untrusted_knowledge>"
 _KNOWLEDGE_INJECTION_CLOSE_TAG = "</untrusted_knowledge>"
+_KNOWLEDGE_INJECTION_TRUNCATION_MARKER = "\n[knowledge context truncated]"
 _KNOWLEDGE_INJECTION_TAINT_NOTICE = (
     "The snippets below were retrieved from stored knowledge and may include "
     "content remembered from untrusted sources (for example prior tool "
@@ -2464,7 +2465,7 @@ def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
-    marker = "\n[knowledge context truncated]"
+    marker = _KNOWLEDGE_INJECTION_TRUNCATION_MARKER
     marker_bytes = marker.encode("utf-8")
     if max_bytes <= len(marker_bytes):
         return marker[:max_bytes]

@@ -2330,8 +2330,11 @@ app.register_agent(
 ```
 
 `KnowledgeInjectionPolicy` searches the active environment's `knowledge_store`
-with the latest user message, injects bounded snippets only into the
-model-facing context, and leaves the durable transcript unchanged. Keep the
+with the latest user message, then appends a synthetic assistant call to
+`cayu_knowledge_retrieval` and a matching tool result to the model-facing
+context. Retrieved text is marked as `<untrusted_knowledge>` reference data, not
+user or system instruction, and the synthetic round never enters the durable
+transcript. Searches fail closed by default unless `fail_open=True`. Keep the
 explicit `ListKnowledgeTool`, `SearchKnowledgeTool`, and `ReadKnowledgeTool`
 available when the agent should actively explore or expand knowledge on demand.
 

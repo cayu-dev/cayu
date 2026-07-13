@@ -1857,14 +1857,36 @@ that scope part of the registered agent/tool configuration or instructions.
 
 Apps can also use `KnowledgeInjectionPolicy` when knowledge should be recalled
 automatically before a model call instead of only through explicit tools. The
-policy wraps another context policy, searches the active environment's
-`knowledge_store` with the latest user message and configured filters, then
-injects bounded snippets as model-facing synthetic user context before the latest
-real user message. It does not append those snippets to the durable transcript.
-It emits `knowledge.search.started`, `knowledge.search.completed`,
-`knowledge.search.failed`, and `knowledge.injected` events for audit/debugging.
-Search failures fail closed by default; configure `fail_open=True` when a
-missing knowledge lookup should not block the provider request.
+policy first builds its wrapped context-policy projection, derives a bounded
+query from the text parts of that projection's latest user message, and searches
+the active environment's `knowledge_store`. If that latest user message has no
+non-blank text, the policy skips the search instead of falling back to an earlier
+turn. The query honors `query_max_chars`, namespace, labels, kinds,
+visibilities, aspects, impact targets, source type/id, search mode, expiry
+handling, `max_hits`, and `max_bytes`.
+
+When the search returns hits, the policy appends a self-contained synthetic tool
+round to the end of the wrapped projection — after the latest real user message
+in the normal and compacted projections. The assistant message calls
+`cayu_knowledge_retrieval` with id `cayu_knowledge_step_{step}` and the configured
+namespace; the following tool-result message uses the same name/id and carries
+the bounded retrieved text. That text is untrusted reference data, not a user or
+system instruction. In an untruncated payload, the configurable `prefix` is
+followed by an explicit warning, then the retrieved snippets are enclosed by
+`<untrusted_knowledge>` / `</untrusted_knowledge>` markers. When `max_bytes`
+clips the payload, the tail is replaced by `[knowledge context truncated]`.
+The synthetic round is projection-only: it is sent in model-facing context but
+is not appended to the durable transcript.
+
+`knowledge.search.started` records that a search was attempted and its safe
+query/filter bounds; `knowledge.search.completed` records hit counts and search
+truncation, including zero-hit searches; and `knowledge.search.failed` records
+the lookup failure. `knowledge.injected` proves the synthetic round was added to
+the model-facing projection and records its hit count, byte count, tool-call id,
+and source metadata without copying retrieved text into the event. It does not
+prove that a later provider request completed. Search failures fail closed by
+default; configure `fail_open=True` to emit the failure and continue without the
+synthetic round.
 
 This slice does not add graph retrieval, remote source connectors, background
 remembering workers, or agent-led mutation of existing knowledge. Those layers
