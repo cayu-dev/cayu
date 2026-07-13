@@ -3052,22 +3052,30 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
-            raise RuntimeError(
-                "Session has a pending tool approval. Resolve it with "
-                "resolve_tool_approval(...) before resuming with new messages."
-            )
-        if pending_user_input_from_checkpoint(checkpoint) is not None:
-            raise RuntimeError(
-                "Session is awaiting user input. Answer it with "
-                "resolve_user_input(...) before resuming with new messages."
-            )
 
-        def reject_pending_interruption_cascade(
-            _session: Session,
+        def reject_unresumable_checkpoint(
+            current_session: Session,
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
+            if approval_support.pending_approval_from_checkpoint(current_checkpoint) is not None:
+                raise RuntimeError(
+                    "Session has a pending tool approval. Resolve it with "
+                    "resolve_tool_approval(...) before resuming with new messages."
+                )
+            if pending_user_input_from_checkpoint(current_checkpoint) is not None:
+                raise RuntimeError(
+                    "Session is awaiting user input. Answer it with "
+                    "resolve_user_input(...) before resuming with new messages."
+                )
+            if (
+                current_session.status == SessionStatus.COMPLETED
+                and tool_round_recovery.pending_tool_round_from_checkpoint(current_checkpoint)
+                is not None
+            ):
+                raise RuntimeError(
+                    "Completed session has an inconsistent pending tool round. "
+                    "Inspect or recover the session state before resuming it."
+                )
             if (
                 current_checkpoint is not None
                 and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in current_checkpoint
@@ -3078,11 +3086,17 @@ class CayuApp:
                 )
             return current_checkpoint
 
+        # Report deterministic checkpoint conflicts before claiming the session,
+        # then repeat the same validation inside the atomic transition below so a
+        # concurrent checkpoint update cannot bypass the guard.
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        reject_unresumable_checkpoint(loaded_session, checkpoint)
+
         session = await self.session_store.transition_status_and_checkpoint(
             loaded_session.id,
             from_statuses=_RESUMABLE_SESSION_STATUSES,
             to_status=SessionStatus.RUNNING,
-            checkpoint_transform=reject_pending_interruption_cascade,
+            checkpoint_transform=reject_unresumable_checkpoint,
         )
         try:
             if request.model is not None:

@@ -225,6 +225,114 @@ wrong type, table, access method, columns, expression, or predicate fails with a
 actionable migration error rather than being accepted or retried indefinitely.
 SQLite already carries the equivalent index.
 
+`query_pending_actions(PendingActionQuery(...))` is a required `SessionStore`
+operation and the bounded control-plane read for tool approvals, user-input
+waits, and manual recovery. The latest
+checkpoint remains the durable source of pending workflow state; stores join it
+only to events matching the current approval id, input id, or tool-round call
+ids, plus the latest lifecycle barrier. Implementations must not list candidate
+sessions and issue a history query per session. Results use updated-session
+keyset pagination, stable action ids derived from the source event sequence, and
+an optional total because an exact count is not efficient for every backend.
+Each result embeds `PendingActionSession`, an explicit list-view projection that
+does not contain session metadata; callers must load the session detail when
+metadata is required. The embedded source `EventRecord` preserves stable event
+identity, type, sequence, timestamp, and indexed metadata, but its payload is an
+empty object. Action-specific display and resolution fields live on the pending
+action itself, avoiding a second copy of arbitrary tool arguments or lifecycle
+payload data in the list response.
+
+Schema revision 17 adds checkpoint-side query metrics—projected source bytes,
+tool-call count, pending-key flags, and an explicit metrics-ready marker—updated
+atomically with every checkpoint write. Relevant event writes atomically persist
+a fixed-size SHA-256 lookup key derived from the normalized action identifier,
+a compact control-plane event projection, and that projection's byte count.
+Event projection is size-checked without first
+copying or serializing its selected payload. A projection above the 16 MiB
+storage ceiling is represented by a bounded oversized sentinel and no duplicate
+projection body, so one arbitrary interruption message or user-input option
+cannot create unbounded write amplification. Raw provider-defined identifiers
+are never duplicated into the indexed lookup column, so identifier length cannot
+create oversized SQLite or PostgreSQL B-tree entries. Terminal tool projections
+also persist a bounded structural-validity flag for the `ToolResult` envelope,
+without copying its content, structured data, or artifacts. This prevents a
+malformed terminal event from being mistaken for a safely resumable tool round.
+The partial checkpoint index uses the flags rather than reparsing checkpoint
+JSON on each poll. The revision also adds a compact partial lifecycle-barrier
+index on `(session_id, sequence)` containing only `session.resumed`,
+`session.completed`, and `session.failed` rows, plus a partial index keyed by
+session, fixed-size current approval/input/tool-call/tool-round lookup key,
+event type, and sequence. Rows without a normalized identifier are excluded.
+Unrelated and high-volume events therefore incur no lifecycle-barrier index
+entry. PostgreSQL builds all three revision
+17 indexes concurrently. Both PostgreSQL and SQLite backfill the new metadata in
+short, independently committed batches before recording the revision; the ready
+marker and projection-byte nullability make an interrupted migration resumable
+without repeating already completed batches. PostgreSQL migrators can cooperate
+on backfill rows with `FOR UPDATE SKIP LOCKED`; checkpoint-id and event-sequence
+cursors prevent repeated rescans of already processed history. PostgreSQL
+batches events up to 1 MiB and isolates larger events one per transaction,
+bounding migration memory without committing once for every ordinary event.
+SQLite briefly takes its normal
+single-writer lock for each batch rather than for the complete historical data
+set. Pending-action queries first cap the
+candidate checkpoint page and then resolve at most the latest row for each
+current checkpoint identifier/event-type pair through the lookup index. Both SQL
+stores index the same fixed-length digest and pending-action derivation rechecks
+the original identifier from the bounded event projection after lookup, so a
+digest collision cannot become a false action match.
+Revision 17 is a breaking write-contract migration: stop pre-17 application
+writers before migrating, then deploy the revision-17 binary. This prevents an
+older checkpoint or event writer from leaving the new query metadata stale.
+Unrelated events, including unrelated tool lifecycle events, are not scanned or
+transferred as history. The in-memory store keeps the latest record per normalized
+identifier/event type plus the latest lifecycle barrier rather than rescanning
+the session's relevant history, and releases identifier maps when the checkpoint
+no longer contains a pending action. If checkpoint state later reintroduces a
+cleared durable identifier, the in-memory store reconstructs that bounded index
+from its retained event log so it remains equivalent to SQL stores.
+
+Every query also carries an explicit materialization/result byte ceiling (2 MiB
+by default, configurable up to 16 MiB). SQLite and PostgreSQL first select a
+bounded page of session headers; the extra look-ahead row used for `has_more`
+never enters checkpoint or event JSON projection. They then measure only the
+inspected candidate ids inside the same pinned read snapshot and materialize
+only candidates that fit the page budget. A checkpoint preflight reads the
+transactionally maintained byte/count metrics without touching checkpoint JSON,
+and rejects a tool round with more than 256 calls before expanding any call ids
+into query rows. Event measurement reads only persisted projection byte counts;
+materialization reads the compact projection only after the candidate fits the
+page budget. Polling never parses or detoasts the original event payload. Large
+tool results and unrelated lifecycle payload fields are excluded because
+pending-action derivation needs only the durable event type, current
+identifiers, and action display fields.
+
+An individually oversized, over-complex, malformed, or internally inconsistent
+candidate is returned as a bounded `issues` entry
+with its session id instead of failing the entire page. Issues count toward the
+requested page size and continuation cursors advance past returned issues, so a
+malformed or unusually large pending state cannot block valid actions behind
+it. Completed sessions are also inspected when their checkpoint still contains
+pending workflow state; that impossible terminal/pending combination fails
+closed as `source_invalid`, preventing the dashboard from offering a generic
+resume that would bypass the unresolved state. The runtime enforces the same
+completed-session guard atomically during generic resume, so SDK and HTTP callers
+cannot bypass the control-plane check. A `413` is reserved for the
+exceptional case where even the bounded result envelope cannot satisfy the
+caller's byte ceiling. The dashboard does not retry
+or poll that deterministic failure and does not issue a cascade of smaller-page
+requests; operators can choose a different page size explicitly. Matched events
+are aggregated into one bounded row per materialized candidate so checkpoint
+JSON is not repeated once per event. The design intentionally does not add a
+materialized pending-action table: duplicating checkpoint state would require
+transactional coordination across checkpoint, event, fork, resolution, and
+recovery writes.
+The indexed identifier join keeps one durable source of truth while bounding
+database work. Existing databases must run `cayu storage migrate` before using
+this query. SQLite and PostgreSQL validate the exact required index definitions
+after the revision is recorded; explicit migrate mode recreates missing or invalid
+indexes. A conflicting same-name schema object must be removed or renamed first.
+
 Event ordering has two distinct cursors. The per-session event order is dense
 and gap-free within a session. The global `EventRecord.sequence` is the durable
 cross-session cursor used by dashboards, watchers, and outbox-style readers.

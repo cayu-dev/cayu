@@ -7349,6 +7349,65 @@ def test_cayu_app_resumes_completed_session_from_stored_transcript():
     assert session.status == SessionStatus.COMPLETED
 
 
+def test_cayu_app_rejects_completed_session_with_pending_tool_round():
+    from cayu.runtime import _runtime_records as runtime_records
+    from cayu.runtime import _tool_round_recovery as tool_round_recovery
+
+    store = InMemorySessionStore()
+    provider = FakeProvider([])
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+        None,
+        agent_name="assistant",
+        environment_name=None,
+        task_id=None,
+        tool_calls=[
+            runtime_records.ToolCallRequest(
+                id="completed_pending_call",
+                name="side_effect",
+                arguments={},
+            )
+        ],
+        policy_outcomes=None,
+        structured_output=None,
+    )
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="completed_pending_round",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.checkpoint("completed_pending_round", checkpoint)
+        await store.update_status("completed_pending_round", SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+
+    with pytest.raises(
+        RuntimeError,
+        match="Completed session has an inconsistent pending tool round",
+    ):
+        asyncio.run(
+            collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="completed_pending_round",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load("completed_pending_round"))
+    assert session is not None and session.status == SessionStatus.COMPLETED
+    assert asyncio.run(store.load_checkpoint("completed_pending_round")) == checkpoint
+    assert pending_round.round_id == checkpoint["pending_tool_round"]["round_id"]
+
+
 def test_cayu_app_forks_completed_session_and_preserves_source():
     store = InMemorySessionStore()
     provider = FakeProvider(

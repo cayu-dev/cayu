@@ -24,7 +24,12 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
@@ -586,6 +591,59 @@ class EventOrder(StrEnum):
     SEQUENCE_DESC = "sequence_desc"
 
 
+class PendingActionKind(StrEnum):
+    TOOL_APPROVAL = "tool_approval"
+    USER_INPUT = "user_input"
+    MANUAL_RECOVERY = "manual_recovery"
+
+
+class PendingActionIssueCode(StrEnum):
+    """Why one pending-action candidate could not be projected safely."""
+
+    SOURCE_TOO_LARGE = "source_too_large"
+    SOURCE_TOO_COMPLEX = "source_too_complex"
+    SOURCE_INVALID = "source_invalid"
+
+
+DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES = 2 * 1024 * 1024
+MAX_PENDING_ACTION_RESULT_BYTES = 16 * 1024 * 1024
+# A model/runtime should never produce hundreds of calls in one tool round. This
+# cap is also a storage-safety boundary: SQL stores inspect the count before
+# expanding checkpoint call identifiers into rows.
+MAX_PENDING_ACTION_TOOL_CALLS = 256
+
+
+class PendingActionResultTooLarge(RuntimeError):
+    """A pending-action page exceeded its caller-selected serialized byte ceiling."""
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"Pending-action response exceeds the {max_bytes}-byte result limit. "
+            "Request a smaller page or inspect the session directly."
+        )
+
+
+PENDING_ACTION_EVENT_TYPE_VALUES = frozenset(
+    {
+        "tool.call.approval_requested",
+        "session.awaiting_user_input",
+        "session.interrupted",
+        "session.resumed",
+        "session.completed",
+        "session.failed",
+        "tool.call.started",
+        "tool.call.completed",
+        "tool.call.failed",
+        "tool.call.blocked",
+        "tool.call.approval_denied",
+    }
+)
+PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES = frozenset(
+    {"session.resumed", "session.completed", "session.failed"}
+)
+
+
 class LabelSelectorOperator(StrEnum):
     EXISTS = "exists"
     NOT_EXISTS = "not_exists"
@@ -744,6 +802,362 @@ class EventRecord(BaseModel):
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+
+class PendingActionQuery(BaseModel):
+    """Bounded query for durable control-plane actions blocking a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str | None = None
+    kind: PendingActionKind | None = None
+    agent_name: str | None = None
+    environment_name: str | None = None
+    q: str | None = None
+    cursor: str | None = None
+    limit: StrictInt = Field(default=50, ge=1, le=200)
+    max_result_bytes: StrictInt = Field(
+        default=DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
+        ge=1024,
+        le=MAX_PENDING_ACTION_RESULT_BYTES,
+    )
+
+    @field_validator(
+        "session_id",
+        "agent_name",
+        "environment_name",
+        "q",
+        "cursor",
+    )
+    @classmethod
+    def validate_optional_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+
+class PendingActionSession(BaseModel):
+    """Bounded session identity embedded in pending-action query results."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    agent_name: str
+    provider_name: str
+    model: str
+    parent_session_id: str | None = None
+    causal_budget_id: str
+    runtime_name: str
+    runtime_version: str | None = None
+    environment_name: str | None = None
+    status: SessionStatus
+    created_at: datetime
+    updated_at: datetime
+    labels: dict[str, str] = Field(default_factory=dict)
+
+    @classmethod
+    def from_session(cls, session: Session) -> PendingActionSession:
+        return cls(
+            id=session.id,
+            agent_name=session.agent_name,
+            provider_name=session.provider_name,
+            model=session.model,
+            parent_session_id=session.parent_session_id,
+            causal_budget_id=session.causal_budget_id,
+            runtime_name=session.runtime_name,
+            runtime_version=session.runtime_version,
+            environment_name=session.environment_name,
+            status=session.status,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            labels=session.labels,
+        )
+
+    @field_validator(
+        "id",
+        "agent_name",
+        "provider_name",
+        "model",
+        "causal_budget_id",
+        "runtime_name",
+    )
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("parent_session_id", "environment_name", "runtime_version")
+    @classmethod
+    def validate_optional_nonblank_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def normalize_timestamps(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value: dict[str, str]) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+
+class PendingActionRecord(BaseModel):
+    """One current action derived from a session checkpoint and its source event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: PendingActionKind
+    session: PendingActionSession
+    event: EventRecord
+    title: str
+    detail: str | None = None
+    tool_name: str | None = None
+    approval_id: str | None = None
+    input_id: str | None = None
+    round_id: str | None = None
+    tool_call_id: str | None = None
+    question: str | None = None
+    options: list[str] = Field(default_factory=list)
+    arguments: dict[str, Any] | None = None
+
+    @field_validator("id", "title")
+    @classmethod
+    def validate_required_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "detail",
+        "tool_name",
+        "approval_id",
+        "input_id",
+        "round_id",
+        "tool_call_id",
+        "question",
+    )
+    @classmethod
+    def validate_optional_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("session")
+    @classmethod
+    def copy_session(cls, value: PendingActionSession) -> PendingActionSession:
+        return value.model_copy(deep=True)
+
+    @field_validator("event")
+    @classmethod
+    def copy_event_record(cls, value: EventRecord) -> EventRecord:
+        return value.model_copy(deep=True)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def copy_options(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if type(value) is not list:
+            raise TypeError("options must be a list of strings.")
+        return [require_nonblank(item, "options") for item in value]
+
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def copy_arguments(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return copy_json_value(value, "arguments")
+
+
+class PendingActionIssue(BaseModel):
+    """Bounded visibility for a candidate that could not be materialized."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: PendingActionIssueCode
+    session_id: str
+    agent_name: str
+    status: SessionStatus
+    updated_at: datetime
+    detail: str
+
+    @field_validator("session_id", "agent_name", "detail")
+    @classmethod
+    def validate_required_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("updated_at")
+    @classmethod
+    def normalize_updated_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("updated_at must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @classmethod
+    def source_too_large(
+        cls,
+        session: PendingActionSession,
+        *,
+        max_bytes: int,
+    ) -> PendingActionIssue:
+        return cls(
+            code=PendingActionIssueCode.SOURCE_TOO_LARGE,
+            session_id=session.id,
+            agent_name=session.agent_name,
+            status=session.status,
+            updated_at=session.updated_at,
+            detail=(
+                "Pending-action source data for this session exceeds the "
+                f"{max_bytes}-byte inspection limit. Open the session directly "
+                "to inspect or resolve it."
+            ),
+        )
+
+    @classmethod
+    def source_too_complex(
+        cls,
+        session: PendingActionSession,
+        *,
+        max_tool_calls: int,
+    ) -> PendingActionIssue:
+        return cls(
+            code=PendingActionIssueCode.SOURCE_TOO_COMPLEX,
+            session_id=session.id,
+            agent_name=session.agent_name,
+            status=session.status,
+            updated_at=session.updated_at,
+            detail=(
+                "Pending tool-round state for this session exceeds the "
+                f"{max_tool_calls}-call inspection limit. Open the session directly "
+                "to inspect or resolve it."
+            ),
+        )
+
+    @classmethod
+    def source_invalid(cls, session: PendingActionSession) -> PendingActionIssue:
+        return cls(
+            code=PendingActionIssueCode.SOURCE_INVALID,
+            session_id=session.id,
+            agent_name=session.agent_name,
+            status=session.status,
+            updated_at=session.updated_at,
+            detail=(
+                "Pending-action state for this session is incomplete or inconsistent. "
+                "Inspect the session directly before attempting to resume it."
+            ),
+        )
+
+
+class PendingActionListResult(BaseModel):
+    """One stable page of pending actions and its candidate continuation cursor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[PendingActionRecord] = Field(default_factory=list)
+    issues: list[PendingActionIssue] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: StrictBool = False
+    total_count: StrictInt | None = Field(default=None, ge=0)
+    inspected_candidate_count: StrictInt = Field(default=0, ge=0)
+
+
+class _BoundedJsonSize:
+    """Count JSON UTF-8 bytes without allocating an unbounded serialized copy."""
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+
+    def _consume(self, count: int) -> bool:
+        self.remaining -= count
+        return self.remaining >= 0
+
+    def _string(self, value: str) -> bool:
+        if not self._consume(2):  # opening and closing quotes
+            return False
+        for character in value:
+            codepoint = ord(character)
+            if character in {'"', "\\"} or character in "\b\f\n\r\t":
+                size = 2
+            elif codepoint < 0x20:
+                size = 6
+            elif codepoint < 0x80:
+                size = 1
+            elif codepoint < 0x800:
+                size = 2
+            elif codepoint < 0x10000:
+                size = 3
+            else:
+                size = 4
+            if not self._consume(size):
+                return False
+        return True
+
+    def value(self, value: Any) -> bool:
+        if value is None:
+            return self._consume(4)
+        if value is True:
+            return self._consume(4)
+        if value is False:
+            return self._consume(5)
+        if isinstance(value, str):
+            return self._string(value)
+        if isinstance(value, datetime):
+            # ``+00:00`` is five bytes longer than Pydantic's UTC ``Z`` form, so
+            # this intentionally provides a conservative upper bound.
+            return self._string(value.isoformat())
+        if type(value) in {int, float}:
+            return self._consume(len(str(value).encode("utf-8")))
+        if isinstance(value, BaseModel):
+            fields = type(value).model_fields
+            if not self._consume(2):
+                return False
+            for index, (name, field) in enumerate(fields.items()):
+                if index and not self._consume(1):
+                    return False
+                key = field.serialization_alias or field.alias or name
+                if not self._string(key) or not self._consume(1):
+                    return False
+                if not self.value(getattr(value, name)):
+                    return False
+            return True
+        if isinstance(value, Mapping):
+            if not self._consume(2):
+                return False
+            for index, (key, item) in enumerate(value.items()):
+                if index and not self._consume(1):
+                    return False
+                if not self._string(str(key)) or not self._consume(1):
+                    return False
+                if not self.value(item):
+                    return False
+            return True
+        if isinstance(value, (list, tuple)):
+            if not self._consume(2):
+                return False
+            for index, item in enumerate(value):
+                if index and not self._consume(1):
+                    return False
+                if not self.value(item):
+                    return False
+            return True
+        # Pending-action models contain JSON values, strings/enums, datetimes,
+        # and primitives only. Reject an unexpected value conservatively.
+        return False
+
+
+def enforce_pending_action_result_size(
+    result: PendingActionListResult,
+    *,
+    max_bytes: int,
+) -> PendingActionListResult:
+    """Return ``result`` or fail before an oversized API body is serialized."""
+    counter = _BoundedJsonSize(max_bytes)
+    if not counter.value(result):
+        raise PendingActionResultTooLarge(max_bytes)
+    return result
 
 
 class EventSummary(BaseModel):
@@ -1243,6 +1657,17 @@ class SessionStore(ABC):
         their checkpoints individually is not an acceptable implementation.
         """
 
+    @abstractmethod
+    async def query_pending_actions(
+        self,
+        query: PendingActionQuery | None = None,
+    ) -> PendingActionListResult:
+        """List current checkpoint-backed actions without scanning session histories.
+
+        Implementations must bound candidate and event reads, apply filtering at
+        the storage layer where possible, and avoid per-session history queries.
+        """
+
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and cascade to its events, transcript, and checkpoint.
 
@@ -1352,12 +1777,74 @@ class InMemorySessionStore(SessionStore):
         # queries — including the per-step budget read path — stop scanning the global
         # event list. Keyed by session id and by ``str(event.type)`` respectively.
         self._session_event_records: dict[str, list[EventRecord]] = {}
+        self._pending_action_event_records: dict[
+            str,
+            dict[str, dict[str, EventRecord]],
+        ] = {}
+        # Present only after an identifier map has been pruned. The value lists
+        # identifiers subsequently rebuilt from the complete event log; absence
+        # means the live append index has covered the session since creation.
+        self._pending_action_rebuilt_lookup_ids: dict[str, frozenset[str]] = {}
+        self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
         self._event_ids: dict[str, set[str]] = {}
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
+        self._pending_action_session_ids: set[str] = set()
+
+    def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
+        from cayu.runtime.pending_actions import (
+            checkpoint_has_pending_action_candidate,
+            pending_action_checkpoint_lookup_ids,
+            pending_action_event_lookup_id,
+            pending_action_lookup_key,
+            project_pending_action_event_record,
+        )
+
+        self._checkpoints[session_id] = checkpoint
+        if checkpoint_has_pending_action_candidate(checkpoint):
+            lookup_keys = frozenset(
+                pending_action_lookup_key(identifier)
+                for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
+            )
+            rebuilt_lookup_ids = self._pending_action_rebuilt_lookup_ids.get(session_id)
+            if rebuilt_lookup_ids is not None and not lookup_keys.issubset(rebuilt_lookup_ids):
+                # A public checkpoint transform may legitimately reintroduce a
+                # previously cleared durable action. SQL stores retain the source
+                # events, so rebuild the bounded identifier/type projection here
+                # to preserve identical behavior across backends.
+                rebuilt: dict[str, dict[str, EventRecord]] = {}
+                for record in reversed(self._session_event_records.get(session_id, [])):
+                    event_type = str(record.event.type)
+                    if (
+                        event_type not in PENDING_ACTION_EVENT_TYPE_VALUES
+                        or event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
+                    ):
+                        continue
+                    lookup_id = pending_action_event_lookup_id(record.event)
+                    if lookup_id is None:
+                        continue
+                    lookup_key = pending_action_lookup_key(lookup_id)
+                    if lookup_key not in lookup_keys:
+                        continue
+                    by_event_type = rebuilt.setdefault(lookup_key, {})
+                    by_event_type.setdefault(
+                        event_type,
+                        project_pending_action_event_record(record),
+                    )
+                self._pending_action_event_records[session_id] = rebuilt
+                self._pending_action_rebuilt_lookup_ids[session_id] = lookup_keys
+            self._pending_action_session_ids.add(session_id)
+        else:
+            self._pending_action_session_ids.discard(session_id)
+            # Once the checkpoint no longer names a pending action, identifier-
+            # scoped event history cannot contribute to a future action. Keep the
+            # latest lifecycle barrier, but release the potentially growing map.
+            removed = self._pending_action_event_records.pop(session_id, None)
+            if removed or session_id in self._pending_action_rebuilt_lookup_ids:
+                self._pending_action_rebuilt_lookup_ids[session_id] = frozenset()
 
     async def create(
         self,
@@ -1403,6 +1890,7 @@ class InMemorySessionStore(SessionStore):
             self._events[session.id] = []
             self._event_ids[session.id] = set()
             self._session_event_records[session.id] = []
+            self._pending_action_event_records[session.id] = {}
             self._transcripts[session.id] = []
             return session.model_copy(deep=True)
 
@@ -1461,9 +1949,10 @@ class InMemorySessionStore(SessionStore):
             self._events[fork.id] = []
             self._event_ids[fork.id] = set()
             self._session_event_records[fork.id] = []
+            self._pending_action_event_records[fork.id] = {}
             self._transcripts[fork.id] = copied_transcript
             if copied_checkpoint is not None:
-                self._checkpoints[fork.id] = copied_checkpoint
+                self._store_checkpoint_unlocked(fork.id, copied_checkpoint)
             return fork.model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
@@ -1534,8 +2023,12 @@ class InMemorySessionStore(SessionStore):
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
             self._session_event_records.pop(session_id, None)
+            self._pending_action_event_records.pop(session_id, None)
+            self._pending_action_rebuilt_lookup_ids.pop(session_id, None)
+            self._pending_action_latest_barrier_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
+            self._pending_action_session_ids.discard(session_id)
             self._event_records = [
                 record for record in self._event_records if record.event.session_id != session_id
             ]
@@ -1669,7 +2162,7 @@ class InMemorySessionStore(SessionStore):
             )
             self._sessions[session_id] = updated
             if transformed_checkpoint is not None:
-                self._checkpoints[session_id] = transformed_checkpoint
+                self._store_checkpoint_unlocked(session_id, transformed_checkpoint)
             result = updated.model_copy(deep=True)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(result)
@@ -1722,6 +2215,12 @@ class InMemorySessionStore(SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
+        from cayu.runtime.pending_actions import (
+            pending_action_event_lookup_id,
+            pending_action_lookup_key,
+            project_pending_action_event_record,
+        )
+
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         async with self._lock:
@@ -1747,7 +2246,21 @@ class InMemorySessionStore(SessionStore):
                 # Share the same EventRecord across the secondary indexes; records are
                 # immutable in practice and query paths copy before returning.
                 session_records.append(record)
-                self._type_event_records.setdefault(str(stored_event.type), []).append(record)
+                event_type = str(stored_event.type)
+                if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
+                    projected_record = project_pending_action_event_record(record)
+                    if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
+                        self._pending_action_latest_barrier_records[session_id] = projected_record
+                    else:
+                        lookup_id = pending_action_event_lookup_id(stored_event)
+                        if lookup_id is not None:
+                            lookup_key = pending_action_lookup_key(lookup_id)
+                            by_lookup_id = self._pending_action_event_records.setdefault(
+                                session_id, {}
+                            )
+                            by_event_type = by_lookup_id.setdefault(lookup_key, {})
+                            by_event_type[event_type] = projected_record
+                self._type_event_records.setdefault(event_type, []).append(record)
                 existing_ids.add(stored_event.id)
                 self._next_event_sequence += 1
             if copied_events:
@@ -1863,6 +2376,204 @@ class InMemorySessionStore(SessionStore):
     ) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=True)
 
+    async def query_pending_actions(
+        self,
+        query: PendingActionQuery | None = None,
+    ) -> PendingActionListResult:
+        from cayu.runtime.pending_actions import (
+            PENDING_ACTION_CHECKPOINT_KEYS,
+            PENDING_ACTION_SESSION_STATUSES,
+            pending_action_event_projection_bytes,
+            pending_action_from_records,
+            pending_action_matches_query,
+            pending_action_source_is_invalid,
+            project_pending_action_checkpoint,
+            select_pending_action_indexed_records,
+        )
+
+        if query is None:
+            query = PendingActionQuery()
+        elif type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        else:
+            query = query.model_copy(deep=True)
+
+        candidate_limit = min(query.limit * 4, 800) + 1
+        async with self._lock:
+            if query.session_id is None:
+                candidate_ids = self._pending_action_session_ids
+            elif query.session_id in self._pending_action_session_ids:
+                candidate_ids = {query.session_id}
+            else:
+                candidate_ids = set()
+            candidates = [
+                session
+                for session_id in candidate_ids
+                if (session := self._sessions.get(session_id)) is not None
+                and session.status in PENDING_ACTION_SESSION_STATUSES
+                and (query.agent_name is None or session.agent_name == query.agent_name)
+                and (
+                    query.environment_name is None
+                    or session.environment_name == query.environment_name
+                )
+            ]
+            candidates = _sort_sessions(candidates, SessionOrder.UPDATED_AT_DESC)
+            if query.cursor is not None:
+                cursor_dt, cursor_id = decode_session_cursor(query.cursor)
+                candidates = [
+                    session
+                    for session in candidates
+                    if _session_after_cursor(
+                        session,
+                        SessionOrder.UPDATED_AT_DESC,
+                        cursor_dt,
+                        cursor_id,
+                    )
+                ]
+
+            candidate_window = candidates[:candidate_limit]
+            has_more_candidates = len(candidate_window) == candidate_limit
+            inspected_candidates = candidate_window[: candidate_limit - 1]
+            actions: list[PendingActionRecord] = []
+            issues: list[PendingActionIssue] = []
+            materialized_source_bytes = 0
+            inspected = 0
+            more_matching = False
+            last_inspected_session: PendingActionSession | None = None
+            for session in inspected_candidates:
+                previous_last_inspected_session = last_inspected_session
+                projected_session = PendingActionSession.from_session(session)
+                checkpoint = self._checkpoints.get(session.id)
+                pending_checkpoint_source = (
+                    None
+                    if checkpoint is None
+                    else {
+                        key: checkpoint[key]
+                        for key in PENDING_ACTION_CHECKPOINT_KEYS
+                        if checkpoint.get(key) is not None
+                    }
+                )
+                pending_round_source = (
+                    pending_checkpoint_source.get("pending_tool_round")
+                    if pending_checkpoint_source is not None
+                    else None
+                )
+                pending_tool_calls = (
+                    pending_round_source.get("tool_calls")
+                    if type(pending_round_source) is dict
+                    else None
+                )
+                source_too_complex = (
+                    type(pending_tool_calls) is list
+                    and len(pending_tool_calls) > MAX_PENDING_ACTION_TOOL_CALLS
+                )
+                candidate_size = _BoundedJsonSize(query.max_result_bytes)
+                source_fits = (
+                    not source_too_complex
+                    and candidate_size.value(projected_session)
+                    and candidate_size.value(pending_checkpoint_source)
+                )
+                projected_checkpoint = None
+                records: list[EventRecord] = []
+                if source_fits:
+                    projected_checkpoint = project_pending_action_checkpoint(checkpoint)
+                    records = select_pending_action_indexed_records(
+                        projected_checkpoint,
+                        self._pending_action_event_records.get(session.id, {}),
+                        self._pending_action_latest_barrier_records.get(session.id),
+                    )
+                    source_fits = all(
+                        (projection_bytes := pending_action_event_projection_bytes(record)) is None
+                        or projection_bytes <= query.max_result_bytes
+                        for record in records
+                    ) and all(candidate_size.value(record) for record in records)
+                candidate_source_bytes = query.max_result_bytes - candidate_size.remaining
+                if source_fits and (
+                    materialized_source_bytes + candidate_source_bytes > query.max_result_bytes
+                ):
+                    more_matching = True
+                    break
+
+                inspected += 1
+                last_inspected_session = projected_session
+                if not source_fits:
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        inspected -= 1
+                        last_inspected_session = previous_last_inspected_session
+                        break
+                    issues.append(
+                        PendingActionIssue.source_too_complex(
+                            projected_session,
+                            max_tool_calls=MAX_PENDING_ACTION_TOOL_CALLS,
+                        )
+                        if source_too_complex
+                        else PendingActionIssue.source_too_large(
+                            projected_session,
+                            max_bytes=query.max_result_bytes,
+                        )
+                    )
+                    continue
+
+                materialized_source_bytes += candidate_source_bytes
+                action = pending_action_from_records(
+                    projected_session,
+                    records,
+                    projected_checkpoint,
+                )
+                if pending_action_source_is_invalid(
+                    projected_session,
+                    projected_checkpoint,
+                    action,
+                    records,
+                ):
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        inspected -= 1
+                        last_inspected_session = previous_last_inspected_session
+                        break
+                    issues.append(PendingActionIssue.source_invalid(projected_session))
+                    continue
+                if action is None:
+                    continue
+                if query.kind is not None and action.kind != query.kind:
+                    continue
+                if not pending_action_matches_query(action, query.q):
+                    continue
+                if len(actions) + len(issues) == query.limit:
+                    more_matching = True
+                    inspected -= 1
+                    last_inspected_session = previous_last_inspected_session
+                    break
+                actions.append(action)
+
+            has_more = more_matching or has_more_candidates
+            cursor_session = last_inspected_session
+            next_cursor = (
+                encode_session_cursor(cursor_session, SessionOrder.UPDATED_AT_DESC)
+                if has_more and cursor_session is not None
+                else None
+            )
+            return enforce_pending_action_result_size(
+                PendingActionListResult(
+                    actions=actions,
+                    issues=issues,
+                    next_cursor=next_cursor,
+                    has_more=has_more,
+                    # A cursor query sees only the suffix after that cursor, so a
+                    # final page's local length is not a global total. The first
+                    # page can report an exact total only when it exhausted the
+                    # candidate set without hitting either bound.
+                    total_count=(
+                        len(actions) + len(issues)
+                        if query.cursor is None and not has_more
+                        else None
+                    ),
+                    inspected_candidate_count=inspected,
+                ),
+                max_bytes=query.max_result_bytes,
+            )
+
     async def _list_sessions(
         self,
         query: SessionQuery | None,
@@ -1955,7 +2666,7 @@ class InMemorySessionStore(SessionStore):
             copied_checkpoint = copy_json_value(transformed, "checkpoint")
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
-            self._checkpoints[session_id] = copied_checkpoint
+            self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
             )
@@ -2005,7 +2716,10 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
-            self._checkpoints[session_id] = copy_json_value(state, "checkpoint")
+            self._store_checkpoint_unlocked(
+                session_id,
+                copy_json_value(state, "checkpoint"),
+            )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
             )
@@ -2030,7 +2744,10 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 return
-            self._checkpoints[session_id] = copy_json_value(transformed, "checkpoint")
+            self._store_checkpoint_unlocked(
+                session_id,
+                copy_json_value(transformed, "checkpoint"),
+            )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
             )
@@ -2675,11 +3392,17 @@ def session_sort_column(order_by: SessionOrder) -> str:
     return "created_at" if order_by in _CREATED_AT_ORDERS else "updated_at"
 
 
-def _session_sort_value(session: Session, order_by: SessionOrder) -> datetime:
+def _session_sort_value(
+    session: Session | PendingActionSession,
+    order_by: SessionOrder,
+) -> datetime:
     return session.created_at if order_by in _CREATED_AT_ORDERS else session.updated_at
 
 
-def encode_session_cursor(session: Session, order_by: SessionOrder) -> str:
+def encode_session_cursor(
+    session: Session | PendingActionSession,
+    order_by: SessionOrder,
+) -> str:
     """Opaque keyset cursor for the last row of a page: (sort value, session id)."""
     sort_value = _session_sort_value(session, order_by).astimezone(UTC).isoformat()
     raw = json.dumps([sort_value, session.id], separators=(",", ":"))

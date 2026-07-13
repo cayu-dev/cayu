@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -236,10 +237,30 @@ class ApiPendingAction(ApiBaseModel):
     arguments: dict[str, Any] | None = None
 
 
+class ApiPendingActionIssue(ApiBaseModel):
+    code: Literal["source_too_large", "source_too_complex", "source_invalid"]
+    session_id: str
+    agent_name: str
+    status: Literal["interrupted", "failed", "completed"]
+    updated_at: datetime
+    detail: str
+
+
 class PendingActionsResponse(ApiBaseModel):
     actions: list[ApiPendingAction]
-    total_count: StrictInt = Field(ge=0)
-    inspected_session_count: StrictInt = Field(ge=0)
+    issues: list[ApiPendingActionIssue]
+    next_cursor: str | None
+    has_more: StrictBool
+    total_count: StrictInt | None = Field(ge=0)
+    inspected_candidate_count: StrictInt = Field(ge=0)
+
+
+PENDING_ACTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    413: {
+        "description": "The pending-action page exceeds the bounded response size.",
+        "model": ApiErrorResponse,
+    }
+}
 
 
 class ApiToolSummary(ApiBaseModel):

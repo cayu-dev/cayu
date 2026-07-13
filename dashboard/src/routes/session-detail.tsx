@@ -23,7 +23,7 @@ import {
   Wrench,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
-import { Page, PayloadViewer } from "../components/dashboard/layout"
+import { Page, PayloadViewer, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -45,6 +45,7 @@ import {
   fetchPendingActions,
   fetchSession,
   fetchSessionSummary,
+  isApiPayloadTooLarge,
   type RecoveryOutcome,
   type SessionEvent,
   type SessionSummary,
@@ -76,6 +77,7 @@ import {
 import { cn } from "../lib/utils"
 
 const INTERRUPTIBLE_SESSION_STATUSES = new Set(["pending", "running"])
+const PENDING_ACTION_SESSION_STATUSES = new Set(["interrupted", "failed", "completed"])
 
 function isInterruptionConflict(error: unknown) {
   return error instanceof ApiClientError && error.status === 409
@@ -828,10 +830,26 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     enabled: !isError,
   })
   const pendingActionQuery = useQuery({
-    queryKey: ["pending-actions", "session", sessionId],
+    queryKey: [
+      "pending-actions",
+      "session",
+      sessionId,
+      data?.session.status ?? null,
+      data?.session.updated_at ?? null,
+    ],
     queryFn: () => fetchPendingActions({ session_id: sessionId, limit: 1 }),
-    refetchInterval: live ? 2000 : 5000,
-    enabled: !isError,
+    retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
+    refetchInterval: (query) => {
+      const result = query.state.data
+      if (result !== undefined && result.actions.length === 0 && result.issues.length === 0) {
+        return false
+      }
+      return live ? 2000 : 5000
+    },
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: (query) => !isApiPayloadTooLarge(query.state.error),
+    enabled:
+      !isError && data !== undefined && PENDING_ACTION_SESSION_STATUSES.has(data.session.status),
   })
   const sessionArtifacts = useQuery({
     queryKey: ["session-artifacts", sessionId],
@@ -1129,9 +1147,16 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const allEvents = [...events, ...liveEvents.map((e, i) => ({ ...e, id: `live-${i}` }))]
   const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
   const selectedEvent = filteredEvents.find((event) => event.id === selectedEventId) ?? null
-  const pendingAction = pendingActionFromApi(pendingActionQuery.data?.actions[0])
+  const pendingActionStatus = PENDING_ACTION_SESSION_STATUSES.has(session.status)
+  const pendingAction = pendingActionStatus
+    ? pendingActionFromApi(pendingActionQuery.data?.actions[0])
+    : null
+  const pendingActionIssue = pendingActionStatus ? pendingActionQuery.data?.issues[0] : undefined
   const pendingActionStateUnknown =
-    session.status === "interrupted" && (pendingActionQuery.isLoading || pendingActionQuery.isError)
+    pendingActionStatus &&
+    (pendingActionQuery.data === undefined ||
+      pendingActionQuery.isFetching ||
+      pendingActionQuery.isError)
   const hasPendingInterruptionCascade = data.interruption_cascade !== "none"
   const failureEvent = latestFailureEvent(
     data.interruption_cascade === "failed"
@@ -1141,8 +1166,9 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const canRetryCascade = session.status === "interrupted" && data.interruption_cascade === "failed"
   const cascadePending = session.status === "interrupted" && data.interruption_cascade === "pending"
   const canResume =
-    ["completed", "failed", "interrupted"].includes(session.status) &&
+    pendingActionStatus &&
     !pendingAction &&
+    !pendingActionIssue &&
     !pendingActionStateUnknown &&
     !hasPendingInterruptionCascade
   const eventUsage = fallbackUsage(filteredEvents)
@@ -1387,6 +1413,22 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
             void handleManualRecovery(pendingAction, outcome, message, answer)
           }
         />
+      )}
+
+      {pendingActionIssue && (
+        <StateMessage tone="danger" className="rounded-md border border-destructive/30 p-4">
+          <span className="font-medium">Pending state requires direct inspection.</span>{" "}
+          {pendingActionIssue.detail}
+        </StateMessage>
+      )}
+
+      {pendingActionQuery.isError && pendingActionStatus && (
+        <StateMessage tone="danger" className="rounded-md border border-destructive/30 p-4">
+          <span className="font-medium">Pending state could not be verified.</span>{" "}
+          {pendingActionQuery.error instanceof Error
+            ? pendingActionQuery.error.message
+            : "Reload the page before resuming this session."}
+        </StateMessage>
       )}
 
       {failureEvent && (

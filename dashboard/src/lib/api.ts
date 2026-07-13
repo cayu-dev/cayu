@@ -7,6 +7,7 @@ import type {
   ApiKnowledgeChunk,
   ApiKnowledgeListItem,
   ApiPendingAction,
+  ApiPendingActionIssue,
   ApiReviewedKnowledgeEntry,
   ApiSessionBase,
   ApiSessionDetailEvent,
@@ -65,6 +66,10 @@ export class ApiClientError extends Error {
   }
 }
 
+export function isApiPayloadTooLarge(error: unknown): error is ApiClientError {
+  return error instanceof ApiClientError && error.status === 413
+}
+
 export type ServerContract = GetContractApiContractGetResponse
 export type AgentSummary = ApiAgentSummary
 export type ToolSummary = ApiToolSummary
@@ -95,6 +100,7 @@ export type TaskDetail = ApiTaskDetail
 export type TaskHold = TaskHoldBody
 export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
 export type PendingAction = ApiPendingAction
+export type PendingActionIssue = ApiPendingActionIssue
 export type PendingActionsPage = ListPendingActionsApiPendingActionsGetResponse
 export type PendingActionsQuery = NonNullable<ListPendingActionsApiPendingActionsGetData["query"]>
 export type ApprovalDecision = ToolApprovalDecision

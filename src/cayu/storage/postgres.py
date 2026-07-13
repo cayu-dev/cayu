@@ -62,14 +62,22 @@ from cayu.runtime.event_watchers import (
 )
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
+    MAX_PENDING_ACTION_RESULT_BYTES,
+    MAX_PENDING_ACTION_TOOL_CALLS,
     CheckpointTransform,
     EventQuery,
     EventRecord,
     EventSummary,
+    PendingActionIssue,
+    PendingActionKind,
+    PendingActionListResult,
+    PendingActionQuery,
+    PendingActionSession,
     RunRequest,
     Session,
     SessionIdentity,
     SessionListResult,
+    SessionOrder,
     SessionOutcome,
     SessionQuery,
     SessionRunFenced,
@@ -82,6 +90,7 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     _activate_session_run_fence,
     _assert_session_run_epoch,
+    _BoundedJsonSize,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
@@ -95,6 +104,9 @@ from cayu.runtime.sessions import (
     copy_session_query,
     copy_transcript_messages,
     copy_transcript_query,
+    decode_session_cursor,
+    encode_session_cursor,
+    enforce_pending_action_result_size,
     filter_transcript_records,
     session_next_cursor,
     session_outcome,
@@ -158,7 +170,7 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
-_POSTGRES_MIN_REQUIRED_REVISION = 16
+_POSTGRES_MIN_REQUIRED_REVISION = 17
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -491,26 +503,418 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_checkpoints(session_id) "
         "WHERE state ? 'pending_interruption_cascade'",
     ),
+    17: (
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS pending_action_lookup_key TEXT",
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS pending_action_projection JSONB",
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS pending_action_projection_bytes BIGINT",
+        "ALTER TABLE cayu_checkpoints ADD COLUMN IF NOT EXISTS pending_action_source_bytes BIGINT",
+        "ALTER TABLE cayu_checkpoints ADD COLUMN IF NOT EXISTS "
+        "pending_action_tool_call_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE cayu_checkpoints ADD COLUMN IF NOT EXISTS "
+        "pending_action_flags INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE cayu_checkpoints ADD COLUMN IF NOT EXISTS "
+        "pending_action_metrics_ready BOOLEAN NOT NULL DEFAULT FALSE",
+    ),
 }
+
+_REVISION_17_CHECKPOINT_BACKFILL_SQL = f"""
+    WITH batch AS MATERIALIZED (
+        SELECT session_id
+        FROM cayu_checkpoints
+        WHERE NOT pending_action_metrics_ready
+          AND (%s::text IS NULL OR session_id > %s)
+        ORDER BY session_id
+        LIMIT 100
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE cayu_checkpoints AS target
+    SET pending_action_flags =
+            CASE WHEN target.state -> 'pending_tool_approval' IS NOT NULL
+                  AND target.state -> 'pending_tool_approval' <> 'null'::jsonb
+                THEN 1 ELSE 0 END
+            + CASE WHEN target.state -> 'pending_user_input' IS NOT NULL
+                  AND target.state -> 'pending_user_input' <> 'null'::jsonb
+                THEN 2 ELSE 0 END
+            + CASE WHEN target.state -> 'pending_tool_round' IS NOT NULL
+                  AND target.state -> 'pending_tool_round' <> 'null'::jsonb
+                THEN 4 ELSE 0 END,
+        pending_action_source_bytes = CASE
+            WHEN jsonb_typeof(target.state #> '{{pending_tool_round,tool_calls}}') = 'array'
+              AND jsonb_array_length(target.state #> '{{pending_tool_round,tool_calls}}')
+                  > {MAX_PENDING_ACTION_TOOL_CALLS}
+            THEN 0
+            WHEN (target.state -> 'pending_tool_approval' IS NOT NULL
+                  AND target.state -> 'pending_tool_approval' <> 'null'::jsonb)
+              OR (target.state -> 'pending_user_input' IS NOT NULL
+                  AND target.state -> 'pending_user_input' <> 'null'::jsonb)
+              OR (target.state -> 'pending_tool_round' IS NOT NULL
+                  AND target.state -> 'pending_tool_round' <> 'null'::jsonb)
+            THEN octet_length(jsonb_strip_nulls(jsonb_build_object(
+                'pending_tool_approval', target.state -> 'pending_tool_approval',
+                'pending_user_input', target.state -> 'pending_user_input',
+                'pending_tool_round', target.state -> 'pending_tool_round'
+            ))::text)
+            ELSE NULL
+        END,
+        pending_action_tool_call_count = CASE
+            WHEN jsonb_typeof(target.state #> '{{pending_tool_round,tool_calls}}') = 'array'
+            THEN jsonb_array_length(target.state #> '{{pending_tool_round,tool_calls}}')
+            ELSE 0
+        END,
+        pending_action_metrics_ready = TRUE
+    FROM batch
+    WHERE target.session_id = batch.session_id
+    RETURNING target.session_id
+"""
+
+_REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES = 1024 * 1024
+
+
+def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) -> str:
+    return f"""
+    WITH batch AS MATERIALIZED (
+        SELECT sequence, event_type, payload, event
+        FROM cayu_events
+        WHERE pending_action_projection_bytes IS NULL
+          AND sequence > %s
+          AND ({source_predicate})
+          AND event_type IN (
+              'tool.call.approval_requested',
+              'session.awaiting_user_input',
+              'session.interrupted',
+              'session.resumed',
+              'session.completed',
+              'session.failed',
+              'tool.call.started',
+              'tool.call.completed',
+              'tool.call.failed',
+              'tool.call.blocked',
+              'tool.call.approval_denied'
+        )
+        ORDER BY sequence
+        LIMIT {batch_limit}
+        FOR UPDATE SKIP LOCKED
+    ),
+    projected AS MATERIALIZED (
+        SELECT
+            sequence,
+            CASE
+                WHEN jsonb_typeof(payload -> 'approval_id') = 'string'
+                  AND payload ->> 'approval_id' !~ '^[[:space:]]*$'
+                THEN payload ->> 'approval_id'
+                WHEN jsonb_typeof(payload #> '{{approval,approval_id}}') = 'string'
+                  AND payload #>> '{{approval,approval_id}}' !~ '^[[:space:]]*$'
+                THEN payload #>> '{{approval,approval_id}}'
+                WHEN jsonb_typeof(payload -> 'input_id') = 'string'
+                  AND payload ->> 'input_id' !~ '^[[:space:]]*$'
+                THEN payload ->> 'input_id'
+                WHEN jsonb_typeof(payload #> '{{user_input,input_id}}') = 'string'
+                  AND payload #>> '{{user_input,input_id}}' !~ '^[[:space:]]*$'
+                THEN payload #>> '{{user_input,input_id}}'
+                WHEN jsonb_typeof(payload -> 'tool_call_id') = 'string'
+                  AND payload ->> 'tool_call_id' !~ '^[[:space:]]*$'
+                THEN payload ->> 'tool_call_id'
+                WHEN jsonb_typeof(payload -> 'tool_round_id') = 'string'
+                  AND payload ->> 'tool_round_id' !~ '^[[:space:]]*$'
+                THEN payload ->> 'tool_round_id'
+                ELSE NULL
+            END AS lookup_id,
+            jsonb_set(
+                event,
+                '{{payload}}',
+                CASE
+                    WHEN event_type = 'tool.call.approval_requested' THEN
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'approval', jsonb_strip_nulls(jsonb_build_object(
+                                'approval_id', payload #> '{{approval,approval_id}}',
+                                'reason', payload #> '{{approval,reason}}',
+                                'tool_name', payload #> '{{approval,tool_name}}'
+                            ))
+                        ))
+                    WHEN event_type = 'session.awaiting_user_input' THEN
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'input_id', payload -> 'input_id',
+                            'tool_call_id', payload -> 'tool_call_id',
+                            'question', payload -> 'question',
+                            'options', payload -> 'options'
+                        ))
+                    WHEN event_type = 'session.interrupted' THEN
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'interruption_type', payload -> 'interruption_type',
+                            'manual_recovery_required', payload -> 'manual_recovery_required',
+                            'approval_id', payload -> 'approval_id',
+                            'tool_call_id', payload -> 'tool_call_id',
+                            'tool_round_id', payload -> 'tool_round_id',
+                            'error', payload -> 'error',
+                            'message', payload -> 'message',
+                            'tool_name', payload -> 'tool_name',
+                            'approval', jsonb_strip_nulls(jsonb_build_object(
+                                'approval_id', payload #> '{{approval,approval_id}}',
+                                'reason', payload #> '{{approval,reason}}',
+                                'tool_name', payload #> '{{approval,tool_name}}'
+                            )),
+                            'user_input', jsonb_strip_nulls(jsonb_build_object(
+                                'input_id', payload #> '{{user_input,input_id}}',
+                                'tool_call_id', payload #> '{{user_input,tool_call_id}}',
+                                'question', payload #> '{{user_input,question}}',
+                                'options', payload #> '{{user_input,options}}'
+                            ))
+                        ))
+                    WHEN event_type IN (
+                        'tool.call.started',
+                        'tool.call.completed',
+                        'tool.call.failed',
+                        'tool.call.blocked',
+                        'tool.call.approval_denied'
+                    ) THEN jsonb_strip_nulls(jsonb_build_object(
+                        'tool_call_id', payload -> 'tool_call_id',
+                        'tool_round_id', payload -> 'tool_round_id',
+                        '__cayu_terminal_result_valid__',
+                        CASE WHEN event_type = 'tool.call.started' THEN NULL ELSE COALESCE(
+                        jsonb_typeof(payload -> 'result') = 'object'
+                        AND (payload -> 'result')
+                            - ARRAY['content', 'structured', 'artifacts', 'is_error']
+                            = '{{}}'::jsonb
+                        AND (
+                            NOT ((payload -> 'result') ? 'content')
+                            OR jsonb_typeof(payload #> '{{result,content}}') = 'string'
+                        )
+                        AND (
+                            NOT ((payload -> 'result') ? 'structured')
+                            OR jsonb_typeof(payload #> '{{result,structured}}')
+                                IN ('object', 'null')
+                        )
+                        AND (
+                            NOT ((payload -> 'result') ? 'artifacts')
+                            OR (
+                                jsonb_typeof(payload #> '{{result,artifacts}}') = 'array'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM jsonb_array_elements(
+                                        CASE
+                                            WHEN jsonb_typeof(
+                                                payload #> '{{result,artifacts}}'
+                                            ) = 'array'
+                                            THEN payload #> '{{result,artifacts}}'
+                                            ELSE '[]'::jsonb
+                                        END
+                                    ) AS artifact
+                                    WHERE jsonb_typeof(artifact) <> 'object'
+                                )
+                            )
+                        )
+                        AND (
+                            NOT ((payload -> 'result') ? 'is_error')
+                            OR jsonb_typeof(payload #> '{{result,is_error}}') = 'boolean'
+                        ), FALSE) END
+                    ))
+                    ELSE '{{}}'::jsonb
+                END,
+                true
+            ) AS projection
+        FROM batch
+    ),
+    measured AS MATERIALIZED (
+        SELECT sequence, lookup_id, projection, octet_length(projection::text) AS bytes
+        FROM projected
+    )
+    UPDATE cayu_events AS target
+    SET pending_action_lookup_key = CASE
+            WHEN measured.lookup_id IS NULL THEN NULL
+            ELSE encode(sha256(convert_to(measured.lookup_id, 'UTF8')), 'hex')
+        END,
+        pending_action_projection = CASE
+            WHEN measured.bytes <= {MAX_PENDING_ACTION_RESULT_BYTES}
+            THEN measured.projection
+            ELSE NULL
+        END,
+        pending_action_projection_bytes = CASE
+            WHEN measured.bytes <= {MAX_PENDING_ACTION_RESULT_BYTES}
+            THEN measured.bytes
+            ELSE {MAX_PENDING_ACTION_RESULT_BYTES + 1}
+        END
+    FROM measured
+    WHERE target.sequence = measured.sequence
+    RETURNING target.sequence
+"""
+
+
+_REVISION_17_EVENT_BACKFILL_SMALL_SQL = _revision_17_event_backfill_sql(
+    source_predicate=(
+        f"octet_length(event::text) <= {_REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES}"
+    ),
+    batch_limit=25,
+)
+_REVISION_17_EVENT_BACKFILL_LARGE_SQL = _revision_17_event_backfill_sql(
+    source_predicate=(
+        f"octet_length(event::text) > {_REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES}"
+    ),
+    batch_limit=1,
+)
+
+
+def _revision_17_event_backfill_remaining_sql(source_predicate: str) -> str:
+    return f"""
+        SELECT EXISTS(
+            SELECT 1
+            FROM cayu_events
+            WHERE pending_action_projection_bytes IS NULL
+              AND ({source_predicate})
+              AND event_type IN (
+                  'tool.call.approval_requested',
+                  'session.awaiting_user_input',
+                  'session.interrupted',
+                  'session.resumed',
+                  'session.completed',
+                  'session.failed',
+                  'tool.call.started',
+                  'tool.call.completed',
+                  'tool.call.failed',
+                  'tool.call.blocked',
+                  'tool.call.approval_denied'
+              )
+        )
+    """
+
+
+_REVISION_17_EVENT_BACKFILL_SMALL_REMAINING_SQL = _revision_17_event_backfill_remaining_sql(
+    f"octet_length(event::text) <= {_REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES}"
+)
+_REVISION_17_EVENT_BACKFILL_LARGE_REMAINING_SQL = _revision_17_event_backfill_remaining_sql(
+    f"octet_length(event::text) > {_REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES}"
+)
+
 
 # These revisions cannot run inside the schema transaction. The baseline still
 # creates the same indexes normally because its tables are empty; existing hot
-# databases use CONCURRENTLY so event writes remain available during upgrades.
-_CONCURRENT_INDEX_MIGRATIONS: dict[
-    int,
-    tuple[tuple[str, str, tuple[str, ...], str, str], ...],
-] = {
+# databases use CONCURRENTLY so checkpoint and event writes remain available
+# during upgrades.
+def _normalize_postgres_index_expression(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.lower().replace('"', "")
+    normalized = normalized.replace("::text[]", "").replace("::text", "")
+    return re.sub(r"[\s()]", "", normalized)
+
+
+@dataclass(frozen=True)
+class _ConcurrentIndexMigration:
+    index_name: str
+    table_name: str
+    key_definitions: tuple[str, ...]
+    predicate_definition: str | None
+    create_statement: str
+    drop_statement: str
+
+
+_CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
     16: (
-        (
-            "idx_cayu_events_session_sequence",
-            "cayu_events",
-            ("session_id", "sequence"),
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_events_session_sequence "
-            "ON cayu_events(session_id, sequence)",
-            "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_session_sequence",
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_session_sequence",
+            table_name="cayu_events",
+            key_definitions=("session_id", "sequence"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_events_session_sequence "
+                "ON cayu_events(session_id, sequence)"
+            ),
+            drop_statement=("DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_session_sequence"),
+        ),
+    ),
+    17: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_checkpoints_pending_control_action",
+            table_name="cayu_checkpoints",
+            key_definitions=("session_id",),
+            predicate_definition=("pending_action_flags <> 0"),
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_checkpoints_pending_control_action "
+                "ON cayu_checkpoints(session_id) WHERE pending_action_flags <> 0"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_checkpoints_pending_control_action"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_pending_action_barrier",
+            table_name="cayu_events",
+            key_definitions=("session_id", "sequence"),
+            predicate_definition="""
+                event_type = 'session.resumed'
+                OR event_type = 'session.completed'
+                OR event_type = 'session.failed'
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_pending_action_barrier
+                ON cayu_events(session_id, sequence)
+                WHERE event_type = 'session.resumed'
+                   OR event_type = 'session.completed'
+                   OR event_type = 'session.failed'
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_barrier"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_pending_action_lookup",
+            table_name="cayu_events",
+            key_definitions=(
+                "session_id",
+                "pending_action_lookup_key",
+                "event_type",
+                "sequence",
+            ),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'tool.call.approval_requested',
+                    'session.awaiting_user_input',
+                    'session.interrupted',
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                ])
+                AND pending_action_lookup_key IS NOT NULL
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_pending_action_lookup
+                ON cayu_events(
+                    session_id,
+                    pending_action_lookup_key,
+                    event_type,
+                    sequence
+                )
+                WHERE event_type IN (
+                    'tool.call.approval_requested',
+                    'session.awaiting_user_input',
+                    'session.interrupted',
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                )
+                  AND pending_action_lookup_key IS NOT NULL
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_lookup"
+            ),
         ),
     ),
 }
+
+
+def _required_concurrent_indexes(revision: int) -> tuple[_ConcurrentIndexMigration, ...]:
+    return tuple(
+        index
+        for index_revision, indexes in sorted(_CONCURRENT_INDEX_MIGRATIONS.items())
+        if index_revision <= revision
+        for index in indexes
+    )
 
 
 async def read_schema_state(cur: Any) -> schema.SchemaState:
@@ -615,9 +1019,10 @@ class _PostgresStoreBase:
 
         Concurrent stores serialize transactional schema work on one
         transaction-scoped advisory lock (ADR 0001, Decision 4). Concurrent index
-        DDL necessarily runs outside that transaction; its catalog state provides
-        coordination without relying on session locks, so migration remains safe
-        behind transaction-pooled PgBouncer:
+        DDL necessarily runs outside that transaction, so it polls the same key as
+        a short-lived session advisory lock while validating or building each
+        index. The lock is held only on this dedicated migration connection, which
+        keeps normal store traffic safe behind transaction-pooled PgBouncer:
 
         - ``validate``: read the recorded revision and fail fast unless this binary
           can operate against it. Never runs DDL.
@@ -637,22 +1042,20 @@ class _PostgresStoreBase:
                 state = await self._read_schema_state(cur)
                 if self._schema_mode is schema.SchemaMode.VALIDATE:
                     schema.validate(state)
-                    self._validate_postgres_schema(state)
+                    await self._validate_postgres_schema(cur, state)
                 elif self._schema_mode is schema.SchemaMode.CREATE:
                     if state.revision == schema.UNINITIALIZED:
                         await self._apply_pending(cur, state)
                     else:
                         schema.validate(state)
-                        self._validate_postgres_schema(state)
+                        await self._validate_postgres_schema(cur, state)
             await conn.commit()
 
     async def _migrate_schema(self) -> None:
         while True:
             concurrent_revision: schema.Revision | None = None
-            concurrent_indexes: tuple[
-                tuple[str, str, tuple[str, ...], str, str],
-                ...,
-            ] = ()
+            concurrent_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
+            recorded_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -669,7 +1072,8 @@ class _PostgresStoreBase:
                     if not pending:
                         current_state = await self._read_schema_state(cur)
                         schema.validate(current_state)
-                        self._validate_postgres_schema(current_state)
+                        self._validate_postgres_revision(current_state)
+                        recorded_indexes = _required_concurrent_indexes(current_state.revision)
                     else:
                         revision = pending[0]
                         concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
@@ -677,6 +1081,11 @@ class _PostgresStoreBase:
                             (),
                         )
                         if concurrent_indexes:
+                            # A revision may pair small transactional objects
+                            # with hot-table indexes that must be built outside a
+                            # transaction. Record it only after both phases pass.
+                            for statement in _MIGRATION_STEPS.get(revision.revision, ()):
+                                await cur.execute(cast("LiteralString", statement))
                             concurrent_revision = revision
                         else:
                             for statement in _MIGRATION_STEPS.get(revision.revision, ()):
@@ -685,24 +1094,20 @@ class _PostgresStoreBase:
                 await conn.commit()
             if concurrent_revision is None:
                 if not pending:
+                    for index in recorded_indexes:
+                        async with self._pool.connection() as conn:
+                            await self._ensure_concurrent_index(conn, index)
                     return
                 continue
 
-            for (
-                index_name,
-                table_name,
-                key_columns,
-                create_statement,
-                drop_statement,
-            ) in concurrent_indexes:
+            if concurrent_revision.revision == 17:
+                await self._backfill_revision_seventeen()
+
+            for index in concurrent_indexes:
                 async with self._pool.connection() as conn:
                     await self._ensure_concurrent_index(
                         conn,
-                        index_name,
-                        table_name,
-                        key_columns,
-                        create_statement,
-                        drop_statement,
+                        index,
                     )
 
             # Record the revision only after every non-transactional object is
@@ -718,13 +1123,96 @@ class _PostgresStoreBase:
                     await self._record_revision(cur, concurrent_revision)
                 await conn.commit()
 
-    def _validate_postgres_schema(self, state: schema.SchemaState) -> None:
+    async def _backfill_revision_seventeen(self) -> None:
+        await self._run_resumable_checkpoint_backfill(
+            _REVISION_17_CHECKPOINT_BACKFILL_SQL,
+            "SELECT EXISTS(SELECT 1 FROM cayu_checkpoints WHERE NOT pending_action_metrics_ready)",
+        )
+        await self._run_resumable_sequence_backfill(
+            _REVISION_17_EVENT_BACKFILL_SMALL_SQL,
+            _REVISION_17_EVENT_BACKFILL_SMALL_REMAINING_SQL,
+        )
+        await self._run_resumable_sequence_backfill(
+            _REVISION_17_EVENT_BACKFILL_LARGE_SQL,
+            _REVISION_17_EVENT_BACKFILL_LARGE_REMAINING_SQL,
+        )
+
+    async def _run_resumable_checkpoint_backfill(
+        self,
+        batch_sql: str,
+        remaining_sql: str,
+    ) -> None:
+        after_session_id: str | None = None
+        while True:
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    cast("LiteralString", batch_sql),
+                    (after_session_id, after_session_id),
+                )
+                updated = await cur.fetchall()
+                if updated:
+                    after_session_id = max(str(row[0]) for row in updated)
+                    await conn.commit()
+                    continue
+                await cur.execute(cast("LiteralString", remaining_sql))
+                row = await cur.fetchone()
+                remaining = row is not None and row[0] is True
+                await conn.commit()
+            if not remaining:
+                return
+            # Catch rows skipped behind the local cursor because another
+            # migrator held them. A crash simply restarts this scan from zero.
+            after_session_id = None
+            await asyncio.sleep(0.05)
+
+    async def _run_resumable_sequence_backfill(
+        self,
+        batch_sql: str,
+        remaining_sql: str,
+    ) -> None:
+        after_sequence = 0
+        while True:
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(cast("LiteralString", batch_sql), (after_sequence,))
+                updated = await cur.fetchall()
+                if updated:
+                    after_sequence = max(int(row[0]) for row in updated)
+                    await conn.commit()
+                    continue
+                await cur.execute(cast("LiteralString", remaining_sql))
+                row = await cur.fetchone()
+                remaining = row is not None and row[0] is True
+                await conn.commit()
+            if not remaining:
+                return
+            # Catch rows skipped behind the local cursor because another
+            # migrator held them. A crash simply restarts this scan from zero.
+            after_sequence = 0
+            await asyncio.sleep(0.05)
+
+    def _validate_postgres_revision(self, state: schema.SchemaState) -> None:
         if state.revision < _POSTGRES_MIN_REQUIRED_REVISION:
             raise schema.SchemaTooOld(
                 f"Postgres schema is at revision {state.revision}; this build requires "
                 f">= {_POSTGRES_MIN_REQUIRED_REVISION}. Run `cayu storage migrate` before "
                 "starting."
             )
+
+    async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
+        self._validate_postgres_revision(state)
+        for index in _required_concurrent_indexes(state.revision):
+            existing = await self._concurrent_index_state(cur, index)
+            if existing is None:
+                raise RuntimeError(
+                    f"Required Cayu Postgres index is missing: {index.index_name}. "
+                    "Run `cayu storage migrate` to repair the schema."
+                )
+            valid, building = existing
+            if not valid or building:
+                raise RuntimeError(
+                    f"Required Cayu Postgres index is not ready: {index.index_name}. "
+                    "Run `cayu storage migrate` to repair the schema."
+                )
 
     async def _read_schema_state(self, cur: Any) -> schema.SchemaState:
         return await read_schema_state(cur)
@@ -747,60 +1235,67 @@ class _PostgresStoreBase:
     async def _ensure_concurrent_index(
         self,
         conn: Any,
-        index_name: str,
-        table_name: str,
-        key_columns: tuple[str, ...],
-        create_statement: str,
-        drop_statement: str,
+        index: _ConcurrentIndexMigration,
     ) -> None:
         await conn.set_autocommit(True)
+        lock_acquired = False
         try:
+            # CREATE INDEX CONCURRENTLY cannot run under the transaction-level
+            # schema lock. Poll a session lock with pg_try_advisory_lock: a
+            # blocking advisory-lock statement would hold a virtual xid while
+            # it waits and can deadlock the winning CREATE INDEX CONCURRENTLY.
+            # Each failed try completes its autocommit transaction before sleep.
+            while not lock_acquired:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT pg_try_advisory_lock(%s)",
+                        (_SCHEMA_ADVISORY_LOCK_KEY,),
+                    )
+                    row = await cur.fetchone()
+                    lock_acquired = row is not None and row[0] is True
+                if not lock_acquired:
+                    await asyncio.sleep(0.25)
+
             while True:
                 async with conn.cursor() as cur:
                     existing = await self._concurrent_index_state(
                         cur,
-                        index_name,
-                        table_name,
-                        key_columns,
+                        index,
                     )
                     if existing == (True, False):
                         return
                     if existing is not None and existing[1]:
-                        # Another migrator is building this index. Wait for its
-                        # catalog entry to settle rather than dropping it mid-build.
                         await asyncio.sleep(0.25)
                         continue
                     if existing is not None:
-                        # A cancelled/failed concurrent build leaves an invalid
-                        # index. IF NOT EXISTS would otherwise skip it forever.
-                        await cur.execute(drop_statement)
+                        await cur.execute(index.drop_statement)
                     try:
-                        await cur.execute(create_statement)
+                        await cur.execute(index.create_statement)
                     except (DeadlockDetected, DuplicateTable, UniqueViolation):
-                        # A concurrent migrator won the catalog-name/lock race.
-                        # Its progress/validity is inspected atop the loop.
                         continue
                     created = await self._concurrent_index_state(
                         cur,
-                        index_name,
-                        table_name,
-                        key_columns,
+                        index,
                     )
                     if created == (True, False):
                         return
                     if created is None or not created[1]:
                         raise RuntimeError(
-                            f"Postgres migration did not create a valid index: {index_name}"
+                            f"Postgres migration did not create a valid index: {index.index_name}"
                         )
         finally:
+            if lock_acquired:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT pg_advisory_unlock(%s)",
+                        (_SCHEMA_ADVISORY_LOCK_KEY,),
+                    )
             await conn.set_autocommit(False)
 
     async def _concurrent_index_state(
         self,
         cur: Any,
-        index_name: str,
-        table_name: str,
-        key_columns: tuple[str, ...],
+        index: _ConcurrentIndexMigration,
     ) -> tuple[bool, bool] | None:
         await cur.execute(
             """
@@ -812,23 +1307,22 @@ class _PostgresStoreBase:
                     AND table_class.relname = %s,
                     FALSE
                 ),
-                COALESCE(
-                    ARRAY(
-                        SELECT attribute.attname::text
-                        FROM unnest(index_definition.indkey) WITH ORDINALITY
-                            AS index_key(attribute_number, position)
-                        JOIN pg_catalog.pg_attribute AS attribute
-                          ON attribute.attrelid = index_definition.indrelid
-                         AND attribute.attnum = index_key.attribute_number
-                        WHERE index_key.position <= index_definition.indnkeyatts
-                        ORDER BY index_key.position
-                    ) = %s::text[],
-                    FALSE
-                ),
                 COALESCE(access_method.amname = 'btree', FALSE),
-                COALESCE(
-                    index_definition.indpred IS NULL
-                    AND index_definition.indexprs IS NULL,
+                ARRAY(
+                    SELECT pg_get_indexdef(
+                        index_definition.indexrelid,
+                        key_position,
+                        FALSE
+                    )
+                    FROM generate_series(
+                        1,
+                        index_definition.indnkeyatts
+                    ) AS key_position
+                    ORDER BY key_position
+                ),
+                pg_get_expr(
+                    index_definition.indpred,
+                    index_definition.indrelid,
                     FALSE
                 ),
                 EXISTS (
@@ -848,17 +1342,31 @@ class _PostgresStoreBase:
             WHERE namespace.nspname = current_schema()
               AND index_class.relname = %s
             """,
-            (table_name, list(key_columns), index_name),
+            (index.table_name, index.index_name),
         )
         row = await cur.fetchone()
         if row is None:
             return None
-        expected_definition = bool(row[0]) and all(bool(value) for value in row[2:6])
+        key_definitions = tuple(
+            _normalize_postgres_index_expression(str(value)) for value in (row[4] or [])
+        )
+        expected_keys = tuple(
+            _normalize_postgres_index_expression(value) for value in index.key_definitions
+        )
+        predicate = _normalize_postgres_index_expression(row[5])
+        expected_predicate = _normalize_postgres_index_expression(index.predicate_definition)
+        expected_definition = (
+            bool(row[0])
+            and bool(row[2])
+            and bool(row[3])
+            and key_definitions == expected_keys
+            and predicate == expected_predicate
+        )
         if not expected_definition:
-            columns = ", ".join(key_columns)
+            columns = ", ".join(index.key_definitions)
             raise RuntimeError(
-                f"Postgres schema object {index_name!r} conflicts with the required "
-                f"B-tree index on {table_name}({columns}). Remove or rename the "
+                f"Postgres schema object {index.index_name!r} conflicts with the required "
+                f"B-tree index on {index.table_name}({columns}). Remove or rename the "
                 "conflicting object, then rerun `cayu storage migrate`."
             )
         return bool(row[1]), bool(row[6])
@@ -3486,14 +3994,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if copied_checkpoint is not None:
                         await cur.execute(
                             """
-                            INSERT INTO cayu_checkpoints (session_id, state, updated_at)
-                            VALUES (%s, %s, %s)
+                            INSERT INTO cayu_checkpoints (
+                                session_id, state, updated_at,
+                                pending_action_source_bytes,
+                                pending_action_tool_call_count,
+                                pending_action_flags,
+                                pending_action_metrics_ready
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (
-                                fork.id,
-                                _dumps(copied_checkpoint),
-                                pg_support.to_utc(fork.updated_at),
-                            ),
+                            _checkpoint_row_values(fork.id, copied_checkpoint, fork.updated_at),
                         )
                 await conn.commit()
             except UniqueViolation as exc:
@@ -3906,6 +4416,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self.append_events(session_id, [event])
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         await self._ensure_ready()
@@ -3961,6 +4473,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     rows = []
                     for event in copied_events:
                         next_order += 1
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(event)
+                        )
                         rows.append(
                             (
                                 session_id,
@@ -3974,6 +4489,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 event.tool_name,
                                 _dumps(event.payload),
                                 _dumps(event.model_dump(mode="json")),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
                             )
                         )
                     await cur.executemany(
@@ -3981,9 +4499,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         INSERT INTO cayu_events (
                             session_id, session_order, event_id, event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
-                            payload, event
+                            payload, event, pending_action_lookup_key,
+                            pending_action_projection, pending_action_projection_bytes
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s
+                        )
                         """,
                         rows,
                     )
@@ -4226,6 +4748,511 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         query: SessionQuery | None = None,
     ) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=True)
+
+    async def query_pending_actions(
+        self,
+        query: PendingActionQuery | None = None,
+    ) -> PendingActionListResult:
+        from cayu.runtime.pending_actions import (
+            pending_action_from_records,
+            pending_action_matches_query,
+            pending_action_source_is_invalid,
+        )
+
+        if query is None:
+            query = PendingActionQuery()
+        elif type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        else:
+            query = query.model_copy(deep=True)
+
+        inspected_candidate_limit = min(query.limit * 4, 800)
+        candidate_limit = inspected_candidate_limit + 1
+        filters = [
+            "cayu_sessions.status IN ('interrupted', 'failed', 'completed')",
+            "cayu_checkpoints.pending_action_metrics_ready",
+            "cayu_checkpoints.pending_action_flags <> 0",
+        ]
+        params: list[Any] = []
+        if query.session_id is not None:
+            filters.append("cayu_sessions.id = %s")
+            params.append(query.session_id)
+        if query.agent_name is not None:
+            filters.append("cayu_sessions.agent_name = %s")
+            params.append(query.agent_name)
+        if query.environment_name is not None:
+            filters.append("cayu_sessions.environment_name = %s")
+            params.append(query.environment_name)
+        if query.kind == PendingActionKind.TOOL_APPROVAL:
+            filters.append("(cayu_checkpoints.pending_action_flags & 1) <> 0")
+        elif query.kind == PendingActionKind.USER_INPUT:
+            filters.append("(cayu_checkpoints.pending_action_flags & 2) <> 0")
+        if query.cursor is not None:
+            cursor_dt, cursor_id = decode_session_cursor(query.cursor)
+            filters.append(
+                """
+                (
+                    cayu_sessions.updated_at < %s
+                    OR (cayu_sessions.updated_at = %s AND cayu_sessions.id > %s)
+                )
+                """
+            )
+            params.extend((cursor_dt, cursor_dt, cursor_id))
+        where_sql = " AND ".join(f"({clause.strip()})" for clause in filters)
+        session_columns = ", ".join(
+            f"cayu_sessions.{column.strip()}"
+            for column in pg_support.PENDING_ACTION_SESSION_COLUMNS.split(",")
+        )
+        candidate_select_sql = cast(
+            "LiteralString",
+            f"""
+            SELECT {session_columns}
+            FROM cayu_checkpoints
+            JOIN cayu_sessions ON cayu_sessions.id = cayu_checkpoints.session_id
+            WHERE {where_sql}
+            ORDER BY cayu_sessions.updated_at DESC, cayu_sessions.id ASC
+            LIMIT %s
+            """,
+        )
+        selected_candidate_sql = """
+            SELECT
+                cayu_checkpoints.session_id AS id,
+                jsonb_strip_nulls(jsonb_build_object(
+                    'pending_tool_approval',
+                    cayu_checkpoints.state -> 'pending_tool_approval',
+                    'pending_user_input',
+                    cayu_checkpoints.state -> 'pending_user_input',
+                    'pending_tool_round',
+                    cayu_checkpoints.state -> 'pending_tool_round'
+                )) AS pending_state
+            FROM cayu_checkpoints
+            WHERE cayu_checkpoints.session_id = ANY(%s)
+        """
+        checkpoint_preflight_sql = """
+            SELECT
+                cayu_checkpoints.session_id,
+                cayu_checkpoints.pending_action_source_bytes AS pending_state_bytes,
+                cayu_checkpoints.pending_action_tool_call_count
+            FROM cayu_checkpoints
+            WHERE cayu_checkpoints.session_id = ANY(%s)
+        """
+        projected_event_sql = "source_event.pending_action_projection"
+        pending_action_ctes = f"""
+            WITH candidates AS MATERIALIZED ({selected_candidate_sql}),
+            candidate_action_keys AS (
+                SELECT id AS session_id,
+                    encode(sha256(convert_to(
+                        pending_state #>> '{{pending_tool_approval,approval_id}}',
+                        'UTF8'
+                    )), 'hex') AS action_key
+                FROM candidates
+                WHERE jsonb_typeof(
+                    pending_state #> '{{pending_tool_approval,approval_id}}'
+                ) = 'string'
+                UNION
+                SELECT id, encode(sha256(convert_to(
+                    pending_state #>> '{{pending_user_input,input_id}}',
+                    'UTF8'
+                )), 'hex')
+                FROM candidates
+                WHERE jsonb_typeof(
+                    pending_state #> '{{pending_user_input,input_id}}'
+                ) = 'string'
+                UNION
+                SELECT id, encode(sha256(convert_to(
+                    pending_state #>> '{{pending_tool_round,round_id}}',
+                    'UTF8'
+                )), 'hex')
+                FROM candidates
+                WHERE jsonb_typeof(
+                    pending_state #> '{{pending_tool_round,round_id}}'
+                ) = 'string'
+                UNION
+                SELECT candidates.id, encode(sha256(convert_to(
+                    pending_call ->> 'tool_call_id',
+                    'UTF8'
+                )), 'hex')
+                FROM candidates
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE
+                        WHEN jsonb_typeof(
+                            candidates.pending_state
+                                #> '{{pending_tool_round,tool_calls}}'
+                        ) = 'array'
+                        THEN candidates.pending_state
+                            #> '{{pending_tool_round,tool_calls}}'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS pending_call
+                WHERE jsonb_typeof(pending_call -> 'tool_call_id') = 'string'
+            ),
+            pending_action_event_types(event_type) AS (
+                VALUES
+                    ('tool.call.approval_requested'),
+                    ('session.awaiting_user_input'),
+                    ('session.interrupted'),
+                    ('tool.call.started'),
+                    ('tool.call.completed'),
+                    ('tool.call.failed'),
+                    ('tool.call.blocked'),
+                    ('tool.call.approval_denied')
+            ),
+            latest_barriers AS (
+                SELECT candidates.id AS session_id,
+                    COALESCE((
+                        SELECT MAX(event.sequence)
+                        FROM cayu_events AS event
+                        WHERE event.session_id = candidates.id
+                          AND (
+                              event.event_type = 'session.resumed'
+                              OR event.event_type = 'session.completed'
+                              OR event.event_type = 'session.failed'
+                          )
+                    ), 0) AS sequence
+                FROM candidates
+            ),
+            matched_action_events AS (
+                SELECT
+                    action_keys.session_id AS candidate_session_id,
+                    event.sequence
+                FROM candidate_action_keys AS action_keys
+                CROSS JOIN pending_action_event_types AS action_type
+                CROSS JOIN LATERAL (
+                    SELECT candidate_event.sequence
+                    FROM cayu_events AS candidate_event
+                    WHERE candidate_event.session_id = action_keys.session_id
+                      AND candidate_event.event_type = action_type.event_type
+                      AND candidate_event.event_type IN (
+                          'tool.call.approval_requested',
+                          'session.awaiting_user_input',
+                          'session.interrupted',
+                          'tool.call.started',
+                          'tool.call.completed',
+                          'tool.call.failed',
+                          'tool.call.blocked',
+                          'tool.call.approval_denied'
+                      )
+                      AND candidate_event.pending_action_lookup_key IS NOT NULL
+                      AND candidate_event.pending_action_lookup_key = action_keys.action_key
+                    ORDER BY candidate_event.sequence DESC
+                    LIMIT 1
+                ) AS event
+            ),
+            matched_event_sequences AS (
+                SELECT candidate_session_id, sequence
+                FROM matched_action_events
+                UNION
+                SELECT candidates.id, event.sequence
+                FROM candidates
+                JOIN latest_barriers ON latest_barriers.session_id = candidates.id
+                JOIN cayu_events AS event ON event.sequence = latest_barriers.sequence
+            ),
+            matched_events AS MATERIALIZED (
+                SELECT
+                    matched_event_sequences.candidate_session_id,
+                    source_event.sequence,
+                    source_event.pending_action_projection_bytes AS event_bytes,
+                    source_event.pending_action_projection_bytes IS NOT NULL
+                        AND (
+                            source_event.pending_action_projection IS NOT NULL
+                            OR source_event.pending_action_projection_bytes
+                                > {MAX_PENDING_ACTION_RESULT_BYTES}
+                        )
+                        AS projection_ready
+                FROM matched_event_sequences
+                JOIN cayu_events AS source_event
+                    ON source_event.sequence = matched_event_sequences.sequence
+            )
+        """
+        source_size_sql = f"""
+            {pending_action_ctes}
+            SELECT candidates.id,
+                octet_length(candidates.pending_state::text)
+                + COALESCE((
+                    SELECT SUM(octet_length(jsonb_build_object(
+                        'key', label.key,
+                        'value', label.value
+                    )::text))
+                    FROM cayu_session_labels AS label
+                    WHERE label.session_id = candidates.id
+                ), 0)
+                + COALESCE((
+                    SELECT SUM(
+                        matched_event.event_bytes
+                        + length(matched_event.sequence::text)
+                        + 22
+                    )
+                    FROM matched_events AS matched_event
+                    WHERE matched_event.candidate_session_id = candidates.id
+                ), 0) AS source_bytes,
+                COALESCE((
+                    SELECT bool_and(matched_event.projection_ready)
+                    FROM matched_events AS matched_event
+                    WHERE matched_event.candidate_session_id = candidates.id
+                ), true) AS projections_ready,
+                COALESCE((
+                    SELECT jsonb_agg(
+                        matched_event.sequence ORDER BY matched_event.sequence DESC
+                    )
+                    FROM matched_events AS matched_event
+                    WHERE matched_event.candidate_session_id = candidates.id
+                ), '[]'::jsonb) AS matched_event_sequences
+            FROM candidates
+        """
+        materialize_sql = f"""
+            WITH candidates AS MATERIALIZED ({selected_candidate_sql}),
+            matched_events AS MATERIALIZED (
+                SELECT
+                    source_event.session_id AS candidate_session_id,
+                    source_event.sequence,
+                    {projected_event_sql} AS event
+                FROM cayu_events AS source_event
+                WHERE source_event.sequence = ANY(%s)
+            )
+            SELECT candidates.id, candidates.pending_state,
+                COALESCE((
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'sequence', matched_event.sequence,
+                            'event', matched_event.event
+                        )
+                        ORDER BY matched_event.sequence DESC
+                    )
+                    FROM matched_events AS matched_event
+                    WHERE matched_event.candidate_session_id = candidates.id
+                ), '[]'::jsonb) AS pending_events
+            FROM candidates
+        """
+
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            # Candidate selection, byte accounting, projection reads, and labels all
+            # observe one immutable snapshot. The look-ahead row is selected only
+            # as bounded session metadata and never enters JSON projection work.
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            await cur.execute(candidate_select_sql, [*params, candidate_limit])
+            candidate_rows = await cur.fetchall()
+            has_more_candidates = len(candidate_rows) > inspected_candidate_limit
+            inspected_rows = candidate_rows[:inspected_candidate_limit]
+            candidate_sessions = {
+                str(row[0]): pg_support.pending_action_session_from_row(row, labels={})
+                for row in inspected_rows
+            }
+            inspected_ids = [str(row[0]) for row in inspected_rows]
+
+            checkpoint_preflight_by_session_id: dict[str, tuple[int, int]] = {}
+            if inspected_ids:
+                await cur.execute(checkpoint_preflight_sql, (inspected_ids,))
+                for row in await cur.fetchall():
+                    if row[1] is not None:
+                        checkpoint_preflight_by_session_id[str(row[0])] = (
+                            int(row[1]),
+                            int(row[2]),
+                        )
+
+            oversized_ids: set[str] = set()
+            overcomplex_ids: set[str] = set()
+            preflight_eligible_ids: list[str] = []
+            preflight_processable_ids: list[str] = []
+            preflight_source_bytes = 0
+            preflight_stopped_for_bytes = False
+            for session_id in inspected_ids:
+                checkpoint_preflight = checkpoint_preflight_by_session_id.get(session_id)
+                if checkpoint_preflight is None:
+                    oversized_ids.add(session_id)
+                    preflight_processable_ids.append(session_id)
+                    continue
+                pending_state_bytes, pending_tool_call_count = checkpoint_preflight
+                if pending_state_bytes > query.max_result_bytes:
+                    oversized_ids.add(session_id)
+                    preflight_processable_ids.append(session_id)
+                    continue
+                if pending_tool_call_count > MAX_PENDING_ACTION_TOOL_CALLS:
+                    overcomplex_ids.add(session_id)
+                    preflight_processable_ids.append(session_id)
+                    continue
+                if preflight_source_bytes + pending_state_bytes > query.max_result_bytes:
+                    preflight_stopped_for_bytes = True
+                    break
+                preflight_source_bytes += pending_state_bytes
+                preflight_eligible_ids.append(session_id)
+                preflight_processable_ids.append(session_id)
+
+            source_metadata_by_session_id: dict[str, tuple[int, list[int]]] = {}
+            invalid_ids: set[str] = set()
+            if preflight_eligible_ids:
+                await cur.execute(source_size_sql, (preflight_eligible_ids,))
+                for row in await cur.fetchall():
+                    sequence_values = copy_json_value(row[3], "matched event sequences")
+                    if type(sequence_values) is not list or any(
+                        type(sequence) is not int for sequence in sequence_values
+                    ):
+                        raise ValueError(
+                            "Postgres pending event sequence projection must be an integer array."
+                        )
+                    source_metadata_by_session_id[str(row[0])] = (
+                        int(row[1]),
+                        sequence_values,
+                    )
+                    if not bool(row[2]):
+                        invalid_ids.add(str(row[0]))
+
+            processable_ids: list[str] = []
+            materializable_ids: list[str] = []
+            materialized_source_bytes = 0
+            stopped_for_bytes = preflight_stopped_for_bytes
+            for session_id in preflight_processable_ids:
+                session = candidate_sessions[session_id]
+                if (
+                    session_id in oversized_ids
+                    or session_id in overcomplex_ids
+                    or session_id in invalid_ids
+                ):
+                    processable_ids.append(session_id)
+                    continue
+                session_size = _BoundedJsonSize(query.max_result_bytes)
+                session_fits = session_size.value(session)
+                source_metadata = source_metadata_by_session_id.get(session_id)
+                if not session_fits or source_metadata is None:
+                    oversized_ids.add(session_id)
+                    processable_ids.append(session_id)
+                    continue
+                stored_source_bytes = source_metadata[0]
+                candidate_bytes = (
+                    query.max_result_bytes - session_size.remaining + stored_source_bytes
+                )
+                if candidate_bytes > query.max_result_bytes:
+                    oversized_ids.add(session_id)
+                    processable_ids.append(session_id)
+                    continue
+                if materialized_source_bytes + candidate_bytes > query.max_result_bytes:
+                    stopped_for_bytes = True
+                    break
+                materialized_source_bytes += candidate_bytes
+                materializable_ids.append(session_id)
+                processable_ids.append(session_id)
+
+            grouped: dict[str, tuple[dict[str, Any], list[EventRecord]]] = {}
+            if materializable_ids:
+                materializable_sequences = sorted(
+                    {
+                        sequence
+                        for session_id in materializable_ids
+                        for sequence in source_metadata_by_session_id[session_id][1]
+                    }
+                )
+                await cur.execute(
+                    materialize_sql,
+                    (materializable_ids, materializable_sequences),
+                )
+                for row in await cur.fetchall():
+                    session_id = str(row[0])
+                    records: list[EventRecord] = []
+                    pending_events = copy_json_value(row[2], "pending events")
+                    if type(pending_events) is not list:
+                        raise ValueError("Postgres pending events projection must be an array.")
+                    for pending_event in pending_events:
+                        if type(pending_event) is not dict:
+                            raise ValueError("Postgres pending event projections must be objects.")
+                        records.append(
+                            EventRecord(
+                                sequence=pending_event.get("sequence"),
+                                event=Event(**_json_obj(pending_event.get("event"))),
+                            )
+                        )
+                    grouped[session_id] = (
+                        copy_json_value(_json_obj(row[1]), "checkpoint"),
+                        records,
+                    )
+
+            labels_by_session_id = await self._load_labels_for_sessions(cur, materializable_ids)
+            actions = []
+            issues: list[PendingActionIssue] = []
+            inspected_count = 0
+            more_matching = False
+            last_inspected_session: PendingActionSession | None = None
+            for session_id in processable_ids:
+                session = candidate_sessions[session_id]
+                if session_id in oversized_ids:
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        break
+                    issues.append(
+                        PendingActionIssue.source_too_large(
+                            session,
+                            max_bytes=query.max_result_bytes,
+                        )
+                    )
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+                if session_id in overcomplex_ids:
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        break
+                    issues.append(
+                        PendingActionIssue.source_too_complex(
+                            session,
+                            max_tool_calls=MAX_PENDING_ACTION_TOOL_CALLS,
+                        )
+                    )
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+                if session_id in invalid_ids:
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        break
+                    issues.append(PendingActionIssue.source_invalid(session))
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+
+                checkpoint, records = grouped[session_id]
+                session = session.model_copy(
+                    update={"labels": labels_by_session_id.get(session_id, {})}, deep=True
+                )
+                action = pending_action_from_records(session, records, checkpoint)
+                if pending_action_source_is_invalid(session, checkpoint, action, records):
+                    if len(actions) + len(issues) == query.limit:
+                        more_matching = True
+                        break
+                    issues.append(PendingActionIssue.source_invalid(session))
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+                if action is None or (query.kind is not None and action.kind != query.kind):
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+                if not pending_action_matches_query(action, query.q):
+                    inspected_count += 1
+                    last_inspected_session = session
+                    continue
+                if len(actions) + len(issues) == query.limit:
+                    more_matching = True
+                    break
+                actions.append(action)
+                inspected_count += 1
+                last_inspected_session = session
+
+            has_more = more_matching or has_more_candidates or stopped_for_bytes
+            next_cursor = (
+                encode_session_cursor(last_inspected_session, SessionOrder.UPDATED_AT_DESC)
+                if has_more and last_inspected_session is not None
+                else None
+            )
+            return enforce_pending_action_result_size(
+                PendingActionListResult(
+                    actions=actions,
+                    issues=issues,
+                    next_cursor=next_cursor,
+                    has_more=has_more,
+                    total_count=None,
+                    inspected_candidate_count=inspected_count,
+                ),
+                max_bytes=query.max_result_bytes,
+            )
 
     async def _list_sessions(
         self,
@@ -4641,13 +5668,23 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> None:
         await cur.execute(
             """
-            INSERT INTO cayu_checkpoints (session_id, state, updated_at)
-            VALUES (%s, %s, %s)
+            INSERT INTO cayu_checkpoints (
+                session_id, state, updated_at,
+                pending_action_source_bytes,
+                pending_action_tool_call_count,
+                pending_action_flags,
+                pending_action_metrics_ready
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO UPDATE SET
                 state = EXCLUDED.state,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                pending_action_source_bytes = EXCLUDED.pending_action_source_bytes,
+                pending_action_tool_call_count = EXCLUDED.pending_action_tool_call_count,
+                pending_action_flags = EXCLUDED.pending_action_flags,
+                pending_action_metrics_ready = EXCLUDED.pending_action_metrics_ready
             """,
-            (session_id, _dumps(checkpoint), updated_at),
+            _checkpoint_row_values(session_id, checkpoint, updated_at),
         )
 
     async def _first_existing_event_id(
@@ -5374,6 +6411,25 @@ def _new_id() -> str:
 
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _checkpoint_row_values(
+    session_id: str,
+    checkpoint: dict[str, Any],
+    updated_at: datetime,
+) -> tuple[object, ...]:
+    from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
+
+    source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
+    return (
+        session_id,
+        _dumps(checkpoint),
+        pg_support.to_utc(updated_at),
+        source_bytes,
+        tool_call_count,
+        flags,
+        True,
+    )
 
 
 def _json_obj(value: Any) -> dict[str, Any]:

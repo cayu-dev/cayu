@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
@@ -29,6 +30,7 @@ from cayu.runtime import (
     SessionStatus,
     TranscriptQuery,
 )
+from cayu.runtime.sessions import PendingActionKind, PendingActionQuery
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -81,6 +83,388 @@ def _run(dsn: str, coro_factory) -> object:
             await store.close()
 
     return asyncio.run(runner())
+
+
+def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
+    _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgres_dsn):
+    async def ops(store):
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            session.id,
+            [
+                Event(
+                    id=f"unrelated_{index}",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session.id,
+                    payload={
+                        "approval": {
+                            "approval_id": f"unrelated_approval_{index}",
+                            "tool_name": "unrelated",
+                        }
+                    },
+                )
+                for index in range(500)
+            ]
+            + [
+                Event(
+                    id="approval_pg",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session.id,
+                    tool_name="deploy",
+                    payload={
+                        "approval": {
+                            "approval_id": "approval_pg",
+                            "tool_name": "deploy",
+                            "arguments": {"service": "api"},
+                        }
+                    },
+                ),
+                Event(
+                    id="approval_pg_latest",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session.id,
+                    tool_name="deploy",
+                    payload={
+                        "approval": {
+                            "approval_id": "approval_pg",
+                            "tool_name": "deploy",
+                            "reason": "latest request",
+                            "arguments": {"service": "api"},
+                        }
+                    },
+                ),
+            ],
+        )
+        await store.checkpoint(
+            session.id,
+            {
+                "pending_tool_approval": {
+                    "approval_id": "approval_pg",
+                    "tool_call_id": "call_pg",
+                    "tool_name": "deploy",
+                    "arguments": {"service": "api"},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call_pg",
+                            "tool_name": "deploy",
+                            "arguments": {"service": "api"},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.update_status(session.id, SessionStatus.INTERRUPTED)
+
+        result = await store.query_pending_actions(
+            PendingActionQuery(kind=PendingActionKind.TOOL_APPROVAL, q="deploy")
+        )
+        assert result.has_more is False
+        assert result.inspected_candidate_count == 1
+        assert len(result.actions) == 1
+        action = result.actions[0]
+        assert action.session.id == session.id
+        assert action.event.event.id == "approval_pg_latest"
+        assert action.detail == "latest request"
+        assert action.arguments == {"service": "api"}
+
+        user_session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_input_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            user_session.id,
+            Event(
+                id="input_pg",
+                type=EventType.SESSION_AWAITING_USER_INPUT,
+                session_id=user_session.id,
+                payload={
+                    "input_id": "input_pg",
+                    "tool_call_id": "call_input_pg",
+                    "question": "Deploy now?",
+                    "options": ["yes", "no"],
+                },
+            ),
+        )
+        await store.checkpoint(
+            user_session.id,
+            {
+                "pending_user_input": {
+                    "input_id": "input_pg",
+                    "tool_call_id": "call_input_pg",
+                    "tool_name": "ask_user",
+                    "question": "Deploy now?",
+                    "options": ["yes", "no"],
+                    "arguments": {},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call_input_pg",
+                            "tool_name": "ask_user",
+                            "arguments": {},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.update_status(user_session.id, SessionStatus.INTERRUPTED)
+
+        round_session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_round_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            round_session.id,
+            [
+                Event(
+                    id="round_started_pg",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=round_session.id,
+                    tool_name="charge",
+                    payload={
+                        "tool_round_id": "round_pg",
+                        "tool_call_id": "call_round_pg",
+                    },
+                ),
+                Event(
+                    id="round_failed_pg",
+                    type=EventType.SESSION_FAILED,
+                    session_id=round_session.id,
+                    payload={
+                        "manual_recovery_required": True,
+                        "tool_round_id": "round_pg",
+                        "tool_call_id": "call_round_pg",
+                    },
+                ),
+            ],
+        )
+        await store.checkpoint(
+            round_session.id,
+            {
+                "pending_tool_round": {
+                    "round_id": "round_pg",
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call_round_pg",
+                            "tool_name": "charge",
+                            "arguments": {"amount": 42},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.update_status(round_session.id, SessionStatus.FAILED)
+
+        all_actions = await store.query_pending_actions(PendingActionQuery())
+        actions_by_session = {pending.session.id: pending for pending in all_actions.actions}
+        assert actions_by_session["pending_input_pg"].kind == PendingActionKind.USER_INPUT
+        assert actions_by_session["pending_round_pg"].kind == PendingActionKind.MANUAL_RECOVERY
+        assert actions_by_session["pending_round_pg"].tool_call_id == "call_round_pg"
+
+        long_approval_id = "approval_" + "x" * 10_000
+        long_id_session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_long_identifier_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            long_id_session.id,
+            Event(
+                id="long_identifier_approval_event",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id=long_id_session.id,
+                payload={
+                    "approval": {
+                        "approval_id": long_approval_id,
+                        "tool_name": "deploy",
+                        "arguments": {},
+                    }
+                },
+            ),
+        )
+        await store.checkpoint(
+            long_id_session.id,
+            {
+                "pending_tool_approval": {
+                    "approval_id": long_approval_id,
+                    "tool_call_id": "long_identifier_call",
+                    "tool_name": "deploy",
+                    "arguments": {},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "long_identifier_call",
+                            "tool_name": "deploy",
+                            "arguments": {},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.update_status(long_id_session.id, SessionStatus.INTERRUPTED)
+        long_identifier_result = await store.query_pending_actions(
+            PendingActionQuery(session_id=long_id_session.id)
+        )
+        assert len(long_identifier_result.actions) == 1
+        assert long_identifier_result.actions[0].approval_id == long_approval_id
+
+        malformed = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_malformed_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.checkpoint(
+            malformed.id,
+            {"pending_tool_round": {"tool_calls": "not-an-array"}},
+        )
+        await store.update_status(malformed.id, SessionStatus.INTERRUPTED)
+        malformed_result = await store.query_pending_actions(
+            PendingActionQuery(session_id=malformed.id)
+        )
+        assert malformed_result.actions == []
+        assert [issue.code for issue in malformed_result.issues] == ["source_invalid"]
+
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_events SET payload = jsonb_build_object("
+                    "'unrelated_result', repeat('x', 1048576)) "
+                    "WHERE session_id = %s AND event_id = 'approval_pg_latest'",
+                    (session.id,),
+                )
+            await conn.commit()
+        projection_only = await store.query_pending_actions(
+            PendingActionQuery(session_id=session.id)
+        )
+        assert len(projection_only.actions) == 1
+        assert projection_only.actions[0].approval_id == "approval_pg"
+
+        concurrent_listing, _ = await asyncio.gather(
+            store.query_pending_actions(PendingActionQuery(session_id=session.id)),
+            store.checkpoint(session.id, {}),
+        )
+        assert len(concurrent_listing.actions) in {0, 1}
+        after_concurrent_resolution = await store.query_pending_actions(
+            PendingActionQuery(session_id=session.id)
+        )
+        assert after_concurrent_resolution.actions == []
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("ANALYZE cayu_events")
+            await cur.execute("SET LOCAL enable_seqscan = off")
+            await cur.execute(
+                """
+                EXPLAIN (COSTS OFF)
+                SELECT session_id
+                FROM cayu_checkpoints
+                WHERE pending_action_flags <> 0
+                """
+            )
+            plan = "\n".join(row[0] for row in await cur.fetchall())
+            assert "idx_cayu_checkpoints_pending_control_action" in plan
+            await cur.execute(
+                """
+                EXPLAIN (COSTS OFF)
+                SELECT sequence
+                FROM cayu_events
+                WHERE session_id = 'pending_pg'
+                  AND (
+                      event_type = 'session.resumed'
+                      OR event_type = 'session.completed'
+                      OR event_type = 'session.failed'
+                  )
+                ORDER BY sequence DESC
+                """
+            )
+            event_plan = "\n".join(row[0] for row in await cur.fetchall())
+            assert "idx_cayu_events_pending_action_barrier" in event_plan
+            await cur.execute(
+                """
+                EXPLAIN (COSTS OFF)
+                WITH action_ids(session_id, action_id) AS (
+                    VALUES ('pending_pg'::text, 'approval_pg'::text)
+                ),
+                action_types(event_type) AS (
+                    VALUES ('tool.call.approval_requested'::text)
+                )
+                SELECT matched.sequence
+                FROM action_ids
+                CROSS JOIN action_types
+                CROSS JOIN LATERAL (
+                    SELECT event.sequence
+                    FROM cayu_events AS event
+                    WHERE event.session_id = action_ids.session_id
+                      AND event.event_type = action_types.event_type
+                      AND event.event_type IN (
+                        'tool.call.approval_requested',
+                        'session.awaiting_user_input',
+                        'session.interrupted',
+                        'tool.call.started',
+                        'tool.call.completed',
+                        'tool.call.failed',
+                        'tool.call.blocked',
+                        'tool.call.approval_denied'
+                      )
+                      AND event.pending_action_lookup_key IS NOT NULL
+                      AND event.pending_action_lookup_key = encode(sha256(convert_to(
+                          action_ids.action_id,
+                          'UTF8'
+                      )), 'hex')
+                    ORDER BY event.sequence DESC
+                    LIMIT 1
+                ) AS matched
+                """
+            )
+            lookup_plan = "\n".join(row[0] for row in await cur.fetchall())
+            assert "idx_cayu_events_pending_action_lookup" in lookup_plan
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgres_dsn):

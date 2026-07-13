@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
 )
+from cayu.runtime.pending_actions import pending_action_lookup_key
+from cayu.runtime.sessions import PendingActionQuery
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
@@ -52,6 +55,79 @@ class FakeProvider(ModelProvider):
 
 async def _close(store: SQLiteSessionStore) -> None:
     await store.close()
+
+
+def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payload(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "pending_projection.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session_id = "persisted_pending_projection"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                id="persisted_pending_projection_event",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id=session_id,
+                payload={
+                    "approval": {
+                        "approval_id": "persisted_pending_projection_approval",
+                        "tool_name": "deploy",
+                    }
+                },
+            ),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_tool_approval": {
+                    "approval_id": "persisted_pending_projection_approval",
+                    "tool_call_id": "persisted_pending_projection_call",
+                    "tool_name": "deploy",
+                    "arguments": {},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "persisted_pending_projection_call",
+                            "tool_name": "deploy",
+                            "arguments": {},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                "UPDATE cayu_events SET payload_json = ? WHERE session_id = ?",
+                ("not-json-and-intentionally-unbounded-from-the-query", session_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = await store.query_pending_actions(PendingActionQuery(session_id=session_id))
+        assert len(result.actions) == 1
+        assert result.actions[0].approval_id == "persisted_pending_projection_approval"
+        await store.close()
+
+    asyncio.run(run())
 
 
 async def _collect_app_events(events) -> list[Event]:
@@ -841,7 +917,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 15"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -880,7 +956,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 15"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -901,6 +977,479 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
     assert index is not None
+
+
+def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def seed_and_close_store() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sqlite_revision_17_metrics",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            "sqlite_revision_17_metrics",
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="sqlite_revision_17_metrics",
+                payload={
+                    "tool_call_id": "sqlite_revision_17_call",
+                    "tool_round_id": "sqlite_revision_17_round",
+                },
+            ),
+        )
+        await store.append_event(
+            "sqlite_revision_17_metrics",
+            Event(
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id="sqlite_revision_17_metrics",
+                payload={
+                    "approval_id": "\t",
+                    "approval": {
+                        "approval_id": "sqlite_revision_17_nested_approval",
+                        "tool_name": "deploy",
+                    },
+                },
+            ),
+        )
+        await store.checkpoint(
+            "sqlite_revision_17_metrics",
+            {
+                "pending_tool_round": {
+                    "round_id": "sqlite_revision_17_round",
+                    "agent_name": "assistant",
+                    "tool_calls": [{"tool_call_id": "sqlite_revision_17_call"}],
+                }
+            },
+        )
+        await _close(store)
+
+    asyncio.run(seed_and_close_store())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+        connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key")
+        connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_json")
+        connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_bytes")
+        connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_source_bytes")
+        connection.execute(
+            "ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_tool_call_count"
+        )
+        connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_flags")
+        connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_metrics_ready")
+        connection.execute("PRAGMA user_version = 16")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
+        SQLiteSessionStore(db_path)
+
+    reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def close_reopened() -> None:
+        await _close(reopened)
+
+    asyncio.run(close_reopened())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        index_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_checkpoints_pending_control_action'"
+        ).fetchone()
+        event_index_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_events_pending_action_barrier'"
+        ).fetchone()
+        lookup_index_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_events_pending_action_lookup'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert index_sql is not None
+    assert "pending_action_flags" in index_sql[0]
+    assert event_index_sql is not None
+    assert "session_id, sequence" in event_index_sql[0]
+    assert "session.resumed" in event_index_sql[0]
+    assert "session.completed" in event_index_sql[0]
+    assert "session.failed" in event_index_sql[0]
+    assert "tool.call" not in event_index_sql[0]
+    assert lookup_index_sql is not None
+    assert "pending_action_lookup_key" in lookup_index_sql[0]
+    assert "event_type" in lookup_index_sql[0]
+    assert "IS NOT NULL" in lookup_index_sql[0]
+
+    connection = sqlite3.connect(db_path)
+    try:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT session_id
+            FROM cayu_checkpoints
+                INDEXED BY idx_cayu_checkpoints_pending_control_action
+            WHERE pending_action_flags <> 0
+            """
+        ).fetchall()
+        event_plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT sequence
+            FROM cayu_events
+                INDEXED BY idx_cayu_events_pending_action_barrier
+            WHERE session_id = 'session'
+              AND (
+                  event_type = 'session.resumed'
+                  OR event_type = 'session.completed'
+                  OR event_type = 'session.failed'
+              )
+            ORDER BY sequence DESC
+            """
+        ).fetchall()
+        lookup_plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            WITH action_keys(session_id, action_key) AS (
+                VALUES ('session', ?)
+            ),
+            action_types(event_type) AS (
+                VALUES ('tool.call.approval_requested')
+            )
+            SELECT (
+                SELECT MAX(event.sequence)
+                FROM cayu_events AS event
+                    INDEXED BY idx_cayu_events_pending_action_lookup
+                WHERE event.session_id = action_keys.session_id
+                  AND event.event_type = action_types.event_type
+                  AND event.event_type IN (
+                      'tool.call.approval_requested',
+                      'session.awaiting_user_input',
+                      'session.interrupted',
+                      'tool.call.started',
+                      'tool.call.completed',
+                      'tool.call.failed',
+                      'tool.call.blocked',
+                      'tool.call.approval_denied'
+                  )
+                  AND event.pending_action_lookup_key IS NOT NULL
+                  AND event.pending_action_lookup_key = action_keys.action_key
+            )
+            FROM action_keys
+            CROSS JOIN action_types
+            """,
+            (pending_action_lookup_key("approval"),),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert any("idx_cayu_checkpoints_pending_control_action" in row[3] for row in plan)
+    assert any("idx_cayu_events_pending_action_barrier" in row[3] for row in event_plan)
+    assert any("idx_cayu_events_pending_action_lookup" in row[3] for row in lookup_plan)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        metric_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_checkpoints)")
+        }
+    finally:
+        connection.close()
+    assert {
+        "pending_action_source_bytes",
+        "pending_action_tool_call_count",
+        "pending_action_flags",
+        "pending_action_metrics_ready",
+    } <= metric_columns
+    connection = sqlite3.connect(db_path)
+    try:
+        event_metric_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_events)")
+        }
+    finally:
+        connection.close()
+    assert {
+        "pending_action_lookup_key",
+        "pending_action_projection_json",
+        "pending_action_projection_bytes",
+    } <= event_metric_columns
+    connection = sqlite3.connect(db_path)
+    try:
+        metric_row = connection.execute(
+            "SELECT pending_action_source_bytes, pending_action_tool_call_count, "
+            "pending_action_flags, pending_action_metrics_ready FROM cayu_checkpoints "
+            "WHERE session_id = 'sqlite_revision_17_metrics'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert metric_row is not None
+    assert metric_row[0] > 0
+    assert metric_row[1:] == (1, 4, 1)
+    connection = sqlite3.connect(db_path)
+    try:
+        event_metric_row = connection.execute(
+            "SELECT pending_action_lookup_key, pending_action_projection_json, "
+            "pending_action_projection_bytes FROM cayu_events "
+            "WHERE session_id = 'sqlite_revision_17_metrics' "
+            "AND event_type = 'tool.call.started'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert event_metric_row is not None
+    assert event_metric_row[0] == pending_action_lookup_key("sqlite_revision_17_call")
+    assert json.loads(event_metric_row[1])["payload"] == {
+        "tool_call_id": "sqlite_revision_17_call",
+        "tool_round_id": "sqlite_revision_17_round",
+    }
+    assert event_metric_row[2] > 0
+    connection = sqlite3.connect(db_path)
+    try:
+        normalized_lookup_row = connection.execute(
+            "SELECT pending_action_lookup_key FROM cayu_events "
+            "WHERE session_id = 'sqlite_revision_17_metrics' "
+            "AND event_type = 'tool.call.approval_requested'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert normalized_lookup_row == (
+        pending_action_lookup_key("sqlite_revision_17_nested_approval"),
+    )
+
+
+def test_sqlite_revision_seventeen_rejects_conflicting_same_name_index(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+        connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.execute(
+            "CREATE INDEX idx_cayu_events_pending_action_lookup "
+            "ON cayu_events(session_id, sequence)"
+        )
+        connection.execute("PRAGMA user_version = 16")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="conflicts with Cayu revision 17"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        recorded = connection.execute(
+            "SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 17"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert recorded == (0,)
+
+
+def test_sqlite_revision_seventeen_resumes_committed_checkpoint_batches(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "resumable-revision-17.sqlite"
+    connection = sqlite_support.connect(db_path)
+    sqlite_support.reconcile_schema(connection, schema_migrations.SchemaMode.CREATE)
+    timestamp = "2026-01-01T00:00:00+00:00"
+    session_rows = [
+        (
+            f"resumable_{index:03d}",
+            "assistant",
+            "fake",
+            "fake-model",
+            f"resumable_{index:03d}",
+            "local",
+            "interrupted",
+            timestamp,
+            timestamp,
+            timestamp,
+            "{}",
+        )
+        for index in range(101)
+    ]
+    connection.executemany(
+        """
+        INSERT INTO cayu_sessions (
+            id, agent_name, provider_name, model, causal_budget_id,
+            runtime_name, status, created_at, updated_at, last_activity_at,
+            metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        session_rows,
+    )
+    connection.executemany(
+        "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at) VALUES (?, ?, ?)",
+        [
+            (
+                row[0],
+                json.dumps(
+                    {
+                        "pending_tool_approval": {
+                            "approval_id": f"approval_{index:03d}",
+                            "tool_call_id": f"call_{index:03d}",
+                            "tool_name": "deploy",
+                            "arguments": {},
+                            "agent_name": "assistant",
+                            "tool_calls": [],
+                        }
+                    }
+                ),
+                timestamp,
+            )
+            for index, row in enumerate(session_rows)
+        ],
+    )
+    connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+    connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
+    connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
+    connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+    connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key")
+    connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_json")
+    connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_bytes")
+    connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_source_bytes")
+    connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_tool_call_count")
+    connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_flags")
+    connection.execute("ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_metrics_ready")
+    connection.execute("PRAGMA user_version = 16")
+    connection.commit()
+
+    original_batch = sqlite_support._backfill_pending_action_checkpoint_batch
+    calls = 0
+
+    def fail_after_first_batch(
+        batch_connection: sqlite3.Connection,
+        after_session_id: str | None,
+    ) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated migration interruption")
+        return original_batch(batch_connection, after_session_id)
+
+    monkeypatch.setattr(
+        sqlite_support,
+        "_backfill_pending_action_checkpoint_batch",
+        fail_after_first_batch,
+    )
+    with pytest.raises(RuntimeError, match="simulated migration interruption"):
+        sqlite_support.reconcile_schema(connection, schema_migrations.SchemaMode.MIGRATE)
+
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM cayu_checkpoints WHERE pending_action_metrics_ready = 1"
+        ).fetchone()[0]
+        == 100
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 17"
+        ).fetchone()[0]
+        == 0
+    )
+
+    monkeypatch.setattr(
+        sqlite_support,
+        "_backfill_pending_action_checkpoint_batch",
+        original_batch,
+    )
+    sqlite_support.reconcile_schema(connection, schema_migrations.SchemaMode.MIGRATE)
+
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM cayu_checkpoints WHERE pending_action_metrics_ready = 1"
+        ).fetchone()[0]
+        == 101
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 17"
+        ).fetchone()[0]
+        == 1
+    )
+    connection.close()
+
+
+def test_sqlite_revision_seventeen_validation_checks_exact_index_definition(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.execute(
+            "CREATE INDEX idx_cayu_events_pending_action_lookup "
+            "ON cayu_events(session_id, event_type, sequence)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="conflicts with Cayu revision 17"):
+        SQLiteSessionStore(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.commit()
+    finally:
+        connection.close()
+
+    repaired = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(repaired))
+
+    validated = SQLiteSessionStore(db_path)
+    asyncio.run(_close(validated))
+
+
+def test_sqlite_revision_seventeen_migrate_repairs_missing_recorded_index(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="Required Cayu SQLite index is missing"):
+        SQLiteSessionStore(db_path)
+
+    repaired = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(repaired))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_cayu_events_pending_action_lookup'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert definition is not None
+    assert "event_type" in definition[0]
+    assert "IS NOT NULL" in definition[0]
 
 
 def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
@@ -1018,7 +1567,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-16 are additive and keep the prior compatibility floor.
+    # Revisions 2-7 and 11-16 are additive; revision 17 changes the checkpoint
+    # writer contract and therefore raises the compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
         (1, 1),
@@ -1037,6 +1587,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (14, 10),
         (15, 10),
         (16, 10),
+        (17, 17),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

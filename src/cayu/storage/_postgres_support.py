@@ -6,6 +6,7 @@ from typing import Any
 
 from cayu._validation import copy_label_map
 from cayu.runtime.sessions import (
+    PendingActionSession,
     Session,
     SessionOrder,
     SessionStatus,
@@ -56,6 +57,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         tool_name TEXT,
         payload JSONB NOT NULL,
         event JSONB NOT NULL,
+        pending_action_lookup_key TEXT,
+        pending_action_projection JSONB,
+        pending_action_projection_bytes BIGINT,
         UNIQUE (session_id, event_id),
         UNIQUE (session_id, session_order)
     )
@@ -72,13 +76,22 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL
+        updated_at TIMESTAMPTZ NOT NULL,
+        pending_action_source_bytes BIGINT,
+        pending_action_tool_call_count INTEGER NOT NULL DEFAULT 0,
+        pending_action_flags INTEGER NOT NULL DEFAULT 0,
+        pending_action_metrics_ready BOOLEAN NOT NULL DEFAULT TRUE
     )
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
         ON cayu_checkpoints(session_id)
         WHERE state ? 'pending_interruption_cascade'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_control_action
+        ON cayu_checkpoints(session_id)
+        WHERE pending_action_flags <> 0
     """,
     """
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
@@ -146,6 +159,33 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_events(session_id, session_order)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence "
     "ON cayu_events(session_id, sequence)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_barrier
+    ON cayu_events(session_id, sequence)
+    WHERE event_type = 'session.resumed'
+       OR event_type = 'session.completed'
+       OR event_type = 'session.failed'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_lookup
+    ON cayu_events(
+        session_id,
+        pending_action_lookup_key,
+        event_type,
+        sequence
+    )
+    WHERE event_type IN (
+        'tool.call.approval_requested',
+        'session.awaiting_user_input',
+        'session.interrupted',
+        'tool.call.started',
+        'tool.call.completed',
+        'tool.call.failed',
+        'tool.call.blocked',
+        'tool.call.approval_denied'
+    )
+      AND pending_action_lookup_key IS NOT NULL
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name ON cayu_events(agent_name)",
@@ -240,6 +280,32 @@ SESSION_COLUMNS = (
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
     "last_activity_at, run_epoch, metadata"
 )
+
+PENDING_ACTION_SESSION_COLUMNS = (
+    "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
+    "runtime_name, runtime_version, environment_name, status, created_at, updated_at"
+)
+
+
+def pending_action_session_from_row(
+    row: tuple[Any, ...],
+    labels: dict[str, str] | None = None,
+) -> PendingActionSession:
+    return PendingActionSession(
+        id=row[0],
+        agent_name=row[1],
+        provider_name=row[2],
+        model=row[3],
+        parent_session_id=row[4],
+        causal_budget_id=row[5],
+        runtime_name=row[6],
+        runtime_version=row[7],
+        environment_name=row[8],
+        status=SessionStatus(row[9]),
+        created_at=to_utc(row[10]),
+        updated_at=to_utc(row[11]),
+        labels=copy_label_map(labels, "labels"),
+    )
 
 
 def task_insert_values(task: Task) -> tuple[object, ...]:

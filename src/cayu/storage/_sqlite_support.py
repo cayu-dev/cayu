@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -11,7 +12,10 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from cayu._validation import copy_json_value, copy_label_map
+from cayu.core.events import Event
 from cayu.runtime.sessions import (
+    PENDING_ACTION_EVENT_TYPE_VALUES,
+    PendingActionSession,
     RunRequest,
     Session,
     SessionIdentity,
@@ -39,6 +43,7 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA query_only = ON")
+        _register_sqlite_functions(connection)
         return connection
     connection = sqlite3.connect(path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
@@ -46,7 +51,22 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     connection.execute("PRAGMA busy_timeout = 5000")
     if str(path) != ":memory:":
         connection.execute("PRAGMA journal_mode = WAL")
+    _register_sqlite_functions(connection)
     return connection
+
+
+def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
+    from cayu.runtime.pending_actions import pending_action_lookup_key
+
+    def lookup_key(value: object) -> str | None:
+        return pending_action_lookup_key(value) if type(value) is str else None
+
+    connection.create_function(
+        "cayu_pending_action_lookup_key",
+        1,
+        lookup_key,
+        deterministic=True,
+    )
 
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
@@ -82,6 +102,9 @@ _BASELINE_DDL = """
         workflow_name TEXT,
         tool_name TEXT,
         payload_json TEXT NOT NULL,
+        pending_action_lookup_key TEXT,
+        pending_action_projection_json TEXT,
+        pending_action_projection_bytes INTEGER,
         UNIQUE(session_id, event_id)
     );
 
@@ -95,12 +118,20 @@ _BASELINE_DDL = """
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        pending_action_source_bytes INTEGER,
+        pending_action_tool_call_count INTEGER NOT NULL DEFAULT 0,
+        pending_action_flags INTEGER NOT NULL DEFAULT 0,
+        pending_action_metrics_ready INTEGER NOT NULL DEFAULT 1
     );
 
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
         ON cayu_checkpoints(session_id)
         WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_control_action
+        ON cayu_checkpoints(session_id)
+        WHERE pending_action_flags <> 0;
 
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,6 +196,29 @@ _BASELINE_DDL = """
         ON cayu_session_labels(key, value, session_id);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence
         ON cayu_events(session_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_barrier
+        ON cayu_events(session_id, sequence)
+        WHERE event_type = 'session.resumed'
+           OR event_type = 'session.completed'
+           OR event_type = 'session.failed';
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_lookup
+        ON cayu_events(
+            session_id,
+            pending_action_lookup_key,
+            event_type,
+            sequence
+        )
+        WHERE event_type IN (
+            'tool.call.approval_requested',
+            'session.awaiting_user_input',
+            'session.interrupted',
+            'tool.call.started',
+            'tool.call.completed',
+            'tool.call.failed',
+            'tool.call.blocked',
+            'tool.call.approval_denied'
+        )
+          AND pending_action_lookup_key IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp
         ON cayu_events(event_type, timestamp);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name
@@ -367,6 +421,36 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_checkpoints(session_id)
             WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
     """,
+    17: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_control_action
+            ON cayu_checkpoints(session_id)
+            WHERE pending_action_flags <> 0;
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_barrier
+            ON cayu_events(session_id, sequence)
+            WHERE event_type = 'session.resumed'
+               OR event_type = 'session.completed'
+               OR event_type = 'session.failed';
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_lookup
+            ON cayu_events(
+                session_id,
+                pending_action_lookup_key,
+                event_type,
+                sequence
+            )
+            WHERE event_type IN (
+                'tool.call.approval_requested',
+                'session.awaiting_user_input',
+                'session.interrupted',
+                'tool.call.started',
+                'tool.call.completed',
+                'tool.call.failed',
+                'tool.call.blocked',
+                'tool.call.approval_denied'
+            )
+              AND pending_action_lookup_key IS NOT NULL;
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -391,6 +475,23 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
         ),
         ("cayu_sessions", "run_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    17: (
+        ("cayu_events", "pending_action_lookup_key", "TEXT"),
+        ("cayu_events", "pending_action_projection_json", "TEXT"),
+        ("cayu_events", "pending_action_projection_bytes", "INTEGER"),
+        ("cayu_checkpoints", "pending_action_source_bytes", "INTEGER"),
+        (
+            "cayu_checkpoints",
+            "pending_action_tool_call_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("cayu_checkpoints", "pending_action_flags", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "cayu_checkpoints",
+            "pending_action_metrics_ready",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
     ),
 }
 
@@ -440,6 +541,107 @@ def _backfill_session_activity(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE cayu_sessions SET last_activity_at = updated_at")
 
 
+def _backfill_pending_action_checkpoint_batch(
+    connection: sqlite3.Connection,
+    after_session_id: str | None,
+) -> str | None:
+    from cayu.runtime.pending_actions import (
+        pending_action_checkpoint_metrics,
+    )
+
+    rows = connection.execute(
+        "SELECT session_id FROM cayu_checkpoints "
+        "WHERE pending_action_metrics_ready = 0 AND (? IS NULL OR session_id > ?) "
+        "ORDER BY session_id LIMIT 100",
+        (after_session_id, after_session_id),
+    ).fetchall()
+    if not rows:
+        return None
+    for row in rows:
+        checkpoint_row = connection.execute(
+            "SELECT state_json FROM cayu_checkpoints WHERE session_id = ?",
+            (row["session_id"],),
+        ).fetchone()
+        if checkpoint_row is None:  # pragma: no cover - this transaction holds the writer lock.
+            continue
+        source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(
+            json.loads(checkpoint_row["state_json"])
+        )
+        connection.execute(
+            "UPDATE cayu_checkpoints SET pending_action_source_bytes = ?, "
+            "pending_action_tool_call_count = ?, pending_action_flags = ?, "
+            "pending_action_metrics_ready = 1 WHERE session_id = ?",
+            (source_bytes, tool_call_count, flags, row["session_id"]),
+        )
+        del checkpoint_row
+    return str(rows[-1]["session_id"])
+
+
+def _backfill_pending_action_event_batch(
+    connection: sqlite3.Connection,
+    after_sequence: int,
+) -> int | None:
+    from cayu.runtime.pending_actions import (
+        PENDING_ACTION_EVENT_TYPE_VALUES,
+        pending_action_event_storage_values,
+    )
+
+    event_types = sorted(PENDING_ACTION_EVENT_TYPE_VALUES)
+    placeholders = ", ".join("?" for _ in event_types)
+    sequence_rows = connection.execute(
+        f"""
+        SELECT sequence
+        FROM cayu_events
+        WHERE pending_action_projection_bytes IS NULL
+          AND sequence > ?
+          AND event_type IN ({placeholders})
+        ORDER BY sequence
+        LIMIT 25
+        """,
+        (after_sequence, *event_types),
+    ).fetchall()
+    if not sequence_rows:
+        return None
+    for sequence_row in sequence_rows:
+        row = connection.execute(
+            """
+            SELECT sequence, session_id, event_id, event_type, timestamp,
+                   agent_name, environment_name, workflow_name, tool_name, payload_json
+            FROM cayu_events
+            WHERE sequence = ?
+            """,
+            (sequence_row["sequence"],),
+        ).fetchone()
+        if row is None:  # pragma: no cover - this transaction holds the writer lock.
+            continue
+        event = Event(
+            session_id=row["session_id"],
+            id=row["event_id"],
+            type=row["event_type"],
+            timestamp=parse_datetime(row["timestamp"]),
+            agent_name=row["agent_name"],
+            environment_name=row["environment_name"],
+            workflow_name=row["workflow_name"],
+            tool_name=row["tool_name"],
+            payload=json.loads(row["payload_json"]),
+        )
+        lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+        connection.execute(
+            "UPDATE cayu_events SET pending_action_lookup_key = ?, "
+            "pending_action_projection_json = ?, pending_action_projection_bytes = ? "
+            "WHERE sequence = ?",
+            (
+                lookup_key,
+                projection,
+                projection_bytes,
+                row["sequence"],
+            ),
+        )
+        # Do not retain one arbitrary-size legacy payload while loading the next.
+        del event, lookup_key, projection, projection_bytes, row
+    return int(sequence_rows[-1]["sequence"])
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -447,6 +649,86 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_legacy_budget_reservations,
     14: _backfill_session_activity,
 }
+
+_REVISION_17_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_checkpoints_pending_control_action",
+        "idx_cayu_events_pending_action_barrier",
+        "idx_cayu_events_pending_action_lookup",
+    }
+)
+
+
+def _normalize_sqlite_schema_definition(definition: str) -> str:
+    """Normalize formatting, while preserving every structural SQL token."""
+    normalized = re.sub(r"\s+", "", definition.casefold())
+    normalized = normalized.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
+    return normalized.replace("ifnotexists", "")
+
+
+def _revision_17_index_definitions() -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in _iter_statements(_MIGRATION_STEPS[17]):
+        match = re.match(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if match is not None and match.group(1) in _REVISION_17_INDEX_NAMES:
+            definitions[match.group(1)] = statement
+    if definitions.keys() != _REVISION_17_INDEX_NAMES:
+        raise RuntimeError("Cayu revision 17 index definitions are incomplete.")
+    return definitions
+
+
+def _validate_revision_17_indexes(
+    connection: sqlite3.Connection,
+    *,
+    require_all: bool,
+) -> None:
+    """Reject same-name SQLite indexes whose structure is not Cayu's contract."""
+    for index_name, expected in _revision_17_index_definitions().items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, _table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or actual_definition is None
+            or (
+                _normalize_sqlite_schema_definition(actual_definition)
+                != _normalize_sqlite_schema_definition(expected)
+            )
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu revision 17. "
+                "Rename or remove the conflicting object, then run with "
+                "schema_mode='migrate' to create the required index."
+            )
+
+
+def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
+    """Recreate missing required indexes even when revision 17 is already recorded."""
+    with _transaction(connection):
+        _validate_revision_17_indexes(connection, require_all=False)
+        existing_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        for index_name, definition in _revision_17_index_definitions().items():
+            if index_name not in existing_names:
+                connection.execute(definition)
+        _validate_revision_17_indexes(connection, require_all=True)
 
 
 def reconcile_schema(
@@ -478,6 +760,12 @@ def reconcile_schema(
     else:  # MIGRATE
         _apply_pending(connection, state)
         schema.validate(read_schema_state(connection))
+    current = read_schema_state(connection)
+    if current.revision >= 17:
+        if schema_mode is schema.SchemaMode.MIGRATE:
+            _repair_missing_revision_17_indexes(connection)
+        else:
+            _validate_revision_17_indexes(connection, require_all=True)
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -504,11 +792,13 @@ def read_schema_state(connection: sqlite3.Connection) -> schema.SchemaState:
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     """Run a block inside one explicit SQLite transaction (BEGIN/COMMIT/ROLLBACK).
 
-    Applying a revision's DDL, its data hook, the ``cayu_schema_migrations`` row,
-    and ``user_version`` in a single transaction makes each revision atomic: a
-    crash mid-revision leaves the recorded revision unchanged, so ``migrate`` can
-    safely re-run. (``executescript`` cannot be used here — it force-commits any
-    open transaction — so revision DDL is executed statement-by-statement.)
+    Most revisions apply DDL, their data hook, and their revision marker
+    atomically. Large revision-17 backfills instead use this helper for short,
+    independently committed batches and explicit ready markers, making a crash
+    resumable without holding one write lock for the entire data set.
+
+    ``executescript`` cannot be used here: it force-commits any open transaction,
+    so revision DDL is executed statement-by-statement.
     """
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -569,6 +859,9 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
 
 
 def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:
+    if rev.revision == 17:
+        _apply_revision_seventeen(connection, rev)
+        return
     with _transaction(connection):
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
@@ -581,6 +874,71 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
         hook = _MIGRATION_HOOKS.get(rev.revision)
         if hook is not None:
             hook(connection)
+        _record_revision(connection, rev)
+        connection.execute(f"PRAGMA user_version = {rev.revision}")
+
+
+def _apply_revision_seventeen(
+    connection: sqlite3.Connection,
+    rev: schema.Revision,
+) -> None:
+    # CREATE INDEX IF NOT EXISTS silently accepts a wrong same-name index.
+    # Validate before any staged work so a conflict cannot be followed by a
+    # falsely recorded successful migration.
+    with _transaction(connection):
+        _validate_revision_17_indexes(connection, require_all=False)
+        for table, column, decl in _MIGRATION_ADD_COLUMNS[17]:
+            _add_column_if_missing(connection, table, column, decl)
+        for statement in _iter_statements(_MIGRATION_STEPS[17]):
+            connection.execute(statement)
+
+    after_session_id: str | None = None
+    while True:
+        with _transaction(connection):
+            next_session_id = _backfill_pending_action_checkpoint_batch(
+                connection,
+                after_session_id,
+            )
+            checkpoint_remaining = (
+                next_session_id is None
+                and connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM cayu_checkpoints "
+                    "WHERE pending_action_metrics_ready = 0)"
+                ).fetchone()[0]
+                == 1
+            )
+        if next_session_id is not None:
+            after_session_id = next_session_id
+            continue
+        if not checkpoint_remaining:
+            break
+        after_session_id = None
+
+    after_sequence = 0
+    event_types = sorted(PENDING_ACTION_EVENT_TYPE_VALUES)
+    event_type_placeholders = ", ".join("?" for _ in event_types)
+    while True:
+        with _transaction(connection):
+            next_sequence = _backfill_pending_action_event_batch(connection, after_sequence)
+            event_remaining = (
+                next_sequence is None
+                and connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM cayu_events "
+                    "WHERE pending_action_projection_bytes IS NULL "
+                    f"AND event_type IN ({event_type_placeholders}))",
+                    event_types,
+                ).fetchone()[0]
+                == 1
+            )
+        if next_sequence is not None:
+            after_sequence = next_sequence
+            continue
+        if not event_remaining:
+            break
+        after_sequence = 0
+
+    with _transaction(connection):
+        _validate_revision_17_indexes(connection, require_all=True)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
@@ -719,6 +1077,27 @@ def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> 
     )
 
 
+def pending_action_session_from_row(
+    row: sqlite3.Row,
+    labels: dict[str, str] | None = None,
+) -> PendingActionSession:
+    return PendingActionSession(
+        id=row["id"],
+        agent_name=row["agent_name"],
+        provider_name=row["provider_name"],
+        model=row["model"],
+        parent_session_id=row["parent_session_id"],
+        causal_budget_id=row["causal_budget_id"],
+        runtime_name=row["runtime_name"],
+        runtime_version=row["runtime_version"],
+        environment_name=row["environment_name"],
+        status=SessionStatus(row["status"]),
+        created_at=parse_datetime(row["created_at"]),
+        updated_at=parse_datetime(row["updated_at"]),
+        labels=copy_label_map(labels, "labels"),
+    )
+
+
 def format_datetime(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
@@ -746,6 +1125,25 @@ def parse_optional_datetime(value: str | None) -> datetime | None:
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def checkpoint_row_values(
+    session_id: str,
+    checkpoint: dict[str, Any],
+    updated_at: datetime,
+) -> tuple[object, ...]:
+    from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
+
+    source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
+    return (
+        session_id,
+        json_dumps(checkpoint),
+        format_datetime(updated_at),
+        source_bytes,
+        tool_call_count,
+        flags,
+        1,
+    )
 
 
 def session_order_sql(order_by: SessionOrder) -> str:

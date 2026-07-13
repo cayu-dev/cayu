@@ -46,6 +46,7 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     EventQuery,
     InMemorySessionStore,
+    PendingActionListResult,
     RunRequest,
     SessionIdentity,
     SessionStatus,
@@ -2521,7 +2522,9 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     response = client.get("/api/pending-actions")
     assert response.status_code == 200
     body = response.json()
-    assert body["inspected_session_count"] == 6
+    assert body["inspected_candidate_count"] == 4
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
     assert body["total_count"] == 4
     actions_by_session = {action["session"]["id"]: action for action in body["actions"]}
     assert set(actions_by_session) == {
@@ -2559,22 +2562,99 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     exact = client.get("/api/pending-actions?session_id=manual_recovery")
     assert exact.status_code == 200
     exact_body = exact.json()
-    assert exact_body["inspected_session_count"] == 1
+    assert exact_body["inspected_candidate_count"] == 1
     assert exact_body["total_count"] == 1
     assert exact_body["actions"][0]["kind"] == "manual_recovery"
 
     tool_round_exact = client.get("/api/pending-actions?session_id=manual_tool_round_recovery")
     assert tool_round_exact.status_code == 200
     tool_round_exact_body = tool_round_exact.json()
-    assert tool_round_exact_body["inspected_session_count"] == 1
+    assert tool_round_exact_body["inspected_candidate_count"] == 1
     assert tool_round_exact_body["total_count"] == 1
     assert tool_round_exact_body["actions"][0]["round_id"] == "round_crashed"
 
     stale_exact = client.get("/api/pending-actions?session_id=missing_checkpoint")
     assert stale_exact.status_code == 200
     stale_body = stale_exact.json()
-    assert stale_body["inspected_session_count"] == 1
+    assert stale_body["inspected_candidate_count"] == 0
     assert stale_body["total_count"] == 0
+
+
+def test_server_pending_actions_uses_one_store_native_query() -> None:
+    class PendingActionStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pending_query_count = 0
+
+        async def query_pending_actions(self, query=None):
+            self.pending_query_count += 1
+            return PendingActionListResult()
+
+        async def list_sessions(self, query=None):
+            raise AssertionError("pending-action route must not list candidate sessions")
+
+        async def query_events(self, query=None):
+            raise AssertionError("pending-action route must not query per-session events")
+
+        async def load_checkpoint(self, session_id: str):
+            raise AssertionError("pending-action route must not load per-session checkpoints")
+
+    store = PendingActionStore()
+    client = TestClient(create_server(CayuApp(session_store=store), dev=True))
+
+    response = client.get("/api/pending-actions")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "actions": [],
+        "issues": [],
+        "next_cursor": None,
+        "has_more": False,
+        "total_count": None,
+        "inspected_candidate_count": 0,
+    }
+    assert store.pending_query_count == 1
+
+
+def test_server_pending_actions_returns_413_for_oversized_page() -> None:
+    class OversizedPendingActionStore(InMemorySessionStore):
+        async def query_pending_actions(self, query=None):
+            from cayu.runtime.sessions import PendingActionResultTooLarge
+
+            raise PendingActionResultTooLarge(2 * 1024 * 1024)
+
+    client = TestClient(
+        create_server(CayuApp(session_store=OversizedPendingActionStore()), dev=True)
+    )
+
+    response = client.get("/api/pending-actions")
+
+    assert response.status_code == 413
+    assert "2097152-byte result limit" in response.json()["detail"]
+
+
+def test_server_pending_actions_rejects_invalid_cursor_as_400() -> None:
+    client = TestClient(create_server(CayuApp(), dev=True))
+
+    response = client.get("/api/pending-actions?cursor=not-a-cursor")
+
+    assert response.status_code == 400
+    assert "Invalid session cursor" in response.json()["detail"]
+
+
+def test_server_pending_actions_does_not_misclassify_store_failure_as_400() -> None:
+    class FailingPendingActionStore(InMemorySessionStore):
+        async def query_pending_actions(self, query=None):
+            raise ValueError("persisted pending-action projection is corrupt")
+
+    client = TestClient(
+        create_server(CayuApp(session_store=FailingPendingActionStore()), dev=True),
+        raise_server_exceptions=False,
+    )
+
+    response = client.get("/api/pending-actions")
+
+    assert response.status_code == 500
 
 
 def test_server_run_rejects_request_budget_reservations() -> None:

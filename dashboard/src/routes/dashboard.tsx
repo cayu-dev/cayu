@@ -9,6 +9,7 @@ import {
   fetchPendingActions,
   fetchSessionsSummary,
   fetchTasks,
+  isApiPayloadTooLarge,
   type PendingAction,
   type Session,
   type SessionsSummary,
@@ -97,13 +98,17 @@ export function DashboardPage() {
   const pendingActions = useQuery({
     queryKey: ["pending-actions", "dashboard"],
     queryFn: () => fetchPendingActions({ limit: 25 }),
-    refetchInterval: 5000,
+    retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
+    refetchInterval: (query) => (isApiPayloadTooLarge(query.state.error) ? false : 5000),
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: (query) => !isApiPayloadTooLarge(query.state.error),
   })
 
   const sessionItems = summary.data?.sessions || []
   const list = sessionItems.map((item) => item.session)
   const taskList = tasks.data || []
   const pendingActionList = pendingActions.data?.actions || []
+  const pendingActionIssues = pendingActions.data?.issues || []
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
   const tasksError = tasks.error instanceof Error ? tasks.error.message : null
   const activeSessions = list.filter(isActiveSession)
@@ -227,12 +232,32 @@ export function DashboardPage() {
             </StateMessage>
           ) : attentionSessions.length === 0 &&
             attentionTasks.length === 0 &&
-            pendingActionList.length === 0 ? (
+            pendingActionList.length === 0 &&
+            pendingActionIssues.length === 0 ? (
             <StateMessage className="py-6">
               No sessions, tasks, or pending actions need attention in the current view.
             </StateMessage>
           ) : (
             <div className="space-y-2">
+              {pendingActionIssues.slice(0, 5).map((issue) => (
+                <Link
+                  key={`${issue.code}:${issue.session_id}`}
+                  to="/sessions/$sessionId"
+                  params={{ sessionId: issue.session_id }}
+                  className="flex items-center justify-between gap-3 rounded-md p-3 text-foreground no-underline transition-colors hover:bg-muted"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 truncate text-sm font-medium">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+                      <span className="truncate">Pending state needs inspection</span>
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">{issue.session_id}</div>
+                  </div>
+                  <Badge variant="outline" className="shrink-0">
+                    {issue.agent_name}
+                  </Badge>
+                </Link>
+              ))}
               {pendingActionList.slice(0, 5).map((action) => (
                 <Link
                   key={action.id}

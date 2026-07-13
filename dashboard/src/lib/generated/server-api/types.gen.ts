@@ -519,6 +519,36 @@ export type ApiPendingAction = {
 };
 
 /**
+ * ApiPendingActionIssue
+ */
+export type ApiPendingActionIssue = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * Code
+     */
+    code: 'source_too_large' | 'source_too_complex' | 'source_invalid';
+    /**
+     * Detail
+     */
+    detail: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'interrupted' | 'failed' | 'completed';
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
  * ApiReviewedKnowledgeEntry
  */
 export type ApiReviewedKnowledgeEntry = {
@@ -1580,6 +1610,11 @@ export type ModelPricing = {
 };
 
 /**
+ * PendingActionKind
+ */
+export type PendingActionKind = 'tool_approval' | 'user_input' | 'manual_recovery';
+
+/**
  * PendingActionsResponse
  */
 export type PendingActionsResponse = {
@@ -1588,13 +1623,25 @@ export type PendingActionsResponse = {
      */
     actions: Array<ApiPendingAction>;
     /**
-     * Inspected Session Count
+     * Has More
      */
-    inspected_session_count: number;
+    has_more: boolean;
+    /**
+     * Inspected Candidate Count
+     */
+    inspected_candidate_count: number;
+    /**
+     * Issues
+     */
+    issues: Array<ApiPendingActionIssue>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
     /**
      * Total Count
      */
-    total_count: number;
+    total_count: number | null;
 };
 
 /**
@@ -3404,10 +3451,6 @@ export type ListPendingActionsApiPendingActionsGetData = {
          */
         limit?: number;
         /**
-         * Session Limit
-         */
-        session_limit?: number;
-        /**
          * Session Id
          */
         session_id?: string | null;
@@ -3418,12 +3461,28 @@ export type ListPendingActionsApiPendingActionsGetData = {
         /**
          * Kind
          */
-        kind?: string | null;
+        kind?: PendingActionKind | null;
+        /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+        /**
+         * Environment Name
+         */
+        environment_name?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
     };
     url: '/api/pending-actions';
 };
 
 export type ListPendingActionsApiPendingActionsGetErrors = {
+    /**
+     * The pending-action page exceeds the bounded response size.
+     */
+    413: ApiErrorResponse;
     /**
      * Validation Error
      */

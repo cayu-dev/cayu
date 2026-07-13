@@ -967,6 +967,56 @@
       "title": "ApiPendingAction",
       "type": "object"
     },
+    "ApiPendingActionIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "code": {
+          "enum": [
+            "source_too_large",
+            "source_too_complex",
+            "source_invalid"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "interrupted",
+            "failed",
+            "completed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "session_id",
+        "agent_name",
+        "status",
+        "updated_at",
+        "detail"
+      ],
+      "title": "ApiPendingActionIssue",
+      "type": "object"
+    },
     "ApiReviewedKnowledgeEntry": {
       "additionalProperties": false,
       "properties": {
@@ -3004,6 +3054,15 @@
       "title": "ModelPricing",
       "type": "object"
     },
+    "PendingActionKind": {
+      "enum": [
+        "tool_approval",
+        "user_input",
+        "manual_recovery"
+      ],
+      "title": "PendingActionKind",
+      "type": "string"
+    },
     "PendingActionsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -3014,21 +3073,53 @@
           "title": "Actions",
           "type": "array"
         },
-        "inspected_session_count": {
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "inspected_candidate_count": {
           "minimum": 0.0,
-          "title": "Inspected Session Count",
+          "title": "Inspected Candidate Count",
           "type": "integer"
         },
+        "issues": {
+          "items": {
+            "$ref": "#/components/schemas/ApiPendingActionIssue"
+          },
+          "title": "Issues",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
         "total_count": {
-          "minimum": 0.0,
-          "title": "Total Count",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Total Count"
         }
       },
       "required": [
         "actions",
+        "issues",
+        "next_cursor",
+        "has_more",
         "total_count",
-        "inspected_session_count"
+        "inspected_candidate_count"
       ],
       "title": "PendingActionsResponse",
       "type": "object"
@@ -6324,13 +6415,60 @@
         "parameters": [
           {
             "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
             "name": "kind",
             "required": false,
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^(tool_approval|user_input|manual_recovery)$",
-                  "type": "string"
+                  "$ref": "#/components/schemas/PendingActionKind"
                 },
                 {
                   "type": "null"
@@ -6382,18 +6520,6 @@
               ],
               "title": "Session Id"
             }
-          },
-          {
-            "in": "query",
-            "name": "session_limit",
-            "required": false,
-            "schema": {
-              "default": 250,
-              "maximum": 1000,
-              "minimum": 1,
-              "title": "Session Limit",
-              "type": "integer"
-            }
           }
         ],
         "request_body": {
@@ -6404,6 +6530,13 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/PendingActionsResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           },

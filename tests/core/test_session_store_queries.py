@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 
 from cayu import (
     EventOrder,
@@ -27,7 +28,17 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
-from cayu.runtime.sessions import event_summary_from_records, session_outcome_from_records
+from cayu.runtime.pending_actions import (
+    pending_action_event_storage_values,
+    pending_action_lookup_key,
+)
+from cayu.runtime.sessions import (
+    MAX_PENDING_ACTION_RESULT_BYTES,
+    PendingActionKind,
+    PendingActionQuery,
+    event_summary_from_records,
+    session_outcome_from_records,
+)
 
 StoreFactory = Callable[[object], SessionStore]
 
@@ -45,7 +56,11 @@ def test_session_store_lifecycle_methods_are_not_abstract() -> None:
 
 
 def test_session_store_requires_run_fencing_implementation() -> None:
-    assert {"fence_stalled_run", "release_run_fence"} <= SessionStore.__abstractmethods__
+    assert {
+        "fence_stalled_run",
+        "query_pending_actions",
+        "release_run_fence",
+    } <= SessionStore.__abstractmethods__
 
 
 def test_event_query_requires_session_id_for_event_id() -> None:
@@ -65,6 +80,455 @@ def test_event_query_requires_ordered_sequence_bounds() -> None:
         match="after_sequence must be before before_sequence",
     ):
         EventQuery(session_id="session_1", after_sequence=2, before_sequence=2)
+
+
+def test_pending_action_event_projection_rejects_oversized_selected_payload() -> None:
+    event = Event(
+        type=EventType.SESSION_INTERRUPTED,
+        session_id="oversized_pending_action_projection",
+        payload={
+            "approval_id": "oversized_approval",
+            "error": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
+        },
+    )
+
+    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+
+    assert lookup_key == pending_action_lookup_key("oversized_approval")
+    assert projection is None
+    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
+
+    oversized_identifier = Event(
+        type=EventType.SESSION_INTERRUPTED,
+        session_id="oversized_pending_action_identifier",
+        payload={"approval_id": "x" * (MAX_PENDING_ACTION_RESULT_BYTES + 1)},
+    )
+
+    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+        oversized_identifier
+    )
+
+    assert lookup_key == pending_action_lookup_key("x" * (MAX_PENDING_ACTION_RESULT_BYTES + 1))
+    assert len(lookup_key) == 64
+    assert projection is None
+    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_pending_action_store_conformance(store_factory: StoreFactory, tmp_path) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        try:
+            await assert_pending_action_store_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run() -> None:
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="bounded_pending_action",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            approval_id = "bounded_approval"
+            for index in range(50):
+                await store.append_event(
+                    session.id,
+                    Event(
+                        id=f"approval_event_{index}",
+                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                        session_id=session.id,
+                        tool_name="deploy",
+                        payload={
+                            "approval": {
+                                "approval_id": approval_id,
+                                "tool_name": "deploy",
+                                "reason": f"request {index}",
+                                "arguments": {"blob": "x" * 4096},
+                            }
+                        },
+                    ),
+                )
+            await store.checkpoint(
+                session.id,
+                {
+                    "pending_tool_approval": {
+                        "approval_id": approval_id,
+                        "tool_call_id": "bounded_call",
+                        "tool_name": "deploy",
+                        "arguments": {"blob": "x" * 4096},
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": "bounded_call",
+                                "tool_name": "deploy",
+                                "arguments": {"blob": "x" * 4096},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
+                    }
+                },
+            )
+            await store.update_status(session.id, SessionStatus.INTERRUPTED)
+
+            result = await store.query_pending_actions(
+                PendingActionQuery(session_id=session.id, max_result_bytes=32 * 1024)
+            )
+            assert len(result.actions) == 1
+            assert result.actions[0].event.event.id == "approval_event_49"
+            assert result.actions[0].detail == "request 49"
+
+            oversized = await store.query_pending_actions(
+                PendingActionQuery(session_id=session.id, max_result_bytes=1024)
+            )
+            assert oversized.actions == []
+            assert len(oversized.issues) == 1
+            assert oversized.issues[0].session_id == session.id
+            assert oversized.issues[0].code == "source_too_large"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_in_memory_pending_action_index_is_pruned_after_resolution() -> None:
+    store = InMemorySessionStore()
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pruned_pending_action",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            session.id,
+            Event(
+                id="pruned_approval_event",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id=session.id,
+                payload={"approval": {"approval_id": "pruned_approval"}},
+            ),
+        )
+        assert session.id in store._pending_action_event_records
+
+        await store.checkpoint(session.id, {})
+
+        assert session.id not in store._pending_action_event_records
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_query_pending_actions_without_unrelated_history(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        for index in range(3):
+            session_id = f"pending_{index}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                    metadata={"large": "x" * 100_000} if index == 0 else {},
+                ),
+                identity=_identity(),
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=f"unrelated_{index}_{event_index}",
+                        type=EventType.TOOL_CALL_COMPLETED,
+                        session_id=session_id,
+                        payload={
+                            "tool_call_id": f"unrelated_call_{index}_{event_index}",
+                            "tool_round_id": f"unrelated_round_{index}_{event_index}",
+                            "result": "x" * 1000,
+                        },
+                    )
+                    for event_index in range(100)
+                ]
+                + [
+                    Event(
+                        id=f"approval_{index}",
+                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                        session_id=session_id,
+                        tool_name="deploy",
+                        payload={
+                            "approval": {
+                                "approval_id": f"approval_{index}",
+                                "tool_name": "deploy",
+                                "arguments": {"slot": index},
+                            }
+                        },
+                    )
+                ],
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    "unrelated": {"large": "x" * 100_000},
+                    "pending_tool_approval": {
+                        "approval_id": f"approval_{index}",
+                        "tool_call_id": f"call_{index}",
+                        "tool_name": "deploy",
+                        "arguments": {"slot": index},
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": f"call_{index}",
+                                "tool_name": "deploy",
+                                "arguments": {"slot": index},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
+                    },
+                },
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        first = await store.query_pending_actions(PendingActionQuery(limit=2))
+        assert len(first.actions) == 2
+        assert first.has_more is True
+        assert first.next_cursor is not None
+        assert all(action.kind == PendingActionKind.TOOL_APPROVAL for action in first.actions)
+        assert all(
+            action.event.event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+            for action in first.actions
+        )
+        assert all("metadata" not in action.session.model_fields_set for action in first.actions)
+        assert all(not hasattr(action.session, "metadata") for action in first.actions)
+
+        second = await store.query_pending_actions(
+            PendingActionQuery(limit=2, cursor=first.next_cursor)
+        )
+        assert len(second.actions) == 1
+        assert second.has_more is False
+        assert {action.id for action in first.actions}.isdisjoint(
+            action.id for action in second.actions
+        )
+
+        filtered = await store.query_pending_actions(
+            PendingActionQuery(kind=PendingActionKind.TOOL_APPROVAL, q="deploy")
+        )
+        assert len(filtered.actions) == 3
+        repeated = await store.query_pending_actions(
+            PendingActionQuery(session_id=filtered.actions[0].session.id)
+        )
+        assert repeated.actions[0].id == filtered.actions[0].id
+
+        await store.checkpoint("pending_1", {})
+        resolved = await store.query_pending_actions(PendingActionQuery(session_id="pending_1"))
+        assert resolved.actions == []
+
+        malformed = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="pending_malformed",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.checkpoint(
+            malformed.id,
+            {"pending_tool_round": {"tool_calls": "not-an-array"}},
+        )
+        await store.update_status(malformed.id, SessionStatus.INTERRUPTED)
+        malformed_result = await store.query_pending_actions(
+            PendingActionQuery(session_id=malformed.id)
+        )
+        assert malformed_result.actions == []
+
+        concurrent_listing, _ = await asyncio.gather(
+            store.query_pending_actions(PendingActionQuery(session_id="pending_2")),
+            store.checkpoint("pending_2", {}),
+        )
+        assert len(concurrent_listing.actions) in {0, 1}
+        after_concurrent_resolution = await store.query_pending_actions(
+            PendingActionQuery(session_id="pending_2")
+        )
+        assert after_concurrent_resolution.actions == []
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_bound_sparse_pending_action_candidate_pages(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        for index in range(10):
+            session_id = f"sparse_pending_{index:02d}"
+            approval_id = f"sparse_approval_{index:02d}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=approval_id,
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session_id,
+                    payload={
+                        "approval": {
+                            "approval_id": approval_id,
+                            "tool_name": "deploy",
+                            "arguments": {},
+                        }
+                    },
+                ),
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    "pending_tool_approval": {
+                        "approval_id": approval_id,
+                        "tool_call_id": f"sparse_call_{index:02d}",
+                        "tool_name": "deploy",
+                        "arguments": {},
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": f"sparse_call_{index:02d}",
+                                "tool_name": "deploy",
+                                "arguments": {},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
+                    }
+                },
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        first = await store.query_pending_actions(PendingActionQuery(limit=1, q="never-matches"))
+        assert first.actions == []
+        assert first.has_more is True
+        assert first.next_cursor is not None
+        assert first.inspected_candidate_count == 4
+
+        second = await store.query_pending_actions(
+            PendingActionQuery(limit=1, q="never-matches", cursor=first.next_cursor)
+        )
+        assert second.actions == []
+        assert second.inspected_candidate_count <= 4
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_page_pending_actions_beyond_legacy_candidate_cap(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        for index in range(251):
+            session_id = f"pending_many_{index:03d}"
+            approval_id = f"approval_many_{index:03d}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=approval_id,
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session_id,
+                    tool_name="deploy",
+                    payload={
+                        "approval": {
+                            "approval_id": approval_id,
+                            "tool_name": "deploy",
+                            "arguments": {},
+                        }
+                    },
+                ),
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    "pending_tool_approval": {
+                        "approval_id": approval_id,
+                        "tool_call_id": f"call_many_{index:03d}",
+                        "tool_name": "deploy",
+                        "arguments": {},
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": f"call_many_{index:03d}",
+                                "tool_name": "deploy",
+                                "arguments": {},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
+                    }
+                },
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        first = await store.query_pending_actions(PendingActionQuery(limit=200))
+        assert len(first.actions) == 200
+        assert first.has_more is True
+        assert first.next_cursor is not None
+        second = await store.query_pending_actions(
+            PendingActionQuery(limit=200, cursor=first.next_cursor)
+        )
+        assert len(second.actions) == 51
+        assert second.has_more is False
+        assert len({action.id for action in [*first.actions, *second.actions]}) == 251
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])

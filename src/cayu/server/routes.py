@@ -41,8 +41,6 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime import _approval_support as approval_support
-from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.approvals import (
     ResolutionActor,
     ResolutionActorSource,
@@ -67,6 +65,10 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     LabelSelectorOperator,
     LabelSelectorRequirement,
+    PendingActionKind,
+    PendingActionQuery,
+    PendingActionResultTooLarge,
+    PendingActionSession,
     ResumeRequest,
     RunRequest,
     Session,
@@ -76,6 +78,7 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     TranscriptQuery,
+    decode_session_cursor,
     event_summary_from_records,
     session_outcome_from_records,
 )
@@ -91,15 +94,12 @@ from cayu.runtime.usage import (
     causal_budget_usage_summary,
     usage_metrics_from_event_payload,
 )
-from cayu.runtime.user_input import (
-    UserInputRecoveryRequest,
-    UserInputResponse,
-    pending_user_input_from_checkpoint,
-)
+from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+    PENDING_ACTION_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
     AgentsResponse,
@@ -169,25 +169,6 @@ _REPLAY_ACTIVE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
     SessionStatus.INTERRUPTING,
 }
-_PENDING_ACTION_EVENT_TYPES = (
-    EventType.SESSION_RESUMED,
-    EventType.SESSION_COMPLETED,
-    EventType.SESSION_FAILED,
-    EventType.SESSION_INTERRUPTED,
-    EventType.SESSION_AWAITING_USER_INPUT,
-    EventType.TOOL_CALL_STARTED,
-    EventType.TOOL_CALL_COMPLETED,
-    EventType.TOOL_CALL_FAILED,
-    EventType.TOOL_CALL_BLOCKED,
-    EventType.TOOL_CALL_APPROVAL_DENIED,
-    EventType.TOOL_CALL_APPROVAL_REQUESTED,
-)
-_PENDING_ACTION_SESSION_STATUSES = frozenset(
-    {
-        SessionStatus.INTERRUPTED,
-        SessionStatus.FAILED,
-    }
-)
 # Replays check quickly after reconnect, then back off while a live session is
 # quiet so idle streams do not continuously hammer the durable stores.
 _REPLAY_POLL_INTERVAL_MIN_S = 0.05
@@ -615,7 +596,7 @@ def _serialize_session_outcome(outcome: SessionOutcome) -> dict[str, Any]:
     }
 
 
-def _serialize_session_base(session: Session) -> dict[str, Any]:
+def _serialize_session_base(session: Session | PendingActionSession) -> dict[str, Any]:
     # Shared list-view fields. The list endpoint omits the (potentially large,
     # unbounded) per-session metadata; callers fetch a single session to get it.
     return {
@@ -880,446 +861,6 @@ def _artifact_header_value(value: str, fallback: str) -> str:
         if stripped and all(0x20 <= ord(char) < 0x7F for char in stripped):
             return stripped[:_ARTIFACT_ID_HEADER_MAX_CHARS]
     return "unknown"
-
-
-def _object_payload(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, dict):
-        return value
-    return None
-
-
-def _optional_payload_string(payload: dict[str, Any] | None, key: str) -> str | None:
-    if payload is None:
-        return None
-    value = payload.get(key)
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
-
-
-def _payload_string_list(payload: dict[str, Any] | None, key: str) -> list[str]:
-    if payload is None:
-        return []
-    value = payload.get(key)
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, str)]
-
-
-def _pending_action_matches_query(action: dict[str, Any], q: str | None) -> bool:
-    if q is None:
-        return True
-    needle = q.lower()
-    session = _object_payload(action.get("session")) or {}
-    values = [
-        action.get("id"),
-        action.get("kind"),
-        action.get("title"),
-        action.get("detail"),
-        action.get("tool_name"),
-        action.get("approval_id"),
-        action.get("input_id"),
-        action.get("round_id"),
-        action.get("tool_call_id"),
-        action.get("question"),
-        session.get("id"),
-        session.get("agent_name"),
-        session.get("provider_name"),
-        session.get("model"),
-        session.get("environment_name"),
-    ]
-    return any(isinstance(value, str) and needle in value.lower() for value in values)
-
-
-def _pending_action_from_event_record(
-    *,
-    session: Session,
-    record: EventRecord,
-    action_kind: str,
-    title: str,
-    detail: str | None = None,
-    tool_name: str | None = None,
-    approval_id: str | None = None,
-    input_id: str | None = None,
-    round_id: str | None = None,
-    tool_call_id: str | None = None,
-    question: str | None = None,
-    options: list[str] | None = None,
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    discriminator = approval_id or input_id or tool_call_id or record.event.id
-    return {
-        "id": f"{session.id}:{record.sequence}:{action_kind}:{discriminator}",
-        "kind": action_kind,
-        "session": _serialize_session_base(session),
-        "event": _serialize_event_record(record),
-        "title": title,
-        "detail": detail,
-        "tool_name": tool_name,
-        "approval_id": approval_id,
-        "input_id": input_id,
-        "round_id": round_id,
-        "tool_call_id": tool_call_id,
-        "question": question,
-        "options": options or [],
-        "arguments": arguments,
-    }
-
-
-def _pending_approval_checkpoint_call(
-    checkpoint: dict[str, Any] | None,
-    *,
-    approval_id: str,
-    tool_call_id: str | None = None,
-) -> dict[str, Any] | None:
-    try:
-        pending = approval_support.pending_approval_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        return None
-    if pending is None or pending.approval_id != approval_id:
-        return None
-    if tool_call_id is None:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": copy_json_value(pending.arguments, "arguments"),
-        }
-    for call in pending.tool_calls:
-        if call.tool_call_id == tool_call_id:
-            return {
-                "tool_name": call.tool_name,
-                "arguments": copy_json_value(call.arguments, "arguments"),
-            }
-    if pending.tool_call_id == tool_call_id:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": copy_json_value(pending.arguments, "arguments"),
-        }
-    return None
-
-
-def _pending_user_input_checkpoint_call(
-    checkpoint: dict[str, Any] | None,
-    *,
-    input_id: str,
-    tool_call_id: str | None = None,
-) -> dict[str, Any] | None:
-    try:
-        pending = pending_user_input_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        return None
-    if pending is None or pending.input_id != input_id:
-        return None
-    if tool_call_id is None:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": copy_json_value(pending.arguments, "arguments"),
-        }
-    for call in pending.tool_calls:
-        if call.tool_call_id == tool_call_id:
-            return {
-                "tool_name": call.tool_name,
-                "arguments": copy_json_value(call.arguments, "arguments"),
-            }
-    if pending.tool_call_id == tool_call_id:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": copy_json_value(pending.arguments, "arguments"),
-        }
-    return None
-
-
-def _pending_tool_round_checkpoint_call(
-    checkpoint: dict[str, Any] | None,
-    *,
-    round_id: str,
-    tool_call_id: str,
-) -> dict[str, Any] | None:
-    try:
-        pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        return None
-    if pending is None or pending.round_id != round_id:
-        return None
-    for call in pending.tool_calls:
-        if call.tool_call_id == tool_call_id:
-            return {
-                "tool_name": call.tool_name,
-                "arguments": copy_json_value(call.arguments, "arguments"),
-            }
-    return None
-
-
-def _pending_tool_round_manual_recovery_action(
-    session: Session,
-    records_desc: list[EventRecord],
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    try:
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
-        return None
-    if pending_round is None:
-        return None
-
-    events = [record.event for record in reversed(records_desc)]
-    recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
-        events=events,
-        pending_round=pending_round,
-    )
-    unresolved_calls = [
-        call
-        for call in pending_round.tool_calls
-        if call.tool_call_id in started_ids and call.tool_call_id not in recorded_outcomes
-    ]
-    if not unresolved_calls:
-        return None
-
-    pending_call = unresolved_calls[0]
-    source_record = next(
-        (
-            record
-            for record in records_desc
-            if record.event.type in {EventType.SESSION_INTERRUPTED, EventType.SESSION_FAILED}
-            and (
-                record.event.payload.get("tool_round_id") in {None, pending_round.round_id}
-                or record.event.payload.get("manual_recovery_required") is True
-            )
-        ),
-        None,
-    )
-    if source_record is None:
-        source_record = next(
-            (
-                record
-                for record in records_desc
-                if record.event.type == EventType.TOOL_CALL_STARTED
-                and record.event.payload.get("tool_round_id") == pending_round.round_id
-                and record.event.payload.get("tool_call_id") == pending_call.tool_call_id
-            ),
-            None,
-        )
-    if source_record is None:
-        return None
-
-    detail = (
-        "Tool started but no terminal result was recorded before the session failed."
-        if session.status == SessionStatus.FAILED
-        else "Tool started but no terminal result was recorded."
-    )
-    return _pending_action_from_event_record(
-        session=session,
-        record=source_record,
-        action_kind="manual_recovery",
-        title="Manual recovery required",
-        detail=detail,
-        tool_name=pending_call.tool_name,
-        round_id=pending_round.round_id,
-        tool_call_id=pending_call.tool_call_id,
-        arguments=copy_json_value(pending_call.arguments, "arguments"),
-    )
-
-
-def _pending_action_from_records(
-    session: Session,
-    records_desc: list[EventRecord],
-    checkpoint: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    if session.status != SessionStatus.INTERRUPTED:
-        return None
-
-    for record in records_desc:
-        event = record.event
-        event_type = str(event.type)
-        if event_type in {"session.resumed", "session.completed", "session.failed"}:
-            return None
-
-        payload = event.payload
-        interruption_type = _optional_payload_string(payload, "interruption_type")
-        manual_recovery_required = payload.get("manual_recovery_required") is True
-
-        if event_type == "tool.call.approval_requested":
-            approval = _object_payload(payload.get("approval"))
-            approval_id = _optional_payload_string(approval, "approval_id")
-            if approval is not None and approval_id is not None:
-                checkpoint_call = _pending_approval_checkpoint_call(
-                    checkpoint,
-                    approval_id=approval_id,
-                )
-                if checkpoint_call is None:
-                    continue
-                tool_name = (
-                    _optional_payload_string(approval, "tool_name")
-                    or _optional_payload_string(checkpoint_call, "tool_name")
-                    or event.tool_name
-                )
-                return _pending_action_from_event_record(
-                    session=session,
-                    record=record,
-                    action_kind="tool_approval",
-                    title="Tool approval required",
-                    detail=_optional_payload_string(approval, "reason"),
-                    tool_name=tool_name,
-                    approval_id=approval_id,
-                    arguments=_object_payload(approval.get("arguments"))
-                    or _object_payload(checkpoint_call.get("arguments"))
-                    or {},
-                )
-
-        if event_type == "session.awaiting_user_input":
-            input_id = _optional_payload_string(payload, "input_id")
-            if input_id is not None:
-                tool_call_id = _optional_payload_string(payload, "tool_call_id")
-                checkpoint_call = _pending_user_input_checkpoint_call(
-                    checkpoint,
-                    input_id=input_id,
-                    tool_call_id=tool_call_id,
-                )
-                if checkpoint_call is None:
-                    continue
-                question = _optional_payload_string(payload, "question") or "Input required"
-                return _pending_action_from_event_record(
-                    session=session,
-                    record=record,
-                    action_kind="user_input",
-                    title="User input required",
-                    detail=question,
-                    tool_name=event.tool_name
-                    or _optional_payload_string(checkpoint_call, "tool_name"),
-                    input_id=input_id,
-                    tool_call_id=tool_call_id,
-                    question=question,
-                    options=_payload_string_list(payload, "options"),
-                    arguments=_object_payload(checkpoint_call.get("arguments")),
-                )
-
-        if event_type != "session.interrupted":
-            continue
-
-        if manual_recovery_required:
-            approval = _object_payload(payload.get("approval"))
-            user_input = _object_payload(payload.get("user_input"))
-            approval_id = _optional_payload_string(
-                payload, "approval_id"
-            ) or _optional_payload_string(approval, "approval_id")
-            input_id = _optional_payload_string(user_input, "input_id")
-            tool_name = (
-                _optional_payload_string(payload, "tool_name")
-                or _optional_payload_string(approval, "tool_name")
-                or event.tool_name
-            )
-            tool_call_id = _optional_payload_string(payload, "tool_call_id") or (
-                _optional_payload_string(user_input, "tool_call_id")
-            )
-            round_id = _optional_payload_string(payload, "tool_round_id")
-            if tool_call_id is None or (
-                approval_id is None and input_id is None and round_id is None
-            ):
-                continue
-            checkpoint_call: dict[str, Any] | None
-            if input_id is not None:
-                checkpoint_call = _pending_user_input_checkpoint_call(
-                    checkpoint,
-                    input_id=input_id,
-                    tool_call_id=tool_call_id,
-                )
-                if checkpoint_call is None:
-                    continue
-            elif approval_id is not None:
-                checkpoint_call = _pending_approval_checkpoint_call(
-                    checkpoint,
-                    approval_id=approval_id,
-                    tool_call_id=tool_call_id,
-                )
-                if checkpoint_call is None:
-                    continue
-            elif round_id is not None:
-                checkpoint_call = _pending_tool_round_checkpoint_call(
-                    checkpoint,
-                    round_id=round_id,
-                    tool_call_id=tool_call_id,
-                )
-                if checkpoint_call is None:
-                    continue
-            else:
-                continue
-            arguments = _object_payload(approval.get("arguments")) if approval else None
-            if arguments is None:
-                arguments = _object_payload(checkpoint_call.get("arguments"))
-            return _pending_action_from_event_record(
-                session=session,
-                record=record,
-                action_kind="manual_recovery",
-                title="Manual recovery required",
-                detail=_optional_payload_string(payload, "error")
-                or _optional_payload_string(payload, "message")
-                or "A previously started tool result must be reconciled before the session can continue.",
-                tool_name=tool_name or _optional_payload_string(checkpoint_call, "tool_name"),
-                approval_id=approval_id,
-                input_id=input_id,
-                round_id=round_id,
-                tool_call_id=tool_call_id,
-                question=_optional_payload_string(user_input, "question"),
-                options=_payload_string_list(user_input, "options"),
-                arguments=arguments,
-            )
-
-        if interruption_type == "tool_approval_required":
-            approval = _object_payload(payload.get("approval"))
-            approval_id = _optional_payload_string(approval, "approval_id")
-            if approval is not None and approval_id is not None:
-                checkpoint_call = _pending_approval_checkpoint_call(
-                    checkpoint,
-                    approval_id=approval_id,
-                )
-                if checkpoint_call is None:
-                    continue
-                tool_name = (
-                    _optional_payload_string(approval, "tool_name")
-                    or _optional_payload_string(checkpoint_call, "tool_name")
-                    or event.tool_name
-                )
-                return _pending_action_from_event_record(
-                    session=session,
-                    record=record,
-                    action_kind="tool_approval",
-                    title="Tool approval required",
-                    detail=_optional_payload_string(approval, "reason"),
-                    tool_name=tool_name,
-                    approval_id=approval_id,
-                    arguments=_object_payload(approval.get("arguments"))
-                    or _object_payload(checkpoint_call.get("arguments"))
-                    or {},
-                )
-
-        if interruption_type == "user_input_required":
-            user_input = _object_payload(payload.get("user_input"))
-            input_id = _optional_payload_string(user_input, "input_id")
-            if user_input is not None and input_id is not None:
-                tool_call_id = _optional_payload_string(user_input, "tool_call_id")
-                checkpoint_call = _pending_user_input_checkpoint_call(
-                    checkpoint,
-                    input_id=input_id,
-                    tool_call_id=tool_call_id,
-                )
-                if checkpoint_call is None:
-                    continue
-                question = _optional_payload_string(user_input, "question") or "Input required"
-                return _pending_action_from_event_record(
-                    session=session,
-                    record=record,
-                    action_kind="user_input",
-                    title="User input required",
-                    detail=question,
-                    tool_name=event.tool_name
-                    or _optional_payload_string(checkpoint_call, "tool_name"),
-                    input_id=input_id,
-                    tool_call_id=tool_call_id,
-                    question=question,
-                    options=_payload_string_list(user_input, "options"),
-                    arguments=_object_payload(checkpoint_call.get("arguments")),
-                )
-
-    return None
 
 
 def _usage_breakdown(
@@ -2517,75 +2058,61 @@ def create_router(
     @router.get(
         "/pending-actions",
         response_model=PendingActionsResponse,
+        responses=PENDING_ACTION_ENDPOINT_RESPONSES,
         dependencies=protected,
     )
     async def list_pending_actions(
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
-        session_limit: Annotated[int, Query(ge=1, le=1000)] = 250,
         session_id: Annotated[str | None, Query()] = None,
         q: Annotated[str | None, Query()] = None,
-        kind: Annotated[
-            str | None,
-            Query(pattern="^(tool_approval|user_input|manual_recovery)$"),
-        ] = None,
+        kind: PendingActionKind | None = None,
+        agent_name: Annotated[str | None, Query()] = None,
+        environment_name: Annotated[str | None, Query()] = None,
+        cursor: Annotated[str | None, Query()] = None,
     ):
         requested_session_id = _clean_optional_query_value(session_id, "session_id")
         search = _clean_optional_query_value(q, "q")
-        if requested_session_id is not None:
-            session = await session_store.load(requested_session_id)
-            sessions = (
-                [session]
-                if session is not None and session.status in _PENDING_ACTION_SESSION_STATUSES
-                else []
-            )
-        else:
-            sessions_by_id: dict[str, Session] = {}
-            for status in _PENDING_ACTION_SESSION_STATUSES:
-                page = await session_store.list_sessions(
-                    SessionQuery(
-                        status=status,
-                        limit=session_limit,
-                        order_by=SessionOrder.UPDATED_AT_DESC,
-                    )
-                )
-                for session in page.sessions:
-                    sessions_by_id[session.id] = session
-            sessions = sorted(
-                sessions_by_id.values(),
-                key=lambda session: session.updated_at,
-                reverse=True,
-            )[:session_limit]
-
-        actions: list[dict[str, Any]] = []
-        for session in sessions:
-            records = await session_store.query_events(
-                EventQuery(
-                    session_id=session.id,
-                    event_types=_PENDING_ACTION_EVENT_TYPES,
-                    order_by=EventOrder.SEQUENCE_DESC,
-                    limit=1000,
+        requested_agent_name = _clean_optional_query_value(agent_name, "agent_name")
+        requested_environment_name = _clean_optional_query_value(
+            environment_name, "environment_name"
+        )
+        requested_cursor = _clean_optional_query_value(cursor, "cursor")
+        if requested_cursor is not None:
+            try:
+                decode_session_cursor(requested_cursor)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            result = await session_store.query_pending_actions(
+                PendingActionQuery(
+                    session_id=requested_session_id,
+                    kind=kind,
+                    agent_name=requested_agent_name,
+                    environment_name=requested_environment_name,
+                    q=search,
+                    cursor=requested_cursor,
+                    limit=limit,
                 )
             )
-            checkpoint = await session_store.load_checkpoint(session.id)
-            action = _pending_action_from_records(session, records, checkpoint)
-            if action is None:
-                action = _pending_tool_round_manual_recovery_action(
-                    session,
-                    records,
-                    checkpoint,
-                )
-            if action is None:
-                continue
-            if kind is not None and action["kind"] != kind:
-                continue
-            if not _pending_action_matches_query(action, search):
-                continue
-            actions.append(action)
-
+        except PendingActionResultTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         return {
-            "actions": actions[:limit],
-            "total_count": len(actions),
-            "inspected_session_count": len(sessions),
+            "actions": [
+                {
+                    **action.model_dump(
+                        mode="json",
+                        exclude={"session", "event"},
+                    ),
+                    "session": _serialize_session_base(action.session),
+                    "event": _serialize_event_record(action.event),
+                }
+                for action in result.actions
+            ],
+            "issues": [issue.model_dump(mode="json") for issue in result.issues],
+            "next_cursor": result.next_cursor,
+            "has_more": result.has_more,
+            "total_count": result.total_count,
+            "inspected_candidate_count": result.inspected_candidate_count,
         }
 
     @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)

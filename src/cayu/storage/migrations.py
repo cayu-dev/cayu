@@ -121,6 +121,12 @@ REVISIONS: tuple[Revision, ...] = (
     # Index a session's durable global event sequence so newest-first history
     # pages and exclusive before_sequence cursors do not scan other sessions.
     Revision(revision=16, kind=RevisionKind.ADDITIVE, compatible_from=10),
+    # Persist bounded-query metadata beside checkpoint state and relevant event
+    # rows, then index checkpoints and normalized event identifiers. The deploy
+    # migration backfills explicit readiness markers in resumable committed
+    # batches. Every checkpoint and event writer must maintain that metadata
+    # atomically, so pre-17 binaries must not write against a revision-17 database.
+    Revision(revision=17, kind=RevisionKind.BREAKING, compatible_from=17),
 )
 
 #: The revision an empty database is initialized to.
