@@ -64,7 +64,9 @@ egress = [
   "cryptography>=42",
 ]
 microsandbox = [
-  "microsandbox>=0.5.5,<0.6",
+  # Prerelease policy: accept only the exact SDK/runtime baseline Cayu verifies.
+  # Upstream patch fixes require a Cayu bump and a fresh live-verification pass.
+  "microsandbox==0.6.6",
 ]
 otel = [
   "opentelemetry-api>=1.20",

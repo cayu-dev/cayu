@@ -346,7 +346,9 @@ src/cayu/
 
 `LocalRunner` is for trusted local development. `MicrosandboxRunner` is available
 behind the optional `cayu[microsandbox]` extra for local microVM-backed command
-execution. `E2BRunner` and `E2BWorkspace` are available behind the optional
+execution. The prerelease integration is pinned to Microsandbox 0.6.6; Cayu does
+not support older 0.5.x SDK/runtime combinations. `E2BRunner` and `E2BWorkspace`
+are available behind the optional
 `cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
 access. `LambdaMicroVMRunner` is available behind `cayu[aws]` for AWS-native,
 Firecracker-isolated, stateful execution and composes with `RunnerWorkspace`.

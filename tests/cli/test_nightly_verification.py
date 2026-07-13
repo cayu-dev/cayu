@@ -528,7 +528,7 @@ def test_virtual_egress_opt_in_flag_must_equal_one(
     assert result.reason == "CAYU_RUN_E2B_EGRESS_E2E must equal '1'"
 
 
-def test_microsandbox_virtual_egress_skips_when_runtime_is_unavailable(
+def test_microsandbox_virtual_egress_runs_when_module_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     check = next(
@@ -536,7 +536,6 @@ def test_microsandbox_virtual_egress_skips_when_runtime_is_unavailable(
     )
     called = False
     monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
-    monkeypatch.setattr(nightly, "_microsandbox_runtime_available", lambda: False)
 
     def runner(command, env):
         nonlocal called
@@ -549,9 +548,8 @@ def test_microsandbox_virtual_egress_skips_when_runtime_is_unavailable(
         runner=runner,
     )[0]
 
-    assert called is False
-    assert result.status == nightly.STATUS_SKIPPED
-    assert result.reason == "Microsandbox runtime is unavailable"
+    assert called is True
+    assert result.status == nightly.STATUS_VERIFIED
 
 
 def test_lambda_microvm_live_check_defers_credential_discovery_to_boto3(

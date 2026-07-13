@@ -67,7 +67,6 @@ class VerificationCheck:
     requires_provider_api_key: bool = False
     requires_docker: bool = False
     requires_postgres: bool = False
-    requires_microsandbox_runtime: bool = False
     requires_sigkill: bool = False
     requires_playwright_chromium: bool = False
     requires_structured_evidence: bool = False
@@ -358,7 +357,6 @@ CHECKS: tuple[VerificationCheck, ...] = (
         ),
         required_env_values={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
         required_modules=("microsandbox",),
-        requires_microsandbox_runtime=True,
     ),
     VerificationCheck(
         id="e2b-live-runner",
@@ -962,12 +960,6 @@ def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str])
         missing.append("Docker daemon is unavailable")
     if check.requires_postgres and not _postgres_available(environ):
         missing.append("Postgres is unavailable: set CAYU_TEST_POSTGRES_DSN or run Docker")
-    if (
-        check.requires_microsandbox_runtime
-        and "microsandbox" not in missing_modules
-        and not _microsandbox_runtime_available()
-    ):
-        missing.append("Microsandbox runtime is unavailable")
     if check.requires_sigkill and not _sigkill_available():
         missing.append("POSIX SIGKILL is unavailable")
     if (
@@ -983,15 +975,6 @@ def _module_missing(name: str) -> bool:
     import importlib.util
 
     return importlib.util.find_spec(name) is None
-
-
-def _microsandbox_runtime_available() -> bool:
-    try:
-        import microsandbox
-
-        return bool(microsandbox.is_installed())
-    except Exception:
-        return False
 
 
 def _playwright_chromium_available() -> bool:

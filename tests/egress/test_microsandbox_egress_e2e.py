@@ -17,11 +17,11 @@ from tests.egress_e2e_support import (
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 
 pytest.importorskip("cryptography")
-microsandbox = pytest.importorskip("microsandbox")
+pytest.importorskip("microsandbox")
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("CAYU_RUN_MICROSANDBOX_EGRESS_E2E") != "1" or not microsandbox.is_installed(),
-    reason="Set CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 with Microsandbox installed.",
+    os.environ.get("CAYU_RUN_MICROSANDBOX_EGRESS_E2E") != "1",
+    reason="Set CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 to start a real microVM.",
 )
 
 REAL_SECRET = "sk_test_51MicrosandboxRealSecretNeverInGuest"

@@ -116,7 +116,7 @@ class FakeSsh:
     def __init__(self, fs: FakeMicrosandboxFs) -> None:
         self.fs = fs
 
-    async def connect(
+    async def open_client(
         self, *, user: str = "root", term: str | None = None, sftp: bool = True
     ) -> FakeSshClient:
         self.fs.connect_calls += 1
@@ -412,8 +412,8 @@ def test_microsandbox_close_tears_down_cached_sftp_session() -> None:
 
 
 def test_is_path_not_found_error_recognizes_sftp_enoent_message() -> None:
-    # microsandbox 0.5.x SFTP real_path raises a generic error carrying the
-    # ENOENT text rather than a typed not-found error; it must still be treated
+    # Microsandbox SFTP real_path raises a generic error carrying the ENOENT
+    # text rather than a typed not-found error; it must still be treated
     # as "file not found" so list surfaces FileNotFoundError.
     assert _is_path_not_found_error(RuntimeError("SFTP error: No such file: /workspace/x"))
     assert _is_path_not_found_error(FileNotFoundError("/x"))

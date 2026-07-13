@@ -358,9 +358,11 @@ ANTHROPIC_API_KEY=... CAYU_PROVIDER=anthropic \
 ```
 
 Run the local Microsandbox virtual-egress contract only when starting a real
-microVM is intended:
+microVM is intended. Use an isolated `MSB_HOME` when verification must not
+migrate or otherwise mutate the default shared Microsandbox state:
 
 ```bash
+MSB_HOME=/tmp/cayu-microsandbox-verification \
 CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 \
 uv run python scripts/nightly_verification.py \
   --check microsandbox-live-virtual-egress \

@@ -1178,6 +1178,18 @@ Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 pip install "cayu[microsandbox]"
 ```
 
+Cayu's prerelease Microsandbox integration is pinned to version `0.6.6`. The
+runner uses that release's public Python API and bundled `msb` runtime directly;
+it does not carry compatibility paths for Microsandbox 0.5.x. The Python SDK
+uses its bundled runtime unless `MSB_PATH` overrides it.
+
+Microsandbox SDKs and separately invoked `msb` binaries use the same state
+directory and SQLite database by default. Running different versions against
+that shared state can apply migrations another version cannot read. Keep any
+separately installed CLI aligned with 0.6.6, or set `MSB_HOME` to a dedicated
+directory for isolated development/live verification. Cayu never deletes,
+downgrades, or rewrites that database as remediation.
+
 ```python
 from cayu import Environment, EnvironmentSpec, MicrosandboxRunner
 from microsandbox import Network
