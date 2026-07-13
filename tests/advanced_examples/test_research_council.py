@@ -40,9 +40,31 @@ def test_research_council_forks_strategies_and_repairs_seeded_weakness(
     observation = result.metrics["paired_token_observation"]
     assert observation["input_token_delta"] > 0
     assert observation["first_attempt_input_token_delta"] > 0
+    assert observation["baseline_output_tokens"] == 30
+    assert observation["candidate_output_tokens"] == 30
     assert observation["measurement"] == "total-provider-input-with-first-attempt-control"
     assert observation["baseline_model_steps"] == 3
     assert observation["candidate_model_steps"] == 3
+    cost = result.metrics["paired_cost_evidence"]
+    assert cost == {
+        "status": "priced",
+        "currency": "USD",
+        "candidate_cost": "0.00039",
+        "paired_baseline_cost": "0.00087",
+        "savings": "0.00048",
+        "savings_percent": "55.17",
+        "catalog_version": "deterministic-fixture-v1",
+        "catalog_generated_at": "2026-01-01T00:00:00Z",
+        "pricing_provider_name": "scripted",
+        "pricing_model": "scripted-model",
+        "pricing_match": "exact",
+        "pricing_tier_max_input_tokens": None,
+        "pricing_provenance": {
+            "source": "deterministic fixture; not provider pricing",
+            "url": "https://example.invalid/cayu/research-council-pricing-fixture",
+            "as_of": "2026-01-01",
+        },
+    }
     assert all(session.model_steps >= 1 for session in result.sessions)
     assert result.output_path is not None
     assert result.output_path.exists()

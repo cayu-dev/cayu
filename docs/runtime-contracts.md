@@ -18,7 +18,12 @@ The durable transcript is the source record of what happened in the session. A c
 
 `DefaultContextPolicy` returns the current runtime transcript as model-facing context while stripping old native file attachment references by default. Custom policies implement `build(ContextRequest) -> list[Message]`. The runtime passes copied session, agent, message, environment, step, metadata, and `context_usage` values into the policy, validates the returned messages, and then sends those messages to the provider. Invalid policy output fails the session before a provider request is made.
 
-`ContextRequest.context_usage` is derived from durable `model.completed` events already stored for the session. It exposes actual normalized usage from the previous completed model call, including input/output/total token counts and provider/model identity when available. It is intentionally post-call state: a policy can use it to compact, roll, truncate, or route the next request after prior actual usage crossed an application threshold. When the latest completed event includes a transcript cursor, `context_usage.input_pressure` adds a local transcript-pressure estimate: previous actual input tokens plus an estimate for transcript messages appended after that cursor. This is `method="observed_plus_estimated_delta"` and `confidence="estimated"`; it is useful for policy inspection but is not provider-authoritative token counting, billing data, or an exact final-provider-request context-window guarantee.
+`ContextRequest.context_usage` is derived from durable `model.completed` events already stored for the session. It exposes actual normalized usage from the previous completed model call, including input/output/total token counts plus provider, requested-model, and resolved-model identity when available. It is intentionally post-call state: a policy can use it to compact, roll, truncate, or route the next request after prior actual usage crossed an application threshold. When the latest completed event includes a transcript cursor, `context_usage.input_pressure` adds a local transcript-pressure estimate: previous actual input tokens plus an estimate for transcript messages appended after that cursor. This is `method="observed_plus_estimated_delta"` and `confidence="estimated"`; it is useful for policy inspection but is not provider-authoritative token counting, billing data, or an exact final-provider-request context-window guarantee.
+
+`ContextRequest.force_bounded_compaction` is set by the runtime while rebuilding
+context after a provider overflow. `CheckpointCompactionContextPolicy` carries
+that signal into `CompactionRequest.force_bounded_compaction`; cache-aware
+compactors must not reconstruct the request that already overflowed.
 
 `UsageTriggeredContextPolicy` packages actual and estimated pressure triggers. Below threshold it delegates to a base policy. Once the previous call's input/total tokens meet an exact threshold, or once `trigger_estimated_context_tokens` is met, later context builds delegate to a triggered policy such as a smaller `RecentTurnsContextPolicy` or `MessageWindowContextPolicy`. The estimated trigger is computed after the base policy has produced model-facing context, so it includes knowledge injected by that base policy, trimming performed by that base policy, known tool schemas, structured-output tool/schema wiring, provider-visible request options, tool-call arguments, tool-result text, thinking/provider-state parts, and conservative file-attachment size estimates from attachment references. Provider adapters expose `ModelContextPressureProfile` hints for local calibration of image attachment floors, document/PDF attachment floors, document byte density, and tool-schema payload density; runtime estimators consume those hints without branching on provider names. Tool-result structured data and artifact reference metadata are not counted as prompt text unless a provider-facing adapter actually sends them. The trigger compares `estimated_context_window_tokens`, which is `estimated_context_input_tokens + reserved_output_tokens`, so applications can reserve generation/reasoning headroom before the hard provider context limit. This estimate uses `method="observed_plus_estimated_delta_with_overhead"` when it can anchor on previous actual provider input usage and `method="local_full_request_estimate"` when it must estimate the whole model-facing request locally. Anchored estimates do not add stable request overhead twice: `model.completed` records component-only overhead counts, and the next estimate adds only the current overhead delta if tools, structured output, or provider-visible options changed. Both remain local and conservative; providers can still count differently. The trigger is sticky by default and stored under the `usage_triggered_context` session checkpoint key so a lower-usage compact/windowed call does not immediately return the session to the base policy. Set `sticky=False` only for explicit last-call-only routing.
 
@@ -33,6 +38,43 @@ Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolic
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
 `TranscriptDigestCompactor` is the deterministic fallback. It converts older messages into a clipped text digest and does not perform semantic summarization. `ModelCompactor` is the provider-backed implementation for production semantic summaries: it sends a text-only compaction request with no tools to a configured `ModelProvider`, rejects tool calls from the compaction model, and stores the returned text as the checkpoint summary. Model compaction bounds the serialized compaction input with `max_input_chars` by default so very large transcripts cannot create unbounded provider requests; the default prompt preserves compaction instructions and existing summary while clipping only the newly compacted transcript digest. Callers can tune or disable that bound explicitly. Callers can provide `system_prompt` to change compaction-model behavior and `prompt_builder` to replace the user prompt body.
+
+`PromptCacheCompactor` is the cache-aware first-checkpoint strategy. On its
+first compaction, `CayuApp` rebuilds the actual runtime `ModelRequest` from the
+durable transcript and the compactor appends one summary instruction. Model,
+messages, tools, request-level thinking, provider options, and resolved prompt
+attachment bytes therefore match the request prefix already seen by the
+provider. Attachment reconstruction starts from the last completed request's
+projection: older omitted files stay omitted while the formerly-current file
+remains live through the cached prefix.
+`PromptCacheCompactor(options=...)` recursively overrides copied options for
+the compaction call; structured-output enforcement is disabled because the
+result must be summary text. Cayu only claims the exact request after a durable
+`model.completed` cursor plus matching prior provider and requested-model
+identity proves a compatible provider call. Missing identity uses the configured
+fallback because no prior provider request is proven. A changed session model, a
+different compactor provider, a differing `model=` override, an overflow-recovery
+build, and every later checkpoint use bounded `ModelCompactor` input rather than
+claiming a cache hit or copying full transcript/attachment bytes across providers.
+When the compactor provider differs from the session provider, callers must set
+an explicit provider-compatible `model=`; Cayu fails before the compactor request
+instead of sending the session provider's model name across providers.
+Tool-based structured output also uses bounded `ModelCompactor` input because
+its synthetic system instruction requires the reserved output tool; native structured output can use
+the exact prefix with enforcement disabled. A tool call emitted despite the
+exact-path summary instruction is never executed or accepted as a summary. Cayu
+drains that provider completion to retain usage when available, records the
+rejected attempt, and makes one bounded request with no tools. If the provider
+does not complete the rejected attempt, its usage remains explicitly unavailable
+and therefore unpriced rather than disappearing from the attempt count.
+Later bounded calls merge `AgentSpec.provider_options` with the same compactor
+overrides, then remove attachment and structured-output enforcement fields.
+They retain the caller's `compaction_instruction` as their model system prompt
+so application retention and summary-quality requirements do not disappear
+after the first cache-aware checkpoint. Every
+provider-backed compaction follows the runtime retry/error stream contract and
+emits a `model.completed` payload with `purpose="context_compaction"`, so cache,
+token, cost, budget, and model-step accounting remain durable.
 
 ## Context Counting
 
@@ -52,7 +94,7 @@ This contract is the first slice for future context-budget enforcement. Later re
 
 Providers should raise `ModelContextOverflowError` when a request clearly exceeds a model context window or documented request-size boundary. Built-in adapters expose provider-specific subclasses (`OpenAIContextOverflowError`, `AnthropicContextOverflowError`, and `ChatCompletionsContextOverflowError`) that also inherit from their provider API error class. Runtime code can catch `ModelContextOverflowError`; provider-specific code can catch the corresponding API error. Built-in adapters classify only conservative signals: OpenAI `context_length_exceeded` responses or equivalent context-length messages, Anthropic `413 request_too_large` plus explicit prompt/context-too-long invalid requests, and OpenAI-compatible Chat Completions responses with explicit context-too-long messages such as Gemini's "input context is too long." Generic quota/rate errors such as Gemini `RESOURCE_EXHAUSTED` are not context overflow.
 
-Context overflow recovery is opt-in per agent through `register_agent(..., context_overflow_policy=...)`. When the initial provider request for a model step raises `ModelContextOverflowError`, Cayu emits `context.overflow.detected`, rebuilds model-facing messages with the configured overflow policy, emits `context.overflow.recovering`, and runs the rebuilt request through the normal model-step retry policy. Cayu performs at most one overflow rebuild for a model step; if the rebuilt request also raises `ModelContextOverflowError`, Cayu emits `context.overflow.failed` and fails the session. The durable transcript is not deleted or rewritten by overflow recovery. A checkpoint-backed overflow policy may write a compaction checkpoint; projection-only policies such as recent-turn or message-window policies only change the retry request sent to the provider.
+Context overflow recovery is opt-in per agent through `register_agent(..., context_overflow_policy=...)`. When the initial provider request for a model step raises `ModelContextOverflowError`, Cayu emits `context.overflow.detected`, rebuilds model-facing messages with the configured overflow policy, emits `context.overflow.recovering`, and runs the rebuilt request through the normal model-step retry policy. Cayu performs at most one overflow rebuild for a model step; if the rebuilt request also raises `ModelContextOverflowError`, Cayu emits `context.overflow.failed` and fails the session. The durable transcript is not deleted or rewritten by overflow recovery. A checkpoint-backed overflow policy may write a compaction checkpoint; projection-only policies such as recent-turn or message-window policies only change the retry request sent to the provider. Overflow recovery marks compaction as bounded, so `PromptCacheCompactor` cannot rebuild and enlarge the exact request that already exceeded the provider limit.
 
 ## Agent, Environment, Session
 
@@ -741,9 +783,11 @@ AgentSpec(
 
 The runtime copies these options into every provider request for that agent, then
 adds framework-owned request metadata such as `agent_metadata`, environment
-metadata, step number, and resolved file attachments. Provider-backed compaction
-uses `ModelCompactor(options=...)` because compaction is its own direct model
-request. OpenAI prompt caching is mostly automatic and can use
+metadata, step number, and resolved file attachments. Ordinary provider-backed
+compaction uses `ModelCompactor(options=...)` because it is a separate direct
+model request. `PromptCacheCompactor` is the explicit exception: its first call
+copies the runtime request options to extend the cached request, then applies
+its own `options` as recursive overrides. OpenAI prompt caching is mostly automatic and can use
 `prompt_cache_key` / `prompt_cache_retention` as provider options. Anthropic
 automatic prompt caching uses top-level `cache_control`; explicit block-level
 cache breakpoints are intentionally not modeled in Cayu's provider-neutral

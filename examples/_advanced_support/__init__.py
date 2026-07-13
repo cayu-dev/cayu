@@ -1,3 +1,4 @@
+from examples._advanced_support.costs import paired_cost_evidence
 from examples._advanced_support.results import ScenarioResult, SessionEvidence
 from examples._advanced_support.runtime import (
     GEMINI_BASE_URL,
@@ -25,6 +26,7 @@ __all__ = [
     "first_model_input_tokens",
     "fork_session",
     "live_provider",
+    "paired_cost_evidence",
     "session_evidence",
     "stable_output_spec",
     "structured_batch",

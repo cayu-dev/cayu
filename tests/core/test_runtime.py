@@ -20,7 +20,16 @@ from cayu.artifacts import (
     LocalArtifactStore,
     file_attachment,
 )
-from cayu.core import AgentSpec, Event, EventType, Message, TextPart, ToolCallPart, ToolResultPart
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    Message,
+    MessageRole,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+)
 from cayu.core.messages import FilePart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import (
@@ -108,6 +117,7 @@ from cayu.runtime import (
     ParameterConstrainedToolPolicy,
     PendingToolApproval,
     PricingCatalog,
+    PromptCacheCompactor,
     RecentTurnsContextPolicy,
     RequiredAllowlistRule,
     ResolutionActor,
@@ -239,6 +249,32 @@ class ContextOverflowProvider(ModelProvider):
             )
         for event in self.success_events:
             yield event
+
+
+class MessageCountOverflowProvider(ModelProvider):
+    """Overflows full history but accepts a bounded two-message rebuild."""
+
+    name = "message-count-overflow"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(request.messages) >= 3:
+            raise ModelContextOverflowError(
+                "context too large",
+                provider=self.name,
+                status_code=400,
+                error_code="context_length_exceeded",
+            )
+        yield ModelStreamEvent.text_delta("bounded response")
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+        )
 
 
 class EventFlattenedOverflowProvider(ModelProvider):
@@ -21010,6 +21046,7 @@ def test_context_policy_receives_previous_actual_context_usage_on_next_call():
     assert policy.requests[1].context_usage.last_output_tokens == 4
     assert policy.requests[1].context_usage.last_total_tokens == 104
     assert policy.requests[1].context_usage.last_provider_name == "fake"
+    assert policy.requests[1].context_usage.last_requested_model == "fake-model"
     assert policy.requests[1].context_usage.last_model == "fake-model"
     assert policy.requests[2].context_usage.last_input_tokens == 20
     assert len(provider.requests[0].messages) == 1
@@ -21067,6 +21104,7 @@ def test_context_usage_state_uses_latest_completed_event_query():
     assert context_usage.last_output_tokens == 1
     assert context_usage.last_total_tokens == 106
     assert context_usage.last_provider_name is None
+    assert context_usage.last_requested_model is None
     assert context_usage.last_model == "fake-model"
     assert len(tracking_store.event_queries) == 1
     assert tracking_store.event_queries[0].limit == 1
@@ -22495,6 +22533,50 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
     }
 
 
+def test_prompt_cache_compactor_bounds_context_overflow_recovery() -> None:
+    provider = MessageCountOverflowProvider()
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="prompt_cache_overflow_recovery",
+                messages=[Message.text("user", "old request")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    recovery_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="prompt_cache_overflow_recovery",
+                messages=[Message.text("user", "new request")],
+            ),
+        )
+    )
+
+    assert recovery_events[-1].type == EventType.SESSION_COMPLETED
+    assert [len(request.messages) for request in provider.requests] == [1, 3, 2, 2]
+    completed = [
+        event for event in recovery_events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+    ]
+    assert len(completed) == 1
+    assert completed[0].payload["metadata"]["compactor"] == "ModelCompactor"
+
+
 def test_context_overflow_without_policy_fails_without_retry():
     provider = ContextOverflowProvider()
     app = CayuApp()
@@ -22938,6 +23020,379 @@ def test_model_compactor_accepts_exported_default_prompt_builder():
     assert "Transcript to compact:\nuser: old request" in (
         provider.requests[0].messages[1].content[0].text
     )
+
+
+def test_prompt_cache_compactor_sends_context_messages_as_prefix():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("session cache "),
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"usage": {"output_tokens": 3}}),
+        ]
+    )
+    compactor = PromptCacheCompactor(provider=provider)
+
+    context = [
+        Message.text("system", "You are helpful."),
+        Message.text("user", "first request"),
+        Message.text("assistant", "first answer"),
+        Message.text("user", "second request"),
+        Message.text("assistant", "second answer"),
+    ]
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+                context_messages=context,
+                cache_prefix_request=ModelRequest(model="fake-model", messages=context),
+            )
+        )
+    )
+
+    assert result.summary == "session cache summary"
+    assert result.metadata["compactor"] == "PromptCacheCompactor"
+    assert result.metadata["provider"] == "fake"
+    assert result.metadata["model"] == "fake-model"
+    assert result.metadata["prompt_cache_compaction"] is True
+    assert result.metadata["context_message_count"] == 5
+    assert result.metadata["attachment_results_preserved"] == 0
+
+    assert len(provider.requests) == 1
+    request = provider.requests[0]
+    assert request.model == "fake-model"
+    assert request.tools == []
+    assert len(request.messages) == len(context) + 1
+    for i, original in enumerate(context):
+        assert request.messages[i].role == original.role
+        assert request.messages[i].content[0].text == original.content[0].text
+    instruction_message = request.messages[-1]
+    assert instruction_message.role == MessageRole.USER
+    assert "Summarize the conversation above" in instruction_message.content[0].text
+
+
+def test_prompt_cache_compactor_falls_back_when_context_messages_empty():
+    provider = FakeProvider([ModelStreamEvent.text_delta("should not be called")])
+    compactor = PromptCacheCompactor(provider=provider)
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert len(provider.requests) == 0
+    assert "old request" in result.summary
+
+
+def test_prompt_cache_compactor_uses_session_model_by_default():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = PromptCacheCompactor(provider=provider)
+    session = Session(
+        id="sess_model_test",
+        agent_name="assistant",
+        provider_name="fake",
+        model="claude-sonnet-4-20260601",
+    )
+
+    asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=session,
+                agent=AgentSpec(name="assistant", model="claude-sonnet-4-20260601"),
+                messages=[Message.text("user", "old")],
+                context_messages=[Message.text("user", "hello")],
+                cache_prefix_request=ModelRequest(
+                    model="claude-sonnet-4-20260601",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+    )
+
+    assert provider.requests[0].model == "claude-sonnet-4-20260601"
+
+
+def test_prompt_cache_compactor_uses_model_override():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = PromptCacheCompactor(provider=provider, model="override-model")
+
+    asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old")],
+                context_messages=[Message.text("user", "hello")],
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+    )
+
+    assert provider.requests[0].model == "override-model"
+
+
+def test_prompt_cache_compactor_marks_unpriced_exact_tool_call_attempt():
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_1", name="echo", arguments={"text": "bad"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("bounded summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {"input_tokens": 20, "output_tokens": 5},
+                    }
+                ),
+            ],
+        ]
+    )
+    compactor = PromptCacheCompactor(provider=provider)
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old")],
+                context_messages=[Message.text("user", "hello")],
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+    )
+
+    assert result.summary == "bounded summary"
+    assert len(provider.requests) == 2
+    assert result.model_completed_payloads[0]["compaction_outcome"] == ("rejected_tool_call")
+    assert result.model_completed_payloads[0]["usage_unavailable_reason"] == (
+        "compaction tool-call attempt ended without provider completion usage"
+    )
+    assert "usage_metrics" not in result.model_completed_payloads[0]
+    assert result.model_completed_payloads[1]["usage_metrics"]["input_tokens"] == 20
+
+
+def test_prompt_cache_compactor_fails_on_provider_error():
+    provider = FakeProvider([ModelStreamEvent.error("provider unavailable")])
+    compactor = PromptCacheCompactor(provider=provider)
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old")],
+                    context_messages=[Message.text("user", "hello")],
+                    cache_prefix_request=ModelRequest(
+                        model="fake-model",
+                        messages=[Message.text("user", "hello")],
+                    ),
+                )
+            )
+        )
+
+
+def test_prompt_cache_compactor_custom_instruction():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("custom done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = PromptCacheCompactor(
+        provider=provider,
+        compaction_instruction="Make it short.",
+    )
+
+    asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old")],
+                context_messages=[Message.text("user", "hello")],
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+    )
+
+    instruction = provider.requests[0].messages[-1].content[0].text
+    assert instruction == "Make it short."
+
+
+def test_prompt_cache_compactor_custom_fallback():
+    provider = FakeProvider([ModelStreamEvent.text_delta("should not be called")])
+    recording = RecordingCompactor()
+    compactor = PromptCacheCompactor(
+        provider=provider,
+        fallback_compactor=recording,
+    )
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert len(provider.requests) == 0
+    assert len(recording.requests) == 1
+    assert "old request" in result.summary
+
+
+def test_prompt_cache_compactor_merges_cached_request_options_with_overrides():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = PromptCacheCompactor(
+        provider=provider,
+        options={"anthropic": {"max_tokens": 512}, "custom": {"enabled": True}},
+    )
+
+    asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(
+                    name="assistant",
+                    model="fake-model",
+                    provider_options={
+                        "anthropic": {
+                            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                            "max_tokens": 2048,
+                        },
+                        "openai": {"prompt_cache_key": "agent-cache"},
+                    },
+                ),
+                messages=[Message.text("user", "old")],
+                context_messages=[Message.text("user", "hello")],
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "hello")],
+                    options={
+                        "anthropic": {
+                            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                            "max_tokens": 2048,
+                        },
+                        "openai": {"prompt_cache_key": "agent-cache"},
+                    },
+                ),
+            )
+        )
+    )
+
+    assert provider.requests[0].options == {
+        "anthropic": {
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "max_tokens": 512,
+        },
+        "openai": {"prompt_cache_key": "agent-cache"},
+        "custom": {"enabled": True},
+    }
+
+
+def test_prompt_cache_compactor_rejects_invalid_provider():
+    with pytest.raises(TypeError, match="provider must be a ModelProvider"):
+        PromptCacheCompactor(provider="not a provider")
+
+
+def test_prompt_cache_compactor_rejects_invalid_fallback():
+    provider = FakeProvider([])
+    with pytest.raises(TypeError, match="fallback_compactor must be a ContextCompactor"):
+        PromptCacheCompactor(provider=provider, fallback_compactor="not a compactor")
+
+
+def test_checkpoint_compaction_passes_context_messages_to_compactor():
+    store = InMemorySessionStore()
+    compactor = RecordingCompactor()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="You are careful.",
+        ),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_ctx_messages",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    assert any(event.type == EventType.SESSION_COMPLETED for event in first_events)
+
+    second_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_ctx_messages",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+    assert any(event.type == EventType.SESSION_COMPLETED for event in second_events)
+
+    assert len(compactor.requests) >= 1
+    last_request = compactor.requests[-1]
+    assert len(last_request.context_messages) > 0
+    context_roles = [m.role for m in last_request.context_messages]
+    assert MessageRole.SYSTEM in context_roles
+    assert MessageRole.USER in context_roles
 
 
 def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript():

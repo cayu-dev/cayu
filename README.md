@@ -262,6 +262,7 @@ durable evidence—not exact model prose.
 
 | Example | Runtime capability |
 | --- | --- |
+| [Prompt-cache compaction](examples/prompt_cache_compaction/) | Compare a cache-aware compaction with a bounded control from the same compactable source, then keep later compactions bounded to the checkpoint delta. |
 | [Cache-aware research council](examples/cache_aware_research_council/) | Compact shared context once, fork several strategies, evaluate them from another branch, and repair the selected result while measuring provider-reported input tokens. |
 | [Counterfactual approval](examples/counterfactual_approval/) | Compute authority-free approved and denied futures during a human wait, reject stale state, select one analysis as advisory continuation context, and recover exactly one protected mutation after `CayuApp` reconstruction. |
 | [Repository maintainer tournament](examples/repo_maintainer_tournament/) | Replay competing repairs in isolated worktrees, reject test weakening, select one winner, and optionally push exactly one verified PR to a real repository. |
@@ -271,12 +272,19 @@ Start with the [advanced example developer index](examples/ADVANCED_RUNTIME_EXAM
 for commands, evidence contracts, and verification lanes. See
 [Advanced runtime strategies](docs/advanced-runtime-examples.md) for the product
 story, measured observations, and explicit proof boundaries.
+For the optimization portfolio, paired-evidence standard, and enterprise budget
+controls, see [Cost optimization and governance](docs/cost-optimization.md).
+The current [live Anthropic Haiku benchmark](docs/anthropic-haiku-cost-savings-results.md)
+measured 66.17% aggregate savings for prompt-cache compaction and 48.56% across
+paired compacted research branch calls, with six of six final trials verified.
 
 ## Further reading
 
 User guides:
 
 - [Advanced runtime strategies](docs/advanced-runtime-examples.md) — programmable forks, speculative approval, evaluator branches, real-repository promotion, and taint-aware isolation with measured evidence.
+- [Cost optimization and governance](docs/cost-optimization.md) — workload-specific savings strategies, paired evidence, pricing provenance, causal budgets, reservations, and failure cases.
+- [Live Anthropic Haiku cost-savings results](docs/anthropic-haiku-cost-savings-results.md) — six paired live trials, exact denominators, quality gates, and current pricing provenance.
 - [PR-reviewer recipe](docs/recipes/pr-reviewer.md) — the featured end-to-end example.
 - [Business approvals recipe](docs/recipes/business-approvals.md) — multi-tier approve/condition/decline on top of the binary approval primitive.
 - [Triggering runs](docs/triggering-runs.md) — which start verb (run / dispatch / task worker / subagent / event watcher) fits your trigger.
@@ -1340,8 +1348,11 @@ they require block-level provider metadata and should be added deliberately if
 the transcript contract grows that capability.
 
 Provider options configured on `AgentSpec` are copied into each normal model
-request for that agent. Provider-backed compaction can use the existing
-`ModelCompactor(options=...)` argument for compaction-model cache settings.
+request for that agent. Ordinary provider-backed compaction uses
+`ModelCompactor(options=...)` for its separate request. The cache-aware
+`PromptCacheCompactor` instead copies the first runtime request options and
+applies its own `options` recursively, because that call must extend the cached
+request shape.
 
 Estimate session cost from the same durable usage events by passing your own
 pricing table. Cayu does not ship hardcoded provider prices because those change
@@ -2522,3 +2533,30 @@ Advanced users can replace the compaction prompt body with
 summary and transcript cursor in the session checkpoint, then injects the
 summary as model-facing user context. It does not append the summary to the
 durable transcript.
+
+For providers with prompt caching, `PromptCacheCompactor` preserves the first
+compaction's exact runtime request prefix—including tools, request-level
+thinking options, and resolved prompt attachments—then switches subsequent
+checkpoints to bounded `previous summary + new delta` compaction:
+
+```python
+from cayu import PromptCacheCompactor
+
+context_policy = CheckpointCompactionContextPolicy(
+    compactor=PromptCacheCompactor(
+        provider=summary_provider,
+        options={"anthropic": {"max_tokens": 1000}},
+    ),
+    max_user_turns=10,
+    compact_after_messages=40,
+)
+```
+
+Compactor options override copied agent/provider options recursively. Both the
+cache-aware first call and later bounded calls follow the same structured
+provider-error/retry contract and are included in durable session usage. Exact
+reuse additionally requires durable proof that the previous request used the
+same provider and requested model. A provider/model identity change or
+tool-based structured-output request takes the bounded path, preventing an
+incompatible provider request from receiving the copied full prefix, tools, or
+resolved attachment bytes.

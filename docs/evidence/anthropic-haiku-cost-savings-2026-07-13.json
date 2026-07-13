@@ -1,0 +1,296 @@
+{
+  "schema": "cayu.cost-benchmark-evidence.v1",
+  "date": "2026-07-13",
+  "producing_commit": "947ae38c4eabfcccb66ab2a778a9ffb875c37f3b",
+  "provider_name": "anthropic",
+  "model": "claude-haiku-4-5-20251001",
+  "pricing_catalog": "anthropic-haiku-4-5-pricing-2026-07-13.json",
+  "prompt_cache_compaction": {
+    "aggregate": {
+      "baseline_cost": "0.025633",
+      "candidate_cost": "0.00867080",
+      "savings": "0.01696220",
+      "savings_percent": "66.17"
+    },
+    "assertions": [
+      "bounded_baseline_stripped_exact_request_shape",
+      "bounded_baseline_used_same_compactable_source",
+      "compaction_modes_recorded",
+      "compaction_spend_persisted",
+      "comparison_spend_reported_separately",
+      "first_compaction_extended_exact_request_prefix",
+      "first_compaction_reused_provider_cache",
+      "paired_cache_counters_reported_separately",
+      "paired_cost_claim_is_provenance_gated",
+      "paired_model_configuration_matches",
+      "paired_summaries_pass_quality_floor",
+      "second_compaction_used_bounded_delta",
+      "session_completed",
+      "tool_session_exercised"
+    ],
+    "trials": [
+      {
+        "run_id": "6a88545c7e2a",
+        "status": "verified",
+        "candidate_session_model_steps": 7,
+        "comparison_model_steps": 1,
+        "candidate_session_provider_attempts": 7,
+        "comparison_provider_attempts": 1,
+        "attempts_beyond_completed_steps": 0,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "candidate": {
+          "input_tokens": 7737,
+          "output_tokens": 365,
+          "reasoning_output_tokens": 176,
+          "cache_read_tokens": 7590,
+          "cache_write_tokens": 69,
+          "uncached_input_tokens": 78,
+          "cost": "0.00274825"
+        },
+        "baseline": {
+          "input_tokens": 7179,
+          "output_tokens": 272,
+          "reasoning_output_tokens": 78,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "uncached_input_tokens": 7179,
+          "cost": "0.008539"
+        },
+        "candidate_session": {
+          "input_tokens": 25838,
+          "output_tokens": 1049,
+          "model_steps": 7,
+          "provider_attempts": 7,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact session cost"
+        },
+        "benchmark_harness": {
+          "input_tokens": 33017,
+          "output_tokens": 1321,
+          "model_steps": 8,
+          "provider_attempts": 8,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact harness cost"
+        },
+        "savings_percent": "67.82"
+      },
+      {
+        "run_id": "a2f251ee117a",
+        "status": "verified",
+        "candidate_session_model_steps": 7,
+        "comparison_model_steps": 1,
+        "candidate_session_provider_attempts": 7,
+        "comparison_provider_attempts": 1,
+        "attempts_beyond_completed_steps": 0,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "candidate": {
+          "input_tokens": 7732,
+          "output_tokens": 431,
+          "reasoning_output_tokens": 257,
+          "cache_read_tokens": 7591,
+          "cache_write_tokens": 63,
+          "uncached_input_tokens": 78,
+          "cost": "0.00307085"
+        },
+        "baseline": {
+          "input_tokens": 7158,
+          "output_tokens": 257,
+          "reasoning_output_tokens": 80,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "uncached_input_tokens": 7158,
+          "cost": "0.008443"
+        },
+        "candidate_session": {
+          "input_tokens": 25920,
+          "output_tokens": 1215,
+          "model_steps": 7,
+          "provider_attempts": 7,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact session cost"
+        },
+        "benchmark_harness": {
+          "input_tokens": 33078,
+          "output_tokens": 1472,
+          "model_steps": 8,
+          "provider_attempts": 8,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact harness cost"
+        },
+        "savings_percent": "63.63"
+      },
+      {
+        "run_id": "1162b9f8c23c",
+        "status": "verified",
+        "candidate_session_model_steps": 7,
+        "comparison_model_steps": 1,
+        "candidate_session_provider_attempts": 7,
+        "comparison_provider_attempts": 1,
+        "attempts_beyond_completed_steps": 0,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "candidate": {
+          "input_tokens": 7733,
+          "output_tokens": 386,
+          "reasoning_output_tokens": 210,
+          "cache_read_tokens": 7587,
+          "cache_write_tokens": 68,
+          "uncached_input_tokens": 78,
+          "cost": "0.00285170"
+        },
+        "baseline": {
+          "input_tokens": 7171,
+          "output_tokens": 296,
+          "reasoning_output_tokens": 98,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "uncached_input_tokens": 7171,
+          "cost": "0.008651"
+        },
+        "candidate_session": {
+          "input_tokens": 25788,
+          "output_tokens": 1180,
+          "model_steps": 7,
+          "provider_attempts": 7,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact session cost"
+        },
+        "benchmark_harness": {
+          "input_tokens": 32959,
+          "output_tokens": 1476,
+          "model_steps": 8,
+          "provider_attempts": 8,
+          "cost_status": "not_reconstructable_from_retained_evidence",
+          "cost": null,
+          "cost_reason": "the retained aggregate omitted per-attempt cache categories needed to reconstruct exact harness cost"
+        },
+        "savings_percent": "67.04"
+      }
+    ]
+  },
+  "research_branch_comparison": {
+    "aggregate": {
+      "baseline_cost": "0.125362",
+      "candidate_cost": "0.064486",
+      "savings": "0.060876",
+      "savings_percent": "48.56"
+    },
+    "assertions": [
+      "causal_budget_shared",
+      "compaction_checkpoint_persisted",
+      "paired_baseline_recorded",
+      "compacted_candidate_first_attempt_context_is_smaller",
+      "compacted_candidate_used_fewer_input_tokens",
+      "evaluator_found_material_weakness",
+      "repair_addressed_critique",
+      "fork_lineage_persisted",
+      "strategies_are_distinct"
+    ],
+    "trials": [
+      {
+        "run_id": "83f294fdf0374e00bbce3041c7b3bd1d",
+        "status": "verified",
+        "workflow_model_requests": 11,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "baseline": {
+          "input_tokens": 25143,
+          "output_tokens": 3690,
+          "model_steps": 3,
+          "cost": "0.043593"
+        },
+        "candidate": {
+          "input_tokens": 13830,
+          "output_tokens": 1409,
+          "model_steps": 3,
+          "cost": "0.020875"
+        },
+        "candidate_workflow": {
+          "input_tokens": 54535,
+          "output_tokens": 4985,
+          "model_steps": 8,
+          "cost": "0.079460"
+        },
+        "benchmark_harness": {
+          "input_tokens": 79678,
+          "output_tokens": 8675,
+          "model_steps": 11,
+          "cost": "0.123053"
+        },
+        "savings_percent": "52.11"
+      },
+      {
+        "run_id": "dd7dbdf242ca418d9a12907517eb0e58",
+        "status": "verified",
+        "workflow_model_requests": 11,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "baseline": {
+          "input_tokens": 26028,
+          "output_tokens": 1568,
+          "model_steps": 3,
+          "cost": "0.033868"
+        },
+        "candidate": {
+          "input_tokens": 13839,
+          "output_tokens": 1481,
+          "model_steps": 3,
+          "cost": "0.021244"
+        },
+        "candidate_workflow": {
+          "input_tokens": 56915,
+          "output_tokens": 6604,
+          "model_steps": 8,
+          "cost": "0.089935"
+        },
+        "benchmark_harness": {
+          "input_tokens": 82943,
+          "output_tokens": 8172,
+          "model_steps": 11,
+          "cost": "0.123803"
+        },
+        "savings_percent": "37.27"
+      },
+      {
+        "run_id": "0427f71064b54943a46080e070ad589c",
+        "status": "verified",
+        "workflow_model_requests": 11,
+        "paired_unpriced_or_missing_usage_attempts": 0,
+        "baseline": {
+          "input_tokens": 26991,
+          "output_tokens": 4182,
+          "model_steps": 3,
+          "cost": "0.047901"
+        },
+        "candidate": {
+          "input_tokens": 14022,
+          "output_tokens": 1669,
+          "model_steps": 3,
+          "cost": "0.022367"
+        },
+        "candidate_workflow": {
+          "input_tokens": 58923,
+          "output_tokens": 7287,
+          "model_steps": 8,
+          "cost": "0.095358"
+        },
+        "benchmark_harness": {
+          "input_tokens": 85914,
+          "output_tokens": 11469,
+          "model_steps": 11,
+          "cost": "0.143259"
+        },
+        "savings_percent": "53.31"
+      }
+    ]
+  },
+  "pricing_resolution": {
+    "provider_name": "anthropic",
+    "model": "claude-haiku-4-5",
+    "match": "prefix",
+    "tier_max_input_tokens": 200000,
+    "currency": "USD"
+  }
+}

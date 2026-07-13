@@ -529,6 +529,31 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="advanced-prompt-cache-compaction",
+        capability=(
+            "paired cache-aware/bounded compaction, two-cycle behavior, and separated usage"
+        ),
+        lane="advanced-runtime",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "examples.prompt_cache_compaction.app",
+            "--mode",
+            "live",
+            "--provider",
+            "anthropic",
+            "--trials",
+            "1",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("ANTHROPIC_API_KEY",),
+        required_env=("ANTHROPIC_API_KEY",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="advanced-research-council",
         capability="checkpoint forks, evaluator repair, causal budget, and cache-window policy",
         lane="advanced-runtime",

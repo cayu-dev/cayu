@@ -23,6 +23,17 @@ def _load_nightly_verification() -> ModuleType:
 nightly = _load_nightly_verification()
 
 
+def test_prompt_cache_compaction_live_check_is_anthropic_credential_gated() -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "advanced-prompt-cache-compaction"
+    )
+
+    assert check.required_env == ("ANTHROPIC_API_KEY",)
+    assert check.requires_provider_api_key is True
+    assert "examples.prompt_cache_compaction.app" in check.command
+    assert check.command[-4:] == ("--provider", "anthropic", "--trials", "1")
+
+
 def test_missing_required_env_skips_without_running_command() -> None:
     called = False
     check = nightly.VerificationCheck(

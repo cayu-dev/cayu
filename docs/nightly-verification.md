@@ -29,7 +29,7 @@ The report is the product. A pass count without a capability map is not enough.
 5. **Costs and prerequisites are separate.** "No LLM spend" does not mean "no
    external service." E2B needs `E2B_API_KEY` even when no model is called.
 
-The four executable advanced scenarios and their assertion contract are indexed
+The five executable advanced scenarios and their assertion contract are indexed
 in [`examples/ADVANCED_RUNTIME_EXAMPLES.md`](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
 Their product story and dated live observations are documented in
 [`docs/advanced-runtime-examples.md`](advanced-runtime-examples.md).
@@ -107,7 +107,7 @@ or in CI.
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
-| Advanced runtime examples | `GEMINI_API_KEY` for the primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
+| Advanced runtime examples | `ANTHROPIC_API_KEY` for prompt-cache compaction; `GEMINI_API_KEY` for the other primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-prompt-cache-compaction`, `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
 
 The CI workflow also runs dashboard lint/typecheck, generated-client drift,
@@ -171,7 +171,7 @@ high level:
 | Amazon Bedrock text, tool structured output, usage, and token counting | verified when AWS and a Bedrock model are available | `bedrock-provider-live` |
 | OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
 | OpenAI embedding and semantic-retrieval contract | verified when `OPENAI_API_KEY` is present | `knowledge-embedding-live` |
-| cache-aware branching, counterfactual approval, repository tournament, and tainted incident response | verified when the selected provider key is present and every scenario assertion passes | `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, and provider-suffixed portability checks |
+| paired prompt-cache/bounded compaction, cache-aware branching, counterfactual approval, repository tournament, and tainted incident response | verified when the selected provider key is present and every scenario assertion passes | `advanced-prompt-cache-compaction`, `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, and provider-suffixed portability checks |
 | real `SIGKILL` recovery for tool rounds, approvals, background-child linkage, and SQLite task claims | verified on POSIX | `sigkill-recovery` |
 | real `SIGKILL` recovery for Postgres task claim/attachment | verified when Postgres is available | `postgres-required` |
 | real provider adapter transport abort with durable terminal state | verified on loopback TCP and SQLite | `provider-stream-abort` |

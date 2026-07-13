@@ -34,5 +34,10 @@ diversity, evaluator criticism, repair, and the cache-window decision. They do
 not assert exact prose.
 Input-token savings use total provider-reported usage, including structured-output
 retries. First-attempt context size and model-step counts are recorded separately
-to show whether compaction reduced the prepared request. This example does not
-claim dollar savings without provider-specific pricing evidence.
+to show whether compaction reduced the prepared request. Set
+`CAYU_RESEARCH_COUNCIL_MODEL_CATALOG` to a provenance-bearing `ModelCatalog` JSON
+file to add a fail-closed dollar comparison across the paired branch sessions.
+Without a matching catalog the result remains explicitly unpriced.
+
+See [the live Anthropic Haiku benchmark](../../docs/anthropic-haiku-cost-savings-results.md)
+for a three-trial result, exact denominators, and pricing provenance.

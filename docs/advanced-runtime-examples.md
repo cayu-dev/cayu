@@ -13,7 +13,24 @@ reconstruction around the same store.
 For commands, source locations, and contributor guidance, start with the
 [advanced example developer index](../examples/ADVANCED_RUNTIME_EXAMPLES.md).
 
-## Four executable product stories
+## Five executable product stories
+
+### Refresh a provider cache, then compact only the checkpoint delta
+
+The [prompt-cache compaction example](../examples/prompt_cache_compaction/)
+uses a real tool round and two compaction cycles. The first compaction must
+extend the exact provider request prefix, including tools and thinking options,
+and persist its cache-read usage. A bounded `ModelCompactor` control receives
+the same captured compactable source after the candidate session completes;
+its comparison-only attempt is reported separately from durable session spend.
+Both summaries must preserve a mandatory retention token, and the candidate
+must recover it after the second compaction, so lower counters alone cannot
+pass the scenario.
+The second session compaction must summarize only the previous checkpoint plus
+newly compactable messages. Deterministic coverage is PR-safe and uses clearly
+labeled fixture prices; the credential-gated Anthropic path additionally
+requires a nonzero provider cache-read counter. Live dollar evidence is emitted
+only with a caller-supplied, provenance-bearing model catalog.
 
 ### Share context once, then explore several futures
 
@@ -125,6 +142,8 @@ The research example separates two different questions:
 That distinction is why Cayu records provider-reported total usage instead of
 marketing a context-size estimate as realized savings. Dollar savings require a
 pricing catalog and must include source, evaluator, repair, and retry overhead.
+The [cost optimization and governance guide](cost-optimization.md) applies the
+same evidence standard across Cayu's optimization and budget-control options.
 
 Before publishing a general benchmark, run several trials per provider and
 report the median and range. The registered Gemini checks use five trials when

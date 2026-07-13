@@ -12,6 +12,7 @@ from examples._advanced_support import (
     count_model_completions,
     first_model_input_tokens,
     fork_session,
+    paired_cost_evidence,
     session_evidence,
     stable_output_spec,
     validated_output,
@@ -23,27 +24,40 @@ from cayu import (
     CheckpointCompactionContextPolicy,
     EventType,
     Message,
+    ModelCatalog,
     ResumeRequest,
     RunRequest,
     SessionStore,
     TranscriptDigestCompactor,
+    estimate_session_cost,
 )
 from cayu.providers import ModelProvider
 
+_STRUCTURED_OUTPUT_TEXT_MAX_CHARS = 1024
+
+# The live provider needs room for ordinary report prose without avoidable
+# structured-output repair retries. Prompts and array bounds still keep the
+# example concise; one shared cap prevents the schemas from drifting apart.
 REPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "strategy": {"type": "string", "maxLength": 100},
-        "claim": {"type": "string", "maxLength": 300},
+        "strategy": {"type": "string", "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS},
+        "claim": {"type": "string", "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS},
         "evidence": {
             "type": "array",
-            "items": {"type": "string", "maxLength": 240},
+            "items": {
+                "type": "string",
+                "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+            },
             "minItems": 2,
             "maxItems": 3,
         },
         "uncertainties": {
             "type": "array",
-            "items": {"type": "string", "maxLength": 200},
+            "items": {
+                "type": "string",
+                "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+            },
             "minItems": 1,
             "maxItems": 2,
         },
@@ -64,9 +78,12 @@ SOURCE_CONTEXT = (
 EVALUATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "winner": {"type": "string", "maxLength": 100},
-        "weakness": {"type": "string", "maxLength": 300},
-        "repair_instruction": {"type": "string", "maxLength": 240},
+        "winner": {"type": "string", "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS},
+        "weakness": {"type": "string", "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS},
+        "repair_instruction": {
+            "type": "string",
+            "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+        },
     },
     "required": ["winner", "weakness", "repair_instruction"],
     "additionalProperties": False,
@@ -74,14 +91,23 @@ EVALUATION_SCHEMA: dict[str, Any] = {
 REPAIR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "fixed_weakness": {"type": "string", "maxLength": 300},
+        "fixed_weakness": {
+            "type": "string",
+            "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+        },
         "added_evidence": {
             "type": "array",
-            "items": {"type": "string", "maxLength": 240},
+            "items": {
+                "type": "string",
+                "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+            },
             "minItems": 1,
             "maxItems": 2,
         },
-        "remaining_uncertainty": {"type": "string", "maxLength": 200},
+        "remaining_uncertainty": {
+            "type": "string",
+            "maxLength": _STRUCTURED_OUTPUT_TEXT_MAX_CHARS,
+        },
     },
     "required": ["fixed_weakness", "added_evidence", "remaining_uncertainty"],
     "additionalProperties": False,
@@ -105,6 +131,7 @@ async def run_scenario(
     provider: ModelProvider,
     model: str,
     mode: str,
+    model_catalog: ModelCatalog | None = None,
 ) -> ScenarioResult:
     prompts = {
         "source": SOURCE_CONTEXT,
@@ -290,10 +317,22 @@ async def run_scenario(
     candidate_total_input_tokens = sum(
         sessions_by_role[role].usage["input_tokens"] for role in research_roles
     )
+    baseline_total_output_tokens = sum(
+        sessions_by_role[f"baseline-{role}"].usage["output_tokens"] for role in research_roles
+    )
+    candidate_total_output_tokens = sum(
+        sessions_by_role[role].usage["output_tokens"] for role in research_roles
+    )
     baseline_model_steps = sum(
         sessions_by_role[f"baseline-{role}"].model_steps for role in research_roles
     )
     candidate_model_steps = sum(sessions_by_role[role].model_steps for role in research_roles)
+    paired_branch_cost = await _paired_cost_evidence(
+        app,
+        baseline_session_ids=[baseline_ids[role] for role in research_roles],
+        candidate_session_ids=[branch_ids[role] for role in research_roles],
+        model_catalog=model_catalog,
+    )
     assertions = {
         "causal_budget_shared": {item.causal_budget_id for item in sessions} == {causal_budget_id},
         "compaction_checkpoint_persisted": (
@@ -351,6 +390,8 @@ async def run_scenario(
                 "baseline_input_tokens": baseline_total_input_tokens,
                 "candidate_input_tokens": candidate_total_input_tokens,
                 "input_token_delta": baseline_total_input_tokens - candidate_total_input_tokens,
+                "baseline_output_tokens": baseline_total_output_tokens,
+                "candidate_output_tokens": candidate_total_output_tokens,
                 "measurement": "total-provider-input-with-first-attempt-control",
                 "baseline_first_attempt_input_tokens": baseline_first_attempt_input_tokens,
                 "candidate_first_attempt_input_tokens": candidate_first_attempt_input_tokens,
@@ -361,6 +402,7 @@ async def run_scenario(
                 "provider_reported": True,
                 "same_source_and_branch_prompts": True,
             },
+            "paired_cost_evidence": paired_branch_cost,
         },
         outputs={
             "baseline_reports": baseline_reports,
@@ -372,6 +414,41 @@ async def run_scenario(
     result.write(root)
     result.require_verified()
     return result
+
+
+async def _paired_cost_evidence(
+    app: CayuApp,
+    *,
+    baseline_session_ids: list[str],
+    candidate_session_ids: list[str],
+    model_catalog: ModelCatalog | None,
+) -> dict[str, Any]:
+    if model_catalog is None:
+        return paired_cost_evidence(
+            candidate=(),
+            baseline=(),
+            catalog=None,
+            baseline_cost_field="paired_baseline_cost",
+        )
+
+    async def priced_sessions(session_ids: list[str]):
+        return [
+            estimate_session_cost(
+                session_id=session_id,
+                events=await app.session_store.load_events(session_id),
+                catalog=model_catalog,
+            )
+            for session_id in session_ids
+        ]
+
+    baseline = await priced_sessions(baseline_session_ids)
+    candidate = await priced_sessions(candidate_session_ids)
+    return paired_cost_evidence(
+        candidate=candidate,
+        baseline=baseline,
+        catalog=model_catalog,
+        baseline_cost_field="paired_baseline_cost",
+    )
 
 
 def _build_app(
@@ -398,7 +475,10 @@ def _build_app(
             AgentSpec(
                 name=name,
                 model=model,
-                system_prompt=prompt + " Be concise and stay within the structured field limits.",
+                system_prompt=(
+                    prompt + " Be concise, use one sentence per string field, and stay within the "
+                    "structured field limits."
+                ),
             ),
             context_policy=context_policy,
         )

@@ -11,12 +11,15 @@ The assertion contract is the stable behavioral envelope around model output.
 Do not assert exact prose.
 
 For the product narrative and dated measurements, see
-[Advanced runtime strategies](../docs/advanced-runtime-examples.md).
+[Advanced runtime strategies](../docs/advanced-runtime-examples.md). For the
+cost strategy and governance map, see
+[Cost optimization and governance](../docs/cost-optimization.md).
 
 ## Example map
 
 | Example | Product idea | Stable runtime evidence | Entry point |
 | --- | --- | --- | --- |
+| `prompt_cache_compaction` | Refresh an expensive provider prefix once, compare it with bounded compaction from the same compactable source, then keep later summaries bounded to the checkpoint delta. | Tool and thinking request-shape parity, paired cache/uncached counters, provenance-gated cost evidence, two real compaction cycles, bounded incremental input, and explicit separation of session and comparison-only spend. | [README](prompt_cache_compaction/README.md) · [app](prompt_cache_compaction/app.py) |
 | `cache_aware_research_council` | Prepare and compact shared context once, then reduce repeated input while exploring several research strategies independently. | Shared causal budget and lineage, persisted compaction checkpoint, paired provider-token comparison, evaluator weakness, and critique-aware repair. | [README](cache_aware_research_council/README.md) · [app](cache_aware_research_council/app.py) |
 | `counterfactual_approval` | Turn approval latency into useful computation without granting speculative branches authority. | Approved and denied futures are authority-free, stale state is rejected, one analysis is selected as advisory continuation context while the other is ignored, exactly one mutation occurs, and its receipt is recovered after `CayuApp` reconstruction. Both child sessions remain durable and auditable. | [README](counterfactual_approval/README.md) · [app](counterfactual_approval/app.py) |
 | `repo_maintainer_tournament` | Generate competing repairs, reject reward hacking, and promote only the verified winner. | Candidate isolation, deterministic tests and diff gates, test-weakening rejection, one winner, idempotent PR recovery, and optional real Git worktree/commit/push/PR verification. | [README](repo_maintainer_tournament/README.md) · [app](repo_maintainer_tournament/app.py) |
@@ -50,6 +53,7 @@ must satisfy the same structural assertions as live runs:
 
 ```bash
 for example in \
+  prompt_cache_compaction \
   cache_aware_research_council \
   counterfactual_approval \
   repo_maintainer_tournament \
@@ -87,6 +91,10 @@ Replace the module name to run another example. Defaults can be overridden with
 `CAYU_GEMINI_MODEL`, `CAYU_OPENAI_MODEL`, and `CAYU_ANTHROPIC_MODEL`. The current
 defaults are `gemini-3.1-flash-lite`, `gpt-5.4-mini`, and
 `claude-sonnet-4-6`.
+
+`prompt_cache_compaction` is intentionally Anthropic-only in live mode because
+its assertion reads Anthropic prompt-cache counters; its deterministic mode is
+provider-neutral.
 
 ### Real repository maintainer boundary
 
@@ -138,7 +146,7 @@ and semantic envelope passed—not merely that the provider returned text.
 
 | Layer | Cost and prerequisites | Purpose |
 | --- | --- | --- |
-| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for all four scenarios. |
+| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for all five scenarios. |
 | Primary Gemini checks | `GEMINI_API_KEY`; five trials when the registered nightly checks are invoked | Multi-trial verification of the main live-provider path. |
 | OpenAI and Anthropic portability checks | Matching provider key; one trial per registered check | Detect provider-specific tool, structured-output, and usage regressions. |
 | Real repository promotion | Provider key, GitHub authority, Git credentials, and a disposable repository; manual opt-in | Verify clone, real worktrees, commit, push, PR creation, and idempotent recovery. |

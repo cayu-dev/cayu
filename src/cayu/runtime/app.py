@@ -5286,6 +5286,15 @@ class CayuApp:
                             thinking=effective_thinking,
                             step=step,
                         ),
+                        build_cache_prefix_request=_cache_prefix_request_builder(
+                            app=self,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            structured_output=structured_output,
+                            thinking=effective_thinking,
+                            step=step,
+                        ),
                     )
                 except ContextBuildError as exc:
                     for telemetry in exc.compaction_telemetry:
@@ -6338,6 +6347,16 @@ class CayuApp:
                     thinking=thinking,
                     step=step,
                 ),
+                build_cache_prefix_request=_cache_prefix_request_builder(
+                    app=self,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    structured_output=structured_output,
+                    thinking=thinking,
+                    step=step,
+                ),
+                force_bounded_compaction=True,
             )
         except ContextBuildError as build_exc:
             for telemetry in build_exc.compaction_telemetry:
@@ -11488,6 +11507,30 @@ def _context_input_token_counter(
     return count_input_tokens
 
 
+def _cache_prefix_request_builder(
+    *,
+    app: CayuApp,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    structured_output: StructuredOutputSpec | None,
+    thinking: ThinkingConfig | None,
+    step: int,
+) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
+    async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
+        return await app._build_model_request(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            context_messages=copy_context_messages(context_messages),
+            structured_output=structured_output,
+            thinking=thinking,
+            step=step,
+        )
+
+    return build_cache_prefix_request
+
+
 async def _build_context(
     *,
     context_policy: ContextPolicy,
@@ -11501,6 +11544,8 @@ async def _build_context(
     request_metadata: dict[str, Any],
     pressure_overhead: ContextPressureOverhead,
     count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
+    build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
+    force_bounded_compaction: bool = False,
 ) -> tuple[
     list[Message],
     dict[str, Any] | None,
@@ -11530,6 +11575,8 @@ async def _build_context(
         context_usage=context_usage,
         pressure_overhead=pressure_overhead,
         count_input_tokens=count_input_tokens,
+        build_cache_prefix_request=build_cache_prefix_request,
+        force_bounded_compaction=force_bounded_compaction,
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
@@ -11575,7 +11622,9 @@ def _context_usage_state_from_model_completed_event(
         return ContextUsageState()
     metrics = usage_metrics_from_event_payload(event.payload)
     if metrics is None:
-        return ContextUsageState()
+        return ContextUsageState(
+            last_transcript_cursor=_transcript_cursor_from_model_completed_event(event)
+        )
     return ContextUsageState(
         last_input_tokens=metrics.input_tokens,
         last_output_tokens=metrics.output_tokens,
@@ -11585,6 +11634,7 @@ def _context_usage_state_from_model_completed_event(
             _context_overhead_input_tokens_from_model_completed_event(event)
         ),
         last_provider_name=metrics.provider_name,
+        last_requested_model=metrics.requested_model,
         last_model=metrics.model,
     )
 

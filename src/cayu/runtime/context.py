@@ -5,9 +5,10 @@ import json
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 from cayu._validation import (
     copy_json_value,
@@ -46,6 +47,7 @@ from cayu.providers.base import (
 from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
+from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.usage import normalize_usage_metrics, usage_metrics_payload
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
@@ -202,10 +204,11 @@ class ContextUsageState(BaseModel):
     last_transcript_cursor: StrictInt | None = Field(default=None, ge=0)
     last_context_overhead_input_tokens: StrictInt | None = Field(default=None, ge=0)
     last_provider_name: str | None = None
+    last_requested_model: str | None = None
     last_model: str | None = None
     input_pressure: ContextPressureEstimate | None = None
 
-    @field_validator("last_provider_name", "last_model")
+    @field_validator("last_provider_name", "last_requested_model", "last_model")
     @classmethod
     def validate_optional_nonblank(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -650,6 +653,11 @@ class ContextRequest(BaseModel):
         default=None,
         exclude=True,
     )
+    build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None = Field(
+        default=None,
+        exclude=True,
+    )
+    force_bounded_compaction: StrictBool = False
 
     @field_validator("messages")
     @classmethod
@@ -1478,7 +1486,13 @@ def _usage_triggered_checkpoint_event_payload(marker: dict[str, Any]) -> dict[st
 
 
 class CompactionRequest(BaseModel):
-    """Input passed to a compactor when older context needs summarizing."""
+    """Input passed to a compactor when older context needs summarizing.
+
+    ``messages`` is only the newly compactable transcript delta.
+    ``context_messages`` is the current full provider-facing projection for
+    compatibility with custom compactors. ``cache_prefix_request`` is the exact
+    runtime request shape available to cache-aware compactors.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1487,11 +1501,26 @@ class CompactionRequest(BaseModel):
     messages: list[Message]
     existing_summary: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    context_messages: list[Message] = Field(default_factory=list)
+    cache_prefix_request: ModelRequest | None = None
+    force_bounded_compaction: StrictBool = False
 
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
         return [copy_message(message) for message in value]
+
+    @field_validator("context_messages")
+    @classmethod
+    def copy_context_messages(cls, value):
+        return [copy_message(message) for message in value]
+
+    @field_validator("cache_prefix_request")
+    @classmethod
+    def copy_cache_prefix_request(cls, value: ModelRequest | None) -> ModelRequest | None:
+        if value is None:
+            return None
+        return value.model_copy(deep=True)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -1698,36 +1727,299 @@ class ModelCompactor(ContextCompactor):
             tools=[],
             options=self.options,
         )
+        summary, completed_metadata = await _run_compaction_model(
+            provider=self.provider,
+            model_request=model_request,
+            retry_policy=self.retry_policy,
+        )
+        return _provider_compaction_result(
+            summary=summary,
+            completed_metadata=completed_metadata,
+            provider=self.provider,
+            model=self.model,
+            compactor=type(self).__name__,
+            metadata={
+                "input_truncated": input_truncated,
+                "max_input_chars": self.max_input_chars,
+            },
+        )
 
-        attempt = 1
-        while True:
-            try:
-                return await self._compact_once(model_request, input_truncated=input_truncated)
-            except ModelProviderError as exc:
-                decision = retry_decision(
-                    policy=self.retry_policy,
-                    attempt=attempt,
-                    error=str(exc),
-                    status_code=exc.status_code,
-                    retryable=exc.retryable,
-                    retry_after_s=exc.retry_after_s,
-                )
-                if not decision.retry or decision.next_attempt is None:
-                    raise
-                if decision.delay_seconds > 0:
-                    await asyncio.sleep(decision.delay_seconds)
-                attempt = decision.next_attempt
 
-    async def _compact_once(
+_DEFAULT_PROMPT_CACHE_COMPACTION_INSTRUCTION = (
+    "Summarize the conversation above so a future agent step can continue "
+    "with the important context. Preserve concrete user requests, decisions, "
+    "files or resources mentioned, tool results, errors, and pending work. "
+    "Do not invent facts. Keep the summary concise but specific. "
+    "Do not call tools. Return only the summary text."
+)
+
+
+class _CompactionToolCallError(RuntimeError):
+    """Compaction protocol failure with any provider-reported completion metadata."""
+
+    def __init__(self, *, completed_metadata: dict[str, Any] | None) -> None:
+        super().__init__("Compaction model must not call tools.")
+        self.completed_metadata = (
+            None
+            if completed_metadata is None
+            else copy_json_value(completed_metadata, "completed_metadata")
+        )
+
+
+class _PromptCacheCompactionMode(StrEnum):
+    EXACT = "exact"
+    BOUNDED = "bounded"
+    FALLBACK = "fallback"
+
+
+def _prompt_cache_compaction_mode(
+    *,
+    request: ContextRequest,
+    compactor: PromptCacheCompactor,
+    previous_summary: str | None,
+) -> _PromptCacheCompactionMode:
+    """Choose the first-checkpoint cache path from one auditable decision."""
+
+    if previous_summary is not None or request.force_bounded_compaction:
+        return _PromptCacheCompactionMode.BOUNDED
+    if any(
+        (
+            compactor.model not in {None, request.session.model},
+            compactor.provider.name != request.session.provider_name,
+            request.context_usage.last_provider_name is not None
+            and request.context_usage.last_provider_name != compactor.provider.name,
+            request.context_usage.last_requested_model is not None
+            and request.context_usage.last_requested_model != request.session.model,
+            request.pressure_overhead.structured_output_instruction is not None,
+        )
+    ):
+        return _PromptCacheCompactionMode.BOUNDED
+    if (
+        request.context_usage.last_provider_name == compactor.provider.name
+        and request.context_usage.last_requested_model == request.session.model
+        and request.build_cache_prefix_request is not None
+    ):
+        return _PromptCacheCompactionMode.EXACT
+    return _PromptCacheCompactionMode.FALLBACK
+
+
+class PromptCacheCompactor(ContextCompactor):
+    """Compactor that reuses the first provider prompt-cache prefix.
+
+    On the first compaction, extends the runtime's exact ``ModelRequest`` with a
+    compaction instruction. This preserves model, messages, tool definitions,
+    thinking configuration, provider options, and resolved file attachments at
+    the cache boundary. Compactor options recursively override the copied
+    request options; native structured-output enforcement is disabled because
+    the compactor must return summary text and must not call tools.
+    A configured model override that differs from the cached request uses bounded
+    ``ModelCompactor`` input because provider caches are model-bound. Provider
+    identity mismatches and tool-based structured-output requests also use the
+    bounded path so the exact transcript, tools, synthetic instruction, and
+    resolved attachment bytes cannot cross an incompatible request boundary.
+    Cross-provider compaction requires an explicit provider-compatible ``model``;
+    Cayu never forwards the session provider's model name to another provider.
+
+    Later compactions use bounded ``ModelCompactor`` input containing only the
+    previous checkpoint summary and newly compactable messages. This avoids
+    rebuilding an unbounded raw-transcript prefix after the cache checkpoint.
+
+    Falls back to the configured fallback compactor when no completed-request
+    cursor plus matching durable provider/requested-model identity is available
+    to reconstruct the exact runtime request.
+    """
+
+    def __init__(
         self,
-        model_request: ModelRequest,
         *,
-        input_truncated: bool,
+        provider: ModelProvider,
+        model: str | None = None,
+        compaction_instruction: str | None = None,
+        options: dict[str, Any] | None = None,
+        fallback_compactor: ContextCompactor | None = None,
+        retry_policy: RetryPolicy | None = None,
+    ) -> None:
+        if not isinstance(provider, ModelProvider):
+            raise TypeError("provider must be a ModelProvider.")
+        if model is not None:
+            model = require_clean_nonblank(model, "model")
+        self.provider = provider
+        self.model = model
+        self.compaction_instruction = (
+            compaction_instruction
+            if compaction_instruction is not None
+            else _DEFAULT_PROMPT_CACHE_COMPACTION_INSTRUCTION
+        )
+        require_nonblank(self.compaction_instruction, "compaction_instruction")
+        self.options = copy_json_value({} if options is None else options, "options")
+        self.retry_policy = copy_retry_policy(retry_policy)
+        if fallback_compactor is None:
+            self._fallback: ContextCompactor = TranscriptDigestCompactor()
+        elif isinstance(fallback_compactor, ContextCompactor):
+            self._fallback = fallback_compactor
+        else:
+            raise TypeError("fallback_compactor must be a ContextCompactor.")
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        provider_differs = self.provider.name != request.session.provider_name
+        if provider_differs and self.model is None:
+            raise ValueError(
+                "model is required when the compactor provider differs from the session provider."
+            )
+        bounded_model = self.model if self.model is not None else request.session.model
+
+        if request.existing_summary is not None:
+            return await self._compact_bounded(request, model=bounded_model)
+
+        if request.force_bounded_compaction:
+            return await self._compact_bounded(request, model=bounded_model)
+
+        if provider_differs:
+            return await self._compact_bounded(request, model=bounded_model)
+
+        cached_request = request.cache_prefix_request
+        if cached_request is None:
+            if self.model is not None and self.model != request.session.model:
+                return await self._compact_bounded(request, model=self.model)
+            return await self._fallback.compact(request)
+        cached_model = cached_request.model
+        if cached_model != request.session.model:
+            return await self._compact_bounded(request, model=bounded_model)
+        if self.model is not None and self.model != cached_model:
+            return await self._compact_bounded(request, model=self.model)
+        model = self.model if self.model is not None else cached_model
+        model = require_clean_nonblank(model, "model")
+        if _has_structured_output_tool(cached_request.tools):
+            return await self._compact_bounded(request, model=model)
+
+        compaction_messages = [copy_message(message) for message in cached_request.messages]
+        tools = copy_json_value(cached_request.tools, "cache_prefix_request.tools")
+        base_options = cached_request.options
+        compaction_messages.append(Message.text(MessageRole.USER, self.compaction_instruction))
+        options = _merged_json_options(base_options, self.options)
+        if "structured_output" in options:
+            options["structured_output"] = None
+
+        model_request = ModelRequest(
+            model=model,
+            messages=compaction_messages,
+            tools=tools,
+            options=options,
+        )
+
+        try:
+            summary, completed_metadata = await _run_compaction_model(
+                provider=self.provider,
+                model_request=model_request,
+                retry_policy=self.retry_policy,
+            )
+        except _CompactionToolCallError as exc:
+            bounded_result = await self._compact_bounded(request, model=model)
+            bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
+            bounded_metadata["prompt_cache_exact_attempt"] = "rejected_tool_call"
+            return CompactionResult(
+                summary=bounded_result.summary,
+                metadata=bounded_metadata,
+                model_completed_payloads=[
+                    _rejected_compaction_tool_call_payload(
+                        error=exc,
+                        provider=self.provider,
+                        model=model,
+                        compactor=type(self).__name__,
+                    ),
+                    *bounded_result.model_completed_payloads,
+                ],
+            )
+        return _provider_compaction_result(
+            summary=summary,
+            completed_metadata=completed_metadata,
+            provider=self.provider,
+            model=model,
+            compactor=type(self).__name__,
+            metadata={
+                "prompt_cache_compaction": True,
+                "context_message_count": len(request.context_messages),
+                "attachment_results_preserved": len(
+                    options.get(RESOLVED_FILE_ATTACHMENTS_OPTION, {})
+                ),
+            },
+        )
+
+    async def _compact_bounded(
+        self,
+        request: CompactionRequest,
+        *,
+        model: str,
     ) -> CompactionResult:
-        provider_name = require_clean_nonblank(self.provider.name, "provider.name")
-        text_parts: list[str] = []
-        completed_payload: dict[str, Any] | None = None
-        async for raw_event in self.provider.stream(model_request):
+        incremental_options = _merged_json_options(
+            request.agent.provider_options,
+            self.options,
+        )
+        incremental_options.pop(RESOLVED_FILE_ATTACHMENTS_OPTION, None)
+        if "structured_output" in incremental_options:
+            incremental_options["structured_output"] = None
+        incremental_compactor = ModelCompactor(
+            provider=self.provider,
+            model=require_clean_nonblank(model, "model"),
+            system_prompt=self.compaction_instruction,
+            options=incremental_options,
+            retry_policy=self.retry_policy,
+        )
+        return await incremental_compactor.compact(request)
+
+
+def _merged_json_options(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = copy_json_value(base, "base_options")
+    for key, value in override.items():
+        existing = result.get(key)
+        if type(existing) is dict and type(value) is dict:
+            result[key] = _merged_json_options(existing, value)
+        else:
+            result[key] = copy_json_value(value, f"options.{key}")
+    return result
+
+
+def _has_structured_output_tool(tools: list[dict[str, Any]]) -> bool:
+    return any(tool.get("name") == STRUCTURED_OUTPUT_TOOL_NAME for tool in tools)
+
+
+async def _run_compaction_model(
+    *,
+    provider: ModelProvider,
+    model_request: ModelRequest,
+    retry_policy: RetryPolicy,
+) -> tuple[str, dict[str, Any]]:
+    attempt = 1
+    while True:
+        try:
+            return await _stream_compaction_model(provider=provider, model_request=model_request)
+        except ModelProviderError as exc:
+            decision = retry_decision(
+                policy=retry_policy,
+                attempt=attempt,
+                error=str(exc),
+                status_code=exc.status_code,
+                retryable=exc.retryable,
+                retry_after_s=exc.retry_after_s,
+            )
+            if not decision.retry or decision.next_attempt is None:
+                raise
+            if decision.delay_seconds > 0:
+                await asyncio.sleep(decision.delay_seconds)
+            attempt = decision.next_attempt
+
+
+async def _stream_compaction_model(
+    *,
+    provider: ModelProvider,
+    model_request: ModelRequest,
+) -> tuple[str, dict[str, Any]]:
+    provider_name = require_clean_nonblank(provider.name, "provider.name")
+    text_parts: list[str] = []
+    completed_payload: dict[str, Any] | None = None
+    tool_call_seen = False
+    try:
+        async for raw_event in provider.stream(model_request):
             event = copy_model_stream_event(raw_event)
             if completed_payload is not None:
                 raise RuntimeError(
@@ -1736,9 +2028,9 @@ class ModelCompactor(ContextCompactor):
             if event.type == ModelStreamEventType.TEXT_DELTA:
                 text_parts.append(event.delta)
             elif event.type == ModelStreamEventType.THINKING:
-                continue  # reasoning is internal; the compaction summary uses only text
+                continue
             elif event.type == ModelStreamEventType.TOOL_CALL:
-                raise RuntimeError("Compaction model must not call tools.")
+                tool_call_seen = True
             elif event.type == ModelStreamEventType.ERROR:
                 provider_error = model_provider_error_from_payload(
                     event.payload,
@@ -1754,32 +2046,78 @@ class ModelCompactor(ContextCompactor):
                 completed_payload = event.payload
             else:
                 raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
+    except Exception as exc:
+        if tool_call_seen:
+            completed_metadata = (
+                None
+                if completed_payload is None
+                else _provider_completed_metadata(completed_payload)
+            )
+            raise _CompactionToolCallError(completed_metadata=completed_metadata) from exc
+        raise
 
-        if completed_payload is None:
-            raise RuntimeError("Compaction model stream ended without a completed event.")
+    if completed_payload is None:
+        if tool_call_seen:
+            raise _CompactionToolCallError(completed_metadata=None)
+        raise RuntimeError("Compaction model stream ended without a completed event.")
+    completed_metadata = _provider_completed_metadata(completed_payload)
+    if tool_call_seen:
+        raise _CompactionToolCallError(completed_metadata=completed_metadata)
+    return require_nonblank("".join(text_parts), "summary"), completed_metadata
 
-        summary = require_nonblank("".join(text_parts), "summary")
-        completed_metadata = _provider_completed_metadata(completed_payload)
-        return CompactionResult(
-            summary=summary,
-            metadata={
-                "compactor": type(self).__name__,
-                "provider": provider_name,
-                "model": self.model,
-                "input_truncated": input_truncated,
-                "max_input_chars": self.max_input_chars,
-                "completed": completed_metadata,
-            },
-            model_completed_payloads=[
-                _compaction_model_completed_payload(
-                    completed_payload=completed_metadata,
-                    provider_name=provider_name,
-                    fallback_model=self.model,
-                    compactor=type(self).__name__,
-                    usage_dialect=self.provider.usage_dialect,
-                )
-            ],
+
+def _provider_compaction_result(
+    *,
+    summary: str,
+    completed_metadata: dict[str, Any],
+    provider: ModelProvider,
+    model: str,
+    compactor: str,
+    metadata: dict[str, Any],
+) -> CompactionResult:
+    provider_name = require_clean_nonblank(provider.name, "provider.name")
+    return CompactionResult(
+        summary=summary,
+        metadata={
+            "compactor": compactor,
+            "provider": provider_name,
+            "model": model,
+            **copy_json_value(metadata, "metadata"),
+            "completed": completed_metadata,
+        },
+        model_completed_payloads=[
+            _compaction_model_completed_payload(
+                completed_payload=completed_metadata,
+                provider_name=provider_name,
+                fallback_model=model,
+                compactor=compactor,
+                usage_dialect=provider.usage_dialect,
+            )
+        ],
+    )
+
+
+def _rejected_compaction_tool_call_payload(
+    *,
+    error: _CompactionToolCallError,
+    provider: ModelProvider,
+    model: str,
+    compactor: str,
+) -> dict[str, Any]:
+    completed_metadata = {} if error.completed_metadata is None else error.completed_metadata
+    payload = _compaction_model_completed_payload(
+        completed_payload=completed_metadata,
+        provider_name=require_clean_nonblank(provider.name, "provider.name"),
+        fallback_model=model,
+        compactor=compactor,
+        usage_dialect=provider.usage_dialect,
+    )
+    payload["compaction_outcome"] = "rejected_tool_call"
+    if error.completed_metadata is None:
+        payload["usage_unavailable_reason"] = (
+            "compaction tool-call attempt ended without provider completion usage"
         )
+    return payload
 
 
 class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
@@ -1873,6 +2211,34 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             )
             compaction_telemetry.append(compaction_started)
             try:
+                context_messages = strip_old_file_attachments(
+                    request.messages,
+                    max_attachment_results=self.max_attachment_results,
+                )
+                cache_prefix_request = None
+                force_bounded_compaction = request.force_bounded_compaction
+                prompt_cache_mode = None
+                if isinstance(self.compactor, PromptCacheCompactor):
+                    prompt_cache_mode = _prompt_cache_compaction_mode(
+                        request=request,
+                        compactor=self.compactor,
+                        previous_summary=previous_summary,
+                    )
+                    force_bounded_compaction = (
+                        prompt_cache_mode == _PromptCacheCompactionMode.BOUNDED
+                    )
+                if (
+                    prompt_cache_mode == _PromptCacheCompactionMode.EXACT
+                    and request.build_cache_prefix_request is not None
+                ):
+                    extension_messages = _prompt_cache_extension_messages(
+                        request,
+                        max_attachment_results=self.max_attachment_results,
+                    )
+                    if extension_messages is not None:
+                        cache_prefix_request = await request.build_cache_prefix_request(
+                            extension_messages
+                        )
                 result = await self.compactor.compact(
                     CompactionRequest(
                         session=request.session,
@@ -1880,6 +2246,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         messages=newly_compactable,
                         existing_summary=previous_summary,
                         metadata=request.metadata,
+                        context_messages=context_messages,
+                        cache_prefix_request=cache_prefix_request,
+                        force_bounded_compaction=force_bounded_compaction,
                     )
                 )
             except Exception as exc:
@@ -1941,10 +2310,12 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 )
             )
 
-        messages = [copy_message(message) for message in system_prefix]
-        if summary is not None:
+        if summary is None:
+            messages = [copy_message(message) for message in request.messages]
+        else:
+            messages = [copy_message(message) for message in system_prefix]
             messages.append(Message.text(MessageRole.USER, f"{self.summary_prefix}\n{summary}"))
-        messages.extend(copy_message(message) for message in recent_messages)
+            messages.extend(copy_message(message) for message in recent_messages)
         messages = strip_old_file_attachments(
             messages,
             max_attachment_results=self.max_attachment_results,
@@ -1955,6 +2326,39 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=compaction_telemetry,
         )
+
+
+def _prompt_cache_extension_messages(
+    request: ContextRequest,
+    *,
+    max_attachment_results: int,
+) -> list[Message] | None:
+    """Rebuild the last provider projection, then append the transcript delta.
+
+    File projection depends on which user turn was current. Re-projecting the
+    entire present transcript would omit the formerly-current attachment and
+    change the cached prefix; using the entire durable transcript would instead
+    resurrect older attachments that the last provider request had omitted.
+    """
+
+    messages = [copy_message(message) for message in request.messages]
+    completed_cursor = request.context_usage.last_transcript_cursor
+    if completed_cursor is None or completed_cursor < 1 or completed_cursor > len(messages):
+        return None
+
+    previous_input_cursor = completed_cursor
+    if (
+        previous_input_cursor > 0
+        and messages[previous_input_cursor - 1].role == MessageRole.ASSISTANT
+    ):
+        previous_input_cursor -= 1
+    previous_projection = strip_old_file_attachments(
+        messages[:previous_input_cursor],
+        max_attachment_results=max_attachment_results,
+    )
+    return previous_projection + [
+        copy_message(message) for message in messages[previous_input_cursor:]
+    ]
 
 
 def copy_context_messages(messages: list[Message]) -> list[Message]:

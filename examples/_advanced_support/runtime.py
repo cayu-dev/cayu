@@ -98,6 +98,31 @@ async def collect_events(events: AsyncIterator[Event]) -> list[Event]:
     return [event async for event in events]
 
 
+def _runtime_failure_summary(events: list[Event]) -> list[dict[str, Any]]:
+    failure_types = {
+        EventType.MODEL_ERROR,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.SESSION_FAILED,
+    }
+    diagnostic_keys = (
+        "error_type",
+        "error",
+        "provider_error_type",
+        "status_code",
+        "retryable",
+        "purpose",
+        "reason",
+    )
+    return [
+        {
+            "type": str(event.type),
+            **{key: event.payload[key] for key in diagnostic_keys if key in event.payload},
+        }
+        for event in events
+        if event.type in failure_types
+    ][-5:]
+
+
 async def count_model_completions(app: CayuApp, session_ids: list[str]) -> int:
     total = 0
     for session_id in session_ids:
@@ -115,9 +140,12 @@ async def session_evidence(
         session = await app.session_store.load(session_id)
         if session is None:
             raise RuntimeError(f"Session disappeared: {session_id}")
-        if session.status != SessionStatus.COMPLETED:
-            raise RuntimeError(f"Session {session_id} did not complete: {session.status}")
         events = await app.session_store.load_events(session_id)
+        if session.status != SessionStatus.COMPLETED:
+            failures = _runtime_failure_summary(events)
+            raise RuntimeError(
+                f"Session {session_id} did not complete: {session.status}; failures={failures!r}"
+            )
         usage = session_usage_summary(session_id, events)
         manual_recovery = any(event.payload.get("manual_recovery") is True for event in events)
         interrupted = any(event.type == EventType.SESSION_INTERRUPTED for event in events)
@@ -204,7 +232,14 @@ def validated_output(events: list[Event]) -> dict[str, Any]:
     validated = [event for event in events if event.type == EventType.STRUCTURED_OUTPUT_VALIDATED]
     if len(validated) != 1:
         summary = [
-            (str(event.type), event.payload.get("error"), event.payload.get("reason"))
+            {
+                "type": str(event.type),
+                **{
+                    key: event.payload[key]
+                    for key in ("errors", "error", "reason")
+                    if key in event.payload
+                },
+            }
             for event in events
             if event.type
             in {
