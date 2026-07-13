@@ -11,7 +11,7 @@ from cayu.evals.assertions import EvalAssertion, _message_text
 from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.runner import final_output_text
 from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import RunRequest, Session
+from cayu.runtime.sessions import RunRequest, Session, SessionStatus
 
 _JUDGE_INSTRUCTIONS = (
     'Respond with ONLY a JSON object of the form {"score": <number between 0 and 1>, '
@@ -38,10 +38,10 @@ class LLMJudge(EvalAssertion):
     judge's provider/model, the rubric (and version), the exact prompt, the raw output, and the
     parsed score/rationale.
 
-    The judge agent should be tool-free (it runs a single model step). Each evaluation opens a
-    new session on the judge ``app`` and deletes it (best-effort) once the judgment is
-    captured, so large suites don't accumulate orphan judge sessions; stores that don't
-    support ``delete_session`` simply retain them.
+    The judge agent must be registered without tools. A tool-bearing registration is rejected
+    before the provider is invoked. Each evaluation opens a new session on the judge ``app``
+    and deletes it (best-effort) once the judgment is captured, so large suites don't accumulate
+    orphan judge sessions; stores that don't support ``delete_session`` simply retain them.
 
     The graded material (task, final output, transcript) is delimited as untrusted data in
     the judge prompt, and the score is only accepted as a well-formed JSON object — a run
@@ -79,10 +79,22 @@ class LLMJudge(EvalAssertion):
         return self._name or "LLMJudge"
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        try:
+            registered_agent = self._app.get_agent(self._agent_name)
+        except Exception as exc:
+            return self.failed(f"Judge configuration is invalid: {type(exc).__name__}: {exc}")
+        if registered_agent.tools:
+            tool_names = ", ".join(sorted(registered_agent.tools))
+            return self.failed(
+                f"Judge agent {self._agent_name!r} must be tool-free; registered tools: "
+                f"{tool_names}."
+            )
+
         prompt = _build_judge_prompt(
             self._rubric, context, include_transcript=self._include_transcript
         )
         session_id: str | None = None
+        tool_call_observed = False
         try:
             try:
                 async for event in self._app.run(
@@ -93,6 +105,10 @@ class LLMJudge(EvalAssertion):
                     )
                 ):
                     session_id = session_id or event.session_id
+                    # Defense in depth only: the tool-free agent pre-gate above prevents
+                    # execution; this post-hoc check rejects even a hallucinated tool request.
+                    if str(event.type).startswith("tool.call."):
+                        tool_call_observed = True
                 if session_id is None:
                     return self.failed("Judge run produced no session.")
                 transcript = await self._app.session_store.load_transcript(session_id)
@@ -104,6 +120,14 @@ class LLMJudge(EvalAssertion):
 
         text = final_output_text(transcript)
         audit = self._audit_metadata(prompt, text, session)
+        if tool_call_observed:
+            return self.failed("Judge attempted a tool call.", metadata=audit)
+        if session is None or session.status != SessionStatus.COMPLETED:
+            status = session.status.value if session is not None else "missing"
+            return self.failed(
+                f"Judge session did not complete successfully (status={status}).",
+                metadata=audit,
+            )
         if not text.strip():
             # app.run() ends a failed judge session without raising; distinguish that from
             # "produced output but no score".

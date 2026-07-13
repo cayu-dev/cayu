@@ -52,18 +52,21 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) 
             case_timeout_seconds=5,
             retain_trajectory=True,
         )
+        cases_by_id = {case.case_id: case for case in result.cases}
+        workspace_session_id = cases_by_id["workspace_roundtrip"].trial_session_ids[0]
+        tool_session_id = cases_by_id["tool_roundtrip"].trial_session_ids[0]
 
         factory = plan.app.get_environment_factory()
         workspace_environment = await factory.create(
             EnvironmentFactoryRequest(
-                session_id="cayu-eval-runtime-workspace-roundtrip-v1",
+                session_id=workspace_session_id,
                 agent_name="runtime_acceptance_workspace",
                 environment_name="runtime-acceptance-local",
             )
         )
         other_environment = await factory.create(
             EnvironmentFactoryRequest(
-                session_id="cayu-eval-runtime-tool-roundtrip-v1",
+                session_id=tool_session_id,
                 agent_name="runtime_acceptance_tool",
                 environment_name="runtime-acceptance-local",
             )

@@ -66,6 +66,8 @@ def load_eval_run(path: str | Path) -> EvalRun:
             f"Eval run has unsupported schema_version {raw!r}; this cayu supports "
             f"1..{EVAL_SCHEMA_VERSION}. Upgrade cayu or regenerate the run."
         )
+    if raw == 1:
+        data = {**data, "schema_version": EVAL_SCHEMA_VERSION}
     return EvalRun.model_validate(data)
 
 

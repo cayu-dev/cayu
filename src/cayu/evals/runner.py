@@ -80,7 +80,13 @@ class EvalCase(BaseModel):
     @field_validator("request")
     @classmethod
     def copy_request(cls, value: RunRequest) -> RunRequest:
-        return copy_run_request(value)
+        request = copy_run_request(value)
+        if request.task_id is not None:
+            raise ValueError(
+                "EvalCase request cannot set task_id or task_worker_id; eval trials "
+                "create independent sessions and cannot share durable task identity."
+            )
+        return request
 
     @field_validator("assertions", mode="before")
     @classmethod
@@ -292,9 +298,11 @@ async def run_eval_case(
 ) -> EvalCaseResult:
     """Run one case, optionally `trials` times, aggregating to the mean per-assertion score.
 
-    `trials=1` (the default) returns the single run unchanged. `trials>1` runs the case N
-    times and reports each assertion's mean score across trials, so a stochastic model whose
-    score wobbles run-to-run settles to a stable average instead of a coin-flip pass/fail.
+    Every trial receives a fresh concrete session ID; an authored request session ID is never
+    reused as concrete state, but remains result provenance and the causal-accounting fallback.
+    `trials=1` (the default) returns the single assertion result without aggregation. `trials>1`
+    reports each assertion's mean score across trials, so a stochastic model whose score wobbles
+    run-to-run settles to a stable average instead of a coin-flip pass/fail.
     """
     _validate_trials(trials, "run_eval_case trials")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
@@ -336,7 +344,10 @@ async def _run_case_once(
     timeout_seconds: float | None = None,
 ) -> EvalCaseResult:
     started_at = datetime.now(UTC)
+    authored_session_id = case.request.session_id
+    trial_request = _isolated_trial_request(case.request)
     emitted_events: list[Event] = []
+    observed_session_id: str | None = None
     session_id: str | None = None
     run_error: str | None = None
     session: Session | None = None
@@ -354,10 +365,11 @@ async def _run_case_once(
     try:
         async with asyncio.timeout(timeout_seconds) as deadline:
             try:
-                async for event in app.run(case.request):
+                async for event in app.run(trial_request):
                     emitted_events.append(event)
-                    if session_id is None:
-                        session_id = event.session_id
+                    # Anchor the trial to the first emitted session. If app.run() ever forwards
+                    # child-session events, they must not replace the root trial identity.
+                    observed_session_id = observed_session_id or event.session_id
             except TimeoutError as exc:
                 # A provider-originated TimeoutError is an eval run error, not the case
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
@@ -365,14 +377,16 @@ async def _run_case_once(
             except Exception as exc:
                 run_error = _format_exception(exc)
 
-            if session_id is None:
-                session_id = case.request.session_id
-
             events = tuple(emitted_events)
-            if session_id is not None:
+            candidate_session_id = observed_session_id or trial_request.session_id
+            if candidate_session_id is not None:
                 try:
-                    session = await app.session_store.load(session_id)
-                    events, transcript, usage_summary = await _load_session_records(app, session_id)
+                    session = await app.session_store.load(candidate_session_id)
+                    if session is not None:
+                        session_id = candidate_session_id
+                        events, transcript, usage_summary = await _load_session_records(
+                            app, session_id
+                        )
                 except Exception as exc:
                     if run_error is None:
                         run_error = f"Failed to load eval session state: {_format_exception(exc)}"
@@ -426,8 +440,11 @@ async def _run_case_once(
         # partial prefix as passing when the case timed out before evaluation completed.
         assertion_results = []
 
-    if session_id is None:
-        session_id = case.request.session_id
+    # A yielded runtime event proves the session was created before a deadline interrupted
+    # state capture. Do not perform any store I/O after the deadline; without an event, the
+    # request UUID remains only a plan and must not be published as a concrete trial ID.
+    if session_id is None and observed_session_id is not None:
+        session_id = observed_session_id
     if not events:
         events = tuple(emitted_events)
     completed_at = datetime.now(UTC)
@@ -435,6 +452,8 @@ async def _run_case_once(
     return EvalCaseResult(
         case_id=case.id,
         status=status,
+        authored_session_id=authored_session_id,
+        trial_session_ids=(session_id,) if session_id is not None else (),
         session_id=session_id,
         score=_case_score(status, assertion_results),
         final_output=final_output,
@@ -449,6 +468,21 @@ async def _run_case_once(
         # The probe-complete trajectory captured during this run, for export/replay. Opt-in so
         # the default run doesn't retain every case's trajectory (incl. file bytes) in memory.
         trajectory=trajectory if retain_trajectory else None,
+    )
+
+
+def _isolated_trial_request(request: RunRequest) -> RunRequest:
+    copied = copy_run_request(request)
+    trial_session_id = str(uuid4())
+    # Session identity owns transcript/checkpoint/terminal state and is always isolated.
+    # Causal identity intentionally groups related sessions for accounting, so preserve the
+    # authored effective identity and only default it to the concrete trial when none exists.
+    causal_budget_id = copied.causal_budget_id or copied.session_id or trial_session_id
+    return copied.model_copy(
+        update={
+            "session_id": trial_session_id,
+            "causal_budget_id": causal_budget_id,
+        }
     )
 
 
@@ -690,8 +724,15 @@ def _aggregate_trials(
     aggregated = [] if errored else _aggregate_trial_assertions(results, n)
     status = _case_status(combined_error, aggregated)
     score = _case_score(status, aggregated)
-    # The last trial supplies the representative session/output/trajectory for export.
+    # The last trial supplies output/trajectory for export; the last concrete trial session
+    # remains the compatibility representative when a later trial created no session.
     last = results[-1]
+    trial_session_ids = tuple(
+        session_id for result in results for session_id in result.trial_session_ids
+    )
+    representative_session_id = last.session_id or (
+        trial_session_ids[-1] if trial_session_ids else None
+    )
     metadata = {
         **case.metadata,
         "trials": n,
@@ -701,7 +742,9 @@ def _aggregate_trials(
     return EvalCaseResult(
         case_id=case.id,
         status=status,
-        session_id=last.session_id,
+        authored_session_id=case.request.session_id,
+        trial_session_ids=trial_session_ids,
+        session_id=representative_session_id,
         score=score,
         final_output=last.final_output,
         assertions=tuple(aggregated),

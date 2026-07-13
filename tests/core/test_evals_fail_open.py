@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
 from cayu import (
     AgentSpec,
+    BudgetLimit,
+    BudgetPolicy,
     CayuApp,
     EvalAssertion,
     EvalCase,
@@ -15,9 +18,15 @@ from cayu import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    Event,
+    EventType,
+    InMemorySessionStore,
     Message,
+    ModelPricing,
+    PricingCatalog,
     RunRequest,
     ScriptedModelProvider,
+    SessionIdentity,
     compare_eval_runs,
     run_eval_suite,
 )
@@ -45,6 +54,90 @@ def _app() -> CayuApp:
 
 def _request() -> RunRequest:
     return RunRequest(agent_name="agent", messages=[Message.text("user", "go")], max_steps=1)
+
+
+def _causal_budget_limit(key: str) -> BudgetLimit:
+    return BudgetLimit(
+        scope="causal",
+        key=key,
+        max_estimated_cost=Decimal("100"),
+        pricing=PricingCatalog(
+            prices=(
+                ModelPricing(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+
+
+def test_eval_case_rejects_task_linked_request():
+    with pytest.raises(ValueError, match="task_id"):
+        EvalCase(
+            id="task-linked",
+            request=RunRequest(
+                agent_name="agent",
+                messages=[Message.text("user", "go")],
+                task_id="task-1",
+                task_worker_id="worker-1",
+            ),
+        )
+
+
+def test_preflight_error_does_not_report_nonexistent_trial_session():
+    case = EvalCase(
+        id="missing-agent",
+        request=RunRequest(
+            agent_name="missing",
+            messages=[Message.text("user", "go")],
+        ),
+    )
+
+    result = asyncio.run(run_eval_case(_app(), case, suite_id="s"))
+
+    assert result.status == EvalStatus.ERROR
+    assert result.session_id is None
+    assert result.trial_session_ids == ()
+
+
+def test_eval_trial_anchors_to_first_emitted_session(monkeypatch):
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+
+    async def forwarding_run(request):
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        root = await store.create(request, identity=identity)
+        child = await store.create(
+            RunRequest(
+                agent_name="child",
+                session_id="forwarded-child",
+                parent_session_id=root.id,
+                messages=[Message.text("user", "child work")],
+            ),
+            identity=identity,
+        )
+        root_event = Event(type=EventType.SESSION_STARTED, session_id=root.id)
+        child_event = Event(type=EventType.SESSION_STARTED, session_id=child.id)
+        await store.append_event(root.id, root_event)
+        await store.append_event(child.id, child_event)
+        yield root_event
+        yield child_event
+
+    monkeypatch.setattr(app, "run", forwarding_run)
+
+    result = asyncio.run(
+        run_eval_case(
+            app,
+            EvalCase(id="forwarded-events", request=_request()),
+            suite_id="s",
+        )
+    )
+
+    assert result.session_id == result.trial_session_ids[0]
+    assert result.session_id != "forwarded-child"
 
 
 class _SequenceScoreAssertion(EvalAssertion):
@@ -132,6 +225,203 @@ def test_trials_average_the_per_assertion_score():
     assert result.score == pytest.approx(0.9)
     assert result.metadata["trials"] == 4
     assert result.metadata["trial_scores"] == pytest.approx([1.0, 0.8, 1.0, 0.8])
+    assert len(result.trial_session_ids) == 4
+    assert len(set(result.trial_session_ids)) == 4
+    assert result.session_id == result.trial_session_ids[-1]
+
+
+def test_trials_keep_last_concrete_session_when_final_trial_has_none():
+    from cayu.evals.runner import _aggregate_trials
+
+    now = datetime.now(UTC)
+    concrete = EvalCaseResult(
+        case_id="partial",
+        status=EvalStatus.ERROR,
+        trial_session_ids=("concrete-session",),
+        session_id="concrete-session",
+        error="failed after session creation",
+        started_at=now,
+        completed_at=now,
+    )
+    no_session = EvalCaseResult(
+        case_id="partial",
+        status=EvalStatus.ERROR,
+        error="failed before session creation",
+        started_at=now,
+        completed_at=now,
+    )
+
+    result = _aggregate_trials(
+        EvalCase(id="partial", request=_request()),
+        [concrete, no_session],
+        started_at=now,
+        completed_at=now,
+        retain_trajectory=False,
+    )
+
+    assert result.trial_session_ids == ("concrete-session",)
+    assert result.session_id == "concrete-session"
+
+
+@pytest.mark.parametrize(
+    ("authored_causal_budget_id", "budget_key"),
+    [
+        ("authored-budget", "authored-budget"),
+        (None, "authored-session"),
+    ],
+)
+def test_trials_replace_authored_session_but_preserve_causal_identity_and_isolate_state(
+    authored_causal_budget_id,
+    budget_key,
+):
+    app = _app()
+    case = EvalCase(
+        id="isolated",
+        request=RunRequest(
+            agent_name="agent",
+            session_id="authored-session",
+            causal_budget_id=authored_causal_budget_id,
+            messages=[Message.text("user", "fresh trial")],
+            max_steps=1,
+            budget_limits=(_causal_budget_limit(budget_key),),
+        ),
+        assertions=[_SequenceScoreAssertion([1.0, 1.0])],
+    )
+
+    async def scenario():
+        async for _ in app.run(
+            RunRequest(
+                agent_name="agent",
+                session_id="authored-session",
+                messages=[Message.text("user", "poisoned prior state")],
+                max_steps=1,
+            )
+        ):
+            pass
+        result = await run_eval_case(app, case, suite_id="s", trials=2)
+        transcripts = [
+            await app.session_store.load_transcript(session_id)
+            for session_id in result.trial_session_ids
+        ]
+        sessions = [
+            await app.session_store.load(session_id) for session_id in result.trial_session_ids
+        ]
+        return result, transcripts, sessions
+
+    result, transcripts, sessions = asyncio.run(scenario())
+
+    assert case.request.session_id == "authored-session"
+    assert case.request.causal_budget_id == authored_causal_budget_id
+    assert case.request.budget_limits[0].key == budget_key
+    assert result.status == EvalStatus.PASSED
+    assert result.authored_session_id == "authored-session"
+    assert len(result.trial_session_ids) == 2
+    assert len(set(result.trial_session_ids)) == 2
+    assert "authored-session" not in result.trial_session_ids
+    assert all(session is not None for session in sessions)
+    effective_causal_budget_id = authored_causal_budget_id or "authored-session"
+    assert [session.causal_budget_id for session in sessions if session is not None] == [
+        effective_causal_budget_id,
+        effective_causal_budget_id,
+    ]
+    assert all(
+        "poisoned prior state"
+        not in " ".join(
+            part.text for message in transcript for part in message.content if hasattr(part, "text")
+        )
+        for transcript in transcripts
+    )
+
+
+def test_trial_does_not_rewrite_mismatched_causal_budget_limit():
+    app = _app()
+    case = EvalCase(
+        id="mismatched-budget",
+        request=RunRequest(
+            agent_name="agent",
+            session_id="authored-session",
+            causal_budget_id="authored-budget",
+            messages=[Message.text("user", "go")],
+            budget_limits=(_causal_budget_limit("different-budget"),),
+        ),
+        assertions=[_SequenceScoreAssertion([1.0])],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="s"))
+
+    provider = app.get_provider()
+    assert isinstance(provider, ScriptedModelProvider)
+    assert provider.requests == []
+    assert case.request.budget_limits[0].key == "different-budget"
+    assert result.status == EvalStatus.ERROR
+    assert result.error is not None
+    assert "does not match" in result.error
+
+
+def test_trials_without_authored_identity_default_causal_id_to_concrete_session():
+    app = _app()
+    case = EvalCase(
+        id="anonymous-identity",
+        request=_request(),
+        assertions=[_SequenceScoreAssertion([1.0, 1.0])],
+    )
+
+    async def scenario():
+        result = await run_eval_case(app, case, suite_id="s", trials=2)
+        sessions = [
+            await app.session_store.load(session_id) for session_id in result.trial_session_ids
+        ]
+        return result, sessions
+
+    result, sessions = asyncio.run(scenario())
+
+    assert result.status == EvalStatus.PASSED
+    assert all(session is not None for session in sessions)
+    assert [session.causal_budget_id for session in sessions if session is not None] == list(
+        result.trial_session_ids
+    )
+
+
+def test_eval_trial_preserves_causal_identity_for_app_budget_policy():
+    app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(_causal_budget_limit("authored-budget"),)),
+        enable_logging=False,
+    )
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("ok"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="app-causal-policy",
+        request=RunRequest(
+            agent_name="agent",
+            session_id="authored-session",
+            causal_budget_id="authored-budget",
+            messages=[Message.text("user", "go")],
+        ),
+        assertions=[_SequenceScoreAssertion([1.0])],
+    )
+
+    async def scenario():
+        result = await run_eval_case(app, case, suite_id="s")
+        assert result.session_id is not None
+        session = await app.session_store.load(result.session_id)
+        events = await app.session_store.load_events(result.session_id)
+        return result, session, events
+
+    result, session, events = asyncio.run(scenario())
+
+    assert result.status == EvalStatus.PASSED
+    assert result.session_id != "authored-session"
+    assert session is not None
+    assert session.causal_budget_id == "authored-budget"
+    assert EventType.BUDGET_CHECKED in [event.type for event in events]
 
 
 def test_trials_mean_below_threshold_fails():
@@ -173,16 +463,18 @@ def test_trials_preserve_partial_execution_errors():
     assert result.metadata["trial_statuses"] == ["passed", "error"]
 
 
-def test_trials_single_run_is_unchanged():
+def test_trials_single_run_skips_aggregation_metadata():
     case = EvalCase(
         id="one",
         request=_request(),
         assertions=[_SequenceScoreAssertion([0.7], threshold=0.5)],
     )
     result = asyncio.run(run_eval_case(_app(), case, suite_id="s"))
-    # trials=1 returns the single run verbatim: no trial metadata, original message.
+    # trials=1 keeps the assertion result verbatim and does not add aggregation metadata.
     assert result.assertions[0].message == "graded"
     assert "trials" not in result.metadata
+    assert result.authored_session_id is None
+    assert result.trial_session_ids == (result.session_id,)
 
 
 def test_trials_rejects_invalid_values():

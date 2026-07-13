@@ -26,9 +26,9 @@ from cayu.runtime.usage import SessionUsageSummary
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can detect a baseline
-# written by a newer cayu instead of silently misreading it. (Migration of old
-# baselines is a follow-up; today the guard only rejects newer-than-supported.)
-EVAL_SCHEMA_VERSION = 1
+# written by a newer cayu instead of silently misreading it. Version 2 adds explicit
+# authored/concrete trial session identity; version 1 remains loadable via model normalization.
+EVAL_SCHEMA_VERSION = 2
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —
@@ -92,6 +92,12 @@ class EvalCaseResult(BaseModel):
 
     case_id: str
     status: EvalStatus
+    # The caller-authored logical session identity, if one was supplied on the case request.
+    # Eval execution never uses this as a concrete session ID.
+    authored_session_id: str | None = None
+    # Every concrete trial session, in execution order. `session_id` remains the representative
+    # (last) concrete session for compatibility with existing report consumers.
+    trial_session_ids: tuple[str, ...] = Field(default_factory=tuple)
     session_id: str | None = None
     score: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
     final_output: str = ""
@@ -113,12 +119,33 @@ class EvalCaseResult(BaseModel):
     def validate_case_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("session_id")
+    @model_validator(mode="before")
+    @classmethod
+    def default_legacy_trial_session_ids(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and "trial_session_ids" not in data
+            and isinstance(data.get("session_id"), str)
+        ):
+            return {**data, "trial_session_ids": (data["session_id"],)}
+        return data
+
+    @field_validator("session_id", "authored_session_id")
     @classmethod
     def validate_session_id(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("trial_session_ids")
+    @classmethod
+    def validate_trial_session_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(
+            require_clean_nonblank(session_id, "trial_session_ids item") for session_id in value
+        )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("trial_session_ids must contain distinct session IDs.")
+        return normalized
 
     @field_validator("error", mode="before")
     @classmethod
