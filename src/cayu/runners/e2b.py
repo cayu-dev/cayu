@@ -364,6 +364,8 @@ class E2BRunner(Runner):
                     timed_out=True,
                     stdout_truncated=stdout.truncated,
                     stderr_truncated=stderr.truncated,
+                    stdout_bytes=stdout.total_bytes,
+                    stderr_bytes=stderr.total_bytes,
                     artifacts=[cleanup.artifact],
                 )
             if _is_command_exit(exc):
@@ -561,6 +563,7 @@ class _LimitedText:
     def __init__(self, limit: int | None) -> None:
         self.limit = limit
         self.content = bytearray()
+        self.total_bytes = 0
         self.truncated = False
 
     def append(self, data: str | bytes) -> None:
@@ -572,6 +575,7 @@ class _LimitedText:
             raise TypeError("E2B command output chunks must be strings or bytes.")
         if not chunk:
             return
+        self.total_bytes += len(chunk)
         if self.limit is None:
             self.content.extend(chunk)
             return
@@ -688,6 +692,8 @@ def _exec_result_from_e2b_result(
         exit_code=exit_code,
         stdout_truncated=stdout.truncated,
         stderr_truncated=stderr.truncated,
+        stdout_bytes=stdout.total_bytes,
+        stderr_bytes=stderr.total_bytes,
     )
 
 

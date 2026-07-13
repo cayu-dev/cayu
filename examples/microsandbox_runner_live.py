@@ -4,7 +4,8 @@ import asyncio
 import os
 from typing import cast
 
-from _live_checks import require_cleanup_artifact, require_equal, require_exec_success
+from _live_checks import require_cleanup_artifact, require_exec_success
+from _runner_conformance import verify_bounded_output_drain
 from cayu import ExecCommand, MicrosandboxRunner, RunnerCleanupPolicy
 
 
@@ -75,25 +76,14 @@ async def main() -> None:
         require_exec_success(explicit_env, stdout="visible\n", label="explicit_env")
         print(f"explicit_env {explicit_env.stdout.strip()}")
 
-        bounded = await runner.exec(
-            ExecCommand.process(
-                "sh",
-                "-c",
-                "printf abcdef; printf uvwxyz >&2",
-            ),
-            output_limit_bytes=3,
-        )
+        bounded = await verify_bounded_output_drain(runner, adapter="microsandbox")
         print(
             "bounded "
-            f"stdout={bounded.stdout!r} "
+            f"stdout_bytes={bounded.stdout_bytes} "
             f"stdout_truncated={bounded.stdout_truncated} "
-            f"stderr={bounded.stderr!r} "
+            f"stderr_bytes={bounded.stderr_bytes} "
             f"stderr_truncated={bounded.stderr_truncated}"
         )
-        require_equal(bounded.stdout, "abc", "bounded stdout")
-        require_equal(bounded.stderr, "uvw", "bounded stderr")
-        require_equal(bounded.stdout_truncated, True, "bounded stdout_truncated")
-        require_equal(bounded.stderr_truncated, True, "bounded stderr_truncated")
 
         cwd = await runner.exec(
             ExecCommand.process("pwd"),

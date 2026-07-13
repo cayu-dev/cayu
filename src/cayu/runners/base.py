@@ -120,6 +120,8 @@ class ExecCommand(BaseModel):
 
 
 class ExecResult(BaseModel):
+    """Observed command outcome, including bounded capture and full byte totals."""
+
     model_config = ConfigDict(extra="forbid")
 
     stdout: str = ""
@@ -129,6 +131,8 @@ class ExecResult(BaseModel):
     cancelled: StrictBool = False
     stdout_truncated: StrictBool = False
     stderr_truncated: StrictBool = False
+    stdout_bytes: StrictInt | None = Field(default=None, ge=0)
+    stderr_bytes: StrictInt | None = Field(default=None, ge=0)
     artifacts: list[dict] = Field(default_factory=list)
 
     @field_validator("artifacts", mode="before")
@@ -150,6 +154,8 @@ class Runner(ABC):
       work.
     - ``reopen_exec()`` explicitly clears that latch after the caller verified
       out-of-band that no stale command is running.
+    - ``close()`` is terminal for command execution, even for adapters whose
+      configured close action intentionally leaves a remote sandbox alive.
     """
 
     isolation: str = "unknown"

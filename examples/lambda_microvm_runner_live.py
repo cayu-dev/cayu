@@ -7,6 +7,7 @@ import json
 import os
 
 from _live_checks import require, require_exec_success
+from _runner_conformance import verify_bounded_output_drain
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
@@ -62,14 +63,7 @@ async def main() -> None:
         )
         require_exec_success(env_result, stdout="yes/absent", label="environment isolation")
 
-        bounded = await runner.exec(
-            ExecCommand.bash("printf abcdef; printf uvwxyz >&2"), output_limit_bytes=3
-        )
-        require(bounded.stdout == "abc" and bounded.stderr == "uvw", "output was not bounded")
-        require(
-            bounded.stdout_truncated and bounded.stderr_truncated,
-            "bounded output omitted truncation flags",
-        )
+        await verify_bounded_output_drain(runner, adapter="lambda-microvm")
 
         timed_out = await runner.exec(ExecCommand.bash("sleep 30"), timeout_s=1)
         require(timed_out.timed_out, "sidecar did not report command timeout")

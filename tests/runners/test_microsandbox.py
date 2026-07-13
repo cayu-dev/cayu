@@ -285,6 +285,8 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
     assert result.stderr == "uvw"
     assert result.stdout_truncated is True
     assert result.stderr_truncated is True
+    assert result.stdout_bytes == 6
+    assert result.stderr_bytes == 6
     assert sandbox.exec_calls == [
         {
             "cmd": "python",
@@ -745,8 +747,8 @@ def test_microsandbox_runner_can_skip_cancellation_cleanup_explicitly() -> None:
     ]
 
 
-def test_microsandbox_runner_stays_reusable_when_cancelled_before_handle_is_returned() -> None:
-    async def run() -> tuple[FakeSandbox, int]:
+def test_microsandbox_runner_latches_when_cancelled_before_handle_is_returned() -> None:
+    async def run() -> tuple[FakeSandbox, Any]:
         reset_fake_module()
         sandbox = FakeSandbox("runner")
         sandbox.cancel_next_stream = True
@@ -758,17 +760,16 @@ def test_microsandbox_runner_stays_reusable_when_cancelled_before_handle_is_retu
         )
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await runner.exec(ExecCommand.process("sleep", "30"))
-        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
-        after = await runner.exec(ExecCommand.process("pwd"))
+        with pytest.raises(RuntimeError, match="command state is unknown"):
+            await runner.exec(ExecCommand.process("pwd"))
         await runner.close()
-        return sandbox, exc_info.value, after.exit_code
+        return sandbox, exc_info.value
 
-    sandbox, exc, after = asyncio.run(run())
+    sandbox, exc = asyncio.run(run())
 
     assert sandbox.kill_calls == 0
     assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == ["runner"]
-    assert after == 0
     assert exc.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -893,9 +894,7 @@ def test_microsandbox_runner_stays_reusable_when_command_kill_fails() -> None:
     ]
 
 
-def test_microsandbox_runner_stays_reusable_when_timeout_happens_before_handle_is_returned() -> (
-    None
-):
+def test_microsandbox_runner_latches_when_timeout_happens_before_handle_is_returned() -> None:
     async def run() -> tuple[FakeSandbox, Any]:
         sandbox = FakeSandbox("runner")
         sandbox.timeout_next_stream = True
@@ -905,16 +904,15 @@ def test_microsandbox_runner_stays_reusable_when_timeout_happens_before_handle_i
             sandbox_module=FakeMicrosandboxModule,
         )
         result = await runner.exec(ExecCommand.process("sleep", "30"))
-        sandbox.next_handle = FakeHandle([FakeExitedEvent(code=0)])
-        after = await runner.exec(ExecCommand.process("pwd"))
-        return sandbox, result, after.exit_code
+        with pytest.raises(RuntimeError, match="command state is unknown"):
+            await runner.exec(ExecCommand.process("pwd"))
+        return sandbox, result
 
-    sandbox, result, after = asyncio.run(run())
+    sandbox, result = asyncio.run(run())
 
     assert result.timed_out is True
     assert result.exit_code == -9
     assert sandbox.kill_calls == 0
-    assert after == 0
     assert result.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",

@@ -468,6 +468,8 @@ async def test_lambda_microvm_runner_creates_and_executes_without_host_env_leak(
     assert result.exit_code == 7
     assert result.stdout_truncated is True
     assert result.stderr_truncated is False
+    assert result.stdout_bytes == 6
+    assert result.stderr_bytes == 7
     assert runner.microvm_id == "mvm-123"
     assert runner.image_version == "7"
 

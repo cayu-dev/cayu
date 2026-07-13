@@ -127,6 +127,8 @@ def test_run_subprocess_executes_process_and_bounds_output(tmp_path) -> None:
 
     assert result.stdout == "abcd"
     assert result.stdout_truncated is True
+    assert result.stdout_bytes == 7
+    assert result.stderr_bytes == 0
     assert result.exit_code == 0
 
 
@@ -155,6 +157,8 @@ def test_run_subprocess_reports_missing_command(tmp_path) -> None:
 
     assert result.exit_code == 127
     assert "Command not found" in result.stderr
+    assert result.stdout_bytes == 0
+    assert result.stderr_bytes == len(result.stderr.encode("utf-8"))
 
 
 def test_run_subprocess_times_out_and_returns_partial_output(tmp_path) -> None:

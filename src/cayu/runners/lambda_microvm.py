@@ -551,6 +551,8 @@ class LambdaMicroVMRunner(Runner):
             timed_out=True,
             stdout_truncated=terminal.stdout_truncated,
             stderr_truncated=terminal.stderr_truncated,
+            stdout_bytes=terminal.stdout_bytes,
+            stderr_bytes=terminal.stderr_bytes,
         )
 
     async def suspend(self) -> None:
@@ -801,18 +803,31 @@ def _exec_result(response: Mapping[str, Any]) -> ExecResult:
     exit_code = response.get("exit_code")
     if type(exit_code) is not int:
         raise LambdaMicroVMProtocolError("Lambda MicroVM result exit_code must be an integer.")
+    stdout_bytes = _output_byte_count(response, "stdout_bytes")
+    stderr_bytes = _output_byte_count(response, "stderr_bytes")
     return ExecResult(
-        stdout=_decode_output(response, "stdout_base64", "stdout_bytes"),
-        stderr=_decode_output(response, "stderr_base64", "stderr_bytes"),
+        stdout=_decode_output(response, "stdout_base64", stdout_bytes),
+        stderr=_decode_output(response, "stderr_base64", stderr_bytes),
         exit_code=exit_code,
         timed_out=_required_bool(response, "timed_out"),
         cancelled=_optional_bool(response, "cancelled", False),
         stdout_truncated=_required_bool(response, "stdout_truncated"),
         stderr_truncated=_required_bool(response, "stderr_truncated"),
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
     )
 
 
-def _decode_output(response: Mapping[str, Any], key: str, byte_count_key: str) -> str:
+def _output_byte_count(response: Mapping[str, Any], key: str) -> int:
+    value = response.get(key)
+    if type(value) is not int or value < 0:
+        raise LambdaMicroVMProtocolError(
+            f"Lambda MicroVM result {key} must be a nonnegative integer."
+        )
+    return value
+
+
+def _decode_output(response: Mapping[str, Any], key: str, byte_count: int) -> str:
     raw = response.get(key, "")
     if type(raw) is not str:
         raise LambdaMicroVMProtocolError(f"Lambda MicroVM result {key} must be a string.")
@@ -822,10 +837,9 @@ def _decode_output(response: Mapping[str, Any], key: str, byte_count_key: str) -
         raise LambdaMicroVMProtocolError(
             f"Lambda MicroVM result {key} was invalid base64."
         ) from exc
-    byte_count = response.get(byte_count_key)
-    if type(byte_count) is not int or byte_count < len(decoded):
+    if byte_count < len(decoded):
         raise LambdaMicroVMProtocolError(
-            f"Lambda MicroVM result {byte_count_key} must cover decoded output bytes."
+            f"Lambda MicroVM result byte total for {key} must cover decoded output bytes."
         )
     return decoded.decode("utf-8", errors="replace")
 

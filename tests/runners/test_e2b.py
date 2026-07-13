@@ -271,6 +271,8 @@ def test_e2b_runner_executes_process_with_shell_quoting_and_isolated_env(
     assert result.stderr == "uvw"
     assert result.stdout_truncated is True
     assert result.stderr_truncated is True
+    assert result.stdout_bytes == 6
+    assert result.stderr_bytes == 6
     assert sandbox.commands.calls == [
         {
             "cmd": "python -c 'print('\"'\"'hello world'\"'\"')'",

@@ -145,3 +145,25 @@ def test_runner_cancelled_error_stays_compatible():
     error = RunnerCancelledError(artifacts=[artifact])
     assert isinstance(error, asyncio.CancelledError)
     assert getattr(error, "artifacts", None) == [artifact]
+
+
+def test_exec_result_exposes_nonnegative_total_output_bytes():
+    result = ExecResult(
+        stdout="abc",
+        stderr="warning",
+        stdout_bytes=9,
+        stderr_bytes=12,
+        stdout_truncated=True,
+    )
+
+    assert result.stdout_bytes == 9
+    assert result.stderr_bytes == 12
+
+    with pytest.raises(ValueError, match="stdout_bytes"):
+        ExecResult(stdout_bytes=-1)
+    with pytest.raises(ValueError, match="stderr_bytes"):
+        ExecResult(stderr_bytes=-1)
+
+    properties = ExecResult.model_json_schema()["properties"]
+    for field_name in ("stdout_bytes", "stderr_bytes"):
+        assert {"minimum": 0, "type": "integer"} in properties[field_name]["anyOf"]

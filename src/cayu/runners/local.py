@@ -103,6 +103,7 @@ class LocalRunner(Runner):
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("LocalRunner command must be an ExecCommand.")
+        self._ensure_exec_open()
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=self.inherit_env)
         if not self.inherit_env:

@@ -341,6 +341,7 @@ class MicrosandboxRunner(Runner):
         try:
             await asyncio.wait_for(run_command(), timeout=timeout)
         except asyncio.CancelledError as exc:
+            start_acknowledged = handle is not None
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self._sandbox,
                 handle=handle,
@@ -349,11 +350,16 @@ class MicrosandboxRunner(Runner):
                 policy=self.cancellation_cleanup,
             )
             self._apply_cleanup_result(cleanup)
+            if not start_acknowledged and self.cancellation_cleanup == "none":
+                self._close_exec(
+                    "microsandbox command start was not acknowledged; command state is unknown"
+                )
             attach_cancellation_artifacts(exc, [cleanup.artifact])
             raise
         except Exception as exc:
             if not _is_timeout_error(exc):
                 raise
+            start_acknowledged = handle is not None
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self._sandbox,
                 handle=handle,
@@ -362,6 +368,10 @@ class MicrosandboxRunner(Runner):
                 policy=self.timeout_cleanup,
             )
             self._apply_cleanup_result(cleanup)
+            if not start_acknowledged and self.timeout_cleanup == "none":
+                self._close_exec(
+                    "microsandbox command start was not acknowledged; command state is unknown"
+                )
             return ExecResult(
                 stdout=stdout.text(),
                 stderr=stderr.text(),
@@ -369,6 +379,8 @@ class MicrosandboxRunner(Runner):
                 timed_out=True,
                 stdout_truncated=stdout.truncated,
                 stderr_truncated=stderr.truncated,
+                stdout_bytes=stdout.total_bytes,
+                stderr_bytes=stderr.total_bytes,
                 artifacts=[cleanup.artifact],
             )
 
@@ -379,12 +391,22 @@ class MicrosandboxRunner(Runner):
             timed_out=False,
             stdout_truncated=stdout.truncated,
             stderr_truncated=stderr.truncated,
+            stdout_bytes=stdout.total_bytes,
+            stderr_bytes=stderr.total_bytes,
         )
 
     def _apply_cleanup_result(self, cleanup: Any) -> None:
         # Unlike the base contract, a failed command kill does not latch the
         # exec path: the microsandbox supervisor still owns the command, so the
         # runner stays reusable (covered by the adapter's tests).
+        if (
+            cleanup.artifact.get("action") == "kill_command"
+            and cleanup.artifact.get("status") == "unsupported"
+        ):
+            self._close_exec(
+                "microsandbox command cleanup could not identify the command; "
+                "command state is unknown"
+            )
         if cleanup.close_runner:
             self._close_exec("runner cleanup closed the exec path")
         if (
@@ -398,11 +420,13 @@ class _LimitedBytes:
     def __init__(self, limit: int | None) -> None:
         self.limit = limit
         self.content = bytearray()
+        self.total_bytes = 0
         self.truncated = False
 
     def append(self, data: bytes) -> None:
         if not data:
             return
+        self.total_bytes += len(data)
         if self.limit is None:
             self.content.extend(data)
             return
@@ -416,6 +440,7 @@ class _LimitedBytes:
 
     def replace(self, data: bytes) -> None:
         self.content.clear()
+        self.total_bytes = 0
         self.truncated = False
         self.append(data)
 

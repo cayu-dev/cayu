@@ -7,6 +7,7 @@ import subprocess
 from uuid import uuid4
 
 import pytest
+from examples._runner_conformance import verify_bounded_output_drain
 
 from cayu import DockerRunner, ExecCommand
 
@@ -54,6 +55,8 @@ def test_real_docker_runner_executes_and_cleans_up_timed_out_command() -> None:
             assert ok.exit_code == 0
             assert ok.stdout == "docker-live-ok"
             assert ok.timed_out is False
+
+            await verify_bounded_output_drain(runner, adapter="docker")
 
             timed_out = await runner.exec(ExecCommand.process("sh", "-c", "sleep 30"), timeout_s=1)
             assert timed_out.timed_out is True

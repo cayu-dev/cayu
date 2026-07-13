@@ -115,14 +115,20 @@ async def run_subprocess(
                     stderr=asyncio.subprocess.PIPE,
                 )
     except FileNotFoundError:
+        message = f"Command not found: {command.command_name}"
         return ExecResult(
-            stderr=f"Command not found: {command.command_name}",
+            stderr=message,
             exit_code=127,
+            stdout_bytes=0,
+            stderr_bytes=len(message.encode("utf-8")),
         )
     except PermissionError:
+        message = f"Command not executable: {command.command_name}"
         return ExecResult(
-            stderr=f"Command not executable: {command.command_name}",
+            stderr=message,
             exit_code=126,
+            stdout_bytes=0,
+            stderr_bytes=len(message.encode("utf-8")),
         )
 
     input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
@@ -174,6 +180,8 @@ async def run_subprocess(
         timed_out=timed_out,
         stdout_truncated=stdout.truncated,
         stderr_truncated=stderr.truncated,
+        stdout_bytes=stdout.total_bytes,
+        stderr_bytes=stderr.total_bytes,
     )
 
 
@@ -361,6 +369,7 @@ class _CapturedOutput:
     def __init__(self) -> None:
         self._chunks: list[bytes] = []
         self._captured = 0
+        self.total_bytes = 0
         self.truncated = False
 
     @property
@@ -368,6 +377,7 @@ class _CapturedOutput:
         return b"".join(self._chunks)
 
     def append(self, chunk: bytes, *, limit: int | None) -> None:
+        self.total_bytes += len(chunk)
         if limit is None:
             self._chunks.append(chunk)
             return
