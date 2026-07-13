@@ -21,7 +21,11 @@ from cayu.vaults import StaticVault
 
 pytest.importorskip("cryptography")
 
-from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
+from cayu.egress.proxy_server import (
+    DualStackLoopbackEgressProxyServer,
+    SessionCertificateAuthority,
+    TransparentEgressProxyServer,
+)
 
 REAL_SECRET = "sk_test_51RealProxySwapSecret"
 
@@ -155,6 +159,44 @@ def test_plain_http_requests_are_rejected_without_broker_call() -> None:
     assert upstream.sent is None
 
 
+def test_dual_stack_loopback_proxy_serves_and_closes_both_address_families() -> None:
+    async def run() -> tuple[bytes, bytes, bool, bool]:
+        loop = asyncio.get_running_loop()
+        broker, _registry = _broker(_CapturingUpstream())
+        server = DualStackLoopbackEgressProxyServer(broker, loop=loop)
+        port = await server.start()
+
+        def request(host: str) -> bytes:
+            with socket.create_connection((host, port), timeout=5.0) as conn:
+                conn.sendall(
+                    b"GET http://api.stripe.com/v1/customers HTTP/1.1\r\n"
+                    b"Host: api.stripe.com\r\n\r\n"
+                )
+                return conn.recv(1024)
+
+        ipv4, ipv6 = await asyncio.gather(
+            asyncio.to_thread(request, "127.0.0.1"),
+            asyncio.to_thread(request, "::1"),
+        )
+        await server.close()
+
+        def is_closed(host: str) -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=0.25):
+                    return False
+            except OSError:
+                return True
+
+        return ipv4, ipv6, is_closed("127.0.0.1"), is_closed("::1")
+
+    ipv4, ipv6, ipv4_closed, ipv6_closed = asyncio.run(run())
+
+    assert ipv4.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert ipv6.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert ipv4_closed is True
+    assert ipv6_closed is True
+
+
 def test_start_closes_listener_when_bind_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeSock:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -197,6 +239,60 @@ def test_start_closes_listener_when_bind_fails(monkeypatch: pytest.MonkeyPatch) 
 
     # The listener socket was created but bind failed — it must be closed, not leaked.
     assert created and created[0].closed is True
+
+
+def test_dual_stack_start_closes_ipv4_listener_when_ipv6_bind_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeSock:
+        def __init__(self, family: int) -> None:
+            self.family = family
+            self.closed = False
+
+        def setsockopt(self, *args: object) -> None:
+            pass
+
+        def bind(self, *args: object) -> None:
+            if self.family == socket.AF_INET6:
+                raise OSError("IPv6 loopback unavailable")
+
+        def listen(self, *args: object) -> None:
+            pass
+
+        def settimeout(self, *args: object) -> None:
+            pass
+
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 8123)
+
+        def close(self) -> None:
+            self.closed = True
+
+    created: list[_FakeSock] = []
+
+    def resolve(host: str, port: int, **kwargs: object) -> list[tuple[Any, ...]]:
+        family = socket.AF_INET6 if host == "::1" else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 0, "", (host, port))]
+
+    def create_socket(family: int, *args: object) -> _FakeSock:
+        sock = _FakeSock(family)
+        created.append(sock)
+        return sock
+
+    loop = asyncio.new_event_loop()
+    try:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = DualStackLoopbackEgressProxyServer(broker, loop=loop)
+        monkeypatch.setattr("cayu.egress.proxy_server.socket.getaddrinfo", resolve)
+        monkeypatch.setattr("cayu.egress.proxy_server.socket.socket", create_socket)
+        with pytest.raises(OSError, match="IPv6 loopback unavailable"):
+            loop.run_until_complete(server.start())
+        loop.run_until_complete(server.close())
+    finally:
+        loop.close()
+
+    assert len(created) == 2
+    assert all(sock.closed for sock in created)
 
 
 def test_leaf_cert_files_do_not_use_untrusted_connect_host(

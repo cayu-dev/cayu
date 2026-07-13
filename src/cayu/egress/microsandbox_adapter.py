@@ -9,7 +9,6 @@ from types import ModuleType
 from typing import Any
 
 from cayu.egress._remote_adapter import (
-    DEFAULT_PROXY_SERVER_FACTORY,
     ProxyServerFactory,
     prepare_exposed_proxy_binding,
     run_enforcement_preflight,
@@ -28,6 +27,7 @@ from cayu.egress.proxy_exposure import (
     MicrosandboxHostProxyExposure,
     ProxyExposure,
 )
+from cayu.egress.proxy_server import DualStackLoopbackEgressProxyServer
 from cayu.runners.base import Runner
 from cayu.runners.microsandbox import MicrosandboxRunner
 
@@ -40,18 +40,14 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     def __init__(
         self,
         *,
-        bind_host: str = "0.0.0.0",
         exposure: ProxyExposure | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
         microsandbox_module: ModuleType | Any | None = None,
-        proxy_server_factory: ProxyServerFactory = DEFAULT_PROXY_SERVER_FACTORY,
+        proxy_server_factory: ProxyServerFactory = DualStackLoopbackEgressProxyServer,
         preflight_timeout_s: int = 15,
     ) -> None:
-        if not bind_host.strip():
-            raise ValueError("Microsandbox proxy bind_host must be nonblank.")
         if type(preflight_timeout_s) is not int or preflight_timeout_s <= 0:
             raise ValueError("preflight_timeout_s must be a positive integer.")
-        self._bind_host = bind_host
         self._exposure = exposure or MicrosandboxHostProxyExposure()
         self._loop = loop
         self._module = microsandbox_module
@@ -70,7 +66,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             broker=broker,
             grants=grants,
             exposure=self._exposure,
-            bind_host=self._bind_host,
+            bind_host="127.0.0.1",
             loop=self._loop,
             proxy_server_factory=self._proxy_server_factory,
         )

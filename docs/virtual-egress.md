@@ -144,14 +144,16 @@ Microsandbox runs locally and exposes the host as
 policy that allows only DNS to the host gateway and TCP to the per-session Cayu
 proxy port. The session CA is copied into the root filesystem before boot.
 
-The adapter binds the proxy to `0.0.0.0` by default so the microVM's reserved
-host gateway can reach it across supported host setups. That listener may also
-be reachable from the host's LAN interfaces while the session is active. It is
-credential- and destination-gated rather than an open relay, but it still adds
-an avoidable connection/DoS surface. Where the deployment has a stable
-guest-reachable bridge address, pass that address as `bind_host`; otherwise use
-host firewalling to keep the ephemeral proxy port off untrusted networks. A
-loopback-only bind is rejected because the microVM cannot reach it.
+Microsandbox publishes both IPv4 and IPv6 gateway addresses for that hostname
+and rewrites them to the matching host loopback address. Cayu therefore binds
+the same ephemeral proxy port on both `127.0.0.1` and `::1`; guest clients work
+regardless of which address family they select. Both listeners share one broker
+and session CA, and both are closed during teardown. Setup fails closed if
+either listener cannot be established.
+
+The default is deliberately loopback-only. It does not expose the proxy port on
+the host's LAN interfaces. The adapter exposes no bind-host override; paired
+loopback listeners are part of its fixed Microsandbox exposure contract.
 
 ```python
 from cayu.egress import EgressAdapterRegistry

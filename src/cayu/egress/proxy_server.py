@@ -9,6 +9,7 @@ import socket
 import ssl
 import tempfile
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
@@ -152,18 +153,23 @@ class TransparentEgressProxyServer:
         *,
         loop: asyncio.AbstractEventLoop,
         authority: SessionCertificateAuthority | None = None,
-        host: str = "127.0.0.1",
+        host: str | Sequence[str] = "127.0.0.1",
         port: int = 0,
         max_workers: int = 16,
     ) -> None:
+        listen_hosts = (host,) if isinstance(host, str) else tuple(host)
+        if not listen_hosts or any(not item.strip() for item in listen_hosts):
+            raise ValueError("Egress proxy listen hosts must be nonblank.")
+        if len(set(listen_hosts)) != len(listen_hosts):
+            raise ValueError("Egress proxy listen hosts must be unique.")
         self._broker = broker
         self._loop = loop
         self._authority = authority or SessionCertificateAuthority()
-        self._host = host
+        self._hosts = listen_hosts
         self._port = port
-        self._socket: socket.socket | None = None
+        self._sockets: list[socket.socket] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._accept_thread: threading.Thread | None = None
+        self._accept_threads: list[threading.Thread] = []
         self._stop = threading.Event()
 
     @property
@@ -172,41 +178,74 @@ class TransparentEgressProxyServer:
 
     @property
     def port(self) -> int:
-        if self._socket is None:
+        if not self._sockets:
             raise RuntimeError("Proxy server is not started.")
-        return self._socket.getsockname()[1]
+        return self._sockets[0].getsockname()[1]
 
     async def start(self) -> int:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listeners: list[socket.socket] = []
+        port = self._port
         try:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((self._host, self._port))
-            listener.listen(128)
-            listener.settimeout(0.5)
+            for host in self._hosts:
+                listener = self._open_listener(host, port)
+                listeners.append(listener)
+                if port == 0:
+                    port = listener.getsockname()[1]
         except BaseException:
-            # bind()/listen() can fail (port in use, bad host); don't leak the fd.
-            listener.close()
+            for listener in listeners:
+                listener.close()
             raise
-        self._socket = listener
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+
+        self._sockets = listeners
+        self._accept_threads = [
+            threading.Thread(target=self._accept_loop, args=(listener,), daemon=True)
+            for listener in listeners
+        ]
+        for thread in self._accept_threads:
+            thread.start()
         return self.port
 
     async def close(self) -> None:
         self._stop.set()
-        if self._accept_thread is not None:
-            await asyncio.to_thread(self._accept_thread.join, 5.0)
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        for listener in self._sockets:
+            listener.close()
+        self._sockets = []
+        if self._accept_threads:
+            await asyncio.gather(
+                *(asyncio.to_thread(thread.join, 5.0) for thread in self._accept_threads)
+            )
+            self._accept_threads = []
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._authority.close()
 
-    def _accept_loop(self) -> None:
-        assert self._socket is not None
+    @staticmethod
+    def _open_listener(host: str, port: int) -> socket.socket:
+        addresses = socket.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_PASSIVE,
+        )
+        if not addresses:
+            raise OSError(f"No listen address resolved for {host!r}.")
+        family, sock_type, protocol, _, address = addresses[0]
+        listener = socket.socket(family, sock_type, protocol)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            listener.bind(address)
+            listener.listen(128)
+            listener.settimeout(0.5)
+        except BaseException:
+            listener.close()
+            raise
+        return listener
+
+    def _accept_loop(self, listener: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                conn, _ = self._socket.accept()
+                conn, _ = listener.accept()
             except TimeoutError:
                 continue
             except OSError:
@@ -278,6 +317,31 @@ class TransparentEgressProxyServer:
                 waited += 0.25
         future.cancel()
         raise TimeoutError("Broker did not respond within the timeout.")
+
+
+class DualStackLoopbackEgressProxyServer(TransparentEgressProxyServer):
+    """Expose one proxy port on both host loopback address families."""
+
+    def __init__(
+        self,
+        broker: TransparentEgressBroker,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        authority: SessionCertificateAuthority | None = None,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        max_workers: int = 16,
+    ) -> None:
+        if host != "127.0.0.1":
+            raise ValueError("Dual-stack loopback proxy host must be '127.0.0.1'.")
+        super().__init__(
+            broker,
+            loop=loop,
+            authority=authority,
+            host=(host, "::1"),
+            port=port,
+            max_workers=max_workers,
+        )
 
 
 def _write_private(path: str, data: bytes) -> None:

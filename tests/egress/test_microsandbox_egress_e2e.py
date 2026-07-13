@@ -38,7 +38,7 @@ class _CapturingAdapter(MicrosandboxEgressAdapter):
 
 
 async def _drive() -> dict[str, Any]:
-    adapter = _CapturingAdapter(bind_host="0.0.0.0")
+    adapter = _CapturingAdapter()
     return await drive_adversarial_egress_contract(
         adapter=adapter,
         real_secret=REAL_SECRET,

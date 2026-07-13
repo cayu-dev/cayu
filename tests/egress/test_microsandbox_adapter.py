@@ -195,7 +195,6 @@ def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Pa
         _FakeSandboxApi.removed = []
         broker, grant = _broker_and_grant()
         adapter = MicrosandboxEgressAdapter(
-            bind_host="0.0.0.0",
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
         )
@@ -227,6 +226,7 @@ def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Pa
 
     assert binding.proxy_url == "http://host.microsandbox.internal:8123"
     assert binding.env["HTTPS_PROXY"] == binding.proxy_url
+    assert _FakeProxyServer.instances[0].host == "127.0.0.1"
     created = _FakeSandboxApi.created[0]
     network = created["network"]
     assert network.policy.default_egress == "deny"
@@ -262,7 +262,6 @@ def test_microsandbox_adapter_rejects_mismatched_runner_kind(tmp_path: Path) -> 
     async def run() -> None:
         broker, grant = _broker_and_grant()
         adapter = MicrosandboxEgressAdapter(
-            bind_host="0.0.0.0",
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
         )
@@ -288,3 +287,8 @@ def test_microsandbox_adapter_rejects_mismatched_runner_kind(tmp_path: Path) -> 
         await binding.close()
 
     asyncio.run(run())
+
+
+def test_microsandbox_adapter_has_no_proxy_bind_override() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument 'bind_host'"):
+        MicrosandboxEgressAdapter(bind_host="0.0.0.0")

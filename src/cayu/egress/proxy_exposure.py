@@ -67,9 +67,10 @@ class MicrosandboxHostProxyExposure:
 
     async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
         normalized = local_host.strip().lower()
-        if normalized in {"localhost", "127.0.0.1", "::1"}:
+        if normalized != "127.0.0.1":
             raise UnsupportedEgressError(
-                "Microsandbox cannot reach a loopback-only Cayu proxy listener."
+                "Microsandbox virtual egress requires Cayu's paired IPv4/IPv6 "
+                "loopback proxy listener."
             )
         if local_port <= 0:
             raise ValueError("local_port must be positive.")
