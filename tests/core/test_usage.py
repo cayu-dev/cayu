@@ -1716,6 +1716,23 @@ def test_normalize_declared_dialect_beats_name_alias() -> None:
     assert metrics.cache.uncached_input_tokens == 60
 
 
+def test_normalize_openai_usage_dialect_enum_marks_cached_tokens_as_reads() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-chat-provider",
+        model="chat-model",
+        raw_usage={
+            "prompt_tokens": 9,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 3},
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.cache.read_tokens == 3
+    assert metrics.cache.cached_input_tokens == 3
+
+
 def test_normalize_unknown_dialect_falls_back_to_detection() -> None:
     # An unrecognized dialect string is treated as "auto" and detection applies.
     metrics = normalize_usage_metrics(

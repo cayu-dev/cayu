@@ -1031,6 +1031,30 @@ Provider adapters must:
 - stop emitting after `completed`
 - keep provider-specific API payload formatting isolated inside the adapter
 
+The deterministic provider conformance suite lives in
+`tests/providers/test_provider_conformance.py`. It runs every built-in adapter
+against scripted transports through the public `ModelProvider.stream(...)`,
+`count_input_tokens(...)`, and close seams. The shared scenarios cover ordered
+text and terminal metadata, normalized usage, fragmented tool calls and the
+next-request tool-result round trip, typed retryable errors, typed context
+overflow, malformed and unfinished streams, bounded cancellation/idle/close
+behavior, and declared optional capabilities. A new built-in provider must be
+added to the conformance registry; a registry completeness test prevents an
+exported adapter from silently bypassing the suite. Seeded broken adapters also
+exercise the validators so a failure reports the scenario, adapter, optional
+capability, and observed behavior.
+
+This suite is hermetic CI evidence. It uses no credentials, network access, or
+paid provider calls, and it proves Cayu's adapter-level normalization against
+recorded protocol shapes. It does not prove that credentials work, a particular
+account can access a model, a model supports every optional feature, or a vendor
+has not changed its live service. Credentialed examples and the checks described
+in `docs/nightly-verification.md` remain the live boundary, tracked by
+[issue #247](https://github.com/vertexkg/cayu/issues/247). Model-specific facts
+such as tool support, reasoning availability, modalities, lifecycle, and pricing
+belong in a model catalog or application configuration rather than this
+adapter-level conformance registry.
+
 The runtime owns conversion from `ModelStreamEvent` to durable runtime `Event` records, including `session_id`, `agent_name`, and `environment_name`. Provider errors should be yielded as model error stream events; the runtime records the model error event and fails the session. Tool calls should be emitted as structured tool-call stream events so the runtime can execute tools and feed structured results back into the next model step.
 
 Providers that require opaque response items for stateless continuation may return transcript-only `provider_state` in completed stream-event payloads. The runtime stores that state as assistant `ProviderStatePart` content so future provider requests can replay it, but strips it from `model.completed` event payloads and compaction metadata. Provider state is not user-facing text and should not be treated as dashboard telemetry.
@@ -1047,7 +1071,10 @@ Configure OpenAI transport timeouts on the provider. `timeout_s` controls ordina
 OpenAIProvider(timeout_s=600, stream_idle_timeout_s=300)
 ```
 
-`AnthropicProvider` currently uses complete API responses and yields normalized Cayu stream events from the returned model response. Anthropic server-sent-event streaming can be added behind the same provider contract later.
+`AnthropicProvider` uses server-sent-event streaming and normalizes text,
+thinking, tool-call, completion, usage, and typed failure events behind the same
+provider contract. Its transport enforces a provider-event idle timeout, and
+`aclose()` releases the shared HTTP client.
 
 ## Tool
 

@@ -726,6 +726,7 @@ async def openai_stream_events(
     events: AsyncIterator[Mapping[str, Any]], *, reasoning_state: str = "inline"
 ) -> AsyncIterator[ModelStreamEvent]:
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
+    pending_reasoning_items: set[int] = set()
     fallback_output_items: dict[int, dict[str, Any]] = {}
     completed = False
     async for event in events:
@@ -759,9 +760,15 @@ async def openai_stream_events(
                 yield ModelStreamEvent.thinking(delta)
             continue
         if event_type == "response.output_item.added":
+            item = event.get("item")
+            if isinstance(item, Mapping) and item.get("type") == "reasoning":
+                pending_reasoning_items.add(_stream_output_index(event))
             _record_stream_output_item_added(event, pending_function_calls)
             continue
         if event_type == "response.output_item.done":
+            item = event.get("item")
+            if isinstance(item, Mapping) and item.get("type") == "reasoning":
+                pending_reasoning_items.discard(_stream_output_index(event))
             _record_stream_output_item_done(event, fallback_output_items)
             continue
         if event_type == "response.function_call_arguments.delta":
@@ -776,6 +783,14 @@ async def openai_stream_events(
             yield tool_call_event
             continue
         if event_type in {"response.completed", "response.incomplete"}:
+            if pending_function_calls:
+                raise OpenAIProtocolError(
+                    "OpenAI streaming response completed with unfinished function calls."
+                )
+            if pending_reasoning_items:
+                raise OpenAIProtocolError(
+                    "OpenAI streaming response completed with unfinished reasoning items."
+                )
             yield _stream_completed_event(
                 event, fallback_output_items, reasoning_state=reasoning_state
             )
@@ -899,12 +914,15 @@ def _completed_event_from_response(
                 *provider_state_items,
                 {"provider": "openai", "state": {"type": "response_ref", "id": response_id}},
             ]
+    usage = response.get("usage")
+    if usage is not None and not isinstance(usage, Mapping):
+        raise OpenAIProtocolError("OpenAI response usage must be an object.")
     payload = {
         "id": _optional_string(response, "id"),
         "model": _optional_string(response, "model"),
         "status": _optional_string(response, "status"),
         "provider_state": provider_state_items,
-        "usage": copy_json_value(response.get("usage"), "usage"),
+        "usage": copy_json_value(None if usage is None else dict(usage), "usage"),
         "incomplete_details": copy_json_value(
             response.get("incomplete_details"),
             "incomplete_details",

@@ -363,10 +363,18 @@ To run commands on your own platform, implement a custom `Runner`: see the
 ```bash
 uv sync --extra dev
 uv run pytest
+uv run pytest tests/providers/test_provider_conformance.py -q
 uv run ruff check src/ tests/ examples/
 uv run ruff format src/ tests/ examples/
 uv run ty check src/cayu examples
 ```
+
+The provider conformance command is deterministic and credential-free. It
+exercises every built-in adapter with scripted transports and makes no paid API
+calls. Use the opt-in checks in
+[`docs/nightly-verification.md`](docs/nightly-verification.md) when you need
+evidence from real provider accounts and models; those live checks prove a
+different boundary than the CI conformance suite.
 
 Install optional file readers when the built-in `read_file` tool should inspect images/PDFs,
 resize oversized images, or extract selected PDF pages:

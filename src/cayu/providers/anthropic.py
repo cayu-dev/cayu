@@ -790,6 +790,8 @@ async def anthropic_stream_events(
             message_id = optional_string(message, "id")
             model = optional_string(message, "model")
             start_usage = message.get("usage")
+            if start_usage is not None and not isinstance(start_usage, Mapping):
+                raise protocol_error(f"{provider_label} message_start usage must be an object.")
             if isinstance(start_usage, Mapping):
                 usage = {**(usage or {}), **start_usage}
             continue
@@ -924,10 +926,16 @@ async def anthropic_stream_events(
                 stop_reason = optional_string(delta, "stop_reason") or stop_reason
                 stop_sequence = optional_string(delta, "stop_sequence") or stop_sequence
             delta_usage = event.get("usage")
+            if delta_usage is not None and not isinstance(delta_usage, Mapping):
+                raise protocol_error(f"{provider_label} message_delta usage must be an object.")
             if isinstance(delta_usage, Mapping):
                 usage = {**(usage or {}), **delta_usage}
             continue
         if event_type == "message_stop":
+            if blocks:
+                raise protocol_error(
+                    f"{provider_label} message_stop arrived with unfinished content blocks."
+                )
             completed = True
             yield ModelStreamEvent.completed(
                 {

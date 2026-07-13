@@ -921,6 +921,34 @@ async def test_chat_completions_stream_events_requires_finish_reason() -> None:
 
 
 @pytest.mark.anyio
+async def test_chat_completions_stream_events_tolerates_repeated_finish_reason() -> None:
+    async def raw_events():
+        yield _text_chunk("hello")
+        yield _finish_chunk("stop")
+        yield _finish_chunk("stop")
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].delta == "hello"
+    assert events[1].completion is not None
+    assert events[1].completion.finish_reason == ModelFinishReason.STOP
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_conflicting_finish_reasons() -> None:
+    async def raw_events():
+        yield _finish_chunk("stop")
+        yield _finish_chunk("tool_calls")
+
+    with pytest.raises(ChatCompletionsProtocolError, match="conflicting finish_reason"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
 async def test_chat_completions_stream_events_raises_on_mid_stream_error_chunk() -> None:
     # A fault reported after the stream opens arrives as a chunk carrying an
     # ``error`` object with no ``choices``; it must surface as the real API error,

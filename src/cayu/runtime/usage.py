@@ -351,7 +351,7 @@ def _resolve_usage_dialect(
     (Bedrock, gateways, renamed adapters) is still folded correctly.
     """
 
-    declared = declared_dialect.strip().lower() if type(declared_dialect) is str else None
+    declared = declared_dialect.strip().lower() if isinstance(declared_dialect, str) else None
     if declared in _KNOWN_DIALECTS:
         return declared
     if provider in _ANTHROPIC_SHAPED_PROVIDERS:

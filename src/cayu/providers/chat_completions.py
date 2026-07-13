@@ -44,6 +44,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    UsageDialect,
 )
 
 if TYPE_CHECKING:
@@ -221,6 +222,7 @@ class ChatCompletionsProvider(ModelProvider):
     """
 
     name = "openai_chat"
+    usage_dialect = UsageDialect.OPENAI
 
     def __init__(
         self,
@@ -460,6 +462,8 @@ async def chat_completions_stream_events(
         model = model or _optional_string(event, "model")
         chunk_usage = event.get("usage")
         if chunk_usage is not None:
+            if not isinstance(chunk_usage, Mapping):
+                raise ChatCompletionsProtocolError("Chat Completions usage must be an object.")
             usage = chunk_usage
 
         # Some OpenAI-compatible servers report a fault after the stream opens by
@@ -507,11 +511,15 @@ async def chat_completions_stream_events(
                     raise ChatCompletionsProtocolError(
                         "Chat Completions finish_reason must be a string."
                     )
+                if finish_reason is not None and choice_finish != finish_reason:
+                    raise ChatCompletionsProtocolError(
+                        "Chat Completions stream emitted conflicting finish_reason values."
+                    )
                 finish_reason = choice_finish
 
-    # Tool calls are emitted once, after the stream, before the terminal completed
-    # event. The finish_reason chunk is terminal for these providers, so nothing
-    # follows it that would need an earlier flush.
+    # Tool calls are emitted once, after the upstream stream, before Cayu's terminal
+    # completed event. Deferring normalization lets trailing usage or repeated
+    # identical finish metadata arrive without producing multiple terminal events.
     provider_state = tool_calls.provider_state_items()
     if tool_calls.has_pending():
         for tool_call_event in tool_calls.events():
