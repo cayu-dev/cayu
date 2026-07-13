@@ -114,6 +114,19 @@ The CI workflow also runs dashboard lint/typecheck, generated-client drift,
 package build, and packaged-asset status checks. It still does not run dashboard
 browser behavior tests.
 
+### CI source coverage visibility
+
+The Python 3.11 test leg records line and branch coverage for the `cayu` package.
+Missing lines appear in the job log, and the complete report is written to the
+GitHub Actions job summary. This is diagnostic visibility, not a release-quality
+score: CI has no global coverage threshold, so a percentage cannot fail the job;
+test or coverage-tool failures still do.
+
+Source coverage shows which in-process Python paths the required pytest suite
+executed. It does not replace the capability checks above and does not prove the
+quality of their assertions, subprocess behavior, or credential-gated live
+dependencies.
+
 ## Current Coverage Map
 
 The runner's `--list` output is the source of truth for exact check IDs. At a

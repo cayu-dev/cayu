@@ -48,7 +48,19 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --frozen --extra dev --extra server --python ${{ matrix.python-version }}
-      - run: uv run pytest -q
+      - name: Test with coverage visibility
+        if: matrix.python-version == '3.11'
+        run: |
+          uv run pytest -q \
+            --cov=cayu \
+            --cov-branch \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=markdown-append:${GITHUB_STEP_SUMMARY}
+        env:
+          CAYU_REQUIRE_POSTGRES: "1"
+      - name: Test
+        if: matrix.python-version != '3.11'
+        run: uv run pytest -q
         env:
           CAYU_REQUIRE_POSTGRES: "1"
 
