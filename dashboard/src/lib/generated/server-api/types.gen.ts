@@ -763,62 +763,6 @@ export type ApiSessionBase = {
 };
 
 /**
- * ApiSessionDetailEvent
- */
-export type ApiSessionDetailEvent = {
-    /**
-     * Agent Name
-     */
-    agent_name: string | null;
-    /**
-     * Environment Name
-     */
-    environment_name?: string | null;
-    /**
-     * Id
-     */
-    id: string;
-    /**
-     * Payload
-     */
-    payload: {
-        [key: string]: unknown;
-    };
-    /**
-     * Timestamp
-     */
-    timestamp: string;
-    /**
-     * Tool Name
-     */
-    tool_name: string | null;
-    /**
-     * Type
-     */
-    type: string;
-    /**
-     * Workflow Name
-     */
-    workflow_name?: string | null;
-};
-
-/**
- * ApiSessionDetailTranscriptMessage
- */
-export type ApiSessionDetailTranscriptMessage = {
-    /**
-     * Content
-     */
-    content: Array<{
-        [key: string]: unknown;
-    }>;
-    /**
-     * Role
-     */
-    role: string;
-};
-
-/**
  * ApiSessionOutcome
  */
 export type ApiSessionOutcome = {
@@ -1541,6 +1485,12 @@ export type ListSessionEventsResponse = {
      */
     order_by: 'sequence_asc' | 'sequence_desc';
     /**
+     * Scan Through Sequence
+     *
+     * Highest durable sequence that a forward tail reader can safely pass as after_sequence. This can be newer than next_sequence when filters exclude events.
+     */
+    scan_through_sequence: number | null;
+    /**
      * Session Id
      */
     session_id: string;
@@ -2060,25 +2010,6 @@ export type SessionCostSummary = {
  * SessionDebugState
  */
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
-
-/**
- * SessionDetailResponse
- */
-export type SessionDetailResponse = {
-    /**
-     * Events
-     */
-    events: Array<ApiSessionDetailEvent>;
-    /**
-     * Interruption Cascade
-     */
-    interruption_cascade: 'none' | 'pending' | 'failed';
-    session: ApiSession;
-    /**
-     * Transcript
-     */
-    transcript: Array<ApiSessionDetailTranscriptMessage>;
-};
 
 /**
  * SessionOrder
@@ -3774,7 +3705,7 @@ export type GetSessionApiSessionsSessionIdGetResponses = {
     /**
      * Successful Response
      */
-    200: SessionDetailResponse;
+    200: ApiSession;
 };
 
 export type GetSessionApiSessionsSessionIdGetResponse = GetSessionApiSessionsSessionIdGetResponses[keyof GetSessionApiSessionsSessionIdGetResponses];
@@ -3822,6 +3753,12 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
          * Event Type
          */
         event_type?: string | null;
+        /**
+         * Exclude Event Type
+         *
+         * Exclude one event type before applying pagination.
+         */
+        exclude_event_type?: string | null;
         /**
          * Tool Name
          */

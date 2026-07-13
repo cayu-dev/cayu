@@ -110,6 +110,12 @@ def build_event_query_sql(
             f"cayu_events.event_type IN ({dialect.placeholders(len(query.event_types))})"
         )
         params.extend(str(event_type) for event_type in query.event_types)
+    if query.exclude_event_types:
+        clauses.append(
+            "cayu_events.event_type NOT IN "
+            f"({dialect.placeholders(len(query.exclude_event_types))})"
+        )
+        params.extend(str(event_type) for event_type in query.exclude_event_types)
     if query.agent_name is not None:
         clauses.append(f"cayu_events.agent_name = {dialect.placeholder}")
         params.append(query.agent_name)

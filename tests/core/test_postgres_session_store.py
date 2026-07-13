@@ -1331,6 +1331,13 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
             EventQuery(session_id="sess_builder", event_id="event_2")
         )
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
+        excluded_records = await store.query_events(
+            EventQuery(
+                exclude_event_types=(EventType.MODEL_COMPLETED,),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
         multi_type_records = await store.query_events(
             EventQuery(
                 event_types=(EventType.SESSION_STARTED, EventType.TOOL_CALL_COMPLETED),
@@ -1372,6 +1379,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
         assert [r.event.id for r in read_file_records] == ["event_2"]
         assert [r.event.id for r in event_id_records] == ["event_2"]
         assert [r.event.id for r in started_records] == ["event_1", "event_4"]
+        assert [r.event.id for r in excluded_records] == ["event_4", "event_2"]
         assert [r.event.id for r in multi_type_records] == ["event_1", "event_2", "event_4"]
         assert [r.event.id for r in cursor_records] == ["event_3", "event_4"]
         assert [r.event.id for r in backward_records] == ["event_3", "event_2"]

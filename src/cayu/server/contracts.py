@@ -382,6 +382,13 @@ class ListSessionEventsResponse(ApiBaseModel):
             "after_sequence for ascending pages or before_sequence for descending pages."
         ),
     )
+    scan_through_sequence: StrictInt | None = Field(
+        ge=0,
+        description=(
+            "Highest durable sequence that a forward tail reader can safely pass as "
+            "after_sequence. This can be newer than next_sequence when filters exclude events."
+        ),
+    )
     has_more: StrictBool
 
 
@@ -398,29 +405,6 @@ class SessionTranscriptResponse(ApiBaseModel):
     next_offset: StrictInt = Field(ge=0)
     has_more: StrictBool
     total_messages: StrictInt = Field(ge=0)
-
-
-class ApiSessionDetailEvent(ApiBaseModel):
-    id: str
-    type: str
-    agent_name: str | None
-    environment_name: str | None = None
-    workflow_name: str | None = None
-    tool_name: str | None
-    payload: dict[str, Any]
-    timestamp: str
-
-
-class ApiSessionDetailTranscriptMessage(ApiBaseModel):
-    role: str
-    content: list[dict[str, Any]]
-
-
-class SessionDetailResponse(ApiBaseModel):
-    session: ApiSession
-    interruption_cascade: Literal["none", "pending", "failed"]
-    events: list[ApiSessionDetailEvent]
-    transcript: list[ApiSessionDetailTranscriptMessage]
 
 
 class ApiTaskListItem(ApiBaseModel):

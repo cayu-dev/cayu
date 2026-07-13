@@ -22,7 +22,7 @@ import {
   UserRound,
   Wrench,
 } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Page, PayloadViewer, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
@@ -44,11 +44,16 @@ import {
   fetchArtifacts,
   fetchPendingActions,
   fetchSession,
+  fetchSessionEvents,
+  fetchSessionState,
   fetchSessionSummary,
+  fetchSessionTranscript,
   isApiPayloadTooLarge,
   type RecoveryOutcome,
   type SessionEvent,
+  type SessionEventsPage,
   type SessionSummary,
+  type SessionTranscriptPage,
   type SSEEvent,
   streamInterruptSession,
   streamRecoverToolApproval,
@@ -74,13 +79,83 @@ import {
   optionalString,
   summarizeFailureEvent,
 } from "../lib/session-debug"
+import {
+  CoalescedAsyncRunner,
+  durationDetail,
+  durationEndTimestamp,
+  eventScanCursor,
+  historyModeLabel,
+  initialPageNavigation,
+  jumpToLatestPage,
+  loadStableTranscriptTailPage,
+  mergeLatestEventWindow,
+  mergeLatestTranscriptWindow,
+  mergeStoredAndLiveRecords,
+  navigateToNewerPage,
+  navigateToOlderPage,
+  olderTranscriptPage,
+  pendingTailCanReconcile,
+  queryReadErrorIsFatal,
+  sessionMetadataNeedsRefresh,
+  sessionSummaryRevision,
+  statePollInterval,
+  summaryStateIsStable,
+  type TranscriptPageParam,
+  tailActivityAction,
+} from "../lib/session-history"
 import { cn } from "../lib/utils"
 
 const INTERRUPTIBLE_SESSION_STATUSES = new Set(["pending", "running"])
+const ACTIVE_SESSION_STATUSES = new Set(["pending", "running", "interrupting"])
 const PENDING_ACTION_SESSION_STATUSES = new Set(["interrupted", "failed", "completed"])
+const SESSION_EVENT_PAGE_SIZE = 100
+const SESSION_TRANSCRIPT_PAGE_SIZE = 100
+const SESSION_TRANSCRIPT_TAIL_READ_LIMIT = 3
+
+async function fetchTranscriptTailPage(
+  sessionId: string,
+  totalMessages: number,
+  signal?: AbortSignal,
+) {
+  return loadStableTranscriptTailPage(
+    totalMessages,
+    SESSION_TRANSCRIPT_PAGE_SIZE,
+    SESSION_TRANSCRIPT_TAIL_READ_LIMIT,
+    (offset) =>
+      fetchSessionTranscript(sessionId, { offset, limit: SESSION_TRANSCRIPT_PAGE_SIZE }, signal),
+  )
+}
+
+async function fetchTranscriptPage(
+  sessionId: string,
+  pageParam: TranscriptPageParam,
+  signal?: AbortSignal,
+) {
+  if (pageParam !== null) {
+    return fetchSessionTranscript(sessionId, pageParam, signal)
+  }
+
+  const probe = await fetchSessionTranscript(sessionId, { offset: 0, limit: 1 }, signal)
+  if (probe.total_messages <= 1) return probe
+  return fetchTranscriptTailPage(sessionId, probe.total_messages, signal)
+}
 
 function isInterruptionConflict(error: unknown) {
   return error instanceof ApiClientError && error.status === 409
+}
+
+function isNonRetryableStateError(error: unknown) {
+  return (
+    error instanceof ApiClientError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  )
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError"
 }
 
 function EventIcon({ type }: { type: string }) {
@@ -98,47 +173,6 @@ function timestampMs(value: string | null | undefined) {
   if (!value) return null
   const time = new Date(value).getTime()
   return Number.isFinite(time) ? time : null
-}
-
-function fallbackModelSteps(events: Array<{ type: string }>) {
-  return events.filter((event) => event.type === "model.completed").length
-}
-
-function fallbackToolCalls(events: Array<{ type: string }>) {
-  const terminalCount = events.filter(
-    (event) =>
-      event.type === "tool.call.completed" ||
-      event.type === "tool.call.failed" ||
-      event.type === "tool.call.blocked",
-  ).length
-  if (terminalCount > 0) return terminalCount
-  return events.filter((event) => event.type === "tool.call.started").length
-}
-
-function fallbackUsage(
-  events: Array<{
-    type: string
-    payload: Record<string, unknown>
-  }>,
-) {
-  return events.reduce(
-    (usage, event) => {
-      if (event.type !== "model.completed") return usage
-      const eventUsage = modelUsagePayload(event.payload)
-      const inputTokens = numericValue(eventUsage.input_tokens)
-      const outputTokens = numericValue(eventUsage.output_tokens)
-      const totalTokens = numericValue(eventUsage.total_tokens) || inputTokens + outputTokens
-      const model = typeof eventUsage.model === "string" ? eventUsage.model : null
-      return {
-        inputTokens: usage.inputTokens + inputTokens,
-        outputTokens: usage.outputTokens + outputTokens,
-        totalTokens: usage.totalTokens + totalTokens,
-        models:
-          model === null || usage.models.includes(model) ? usage.models : [...usage.models, model],
-      }
-    },
-    { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] as string[] },
-  )
 }
 
 function statusVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
@@ -744,11 +778,12 @@ function FailureDebugBanner({
   )
 }
 
-function transcriptMessageKey(
-  message: { role: string; content: Array<Record<string, unknown>> },
-  index: number,
-) {
-  return `${index}:${message.role}`
+function transcriptMessageKey(message: {
+  index: number
+  role: string
+  content: Array<Record<string, unknown>>
+}) {
+  return `${message.index}:${message.role}`
 }
 
 function transcriptPartKey(index: number) {
@@ -802,8 +837,12 @@ function SessionArtifacts({
   )
 }
 
-export function SessionDetailPage({ live }: { live?: boolean }) {
+export function SessionDetailPage() {
   const { sessionId } = useParams({ from: "/sessions/$sessionId" })
+  return <SessionDetail key={sessionId} sessionId={sessionId} />
+}
+
+function SessionDetail({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient()
   const [interruptSheetOpen, setInterruptSheetOpen] = useState(false)
   const [interruptReason, setInterruptReason] = useState("")
@@ -811,31 +850,116 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   const [interruptError, setInterruptError] = useState<string | null>(null)
   const [retryingCascade, setRetryingCascade] = useState(false)
   const [cascadeRetryError, setCascadeRetryError] = useState<string | null>(null)
-  const { data, error, isError, isLoading, refetch } = useQuery({
+  const [resumePrompt, setResumePrompt] = useState("")
+  const [resuming, setResuming] = useState(false)
+  const [liveEvents, setLiveEvents] = useState<SSEEvent[]>([])
+  const [resumeError, setResumeError] = useState<string | null>(null)
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null)
+  const [resolvingAction, setResolvingAction] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [eventPinnedToTail, setEventPinnedToTail] = useState(true)
+  const [transcriptPinnedToTail, setTranscriptPinnedToTail] = useState(true)
+  const [transcriptVisible, setTranscriptVisible] = useState(false)
+  const [eventReconcileError, setEventReconcileError] = useState<string | null>(null)
+  const [transcriptReconcileError, setTranscriptReconcileError] = useState<string | null>(null)
+  const [eventNavigation, setEventNavigation] = useState(() =>
+    initialPageNavigation<number | null>(null),
+  )
+  const [transcriptNavigation, setTranscriptNavigation] = useState(() =>
+    initialPageNavigation<TranscriptPageParam>(null),
+  )
+  const mutationActive = resuming || resolvingAction || retryingCascade
+  const detailQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => fetchSession(sessionId),
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+  const stateQuery = useQuery({
+    queryKey: ["session-state", sessionId],
+    queryFn: () => fetchSessionState(sessionId),
+    enabled: detailQuery.data !== undefined,
+    retry: (failureCount, error) => !isNonRetryableStateError(error) && failureCount < 2,
     refetchInterval: (query) =>
-      interruptRequested ||
-      query.state.data?.session.status === "interrupting" ||
-      query.state.data?.interruption_cascade === "pending"
-        ? 1000
-        : live
-          ? 2000
-          : 5000,
+      statePollInterval({
+        status: query.state.data?.status,
+        interruptionCascade: query.state.data?.interruption_cascade,
+        interruptRequested,
+        mutationActive,
+        hasError: query.state.error !== null,
+        failureCount: query.state.fetchFailureCount,
+        nonRetryableError: isNonRetryableStateError(query.state.error),
+      }),
+    refetchIntervalInBackground: false,
   })
+  const state = stateQuery.data
+  const interruptionCascade = state?.interruption_cascade ?? "none"
+  const summaryRevision =
+    state === undefined
+      ? null
+      : sessionSummaryRevision({
+          status: state.status,
+          lastActivityAt: state.last_activity_at,
+          interruptionCascade,
+        })
   const summaryQuery = useQuery({
-    queryKey: ["session-summary", sessionId],
+    queryKey: ["session-summary", sessionId, summaryRevision],
     queryFn: () => fetchSessionSummary(sessionId),
-    refetchInterval: live ? 2000 : 5000,
-    enabled: !isError,
+    enabled: summaryRevision !== null && detailQuery.data !== undefined,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
   })
+  const eventsQuery = useQuery({
+    queryKey: ["session-events", sessionId, eventNavigation.current ?? "latest"],
+    queryFn: ({ signal }) =>
+      fetchSessionEvents(
+        sessionId,
+        {
+          order_by: "sequence_desc",
+          limit: SESSION_EVENT_PAGE_SIZE,
+          exclude_event_type: "model.text.delta",
+          ...(eventNavigation.current === null ? {} : { before_sequence: eventNavigation.current }),
+        },
+        signal,
+      ),
+    // Establish the activity baseline before reading history. A later append is
+    // then either present in this page or observed by the next state heartbeat.
+    enabled: state !== undefined,
+    gcTime: 0,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+  })
+  const transcriptQuery = useQuery({
+    queryKey: ["session-transcript", sessionId, transcriptNavigation.current ?? "latest"],
+    queryFn: ({ signal }) => fetchTranscriptPage(sessionId, transcriptNavigation.current, signal),
+    enabled: state !== undefined,
+    gcTime: 0,
+    staleTime: Number.POSITIVE_INFINITY,
+    refetchOnWindowFocus: false,
+  })
+
+  const session = detailQuery.data
+    ? {
+        ...detailQuery.data,
+        ...(state === undefined ? {} : { status: state.status, updated_at: state.updated_at }),
+      }
+    : undefined
+  const error = detailQuery.error ?? stateQuery.error
+  const permanentStateError = isNonRetryableStateError(stateQuery.error)
+  const isError =
+    queryReadErrorIsFatal(detailQuery.isError, detailQuery.data !== undefined) ||
+    queryReadErrorIsFatal(stateQuery.isError, state !== undefined) ||
+    (stateQuery.isRefetchError && permanentStateError)
+  const isLoading = detailQuery.isLoading || stateQuery.isLoading
+  const stateRefetchError = stateQuery.isRefetchError && !permanentStateError
+  const detailRefetchError = detailQuery.isRefetchError
+
   const pendingActionQuery = useQuery({
     queryKey: [
       "pending-actions",
       "session",
       sessionId,
-      data?.session.status ?? null,
-      data?.session.updated_at ?? null,
+      session?.status ?? null,
+      session?.updated_at ?? null,
     ],
     queryFn: () => fetchPendingActions({ session_id: sessionId, limit: 1 }),
     retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
@@ -844,12 +968,12 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
       if (result !== undefined && result.actions.length === 0 && result.issues.length === 0) {
         return false
       }
-      return live ? 2000 : 5000
+      return 5000
     },
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: (query) => !isApiPayloadTooLarge(query.state.error),
     enabled:
-      !isError && data !== undefined && PENDING_ACTION_SESSION_STATUSES.has(data.session.status),
+      !isError && session !== undefined && PENDING_ACTION_SESSION_STATUSES.has(session.status),
   })
   const sessionArtifacts = useQuery({
     queryKey: ["session-artifacts", sessionId],
@@ -858,43 +982,470 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     staleTime: 10_000,
   })
 
-  const [resumePrompt, setResumePrompt] = useState("")
-  const [resuming, setResuming] = useState(false)
-  const [liveEvents, setLiveEvents] = useState<SSEEvent[]>([])
-  const [resumeError, setResumeError] = useState<string | null>(null)
-  const [selectedEventId, setSelectedEventId] = useState<string | null>(null)
-  const [resolvingAction, setResolvingAction] = useState(false)
-  const [actionError, setActionError] = useState<string | null>(null)
-  const eventsEndRef = useRef<HTMLDivElement>(null)
-  const transcriptEndRef = useRef<HTMLDivElement>(null)
-  const transcriptCount = data?.transcript.length ?? 0
-  const liveEventCount = liveEvents.length
+  const eventsViewportRef = useRef<HTMLDivElement>(null)
+  const transcriptViewportRef = useRef<HTMLDivElement>(null)
+  const observedActivityRef = useRef<string | null>(null)
+  const suppressActivityReconcileRef = useRef(false)
+  const eventAtLatestRef = useRef(true)
+  const transcriptAtLatestRef = useRef(true)
+  const eventPinnedToTailRef = useRef(true)
+  const transcriptPinnedToTailRef = useRef(true)
+  const transcriptVisibleRef = useRef(false)
+  const attemptedMetadataRevisionRef = useRef<string | null>(null)
+  const eventsPageRef = useRef<SessionEventsPage | undefined>(eventsQuery.data)
+  const transcriptPageRef = useRef<SessionTranscriptPage | undefined>(transcriptQuery.data)
+  const eventReconcileAbortRef = useRef<AbortController | null>(null)
+  const transcriptReconcileAbortRef = useRef<AbortController | null>(null)
+  const eventReconcilePendingRef = useRef(false)
+  const transcriptReconcilePendingRef = useRef(false)
+  const eventScanCursorRef = useRef(0)
+  const mutationActiveRef = useRef(mutationActive)
+  const eventReconcileRunnerRef = useRef<CoalescedAsyncRunner | null>(null)
+  const transcriptReconcileRunnerRef = useRef<CoalescedAsyncRunner | null>(null)
+  if (eventReconcileRunnerRef.current === null) {
+    eventReconcileRunnerRef.current = new CoalescedAsyncRunner()
+  }
+  if (transcriptReconcileRunnerRef.current === null) {
+    transcriptReconcileRunnerRef.current = new CoalescedAsyncRunner()
+  }
+  const eventReconcileRunner = eventReconcileRunnerRef.current
+  const transcriptReconcileRunner = transcriptReconcileRunnerRef.current
+  eventAtLatestRef.current = eventNavigation.current === null
+  transcriptAtLatestRef.current = transcriptNavigation.current === null
+  eventPinnedToTailRef.current = eventPinnedToTail
+  transcriptPinnedToTailRef.current = transcriptPinnedToTail
+  transcriptVisibleRef.current = transcriptVisible
+  mutationActiveRef.current = mutationActive
+  eventsPageRef.current = eventsQuery.data
+  transcriptPageRef.current = transcriptQuery.data
+  const events = useMemo(() => {
+    return [...(eventsQuery.data?.events ?? [])].sort(
+      (left, right) => left.sequence - right.sequence,
+    )
+  }, [eventsQuery.data])
+  const transcript = useMemo(() => {
+    return [...(transcriptQuery.data?.messages ?? [])].sort(
+      (left, right) => left.index - right.index,
+    )
+  }, [transcriptQuery.data])
+  const liveTimelineEventCount = useMemo(
+    () => liveEvents.filter((event) => event.type !== "model.text.delta").length,
+    [liveEvents],
+  )
+  const eventTailRevision = events.at(-1)?.sequence ?? null
+  const transcriptTailRevision = transcript.at(-1)?.index ?? null
+
+  const performLatestEventReconciliation = useCallback(async (): Promise<boolean> => {
+    if (!eventAtLatestRef.current || mutationActiveRef.current) return false
+    eventReconcilePendingRef.current = false
+    setEventReconcileError(null)
+    const current = eventsPageRef.current
+    if (current === undefined) {
+      const result = await eventsQuery.refetch()
+      eventReconcilePendingRef.current = result.isError
+      return !result.isError
+    }
+
+    const controller = new AbortController()
+    eventReconcileAbortRef.current = controller
+    try {
+      const scanCursor = eventScanCursor(current, eventScanCursorRef.current)
+      const incremental = await fetchSessionEvents(
+        sessionId,
+        {
+          after_sequence: scanCursor,
+          order_by: "sequence_asc",
+          limit: SESSION_EVENT_PAGE_SIZE,
+          exclude_event_type: "model.text.delta",
+        },
+        controller.signal,
+      )
+      if (controller.signal.aborted || !eventAtLatestRef.current) return false
+      if (incremental.has_more) {
+        const result = await eventsQuery.refetch()
+        eventReconcilePendingRef.current = result.isError
+        return !result.isError
+      }
+      const nextScanCursor = eventScanCursor(incremental, scanCursor)
+      eventScanCursorRef.current = nextScanCursor
+      if (incremental.events.length === 0) {
+        queryClient.setQueryData<SessionEventsPage>(
+          ["session-events", sessionId, "latest"],
+          (existing) =>
+            existing === undefined
+              ? existing
+              : { ...existing, scan_through_sequence: nextScanCursor },
+        )
+        return true
+      }
+
+      queryClient.setQueryData<SessionEventsPage>(
+        ["session-events", sessionId, "latest"],
+        (existing) => {
+          if (existing === undefined) return existing
+          const merged = mergeLatestEventWindow(
+            existing.events,
+            incremental.events,
+            SESSION_EVENT_PAGE_SIZE,
+          )
+          const oldest = merged.records.at(-1)
+          return {
+            ...existing,
+            events: merged.records,
+            order_by: "sequence_desc",
+            next_sequence: oldest?.sequence ?? null,
+            scan_through_sequence: nextScanCursor,
+            has_more: existing.has_more || merged.dropped,
+          }
+        },
+      )
+      return true
+    } catch (error) {
+      if (isAbortError(error)) return false
+      throw error
+    } finally {
+      if (eventReconcileAbortRef.current === controller) {
+        eventReconcileAbortRef.current = null
+      }
+    }
+  }, [eventsQuery.refetch, queryClient, sessionId])
+
+  const reconcileLatestEvents = useCallback(
+    () =>
+      eventReconcileRunner.request(performLatestEventReconciliation).catch((error) => {
+        if (isAbortError(error)) return
+        eventReconcilePendingRef.current = true
+        setEventReconcileError(
+          error instanceof Error ? error.message : "Failed to refresh the event tail.",
+        )
+      }),
+    [eventReconcileRunner, performLatestEventReconciliation],
+  )
 
   useEffect(() => {
-    if (liveEventCount > 0) {
-      eventsEndRef.current?.scrollIntoView({ behavior: "smooth" })
+    if (eventNavigation.current !== null || eventsQuery.data === undefined) return
+    eventScanCursorRef.current = eventScanCursor(eventsQuery.data, eventScanCursorRef.current)
+  }, [eventNavigation.current, eventsQuery.data])
+
+  const performLatestTranscriptReconciliation = useCallback(async (): Promise<boolean> => {
+    if (!transcriptAtLatestRef.current || mutationActiveRef.current) return false
+    transcriptReconcilePendingRef.current = false
+    setTranscriptReconcileError(null)
+    const current = transcriptPageRef.current
+    if (current === undefined) {
+      const result = await transcriptQuery.refetch()
+      transcriptReconcilePendingRef.current = result.isError
+      return !result.isError
     }
-  }, [liveEventCount])
+
+    const controller = new AbortController()
+    transcriptReconcileAbortRef.current = controller
+    try {
+      const incremental = await fetchSessionTranscript(
+        sessionId,
+        { offset: current.total_messages, limit: SESSION_TRANSCRIPT_PAGE_SIZE },
+        controller.signal,
+      )
+      if (controller.signal.aborted || !transcriptAtLatestRef.current) return false
+
+      if (incremental.has_more) {
+        const tail = await fetchTranscriptTailPage(
+          sessionId,
+          incremental.total_messages,
+          controller.signal,
+        )
+        if (controller.signal.aborted || !transcriptAtLatestRef.current) return false
+        queryClient.setQueryData<SessionTranscriptPage>(
+          ["session-transcript", sessionId, "latest"],
+          tail,
+        )
+        transcriptReconcilePendingRef.current = false
+        return true
+      }
+      if (
+        incremental.messages.length === 0 &&
+        incremental.total_messages === current.total_messages
+      ) {
+        queryClient.setQueryData<SessionTranscriptPage>(
+          ["session-transcript", sessionId, "latest"],
+          (existing) => existing,
+        )
+        transcriptReconcilePendingRef.current = false
+        return true
+      }
+
+      queryClient.setQueryData<SessionTranscriptPage>(
+        ["session-transcript", sessionId, "latest"],
+        (existing) => {
+          if (existing === undefined) return existing
+          const merged = mergeLatestTranscriptWindow(
+            existing.messages,
+            incremental.messages,
+            SESSION_TRANSCRIPT_PAGE_SIZE,
+          )
+          const totalMessages = Math.max(existing.total_messages, incremental.total_messages)
+          return {
+            ...existing,
+            messages: merged.records,
+            offset: merged.records[0]?.index ?? totalMessages,
+            next_offset: totalMessages,
+            has_more: false,
+            total_messages: totalMessages,
+          }
+        },
+      )
+      transcriptReconcilePendingRef.current = false
+      return true
+    } catch (error) {
+      if (isAbortError(error)) return false
+      throw error
+    } finally {
+      if (transcriptReconcileAbortRef.current === controller) {
+        transcriptReconcileAbortRef.current = null
+      }
+    }
+  }, [queryClient, sessionId, transcriptQuery.refetch])
+
+  const reconcileLatestTranscript = useCallback(
+    () =>
+      transcriptReconcileRunner.request(performLatestTranscriptReconciliation).catch((error) => {
+        if (isAbortError(error)) return
+        transcriptReconcilePendingRef.current = true
+        setTranscriptReconcileError(
+          error instanceof Error ? error.message : "Failed to refresh the transcript tail.",
+        )
+      }),
+    [performLatestTranscriptReconciliation, transcriptReconcileRunner],
+  )
 
   useEffect(() => {
-    if (resuming && transcriptCount > 0) {
-      transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" })
+    const detailUpdatedAt = detailQuery.data?.updated_at
+    const stateUpdatedAt = state?.updated_at
+    if (!sessionMetadataNeedsRefresh(detailUpdatedAt, stateUpdatedAt)) {
+      if (detailUpdatedAt !== undefined && detailUpdatedAt === stateUpdatedAt) {
+        attemptedMetadataRevisionRef.current = null
+      }
+      return
     }
-  }, [resuming, transcriptCount])
+    if (
+      detailQuery.isFetching ||
+      stateUpdatedAt === undefined ||
+      attemptedMetadataRevisionRef.current === stateUpdatedAt
+    ) {
+      return
+    }
+    attemptedMetadataRevisionRef.current = stateUpdatedAt
+    void detailQuery.refetch()
+  }, [detailQuery.data?.updated_at, detailQuery.isFetching, detailQuery.refetch, state?.updated_at])
+
+  useEffect(() => {
+    const lastActivityAt = state?.last_activity_at
+    if (lastActivityAt === undefined) return
+    const previous = observedActivityRef.current
+    observedActivityRef.current = lastActivityAt
+    if (suppressActivityReconcileRef.current) {
+      suppressActivityReconcileRef.current = false
+      return
+    }
+    if (previous === null || previous === lastActivityAt) return
+    if (mutationActive) return
+
+    const eventAction = tailActivityAction({
+      atLatest: eventNavigation.current === null,
+      pinned: eventPinnedToTail,
+      visible: true,
+    })
+    if (eventAction === "reconcile") {
+      if (eventsQuery.isFetching) eventReconcilePendingRef.current = true
+      else void reconcileLatestEvents()
+    } else if (eventAction === "defer") {
+      eventReconcilePendingRef.current = true
+    }
+
+    const transcriptAction = tailActivityAction({
+      atLatest: transcriptNavigation.current === null,
+      pinned: transcriptPinnedToTail,
+      visible: transcriptVisible,
+    })
+    if (transcriptAction === "reconcile") {
+      if (transcriptQuery.isFetching) transcriptReconcilePendingRef.current = true
+      else void reconcileLatestTranscript()
+    } else if (transcriptAction === "defer") {
+      transcriptReconcilePendingRef.current = true
+    }
+  }, [
+    eventNavigation.current,
+    eventPinnedToTail,
+    eventsQuery.isFetching,
+    mutationActive,
+    reconcileLatestEvents,
+    reconcileLatestTranscript,
+    state?.last_activity_at,
+    transcriptNavigation.current,
+    transcriptPinnedToTail,
+    transcriptQuery.isFetching,
+    transcriptVisible,
+  ])
+
+  useEffect(() => {
+    if (
+      eventNavigation.current === null &&
+      eventPinnedToTail &&
+      (eventTailRevision !== null || liveTimelineEventCount > 0)
+    ) {
+      const viewport = eventsViewportRef.current
+      if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
+    }
+  }, [eventNavigation.current, eventPinnedToTail, eventTailRevision, liveTimelineEventCount])
+
+  useEffect(() => {
+    if (
+      transcriptNavigation.current === null &&
+      transcriptPinnedToTail &&
+      transcriptTailRevision !== null
+    ) {
+      const viewport = transcriptViewportRef.current
+      if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
+    }
+  }, [transcriptNavigation.current, transcriptPinnedToTail, transcriptTailRevision])
+
+  useEffect(() => {
+    const node = transcriptViewportRef.current
+    if (isLoading || node === null) return
+    if (typeof IntersectionObserver === "undefined") {
+      setTranscriptVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => setTranscriptVisible(entry?.isIntersecting ?? false),
+      { threshold: 0.01 },
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [isLoading])
+
+  useEffect(() => {
+    if (
+      pendingTailCanReconcile({
+        pending: eventReconcilePendingRef.current,
+        atLatest: eventNavigation.current === null,
+        pinned: eventPinnedToTail,
+        visible: true,
+        mutationActive,
+        queryFetching: eventsQuery.isFetching,
+        hasError: eventReconcileError !== null || eventsQuery.isError,
+      })
+    ) {
+      eventReconcilePendingRef.current = false
+      void reconcileLatestEvents()
+    }
+  }, [
+    eventNavigation.current,
+    eventPinnedToTail,
+    eventReconcileError,
+    eventsQuery.isError,
+    eventsQuery.isFetching,
+    mutationActive,
+    reconcileLatestEvents,
+  ])
+
+  useEffect(() => {
+    if (
+      pendingTailCanReconcile({
+        pending: transcriptReconcilePendingRef.current,
+        atLatest: transcriptNavigation.current === null,
+        pinned: transcriptPinnedToTail,
+        visible: transcriptVisible,
+        mutationActive,
+        queryFetching: transcriptQuery.isFetching,
+        hasError: transcriptReconcileError !== null || transcriptQuery.isError,
+      })
+    ) {
+      transcriptReconcilePendingRef.current = false
+      void reconcileLatestTranscript()
+    }
+  }, [
+    mutationActive,
+    reconcileLatestTranscript,
+    transcriptNavigation.current,
+    transcriptPinnedToTail,
+    transcriptQuery.isError,
+    transcriptQuery.isFetching,
+    transcriptReconcileError,
+    transcriptVisible,
+  ])
+
+  useEffect(
+    () => () => {
+      eventReconcileRunner.clearPending()
+      transcriptReconcileRunner.clearPending()
+      eventReconcileAbortRef.current?.abort()
+      transcriptReconcileAbortRef.current?.abort()
+    },
+    [eventReconcileRunner, transcriptReconcileRunner],
+  )
 
   useEffect(() => {
     if (!interruptRequested) return
-    const status = data?.session.status
+    const status = session?.status
     if (status && !["pending", "running", "interrupting"].includes(status)) {
       setInterruptRequested(false)
       setInterruptReason("")
     }
-  }, [data?.session.status, interruptRequested])
+  }, [session?.status, interruptRequested])
+
+  const refreshSessionReadModels = () => {
+    eventReconcileRunner.clearPending()
+    transcriptReconcileRunner.clearPending()
+    eventReconcileAbortRef.current?.abort()
+    transcriptReconcileAbortRef.current?.abort()
+    const historyRefreshes: Promise<unknown>[] = []
+    if (eventAtLatestRef.current) {
+      if (eventPinnedToTailRef.current) {
+        eventReconcilePendingRef.current = false
+        historyRefreshes.push(
+          queryClient.refetchQueries({
+            queryKey: ["session-events", sessionId, "latest"],
+            exact: true,
+          }),
+        )
+      } else {
+        eventReconcilePendingRef.current = true
+      }
+    } else {
+      eventReconcilePendingRef.current = false
+    }
+    if (transcriptAtLatestRef.current) {
+      if (transcriptPinnedToTailRef.current && transcriptVisibleRef.current) {
+        transcriptReconcilePendingRef.current = false
+        historyRefreshes.push(
+          queryClient.refetchQueries({
+            queryKey: ["session-transcript", sessionId, "latest"],
+            exact: true,
+          }),
+        )
+      } else {
+        transcriptReconcilePendingRef.current = true
+      }
+    } else {
+      transcriptReconcilePendingRef.current = false
+    }
+    setEventReconcileError(null)
+    setTranscriptReconcileError(null)
+    suppressActivityReconcileRef.current = true
+    const stateRefresh = stateQuery.refetch().then((result) => {
+      if (result.data !== undefined) {
+        observedActivityRef.current = result.data.last_activity_at
+      }
+      suppressActivityReconcileRef.current = false
+      return result
+    })
+    return Promise.all([stateRefresh, ...historyRefreshes])
+  }
 
   const refreshAfterInterrupt = () =>
     Promise.all([
-      refetch(),
-      summaryQuery.refetch(),
+      refreshSessionReadModels(),
       pendingActionQuery.refetch(),
       queryClient.invalidateQueries({ queryKey: ["sessions-summary"] }),
       queryClient.invalidateQueries({ queryKey: ["pending-actions"] }),
@@ -951,11 +1502,9 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         if (!streamFailed) {
           setResumePrompt("")
         }
-        void Promise.all([refetch(), summaryQuery.refetch(), pendingActionQuery.refetch()]).finally(
-          () => {
-            setLiveEvents([])
-          },
-        )
+        void Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()]).finally(() => {
+          setLiveEvents([])
+        })
       },
       (message) => {
         streamFailed = true
@@ -989,13 +1538,11 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
   }
 
   const finishContinuation = (streamFailed: boolean) => {
-    void Promise.all([refetch(), summaryQuery.refetch(), pendingActionQuery.refetch()]).finally(
-      () => {
-        if (!streamFailed) {
-          setLiveEvents([])
-        }
-      },
-    )
+    void Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()]).finally(() => {
+      if (!streamFailed) {
+        setLiveEvents([])
+      }
+    })
   }
 
   const handleApprovalDecision = async (
@@ -1138,13 +1685,17 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
       </div>
     )
   }
-  if (!data) return <div className="text-destructive">Session not found</div>
+  if (!session) return <div className="text-destructive">Session not found</div>
 
-  const { session, events, transcript } = data
-  const canInterrupt = INTERRUPTIBLE_SESSION_STATUSES.has(session.status) && !interruptRequested
+  const stateIsFresh = state !== undefined && !stateRefetchError
+  const canInterrupt =
+    stateIsFresh && INTERRUPTIBLE_SESSION_STATUSES.has(session.status) && !interruptRequested
   const interruptionFinalizing = session.status === "interrupting" || interruptRequested
   const summary = summaryQuery.data
-  const allEvents = [...events, ...liveEvents.map((e, i) => ({ ...e, id: `live-${i}` }))]
+  const allEvents =
+    eventNavigation.current === null && eventPinnedToTail
+      ? mergeStoredAndLiveRecords<SessionEvent>(events, liveEvents)
+      : events
   const filteredEvents = allEvents.filter((e) => e.type !== "model.text.delta")
   const selectedEvent = filteredEvents.find((event) => event.id === selectedEventId) ?? null
   const pendingActionStatus = PENDING_ACTION_SESSION_STATUSES.has(session.status)
@@ -1157,34 +1708,57 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
     (pendingActionQuery.data === undefined ||
       pendingActionQuery.isFetching ||
       pendingActionQuery.isError)
-  const hasPendingInterruptionCascade = data.interruption_cascade !== "none"
+  const hasPendingInterruptionCascade = interruptionCascade !== "none"
   const failureEvent = latestFailureEvent(
-    data.interruption_cascade === "failed"
+    interruptionCascade === "failed"
       ? filteredEvents
       : filteredEvents.filter((event) => event.type !== "session.interruption_cascade_failed"),
   )
-  const canRetryCascade = session.status === "interrupted" && data.interruption_cascade === "failed"
-  const cascadePending = session.status === "interrupted" && data.interruption_cascade === "pending"
+  const canRetryCascade =
+    stateIsFresh && session.status === "interrupted" && interruptionCascade === "failed"
+  const cascadePending = session.status === "interrupted" && interruptionCascade === "pending"
   const canResume =
     pendingActionStatus &&
     !pendingAction &&
     !pendingActionIssue &&
     !pendingActionStateUnknown &&
-    !hasPendingInterruptionCascade
-  const eventUsage = fallbackUsage(filteredEvents)
+    !hasPendingInterruptionCascade &&
+    stateIsFresh
+  const summaryIsCurrent =
+    summary !== undefined &&
+    state !== undefined &&
+    summaryStateIsStable({
+      status: state.status,
+      lastActivityAt: state.last_activity_at,
+      interruptionCascade,
+    })
   const models = summaryModels(summary)
-  const modelSteps = summary?.usage.model_steps ?? fallbackModelSteps(filteredEvents)
-  const toolCalls = summary?.usage.tool_calls ?? fallbackToolCalls(filteredEvents)
-  const tokenInput = summary?.usage.usage?.input_tokens ?? eventUsage.inputTokens
-  const tokenOutput = summary?.usage.usage?.output_tokens ?? eventUsage.outputTokens
-  const tokenTotal = summary === undefined ? eventUsage.totalTokens : totalTokens(summary)
-  const outcomeReason = summary?.outcome.reason || summary?.session.status || session.status
+  const modelSteps = summary?.usage.model_steps
+  const toolCalls = summary?.usage.tool_calls
+  const tokenInput = summary?.usage.usage?.input_tokens
+  const tokenOutput = summary?.usage.usage?.output_tokens
+  const tokenTotal = summary === undefined ? null : totalTokens(summary)
+  const outcomeReason = summaryIsCurrent
+    ? summary.outcome.reason || summary.session.status
+    : session.status
   const latestEvent = summary?.events.latest_event
-  const eventCounts = sortedEventCounts(summary)
-  const statusDetail = summary?.outcome.retry ? "retry recorded" : "latest session state"
-  const durationSession = summary?.session ?? session
-  const createdAtMs = timestampMs(durationSession.created_at)
-  const updatedAtMs = timestampMs(durationSession.updated_at)
+  const eventCounts = summaryIsCurrent ? sortedEventCounts(summary) : []
+  const totalEvents = summaryIsCurrent ? summary.events.total_events : undefined
+  const totalTranscriptMessages =
+    transcriptQuery.data?.total_messages ?? summary?.transcript.total_messages ?? transcript.length
+  const statusDetail =
+    summaryIsCurrent && summary.outcome.retry ? "retry recorded" : "current lifecycle state"
+  const summaryUnavailableDetail = summaryQuery.isError ? "summary unavailable" : "loading summary"
+  const summarySnapshotDetail = summaryIsCurrent ? "" : " · snapshot"
+  const createdAtMs = timestampMs(session.created_at)
+  const terminalEventAt = summaryIsCurrent ? summary.outcome.terminal_event?.timestamp : null
+  const updatedAtMs = timestampMs(
+    durationEndTimestamp({
+      terminalEventAt,
+      lastActivityAt: state?.last_activity_at,
+      updatedAt: session.updated_at,
+    }),
+  )
   const duration =
     createdAtMs !== null && updatedAtMs !== null ? Math.max(0, updatedAtMs - createdAtMs) : null
   const durationText =
@@ -1199,6 +1773,82 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
       : duration < 60_000
         ? `${Math.round(duration / 1000)}s`
         : `${Math.floor(duration / 60_000)}m ${Math.round((duration % 60_000) / 1000)}s`
+  const olderEventCursor =
+    eventsQuery.data?.has_more && typeof eventsQuery.data.next_sequence === "number"
+      ? eventsQuery.data.next_sequence
+      : null
+  const olderTranscript =
+    transcriptQuery.data === undefined
+      ? undefined
+      : olderTranscriptPage(transcriptQuery.data.offset, SESSION_TRANSCRIPT_PAGE_SIZE)
+  const lifecycleActive = ACTIVE_SESSION_STATUSES.has(session.status) || mutationActive
+  const eventHistoryMode = historyModeLabel({
+    atLatest: eventNavigation.current === null,
+    active: lifecycleActive,
+    pinned: eventPinnedToTail,
+  })
+  const transcriptHistoryMode = historyModeLabel({
+    atLatest: transcriptNavigation.current === null,
+    active: lifecycleActive,
+    pinned: transcriptPinnedToTail,
+  })
+  const durationDetailText = durationDetail(session.status, terminalEventAt != null)
+  const showNewerEvents = () => {
+    eventReconcileRunner.clearPending()
+    eventReconcileAbortRef.current?.abort()
+    eventReconcilePendingRef.current = false
+    const next = navigateToNewerPage(eventNavigation)
+    setEventReconcileError(null)
+    setEventNavigation(next)
+    if (next.current === null) setEventPinnedToTail(true)
+  }
+  const showOlderEvents = () => {
+    if (olderEventCursor === null) return
+    eventReconcileRunner.clearPending()
+    eventReconcileAbortRef.current?.abort()
+    eventReconcilePendingRef.current = false
+    setEventReconcileError(null)
+    setEventPinnedToTail(false)
+    setEventNavigation(navigateToOlderPage(eventNavigation, olderEventCursor))
+  }
+  const jumpToEventTail = () => {
+    eventReconcileRunner.clearPending()
+    eventReconcileAbortRef.current?.abort()
+    if (eventNavigation.current !== null) eventReconcilePendingRef.current = false
+    setEventReconcileError(null)
+    setEventPinnedToTail(true)
+    setEventNavigation(jumpToLatestPage(null))
+    const viewport = eventsViewportRef.current
+    if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
+  }
+  const showNewerTranscript = () => {
+    transcriptReconcileRunner.clearPending()
+    transcriptReconcileAbortRef.current?.abort()
+    transcriptReconcilePendingRef.current = false
+    const next = navigateToNewerPage(transcriptNavigation)
+    setTranscriptReconcileError(null)
+    setTranscriptNavigation(next)
+    if (next.current === null) setTranscriptPinnedToTail(true)
+  }
+  const showOlderTranscript = () => {
+    if (olderTranscript === undefined) return
+    transcriptReconcileRunner.clearPending()
+    transcriptReconcileAbortRef.current?.abort()
+    transcriptReconcilePendingRef.current = false
+    setTranscriptReconcileError(null)
+    setTranscriptPinnedToTail(false)
+    setTranscriptNavigation(navigateToOlderPage(transcriptNavigation, olderTranscript))
+  }
+  const jumpToTranscriptTail = () => {
+    transcriptReconcileRunner.clearPending()
+    transcriptReconcileAbortRef.current?.abort()
+    if (transcriptNavigation.current !== null) transcriptReconcilePendingRef.current = false
+    setTranscriptReconcileError(null)
+    setTranscriptPinnedToTail(true)
+    setTranscriptNavigation(jumpToLatestPage(null))
+    const viewport = transcriptViewportRef.current
+    if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
+  }
 
   return (
     <Page className="space-y-4">
@@ -1317,6 +1967,63 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
         </div>
       )}
 
+      {stateRefetchError && (
+        <StateMessage tone="danger" className="rounded-md border border-destructive/30 p-4">
+          <span className="font-medium">Live session state is temporarily unavailable.</span> The
+          page is showing the last confirmed state, and mutation controls are disabled until polling
+          recovers.
+        </StateMessage>
+      )}
+
+      {detailRefetchError && (
+        <StateMessage tone="danger" className="rounded-md border border-destructive/30 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <span>
+              <span className="font-medium">Session metadata could not be refreshed.</span> The page
+              is preserving the last confirmed metadata while lifecycle state continues
+              independently.
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={detailQuery.isFetching}
+              onClick={() => {
+                void detailQuery.refetch()
+              }}
+            >
+              {detailQuery.isFetching ? (
+                <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              Retry
+            </Button>
+          </div>
+        </StateMessage>
+      )}
+
+      {summaryQuery.isError && (
+        <StateMessage tone="danger" className="rounded-md border border-destructive/30 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <span>
+              <span className="font-medium">Session summary is temporarily unavailable.</span>{" "}
+              Metadata and bounded history remain usable while you retry the aggregate read.
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={summaryQuery.isFetching}
+              onClick={() => {
+                void summaryQuery.refetch()
+              }}
+            >
+              {summaryQuery.isFetching ? (
+                <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              Retry
+            </Button>
+          </div>
+        </StateMessage>
+      )}
+
       <Card className="flex-shrink-0 gap-0 py-0">
         <CardContent className="grid grid-cols-1 p-0 md:grid-cols-2 xl:grid-cols-6">
           <SummaryStat
@@ -1338,21 +2045,25 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           <SummaryStat
             icon={Hash}
             label="Events"
-            value={formatCount(summary?.events.total_events ?? filteredEvents.length)}
-            detail={latestEvent ? `latest ${latestEvent.type}` : "stored timeline"}
+            value={summary === undefined ? "-" : formatCount(summary.events.total_events)}
+            detail={
+              latestEvent
+                ? `latest ${latestEvent.type}${summarySnapshotDetail}`
+                : summaryUnavailableDetail
+            }
             className="border-b border-border xl:border-b-0 xl:border-r"
             tone="blue"
           />
           <SummaryStat
             icon={Cpu}
             label="Model Steps"
-            value={formatCount(modelSteps)}
+            value={summary === undefined ? "-" : formatCount(modelSteps)}
             detail={
               models.length
-                ? models.slice(0, 2).join(", ")
-                : eventUsage.models.length
-                  ? eventUsage.models.slice(0, 2).join(", ")
-                  : "no model usage"
+                ? `${models.slice(0, 2).join(", ")}${summarySnapshotDetail}`
+                : summary === undefined
+                  ? summaryUnavailableDetail
+                  : `no model usage${summarySnapshotDetail}`
             }
             className="border-b border-border md:border-r xl:border-b-0"
             tone="violet"
@@ -1360,16 +2071,24 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
           <SummaryStat
             icon={Wrench}
             label="Tool Calls"
-            value={formatCount(toolCalls)}
-            detail="completed and failed tool calls"
+            value={summary === undefined ? "-" : formatCount(toolCalls)}
+            detail={
+              summary === undefined
+                ? summaryUnavailableDetail
+                : `completed and failed calls${summarySnapshotDetail}`
+            }
             className="border-b border-border xl:border-b-0 xl:border-r"
             tone="amber"
           />
           <SummaryStat
             icon={Database}
             label="Tokens"
-            value={formatCount(tokenTotal)}
-            detail={`${formatCount(tokenInput)} in / ${formatCount(tokenOutput)} out`}
+            value={summary === undefined ? "-" : formatCount(tokenTotal)}
+            detail={
+              summary === undefined
+                ? summaryUnavailableDetail
+                : `${formatCount(tokenInput)} in / ${formatCount(tokenOutput)} out${summarySnapshotDetail}`
+            }
             className="border-b border-border md:border-b-0 md:border-r"
             tone="blue"
           />
@@ -1377,7 +2096,7 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
             icon={Clock}
             label="Duration"
             value={summaryDurationValue}
-            detail="started to completed"
+            detail={durationDetailText}
             tone="neutral"
           />
         </CardContent>
@@ -1451,22 +2170,105 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
                   </p>
                 </div>
                 <div className="flex max-w-[62%] flex-wrap justify-end gap-1.5">
+                  <Badge variant="secondary" className="font-mono text-[10px]">
+                    {formatCount(filteredEvents.length)} visible
+                    {totalEvents === undefined ? "" : ` · ${formatCount(totalEvents)} stored`}
+                  </Badge>
+                  <Badge variant={eventHistoryMode === "Live tail" ? "secondary" : "outline"}>
+                    {eventHistoryMode}
+                  </Badge>
                   {eventCounts.slice(0, 4).map(([type, count]) => (
                     <Badge key={type} variant="outline" className="font-mono text-[10px]">
                       {type} {count}
                     </Badge>
                   ))}
+                  {eventNavigation.newer.length > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={eventsQuery.isFetching}
+                      onClick={showNewerEvents}
+                    >
+                      Newer events
+                    </Button>
+                  )}
+                  {eventNavigation.newer.length > 1 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={eventsQuery.isFetching}
+                      onClick={jumpToEventTail}
+                    >
+                      Jump to latest
+                    </Button>
+                  )}
+                  {olderEventCursor !== null && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={eventsQuery.isFetching}
+                      onClick={showOlderEvents}
+                    >
+                      {eventsQuery.isFetching ? (
+                        <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      {eventsQuery.isFetching ? "Loading events..." : "Older events"}
+                    </Button>
+                  )}
+                  {eventNavigation.current === null && eventHistoryMode === "Paused" && (
+                    <Button variant="outline" size="sm" onClick={jumpToEventTail}>
+                      {lifecycleActive ? "Jump to live" : "Jump to latest"}
+                    </Button>
+                  )}
                 </div>
               </div>
             </CardHeader>
             <CardContent className="min-h-0 flex-1 p-0">
-              <div className="h-full overflow-auto">
+              <div
+                ref={eventsViewportRef}
+                className="max-h-[42rem] overflow-auto"
+                onScroll={(event) => {
+                  const viewport = event.currentTarget
+                  const pinned =
+                    viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 32
+                  if (!pinned && eventPinnedToTail) {
+                    eventReconcilePendingRef.current = true
+                    eventReconcileRunner.clearPending()
+                    eventReconcileAbortRef.current?.abort()
+                    void queryClient.cancelQueries({
+                      queryKey: ["session-events", sessionId, "latest"],
+                      exact: true,
+                    })
+                  }
+                  setEventPinnedToTail(pinned)
+                }}
+              >
                 <div className="sticky top-0 z-10 grid grid-cols-[0.75rem_5.25rem_minmax(0,1fr)_1rem] gap-2 border-b border-border bg-background/95 px-3 py-2 text-[11px] font-medium uppercase text-muted-foreground backdrop-blur sm:grid-cols-[1rem_7.5rem_minmax(0,1fr)_1.5rem] sm:gap-3 sm:px-4">
                   <span />
                   <span>Time</span>
                   <span>Event</span>
                   <span />
                 </div>
+                {(eventsQuery.isError || eventReconcileError) && (
+                  <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3 text-sm text-destructive">
+                    <span>
+                      {eventReconcileError ??
+                        (eventsQuery.error instanceof Error
+                          ? eventsQuery.error.message
+                          : "Failed to load events.")}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        if (eventNavigation.current === null) void reconcileLatestEvents()
+                        else void eventsQuery.refetch()
+                      }}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                )}
                 {filteredEvents.map((e) => (
                   <EventRow
                     key={e.id}
@@ -1475,10 +2277,17 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
                     onSelect={setSelectedEventId}
                   />
                 ))}
-                {filteredEvents.length === 0 && (
-                  <p className="px-4 py-6 text-sm text-muted-foreground">No events yet</p>
+                {filteredEvents.length === 0 && !eventsQuery.isError && !eventReconcileError && (
+                  <p className="px-4 py-6 text-sm text-muted-foreground">
+                    {eventsQuery.isLoading
+                      ? "Loading events..."
+                      : allEvents.length > 0
+                        ? olderEventCursor !== null
+                          ? "This page contains only hidden streaming text deltas. Load older events to continue."
+                          : "Only streaming text deltas were recorded; they are hidden from this timeline."
+                        : "No events yet"}
+                  </p>
                 )}
-                <div ref={eventsEndRef} />
               </div>
             </CardContent>
           </Card>
@@ -1504,18 +2313,97 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
               <CardTitle className="text-base">Transcript</CardTitle>
               <p className="mt-1 text-xs text-muted-foreground">Model-facing conversation state.</p>
             </div>
-            {summary?.transcript && (
+            <div className="flex flex-wrap justify-end gap-2">
               <Badge variant="outline" className="font-mono text-[10px]">
-                {formatCount(summary.transcript.total_messages)} messages
+                {formatCount(transcript.length)} of {formatCount(totalTranscriptMessages)} shown
               </Badge>
-            )}
+              <Badge variant={transcriptHistoryMode === "Live tail" ? "secondary" : "outline"}>
+                {transcriptHistoryMode}
+              </Badge>
+              {transcriptNavigation.newer.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={transcriptQuery.isFetching}
+                  onClick={showNewerTranscript}
+                >
+                  Newer messages
+                </Button>
+              )}
+              {transcriptNavigation.newer.length > 1 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={transcriptQuery.isFetching}
+                  onClick={jumpToTranscriptTail}
+                >
+                  Jump to latest
+                </Button>
+              )}
+              {olderTranscript !== undefined && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={transcriptQuery.isFetching}
+                  onClick={showOlderTranscript}
+                >
+                  {transcriptQuery.isFetching ? (
+                    <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  {transcriptQuery.isFetching ? "Loading messages..." : "Older messages"}
+                </Button>
+              )}
+              {transcriptNavigation.current === null && transcriptHistoryMode === "Paused" && (
+                <Button variant="outline" size="sm" onClick={jumpToTranscriptTail}>
+                  {lifecycleActive ? "Jump to live" : "Jump to latest"}
+                </Button>
+              )}
+            </div>
           </div>
         </CardHeader>
         <CardContent className="min-h-0 flex-1 p-0">
-          <div className="max-h-[42rem] space-y-3 overflow-auto p-4">
-            {transcript.map((msg, messageIndex) => (
+          <div
+            ref={transcriptViewportRef}
+            className="max-h-[42rem] space-y-3 overflow-auto p-4"
+            onScroll={(event) => {
+              const viewport = event.currentTarget
+              const pinned =
+                viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 32
+              if (!pinned && transcriptPinnedToTail) {
+                transcriptReconcilePendingRef.current = true
+                transcriptReconcileRunner.clearPending()
+                transcriptReconcileAbortRef.current?.abort()
+                void queryClient.cancelQueries({
+                  queryKey: ["session-transcript", sessionId, "latest"],
+                  exact: true,
+                })
+              }
+              setTranscriptPinnedToTail(pinned)
+            }}
+          >
+            {(transcriptQuery.isError || transcriptReconcileError) && (
+              <div className="flex items-center justify-between gap-3 text-sm text-destructive">
+                <span>
+                  {transcriptReconcileError ??
+                    (transcriptQuery.error instanceof Error
+                      ? transcriptQuery.error.message
+                      : "Failed to load the transcript.")}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    if (transcriptNavigation.current === null) void reconcileLatestTranscript()
+                    else void transcriptQuery.refetch()
+                  }}
+                >
+                  Retry
+                </Button>
+              </div>
+            )}
+            {transcript.map((msg) => (
               <div
-                key={transcriptMessageKey(msg, messageIndex)}
+                key={transcriptMessageKey(msg)}
                 className={cn(
                   "rounded-md border border-border p-3 text-sm",
                   msg.role === "user"
@@ -1542,10 +2430,11 @@ export function SessionDetailPage({ live }: { live?: boolean }) {
                 </div>
               </div>
             ))}
-            {transcript.length === 0 && (
-              <p className="text-sm text-muted-foreground">No transcript yet</p>
+            {transcript.length === 0 && !transcriptQuery.isError && !transcriptReconcileError && (
+              <p className="text-sm text-muted-foreground">
+                {transcriptQuery.isLoading ? "Loading transcript..." : "No transcript yet"}
+              </p>
             )}
-            <div ref={transcriptEndRef} />
           </div>
         </CardContent>
       </Card>

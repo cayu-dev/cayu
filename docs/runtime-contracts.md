@@ -355,14 +355,24 @@ which the usage folding tolerates but is a wider read than intended.
 The optional FastAPI server exposes the session event query endpoint at
 `GET /api/sessions/{session_id}/events`. The endpoint validates the session,
 accepts `after_sequence`, `before_sequence`, `order_by`, `limit`, `event_type`,
-`tool_name`, `agent_name`, `environment_name`, and `workflow_name` filters, and
-returns durable event records with `sequence`, `has_more`, `order_by`, and
-`next_sequence`; `event_types` is a runtime/store-level query field and is not
-exposed here. For ascending pages, continue with
+`exclude_event_type`, `tool_name`, `agent_name`, `environment_name`, and
+`workflow_name` filters, and returns durable event records with `sequence`,
+`has_more`, `order_by`, `next_sequence`, and `scan_through_sequence`.
+Event-type inclusion and exclusion
+are applied by the store before the page limit; the plural `event_types` and
+`exclude_event_types` fields remain runtime/store-level query fields. For
+ascending pages, continue with
 `after_sequence=next_sequence`; for descending pages, continue with
 `before_sequence=next_sequence`. Clients should use this endpoint for timelines,
 logs, replay panes, and polling instead of fetching the full session when they
 only need events.
+
+`next_sequence` paginates matching history. `scan_through_sequence` is a
+separate forward-tail watermark and can exceed it when filters excluded newer
+events. Passing that watermark as the next `after_sequence` avoids rescanning
+excluded events. When an ascending response has another matching page,
+`scan_through_sequence` stops at the last returned event so a tail reader cannot
+skip matching records.
 
 `GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
 It returns the session id, status, update/activity timestamps, and typed
@@ -374,6 +384,13 @@ Built-in stores must not implement either
 method by loading and copying the full session or checkpoint. The richer
 `/summary` endpoint computes event, outcome, transcript, and usage metrics and
 is intentionally an on-demand/low-frequency read rather than a heartbeat.
+
+`GET /api/sessions/{session_id}` is the stable session metadata read. Its
+`ApiSession` response contains identity, labels, and full user-authored metadata
+directly; it does not load or embed events, transcript messages, summary data,
+or interruption-cascade state. This replaces the earlier compound response:
+clients must read session fields at the response root and use `/state`,
+`/events`, `/transcript`, and `/summary` for the separated bounded read models.
 
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`

@@ -119,7 +119,6 @@ from cayu.server.contracts import (
     PendingKnowledgeDetailResponse,
     PendingKnowledgeListResponse,
     ServerContractResponse,
-    SessionDetailResponse,
     SessionsSummaryResponse,
     SessionStateResponse,
     SessionSummaryResponse,
@@ -2587,6 +2586,10 @@ def create_router(
     async def list_session_events(
         session_id: NonBlankString,
         event_type: str | None = None,
+        exclude_event_type: str | None = Query(
+            default=None,
+            description="Exclude one event type before applying pagination.",
+        ),
         tool_name: str | None = None,
         agent_name: str | None = None,
         environment_name: str | None = None,
@@ -2611,10 +2614,22 @@ def create_router(
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        has_event_filters = any(
+            value is not None
+            for value in (
+                event_type,
+                exclude_event_type,
+                tool_name,
+                agent_name,
+                environment_name,
+                workflow_name,
+            )
+        )
         try:
             query = EventQuery(
                 session_id=session_id,
                 event_type=event_type,
+                exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
                 tool_name=tool_name,
                 agent_name=agent_name,
                 environment_name=environment_name,
@@ -2630,17 +2645,49 @@ def create_router(
                 detail=exc.errors(include_context=False, include_url=False),
             ) from exc
 
+        raw_scan_sequence: int | None = None
+        if before_sequence is None and has_event_filters:
+            # Capture the raw high-water mark before the filtered read. Advancing
+            # through a sequence observed after that read could skip a matching
+            # event committed between the two queries.
+            latest_records = await session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    after_sequence=after_sequence,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if latest_records:
+                raw_scan_sequence = latest_records[0].sequence
+
         records = await session_store.query_events(query)
         page = records[:limit]
         has_more = len(records) > limit
         cursor = after_sequence if order_by == EventOrder.SEQUENCE_ASC else before_sequence
         next_sequence = page[-1].sequence if page else cursor
 
+        scan_through_sequence: int | None = None
+        if before_sequence is None:
+            scan_candidates = [sequence for sequence in (after_sequence,) if sequence is not None]
+            if order_by == EventOrder.SEQUENCE_ASC and has_more:
+                # A matching event remains beyond this response, so the tail
+                # cursor must stop at the last event actually returned.
+                if page:
+                    scan_candidates.append(page[-1].sequence)
+            else:
+                scan_candidates.extend(record.sequence for record in page)
+                if raw_scan_sequence is not None:
+                    scan_candidates.append(raw_scan_sequence)
+            if scan_candidates:
+                scan_through_sequence = max(scan_candidates)
+
         return {
             "session_id": session_id,
             "events": [_serialize_event_record(record) for record in page],
             "order_by": order_by,
             "next_sequence": next_sequence,
+            "scan_through_sequence": scan_through_sequence,
             "has_more": has_more,
         }
 
@@ -2689,42 +2736,14 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}",
-        response_model=SessionDetailResponse,
+        response_model=ApiSession,
         dependencies=protected,
     )
-    async def get_session(session_id: str):
+    async def get_session(session_id: NonBlankString):
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-
-        events = await session_store.load_events(session_id)
-        transcript = await session_store.load_transcript(session_id)
-        interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
-
-        return {
-            "session": _serialize_session(session),
-            "interruption_cascade": interruption_cascade,
-            "events": [
-                {
-                    "id": e.id,
-                    "type": str(e.type),
-                    "agent_name": e.agent_name,
-                    "environment_name": e.environment_name,
-                    "workflow_name": e.workflow_name,
-                    "tool_name": e.tool_name,
-                    "payload": e.payload,
-                    "timestamp": e.timestamp.isoformat(),
-                }
-                for e in events
-            ],
-            "transcript": [
-                {
-                    "role": str(m.role),
-                    "content": [_serialize_message_part(p) for p in m.content],
-                }
-                for m in transcript
-            ],
-        }
+        return _serialize_session(session)
 
     @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):

@@ -10,11 +10,10 @@ import type {
   ApiPendingActionIssue,
   ApiReviewedKnowledgeEntry,
   ApiSessionBase,
-  ApiSessionDetailEvent,
-  ApiSessionDetailTranscriptMessage,
   ApiTaskDetail,
   ApiTaskListItem,
   ApiToolSummary,
+  ApiTranscriptMessage,
   ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
   ArtifactReadResponse,
   ArtifactsResponse,
@@ -23,15 +22,20 @@ import type {
   GetArtifactContentApiArtifactsArtifactIdContentGetData,
   GetContractApiContractGetResponse,
   GetSessionApiSessionsSessionIdGetResponse,
+  GetSessionStateApiSessionsSessionIdStateGetResponse,
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
+  GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
+  GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
   GetTaskApiTasksTaskIdGetResponse,
   InterruptSessionBody,
   ListArtifactsApiArtifactsGetData,
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
+  ListSessionEventsApiSessionsSessionIdEventsGetData,
+  ListSessionEventsApiSessionsSessionIdEventsGetResponse,
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
   ListTasksApiTasksGetData,
@@ -85,10 +89,19 @@ export type ArtifactContentQuery = NonNullable<
   GetArtifactContentApiArtifactsArtifactIdContentGetData["query"]
 >
 export type Session = ApiSessionBase
-export type SessionEvent = ApiSessionDetailEvent
-export type TranscriptMessage = ApiSessionDetailTranscriptMessage
+export type SessionEvent = SseEventEnvelope
+export type TranscriptMessage = ApiTranscriptMessage
 export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
+export type SessionState = GetSessionStateApiSessionsSessionIdStateGetResponse
 export type SessionSummary = GetSessionSummaryApiSessionsSessionIdSummaryGetResponse
+export type SessionEventsPage = ListSessionEventsApiSessionsSessionIdEventsGetResponse
+export type SessionEventsQuery = NonNullable<
+  ListSessionEventsApiSessionsSessionIdEventsGetData["query"]
+>
+export type SessionTranscriptPage = GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse
+export type SessionTranscriptQuery = NonNullable<
+  GetSessionTranscriptApiSessionsSessionIdTranscriptGetData["query"]
+>
 export type SessionsSummary = GetSessionsSummaryApiSessionsSummaryPostResponse
 export type SessionListQuery = NonNullable<ListSessionsApiSessionsGetData["query"]>
 export type SessionsSummaryQuery = NonNullable<
@@ -280,11 +293,37 @@ export async function fetchSessionsSummary(
 }
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
-  return requestJson<SessionDetail>(`/sessions/${id}`)
+  return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function fetchSessionState(id: string): Promise<SessionState> {
+  return requestJson<SessionState>(`/sessions/${encodeURIComponent(id)}/state`)
+}
+
+export async function fetchSessionEvents(
+  id: string,
+  query: SessionEventsQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionEventsPage> {
+  return requestJson<SessionEventsPage>(
+    `/sessions/${encodeURIComponent(id)}/events${queryString(query)}`,
+    { signal },
+  )
+}
+
+export async function fetchSessionTranscript(
+  id: string,
+  query: SessionTranscriptQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionTranscriptPage> {
+  return requestJson<SessionTranscriptPage>(
+    `/sessions/${encodeURIComponent(id)}/transcript${queryString(query)}`,
+    { signal },
+  )
 }
 
 export async function fetchSessionSummary(id: string): Promise<SessionSummary> {
-  return requestJson<SessionSummary>(`/sessions/${id}/summary`)
+  return requestJson<SessionSummary>(`/sessions/${encodeURIComponent(id)}/summary`)
 }
 
 export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {

@@ -13,9 +13,10 @@
     "preview": "vite preview",
     "generate:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py",
     "check:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py --check",
-    "lint": "biome check src/",
-    "lint:fix": "biome check --fix src/",
-    "format": "biome format --write src/",
+    "lint": "biome check src/ tests/",
+    "lint:fix": "biome check --fix src/ tests/",
+    "format": "biome format --write src/ tests/",
+    "test": "node --experimental-strip-types --test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

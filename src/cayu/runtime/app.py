@@ -2840,6 +2840,7 @@ class CayuApp:
                     causal_budget_id=query.causal_budget_id,
                     event_type=query.event_type,
                     event_types=query.event_types,
+                    exclude_event_types=query.exclude_event_types,
                     agent_name=query.agent_name,
                     environment_name=query.environment_name,
                     workflow_name=query.workflow_name,

@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -3330,6 +3331,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert first_body["order_by"] == "sequence_asc"
     assert first_body["has_more"] is True
     assert first_body["next_sequence"] == 2
+    assert first_body["scan_through_sequence"] == 2
     assert [event["id"] for event in first_body["events"]] == ["event_1", "event_2"]
     assert first_body["events"][1] == {
         "sequence": 2,
@@ -3350,6 +3352,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert second_body["has_more"] is False
     assert second_body["order_by"] == "sequence_asc"
     assert second_body["next_sequence"] == 3
+    assert second_body["scan_through_sequence"] == 3
     assert [event["id"] for event in second_body["events"]] == ["event_3"]
 
     latest_page = client.get("/api/sessions/events_1/events?order_by=sequence_desc&limit=2")
@@ -3358,6 +3361,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert latest_body["order_by"] == "sequence_desc"
     assert latest_body["has_more"] is True
     assert latest_body["next_sequence"] == 2
+    assert latest_body["scan_through_sequence"] == 3
     assert [event["id"] for event in latest_body["events"]] == ["event_3", "event_2"]
 
     older_page = client.get(
@@ -3368,6 +3372,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert older_body["order_by"] == "sequence_desc"
     assert older_body["has_more"] is False
     assert older_body["next_sequence"] == 1
+    assert older_body["scan_through_sequence"] is None
     assert [event["id"] for event in older_body["events"]] == ["event_1"]
 
     exhausted_page = client.get(
@@ -3379,6 +3384,7 @@ def test_server_exposes_paginated_session_events() -> None:
         "events": [],
         "order_by": "sequence_desc",
         "next_sequence": 1,
+        "scan_through_sequence": None,
         "has_more": False,
     }
 
@@ -3443,7 +3449,116 @@ def test_server_filters_session_events() -> None:
     body = response.json()
     assert body["has_more"] is False
     assert body["next_sequence"] == 1
+    assert body["scan_through_sequence"] == 3
     assert [event["id"] for event in body["events"]] == ["event_filter_1"]
+
+    bounded_response = client.get(
+        "/api/sessions/events_filters/events",
+        params={"event_type": "tool.call.completed", "limit": 1},
+    )
+    assert bounded_response.status_code == 200
+    bounded_body = bounded_response.json()
+    assert bounded_body["has_more"] is True
+    assert bounded_body["scan_through_sequence"] == 1
+    assert [event["id"] for event in bounded_body["events"]] == ["event_filter_1"]
+
+
+def test_server_excludes_event_type_before_pagination() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_events() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="events_exclusion",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "events_exclusion",
+            [
+                Event(
+                    id="useful_old",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="events_exclusion",
+                ),
+                *[
+                    Event(
+                        id=f"delta_{index}",
+                        type=EventType.MODEL_TEXT_DELTA,
+                        session_id="events_exclusion",
+                        payload={"delta": "x"},
+                    )
+                    for index in range(20)
+                ],
+                Event(
+                    id="useful_new",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="events_exclusion",
+                ),
+                *[
+                    Event(
+                        id=f"trailing_delta_{index}",
+                        type=EventType.MODEL_TEXT_DELTA,
+                        session_id="events_exclusion",
+                        payload={"delta": "y"},
+                    )
+                    for index in range(10)
+                ],
+            ],
+        )
+
+    asyncio.run(seed_events())
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.get(
+        "/api/sessions/events_exclusion/events",
+        params={
+            "exclude_event_type": "model.text.delta",
+            "order_by": "sequence_desc",
+            "limit": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_more"] is False
+    assert [event["id"] for event in body["events"]] == ["useful_new", "useful_old"]
+    assert body["scan_through_sequence"] == 32
+
+    useful_new_sequence = body["events"][0]["sequence"]
+    forward_response = client.get(
+        "/api/sessions/events_exclusion/events",
+        params={
+            "exclude_event_type": "model.text.delta",
+            "after_sequence": useful_new_sequence,
+            "order_by": "sequence_asc",
+            "limit": 2,
+        },
+    )
+    assert forward_response.status_code == 200
+    forward_body = forward_response.json()
+    assert forward_body["events"] == []
+    assert forward_body["next_sequence"] == useful_new_sequence
+    assert forward_body["scan_through_sequence"] == 32
+
+    caught_up_response = client.get(
+        "/api/sessions/events_exclusion/events",
+        params={
+            "exclude_event_type": "model.text.delta",
+            "after_sequence": forward_body["scan_through_sequence"],
+            "order_by": "sequence_asc",
+            "limit": 2,
+        },
+    )
+    assert caught_up_response.status_code == 200
+    caught_up_body = caught_up_response.json()
+    assert caught_up_body["events"] == []
+    assert caught_up_body["next_sequence"] == 32
+    assert caught_up_body["scan_through_sequence"] == 32
 
 
 def test_server_session_events_returns_404_for_missing_session() -> None:
@@ -3489,6 +3604,12 @@ def test_server_session_events_validates_query() -> None:
     )
     assert (
         client.get("/api/sessions/events_validation/events?event_type=not.valid").status_code == 422
+    )
+    assert (
+        client.get(
+            "/api/sessions/events_validation/events?exclude_event_type=not.valid"
+        ).status_code
+        == 422
     )
     assert client.get("/api/sessions/%20/events").status_code == 422
 
@@ -4481,7 +4602,7 @@ def test_server_updates_session_labels() -> None:
     empty_body = client.patch("/api/sessions/sess_lab/labels", json={})
     assert empty_body.status_code == 422
     # The labels were not wiped by any of the rejected requests.
-    assert client.get("/api/sessions/sess_lab").json()["session"]["labels"] == {"stage": "review"}
+    assert client.get("/api/sessions/sess_lab").json()["labels"] == {"stage": "review"}
 
 
 def test_server_updates_session_metadata() -> None:
@@ -4498,7 +4619,7 @@ def test_server_updates_session_metadata() -> None:
     # Typo'd key / missing field must 422, never silently wipe metadata.
     assert client.patch("/api/sessions/sess_meta/metadata", json={"metadat": {}}).status_code == 422
     assert client.patch("/api/sessions/sess_meta/metadata", json={}).status_code == 422
-    assert client.get("/api/sessions/sess_meta").json()["session"]["metadata"] == {"b": [1, 2]}
+    assert client.get("/api/sessions/sess_meta").json()["metadata"] == {"b": [1, 2]}
 
 
 def test_server_lists_sessions_with_cursor_pagination() -> None:
@@ -4545,20 +4666,60 @@ def test_server_list_omits_metadata_but_detail_includes_it() -> None:
     assert "labels" in listed[0]  # base fields still present
     # ...but the single-session detail view includes it.
     detail = client.get("/api/sessions/sess_m").json()
-    assert detail["session"]["metadata"] == {"secret": "value"}
+    assert detail["metadata"] == {"secret": "value"}
+    assert "events" not in detail
+    assert "transcript" not in detail
+    assert "interruption_cascade" not in detail
 
 
-def test_server_session_detail_and_state_expose_typed_interruption_cascade_state() -> None:
+def test_server_session_detail_does_not_read_history_or_checkpoint_state() -> None:
+    async def seed(store):
+        session = await _create_session(store, "sess_bounded_detail", metadata={"kind": "demo"})
+        await store.append_event(
+            session.id,
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id=session.id,
+                agent_name=session.agent_name,
+                payload={},
+            ),
+        )
+        await store.append_transcript_messages(
+            session.id,
+            [Message.text("assistant", "response")],
+        )
+
+    store, client = _lifecycle_store_and_client(seed)
+
+    with (
+        patch.object(store, "load_events", wraps=store.load_events) as load_events,
+        patch.object(store, "load_transcript", wraps=store.load_transcript) as load_transcript,
+        patch.object(store, "query_events", wraps=store.query_events) as query_events,
+        patch.object(store, "query_transcript", wraps=store.query_transcript) as query_transcript,
+        patch.object(
+            store,
+            "load_interruption_cascade_marker",
+            wraps=store.load_interruption_cascade_marker,
+        ) as load_interruption_cascade_marker,
+    ):
+        response = client.get("/api/sessions/sess_bounded_detail")
+
+    assert response.status_code == 200
+    assert response.json()["metadata"] == {"kind": "demo"}
+    load_events.assert_not_awaited()
+    load_transcript.assert_not_awaited()
+    query_events.assert_not_awaited()
+    query_transcript.assert_not_awaited()
+    load_interruption_cascade_marker.assert_not_awaited()
+
+
+def test_server_session_state_exposes_typed_interruption_cascade_state() -> None:
     async def seed(store):
         await _create_session(store, "sess_cascade_state")
 
     store, client = _lifecycle_store_and_client(seed)
 
     def assert_cascade_state(expected: str) -> None:
-        assert (
-            client.get("/api/sessions/sess_cascade_state").json()["interruption_cascade"]
-            == expected
-        )
         assert (
             client.get("/api/sessions/sess_cascade_state/state").json()["interruption_cascade"]
             == expected
@@ -5083,7 +5244,7 @@ def test_client_disconnect_does_not_cancel_detached_run() -> None:
     deadline = time.monotonic() + 10
     status = None
     while time.monotonic() < deadline:
-        status = client.get(f"/api/sessions/{session_id}").json()["session"]["status"]
+        status = client.get(f"/api/sessions/{session_id}").json()["status"]
         if status == "completed":
             break
         time.sleep(0.05)

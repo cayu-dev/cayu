@@ -1437,105 +1437,6 @@
       "title": "ApiSessionBase",
       "type": "object"
     },
-    "ApiSessionDetailEvent": {
-      "additionalProperties": false,
-      "properties": {
-        "agent_name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Agent Name"
-        },
-        "environment_name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Environment Name"
-        },
-        "id": {
-          "title": "Id",
-          "type": "string"
-        },
-        "payload": {
-          "additionalProperties": true,
-          "title": "Payload",
-          "type": "object"
-        },
-        "timestamp": {
-          "title": "Timestamp",
-          "type": "string"
-        },
-        "tool_name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Tool Name"
-        },
-        "type": {
-          "title": "Type",
-          "type": "string"
-        },
-        "workflow_name": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Workflow Name"
-        }
-      },
-      "required": [
-        "id",
-        "type",
-        "agent_name",
-        "tool_name",
-        "payload",
-        "timestamp"
-      ],
-      "title": "ApiSessionDetailEvent",
-      "type": "object"
-    },
-    "ApiSessionDetailTranscriptMessage": {
-      "additionalProperties": false,
-      "properties": {
-        "content": {
-          "items": {
-            "additionalProperties": true,
-            "type": "object"
-          },
-          "title": "Content",
-          "type": "array"
-        },
-        "role": {
-          "title": "Role",
-          "type": "string"
-        }
-      },
-      "required": [
-        "role",
-        "content"
-      ],
-      "title": "ApiSessionDetailTranscriptMessage",
-      "type": "object"
-    },
     "ApiSessionOutcome": {
       "additionalProperties": false,
       "properties": {
@@ -2895,6 +2796,19 @@
           "title": "Order By",
           "type": "string"
         },
+        "scan_through_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Highest durable sequence that a forward tail reader can safely pass as after_sequence. This can be newer than next_sequence when filters exclude events.",
+          "title": "Scan Through Sequence"
+        },
         "session_id": {
           "title": "Session Id",
           "type": "string"
@@ -2904,6 +2818,7 @@
         "session_id",
         "events",
         "order_by",
+        "scan_through_sequence",
         "has_more"
       ],
       "title": "ListSessionEventsResponse",
@@ -3869,45 +3784,6 @@
       ],
       "title": "SessionDebugState",
       "type": "string"
-    },
-    "SessionDetailResponse": {
-      "additionalProperties": false,
-      "properties": {
-        "events": {
-          "items": {
-            "$ref": "#/components/schemas/ApiSessionDetailEvent"
-          },
-          "title": "Events",
-          "type": "array"
-        },
-        "interruption_cascade": {
-          "enum": [
-            "none",
-            "pending",
-            "failed"
-          ],
-          "title": "Interruption Cascade",
-          "type": "string"
-        },
-        "session": {
-          "$ref": "#/components/schemas/ApiSession"
-        },
-        "transcript": {
-          "items": {
-            "$ref": "#/components/schemas/ApiSessionDetailTranscriptMessage"
-          },
-          "title": "Transcript",
-          "type": "array"
-        }
-      },
-      "required": [
-        "session",
-        "interruption_cascade",
-        "events",
-        "transcript"
-      ],
-      "title": "SessionDetailResponse",
-      "type": "object"
     },
     "SessionOrder": {
       "enum": [
@@ -7175,6 +7051,7 @@
             "name": "session_id",
             "required": true,
             "schema": {
+              "minLength": 1,
               "title": "Session Id",
               "type": "string"
             }
@@ -7187,7 +7064,7 @@
           "200": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/SessionDetailResponse"
+                "$ref": "#/components/schemas/ApiSession"
               }
             }
           },
@@ -7338,6 +7215,23 @@
                 }
               ],
               "title": "Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclude one event type before applying pagination.",
+              "title": "Exclude Event Type"
             }
           },
           {

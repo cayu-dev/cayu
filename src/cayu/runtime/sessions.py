@@ -1339,6 +1339,7 @@ class EventQuery(BaseModel):
     causal_budget_id: str | None = None
     event_type: EventType | str | None = None
     event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
+    exclude_event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
     agent_name: str | None = None
     environment_name: str | None = None
     workflow_name: str | None = None
@@ -1394,19 +1395,19 @@ class EventQuery(BaseModel):
             return value
         return Event(type=value, session_id="query").type
 
-    @field_validator("event_types", mode="before")
+    @field_validator("event_types", "exclude_event_types", mode="before")
     @classmethod
-    def copy_event_types(cls, value) -> tuple[EventType | str, ...]:
+    def copy_event_types(cls, value, info) -> tuple[EventType | str, ...]:
         if value is None:
             return ()
         if type(value) is str:
-            raise ValueError("`event_types` must be a sequence of event types.")
+            raise ValueError(f"`{info.field_name}` must be a sequence of event types.")
         normalized: list[EventType | str] = []
         for item in tuple(value):
             if not isinstance(item, EventType):
                 item = Event(type=item, session_id="query").type
             if item in normalized:
-                raise ValueError("`event_types` must not contain duplicates.")
+                raise ValueError(f"`{info.field_name}` must not contain duplicates.")
             normalized.append(item)
         return tuple(normalized)
 
@@ -2283,6 +2284,9 @@ class InMemorySessionStore(SessionStore):
             event_types = frozenset((str(query.event_type),))
         else:
             event_types = frozenset(str(event_type) for event_type in query.event_types)
+        excluded_event_types = frozenset(
+            str(event_type) for event_type in query.exclude_event_types
+        )
         async with self._lock:
             candidates = self._query_candidate_records(query, event_types)
             start = (
@@ -2303,7 +2307,12 @@ class InMemorySessionStore(SessionStore):
             records: list[EventRecord] = []
             for index in indexes:
                 record = candidates[index]
-                if not _event_record_matches(record, query, event_types):
+                if not _event_record_matches(
+                    record,
+                    query,
+                    event_types,
+                    excluded_event_types,
+                ):
                     continue
                 if not _event_record_matches_session(record, query, self._sessions):
                     continue
@@ -3243,6 +3252,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
+        exclude_event_types=query.exclude_event_types,
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,
@@ -3459,6 +3469,7 @@ def _event_record_matches(
     record: EventRecord,
     query: EventQuery,
     event_types: frozenset[str],
+    excluded_event_types: frozenset[str],
 ) -> bool:
     event = record.event
     if query.after_sequence is not None and record.sequence <= query.after_sequence:
@@ -3477,6 +3488,8 @@ def _event_record_matches(
     if query.until is not None and event_timestamp >= query.until:
         return False
     if event_types and str(event.type) not in event_types:
+        return False
+    if str(event.type) in excluded_event_types:
         return False
     if query.agent_name is not None and event.agent_name != query.agent_name:
         return False

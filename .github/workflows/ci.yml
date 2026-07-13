@@ -124,6 +124,7 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npm run lint
+      - run: npm run test
       - run: npm run typecheck
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11

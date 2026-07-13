@@ -1177,6 +1177,13 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         )
         read_file_records = await store.query_events(EventQuery(tool_name="read_file"))
         started_records = await store.query_events(EventQuery(event_type=EventType.SESSION_STARTED))
+        excluded_records = await store.query_events(
+            EventQuery(
+                exclude_event_types=(EventType.MODEL_COMPLETED,),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=2,
+            )
+        )
         causal_records = await store.query_events(EventQuery(causal_budget_id="job_build"))
         event_id_records = await store.query_events(
             EventQuery(session_id="sess_builder", event_id="event_2")
@@ -1227,6 +1234,7 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
             "event_1",
             "event_4",
         ]
+        assert [record.event.id for record in excluded_records] == ["event_4", "event_2"]
         assert [record.event.id for record in causal_records] == [
             "event_1",
             "event_2",
@@ -1395,6 +1403,12 @@ def test_event_query_event_types_validation() -> None:
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
     )
+    excluded = EventQuery(exclude_event_types=("model.text.delta",))
+    assert excluded.exclude_event_types == (EventType.MODEL_TEXT_DELTA,)
+    with pytest.raises(ValidationError, match="exclude_event_types.*sequence of event types"):
+        EventQuery(exclude_event_types="model.text.delta")
+    with pytest.raises(ValidationError, match="exclude_event_types.*duplicates"):
+        EventQuery(exclude_event_types=(EventType.MODEL_TEXT_DELTA, "model.text.delta"))
 
 
 def test_sqlite_session_store_batches_large_event_session_id_queries(tmp_path, monkeypatch):
