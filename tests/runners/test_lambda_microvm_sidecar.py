@@ -69,6 +69,33 @@ def wait_for_terminal(
     raise AssertionError(f"command {command_id} did not finish")
 
 
+def wait_for_process_exit(pid: int, *, timeout_s: float = 3) -> None:
+    """Wait until a process has exited, treating Linux zombies as terminated."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+
+        # A killed orphan can remain visible to kill(2) as a zombie until the
+        # host's PID 1 reaps it. It is no longer executing at that point.
+        if Path("/proc").is_dir():
+            stat_path = Path(f"/proc/{pid}/stat")
+            try:
+                stat = stat_path.read_text()
+            except FileNotFoundError:
+                return
+            except OSError:
+                pass
+            else:
+                _prefix, separator, fields = stat.rpartition(") ")
+                if separator and fields.split(maxsplit=1)[0] in {"X", "Z"}:
+                    return
+        time.sleep(0.01)
+    raise AssertionError(f"process {pid} did not exit")
+
+
 def test_sidecar_executes_process_form_without_host_env_and_bounds_output(
     tmp_path: Path,
 ) -> None:
@@ -155,8 +182,7 @@ def test_sidecar_timeout_kills_sigterm_ignoring_descendant(tmp_path: Path) -> No
     descendant_pid = int(pid_file.read_text())
 
     assert result["timed_out"] is True
-    with pytest.raises(ProcessLookupError):
-        os.kill(descendant_pid, 0)
+    wait_for_process_exit(descendant_pid)
 
 
 def test_sidecar_cancels_running_command_idempotently(tmp_path: Path) -> None:
