@@ -31,7 +31,8 @@ def test_runner_init_and_resolve_cwd():
     assert r.default_cwd == DEFAULT_SBX_CWD
     assert r.resolve_cwd() == DEFAULT_SBX_CWD
     assert r.resolve_cwd("subdir") == "/workspace/subdir"
-    with pytest.raises(ValueError, match="relative"):
+    assert r.resolve_cwd("/workspace/subdir") == "/workspace/subdir"
+    with pytest.raises(ValueError, match="outside the runner root"):
         r.resolve_cwd("/x")
     with pytest.raises(ValueError, match="escapes"):
         r.resolve_cwd("../../etc")
@@ -234,9 +235,10 @@ def test_resolve_cwd_relative_path():
     assert r.resolve_cwd("sub/dir") == "/workspace/sub/dir"
 
 
-def test_resolve_cwd_rejects_absolute():
+def test_resolve_cwd_accepts_contained_absolute_and_rejects_outside():
     r = SbxRunner("a1", mount_path="/tmp/m", sbx_path="/usr/bin/sbx")
-    with pytest.raises(ValueError, match="relative"):
+    assert r.resolve_cwd("/workspace/sub/../tests") == "/workspace/tests"
+    with pytest.raises(ValueError, match="outside the runner root"):
         r.resolve_cwd("/etc")
 
 

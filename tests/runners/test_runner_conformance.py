@@ -1132,6 +1132,38 @@ def test_runner_conformance_executes_each_submitted_command_once(
 
 
 @pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+def test_runner_conformance_resolves_cwd_idempotently_and_rejects_escape(
+    registration: RunnerConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "nested"
+    work.mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    evidence = ConformanceEvidence("canonical-cwd", registration.name, "required")
+
+    async def run() -> None:
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            canonical = harness.runner.resolve_cwd("nested")
+            evidence.observed = {
+                "default": harness.runner.resolve_cwd(),
+                "canonical": canonical,
+            }
+            assert canonical == str(work)
+            assert harness.runner.resolve_cwd(canonical) == canonical
+            with pytest.raises(ValueError, match="escapes the runner root"):
+                harness.runner.resolve_cwd("../outside")
+            with pytest.raises(ValueError, match="outside the runner root"):
+                harness.runner.resolve_cwd(str(outside))
+        finally:
+            await harness.aclose()
+
+    with evidence.reporting():
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
 def test_runner_conformance_reports_success_failure_cwd_env_stdin_and_output(
     registration: RunnerConformanceRegistration,
     tmp_path: Path,

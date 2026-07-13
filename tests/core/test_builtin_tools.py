@@ -1582,6 +1582,7 @@ class _StaticCommandPolicy(CommandPolicy):
 
 def test_exec_command_tool_policy_receives_resolved_request_and_allows():
     runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
     policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
     ctx = ToolContext(session_id="sess_1", runner=runner)
 
@@ -1590,7 +1591,7 @@ def test_exec_command_tool_policy_receives_resolved_request_and_allows():
             ctx,
             {
                 "argv": ["echo", "hi"],
-                "cwd": "/tmp",
+                "cwd": "src/../tests",
                 "env": {"FOO": "bar"},
                 "timeout_s": 5,
             },
@@ -1603,13 +1604,154 @@ def test_exec_command_tool_policy_receives_resolved_request_and_allows():
     seen_ctx, seen_request = policy.requests[0]
     assert seen_ctx is ctx
     assert seen_request.command == ExecCommand.process("echo", "hi")
-    assert seen_request.cwd == "/tmp"
+    assert seen_request.cwd == "src/../tests"
+    assert seen_request.canonical_cwd == "/workspace/tests"
     assert seen_request.env == {"FOO": "bar"}
     assert seen_request.timeout_s == 5
+    assert runner.cwd == "/workspace/tests"
+
+
+@pytest.mark.parametrize(
+    ("requested_cwd", "canonical_cwd"),
+    [
+        (None, "/workspace"),
+        ("repo", "/workspace/repo"),
+        ("/workspace/repo", "/workspace/repo"),
+    ],
+)
+def test_exec_command_tool_policy_authorizes_and_executes_the_same_canonical_cwd(
+    requested_cwd,
+    canonical_cwd,
+):
+    runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+    args = {"argv": ["pwd"]}
+    if requested_cwd is not None:
+        args["cwd"] = requested_cwd
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            args,
+        )
+    )
+
+    assert result.is_error is False
+    assert policy.requests[0][1].cwd == requested_cwd
+    assert policy.requests[0][1].canonical_cwd == canonical_cwd
+    assert runner.cwd == canonical_cwd
+
+
+class _ResolvingRecordingRunner(RecordingRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.received_cwd: str | None = None
+        self.executed_cwd: str | None = None
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = None,
+    ) -> ExecResult:
+        self.received_cwd = cwd
+        self.executed_cwd = self.resolve_cwd(cwd)
+        return await super().exec(
+            command,
+            cwd=self.executed_cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+
+class _ChangeRunnerDefaultPolicy(CommandPolicy):
+    def __init__(self, runner: Runner) -> None:
+        self.runner = runner
+        self.request: CommandRequest | None = None
+
+    async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+        self.request = request
+        self.runner.default_cwd = "/other"
+        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+
+
+def test_exec_command_tool_cannot_drift_after_authorizing_an_omitted_cwd():
+    runner = _ResolvingRecordingRunner()
+    runner.default_cwd = "/workspace"
+    policy = _ChangeRunnerDefaultPolicy(runner)
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"]},
+        )
+    )
+
+    assert policy.request is not None
+    assert policy.request.cwd is None
+    assert policy.request.canonical_cwd == "/workspace"
+    assert runner.received_cwd == "/workspace"
+    assert runner.executed_cwd is None
+    assert runner.command is None
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+
+
+@pytest.mark.parametrize("requested_cwd", ["../etc", "/etc"])
+def test_exec_command_tool_rejects_cwd_outside_runner_root_before_policy_or_exec(
+    requested_cwd,
+):
+    runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"], "cwd": requested_cwd},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_resolves_local_cwd_existence_before_policy_or_exec(tmp_path):
+    runner = LocalRunner(tmp_path)
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+    marker = tmp_path / "executed"
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                    ],
+                    "cwd": "missing",
+                },
+            )
+        )
+
+    assert policy.requests == []
+    assert marker.exists() is False
 
 
 def test_exec_command_tool_policy_deny_blocks_runner():
     runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
     policy = _StaticCommandPolicy(
         CommandPolicyResult(
             decision=CommandPolicyDecision.DENY,
@@ -1620,7 +1762,7 @@ def test_exec_command_tool_policy_deny_blocks_runner():
     result = asyncio.run(
         ExecCommandTool(policy=policy).run(
             ToolContext(session_id="sess_1", runner=runner),
-            {"shell": "rm -rf /"},
+            {"shell": "rm -rf /", "cwd": "repo"},
         )
     )
 
@@ -1631,7 +1773,22 @@ def test_exec_command_tool_policy_deny_blocks_runner():
         "decision": "deny",
         "reason": "Shell scripts are not allowed here.",
     }
+    assert policy.requests[0][1].cwd == "repo"
+    assert policy.requests[0][1].canonical_cwd == "/workspace/repo"
     assert runner.command is None
+
+
+def test_command_request_loads_policy_metadata_without_canonical_cwd():
+    request = CommandRequest.model_validate(
+        {
+            "command": {"kind": "process", "argv": ["pwd"]},
+            "cwd": "repo",
+            "timeout_s": 5,
+        }
+    )
+
+    assert request.cwd == "repo"
+    assert request.canonical_cwd is None
 
 
 def test_exec_command_tool_policy_require_approval_blocks_runner():
@@ -1756,6 +1913,60 @@ def test_runtime_passes_environment_services_to_tool_context(tmp_path):
     assert tool.context.workspace is workspace
     assert tool.context.artifact_store is artifact_store
     assert tool.context.runner is runner
+
+
+def test_runtime_executes_in_the_local_canonical_cwd_authorized_by_policy(tmp_path):
+    work = tmp_path / "repo"
+    work.mkdir()
+    runner = LocalRunner(tmp_path)
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="exec_command",
+                    arguments={
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "import os; print(os.getcwd())",
+                        ],
+                        "cwd": str(work),
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local-dev"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy)],
+    )
+
+    events = asyncio.run(
+        _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "print the working directory")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    request = policy.requests[0][1]
+    assert request.cwd == str(work)
+    assert request.canonical_cwd == str(work)
+    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    assert completed.payload["result"]["structured"]["stdout"].strip() == str(work)
 
 
 def test_runtime_resolves_file_attachments_only_for_provider_request(tmp_path):

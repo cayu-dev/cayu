@@ -1031,8 +1031,9 @@ def test_e2b_runner_validates_boundary_inputs() -> None:
     runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
     bad_cleanup: Any = "delete_process"
 
-    with pytest.raises(ValueError, match="relative"):
-        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="/home/user/workspace"))
+    assert runner.resolve_cwd("/home/user/workspace") == "/home/user/workspace"
+    with pytest.raises(ValueError, match="outside the runner root"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="/etc"))
 
     with pytest.raises(ValueError, match="escapes"):
         asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="../"))

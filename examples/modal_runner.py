@@ -178,19 +178,6 @@ class ModalRunner(Runner):
                 artifacts=[_cleanup_artifact(self.isolation, terminated)]
             ) from exc
 
-    def resolve_cwd(self, cwd: str | None = None) -> str:
-        if cwd is None:
-            return self.default_cwd
-        if not cwd.strip():
-            raise ValueError("Runner cwd must be a non-empty string.")
-        if posixpath.isabs(cwd):
-            raise ValueError("Runner cwd must be relative.")
-        resolved = posixpath.normpath(posixpath.join(self.default_cwd, cwd))
-        root = self.default_cwd.rstrip("/")
-        if resolved != self.default_cwd and not resolved.startswith(f"{root}/"):
-            raise ValueError("Runner cwd escapes the runner root.")
-        return resolved
-
 
 def _command_argv(command: ExecCommand) -> list[str]:
     """Translate an ExecCommand into argv. Modal exec takes argv natively, so

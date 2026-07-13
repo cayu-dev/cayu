@@ -292,6 +292,14 @@ def test_exec_rejects_cwd_escape() -> None:
         asyncio.run(run())
 
 
+def test_resolve_cwd_is_idempotent_for_contained_canonical_paths() -> None:
+    runner = mod.ModalRunner(FakeSandbox())
+
+    assert runner.resolve_cwd("/workspace/src/../tests") == "/workspace/tests"
+    with pytest.raises(ValueError, match="outside the runner root"):
+        runner.resolve_cwd("/etc")
+
+
 # ---- _truncate handles both bytes and str (#8) ----
 
 

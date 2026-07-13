@@ -36,6 +36,14 @@ class Runner(ABC):
 - `command` is positional; everything else is keyword-only. Match the signature
   and defaults exactly — `ExecCommandTool` calls `exec(...)` with these keywords.
 - Set `isolation` to a short label for your backend (`"modal"`, `"docker"`, …).
+- Implement `resolve_cwd()` as an idempotent containment boundary. Relative
+  requests resolve beneath `default_cwd`; an absolute input is accepted only
+  when it is the runner's own canonical root/child path. In particular,
+  `resolve_cwd(resolve_cwd(value))` must equal `resolve_cwd(value)`. A configured
+  `CommandPolicy` authorizes that canonical result and `ExecCommandTool` passes
+  the same value to `exec(...)`, including the canonical default when the model
+  omitted `cwd`. Therefore attaching a command policy requires a runner whose
+  resolver accepts its own canonical output on every invocation.
 - **`Runner` is exported from `cayu.runners`, not the top-level `cayu`** (only the
   concrete runners are re-exported at the top level):
 
@@ -110,8 +118,9 @@ Follow [`examples/modal_runner.py`](../examples/modal_runner.py).
    This mirrors `_e2b_module()` / `_microsandbox_module()` in the built-in runners.
 
 2. **Subclass and translate.** Set `isolation = "modal"`, validate
-   `type(command) is ExecCommand`, resolve `cwd` to a relative, in-root path, and
-   build argv (`process` → `argv`; `shell` → `["bash", "-c", script]`).
+   `type(command) is ExecCommand`, resolve relative or already-canonical `cwd`
+   to an absolute in-root path, and build argv (`process` → `argv`; `shell` →
+   `["bash", "-c", script]`). Reject every absolute path outside the runner root.
 
 3. **Run it on the platform.** Modal's `exec` takes a plain `env` dict directly
    (it also accepts a native `timeout=` and a `secrets=` list) — passing the
@@ -239,6 +248,9 @@ commands through your runner.
 - [ ] Capture stderr separately; never raise on a non-zero exit — return it in `exit_code`.
 - [ ] Build the child env from the explicit `env` only — no host-env inheritance.
 - [ ] Resolve secrets at the environment/vault boundary, not in the runner.
-- [ ] Reject absolute/escaping `cwd`; keep it relative and in-root.
+- [ ] Resolve relative `cwd` beneath `default_cwd`; accept only contained
+      canonical absolute values; reject outside/escaping paths.
+- [ ] Keep `resolve_cwd()` idempotent so policy-authorized canonical paths execute
+      unchanged.
 - [ ] Lazy-import the optional SDK with an injectable module hook for tests.
 - [ ] Return a real `ExecResult`.

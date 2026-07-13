@@ -8,13 +8,20 @@ from _live_checks import require_equal
 from cayu import (
     AgentSpec,
     CayuApp,
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
     Environment,
     EnvironmentSpec,
+    ExecCommand,
     ExecCommandTool,
     Message,
     MicrosandboxRunner,
     RunRequest,
 )
+from cayu.core import Event, EventType
+from cayu.core.tools import ToolContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 
 
@@ -30,7 +37,11 @@ class FakeProvider(ModelProvider):
                 ModelStreamEvent.tool_call(
                     id="call_pwd",
                     name="exec_command",
-                    arguments={"kind": "process", "argv": ["pwd"]},
+                    arguments={
+                        "kind": "process",
+                        "argv": ["pwd"],
+                        "cwd": "/workspace/repo",
+                    },
                 ),
                 ModelStreamEvent.tool_call(
                     id="call_env",
@@ -79,6 +90,21 @@ class FakeProvider(ModelProvider):
             yield event
 
 
+class CanonicalCwdPolicy(CommandPolicy):
+    """Records the path representation authorized by the live runtime."""
+
+    def __init__(self) -> None:
+        self.requests: list[CommandRequest] = []
+
+    async def evaluate(
+        self,
+        ctx: ToolContext,
+        request: CommandRequest,
+    ) -> CommandPolicyResult:
+        self.requests.append(request)
+        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+
+
 async def main() -> None:
     sandbox_name = os.environ.get("CAYU_MICROSANDBOX_NAME", "cayu-runtime-live")
     image = os.environ.get("CAYU_MICROSANDBOX_IMAGE", "alpine")
@@ -96,8 +122,11 @@ async def main() -> None:
         close_action="remove",
     ) as runner:
         print("sandbox ready")
+        setup = await runner.exec(ExecCommand.process("mkdir", "-p", "/workspace/repo"))
+        require_equal(setup.exit_code, 0, "canonical_cwd_setup_exit_code")
 
         provider = FakeProvider()
+        policy = CanonicalCwdPolicy()
         app = CayuApp()
         app.register_provider(provider, default=True)
         app.register_environment(
@@ -109,9 +138,10 @@ async def main() -> None:
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            tools=[ExecCommandTool()],
+            tools=[ExecCommandTool(policy=policy)],
         )
 
+        events: list[Event] = []
         async for event in app.run(
             RunRequest(
                 agent_name="assistant",
@@ -119,6 +149,7 @@ async def main() -> None:
                 messages=[Message.text("user", "run sandbox commands")],
             )
         ):
+            events.append(event)
             print(
                 event.type,
                 event.environment_name or "-",
@@ -127,6 +158,23 @@ async def main() -> None:
             )
 
         require_equal(len(provider.requests), 2, "model_requests")
+        require_equal(policy.requests[0].cwd, "/workspace/repo", "requested_cwd")
+        require_equal(
+            policy.requests[0].canonical_cwd,
+            "/workspace/repo",
+            "canonical_cwd",
+        )
+        pwd_event = next(
+            event
+            for event in events
+            if event.type == EventType.TOOL_CALL_COMPLETED
+            and event.payload.get("tool_call_id") == "call_pwd"
+        )
+        require_equal(
+            pwd_event.payload["result"]["structured"]["stdout"],
+            "/workspace/repo\n",
+            "executed_canonical_cwd",
+        )
         print("model_requests", len(provider.requests))
         print("closing sandbox")
 

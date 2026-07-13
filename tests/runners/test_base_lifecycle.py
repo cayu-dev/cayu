@@ -61,7 +61,10 @@ def test_resolve_cwd_shared_implementation():
     runner = StubRunner()
     assert runner.resolve_cwd() == "/workspace"
     assert runner.resolve_cwd("sub/dir") == "/workspace/sub/dir"
-    with pytest.raises(ValueError, match="must be relative"):
+    assert runner.resolve_cwd("sub/../tests") == "/workspace/tests"
+    assert runner.resolve_cwd("/workspace") == "/workspace"
+    assert runner.resolve_cwd("/workspace/sub/../tests") == "/workspace/tests"
+    with pytest.raises(ValueError, match="outside the runner root"):
         runner.resolve_cwd("/etc")
     with pytest.raises(ValueError, match="escapes"):
         runner.resolve_cwd("../../etc")

@@ -3426,8 +3426,23 @@ def test_local_runner_executes_process_and_shell_commands(tmp_path):
 def test_local_runner_restricts_cwd_to_root(tmp_path):
     runner = LocalRunner(tmp_path)
 
-    with pytest.raises(ValueError, match="relative"):
-        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(tmp_path)))
+    root_result = asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(tmp_path)))
+    assert root_result.stdout.strip() == str(tmp_path)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    child_result = asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(work)))
+    assert child_result.stdout.strip() == str(work)
+
+    with pytest.raises(ValueError, match="outside the runner root"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(tmp_path.parent)))
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    link = tmp_path / "outside-link"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside the runner root"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd=str(link)))
 
     with pytest.raises(ValueError, match="escapes"):
         asyncio.run(runner.exec(ExecCommand.process("pwd"), cwd="../"))

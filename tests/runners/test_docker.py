@@ -428,9 +428,10 @@ def test_resolve_cwd_relative_path():
     assert r.resolve_cwd("sub/dir") == "/workspace/sub/dir"
 
 
-def test_resolve_cwd_rejects_absolute():
+def test_resolve_cwd_accepts_contained_absolute_and_rejects_outside():
     r = DockerRunner("a1", docker_path="/usr/bin/docker")
-    with pytest.raises(ValueError, match="relative"):
+    assert r.resolve_cwd("/workspace/sub/../tests") == "/workspace/tests"
+    with pytest.raises(ValueError, match="outside the runner root"):
         r.resolve_cwd("/etc")
 
 

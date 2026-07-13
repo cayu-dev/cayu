@@ -389,7 +389,7 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
     result = asyncio.run(
         runner.exec(
             ExecCommand.process("python", "-c", "print(1)"),
-            cwd="src",
+            cwd="/workspace/src",
             env={"VISIBLE": "1"},
             timeout_s=5,
             stdin="input",
@@ -831,7 +831,9 @@ def test_microsandbox_runner_restricts_cwd_to_guest_root() -> None:
     assert runner.resolve_cwd(None) == "/repo"
     assert runner.resolve_cwd("src") == "/repo/src"
     assert runner.resolve_cwd("src/../tests") == "/repo/tests"
-    with pytest.raises(ValueError, match="relative"):
+    assert runner.resolve_cwd("/repo") == "/repo"
+    assert runner.resolve_cwd("/repo/src/../tests") == "/repo/tests"
+    with pytest.raises(ValueError, match="outside the runner root"):
         runner.resolve_cwd("/etc")
     with pytest.raises(ValueError, match="escapes"):
         runner.resolve_cwd("../etc")

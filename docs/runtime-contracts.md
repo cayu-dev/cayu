@@ -1163,6 +1163,10 @@ Framework-native tools receive runtime services through `ToolContext`: workspace
 
 A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.write_bytes(path, data)` and `ctx.workspace.read_bytes(path)` (which returns a `WorkspaceReadResult` carrying `content` / `total_bytes`) write and read files. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
 
+`ExecCommandTool(policy=...)` resolves the model-requested working directory through the active runner **before** it calls `CommandPolicy.evaluate(...)`. `CommandRequest.cwd` remains the original requested value (`None`, relative, normalized-relative, or contained absolute) for audit messages and backward compatibility. `CommandRequest.canonical_cwd` is the runner-resolved directory; it is always populated by `ExecCommandTool` at policy-evaluation time, and policies must use it for workspace-containment decisions. When a policy allows the request, the tool passes that exact canonical string to `runner.exec(...)`, including the canonical default when the request omitted `cwd`. A denial never reaches `runner.exec(...)`, and resolution failures (blank paths, relative traversal that escapes the root, absolute paths outside the runner root, or runner-specific failures such as a missing local directory) happen before policy evaluation or command execution.
+
+The built-in runner resolution contract is idempotent: `resolve_cwd(resolve_cwd(requested)) == resolve_cwd(requested)`. A relative path is resolved below `default_cwd`; an absolute path is accepted only when its normalized form is the runner root or a child of that root. This acceptance of contained absolute paths exists so the authorized canonical value can cross the tool/runner boundary; it does not permit arbitrary host or guest absolute paths. Custom runners that override `resolve_cwd()` must preserve the same idempotence and containment rules. Attaching a `CommandPolicy` requires that migrated resolver contract for every invocation, including one where the model omitted `cwd`: Cayu deliberately passes the authorized canonical default to `runner.exec(...)` instead of asking the runner to derive the default again after authorization. Existing `CommandPolicy` implementations need no code change if they only inspect `request.cwd`; that field still means the requested form. New or migrated containment logic should inspect `request.canonical_cwd` instead. The field is optional in the Pydantic model solely so previously serialized `CommandRequest` metadata remains loadable; policy requests created by `ExecCommandTool` always contain it.
+
 The first built-in tools are:
 
 - `read_file`: read text from the active workspace by `path`, capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers
@@ -1341,8 +1345,10 @@ Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
 creation and lifecycle.
 
 The runner executes all commands under an absolute guest root, `/workspace` by
-default. Per-command `cwd` values must be relative to that root. `env` values
-are explicit overlays only; host process environment variables are not inherited.
+default. Per-command `cwd` values may be relative to that root or the already
+canonical absolute root/child path produced by `resolve_cwd()`; other absolute
+paths and escaping relative traversal are rejected. `env` values are explicit
+overlays only; host process environment variables are not inherited.
 Vault integrations should resolve only the specific secrets needed at the
 execution boundary and pass them through the runner or Microsandbox's own secret
 placeholder mechanism. A microVM boundary prevents ordinary workspace escape,

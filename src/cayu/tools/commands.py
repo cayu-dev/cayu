@@ -26,17 +26,20 @@ class CommandPolicyDecision(StrEnum):
 
 
 class CommandRequest(BaseModel):
-    """Resolved exec request evaluated by a :class:`CommandPolicy`.
+    """Exec request evaluated by a :class:`CommandPolicy`.
 
-    Carries everything the tool would hand to the runner (command shape plus
-    ``cwd``/``env``/``stdin``/timeout) so policies can vet the full blast
-    radius, not just the command line.
+    ``cwd`` preserves the original requested value for audit and backward
+    compatibility. ``canonical_cwd`` is the active runner's resolved working
+    directory and is the value execution will receive. The canonical field is
+    optional only so policy metadata serialized before it was introduced can
+    still be loaded; :class:`ExecCommandTool` always supplies it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     command: ExecCommand
     cwd: str | None = None
+    canonical_cwd: str | None = None
     env: dict[str, str] | None = None
     timeout_s: int
     stdin: str | None = None
@@ -61,9 +64,12 @@ class CommandPolicyResult(BaseModel):
 class CommandPolicy(ABC):
     """Authorizes exec_command requests before they reach the runner.
 
-    Without a policy the model-controlled command, ``cwd``, and ``env`` pass
-    straight to the runner. Hosts that need an allow/deny/approval seam attach
-    a policy via ``ExecCommandTool(policy=...)``.
+    With a policy, ``ExecCommandTool`` resolves the requested ``cwd`` through
+    the active runner before evaluation and supplies both the requested and
+    canonical forms. An allowed command executes with that same canonical
+    value. Without a policy the model-controlled command, ``cwd``, and ``env``
+    pass straight to the runner. Hosts that need an allow/deny/approval seam
+    attach a policy via ``ExecCommandTool(policy=...)``.
     """
 
     @abstractmethod
@@ -162,11 +168,13 @@ class ExecCommandTool(Tool):
         env = _optional_env(args)
         stdin = _optional_string(args, "stdin", allow_blank=True)
         if self._policy is not None:
+            canonical_cwd = runner.resolve_cwd(cwd)
             verdict = await self._policy.evaluate(
                 ctx,
                 CommandRequest(
                     command=command,
                     cwd=cwd,
+                    canonical_cwd=canonical_cwd,
                     env=env,
                     timeout_s=timeout_s,
                     stdin=stdin,
@@ -176,6 +184,7 @@ class ExecCommandTool(Tool):
                 raise TypeError("Command policy must return a CommandPolicyResult.")
             if verdict.decision is not CommandPolicyDecision.ALLOW:
                 return _policy_refusal_result(verdict)
+            cwd = canonical_cwd
         try:
             result = await runner.exec(
                 command,

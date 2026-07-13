@@ -208,13 +208,23 @@ class Runner(ABC):
         self._open_exec()
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
+        """Resolve a requested cwd to a canonical path inside the runner root.
+
+        Relative requests are resolved against ``default_cwd``. An absolute
+        input is accepted only when it is already contained by the runner root,
+        making canonicalization idempotent for policy-authorized execution.
+        """
+        root = posixpath.normpath(self.default_cwd)
         if cwd is None:
-            return self.default_cwd
-        relative_cwd = require_nonblank(cwd, "cwd")
-        if posixpath.isabs(relative_cwd):
-            raise ValueError("Runner cwd must be relative.")
-        resolved = posixpath.normpath(posixpath.join(self.default_cwd, relative_cwd))
-        if not is_same_or_child(resolved, self.default_cwd):
+            return root
+        requested_cwd = require_nonblank(cwd, "cwd")
+        if posixpath.isabs(requested_cwd):
+            resolved = posixpath.normpath(requested_cwd)
+            if not is_same_or_child(resolved, root):
+                raise ValueError("Runner cwd is outside the runner root.")
+            return resolved
+        resolved = posixpath.normpath(posixpath.join(root, requested_cwd))
+        if not is_same_or_child(resolved, root):
             raise ValueError("Runner cwd escapes the runner root.")
         return resolved
 

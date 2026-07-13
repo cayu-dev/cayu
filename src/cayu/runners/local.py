@@ -131,12 +131,15 @@ class LocalRunner(Runner):
         cwd = require_nonblank(cwd, "cwd")
         candidate = Path(cwd)
         if candidate.is_absolute():
-            raise ValueError("Runner cwd must be relative.")
-        resolved = (self.root / candidate).resolve()
+            resolved = candidate.resolve()
+            outside_message = "Runner cwd is outside the runner root."
+        else:
+            resolved = (self.root / candidate).resolve()
+            outside_message = "Runner cwd escapes the runner root."
         try:
             resolved.relative_to(self.root)
         except ValueError as exc:
-            raise ValueError("Runner cwd escapes the runner root.") from exc
+            raise ValueError(outside_message) from exc
         if not resolved.exists():
             raise FileNotFoundError(f"Runner cwd does not exist: {cwd}")
         if not resolved.is_dir():

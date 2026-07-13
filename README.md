@@ -2444,6 +2444,10 @@ from cayu import CommandPolicy, CommandPolicyDecision, CommandPolicyResult, Exec
 
 class QaCommandPolicy(CommandPolicy):
     async def evaluate(self, ctx, request):
+        # Use canonical_cwd, not the model's request.cwd spelling, for any
+        # workspace-containment decision. ExecCommandTool runs in this exact path.
+        if request.canonical_cwd is None:  # only possible for legacy serialized metadata
+            return CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason="no cwd")
         if request.command.kind == "shell":  # no raw shell strings
             return CommandPolicyResult(
                 decision=CommandPolicyDecision.DENY, reason="use kind='process' with argv"
@@ -2454,6 +2458,14 @@ class QaCommandPolicy(CommandPolicy):
 
 tool = ExecCommandTool(policy=QaCommandPolicy())
 ```
+
+`request.cwd` preserves the original requested value for audit and policy
+explanations. `request.canonical_cwd` is resolved by the active runner before
+the policy runs and is the value passed to execution after an allow decision,
+including when the request omitted `cwd`. Use the canonical value for containment
+checks; built-in runners reject escaping relative traversal and absolute paths
+outside their configured root first. Attaching a command policy therefore
+requires a custom runner whose resolver accepts its own canonical output.
 
 A `CommandPolicy` denial surfaces as a `tool.call.failed` event (see the note in
 Contract Rules on blocked-vs-failed). To gate a whole tool behind human approval,
