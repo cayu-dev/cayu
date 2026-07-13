@@ -11,6 +11,7 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerCancelledError,
+    RunnerUnavailableError,
     attach_cancellation_artifacts,
 )
 from cayu.runners.docker import (
@@ -40,10 +41,12 @@ from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_CWD,
     DEFAULT_MICROSANDBOX_IMAGE,
     DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
+    MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
     MICROSANDBOX_NAME_MAX_BYTES,
     MicrosandboxCleanupError,
     MicrosandboxCloseAction,
     MicrosandboxRunner,
+    MicrosandboxUnavailableError,
 )
 from cayu.runners.sbx import (
     DEFAULT_SBX_CWD,
@@ -64,6 +67,7 @@ __all__ = [
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
     "DEFAULT_SBX_CWD",
     "E2B_SANDBOX_ID_MAX_BYTES",
+    "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS",
     "MICROSANDBOX_NAME_MAX_BYTES",
     "DockerCloseAction",
     "DockerRunner",
@@ -82,9 +86,11 @@ __all__ = [
     "MicrosandboxCleanupError",
     "MicrosandboxCloseAction",
     "MicrosandboxRunner",
+    "MicrosandboxUnavailableError",
     "Runner",
     "RunnerCancelledError",
     "RunnerCleanupPolicy",
+    "RunnerUnavailableError",
     "SbxCloseAction",
     "SbxRunner",
     "attach_cancellation_artifacts",

@@ -31,7 +31,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
+from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
 from cayu.runtime import CayuApp, RunRequest
 from cayu.tools import ExecCommandTool
 from cayu.tools.commands import (
@@ -1418,6 +1418,102 @@ def test_exec_command_tool_reports_timeout_and_cancellation():
     assert cancelled.is_error is True
     assert cancelled.content == "Command was cancelled."
     assert cancelled.structured["cancelled"] is True
+
+
+def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
+    diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "sandbox_name": "dead-agent",
+        "status": "unavailable",
+    }
+
+    class UnavailableRunner(RecordingRunner):
+        async def exec(self, *args, **kwargs) -> ExecResult:
+            raise RunnerUnavailableError(
+                "Microsandbox guest agent is unavailable.",
+                diagnostic=diagnostic,
+            )
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=UnavailableRunner()),
+            {"argv": ["pwd"]},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "Microsandbox guest agent is unavailable."
+    assert result.structured == {
+        "error": "runner_unavailable",
+        "diagnostic": diagnostic,
+    }
+    assert result.artifacts == [diagnostic]
+
+
+def test_runner_unavailable_diagnostic_reaches_durable_tool_event() -> None:
+    diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "sandbox_name": "dead-agent",
+        "status": "unavailable",
+    }
+
+    class UnavailableRunner(RecordingRunner):
+        async def exec(self, *args, **kwargs) -> ExecResult:
+            raise RunnerUnavailableError(
+                "Microsandbox guest agent is unavailable.",
+                diagnostic=diagnostic,
+            )
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_dead_agent",
+                    name="exec_command",
+                    arguments={"argv": ["pwd"]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("The sandbox must be replaced."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="dead-agent"), runner=UnavailableRunner()),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool()],
+    )
+
+    async def run() -> list[Event]:
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_dead_agent",
+                    messages=[Message.text("user", "run pwd")],
+                )
+            )
+        ]
+        return await app.session_store.load_events("sess_dead_agent")
+
+    stored_events = asyncio.run(run())
+
+    failed = next(event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED)
+    assert failed.payload["result"]["structured"] == {
+        "error": "runner_unavailable",
+        "diagnostic": diagnostic,
+    }
+    assert failed.payload["result"]["artifacts"] == [diagnostic]
 
 
 def test_exec_command_tool_nonzero_exit_prefixes_output_with_exit_code():

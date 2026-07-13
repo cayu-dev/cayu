@@ -100,7 +100,7 @@ or in CI.
 | Postgres integration | Docker/testcontainers or `CAYU_TEST_POSTGRES_DSN` | $0 | `postgres-required` |
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
-| microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for virtual egress | $0 | `microsandbox-live-*` |
+| microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for virtual egress and guest-agent liveness | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
 | AWS Lambda MicroVM live | `cayu[aws]`, AWS credentials/region, built sidecar image | AWS MicroVM charges | `lambda-microvm-live` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
@@ -161,7 +161,7 @@ high level:
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real Docker container exec, timeout cleanup, and sync binding | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync` |
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
-| real microsandbox runner/workspace/runtime/sync binding | verified when microsandbox is available | `microsandbox-live-*` |
+| real microsandbox runner/workspace/runtime/sync binding and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
@@ -193,13 +193,13 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 25 `examples/*_live.py` files:
+There are 26 `examples/*_live.py` files:
 
 | prerequisite | examples |
 | --- | --- |
 | Docker | `docker_interrupt_live.py`, `docker_sync_binding_live.py` |
 | `sbx` | `sbx_interrupt_live.py`, `sbx_sync_binding_live.py` |
-| microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py` |
+| microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
 | AWS credentials, region, and Lambda MicroVM image | `lambda_microvm_runner_live.py` |
 | AWS credentials, region, and Bedrock model | `bedrock_provider_live.py` |
@@ -378,9 +378,23 @@ ANTHROPIC_API_KEY=... CAYU_PROVIDER=anthropic \
   --strict
 ```
 
-Run the local Microsandbox virtual-egress contract only when starting a real
-microVM is intended. Use an isolated `MSB_HOME` when verification must not
-migrate or otherwise mutate the default shared Microsandbox state:
+Run local Microsandbox live contracts only when starting a real microVM is
+intended. Use an isolated `MSB_HOME` when verification must not migrate or
+otherwise mutate the default shared Microsandbox state. The guest-agent check
+kills a memory-constrained microVM through Microsandbox's public lifecycle API
+while a command is active, verifies the bounded ping classification, and
+removes its unique sandbox in `finally`:
+
+```bash
+MSB_HOME=/tmp/cayu-microsandbox-agent-liveness \
+CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE=1 \
+uv run --extra microsandbox python scripts/nightly_verification.py \
+  --check microsandbox-live-guest-agent-liveness \
+  --strict
+```
+
+The check requires a typed unavailable result followed by a fail-fast call. It
+does not infer OOM from the incomplete command outcome.
 
 ```bash
 MSB_HOME=/tmp/cayu-microsandbox-removal-verification \

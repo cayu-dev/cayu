@@ -1309,6 +1309,34 @@ closed so an operator may retry it. Once stopping succeeds, a removal retry
 resumes directly at removal instead of trying to stop the already-stopped
 sandbox again.
 
+An isolated command exit of `-9` is not enough to classify the sandbox as dead.
+The same is true of Microsandbox 0.6.6's opaque base `MicrosandboxError` when an
+exec session ends without an exit event. After either outcome, the runner gives
+Microsandbox's `Sandbox.ping()` up to `liveness_timeout_s` (one second by
+default) to prove the guest agent is reachable. Other exact-base SDK errors are
+re-raised unchanged without a liveness probe because Microsandbox maps unrelated
+runtime, protocol, HTTP, and agent-client variants to that same Python base
+class. A successful ping returns the original `ExecResult` or re-raises the
+no-exit-event SDK error unchanged. A failed or timed-out ping raises
+`MicrosandboxUnavailableError`, records registry status when available, and
+latches that runner's exec path so later calls fail fast without launching
+another guest command. Explicit SDK subclasses such as a stopped-sandbox error
+are not reclassified. Microsandbox command execution is serialized so another
+command cannot launch while that proof and latch transition is in flight.
+Applications recover by creating a new runner through `from_existing(...)` or
+replacing the sandbox; `reopen_exec()` does not clear confirmed guest-agent
+unavailability.
+
+The `cayu.runner_unavailable.v1` diagnostic includes the sandbox identity,
+last command outcome, bounded ping evidence, registry evidence, and safe
+remediation. `ExecCommandTool` preserves it in structured output and artifacts,
+so runtime tool events retain the same evidence. After confirmed unavailability,
+captured output text from the failed exchange is discarded as unreliable; the
+diagnostic retains observed stdout/stderr byte counts. Cancellation and command
+timeout paths keep their existing cleanup contracts and are not reclassified.
+Cayu reports confirmed guest-agent unavailability; it does not report OOM unless
+Microsandbox provides explicit OOM evidence.
+
 Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
 creation and lifecycle.
 

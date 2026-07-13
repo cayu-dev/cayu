@@ -336,6 +336,24 @@ CHECKS: tuple[VerificationCheck, ...] = (
         required_modules=("microsandbox",),
     ),
     VerificationCheck(
+        id="microsandbox-live-guest-agent-liveness",
+        capability="Microsandbox guest-agent liveness classification",
+        lane="microsandbox",
+        command=(
+            "uv",
+            "run",
+            "python",
+            "examples/microsandbox_guest_agent_liveness_live.py",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "microsandbox package/runtime",
+            "CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE=1",
+        ),
+        required_modules=("microsandbox",),
+        required_env_values={"CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE": "1"},
+    ),
+    VerificationCheck(
         id="microsandbox-live-virtual-egress",
         capability="Microsandbox virtual-egress enforcement",
         lane="microsandbox",

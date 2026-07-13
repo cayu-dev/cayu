@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import posixpath
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 from pydantic import (
@@ -19,6 +20,16 @@ from cayu._validation import copy_json_value, require_nonblank
 from cayu.runners._cleanup import RunnerCleanupResult
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
+
+
+class RunnerUnavailableError(RuntimeError):
+    """A runner cannot execute commands until it is reconnected or replaced."""
+
+    def __init__(self, message: str, *, diagnostic: Mapping[str, Any]) -> None:
+        copied = copy_json_value(dict(diagnostic), "diagnostic")
+        self.diagnostic: dict[str, Any] = copied
+        self.artifacts: list[dict[str, Any]] = [copy_json_value(self.diagnostic, "diagnostic")]
+        super().__init__(require_nonblank(message, "message"))
 
 
 class RunnerCancelledError(asyncio.CancelledError):

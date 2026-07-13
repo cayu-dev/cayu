@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.runners import ExecCommand, ExecResult, Runner
+from cayu.runners import ExecCommand, ExecResult, Runner, RunnerUnavailableError
 from cayu.tools._errors import structured_invalid_arguments
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
@@ -176,14 +176,25 @@ class ExecCommandTool(Tool):
                 raise TypeError("Command policy must return a CommandPolicyResult.")
             if verdict.decision is not CommandPolicyDecision.ALLOW:
                 return _policy_refusal_result(verdict)
-        result = await runner.exec(
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_s=timeout_s,
-            stdin=stdin,
-            output_limit_bytes=max_output_bytes,
-        )
+        try:
+            result = await runner.exec(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=max_output_bytes,
+            )
+        except RunnerUnavailableError as exc:
+            return ToolResult(
+                content=str(exc),
+                structured={
+                    "error": "runner_unavailable",
+                    "diagnostic": copy_json_value(exc.diagnostic, "diagnostic"),
+                },
+                artifacts=exc.artifacts,
+                is_error=True,
+            )
         result = _require_exec_result(result)
         content = _command_content(
             stdout=result.stdout,

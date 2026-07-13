@@ -78,7 +78,9 @@ class ExecResult(BaseModel):
 
 `exec` must **return a real `ExecResult`** (the tool layer does
 `type(result) is ExecResult`). A non-zero exit code is **not** an error — put it
-in `exit_code` and return normally. Reserve raising for cancellation (below).
+in `exit_code` and return normally. Reserve raising for typed runner conditions:
+cancellation (below), or a `RunnerUnavailableError` subclass when provider
+evidence confirms that the execution environment cannot accept more commands.
 
 ### Cancellation
 

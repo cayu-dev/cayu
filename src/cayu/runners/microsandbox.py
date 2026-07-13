@@ -30,6 +30,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerUnavailableError,
     attach_cancellation_artifacts,
 )
 
@@ -40,6 +41,11 @@ MICROSANDBOX_NAME_MAX_BYTES = 128
 _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS = 0.05
 _MICROSANDBOX_REMOVE_MAX_BACKOFF_SECONDS = 0.5
 _MICROSANDBOX_CLEANUP_DIAGNOSTIC_TYPE = "cayu.microsandbox_cleanup.v1"
+MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS = 1.0
+_MICROSANDBOX_NO_EXIT_EVENT_ERROR = "runtime error: exec session ended without exit event"
+_MICROSANDBOX_UNAVAILABLE_REMEDIATION = (
+    "Reconnect to or replace the Microsandbox before executing more commands."
+)
 
 MicrosandboxCloseAction = Literal["remove", "stop", "detach", "none"]
 
@@ -60,11 +66,53 @@ class _MicrosandboxCleanupExceptionGroup(BaseExceptionGroup):
     pass
 
 
+class MicrosandboxUnavailableError(RunnerUnavailableError):
+    """The Microsandbox guest agent was confirmed unreachable after a command."""
+
+    def __init__(
+        self,
+        *,
+        sandbox_name: str,
+        last_command: Mapping[str, Any],
+        probe: Mapping[str, Any],
+    ) -> None:
+        self.sandbox_name = sandbox_name
+        self.last_command: dict[str, Any] = copy_json_value(
+            dict(last_command),
+            "last_command",
+        )
+        self.probe: dict[str, Any] = copy_json_value(dict(probe), "probe")
+        self.probe_status = str(self.probe.get("status", "failed"))
+        if self.last_command.get("exit_code") == -9:
+            reason = "guest_agent_unavailable_after_signal_9"
+        else:
+            reason = "guest_agent_unavailable_after_incomplete_exec"
+        diagnostic = {
+            "type": "cayu.runner_unavailable.v1",
+            "adapter": "microsandbox",
+            "sandbox_name": sandbox_name,
+            "status": "unavailable",
+            "reason": reason,
+            "last_command": self.last_command,
+            "probe": self.probe,
+            "remediation": _MICROSANDBOX_UNAVAILABLE_REMEDIATION,
+        }
+        super().__init__(
+            f"Microsandbox guest agent unavailable for {sandbox_name!r} after an abnormal "
+            f"command outcome. "
+            f"{_MICROSANDBOX_UNAVAILABLE_REMEDIATION}",
+            diagnostic=diagnostic,
+        )
+
+
 class MicrosandboxRunner(Runner):
     """Executes commands in a Microsandbox microVM sandbox.
 
     The runner does not inherit the trusted host process environment. Pass
     explicit `env` values, preferably resolved at the environment/vault boundary.
+    Commands are serialized so a guest-agent liveness transition completes
+    before another guest launch. `reopen_exec()` does not clear confirmed
+    guest-agent unavailability; reconnect with a new runner instead.
     """
 
     isolation = "microsandbox"
@@ -77,6 +125,7 @@ class MicrosandboxRunner(Runner):
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "none",
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        liveness_timeout_s: float = MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
@@ -89,6 +138,7 @@ class MicrosandboxRunner(Runner):
         self.default_cwd = _validate_guest_root(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
+        self.liveness_timeout_s = _validate_liveness_timeout(liveness_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
         )
@@ -100,9 +150,12 @@ class MicrosandboxRunner(Runner):
         self._sftp_client: Any = None
         self._sftp: Any = None
         self._sftp_lock = asyncio.Lock()
+        self._exec_lock = asyncio.Lock()
         self._last_cleanup_diagnostic: dict[str, Any] | None = None
         self._remove_stop_completed = False
         self._remove_stop_status: str | None = None
+        self._unavailable_last_command: dict[str, Any] | None = None
+        self._unavailable_probe: dict[str, Any] | None = None
 
     @classmethod
     async def create(
@@ -113,6 +166,7 @@ class MicrosandboxRunner(Runner):
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "remove",
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        liveness_timeout_s: float = MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
@@ -136,6 +190,7 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        liveness_timeout = _validate_liveness_timeout(liveness_timeout_s)
         removal_timeout = _validate_remove_timeout(remove_timeout_s)
         if type(ensure_default_cwd) is not bool:
             raise TypeError("MicrosandboxRunner ensure_default_cwd must be a bool.")
@@ -173,6 +228,7 @@ class MicrosandboxRunner(Runner):
             default_cwd=guest_root,
             close_action=close_action,
             cancel_timeout_s=cancel_timeout_s,
+            liveness_timeout_s=liveness_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
             remove_timeout_s=removal_timeout,
@@ -188,6 +244,7 @@ class MicrosandboxRunner(Runner):
         default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
         close_action: MicrosandboxCloseAction = "none",
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        liveness_timeout_s: float = MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
         remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
@@ -204,6 +261,7 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        liveness_timeout = _validate_liveness_timeout(liveness_timeout_s)
         removal_timeout = _validate_remove_timeout(remove_timeout_s)
         handle = await module.Sandbox.get(sandbox_name)
         sandbox = await handle.connect()
@@ -213,6 +271,7 @@ class MicrosandboxRunner(Runner):
             default_cwd=default_cwd,
             close_action=close_action,
             cancel_timeout_s=cancel_timeout_s,
+            liveness_timeout_s=liveness_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
             remove_timeout_s=removal_timeout,
@@ -406,8 +465,29 @@ class MicrosandboxRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        async with self._exec_lock:
+            return await self._exec_serialized(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+
+    async def _exec_serialized(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
+        self._ensure_agent_available()
         self._ensure_exec_open()
 
         working_dir = self.resolve_cwd(cwd)
@@ -486,6 +566,19 @@ class MicrosandboxRunner(Runner):
             raise
         except Exception as exc:
             if not _is_timeout_error(exc):
+                module = _microsandbox_module(self._sandbox_module)
+                if _is_opaque_microsandbox_exec_failure(module, exc):
+                    await self._confirm_agent_available(
+                        {
+                            "exit_code": exit_code,
+                            "timed_out": False,
+                            "cancelled": False,
+                            "stdout_bytes": stdout.total_bytes,
+                            "stderr_bytes": stderr.total_bytes,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
                 raise
             start_acknowledged = handle is not None
             cleanup = await cleanup_runner_command_with_diagnostic(
@@ -512,7 +605,7 @@ class MicrosandboxRunner(Runner):
                 artifacts=[cleanup.artifact],
             )
 
-        return ExecResult(
+        result = ExecResult(
             stdout=stdout.text(),
             stderr=stderr.text(),
             exit_code=exit_code if exit_code is not None else 0,
@@ -522,6 +615,82 @@ class MicrosandboxRunner(Runner):
             stdout_bytes=stdout.total_bytes,
             stderr_bytes=stderr.total_bytes,
         )
+        if result.exit_code == -9:
+            await self._confirm_agent_available(
+                {
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "cancelled": result.cancelled,
+                    "stdout_bytes": result.stdout_bytes,
+                    "stderr_bytes": result.stderr_bytes,
+                    "error_type": None,
+                    "error": None,
+                }
+            )
+        return result
+
+    def _ensure_agent_available(self) -> None:
+        if self._closed:
+            return
+        if self._unavailable_last_command is None or self._unavailable_probe is None:
+            return
+        raise MicrosandboxUnavailableError(
+            sandbox_name=self.name,
+            last_command=self._unavailable_last_command,
+            probe=self._unavailable_probe,
+        )
+
+    async def _confirm_agent_available(self, last_command: Mapping[str, Any]) -> None:
+        module = _microsandbox_module(self._sandbox_module)
+        ping_error: Exception | None = None
+        status_error: Exception | None = None
+        registry_status: str | None = None
+        try:
+            async with asyncio.timeout(self.liveness_timeout_s):
+                try:
+                    await self._sandbox.ping()
+                except Exception as exc:
+                    ping_error = exc
+                    try:
+                        handle = await module.Sandbox.get(self.name)
+                        status = getattr(handle, "status", None)
+                        if status is not None:
+                            registry_status = str(status)
+                    except Exception as exc:
+                        status_error = exc
+                else:
+                    return
+        except TimeoutError:
+            if ping_error is None:
+                ping_error = TimeoutError("Microsandbox guest-agent liveness probe timed out.")
+                probe_status = "timed_out"
+            else:
+                status_error = TimeoutError("Microsandbox registry status probe timed out.")
+                probe_status = "failed"
+        else:
+            probe_status = "failed"
+
+        if ping_error is None:
+            raise AssertionError("Failed Microsandbox liveness probe did not record an error.")
+        probe = {
+            "method": "Sandbox.ping",
+            "status": probe_status,
+            "timeout_s": self.liveness_timeout_s,
+            "registry_status": registry_status,
+            "error_type": type(ping_error).__name__,
+            "error": str(ping_error),
+            "status_error_type": type(status_error).__name__ if status_error is not None else None,
+            "status_error": str(status_error) if status_error is not None else None,
+        }
+        error = MicrosandboxUnavailableError(
+            sandbox_name=self.name,
+            last_command=last_command,
+            probe=probe,
+        )
+        self._unavailable_last_command = copy_json_value(error.last_command, "last_command")
+        self._unavailable_probe = copy_json_value(error.probe, "probe")
+        self._close_exec("microsandbox guest agent unavailable after an abnormal command outcome")
+        raise error from ping_error
 
     def _apply_cleanup_result(self, cleanup: Any) -> None:
         # Unlike the base contract, a failed command kill does not latch the
@@ -627,6 +796,16 @@ def _validate_remove_timeout(value: float) -> float:
     return float(value)
 
 
+def _validate_liveness_timeout(value: float) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError("MicrosandboxRunner liveness_timeout_s must be numeric.")
+    if not isfinite(value):
+        raise ValueError("MicrosandboxRunner liveness_timeout_s must be finite.")
+    if value <= 0:
+        raise ValueError("MicrosandboxRunner liveness_timeout_s must be greater than zero.")
+    return float(value)
+
+
 def _event_bytes(data: Any) -> bytes:
     if type(data) is bytes:
         return data
@@ -690,6 +869,17 @@ def _collected_stream_bytes(output: Any, stream_name: Literal["stdout", "stderr"
 
 def _is_timeout_error(exc: Exception) -> bool:
     return isinstance(exc, TimeoutError) or exc.__class__.__name__ == "ExecTimeoutError"
+
+
+def _is_opaque_microsandbox_exec_failure(module: ModuleType | Any, exc: Exception) -> bool:
+    error_type = getattr(module, "MicrosandboxError", None)
+    # The SDK maps many unrelated variants to this exact base class. Only the
+    # observed no-exit-event error is evidence for a guest-agent liveness probe.
+    return (
+        isinstance(error_type, type)
+        and type(exc) is error_type
+        and str(exc) == _MICROSANDBOX_NO_EXIT_EVENT_ERROR
+    )
 
 
 async def _cleanup_created_sandbox(

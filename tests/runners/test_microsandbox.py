@@ -13,6 +13,7 @@ from cayu.runners import (
     ExecCommand,
     MicrosandboxCleanupError,
     MicrosandboxRunner,
+    MicrosandboxUnavailableError,
 )
 
 
@@ -45,10 +46,12 @@ class FakeHandle:
         *,
         wait_result: tuple[int, bool] = (0, False),
         collect_output: Any | None = None,
+        collect_error: Exception | None = None,
     ) -> None:
         self.events = list(events)
         self.wait_result = wait_result
         self.collect_output = collect_output
+        self.collect_error = collect_error
         self.killed = False
         self.fail_kill = False
         self.hang_kill = False
@@ -66,6 +69,8 @@ class FakeHandle:
         return self.wait_result
 
     async def collect(self) -> Any:
+        if self.collect_error is not None:
+            raise self.collect_error
         return self.collect_output or FakeExecOutput(exit_code=self.wait_result[0])
 
     async def kill(self) -> None:
@@ -81,6 +86,11 @@ class FakeExecOutput:
     exit_code: int = 0
     stdout_bytes: bytes = b""
     stderr_bytes: bytes = b""
+
+
+@dataclass
+class FakePingResult:
+    latency_ms: float = 1.5
 
 
 class BlockingHandle(FakeHandle):
@@ -108,12 +118,16 @@ class FakeSandbox:
         self.cancel_next_exec = False
         self.cancel_next_stream = False
         self.timeout_next_stream = False
+        self.stream_error: Exception | None = None
         self.fail_kill = False
         self.hang_kill = False
         self.fail_next_stop = False
         self.fail_repeated_stop = False
         self.already_stopped = False
         self.stop_failure: Exception | None = None
+        self.ping_calls = 0
+        self.ping_error: Exception | None = None
+        self.hang_ping = False
         self.next_handle = FakeHandle(
             [
                 FakeEvent("stdout", b"hello "),
@@ -136,6 +150,8 @@ class FakeSandbox:
 
     async def exec_stream(self, cmd: str, args: list[str], **kwargs: Any) -> FakeHandle:
         self.exec_calls.append({"cmd": cmd, "args": args, **kwargs})
+        if self.stream_error is not None:
+            raise self.stream_error
         if self.cancel_next_stream:
             self.cancel_next_stream = False
             raise asyncio.CancelledError
@@ -170,6 +186,14 @@ class FakeSandbox:
             raise RuntimeError("stop failed")
         if self.fail_repeated_stop and self.stop_and_wait_calls > 1:
             raise FakeSandboxNotRunningError("sandbox is not running")
+
+    async def ping(self) -> FakePingResult:
+        self.ping_calls += 1
+        if self.hang_ping:
+            await asyncio.sleep(30)
+        if self.ping_error is not None:
+            raise self.ping_error
+        return FakePingResult()
 
     async def kill(self) -> None:
         if self.hang_kill:
@@ -232,6 +256,8 @@ class FakeSandboxApi:
     fail_created_setup = False
     cancel_created_setup = False
     created_stop_failure: Exception | None = None
+    registry_status = "running"
+    get_error: Exception | None = None
 
     @classmethod
     async def create(cls, name: str, **kwargs: Any) -> FakeSandbox:
@@ -247,9 +273,11 @@ class FakeSandboxApi:
     async def get(cls, name: str) -> FakeHandleRecord:
         if cls.hang_get:
             await asyncio.sleep(30)
+        if cls.get_error is not None:
+            raise cls.get_error
         sandbox = cls.existing or FakeSandbox(name)
         cls.existing = sandbox
-        status = cls.statuses.pop(0) if cls.statuses else "stopped"
+        status = cls.statuses.pop(0) if cls.statuses else cls.registry_status
         return FakeHandleRecord(sandbox, status=status, hang_refresh=cls.hang_refresh)
 
     @classmethod
@@ -267,11 +295,16 @@ class FakeSandboxApi:
         cls.removed.append(name)
 
 
+class FakeMicrosandboxError(RuntimeError):
+    pass
+
+
 class FakeMicrosandboxModule:
     Sandbox = FakeSandboxApi
     SandboxNotFoundError = FakeSandboxNotFoundError
     SandboxNotRunningError = FakeSandboxNotRunningError
     SandboxStillRunningError = FakeSandboxStillRunningError
+    MicrosandboxError = FakeMicrosandboxError
 
 
 def reset_fake_module() -> None:
@@ -289,6 +322,8 @@ def reset_fake_module() -> None:
     FakeSandboxApi.fail_created_setup = False
     FakeSandboxApi.cancel_created_setup = False
     FakeSandboxApi.created_stop_failure = None
+    FakeSandboxApi.registry_status = "running"
+    FakeSandboxApi.get_error = None
 
 
 def cleanup_diagnostic(error: BaseException) -> dict[str, Any]:
@@ -303,6 +338,7 @@ def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
         runner = await MicrosandboxRunner.create(
             "agent-session",
             image="python:3.13",
+            liveness_timeout_s=2.5,
             replace=True,
             cpus=2,
             network={"policy": "none"},
@@ -315,6 +351,7 @@ def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
     assert runner.name == "agent-session"
     assert runner.default_cwd == DEFAULT_MICROSANDBOX_CWD
     assert runner.close_action == "remove"
+    assert runner.liveness_timeout_s == 2.5
     assert runner._sandbox.exec_sync_calls == [
         {"cmd": "mkdir", "args": ["-p", "/workspace"], "cwd": "/"}
     ]
@@ -378,6 +415,257 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
         }
     ]
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]
+    assert sandbox.ping_calls == 0
+
+
+def test_microsandbox_runner_returns_signal_nine_when_agent_ping_succeeds() -> None:
+    sandbox = FakeSandbox("runner")
+    sandbox.next_handle = FakeHandle(
+        [FakeEvent("exited", code=-9)],
+        wait_result=(-9, False),
+    )
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    result = asyncio.run(runner.exec(ExecCommand.process("memory-heavy-command")))
+
+    assert result.exit_code == -9
+    assert result.timed_out is False
+    assert result.artifacts == []
+    assert sandbox.ping_calls == 1
+
+
+def test_microsandbox_runner_latches_typed_unavailable_state_after_failed_ping() -> None:
+    async def run() -> tuple[MicrosandboxUnavailableError, MicrosandboxUnavailableError]:
+        reset_fake_module()
+        sandbox = FakeSandbox("dead-agent")
+        sandbox.next_handle = FakeHandle(
+            [FakeEvent("exited", code=-9)],
+            wait_result=(-9, False),
+        )
+        sandbox.ping_error = ConnectionResetError("agent connection reset")
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="dead-agent",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(MicrosandboxUnavailableError) as first_info:
+            await runner.exec(ExecCommand.process("memory-heavy-command"))
+        with pytest.raises(MicrosandboxUnavailableError) as second_info:
+            await runner.exec(ExecCommand.process("must-not-launch"))
+        assert len(sandbox.exec_calls) == 1
+        assert sandbox.ping_calls == 1
+        return first_info.value, second_info.value
+
+    first, second = asyncio.run(run())
+
+    expected_diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "sandbox_name": "dead-agent",
+        "status": "unavailable",
+        "reason": "guest_agent_unavailable_after_signal_9",
+        "last_command": {
+            "exit_code": -9,
+            "timed_out": False,
+            "cancelled": False,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "error_type": None,
+            "error": None,
+        },
+        "probe": {
+            "method": "Sandbox.ping",
+            "status": "failed",
+            "timeout_s": 1.0,
+            "registry_status": "running",
+            "error_type": "ConnectionResetError",
+            "error": "agent connection reset",
+            "status_error_type": None,
+            "status_error": None,
+        },
+        "remediation": "Reconnect to or replace the Microsandbox before executing more commands.",
+    }
+    assert first.diagnostic == expected_diagnostic
+    assert first.artifacts == [expected_diagnostic]
+    assert isinstance(first.__cause__, ConnectionResetError)
+    assert second.diagnostic == expected_diagnostic
+    assert second.__cause__ is None
+
+
+def test_microsandbox_runner_blocks_concurrent_launch_during_unavailability_probe() -> None:
+    async def run() -> None:
+        reset_fake_module()
+        sandbox = FakeSandbox("dead-agent")
+        sandbox.next_handle = FakeHandle(
+            [FakeEvent("exited", code=-9)],
+            wait_result=(-9, False),
+        )
+        ping_started = asyncio.Event()
+        release_ping = asyncio.Event()
+
+        async def fail_ping_after_release() -> FakePingResult:
+            sandbox.ping_calls += 1
+            ping_started.set()
+            await release_ping.wait()
+            raise ConnectionResetError("agent connection reset")
+
+        sandbox.ping = fail_ping_after_release  # type: ignore[method-assign]
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="dead-agent",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+
+        first = asyncio.create_task(runner.exec(ExecCommand.process("first-command")))
+        await asyncio.wait_for(ping_started.wait(), timeout=1.0)
+        second = asyncio.create_task(runner.exec(ExecCommand.process("must-not-launch")))
+        await asyncio.sleep(0)
+
+        assert len(sandbox.exec_calls) == 1
+        assert second.done() is False
+
+        release_ping.set()
+        with pytest.raises(MicrosandboxUnavailableError):
+            await first
+        with pytest.raises(MicrosandboxUnavailableError):
+            await second
+        assert len(sandbox.exec_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_microsandbox_runner_bounds_guest_agent_ping() -> None:
+    async def run() -> MicrosandboxUnavailableError:
+        reset_fake_module()
+        sandbox = FakeSandbox("hung-agent")
+        sandbox.next_handle = FakeHandle(
+            [FakeEvent("exited", code=-9)],
+            wait_result=(-9, False),
+        )
+        sandbox.hang_ping = True
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="hung-agent",
+            liveness_timeout_s=0.01,
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(MicrosandboxUnavailableError) as exc_info:
+            await runner.exec(ExecCommand.process("memory-heavy-command"))
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert error.probe_status == "timed_out"
+    assert error.diagnostic["probe"] == {
+        "method": "Sandbox.ping",
+        "status": "timed_out",
+        "timeout_s": 0.01,
+        "registry_status": None,
+        "error_type": "TimeoutError",
+        "error": "Microsandbox guest-agent liveness probe timed out.",
+        "status_error_type": None,
+        "status_error": None,
+    }
+    assert isinstance(error.__cause__, TimeoutError)
+
+
+def test_microsandbox_runner_classifies_no_exit_event_when_agent_ping_fails() -> None:
+    async def run() -> MicrosandboxUnavailableError:
+        reset_fake_module()
+        sandbox = FakeSandbox("dead-agent")
+        command_error = FakeMicrosandboxError(
+            "runtime error: exec session ended without exit event"
+        )
+        sandbox.next_handle = FakeHandle([], collect_error=command_error)
+        sandbox.ping_error = ConnectionResetError("agent connection reset")
+        FakeSandboxApi.registry_status = "stopped"
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="dead-agent",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(MicrosandboxUnavailableError) as exc_info:
+            await runner.exec(ExecCommand.process("sleep", "30"))
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert error.last_command == {
+        "exit_code": None,
+        "timed_out": False,
+        "cancelled": False,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "error_type": "FakeMicrosandboxError",
+        "error": "runtime error: exec session ended without exit event",
+    }
+    assert error.probe["registry_status"] == "stopped"
+    assert error.probe["status"] == "failed"
+    assert isinstance(error.__cause__, ConnectionResetError)
+
+
+def test_microsandbox_runner_preserves_no_exit_event_when_agent_ping_succeeds() -> None:
+    sandbox = FakeSandbox("live-agent")
+    command_error = FakeMicrosandboxError("runtime error: exec session ended without exit event")
+    sandbox.next_handle = FakeHandle([], collect_error=command_error)
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="live-agent",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    with pytest.raises(FakeMicrosandboxError, match="ended without exit event") as exc_info:
+        asyncio.run(runner.exec(ExecCommand.process("sleep", "30")))
+
+    assert exc_info.value is command_error
+    assert sandbox.ping_calls == 1
+    assert runner._exec_closed is False
+
+
+def test_microsandbox_runner_preserves_other_exact_base_error_without_liveness_probe() -> None:
+    sandbox = FakeSandbox("runner")
+    command_error = FakeMicrosandboxError("protocol error: response ended mid-frame")
+    sandbox.next_handle = FakeHandle([], collect_error=command_error)
+    sandbox.ping_error = ConnectionResetError("agent connection reset")
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    with pytest.raises(FakeMicrosandboxError, match="response ended mid-frame") as exc_info:
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+
+    assert exc_info.value is command_error
+    assert sandbox.ping_calls == 0
+    assert runner._exec_closed is False
+
+
+@pytest.mark.parametrize(
+    "stream_error",
+    [RuntimeError("sandbox is stopped"), ConnectionError("transport failed")],
+    ids=["sandbox-stopped", "transport-failed"],
+)
+def test_microsandbox_runner_does_not_reclassify_other_sdk_failures(
+    stream_error: Exception,
+) -> None:
+    sandbox = FakeSandbox("runner")
+    sandbox.stream_error = stream_error
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    with pytest.raises(type(stream_error), match=str(stream_error)):
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+
+    assert sandbox.ping_calls == 0
+    assert runner._exec_closed is False
 
 
 def test_microsandbox_runner_applies_trusted_env_overlay_after_command_env() -> None:
@@ -935,6 +1223,12 @@ def test_microsandbox_runner_does_not_create_sandbox_for_invalid_lifecycle_confi
                 remove_timeout_s=0,
                 sandbox_module=FakeMicrosandboxModule,
             )
+        with pytest.raises(ValueError, match="liveness_timeout_s"):
+            await MicrosandboxRunner.create(
+                "bad-liveness-timeout",
+                liveness_timeout_s=0,
+                sandbox_module=FakeMicrosandboxModule,
+            )
 
     asyncio.run(run())
 
@@ -1296,9 +1590,11 @@ def test_microsandbox_runner_from_existing_does_not_own_lifecycle_by_default() -
         FakeSandboxApi.existing = FakeSandbox("existing")
         runner = await MicrosandboxRunner.from_existing(
             "existing",
+            liveness_timeout_s=2.5,
             sandbox_module=FakeMicrosandboxModule,
         )
         sandbox = runner._sandbox
+        assert runner.liveness_timeout_s == 2.5
         await runner.close()
         return sandbox
 
@@ -1355,6 +1651,7 @@ def test_microsandbox_runner_kills_command_on_cancellation_by_default() -> None:
 
     assert handle.killed is True
     assert sandbox.kill_calls == 0
+    assert sandbox.ping_calls == 0
     assert after == 0
     assert exc.artifacts == [
         {
@@ -1640,6 +1937,7 @@ def test_microsandbox_runner_enforces_timeout_and_kills_command_by_default() -> 
     assert result.exit_code == -9
     assert handle.killed is True
     assert sandbox.kill_calls == 0
+    assert sandbox.ping_calls == 0
     assert after == 0
     assert result.artifacts == [
         {

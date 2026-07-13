@@ -511,6 +511,22 @@ def test_virtual_egress_live_checks_are_registered_and_explicitly_gated(
     assert f"{opt_in_env} is not set" in result.reason
 
 
+def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "microsandbox-live-guest-agent-liveness"
+    )
+
+    assert check.lane == "microsandbox"
+    assert check.command == (
+        "uv",
+        "run",
+        "python",
+        "examples/microsandbox_guest_agent_liveness_live.py",
+    )
+    assert check.required_modules == ("microsandbox",)
+    assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE": "1"}
+
+
 def test_virtual_egress_opt_in_flag_must_equal_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
