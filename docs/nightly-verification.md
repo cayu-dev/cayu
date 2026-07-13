@@ -114,9 +114,30 @@ The CI workflow also runs dashboard lint/typecheck, generated-client drift,
 package build, and packaged-asset status checks. It still does not run dashboard
 browser behavior tests.
 
+### Interpreter coverage
+
+CI runs the full test suite on Python 3.14 only. The lint and typecheck legs run
+on Python 3.11, with ruff `target-version = "py311"` and ty
+`python-version = "3.11"`, so statically detectable compatibility problems in
+their checked paths still fail at PR time. These checks do not prove runtime
+compatibility with the `requires-python = ">=3.11"` floor.
+
+The full test suite is not automated on Python 3.11, 3.12, or 3.13. The release
+artifact job performs package and CLI smoke checks on Python 3.11, and the
+targeted Docker runner check uses Python 3.12, but neither replaces full-suite
+coverage. With Docker available for the disposable Postgres tier (or
+`CAYU_TEST_POSTGRES_DSN` set), run omitted interpreters manually with the same
+loud Postgres requirement as CI:
+
+```console
+$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.11 pytest -q
+$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.12 pytest -q
+$ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.13 pytest -q
+```
+
 ### CI source coverage visibility
 
-The Python 3.11 test leg records line and branch coverage for the `cayu` package.
+The Python 3.14 test leg records line and branch coverage for the `cayu` package.
 Missing lines appear in the job log, and the complete report is written to the
 GitHub Actions job summary. This is diagnostic visibility, not a release-quality
 score: CI has no global coverage threshold, so a percentage cannot fail the job;

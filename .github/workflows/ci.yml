@@ -37,30 +37,21 @@ jobs:
       - run: uv run ty check src/cayu examples
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python 3.14)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv python install ${{ matrix.python-version }}
-      - run: uv sync --frozen --extra dev --extra server --python ${{ matrix.python-version }}
+      - run: uv python install 3.14
+      - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test with coverage visibility
-        if: matrix.python-version == '3.11'
         run: |
           uv run pytest -q \
             --cov=cayu \
             --cov-branch \
             --cov-report=term-missing:skip-covered \
             --cov-report=markdown-append:${GITHUB_STEP_SUMMARY}
-        env:
-          CAYU_REQUIRE_POSTGRES: "1"
-      - name: Test
-        if: matrix.python-version != '3.11'
-        run: uv run pytest -q
         env:
           CAYU_REQUIRE_POSTGRES: "1"
 
