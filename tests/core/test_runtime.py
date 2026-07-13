@@ -109,6 +109,7 @@ from cayu.runtime import (
     PendingToolApproval,
     PricingCatalog,
     RecentTurnsContextPolicy,
+    RequiredAllowlistRule,
     ResolutionActor,
     ResolutionActorSource,
     ResumeRequest,
@@ -17095,6 +17096,155 @@ def test_cayu_app_blocks_tool_call_before_execution_with_parameter_policy():
     assert tool_result_part.content == "Parameter 'value' value is not allowed."
     assert tool_result_part.structured["metadata"]["policy"] == "parameter_constrained"
     assert tool_result_part.is_error is True
+
+
+def test_cayu_app_required_allowlist_blocks_omitted_argument_before_execution():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("blocked handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"side_effect": [RequiredAllowlistRule("value", values=["internal"])]}
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_required_allowlist_blocked_tool",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert tool.calls == []
+    blocked_event = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
+    assert blocked_event.payload["reason"] == ("Required allowlisted parameter 'value' is missing.")
+    assert blocked_event.payload["metadata"] == {
+        "policy": "parameter_constrained",
+        "tool_name": "side_effect",
+        "parameter": "value",
+        "rule": "RequiredAllowlistRule",
+        "rule_index": 0,
+        "violation": "missing",
+    }
+    tool_result_part = provider.requests[1].messages[-1].content[0]
+    assert tool_result_part.content == "Required allowlisted parameter 'value' is missing."
+    assert tool_result_part.structured["metadata"] == blocked_event.payload["metadata"]
+    assert tool_result_part.is_error is True
+
+
+def test_cayu_app_required_allowlist_executes_allowed_argument():
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={"value": "internal"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("allowed handled"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=InMemorySessionStore())
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"side_effect": [RequiredAllowlistRule("value", values=["internal"])]}
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_required_allowlist_allowed_tool",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert tool.calls == [{"value": "internal"}]
+    assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in events)
+    assert all(event.type != EventType.TOOL_CALL_BLOCKED for event in events)
+
+
+def test_cayu_app_required_allowlist_can_request_durable_approval():
+    store = InMemorySessionStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        tool_policy=ParameterConstrainedToolPolicy(
+            {"side_effect": [RequiredAllowlistRule("value", values=["internal"])]},
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_required_allowlist_approval",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    assert tool.calls == []
+    approval_event = next(
+        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    approval = approval_event.payload["approval"]
+    assert approval["reason"] == "Required allowlisted parameter 'value' is missing."
+    assert approval["metadata"] == {
+        "policy": "parameter_constrained",
+        "tool_name": "side_effect",
+        "parameter": "value",
+        "rule": "RequiredAllowlistRule",
+        "rule_index": 0,
+        "violation": "missing",
+    }
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    assert events[-1].payload["interruption_type"] == "tool_approval_required"
+    checkpoint = asyncio.run(store.load_checkpoint("sess_required_allowlist_approval"))
+    assert checkpoint is not None
+    assert checkpoint["pending_tool_approval"]["approval_id"] == approval["approval_id"]
 
 
 def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():

@@ -2340,9 +2340,9 @@ argument shapes:
 ```python
 from cayu import (
     AgentSpec,
-    AllowlistRule,
     DenyPatternRule,
     ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
     RequiredFieldRule,
     ToolPolicyDecision,
 )
@@ -2351,7 +2351,10 @@ policy = ParameterConstrainedToolPolicy(
     {
         "send_email": [
             RequiredFieldRule("to"),
-            AllowlistRule("template", values=["invoice_reminder", "receipt"]),
+            RequiredAllowlistRule(
+                "template",
+                values=["invoice_reminder", "receipt"],
+            ),
             DenyPatternRule("to", patterns=[r"@example\.invalid$"]),
         ],
     },
@@ -2369,6 +2372,11 @@ Here `send_email_tool` is an application-owned tool whose spec name is
 `send_email`. The policy runs before the tool implementation. Violations either
 block the call or request durable approval, depending on the configured
 decision.
+
+`RequiredAllowlistRule` is the safe default when an allowlisted field must be
+present: it rejects missing, empty, non-string, and disallowed values in one
+rule. `AllowlistRule` intentionally ignores a missing field and is appropriate
+only when the field is genuinely optional.
 
 Use taint-aware policies when untrusted source content should not flow into
 sensitive outbound tools without a checkpoint:

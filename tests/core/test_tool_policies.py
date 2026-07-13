@@ -11,6 +11,7 @@ from cayu import (
     AllowlistRule,
     DenyPatternRule,
     ParameterConstrainedToolPolicy,
+    RequiredAllowlistRule,
     RequiredFieldRule,
     TaintAwareToolPolicy,
     ToolPolicyDecision,
@@ -41,6 +42,25 @@ def _request(
     )
 
 
+_REQUIRED_ALLOWLIST_FAILURE_CASES = (
+    ({}, "Required allowlisted parameter 'to' is missing.", "missing"),
+    ({"to": "   "}, "Required allowlisted parameter 'to' is empty.", "empty"),
+    ({"to": None}, "Required allowlisted parameter 'to' is empty.", "empty"),
+    ({"to": []}, "Required allowlisted parameter 'to' is empty.", "empty"),
+    ({"to": {}}, "Required allowlisted parameter 'to' is empty.", "empty"),
+    (
+        {"to": 123},
+        "Required allowlisted parameter 'to' must be a string.",
+        "wrong_type",
+    ),
+    (
+        {"to": "attacker@example.net"},
+        "Required allowlisted parameter 'to' value is not allowed.",
+        "disallowed_value",
+    ),
+)
+
+
 def test_allowlist_rule_allows_only_explicit_string_values() -> None:
     rule = AllowlistRule("to", values=["ops@example.com", "billing@example.com"])
 
@@ -56,6 +76,42 @@ def test_allowlist_rule_supports_nested_argument_paths() -> None:
     assert rule.check({"request": {"host": "api.internal"}}) is None
     assert rule.check({"request": {"host": "evil.example"}}) == (
         "Parameter 'request.host' value is not allowed."
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "reason", "violation"),
+    _REQUIRED_ALLOWLIST_FAILURE_CASES,
+)
+def test_required_allowlist_rule_fails_closed_with_structured_metadata(
+    arguments: dict,
+    reason: str,
+    violation: str,
+) -> None:
+    rule = RequiredAllowlistRule("to", values=["ops@example.com"])
+
+    assert rule.check(arguments) == reason
+    assert rule.violation_metadata(arguments) == {"violation": violation}
+
+
+def test_required_allowlist_rule_allows_top_level_and_nested_values() -> None:
+    top_level = RequiredAllowlistRule("to", values=["ops@example.com"])
+    nested = RequiredAllowlistRule("request.host", values=["api.internal"])
+
+    assert top_level.check({"to": "ops@example.com"}) is None
+    assert top_level.violation_metadata({"to": "ops@example.com"}) == {}
+    assert nested.check({"request": {"host": "api.internal"}}) is None
+    assert nested.check({"request": {}}) == (
+        "Required allowlisted parameter 'request.host' is missing."
+    )
+    assert nested.check({"request": {"host": ""}}) == (
+        "Required allowlisted parameter 'request.host' is empty."
+    )
+    assert nested.check({"request": {"host": {"value": "api.internal"}}}) == (
+        "Required allowlisted parameter 'request.host' must be a string."
+    )
+    assert nested.check({"request": {"host": "evil.example"}}) == (
+        "Required allowlisted parameter 'request.host' value is not allowed."
     )
 
 
@@ -120,6 +176,65 @@ def test_parameter_constrained_policy_denies_first_rule_violation_with_metadata(
     }
 
 
+@pytest.mark.parametrize(
+    ("arguments", "reason", "violation"),
+    _REQUIRED_ALLOWLIST_FAILURE_CASES,
+)
+def test_parameter_constrained_policy_reports_required_allowlist_failure_category(
+    arguments: dict,
+    reason: str,
+    violation: str,
+) -> None:
+    policy = ParameterConstrainedToolPolicy(
+        {"send_email": [RequiredAllowlistRule("to", values=["ops@example.com"])]}
+    )
+
+    result = asyncio.run(policy.authorize(_request(arguments=arguments)))
+
+    assert result.decision == ToolPolicyDecision.DENY
+    assert result.reason == reason
+    assert result.metadata == {
+        "policy": "parameter_constrained",
+        "tool_name": "send_email",
+        "parameter": "to",
+        "rule": "RequiredAllowlistRule",
+        "rule_index": 0,
+        "violation": violation,
+    }
+
+
+def test_parameter_constrained_policy_allows_required_allowlisted_value() -> None:
+    policy = ParameterConstrainedToolPolicy(
+        {"send_email": [RequiredAllowlistRule("to", values=["ops@example.com"])]}
+    )
+
+    result = asyncio.run(policy.authorize(_request(arguments={"to": "ops@example.com"})))
+
+    assert result.decision == ToolPolicyDecision.ALLOW
+    assert result.reason is None
+    assert result.metadata == {}
+
+
+def test_required_allowlist_policy_can_require_approval_with_failure_metadata() -> None:
+    policy = ParameterConstrainedToolPolicy(
+        {"send_email": [RequiredAllowlistRule("to", values=["ops@example.com"])]},
+        decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+    )
+
+    result = asyncio.run(policy.authorize(_request(arguments={})))
+
+    assert result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+    assert result.reason == "Required allowlisted parameter 'to' is missing."
+    assert result.metadata == {
+        "policy": "parameter_constrained",
+        "tool_name": "send_email",
+        "parameter": "to",
+        "rule": "RequiredAllowlistRule",
+        "rule_index": 0,
+        "violation": "missing",
+    }
+
+
 def test_parameter_constrained_policy_can_require_approval_on_violation() -> None:
     policy = ParameterConstrainedToolPolicy(
         {"http_request": [DenyPatternRule("url", patterns=[r"^https://external\.example"])]},
@@ -157,10 +272,16 @@ def test_parameter_constrained_policy_rejects_invalid_configuration() -> None:
         AllowlistRule("to", values=[])
 
     with pytest.raises(ValueError, match="cannot be empty"):
+        RequiredAllowlistRule("to", values=[])
+
+    with pytest.raises(ValueError, match="cannot be empty"):
         DenyPatternRule("shell", patterns=[])
 
     with pytest.raises(ValueError, match="cannot be blank"):
         RequiredFieldRule("payload..message")
+
+    with pytest.raises(ValueError, match="cannot be blank"):
+        RequiredAllowlistRule("payload..message", values=["allowed"])
 
 
 def test_taint_aware_policy_allows_before_untrusted_source() -> None:

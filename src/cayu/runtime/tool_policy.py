@@ -212,6 +212,15 @@ class ParameterRule(ABC):
     def check(self, arguments: dict[str, Any]) -> str | None:
         """Return a violation reason, or ``None`` when the arguments satisfy the rule."""
 
+    def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Return safe structured details for a rejected argument.
+
+        Custom rules remain source-compatible: rules that do not override this
+        hook continue to emit the standard policy, tool, parameter, rule, and
+        rule-index metadata.
+        """
+        return {}
+
 
 class RequiredFieldRule(ParameterRule):
     """Require an argument path to be present and non-empty."""
@@ -234,7 +243,11 @@ class RequiredFieldRule(ParameterRule):
 
 
 class AllowlistRule(ParameterRule):
-    """Require an argument value to match one of the explicitly allowed strings."""
+    """Allow a present argument only when it matches an allowed string.
+
+    A missing argument is intentionally allowed. Use
+    :class:`RequiredAllowlistRule` when omission must fail closed.
+    """
 
     def __init__(self, parameter: str, *, values: Iterable[str]) -> None:
         self._path = _copy_parameter_path(parameter)
@@ -255,6 +268,53 @@ class AllowlistRule(ParameterRule):
             return f"Parameter '{self.parameter}' must be a string for allowlist validation."
         if value not in self.values:
             return f"Parameter '{self.parameter}' value is not allowed."
+        return None
+
+
+class RequiredAllowlistRule(ParameterRule):
+    """Require a non-empty string argument that matches an explicit allowlist."""
+
+    def __init__(self, parameter: str, *, values: Iterable[str]) -> None:
+        self._path = _copy_parameter_path(parameter)
+        self._parameter = ".".join(self._path)
+        self.values = _copy_nonempty_string_set(values, "values")
+        if not self.values:
+            raise ValueError("RequiredAllowlistRule values cannot be empty.")
+
+    @property
+    def parameter(self) -> str:
+        return self._parameter
+
+    def check(self, arguments: dict[str, Any]) -> str | None:
+        violation = self._violation(arguments)
+        return None if violation is None else violation[0]
+
+    def violation_metadata(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        violation = self._violation(arguments)
+        return {} if violation is None else {"violation": violation[1]}
+
+    def _violation(self, arguments: dict[str, Any]) -> tuple[str, str] | None:
+        value = _get_argument_path(arguments, self._path)
+        if value is _MISSING:
+            return (
+                f"Required allowlisted parameter '{self.parameter}' is missing.",
+                "missing",
+            )
+        if _is_empty_parameter_value(value):
+            return (
+                f"Required allowlisted parameter '{self.parameter}' is empty.",
+                "empty",
+            )
+        if type(value) is not str:
+            return (
+                f"Required allowlisted parameter '{self.parameter}' must be a string.",
+                "wrong_type",
+            )
+        if value not in self.values:
+            return (
+                f"Required allowlisted parameter '{self.parameter}' value is not allowed.",
+                "disallowed_value",
+            )
         return None
 
 
@@ -319,16 +379,23 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         for index, rule in enumerate(rules):
             violation = rule.check(request.arguments)
             if violation is not None:
+                metadata = {
+                    "policy": "parameter_constrained",
+                    "tool_name": request.tool_name,
+                    "parameter": rule.parameter,
+                    "rule": type(rule).__name__,
+                    "rule_index": index,
+                }
+                metadata.update(
+                    copy_json_value(
+                        rule.violation_metadata(request.arguments),
+                        "violation_metadata",
+                    )
+                )
                 return ToolPolicyResult(
                     decision=self.decision,
                     reason=violation,
-                    metadata={
-                        "policy": "parameter_constrained",
-                        "tool_name": request.tool_name,
-                        "parameter": rule.parameter,
-                        "rule": type(rule).__name__,
-                        "rule_index": index,
-                    },
+                    metadata=metadata,
                 )
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
