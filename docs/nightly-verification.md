@@ -383,6 +383,12 @@ microVM is intended. Use an isolated `MSB_HOME` when verification must not
 migrate or otherwise mutate the default shared Microsandbox state:
 
 ```bash
+MSB_HOME=/tmp/cayu-microsandbox-removal-verification \
+CAYU_MICROSANDBOX_REMOVE_STRESS_ITERATIONS=10 \
+uv run python scripts/nightly_verification.py \
+  --check microsandbox-live-runner \
+  --strict
+
 MSB_HOME=/tmp/cayu-microsandbox-verification \
 CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1 \
 uv run python scripts/nightly_verification.py \

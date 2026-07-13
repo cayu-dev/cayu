@@ -1238,6 +1238,33 @@ Lifecycle is explicit:
 - `close_action="detach"`: detach and let the sandbox outlive the Python process.
 - `close_action="none"`: attach/use only; no lifecycle action on close.
 
+Microsandbox can briefly continue reporting a stopped sandbox as running after
+its stop waiter completes. Removal therefore attempts immediately, then retries
+only the SDK's typed `SandboxStillRunningError` with bounded exponential
+backoff. `remove_timeout_s` defaults to
+`DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS` (5 seconds); reaching that
+deadline raises `MicrosandboxCleanupError` instead of retrying indefinitely.
+Authentication, transport, permission, and unrelated SDK errors are never
+retried. `SandboxNotFoundError` during removal, including the preceding stop,
+is treated as idempotent success because the requested terminal state has
+already been reached.
+
+After a close attempt, `last_cleanup_diagnostic` provides a copied, JSON-safe
+`cayu.microsandbox_cleanup.v1` record with the sandbox name, lifecycle action,
+terminal status, deadline, removal attempts, refreshed statuses, and safe error
+metadata when available. Deferred removal attempts are recorded separately
+from final `removed`, `timed_out`, or `failed` status. Cancellation during
+removal, status refresh, or retry backoff is re-raised unchanged after recording
+the cancelled operation. Setup cleanup retains the original setup or
+cancellation error alongside every terminal cleanup error in a flat, ordered
+`BaseExceptionGroup`: the original error first, followed by a stop error and
+then a removal error when present. Cleanup still attempts removal after stop
+fails. Non-timeout cleanup errors retain their structured record on the cleanup
+exception's `diagnostic` attribute. A failed close does not mark the runner
+closed so an operator may retry it. Once stopping succeeds, a removal retry
+resumes directly at removal instead of trying to stop the already-stopped
+sandbox again.
+
 Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
 creation and lifecycle.
 

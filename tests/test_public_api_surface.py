@@ -34,6 +34,8 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "NativeStructuredOutputUnsupported",
     "Runner",
     "Workspace",
+    "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",
+    "MicrosandboxCleanupError",
 )
 
 

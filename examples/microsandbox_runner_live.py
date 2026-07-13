@@ -21,6 +21,11 @@ async def main() -> None:
         "RunnerCleanupPolicy",
         os.environ.get("CAYU_RUNNER_TIMEOUT_CLEANUP", "command"),
     )
+    remove_stress_iterations = int(
+        os.environ.get("CAYU_MICROSANDBOX_REMOVE_STRESS_ITERATIONS", "0")
+    )
+    if remove_stress_iterations < 0:
+        raise ValueError("CAYU_MICROSANDBOX_REMOVE_STRESS_ITERATIONS must be non-negative")
 
     os.environ["CAYU_HOST_SECRET_SHOULD_NOT_LEAK"] = "hidden"
 
@@ -29,6 +34,7 @@ async def main() -> None:
     print(f"cancellation_cleanup {cancellation_cleanup}")
     print(f"timeout_cleanup {timeout_cleanup}")
     print(f"cancel_delay_s {cancel_delay_s}")
+    print(f"remove_stress_iterations {remove_stress_iterations}")
     print("creating sandbox")
 
     async with await MicrosandboxRunner.create(
@@ -118,7 +124,47 @@ async def main() -> None:
 
         print("closing sandbox")
 
+    await _verify_reconnected_remove_stress(
+        sandbox_name,
+        image=image,
+        iterations=remove_stress_iterations,
+    )
     print("completed")
+
+
+async def _verify_reconnected_remove_stress(
+    base_name: str,
+    *,
+    image: str,
+    iterations: int,
+) -> None:
+    for index in range(iterations):
+        name = f"{base_name[:96]}-remove-stress-{index}"
+        owner = await MicrosandboxRunner.create(
+            name,
+            image=image,
+            replace=True,
+            close_action="remove",
+        )
+        removed = False
+        try:
+            reconnected = await MicrosandboxRunner.from_existing(
+                name,
+                close_action="remove",
+            )
+            await reconnected.close()
+            diagnostic = reconnected.last_cleanup_diagnostic
+            if diagnostic is None or diagnostic["status"] != "removed":
+                raise RuntimeError(f"Microsandbox removal diagnostic was incomplete: {diagnostic}")
+            removed = True
+            print(
+                f"remove_stress iteration={index + 1} "
+                f"attempts={len(diagnostic['attempts'])} "
+                f"statuses={diagnostic['observed_statuses']}"
+            )
+        finally:
+            if not removed:
+                await owner.close()
 
 
 def _cleanup_action(policy: RunnerCleanupPolicy) -> str:

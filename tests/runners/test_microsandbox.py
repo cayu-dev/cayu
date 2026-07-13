@@ -9,7 +9,9 @@ import pytest
 
 from cayu.runners import (
     DEFAULT_MICROSANDBOX_CWD,
+    DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
     ExecCommand,
+    MicrosandboxCleanupError,
     MicrosandboxRunner,
 )
 
@@ -108,6 +110,10 @@ class FakeSandbox:
         self.timeout_next_stream = False
         self.fail_kill = False
         self.hang_kill = False
+        self.fail_next_stop = False
+        self.fail_repeated_stop = False
+        self.already_stopped = False
+        self.stop_failure: Exception | None = None
         self.next_handle = FakeHandle(
             [
                 FakeEvent("stdout", b"hello "),
@@ -153,6 +159,17 @@ class FakeSandbox:
 
     async def stop_and_wait(self) -> None:
         self.stop_and_wait_calls += 1
+        if self.stop_failure is not None:
+            error = self.stop_failure
+            self.stop_failure = None
+            raise error
+        if self.already_stopped:
+            raise FakeSandboxNotRunningError("sandbox is not running")
+        if self.fail_next_stop:
+            self.fail_next_stop = False
+            raise RuntimeError("stop failed")
+        if self.fail_repeated_stop and self.stop_and_wait_calls > 1:
+            raise FakeSandboxNotRunningError("sandbox is not running")
 
     async def kill(self) -> None:
         if self.hang_kill:
@@ -166,11 +183,38 @@ class FakeSandbox:
 
 
 class FakeHandleRecord:
-    def __init__(self, sandbox: FakeSandbox) -> None:
+    def __init__(
+        self,
+        sandbox: FakeSandbox,
+        *,
+        status: str = "stopped",
+        hang_refresh: bool = False,
+    ) -> None:
         self.sandbox = sandbox
+        self.status = status
+        self.hang_refresh = hang_refresh
+        self.refresh_calls = 0
 
     async def connect(self) -> FakeSandbox:
         return self.sandbox
+
+    async def refresh(self) -> FakeHandleRecord:
+        self.refresh_calls += 1
+        if self.hang_refresh:
+            await asyncio.sleep(30)
+        return self
+
+
+class FakeSandboxStillRunningError(RuntimeError):
+    pass
+
+
+class FakeSandboxNotFoundError(RuntimeError):
+    pass
+
+
+class FakeSandboxNotRunningError(RuntimeError):
+    pass
 
 
 class FakeSandboxApi:
@@ -178,8 +222,16 @@ class FakeSandboxApi:
     removed: list[str] = []
     existing: FakeSandbox | None = None
     fail_next_remove = False
+    remove_failures: list[Exception] = []
+    always_still_running = False
+    hang_get = False
+    hang_refresh = False
+    hang_remove = False
+    remove_calls: list[str] = []
+    statuses: list[str] = []
     fail_created_setup = False
     cancel_created_setup = False
+    created_stop_failure: Exception | None = None
 
     @classmethod
     async def create(cls, name: str, **kwargs: Any) -> FakeSandbox:
@@ -187,25 +239,39 @@ class FakeSandboxApi:
         sandbox = FakeSandbox(name)
         sandbox.fail_next_exec = cls.fail_created_setup
         sandbox.cancel_next_exec = cls.cancel_created_setup
+        sandbox.stop_failure = cls.created_stop_failure
         cls.existing = sandbox
         return sandbox
 
     @classmethod
     async def get(cls, name: str) -> FakeHandleRecord:
+        if cls.hang_get:
+            await asyncio.sleep(30)
         sandbox = cls.existing or FakeSandbox(name)
         cls.existing = sandbox
-        return FakeHandleRecord(sandbox)
+        status = cls.statuses.pop(0) if cls.statuses else "stopped"
+        return FakeHandleRecord(sandbox, status=status, hang_refresh=cls.hang_refresh)
 
     @classmethod
     async def remove(cls, name: str) -> None:
+        cls.remove_calls.append(name)
+        if cls.hang_remove:
+            await asyncio.sleep(30)
         if cls.fail_next_remove:
             cls.fail_next_remove = False
             raise RuntimeError("remove failed")
+        if cls.remove_failures:
+            raise cls.remove_failures.pop(0)
+        if cls.always_still_running:
+            raise FakeSandboxStillRunningError("sandbox status has not settled")
         cls.removed.append(name)
 
 
 class FakeMicrosandboxModule:
     Sandbox = FakeSandboxApi
+    SandboxNotFoundError = FakeSandboxNotFoundError
+    SandboxNotRunningError = FakeSandboxNotRunningError
+    SandboxStillRunningError = FakeSandboxStillRunningError
 
 
 def reset_fake_module() -> None:
@@ -213,8 +279,22 @@ def reset_fake_module() -> None:
     FakeSandboxApi.removed = []
     FakeSandboxApi.existing = None
     FakeSandboxApi.fail_next_remove = False
+    FakeSandboxApi.remove_failures = []
+    FakeSandboxApi.always_still_running = False
+    FakeSandboxApi.hang_get = False
+    FakeSandboxApi.hang_refresh = False
+    FakeSandboxApi.hang_remove = False
+    FakeSandboxApi.remove_calls = []
+    FakeSandboxApi.statuses = []
     FakeSandboxApi.fail_created_setup = False
     FakeSandboxApi.cancel_created_setup = False
+    FakeSandboxApi.created_stop_failure = None
+
+
+def cleanup_diagnostic(error: BaseException) -> dict[str, Any]:
+    diagnostic = error.__dict__.get("diagnostic")
+    assert isinstance(diagnostic, dict)
+    return diagnostic
 
 
 def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
@@ -482,6 +562,8 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         assert removable_sandbox.stop_calls == 0
         assert removable_sandbox.stop_and_wait_calls == 1
         assert FakeSandboxApi.removed == ["remove-me"]
+        assert removable.last_cleanup_diagnostic is not None
+        assert removable.last_cleanup_diagnostic["status"] == "removed"
 
         detachable_sandbox = FakeSandbox("detach-me")
         detachable = MicrosandboxRunner(
@@ -494,6 +576,8 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         assert detachable_sandbox.detach_calls == 1
         assert detachable_sandbox.stop_calls == 0
         assert detachable_sandbox.stop_and_wait_calls == 0
+        assert detachable.last_cleanup_diagnostic is not None
+        assert detachable.last_cleanup_diagnostic["status"] == "detached"
 
         no_op_sandbox = FakeSandbox("keep-me")
         no_op = MicrosandboxRunner(
@@ -505,8 +589,321 @@ def test_microsandbox_runner_close_actions_are_explicit() -> None:
         await no_op.close()
         assert no_op_sandbox.stop_calls == 0
         assert no_op_sandbox.stop_and_wait_calls == 0
+        assert no_op.last_cleanup_diagnostic is not None
+        assert no_op.last_cleanup_diagnostic["status"] == "skipped"
 
     asyncio.run(run())
+
+
+def test_microsandbox_runner_remove_records_immediate_cleanup_without_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("immediate removal must not sleep")
+
+    monkeypatch.setattr("cayu.runners.microsandbox.asyncio.sleep", unexpected_sleep)
+
+    async def run() -> dict[str, Any] | None:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "remove-immediately",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        assert runner.remove_timeout_s == DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS
+        await runner.close()
+        return runner.last_cleanup_diagnostic
+
+    diagnostic = asyncio.run(run())
+
+    assert FakeSandboxApi.remove_calls == ["remove-immediately"]
+    assert diagnostic is not None
+    assert diagnostic["status"] == "removed"
+    assert diagnostic["attempts"] == [{"attempt": 1, "status": "removed"}]
+
+
+def test_microsandbox_runner_retries_only_still_running_removal() -> None:
+    async def run() -> dict[str, Any] | None:
+        reset_fake_module()
+        FakeSandboxApi.remove_failures = [
+            FakeSandboxStillRunningError("sandbox status has not settled")
+        ]
+        FakeSandboxApi.statuses = ["draining"]
+        runner = await MicrosandboxRunner.create(
+            "settles-after-retry",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        await runner.close()
+        return runner.last_cleanup_diagnostic
+
+    diagnostic = asyncio.run(run())
+
+    assert FakeSandboxApi.remove_calls == ["settles-after-retry", "settles-after-retry"]
+    assert diagnostic is not None
+    assert diagnostic["status"] == "removed"
+    assert diagnostic["attempts"] == [
+        {"attempt": 1, "status": "deferred", "sandbox_status": "draining"},
+        {"attempt": 2, "status": "removed"},
+    ]
+    assert diagnostic["observed_statuses"] == ["draining"]
+
+
+def test_microsandbox_runner_bounds_unsettled_removal() -> None:
+    async def run() -> tuple[MicrosandboxRunner, MicrosandboxCleanupError]:
+        reset_fake_module()
+        FakeSandboxApi.always_still_running = True
+        FakeSandboxApi.statuses = ["running"] * 10
+        runner = await MicrosandboxRunner.create(
+            "never-settles",
+            remove_timeout_s=0.01,
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(MicrosandboxCleanupError) as exc_info:
+            await runner.close()
+        return runner, exc_info.value
+
+    runner, error = asyncio.run(run())
+
+    assert len(FakeSandboxApi.remove_calls) >= 2
+    assert error.diagnostic["status"] == "timed_out"
+    assert error.diagnostic["error_type"] == "FakeSandboxStillRunningError"
+    assert runner.last_cleanup_diagnostic == error.diagnostic
+    assert runner._closed is False
+
+
+@pytest.mark.parametrize("stalled_operation", ["remove", "get", "refresh"])
+def test_microsandbox_runner_deadline_bounds_sdk_operations(stalled_operation: str) -> None:
+    async def run() -> tuple[MicrosandboxRunner, MicrosandboxCleanupError, float]:
+        reset_fake_module()
+        if stalled_operation == "remove":
+            FakeSandboxApi.hang_remove = True
+        else:
+            FakeSandboxApi.remove_failures = [
+                FakeSandboxStillRunningError("sandbox status has not settled")
+            ]
+            setattr(FakeSandboxApi, f"hang_{stalled_operation}", True)
+        runner = await MicrosandboxRunner.create(
+            f"stalled-{stalled_operation}",
+            remove_timeout_s=0.02,
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(MicrosandboxCleanupError) as exc_info:
+            await runner.close()
+        return runner, exc_info.value, asyncio.get_running_loop().time() - started
+
+    runner, error, elapsed_s = asyncio.run(run())
+
+    assert elapsed_s < 1
+    assert error.diagnostic["status"] == "timed_out"
+    assert error.diagnostic["attempts"] == [
+        {
+            "attempt": 1,
+            "status": "timed_out",
+            "operation": "remove" if stalled_operation == "remove" else "status_refresh",
+        }
+    ]
+    assert runner.last_cleanup_diagnostic == error.diagnostic
+    assert runner._closed is False
+
+
+@pytest.mark.parametrize("cancelled_operation", ["remove", "get", "refresh", "backoff"])
+def test_microsandbox_runner_records_removal_cancellation(
+    cancelled_operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> tuple[MicrosandboxRunner, asyncio.CancelledError]:
+        reset_fake_module()
+        cancellation_started = asyncio.Event()
+
+        if cancelled_operation == "remove":
+
+            async def hanging_remove(cls: type[FakeSandboxApi], name: str) -> None:
+                cls.remove_calls.append(name)
+                cancellation_started.set()
+                await asyncio.Future()
+
+            monkeypatch.setattr(FakeSandboxApi, "remove", classmethod(hanging_remove))
+        else:
+            FakeSandboxApi.remove_failures = [
+                FakeSandboxStillRunningError("sandbox status has not settled")
+            ]
+            if cancelled_operation == "get":
+
+                async def hanging_get(cls: type[FakeSandboxApi], name: str) -> FakeHandleRecord:
+                    del cls, name
+                    cancellation_started.set()
+                    await asyncio.Future()
+                    raise AssertionError("unreachable")
+
+                monkeypatch.setattr(FakeSandboxApi, "get", classmethod(hanging_get))
+            elif cancelled_operation == "refresh":
+
+                async def hanging_refresh(self: FakeHandleRecord) -> FakeHandleRecord:
+                    del self
+                    cancellation_started.set()
+                    await asyncio.Future()
+                    raise AssertionError("unreachable")
+
+                monkeypatch.setattr(FakeHandleRecord, "refresh", hanging_refresh)
+            else:
+
+                async def hanging_backoff(_delay_s: float) -> None:
+                    cancellation_started.set()
+                    await asyncio.Future()
+
+                monkeypatch.setattr(
+                    "cayu.runners.microsandbox._sleep_before_microsandbox_retry",
+                    hanging_backoff,
+                )
+
+        runner = await MicrosandboxRunner.create(
+            f"cancel-removal-{cancelled_operation}",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        close_task = asyncio.create_task(runner.close())
+        await asyncio.wait_for(cancellation_started.wait(), timeout=1)
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await close_task
+        return runner, exc_info.value
+
+    runner, error = asyncio.run(run())
+
+    diagnostic = cleanup_diagnostic(error)
+    assert runner.last_cleanup_diagnostic == diagnostic
+    assert diagnostic["action"] == "remove"
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["error_type"] == "CancelledError"
+    assert diagnostic["attempts"][-1] == {
+        "attempt": 1,
+        "status": "cancelled",
+        "operation": (
+            "status_refresh" if cancelled_operation in {"get", "refresh"} else cancelled_operation
+        ),
+    }
+    assert runner._closed is False
+
+
+def test_microsandbox_runner_surfaces_nonretryable_remove_error_immediately() -> None:
+    async def run() -> MicrosandboxRunner:
+        reset_fake_module()
+        FakeSandboxApi.remove_failures = [PermissionError("remove denied")]
+        runner = await MicrosandboxRunner.create(
+            "remove-denied",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(PermissionError, match="remove denied"):
+            await runner.close()
+        return runner
+
+    runner = asyncio.run(run())
+
+    assert FakeSandboxApi.remove_calls == ["remove-denied"]
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["status"] == "failed"
+    assert runner.last_cleanup_diagnostic["error_type"] == "PermissionError"
+    assert runner.last_cleanup_diagnostic["attempts"] == [
+        {"attempt": 1, "status": "failed", "operation": "remove"}
+    ]
+
+
+def test_microsandbox_runner_preserves_history_before_terminal_remove_error() -> None:
+    async def run() -> MicrosandboxRunner:
+        reset_fake_module()
+        FakeSandboxApi.remove_failures = [
+            FakeSandboxStillRunningError("sandbox status has not settled"),
+            PermissionError("remove denied"),
+        ]
+        FakeSandboxApi.statuses = ["draining"]
+        runner = await MicrosandboxRunner.create(
+            "remove-denied-after-retry",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        with pytest.raises(PermissionError, match="remove denied"):
+            await runner.close()
+        return runner
+
+    runner = asyncio.run(run())
+
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["attempts"] == [
+        {"attempt": 1, "status": "deferred", "sandbox_status": "draining"},
+        {"attempt": 2, "status": "failed", "operation": "remove"},
+    ]
+    assert runner.last_cleanup_diagnostic["observed_statuses"] == ["draining"]
+
+
+def test_microsandbox_runner_treats_already_removed_as_success() -> None:
+    async def run() -> dict[str, Any] | None:
+        reset_fake_module()
+        FakeSandboxApi.remove_failures = [FakeSandboxNotFoundError("sandbox not found")]
+        runner = await MicrosandboxRunner.create(
+            "already-removed",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        await runner.close()
+        return runner.last_cleanup_diagnostic
+
+    diagnostic = asyncio.run(run())
+
+    assert diagnostic is not None
+    assert diagnostic["status"] == "removed"
+    assert diagnostic["attempts"] == [{"attempt": 1, "status": "already_removed"}]
+
+
+def test_microsandbox_runner_treats_not_found_during_stop_as_already_removed() -> None:
+    async def run() -> tuple[FakeSandbox, MicrosandboxRunner]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "removed-before-stop",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        sandbox = runner._sandbox
+        sandbox.stop_failure = FakeSandboxNotFoundError("sandbox not found")
+        await runner.close()
+        return sandbox, runner
+
+    sandbox, runner = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == []
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["status"] == "removed"
+    assert runner.last_cleanup_diagnostic["attempts"] == [
+        {"attempt": 1, "status": "already_removed", "operation": "stop"}
+    ]
+    assert runner._closed is True
+
+
+def test_microsandbox_runner_uses_06_stop_and_wait_contract() -> None:
+    class CurrentSandbox(FakeSandbox):
+        stop_and_wait = None
+
+        def __init__(self, name: str) -> None:
+            super().__init__(name)
+            self.wait_until_stopped_calls = 0
+
+        async def wait_until_stopped(self) -> Any:
+            self.wait_until_stopped_calls += 1
+            return type("StopResult", (), {"status": "stopped"})()
+
+    async def run() -> tuple[CurrentSandbox, dict[str, Any] | None]:
+        sandbox = CurrentSandbox("current-sdk")
+        runner = MicrosandboxRunner(
+            sandbox,
+            name="current-sdk",
+            close_action="stop",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        await runner.close()
+        return sandbox, runner.last_cleanup_diagnostic
+
+    sandbox, diagnostic = asyncio.run(run())
+
+    assert sandbox.stop_calls == 1
+    assert sandbox.wait_until_stopped_calls == 1
+    assert diagnostic is not None
+    assert diagnostic["observed_statuses"] == ["stopped"]
 
 
 def test_microsandbox_runner_does_not_create_sandbox_for_invalid_lifecycle_config() -> None:
@@ -530,6 +927,12 @@ def test_microsandbox_runner_does_not_create_sandbox_for_invalid_lifecycle_confi
             await MicrosandboxRunner.create(
                 "bad-ensure",
                 ensure_default_cwd=bad_ensure_default_cwd,
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        with pytest.raises(ValueError, match="remove_timeout_s"):
+            await MicrosandboxRunner.create(
+                "bad-remove-timeout",
+                remove_timeout_s=0,
                 sandbox_module=FakeMicrosandboxModule,
             )
 
@@ -557,11 +960,56 @@ def test_microsandbox_runner_cleans_up_created_sandbox_when_setup_fails() -> Non
     assert FakeSandboxApi.removed == ["setup-fails"]
 
 
+def test_microsandbox_runner_setup_failure_retries_transient_removal_lag() -> None:
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FakeSandboxApi.fail_created_setup = True
+        FakeSandboxApi.remove_failures = [
+            FakeSandboxStillRunningError("sandbox status has not settled")
+        ]
+        FakeSandboxApi.statuses = ["draining"]
+        with pytest.raises(RuntimeError, match="exec failed"):
+            await MicrosandboxRunner.create(
+                "setup-fails-remove-lags",
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        assert FakeSandboxApi.existing is not None
+        return FakeSandboxApi.existing
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == [
+        "setup-fails-remove-lags",
+        "setup-fails-remove-lags",
+    ]
+    assert FakeSandboxApi.removed == ["setup-fails-remove-lags"]
+
+
+def test_microsandbox_runner_setup_failure_accepts_sandbox_removed_before_stop() -> None:
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FakeSandboxApi.fail_created_setup = True
+        FakeSandboxApi.created_stop_failure = FakeSandboxNotFoundError("sandbox not found")
+        with pytest.raises(RuntimeError, match="exec failed"):
+            await MicrosandboxRunner.create(
+                "setup-fails-after-removal",
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        assert FakeSandboxApi.existing is not None
+        return FakeSandboxApi.existing
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == []
+
+
 def test_microsandbox_runner_reports_setup_and_cleanup_failures_together() -> None:
     async def run() -> FakeSandbox:
         reset_fake_module()
         FakeSandboxApi.fail_created_setup = True
-        FakeSandboxApi.fail_next_remove = True
+        FakeSandboxApi.remove_failures = [PermissionError("remove denied")]
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await MicrosandboxRunner.create(
                 "setup-and-cleanup-fail",
@@ -570,7 +1018,13 @@ def test_microsandbox_runner_reports_setup_and_cleanup_failures_together() -> No
         assert "setup failed and cleanup failed" in str(exc_info.value)
         assert len(exc_info.value.exceptions) == 2
         assert isinstance(exc_info.value.exceptions[0], RuntimeError)
-        assert isinstance(exc_info.value.exceptions[1], RuntimeError)
+        cleanup_error = exc_info.value.exceptions[1]
+        assert isinstance(cleanup_error, PermissionError)
+        diagnostic = cleanup_diagnostic(cleanup_error)
+        assert diagnostic["type"] == "cayu.microsandbox_cleanup.v1"
+        assert diagnostic["status"] == "failed"
+        assert diagnostic["error_type"] == "PermissionError"
+        assert diagnostic["attempts"] == [{"attempt": 1, "status": "failed", "operation": "remove"}]
         assert FakeSandboxApi.existing is not None
         return FakeSandboxApi.existing
 
@@ -579,6 +1033,99 @@ def test_microsandbox_runner_reports_setup_and_cleanup_failures_together() -> No
     assert sandbox.stop_calls == 0
     assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == []
+
+
+def test_microsandbox_runner_reports_setup_and_stop_failure_after_successful_removal() -> None:
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FakeSandboxApi.fail_created_setup = True
+        FakeSandboxApi.created_stop_failure = PermissionError("stop denied")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await MicrosandboxRunner.create(
+                "setup-and-stop-fail",
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        errors = exc_info.value.exceptions
+        assert len(errors) == 2
+        assert isinstance(errors[0], RuntimeError)
+        stop_error = errors[1]
+        assert isinstance(stop_error, PermissionError)
+        diagnostic = cleanup_diagnostic(stop_error)
+        assert diagnostic["action"] == "stop"
+        assert diagnostic["status"] == "failed"
+        assert diagnostic["error_type"] == "PermissionError"
+        assert diagnostic["attempts"] == []
+        assert FakeSandboxApi.existing is not None
+        return FakeSandboxApi.existing
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == ["setup-and-stop-fail"]
+    assert FakeSandboxApi.removed == ["setup-and-stop-fail"]
+
+
+def test_microsandbox_runner_preserves_setup_stop_and_removal_failures() -> None:
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FakeSandboxApi.fail_created_setup = True
+        FakeSandboxApi.created_stop_failure = PermissionError("stop denied")
+        FakeSandboxApi.remove_failures = [ConnectionError("remove transport failed")]
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await MicrosandboxRunner.create(
+                "setup-stop-and-remove-fail",
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        errors = exc_info.value.exceptions
+        assert len(errors) == 3
+        assert isinstance(errors[0], RuntimeError)
+        stop_error = errors[1]
+        removal_error = errors[2]
+        assert isinstance(stop_error, PermissionError)
+        assert isinstance(removal_error, ConnectionError)
+        stop_diagnostic = cleanup_diagnostic(stop_error)
+        removal_diagnostic = cleanup_diagnostic(removal_error)
+        assert stop_diagnostic["action"] == "stop"
+        assert stop_diagnostic["error_type"] == "PermissionError"
+        assert removal_diagnostic["action"] == "remove"
+        assert removal_diagnostic["error_type"] == "ConnectionError"
+        assert removal_diagnostic["attempts"] == [
+            {"attempt": 1, "status": "failed", "operation": "remove"}
+        ]
+        assert FakeSandboxApi.existing is not None
+        return FakeSandboxApi.existing
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == ["setup-stop-and-remove-fail"]
+    assert FakeSandboxApi.removed == []
+
+
+def test_microsandbox_runner_preserves_setup_cancellation_before_stop_failure() -> None:
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FakeSandboxApi.cancel_created_setup = True
+        FakeSandboxApi.created_stop_failure = PermissionError("stop denied")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await MicrosandboxRunner.create(
+                "setup-cancelled-stop-fails",
+                sandbox_module=FakeMicrosandboxModule,
+            )
+        errors = exc_info.value.exceptions
+        assert len(errors) == 2
+        assert isinstance(errors[0], asyncio.CancelledError)
+        stop_error = errors[1]
+        assert isinstance(stop_error, PermissionError)
+        assert cleanup_diagnostic(stop_error)["action"] == "stop"
+        assert FakeSandboxApi.existing is not None
+        return FakeSandboxApi.existing
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == ["setup-cancelled-stop-fails"]
+    assert FakeSandboxApi.removed == ["setup-cancelled-stop-fails"]
 
 
 def test_microsandbox_runner_cleans_up_created_sandbox_when_setup_is_cancelled() -> None:
@@ -608,6 +1155,7 @@ def test_microsandbox_runner_close_can_retry_after_cleanup_failure() -> None:
             sandbox_module=FakeMicrosandboxModule,
         )
         sandbox = runner._sandbox
+        sandbox.fail_repeated_stop = True
         FakeSandboxApi.fail_next_remove = True
         with pytest.raises(RuntimeError, match="remove failed"):
             await runner.close()
@@ -617,8 +1165,129 @@ def test_microsandbox_runner_close_can_retry_after_cleanup_failure() -> None:
     sandbox = asyncio.run(run())
 
     assert sandbox.stop_calls == 0
-    assert sandbox.stop_and_wait_calls == 2
+    assert sandbox.stop_and_wait_calls == 1
     assert FakeSandboxApi.removed == ["retry-cleanup"]
+
+
+def test_microsandbox_runner_close_retry_accepts_late_removal_completion() -> None:
+    async def run() -> tuple[FakeSandbox, MicrosandboxRunner]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "late-removal",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        sandbox = runner._sandbox
+        sandbox.fail_repeated_stop = True
+        FakeSandboxApi.remove_failures = [
+            RuntimeError("remove acknowledgement lost"),
+            FakeSandboxNotFoundError("sandbox not found"),
+        ]
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            await runner.close()
+        await runner.close()
+        return sandbox, runner
+
+    sandbox, runner = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.remove_calls == ["late-removal", "late-removal"]
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["status"] == "removed"
+    assert runner.last_cleanup_diagnostic["attempts"] == [
+        {"attempt": 1, "status": "already_removed"}
+    ]
+    assert runner._closed is True
+
+
+def test_microsandbox_runner_close_retries_failed_stop() -> None:
+    async def run() -> tuple[FakeSandbox, MicrosandboxRunner]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "retry-stop",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        sandbox = runner._sandbox
+        sandbox.fail_next_stop = True
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await runner.close()
+        await runner.close()
+        return sandbox, runner
+
+    sandbox, runner = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 2
+    assert FakeSandboxApi.removed == ["retry-stop"]
+    assert runner._closed is True
+
+
+def test_microsandbox_runner_close_recovers_after_lost_stop_acknowledgement() -> None:
+    async def run() -> tuple[FakeSandbox, MicrosandboxRunner]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "lost-stop-acknowledgement",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        sandbox = runner._sandbox
+        sandbox.fail_next_stop = True
+        sandbox.fail_repeated_stop = True
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await runner.close()
+        await runner.close()
+        return sandbox, runner
+
+    sandbox, runner = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 2
+    assert FakeSandboxApi.removed == ["lost-stop-acknowledgement"]
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["status"] == "removed"
+    assert runner.last_cleanup_diagnostic["observed_statuses"] == ["stopped"]
+    assert runner._closed is True
+
+
+def test_microsandbox_runner_stop_accepts_already_stopped_sandbox() -> None:
+    async def run() -> tuple[FakeSandbox, MicrosandboxRunner]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "already-stopped",
+            close_action="stop",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        sandbox = runner._sandbox
+        sandbox.already_stopped = True
+        await runner.close()
+        return sandbox, runner
+
+    sandbox, runner = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.removed == []
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["status"] == "stopped"
+    assert runner.last_cleanup_diagnostic["observed_statuses"] == ["stopped"]
+    assert runner._closed is True
+
+
+def test_microsandbox_runner_stop_does_not_accept_missing_sandbox() -> None:
+    async def run() -> tuple[MicrosandboxRunner, FakeSandboxNotFoundError]:
+        reset_fake_module()
+        runner = await MicrosandboxRunner.create(
+            "missing-before-stop-only",
+            close_action="stop",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        runner._sandbox.stop_failure = FakeSandboxNotFoundError("sandbox not found")
+        with pytest.raises(FakeSandboxNotFoundError, match="sandbox not found") as exc_info:
+            await runner.close()
+        return runner, exc_info.value
+
+    runner, error = asyncio.run(run())
+
+    assert runner.last_cleanup_diagnostic is not None
+    assert runner.last_cleanup_diagnostic["action"] == "stop"
+    assert runner.last_cleanup_diagnostic["status"] == "failed"
+    assert cleanup_diagnostic(error) == runner.last_cleanup_diagnostic
+    assert runner._closed is False
 
 
 def test_microsandbox_runner_from_existing_does_not_own_lifecycle_by_default() -> None:
@@ -638,6 +1307,28 @@ def test_microsandbox_runner_from_existing_does_not_own_lifecycle_by_default() -
     assert sandbox.stop_calls == 0
     assert sandbox.stop_and_wait_calls == 0
     assert FakeSandboxApi.removed == []
+
+
+def test_microsandbox_runner_from_existing_can_remove_with_bounded_retry() -> None:
+    async def run() -> dict[str, Any] | None:
+        reset_fake_module()
+        FakeSandboxApi.existing = FakeSandbox("existing-remove")
+        FakeSandboxApi.remove_failures = [
+            FakeSandboxStillRunningError("sandbox status has not settled")
+        ]
+        runner = await MicrosandboxRunner.from_existing(
+            "existing-remove",
+            close_action="remove",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        await runner.close()
+        return runner.last_cleanup_diagnostic
+
+    diagnostic = asyncio.run(run())
+
+    assert FakeSandboxApi.remove_calls == ["existing-remove", "existing-remove"]
+    assert diagnostic is not None
+    assert diagnostic["status"] == "removed"
 
 
 def test_microsandbox_runner_kills_command_on_cancellation_by_default() -> None:

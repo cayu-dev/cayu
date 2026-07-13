@@ -39,7 +39,9 @@ from cayu.runners.local import LocalRunner
 from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_CWD,
     DEFAULT_MICROSANDBOX_IMAGE,
+    DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
     MICROSANDBOX_NAME_MAX_BYTES,
+    MicrosandboxCleanupError,
     MicrosandboxCloseAction,
     MicrosandboxRunner,
 )
@@ -57,6 +59,7 @@ __all__ = [
     "DEFAULT_LAMBDA_MICROVM_CWD",
     "DEFAULT_MICROSANDBOX_CWD",
     "DEFAULT_MICROSANDBOX_IMAGE",
+    "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",
     "DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY",
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
     "DEFAULT_SBX_CWD",
@@ -76,6 +79,7 @@ __all__ = [
     "LambdaMicroVMProtocolError",
     "LambdaMicroVMRunner",
     "LocalRunner",
+    "MicrosandboxCleanupError",
     "MicrosandboxCloseAction",
     "MicrosandboxRunner",
     "Runner",

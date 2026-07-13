@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import importlib
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from math import isfinite
 from types import ModuleType
 from typing import Any, Literal
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -34,9 +35,29 @@ from cayu.runners.base import (
 
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
 DEFAULT_MICROSANDBOX_CWD = "/workspace"
+DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS = 5.0
 MICROSANDBOX_NAME_MAX_BYTES = 128
+_MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS = 0.05
+_MICROSANDBOX_REMOVE_MAX_BACKOFF_SECONDS = 0.5
+_MICROSANDBOX_CLEANUP_DIAGNOSTIC_TYPE = "cayu.microsandbox_cleanup.v1"
 
 MicrosandboxCloseAction = Literal["remove", "stop", "detach", "none"]
+
+
+class MicrosandboxCleanupError(RuntimeError):
+    """Terminal bounded Microsandbox lifecycle cleanup failure."""
+
+    def __init__(self, message: str, *, diagnostic: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostic = copy_json_value(diagnostic, "diagnostic")
+
+
+class _MicrosandboxDeadlineExceeded(TimeoutError):
+    pass
+
+
+class _MicrosandboxCleanupExceptionGroup(BaseExceptionGroup):
+    pass
 
 
 class MicrosandboxRunner(Runner):
@@ -58,6 +79,7 @@ class MicrosandboxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
     ) -> None:
@@ -71,12 +93,16 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.remove_timeout_s = _validate_remove_timeout(remove_timeout_s)
         self.env_overlay = dict(env_overlay) if env_overlay else {}
         self._sandbox = sandbox
         self._sandbox_module = sandbox_module
         self._sftp_client: Any = None
         self._sftp: Any = None
         self._sftp_lock = asyncio.Lock()
+        self._last_cleanup_diagnostic: dict[str, Any] | None = None
+        self._remove_stop_completed = False
+        self._remove_stop_status: str | None = None
 
     @classmethod
     async def create(
@@ -89,6 +115,7 @@ class MicrosandboxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
         ensure_default_cwd: bool = True,
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
@@ -109,6 +136,7 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        removal_timeout = _validate_remove_timeout(remove_timeout_s)
         if type(ensure_default_cwd) is not bool:
             raise TypeError("MicrosandboxRunner ensure_default_cwd must be a bool.")
         sandbox = await module.Sandbox.create(
@@ -126,6 +154,7 @@ class MicrosandboxRunner(Runner):
                 sandbox_name,
                 exc,
                 "Microsandbox setup was cancelled and cleanup failed.",
+                remove_timeout_s=removal_timeout,
             )
             raise
         except Exception as exc:
@@ -135,6 +164,7 @@ class MicrosandboxRunner(Runner):
                 sandbox_name,
                 exc,
                 "Microsandbox setup failed and cleanup failed.",
+                remove_timeout_s=removal_timeout,
             )
             raise
         return cls(
@@ -145,6 +175,7 @@ class MicrosandboxRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            remove_timeout_s=removal_timeout,
             env_overlay=env_overlay,
             sandbox_module=module,
         )
@@ -159,6 +190,7 @@ class MicrosandboxRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
     ) -> MicrosandboxRunner:
@@ -172,6 +204,7 @@ class MicrosandboxRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        removal_timeout = _validate_remove_timeout(remove_timeout_s)
         handle = await module.Sandbox.get(sandbox_name)
         sandbox = await handle.connect()
         return cls(
@@ -182,6 +215,7 @@ class MicrosandboxRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
+            remove_timeout_s=removal_timeout,
             env_overlay=env_overlay,
             sandbox_module=module,
         )
@@ -193,22 +227,116 @@ class MicrosandboxRunner(Runner):
             return
         await self._close_sftp_session()
         if self.close_action == "none":
+            self._last_cleanup_diagnostic = _microsandbox_cleanup_diagnostic(
+                sandbox_name=self.name,
+                action="none",
+                status="skipped",
+                timeout_s=self.remove_timeout_s,
+            )
             self._closed = True
             return
         if self.close_action == "detach":
             detach = getattr(self._sandbox, "detach", None)
-            if detach is not None:
-                await detach()
+            try:
+                if detach is not None:
+                    await detach()
+            except Exception as exc:
+                self._record_failed_cleanup(action="detach", error=exc)
+                raise
+            self._last_cleanup_diagnostic = _microsandbox_cleanup_diagnostic(
+                sandbox_name=self.name,
+                action="detach",
+                status="detached",
+                timeout_s=self.remove_timeout_s,
+            )
             self._closed = True
             return
         if self.close_action in {"stop", "remove"}:
-            await _stop_sandbox(self._sandbox)
+            module = _microsandbox_module(self._sandbox_module)
+            if self.close_action == "remove" and self._remove_stop_completed:
+                stop_status = self._remove_stop_status
+            else:
+                try:
+                    stop_status, already_removed = await _stop_sandbox(
+                        module,
+                        self._sandbox,
+                        not_found_is_removed=self.close_action == "remove",
+                    )
+                except Exception as exc:
+                    self._record_failed_cleanup(action="stop", error=exc)
+                    raise
+                if already_removed:
+                    self._last_cleanup_diagnostic = _microsandbox_cleanup_diagnostic(
+                        sandbox_name=self.name,
+                        action="remove",
+                        status="removed",
+                        timeout_s=self.remove_timeout_s,
+                        attempts=[
+                            {
+                                "attempt": 1,
+                                "status": "already_removed",
+                                "operation": "stop",
+                            }
+                        ],
+                    )
+                    self._closed = True
+                    return
+                if self.close_action == "remove":
+                    self._remove_stop_completed = True
+                    self._remove_stop_status = stop_status
             if self.close_action == "remove":
-                module = _microsandbox_module(self._sandbox_module)
-                await module.Sandbox.remove(self.name)
+                self._last_cleanup_diagnostic = None
+                try:
+                    self._last_cleanup_diagnostic = await _remove_stopped_sandbox(
+                        module,
+                        self.name,
+                        timeout_s=self.remove_timeout_s,
+                        initial_status=stop_status,
+                        record_diagnostic=self._set_last_cleanup_diagnostic,
+                    )
+                except MicrosandboxCleanupError as exc:
+                    self._last_cleanup_diagnostic = copy_json_value(exc.diagnostic, "diagnostic")
+                    raise
+                except Exception as exc:
+                    if self._last_cleanup_diagnostic is None:
+                        self._record_failed_cleanup(action="remove", error=exc)
+                    raise
+            else:
+                self._last_cleanup_diagnostic = _microsandbox_cleanup_diagnostic(
+                    sandbox_name=self.name,
+                    action="stop",
+                    status="stopped",
+                    timeout_s=self.remove_timeout_s,
+                    observed_statuses=[] if stop_status is None else [stop_status],
+                )
             self._closed = True
             return
         raise AssertionError(f"Unsupported Microsandbox close action: {self.close_action}")
+
+    @property
+    def last_cleanup_diagnostic(self) -> dict[str, Any] | None:
+        """Return the latest lifecycle cleanup diagnostic, if close was attempted."""
+
+        if self._last_cleanup_diagnostic is None:
+            return None
+        return copy_json_value(self._last_cleanup_diagnostic, "last_cleanup_diagnostic")
+
+    def _record_failed_cleanup(self, *, action: str, error: Exception) -> None:
+        diagnostic = _microsandbox_cleanup_diagnostic(
+            sandbox_name=self.name,
+            action=action,
+            status="failed",
+            timeout_s=self.remove_timeout_s,
+            error=error,
+        )
+        _attach_microsandbox_cleanup_diagnostic(error, diagnostic)
+        self._set_last_cleanup_diagnostic(diagnostic)
+
+    def _set_last_cleanup_diagnostic(self, diagnostic: dict[str, Any]) -> None:
+        self._last_cleanup_diagnostic = copy_json_value(
+            diagnostic,
+            "diagnostic",
+        )
 
     def filesystem(self) -> Any:
         """Return the native Microsandbox filesystem API for workspace adapters."""
@@ -489,6 +617,16 @@ def _validate_close_action(action: MicrosandboxCloseAction) -> MicrosandboxClose
     return action
 
 
+def _validate_remove_timeout(value: float) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError("MicrosandboxRunner remove_timeout_s must be numeric.")
+    if not isfinite(value):
+        raise ValueError("MicrosandboxRunner remove_timeout_s must be finite.")
+    if value <= 0:
+        raise ValueError("MicrosandboxRunner remove_timeout_s must be greater than zero.")
+    return float(value)
+
+
 def _event_bytes(data: Any) -> bytes:
     if type(data) is bytes:
         return data
@@ -554,19 +692,411 @@ def _is_timeout_error(exc: Exception) -> bool:
     return isinstance(exc, TimeoutError) or exc.__class__.__name__ == "ExecTimeoutError"
 
 
-async def _cleanup_created_sandbox(module: ModuleType | Any, sandbox: Any, name: str) -> None:
+async def _cleanup_created_sandbox(
+    module: ModuleType | Any,
+    sandbox: Any,
+    name: str,
+    *,
+    remove_timeout_s: float,
+) -> None:
+    stop_status: str | None = None
+    already_removed = False
+    stop_error: BaseException | None = None
+    removal_error: BaseException | None = None
     try:
-        await _stop_sandbox(sandbox)
-    finally:
-        await module.Sandbox.remove(name)
+        stop_status, already_removed = await _stop_sandbox(
+            module,
+            sandbox,
+            not_found_is_removed=True,
+        )
+    except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
+        stop_error = exc
+        _attach_microsandbox_cleanup_diagnostic(
+            exc,
+            _microsandbox_cleanup_diagnostic(
+                sandbox_name=name,
+                action="stop",
+                status="failed",
+                timeout_s=remove_timeout_s,
+                error=exc,
+            ),
+        )
+
+    if not already_removed:
+        try:
+            await _remove_stopped_sandbox(
+                module,
+                name,
+                timeout_s=remove_timeout_s,
+                initial_status=stop_status,
+            )
+        except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
+            removal_error = exc
+            if "diagnostic" not in exc.__dict__:
+                _attach_microsandbox_cleanup_diagnostic(
+                    exc,
+                    _microsandbox_cleanup_diagnostic(
+                        sandbox_name=name,
+                        action="remove",
+                        status="failed",
+                        timeout_s=remove_timeout_s,
+                        error=exc,
+                    ),
+                )
+
+    cleanup_errors = [error for error in (stop_error, removal_error) if error is not None]
+    if len(cleanup_errors) == 1:
+        raise cleanup_errors[0]
+    if cleanup_errors:
+        raise _MicrosandboxCleanupExceptionGroup(
+            "Microsandbox stop and removal cleanup both failed.",
+            cleanup_errors,
+        )
 
 
-async def _stop_sandbox(sandbox: Any) -> None:
-    stop_and_wait = getattr(sandbox, "stop_and_wait", None)
-    if stop_and_wait is not None:
-        await stop_and_wait()
-        return
-    await sandbox.stop()
+async def _stop_sandbox(
+    module: ModuleType | Any,
+    sandbox: Any,
+    *,
+    not_found_is_removed: bool,
+) -> tuple[str | None, bool]:
+    try:
+        stop_and_wait = getattr(sandbox, "stop_and_wait", None)
+        if stop_and_wait is not None:
+            result = await stop_and_wait()
+            return _sandbox_status_value(result), False
+        await sandbox.stop()
+        wait_until_stopped = getattr(sandbox, "wait_until_stopped", None)
+        if wait_until_stopped is None:
+            return None, False
+        result = await wait_until_stopped()
+        return _sandbox_status_value(result), False
+    except Exception as exc:
+        if _is_microsandbox_error(module, exc, "SandboxNotRunningError"):
+            return "stopped", False
+        if not_found_is_removed and _is_microsandbox_error(module, exc, "SandboxNotFoundError"):
+            return None, True
+        raise
+
+
+async def _remove_stopped_sandbox(
+    module: ModuleType | Any,
+    name: str,
+    *,
+    timeout_s: float,
+    initial_status: str | None,
+    record_diagnostic: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    backoff_s = _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS
+    attempts: list[dict[str, Any]] = []
+    observed_statuses = [] if initial_status is None else [initial_status]
+
+    while True:
+        attempt = len(attempts) + 1
+        try:
+            await _await_before_microsandbox_deadline(
+                module.Sandbox.remove(name),
+                deadline=deadline,
+            )
+        except asyncio.CancelledError as exc:
+            attempts.append({"attempt": attempt, "status": "cancelled", "operation": "remove"})
+            _record_microsandbox_removal_failure(
+                name=name,
+                timeout_s=timeout_s,
+                attempts=attempts,
+                observed_statuses=observed_statuses,
+                error=exc,
+                record_diagnostic=record_diagnostic,
+            )
+            raise
+        except _MicrosandboxDeadlineExceeded as exc:
+            attempts.append({"attempt": attempt, "status": "timed_out", "operation": "remove"})
+            raise _microsandbox_removal_timeout(
+                name=name,
+                timeout_s=timeout_s,
+                attempts=attempts,
+                observed_statuses=observed_statuses,
+                error=exc,
+                record_diagnostic=record_diagnostic,
+            ) from exc
+        except Exception as exc:
+            if _is_microsandbox_error(module, exc, "SandboxNotFoundError"):
+                attempts.append({"attempt": attempt, "status": "already_removed"})
+                return _microsandbox_cleanup_diagnostic(
+                    sandbox_name=name,
+                    action="remove",
+                    status="removed",
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                )
+            if not _is_microsandbox_error(module, exc, "SandboxStillRunningError"):
+                attempts.append({"attempt": attempt, "status": "failed", "operation": "remove"})
+                _record_microsandbox_removal_failure(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=exc,
+                    record_diagnostic=record_diagnostic,
+                )
+                raise
+
+            try:
+                sandbox_status = await _refreshed_sandbox_status(
+                    module,
+                    name,
+                    deadline=deadline,
+                )
+            except asyncio.CancelledError as status_exc:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": "cancelled",
+                        "operation": "status_refresh",
+                    }
+                )
+                _record_microsandbox_removal_failure(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=status_exc,
+                    record_diagnostic=record_diagnostic,
+                )
+                raise
+            except _MicrosandboxDeadlineExceeded as status_exc:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": "timed_out",
+                        "operation": "status_refresh",
+                    }
+                )
+                raise _microsandbox_removal_timeout(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=status_exc,
+                    record_diagnostic=record_diagnostic,
+                ) from status_exc
+            except Exception as status_exc:
+                if _is_microsandbox_error(module, status_exc, "SandboxNotFoundError"):
+                    attempts.append({"attempt": attempt, "status": "already_removed"})
+                    return _microsandbox_cleanup_diagnostic(
+                        sandbox_name=name,
+                        action="remove",
+                        status="removed",
+                        timeout_s=timeout_s,
+                        attempts=attempts,
+                        observed_statuses=observed_statuses,
+                    )
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": "failed",
+                        "operation": "status_refresh",
+                    }
+                )
+                _record_microsandbox_removal_failure(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=status_exc,
+                    record_diagnostic=record_diagnostic,
+                )
+                raise
+            if sandbox_status is not None:
+                observed_statuses.append(sandbox_status)
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "status": "deferred",
+                    "sandbox_status": sandbox_status,
+                }
+            )
+
+            remaining_s = deadline - loop.time()
+            if remaining_s <= 0:
+                raise _microsandbox_removal_timeout(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=exc,
+                    record_diagnostic=record_diagnostic,
+                ) from exc
+            try:
+                await _sleep_before_microsandbox_retry(min(backoff_s, remaining_s))
+            except asyncio.CancelledError as sleep_exc:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": "cancelled",
+                        "operation": "backoff",
+                    }
+                )
+                _record_microsandbox_removal_failure(
+                    name=name,
+                    timeout_s=timeout_s,
+                    attempts=attempts,
+                    observed_statuses=observed_statuses,
+                    error=sleep_exc,
+                    record_diagnostic=record_diagnostic,
+                )
+                raise
+            backoff_s = min(
+                backoff_s * 2,
+                _MICROSANDBOX_REMOVE_MAX_BACKOFF_SECONDS,
+            )
+            continue
+
+        attempts.append({"attempt": attempt, "status": "removed"})
+        return _microsandbox_cleanup_diagnostic(
+            sandbox_name=name,
+            action="remove",
+            status="removed",
+            timeout_s=timeout_s,
+            attempts=attempts,
+            observed_statuses=observed_statuses,
+        )
+
+
+async def _refreshed_sandbox_status(
+    module: ModuleType | Any,
+    name: str,
+    *,
+    deadline: float,
+) -> str | None:
+    handle = await _await_before_microsandbox_deadline(
+        module.Sandbox.get(name),
+        deadline=deadline,
+    )
+    refresh = getattr(handle, "refresh", None)
+    if refresh is not None:
+        refreshed = await _await_before_microsandbox_deadline(
+            refresh(),
+            deadline=deadline,
+        )
+        if refreshed is not None:
+            handle = refreshed
+    return _sandbox_status_value(handle)
+
+
+async def _sleep_before_microsandbox_retry(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+
+
+async def _await_before_microsandbox_deadline(awaitable: Any, *, deadline: float) -> Any:
+    timeout = asyncio.timeout_at(deadline)
+    try:
+        async with timeout:
+            return await awaitable
+    except TimeoutError as exc:
+        if timeout.expired():
+            raise _MicrosandboxDeadlineExceeded from exc
+        raise
+
+
+def _record_microsandbox_removal_failure(
+    *,
+    name: str,
+    timeout_s: float,
+    attempts: list[dict[str, Any]],
+    observed_statuses: list[str],
+    error: BaseException,
+    record_diagnostic: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    diagnostic = _microsandbox_cleanup_diagnostic(
+        sandbox_name=name,
+        action="remove",
+        status="failed",
+        timeout_s=timeout_s,
+        attempts=attempts,
+        observed_statuses=observed_statuses,
+        error=error,
+    )
+    _attach_microsandbox_cleanup_diagnostic(error, diagnostic)
+    if record_diagnostic is not None:
+        record_diagnostic(diagnostic)
+    return diagnostic
+
+
+def _microsandbox_removal_timeout(
+    *,
+    name: str,
+    timeout_s: float,
+    attempts: list[dict[str, Any]],
+    observed_statuses: list[str],
+    error: Exception,
+    record_diagnostic: Callable[[dict[str, Any]], None] | None,
+) -> MicrosandboxCleanupError:
+    diagnostic = _microsandbox_cleanup_diagnostic(
+        sandbox_name=name,
+        action="remove",
+        status="timed_out",
+        timeout_s=timeout_s,
+        attempts=attempts,
+        observed_statuses=observed_statuses,
+        error=error,
+    )
+    if record_diagnostic is not None:
+        record_diagnostic(diagnostic)
+    return MicrosandboxCleanupError(
+        f"Microsandbox {name!r} removal did not settle within {timeout_s:g} seconds.",
+        diagnostic=diagnostic,
+    )
+
+
+def _sandbox_status_value(value: Any) -> str | None:
+    status = getattr(value, "status", None)
+    if callable(status):
+        status = status()
+    if type(status) is str and status:
+        return status
+    return None
+
+
+def _is_microsandbox_error(module: ModuleType | Any, exc: Exception, name: str) -> bool:
+    error_type = getattr(module, name, None)
+    return isinstance(error_type, type) and isinstance(exc, error_type)
+
+
+def _microsandbox_cleanup_diagnostic(
+    *,
+    sandbox_name: str,
+    action: str,
+    status: str,
+    timeout_s: float,
+    attempts: list[dict[str, Any]] | None = None,
+    observed_statuses: list[str] | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {
+        "type": _MICROSANDBOX_CLEANUP_DIAGNOSTIC_TYPE,
+        "adapter": "microsandbox",
+        "sandbox_name": sandbox_name,
+        "action": action,
+        "status": status,
+        "timeout_s": timeout_s,
+        "attempts": [] if attempts is None else attempts,
+        "observed_statuses": [] if observed_statuses is None else observed_statuses,
+    }
+    if error is not None:
+        diagnostic["error_type"] = type(error).__name__
+        diagnostic["error"] = str(error)
+    return copy_json_value(diagnostic, "diagnostic")
+
+
+def _attach_microsandbox_cleanup_diagnostic(
+    error: BaseException,
+    diagnostic: dict[str, Any],
+) -> None:
+    error.__dict__["diagnostic"] = copy_json_value(diagnostic, "diagnostic")
 
 
 async def _cleanup_created_sandbox_after_failure(
@@ -575,8 +1105,20 @@ async def _cleanup_created_sandbox_after_failure(
     name: str,
     original_error: BaseException,
     message: str,
+    *,
+    remove_timeout_s: float,
 ) -> None:
     try:
-        await _cleanup_created_sandbox(module, sandbox, name)
-    except Exception as cleanup_error:
+        await _cleanup_created_sandbox(
+            module,
+            sandbox,
+            name,
+            remove_timeout_s=remove_timeout_s,
+        )
+    except _MicrosandboxCleanupExceptionGroup as cleanup_group:
+        raise BaseExceptionGroup(
+            message,
+            [original_error, *cleanup_group.exceptions],
+        ) from cleanup_group
+    except (BaseExceptionGroup, Exception, asyncio.CancelledError) as cleanup_error:
         raise BaseExceptionGroup(message, [original_error, cleanup_error]) from cleanup_error
