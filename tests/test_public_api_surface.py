@@ -21,11 +21,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", re.DOTALL)
 
 # The session vocabulary the README's crash-recovery snippet depends on, plus
-# the four runtime base ABCs a builder subclasses to extend the framework.
+# the runtime and workspace capability ABCs builders subclass to extend Cayu.
 REQUIRED_TOP_LEVEL_EXPORTS = (
+    "BoundedTarReader",
     "Session",
     "SessionStatus",
     "SessionStore",
+    "TarWriter",
     "InMemorySessionStore",
     "SessionStatusConflict",
     "ModelProvider",

@@ -3,10 +3,11 @@ from __future__ import annotations
 import posixpath
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
-from cayu._validation import require_nonblank
+from cayu._validation import require_clean_nonblank, require_nonblank
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,16 @@ class Workspace(ABC):
         """Read a file from the workspace."""
 
     @abstractmethod
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        """Resolve a hard read ceiling without loosening backend defaults.
+
+        Return a positive integer no greater than ``max_bytes``. Backends with
+        their own finite default read limit must return the smaller value;
+        backends without one return ``max_bytes``. Callers use this before
+        ``read_bytes`` when a safety bound must compose with backend policy.
+        """
+
+    @abstractmethod
     async def write_bytes(self, path: str, content: bytes) -> None:
         """Write a file into the workspace."""
 
@@ -207,6 +218,62 @@ class Workspace(ABC):
         ``Workspace`` to return a stable identity token and enable that safety check.
         """
         return None
+
+
+class BoundedTarReader(ABC):
+    """Nominal capability for preflight-bounded bulk tar reads.
+
+    Implementations must validate the requested files' combined logical size
+    and the conservative raw archive size before allocating or materializing
+    the archive. Merely accepting the limit keywords or rejecting after
+    construction does not satisfy this contract.
+    """
+
+    @abstractmethod
+    async def read_tar_bytes(
+        self,
+        paths: Sequence[str],
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> bytes:
+        """Return an uncompressed tar after preflighting every configured limit."""
+
+
+class TarWriter(ABC):
+    """Nominal capability for writing a caller-validated bulk tar archive."""
+
+    @abstractmethod
+    async def write_tar_bytes(self, data: bytes) -> None:
+        """Extract caller-validated uncompressed tar data into this workspace."""
+
+
+def _validate_absolute_guest_root(path: str, *, owner: str) -> str:
+    root = require_clean_nonblank(path, "root")
+    if not posixpath.isabs(root):
+        raise ValueError(f"{owner} root must be an absolute guest path.")
+    return posixpath.normpath(root)
+
+
+def _validate_workspace_relative_path(path: str) -> str:
+    value = require_nonblank(path, "path")
+    if posixpath.isabs(value):
+        raise ValueError("Workspace paths must be relative.")
+    normalized = posixpath.normpath(value)
+    if normalized in {"", "."}:
+        raise ValueError("Workspace paths must reference a file.")
+    if normalized == ".." or normalized.startswith("../"):
+        raise ValueError("Workspace path escapes the workspace root.")
+    return normalized
+
+
+def _validate_workspace_positive_limit(value: int, field_name: str, *, owner: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{owner} {field_name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{owner} {field_name} must be greater than zero.")
+    return value
 
 
 def _local_resource_key(path: object) -> tuple[object, ...]:

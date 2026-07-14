@@ -468,6 +468,32 @@ class PendingToolApproval(BaseModel):
         return copy_retry_policy(value)
 
 
+def _copy_approval_resume_fields(
+    request: ToolApprovalRequest | ToolApprovalRecoveryRequest,
+) -> dict[str, Any]:
+    """Copy the run configuration shared by both approval continuation requests."""
+
+    return {
+        "reason": request.reason,
+        "metadata": copy_json_value(request.metadata, "metadata"),
+        "resolved_by": copy_resolution_actor(request.resolved_by),
+        "max_steps": request.max_steps,
+        "limits": copy_run_limits(request.limits) if request.limits is not None else None,
+        "budget_limits": (
+            copy_request_budget_limits(request.budget_limits)
+            if request.budget_limits is not None
+            else None
+        ),
+        "retry_policy": (copy_retry_policy(request.retry_policy) if request.retry_policy else None),
+        "structured_output": copy_structured_output_spec(request.structured_output),
+        "thinking": request.thinking,
+        "loop_policies": validate_loop_policies(
+            request.loop_policies,
+            field_name="loop_policies",
+        ),
+    }
+
+
 def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequest:
     if type(request) is not ToolApprovalRequest:
         raise TypeError("Tool approval resolution requires a ToolApprovalRequest.")
@@ -475,20 +501,7 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
         session_id=request.session_id,
         approval_id=request.approval_id,
         decision=request.decision,
-        reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
-        resolved_by=copy_resolution_actor(request.resolved_by),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits) if request.limits is not None else None,
-        budget_limits=(
-            copy_request_budget_limits(request.budget_limits)
-            if request.budget_limits is not None
-            else None
-        ),
-        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
-        structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
-        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
+        **_copy_approval_resume_fields(request),
     )
 
 
@@ -505,20 +518,7 @@ def copy_tool_approval_recovery_request(
         message=request.message,
         structured=copy_json_value(request.structured, "structured"),
         artifacts=copy_json_value(request.artifacts, "artifacts"),
-        reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
-        resolved_by=copy_resolution_actor(request.resolved_by),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits) if request.limits is not None else None,
-        budget_limits=(
-            copy_request_budget_limits(request.budget_limits)
-            if request.budget_limits is not None
-            else None
-        ),
-        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
-        structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
-        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
+        **_copy_approval_resume_fields(request),
     )
 
 

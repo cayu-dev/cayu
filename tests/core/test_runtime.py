@@ -634,6 +634,9 @@ class MemoryWorkspace(Workspace):
     def __init__(self, workspace_id: str) -> None:
         self.id = workspace_id
 
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        return max_bytes
+
     async def read_bytes(
         self,
         path: str,

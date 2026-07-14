@@ -38,6 +38,12 @@ class LocalWorkspace(Workspace):
     def resource_key(self) -> tuple[object, ...]:
         return _local_resource_key(self.root)
 
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        validated = _validate_limit(max_bytes, "max_bytes")
+        if validated is None:
+            raise TypeError("Workspace max_bytes must be an integer.")
+        return validated
+
     async def read_bytes(
         self,
         path: str,

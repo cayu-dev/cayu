@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -23,20 +25,26 @@ from cayu.environments import (
     copy_bound_workspace,
     copy_workspace_snapshot,
 )
-from cayu.environments.bindings import _reset_workspace_after_failed_clone
+from cayu.environments.bindings import _reset_workspace_after_failed_clone, _validate_sync_tar
 from cayu.runners import E2BRunner, ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.workspaces import (
+    BoundedTarReader,
     E2BWorkspace,
     LocalWorkspace,
     RunnerWorkspace,
+    TarWriter,
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
 )
+from cayu.workspaces._tar import tar_archive_size_bound
 
 
 class StubWorkspace(Workspace):
     id = "stub-workspace"
+
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        return max_bytes
 
     async def read_bytes(
         self,
@@ -1178,6 +1186,69 @@ def test_sync_binding_rejects_truncated_file_copy(tmp_path) -> None:
         asyncio.run(run())
 
 
+def test_sync_binding_enforces_total_bytes_and_accepts_exact_boundary(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    exact_target_root = tmp_path / "exact-target"
+    oversized_target_root = tmp_path / "oversized-target"
+    source_root.mkdir()
+    exact_target_root.mkdir()
+    oversized_target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"abc")
+    (source_root / "b.txt").write_bytes(b"def")
+    (source_root / "empty.txt").write_bytes(b"")
+    source = LocalWorkspace(source_root, workspace_id="source")
+
+    async def run() -> BoundWorkspace:
+        exact_target = LocalWorkspace(exact_target_root, workspace_id="exact-target")
+        bound = await SyncBinding(
+            target_workspace=exact_target,
+            max_total_bytes=6,
+        ).bind(source, None, session_id="sess_sync_total_exact")
+        oversized_target = LocalWorkspace(
+            oversized_target_root,
+            workspace_id="oversized-target",
+        )
+        with pytest.raises(RuntimeError, match="files exceed max_total_bytes=5"):
+            await SyncBinding(
+                target_workspace=oversized_target,
+                max_total_bytes=5,
+            ).bind(source, None, session_id="sess_sync_total_oversized")
+        return bound
+
+    bound = asyncio.run(run())
+
+    assert (exact_target_root / "a.txt").read_bytes() == b"abc"
+    assert (exact_target_root / "b.txt").read_bytes() == b"def"
+    assert (exact_target_root / "empty.txt").read_bytes() == b""
+    assert bound.metadata["sync_binding"]["max_total_bytes"] == 6
+    assert bound.metadata["sync_binding"]["max_archive_bytes"] == 128 * 1024 * 1024
+    assert bound.metadata["sync_binding"]["copied_bytes"] == 6
+
+
+def test_sync_binding_enforces_total_bytes_when_syncing_back(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"a")
+    (source_root / "b.txt").write_bytes(b"b")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target, max_total_bytes=5)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_sync_back_total")
+        await target.write_bytes("a.txt", b"abc")
+        await target.write_bytes("b.txt", b"def")
+        with pytest.raises(RuntimeError, match="files exceed max_total_bytes=5"):
+            await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert (source_root / "a.txt").read_bytes() == b"a"
+    assert (source_root / "b.txt").read_bytes() == b"b"
+
+
 class _CountingLocalRunner(LocalRunner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1186,6 +1257,208 @@ class _CountingLocalRunner(LocalRunner):
     async def exec(self, *args: Any, **kwargs: Any) -> ExecResult:
         self.exec_calls += 1
         return await super().exec(*args, **kwargs)
+
+
+class _UnofficialBulkLocalWorkspace(LocalWorkspace):
+    """Workspace with tar-shaped methods but without the explicit contract."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_read_calls = 0
+        self.bulk_write_calls = 0
+
+    async def read_tar_bytes(
+        self,
+        paths: tuple[str, ...],
+        **_kwargs: Any,
+    ) -> bytes:
+        self.bulk_read_calls += 1
+        raise AssertionError("unofficial bulk read must not be called")
+
+    async def write_tar_bytes(self, data: bytes) -> None:
+        self.bulk_write_calls += 1
+        raise AssertionError("unofficial bulk write must not be called")
+
+
+class _ReaderOnlyBulkLocalWorkspace(LocalWorkspace, BoundedTarReader):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_read_calls = 0
+
+    async def read_tar_bytes(
+        self,
+        paths: tuple[str, ...],
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> bytes:
+        self.bulk_read_calls += 1
+        files: list[tuple[str, int]] = []
+        total_bytes = 0
+        for path in paths:
+            size = (self.root / path).stat().st_size
+            if max_file_bytes is not None and size > max_file_bytes:
+                raise RuntimeError(f"file exceeds max_file_bytes: {path}")
+            total_bytes += size
+            if max_total_bytes is not None and total_bytes > max_total_bytes:
+                raise RuntimeError("files exceed max_total_bytes")
+            files.append((path, size))
+        archive_bound = tar_archive_size_bound(total_bytes, paths)
+        if max_archive_bytes is not None and archive_bound > max_archive_bytes:
+            raise RuntimeError("tar exceeds max_archive_bytes")
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            for path, size in files:
+                content = (self.root / path).read_bytes()
+                info = tarfile.TarInfo(name=path)
+                info.size = size
+                archive.addfile(info, io.BytesIO(content))
+        data = buffer.getvalue()
+        if max_archive_bytes is not None and len(data) > max_archive_bytes:
+            raise RuntimeError("tar exceeds max_archive_bytes")
+        return data
+
+
+class _WriterOnlyBulkLocalWorkspace(LocalWorkspace, TarWriter):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.bulk_write_calls = 0
+
+    async def write_tar_bytes(self, data: bytes) -> None:
+        self.bulk_write_calls += 1
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+            for member in archive.getmembers():
+                extracted = archive.extractfile(member)
+                assert extracted is not None
+                await self.write_bytes(member.name, extracted.read())
+
+
+def test_sync_binding_ignores_unofficial_bulk_methods(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"abc")
+    source = _UnofficialBulkLocalWorkspace(source_root, workspace_id="source")
+    target = _UnofficialBulkLocalWorkspace(
+        target_root,
+        workspace_id="target",
+    )
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target, max_total_bytes=None).bind(
+            source,
+            None,
+            session_id="sess_unofficial_bulk",
+        )
+
+    asyncio.run(run())
+
+    assert source.bulk_read_calls == 0
+    assert target.bulk_write_calls == 0
+    assert (target_root / "a.txt").read_bytes() == b"abc"
+
+
+def test_sync_binding_supports_independent_nominal_bulk_capabilities(tmp_path) -> None:
+    reader_root = tmp_path / "reader"
+    plain_target_root = tmp_path / "plain-target"
+    plain_source_root = tmp_path / "plain-source"
+    writer_root = tmp_path / "writer"
+    for root in (reader_root, plain_target_root, plain_source_root, writer_root):
+        root.mkdir()
+    (reader_root / "a.txt").write_bytes(b"reader")
+    (plain_source_root / "b.txt").write_bytes(b"writer")
+    reader = _ReaderOnlyBulkLocalWorkspace(reader_root, workspace_id="reader")
+    plain_target = LocalWorkspace(plain_target_root, workspace_id="plain-target")
+    plain_source = LocalWorkspace(plain_source_root, workspace_id="plain-source")
+    writer = _WriterOnlyBulkLocalWorkspace(writer_root, workspace_id="writer")
+
+    assert not isinstance(reader, TarWriter)
+    assert not isinstance(writer, BoundedTarReader)
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=plain_target).bind(
+            reader,
+            None,
+            session_id="sess_reader_only_bulk",
+        )
+        await SyncBinding(target_workspace=writer).bind(
+            plain_source,
+            None,
+            session_id="sess_writer_only_bulk",
+        )
+
+    asyncio.run(run())
+
+    assert reader.bulk_read_calls == 1
+    assert writer.bulk_write_calls == 1
+    assert (plain_target_root / "a.txt").read_bytes() == b"reader"
+    assert (writer_root / "b.txt").read_bytes() == b"writer"
+
+
+def test_sync_binding_rejects_raw_tar_bytes_beyond_archive_cap() -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(name="a.txt")
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b"x"))
+    bounded_tar = buffer.getvalue()
+    oversized_tar = bounded_tar + bytes(1024)
+
+    with pytest.raises(RuntimeError, match="tar exceeds max_archive_bytes"):
+        _validate_sync_tar(
+            oversized_tar,
+            ("a.txt",),
+            max_file_bytes=None,
+            max_total_bytes=1,
+            max_archive_bytes=len(bounded_tar),
+        )
+
+
+class _PolicyLimitedLocalWorkspace(LocalWorkspace):
+    """Workspace whose explicit reads can override a private default policy."""
+
+    def __init__(self, *args: Any, policy_limit: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._policy_limit = policy_limit
+
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        return min(self._policy_limit, max_bytes)
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        effective_limit = self._policy_limit if max_bytes is None else max_bytes
+        return await super().read_bytes(path, max_bytes=effective_limit)
+
+
+def test_sync_binding_total_cap_does_not_raise_workspace_read_policy(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"abc")
+    source = _PolicyLimitedLocalWorkspace(
+        source_root,
+        workspace_id="source",
+        policy_limit=2,
+    )
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    with pytest.raises(RuntimeError, match="workspace read limit"):
+        asyncio.run(
+            SyncBinding(target_workspace=target, max_total_bytes=64).bind(
+                source,
+                None,
+                session_id="sess_policy_limit",
+            )
+        )
+
+    assert not (target_root / "a.txt").exists()
 
 
 def test_sync_binding_bulk_transfers_runner_workspace_files(tmp_path) -> None:
@@ -1254,6 +1527,62 @@ def test_sync_binding_bulk_transfer_respects_max_file_bytes(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="exceeds max_file_bytes=3"):
         asyncio.run(run())
+
+
+def test_sync_binding_bulk_transfer_respects_max_total_bytes(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"abc")
+    (source_root / "b.txt").write_bytes(b"def")
+    source = RunnerWorkspace(
+        LocalRunner(source_root, inherit_env=False),
+        workspace_id="source",
+        python_executable=sys.executable,
+    )
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target, max_total_bytes=5).bind(
+            source,
+            None,
+            session_id="sess_bulk_total_limit",
+        )
+
+    with pytest.raises(RuntimeError, match="files exceed max_total_bytes=5"):
+        asyncio.run(run())
+
+    assert not (target_root / "a.txt").exists()
+    assert not (target_root / "b.txt").exists()
+
+
+def test_sync_binding_host_tar_pack_respects_max_total_bytes(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"abc")
+    (source_root / "b.txt").write_bytes(b"def")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = RunnerWorkspace(
+        LocalRunner(target_root, inherit_env=False),
+        workspace_id="target",
+        python_executable=sys.executable,
+    )
+
+    async def run() -> None:
+        await SyncBinding(target_workspace=target, max_total_bytes=5).bind(
+            source,
+            None,
+            session_id="sess_host_tar_total_limit",
+        )
+
+    with pytest.raises(RuntimeError, match="files exceed max_total_bytes=5"):
+        asyncio.run(run())
+
+    assert not (target_root / "a.txt").exists()
+    assert not (target_root / "b.txt").exists()
 
 
 def test_sync_binding_abandon_releases_state_without_syncing(tmp_path) -> None:
@@ -1529,6 +1858,11 @@ def test_binding_constructors_validate_values() -> None:
     invalid_sync_back: Any = "sometimes"
     invalid_delete_missing: Any = "yes"
 
+    assert SyncBinding().max_total_bytes == 64 * 1024 * 1024
+    assert SyncBinding(max_total_bytes=None).max_total_bytes is None
+    assert SyncBinding().max_archive_bytes == 128 * 1024 * 1024
+    assert SyncBinding(max_archive_bytes=None).max_archive_bytes is None
+
     with pytest.raises(TypeError, match="default_path"):
         NativeBinding(default_path=invalid_path)
     with pytest.raises(ValueError, match="default_path"):
@@ -1545,6 +1879,14 @@ def test_binding_constructors_validate_values() -> None:
         SyncBinding(path=" ")
     with pytest.raises(ValueError, match="max_files"):
         SyncBinding(max_files=0)
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        SyncBinding(max_total_bytes=0)
+    with pytest.raises(TypeError, match="max_total_bytes"):
+        SyncBinding(max_total_bytes=True)
+    with pytest.raises(ValueError, match="max_archive_bytes"):
+        SyncBinding(max_archive_bytes=0)
+    with pytest.raises(TypeError, match="max_archive_bytes"):
+        SyncBinding(max_archive_bytes=True)
     with pytest.raises(ValueError, match="clean_target"):
         SyncBinding(clean_target=invalid_clean_target)
     with pytest.raises(ValueError, match="sync_back"):

@@ -700,10 +700,29 @@ The minimal snippet above uses one explicit target workspace and is suitable for
 one live session. For concurrent sessions or per-session sandboxes, use
 `target_workspace_factory` or an `EnvironmentFactory` so each session gets a
 dedicated bound workspace.
-`max_file_bytes=None` means `SyncBinding` does not add its own per-file cap, but
-the workspace being read may still enforce its default read limit. Configure the
-source and target workspace read limits, or `max_file_bytes`, explicitly for
-large files.
+`max_total_bytes` defaults to 64 MiB and bounds the sum of logical file bytes in
+each copy-in or copy-back transfer. `max_archive_bytes` separately defaults to
+128 MiB and caps the complete raw tar, including headers, padding, and path
+metadata. Set smaller values for tighter memory budgets; each accepts `None` as
+an explicit opt-out. `max_file_bytes=None` means `SyncBinding` does not add its
+own per-file cap, but the workspace being read may still enforce its default
+read limit.
+
+Bulk transfers currently use an uncompressed tar archive buffered in memory.
+Runner-backed transfers also base64-encode that archive for the runner protocol,
+so peak memory is higher than `max_archive_bytes`. Configure `pattern`,
+`max_files`, `max_file_bytes`, `max_total_bytes`, and `max_archive_bytes` for
+the deployment's expected workspace and memory budget.
+
+Custom `Workspace` implementations must implement `bounded_read_limit()` so a
+hard aggregate ceiling composes with, rather than raises, the backend's default
+read policy. Bulk export and import are independent nominal capabilities:
+subclass `BoundedTarReader` only when the backend can reject both logical and
+raw-archive overflow before constructing the tar, and subclass `TarWriter` when
+it can import caller-validated tar bytes. `RunnerWorkspace` implements both.
+Ad-hoc methods with the same names are ignored. Generic bounded copies are
+staged and validated before the first copied-file write, so a byte-limit failure
+during finalization does not partially sync changes back to durable storage.
 
 Use `GitRepositoryBinding` when a workspace should start as a checked-out Git
 repository:

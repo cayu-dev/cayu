@@ -196,6 +196,8 @@ def test_microsandbox_workspace_uses_default_read_limit(tmp_path: Path) -> None:
 
     read_result = asyncio.run(workspace.read_bytes("a.txt"))
 
+    assert workspace.bounded_read_limit(10) == 4
+    assert workspace.bounded_read_limit(2) == 2
     assert read_result.content == b"abcd"
     assert read_result.total_bytes == 6
     assert read_result.truncated is True

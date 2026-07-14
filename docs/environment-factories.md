@@ -129,7 +129,11 @@ The built-in bindings live in `src/cayu/environments/bindings.py`:
 | `GitRepositoryBinding` | Ensures the workspace has a checked-out repo at a ref; records commit/branch/dirty state (never commits or pushes). | Any runner for code-on-a-branch workflows. |
 
 `SyncBinding` is policy-driven: `sync_back` (`always`/`on_success`/`never`) controls when changed files
-are copied back, and `clean_target`, `delete_missing`, `pattern`, and `max_files` control the copy — see the
+are copied back, while `clean_target`, `delete_missing`, `pattern`, `max_files`, `max_file_bytes`,
+`max_total_bytes`, and `max_archive_bytes` control the copy. The aggregate cap defaults to 64 MiB of logical file data per
+copy-in or copy-back transfer, while `max_archive_bytes` defaults to 128 MiB for the complete raw
+tar including framing and path metadata. Bulk tar transfers are buffered and runner protocols add
+encoding overhead, so size these controls below the process or sandbox memory ceiling. See the
 `*_sync_binding_live.py` examples below.
 
 Two patterns the issue that motivated this guide called out are **not** separate classes:

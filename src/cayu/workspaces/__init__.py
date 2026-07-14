@@ -1,6 +1,8 @@
 """Workspace contracts."""
 
 from cayu.workspaces.base import (
+    BoundedTarReader,
+    TarWriter,
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
@@ -34,10 +36,12 @@ __all__ = [
     "DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES",
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
+    "BoundedTarReader",
     "E2BWorkspace",
     "LocalWorkspace",
     "MicrosandboxWorkspace",
     "RunnerWorkspace",
+    "TarWriter",
     "Workspace",
     "WorkspaceListResult",
     "WorkspaceReadResult",

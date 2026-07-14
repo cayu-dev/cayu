@@ -18,7 +18,14 @@ from uuid import uuid4
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
-from cayu.workspaces import LocalWorkspace, RunnerWorkspace, Workspace
+from cayu.workspaces import (
+    BoundedTarReader,
+    LocalWorkspace,
+    RunnerWorkspace,
+    TarWriter,
+    Workspace,
+)
+from cayu.workspaces._tar import tar_archive_size_bound
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,8 @@ class _SyncBindingState:
 
 
 DEFAULT_SYNC_STATE_TTL_S = 24 * 60 * 60.0
+DEFAULT_SYNC_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+DEFAULT_SYNC_MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 
 
 SYNC_FINAL_METADATA_KEYS = frozenset(
@@ -541,12 +550,15 @@ class SyncBinding(WorkspaceBinding):
     for concurrent sessions). The guard is per binding instance, so sharing one fixed
     target across separate ``SyncBinding`` instances stays out of contract.
 
-    File copies use one bulk tar transfer per direction when a workspace
-    exposes ``read_tar_bytes``/``write_tar_bytes`` (RunnerWorkspace does), and
-    fall back to per-file copies otherwise. Per-bind state is keyed by session:
-    rebinding a session replaces its leaked state, ``abandon`` drops state for
-    a bind whose finalize will never run, and states older than
-    ``state_ttl_s`` are pruned on the next bind.
+    File copies use one bulk tar transfer per direction when either workspace
+    implements the explicit ``BoundedTarReader`` or ``TarWriter`` capability
+    (RunnerWorkspace implements both). Bounded generic transfers are staged
+    before destination writes. ``max_total_bytes`` bounds logical file bytes,
+    while ``max_archive_bytes`` independently bounds raw tar bytes; pass
+    ``None`` for a limit to opt out of that bound.
+    Per-bind state is keyed by session: rebinding a session replaces its leaked
+    state, ``abandon`` drops state for a bind whose finalize will never run, and
+    states older than ``state_ttl_s`` are pruned on the next bind.
     """
 
     def __init__(
@@ -558,6 +570,8 @@ class SyncBinding(WorkspaceBinding):
         pattern: str = "**/*",
         max_files: int = 10_000,
         max_file_bytes: int | None = None,
+        max_total_bytes: int | None = DEFAULT_SYNC_MAX_TOTAL_BYTES,
+        max_archive_bytes: int | None = DEFAULT_SYNC_MAX_ARCHIVE_BYTES,
         clean_target: SyncTargetCleanPolicy = "always",
         sync_back: SyncBackPolicy = "always",
         delete_missing: bool = True,
@@ -579,6 +593,14 @@ class SyncBinding(WorkspaceBinding):
         self.pattern = require_clean_nonblank(pattern, "pattern")
         self.max_files = _validate_positive_int(max_files, "max_files")
         self.max_file_bytes = _validate_optional_positive_int(max_file_bytes, "max_file_bytes")
+        self.max_total_bytes = _validate_optional_positive_int(
+            max_total_bytes,
+            "max_total_bytes",
+        )
+        self.max_archive_bytes = _validate_optional_positive_int(
+            max_archive_bytes,
+            "max_archive_bytes",
+        )
         self.clean_target = _validate_clean_policy(clean_target)
         self.sync_back = _validate_sync_back_policy(sync_back)
         if type(delete_missing) is not bool:
@@ -652,6 +674,8 @@ class SyncBinding(WorkspaceBinding):
                 target=target,
                 paths=source_paths,
                 max_file_bytes=self.max_file_bytes,
+                max_total_bytes=self.max_total_bytes,
+                max_archive_bytes=self.max_archive_bytes,
             )
             bind_metadata = {
                 **request_metadata,
@@ -661,6 +685,8 @@ class SyncBinding(WorkspaceBinding):
                     "pattern": self.pattern,
                     "max_files": self.max_files,
                     "max_file_bytes": self.max_file_bytes,
+                    "max_total_bytes": self.max_total_bytes,
+                    "max_archive_bytes": self.max_archive_bytes,
                     "clean_target": self.clean_target,
                     "sync_back": self.sync_back,
                     "delete_missing": self.delete_missing,
@@ -741,6 +767,8 @@ class SyncBinding(WorkspaceBinding):
             target=bound.source_workspace,
             paths=copy_back_paths,
             max_file_bytes=self.max_file_bytes,
+            max_total_bytes=self.max_total_bytes,
+            max_archive_bytes=self.max_archive_bytes,
         )
         deleted_paths: tuple[str, ...] = ()
         if self.delete_missing:
@@ -1006,33 +1034,56 @@ async def _copy_paths(
     target: Workspace,
     paths: tuple[str, ...],
     max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
 ) -> int:
-    """Copy files between workspaces, preferring one bulk tar transfer.
+    """Copy files between workspaces, staging whenever a bound is configured.
 
-    When either side exposes the optional ``read_tar_bytes``/``write_tar_bytes``
-    capability (RunnerWorkspace does), the whole file set moves as a single
-    tar so a runner-backed workspace costs O(1) execs instead of one exec per
-    file. Workspaces without the capability fall back to per-file copies.
+    Nominal bulk capabilities keep runner-backed workspaces at O(1) execs.
+    Generic copies with any byte limit are staged as a bounded tar so a limit
+    failure occurs before the first copied-file write. Only an explicitly
+    unbounded generic copy uses the incremental per-file fallback.
     """
 
     if not paths:
         return 0
-    read_tar = getattr(source, "read_tar_bytes", None)
-    write_tar = getattr(target, "write_tar_bytes", None)
-    if not callable(read_tar) and not callable(write_tar):
+    source_supports_bulk = isinstance(source, BoundedTarReader)
+    target_supports_bulk = isinstance(target, TarWriter)
+    requires_staging = any(
+        limit is not None for limit in (max_file_bytes, max_total_bytes, max_archive_bytes)
+    )
+    if not source_supports_bulk and not target_supports_bulk and not requires_staging:
         return await _copy_paths_per_file(
             source=source,
             target=target,
             paths=paths,
             max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
         )
-    if callable(read_tar):
-        tar_data = await read_tar(paths, max_file_bytes=max_file_bytes)
+    if source_supports_bulk:
+        tar_data = await source.read_tar_bytes(
+            paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_archive_bytes=max_archive_bytes,
+        )
     else:
-        tar_data = await _pack_workspace_tar(source, paths, max_file_bytes=max_file_bytes)
-    copied_bytes = _validate_sync_tar(tar_data, paths, max_file_bytes=max_file_bytes)
-    if callable(write_tar):
-        await write_tar(tar_data)
+        tar_data = await _pack_workspace_tar(
+            source,
+            paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_archive_bytes=max_archive_bytes,
+        )
+    copied_bytes = _validate_sync_tar(
+        tar_data,
+        paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+    )
+    if target_supports_bulk:
+        await target.write_tar_bytes(tar_data)
     else:
         await _extract_tar_to_workspace(target, tar_data)
     return copied_bytes
@@ -1044,16 +1095,19 @@ async def _copy_paths_per_file(
     target: Workspace,
     paths: tuple[str, ...],
     max_file_bytes: int | None,
+    max_total_bytes: int | None,
 ) -> int:
     copied_bytes = 0
     for path in paths:
-        result = await source.read_bytes(path, max_bytes=max_file_bytes)
-        if result.truncated:
-            raise RuntimeError(
-                f"SyncBinding file exceeds {_copy_limit_label(max_file_bytes)}: {path}"
-            )
-        await target.write_bytes(path, result.content)
-        copied_bytes += len(result.content)
+        content = await _read_sync_file(
+            source,
+            path,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            copied_bytes=copied_bytes,
+        )
+        await target.write_bytes(path, content)
+        copied_bytes += len(content)
     return copied_bytes
 
 
@@ -1062,19 +1116,37 @@ async def _pack_workspace_tar(
     paths: tuple[str, ...],
     *,
     max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
 ) -> bytes:
+    archive_overhead_bytes = tar_archive_size_bound(0, paths)
+    staged_logical_limit: int | None = None
+    staged_limit_label: str | None = None
+    if max_archive_bytes is not None:
+        if archive_overhead_bytes > max_archive_bytes:
+            raise RuntimeError(f"SyncBinding tar exceeds max_archive_bytes={max_archive_bytes}.")
+        staged_logical_limit = max_archive_bytes - archive_overhead_bytes
+        staged_limit_label = f"max_archive_bytes={max_archive_bytes}"
     buffer = io.BytesIO()
+    copied_bytes = 0
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for path in paths:
-            result = await source.read_bytes(path, max_bytes=max_file_bytes)
-            if result.truncated:
-                raise RuntimeError(
-                    f"SyncBinding file exceeds {_copy_limit_label(max_file_bytes)}: {path}"
-                )
+            content = await _read_sync_file(
+                source,
+                path,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+                copied_bytes=copied_bytes,
+                max_staged_bytes=staged_logical_limit,
+                staged_limit_label=staged_limit_label,
+            )
+            copied_bytes += len(content)
             info = tarfile.TarInfo(name=path)
-            info.size = len(result.content)
-            archive.addfile(info, io.BytesIO(result.content))
-    return buffer.getvalue()
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    tar_data = buffer.getvalue()
+    _validate_sync_archive_bytes(tar_data, max_archive_bytes=max_archive_bytes)
+    return tar_data
 
 
 async def _extract_tar_to_workspace(target: Workspace, tar_data: bytes) -> None:
@@ -1091,9 +1163,12 @@ def _validate_sync_tar(
     paths: tuple[str, ...],
     *,
     max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
 ) -> int:
     if type(tar_data) is not bytes:
         raise TypeError("SyncBinding bulk transfer must produce tar bytes.")
+    _validate_sync_archive_bytes(tar_data, max_archive_bytes=max_archive_bytes)
     copied_bytes = 0
     member_names: list[str] = []
     try:
@@ -1109,6 +1184,10 @@ def _validate_sync_tar(
                     )
                 member_names.append(member.name)
                 copied_bytes += member.size
+                _validate_sync_total_bytes(
+                    copied_bytes,
+                    max_total_bytes=max_total_bytes,
+                )
     except tarfile.TarError as exc:
         raise RuntimeError("SyncBinding bulk transfer returned an invalid tar archive.") from exc
     if sorted(member_names) != sorted(paths):
@@ -1116,10 +1195,132 @@ def _validate_sync_tar(
     return copied_bytes
 
 
-def _copy_limit_label(max_file_bytes: int | None) -> str:
-    if max_file_bytes is None:
-        return "the workspace read limit"
-    return f"max_file_bytes={max_file_bytes}"
+async def _read_sync_file(
+    source: Workspace,
+    path: str,
+    *,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    copied_bytes: int,
+    max_staged_bytes: int | None = None,
+    staged_limit_label: str | None = None,
+) -> bytes:
+    read_limit, limit_label, active_aggregate_limit = _copy_read_limit(
+        source,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        copied_bytes=copied_bytes,
+        max_staged_bytes=max_staged_bytes,
+        staged_limit_label=staged_limit_label,
+    )
+    result = await source.read_bytes(path, max_bytes=read_limit)
+    if result.truncated:
+        if active_aggregate_limit is not None:
+            aggregate_bytes, aggregate_label = active_aggregate_limit
+            _validate_sync_aggregate_bytes(
+                copied_bytes + result.total_bytes,
+                max_bytes=aggregate_bytes,
+                limit_label=aggregate_label,
+            )
+        raise RuntimeError(f"SyncBinding file exceeds {limit_label}: {path}")
+    _validate_sync_total_bytes(
+        copied_bytes + len(result.content),
+        max_total_bytes=max_total_bytes,
+    )
+    if max_staged_bytes is not None:
+        if staged_limit_label is None:
+            raise RuntimeError("SyncBinding staged byte limit is missing its label.")
+        _validate_sync_aggregate_bytes(
+            copied_bytes + len(result.content),
+            max_bytes=max_staged_bytes,
+            limit_label=staged_limit_label,
+        )
+    return result.content
+
+
+def _copy_read_limit(
+    source: Workspace,
+    *,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    copied_bytes: int,
+    max_staged_bytes: int | None,
+    staged_limit_label: str | None,
+) -> tuple[int | None, str, tuple[int, str] | None]:
+    read_limit = max_file_bytes
+    limit_label = (
+        f"max_file_bytes={max_file_bytes}"
+        if max_file_bytes is not None
+        else "the workspace read limit"
+    )
+    aggregate_limits: list[tuple[int, str]] = []
+    if max_total_bytes is not None:
+        aggregate_limits.append((max_total_bytes, f"max_total_bytes={max_total_bytes}"))
+    if max_staged_bytes is not None:
+        if staged_limit_label is None:
+            raise RuntimeError("SyncBinding staged byte limit is missing its label.")
+        aggregate_limits.append((max_staged_bytes, staged_limit_label))
+    active_aggregate_limit: tuple[int, str] | None = None
+    if aggregate_limits:
+        aggregate_bytes, aggregate_label = min(aggregate_limits, key=lambda item: item[0])
+        remaining_bytes = aggregate_bytes - copied_bytes
+        if remaining_bytes < 0:
+            _validate_sync_aggregate_bytes(
+                copied_bytes,
+                max_bytes=aggregate_bytes,
+                limit_label=aggregate_label,
+            )
+        # Workspace reads require a positive max_bytes. Probe one byte when the
+        # aggregate is exactly exhausted so trailing empty files remain valid.
+        total_read_ceiling = max(1, remaining_bytes)
+        if max_file_bytes is None:
+            read_limit = _bounded_workspace_read_limit(source, total_read_ceiling)
+            if read_limit == total_read_ceiling:
+                limit_label = aggregate_label
+                active_aggregate_limit = (aggregate_bytes, aggregate_label)
+        elif remaining_bytes == 0 or total_read_ceiling < max_file_bytes:
+            read_limit = total_read_ceiling
+            limit_label = aggregate_label
+            active_aggregate_limit = (aggregate_bytes, aggregate_label)
+    return read_limit, limit_label, active_aggregate_limit
+
+
+def _validate_sync_total_bytes(
+    copied_bytes: int,
+    *,
+    max_total_bytes: int | None,
+) -> None:
+    if max_total_bytes is not None and copied_bytes > max_total_bytes:
+        raise RuntimeError(f"SyncBinding files exceed max_total_bytes={max_total_bytes}.")
+
+
+def _validate_sync_aggregate_bytes(
+    copied_bytes: int,
+    *,
+    max_bytes: int,
+    limit_label: str,
+) -> None:
+    if copied_bytes > max_bytes:
+        raise RuntimeError(f"SyncBinding files exceed {limit_label}.")
+
+
+def _validate_sync_archive_bytes(
+    tar_data: bytes,
+    *,
+    max_archive_bytes: int | None,
+) -> None:
+    if max_archive_bytes is not None and len(tar_data) > max_archive_bytes:
+        raise RuntimeError(f"SyncBinding tar exceeds max_archive_bytes={max_archive_bytes}.")
+
+
+def _bounded_workspace_read_limit(source: Workspace, max_bytes: int) -> int:
+    value = source.bounded_read_limit(max_bytes)
+    if type(value) is not int or value <= 0 or value > max_bytes:
+        raise RuntimeError(
+            f"{type(source).__name__}.bounded_read_limit() must return a positive integer "
+            f"no greater than max_bytes={max_bytes}."
+        )
+    return value
 
 
 def _validate_sync_binding_metadata(bound: BoundWorkspace) -> dict[str, Any]:

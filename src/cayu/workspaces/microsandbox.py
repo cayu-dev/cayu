@@ -3,7 +3,7 @@ from __future__ import annotations
 import posixpath
 from typing import Any
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import require_clean_nonblank
 from cayu.runners import DEFAULT_MICROSANDBOX_CWD, MicrosandboxRunner
 from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
 from cayu.workspaces.base import (
@@ -11,6 +11,9 @@ from cayu.workspaces.base import (
     WorkspaceListResult,
     WorkspaceReadResult,
     _runner_workspace_resource_key,
+    _validate_absolute_guest_root,
+    _validate_workspace_positive_limit,
+    _validate_workspace_relative_path,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -57,6 +60,12 @@ class MicrosandboxWorkspace(Workspace):
     @property
     def resource_key(self) -> tuple[object, ...] | None:
         return _runner_workspace_resource_key(self.runner, str(self.root))
+
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        return min(
+            self.default_read_limit_bytes,
+            _validate_required_limit(max_bytes, "max_bytes"),
+        )
 
     async def read_bytes(
         self,
@@ -195,30 +204,19 @@ def _entry_guest_path(current_dir: str, entry_path: Any) -> str | None:
 
 
 def _validate_guest_root(path: str) -> str:
-    root = require_clean_nonblank(path, "root")
-    if not posixpath.isabs(root):
-        raise ValueError("MicrosandboxWorkspace root must be an absolute guest path.")
-    return posixpath.normpath(root)
+    return _validate_absolute_guest_root(path, owner="MicrosandboxWorkspace")
 
 
 def _validate_relative_path(path: str) -> str:
-    value = require_nonblank(path, "path")
-    if posixpath.isabs(value):
-        raise ValueError("Workspace paths must be relative.")
-    normalized = posixpath.normpath(value)
-    if normalized in {"", "."}:
-        raise ValueError("Workspace paths must reference a file.")
-    if normalized == ".." or normalized.startswith("../"):
-        raise ValueError("Workspace path escapes the workspace root.")
-    return normalized
+    return _validate_workspace_relative_path(path)
 
 
 def _validate_required_limit(value: int, field_name: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"MicrosandboxWorkspace {field_name} must be an integer.")
-    if value <= 0:
-        raise ValueError(f"MicrosandboxWorkspace {field_name} must be greater than zero.")
-    return value
+    return _validate_workspace_positive_limit(
+        value,
+        field_name,
+        owner="MicrosandboxWorkspace",
+    )
 
 
 def _is_same_or_child(path: str, root: str) -> bool:

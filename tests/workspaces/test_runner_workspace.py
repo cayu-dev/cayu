@@ -10,7 +10,8 @@ import pytest
 from cayu.core.tools import ToolContext
 from cayu.runners import LocalRunner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
-from cayu.workspaces import RunnerWorkspace
+from cayu.workspaces import BoundedTarReader, RunnerWorkspace, TarWriter
+from cayu.workspaces._tar import tar_archive_size_bound
 
 
 def _workspace(root) -> RunnerWorkspace:
@@ -144,6 +145,10 @@ def test_runner_workspace_uses_default_remote_bounds(tmp_path) -> None:
     read_result = asyncio.run(workspace.read_bytes("a.txt"))
     list_result = asyncio.run(workspace.list("*.txt"))
 
+    assert isinstance(workspace, BoundedTarReader)
+    assert isinstance(workspace, TarWriter)
+    assert workspace.bounded_read_limit(10) == 4
+    assert workspace.bounded_read_limit(2) == 2
     assert read_result.content == b"abcd"
     assert read_result.total_bytes == 6
     assert read_result.truncated is True
@@ -237,6 +242,76 @@ def test_runner_workspace_read_tar_rejects_oversized_file(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="exceeds max_file_bytes=3"):
         asyncio.run(workspace.read_tar_bytes(("big.txt",), max_file_bytes=3))
+
+
+def test_runner_workspace_read_tar_enforces_total_bytes_before_archiving(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    asyncio.run(workspace.write_bytes("a.txt", b"abc"))
+    asyncio.run(workspace.write_bytes("b.txt", b"def"))
+
+    data = asyncio.run(
+        workspace.read_tar_bytes(
+            ("a.txt", "b.txt"),
+            max_total_bytes=6,
+        )
+    )
+
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+        assert sum(member.size for member in archive.getmembers()) == 6
+    with pytest.raises(RuntimeError, match="files exceed max_total_bytes=5"):
+        asyncio.run(
+            workspace.read_tar_bytes(
+                ("a.txt", "b.txt"),
+                max_total_bytes=5,
+            )
+        )
+
+
+def test_runner_workspace_read_tar_validates_total_bytes_limit(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        asyncio.run(workspace.read_tar_bytes(("a.txt",), max_total_bytes=0))
+    with pytest.raises(TypeError, match="max_total_bytes"):
+        asyncio.run(workspace.read_tar_bytes(("a.txt",), max_total_bytes=True))
+
+    with pytest.raises(ValueError, match="max_archive_bytes"):
+        asyncio.run(workspace.read_tar_bytes(("a.txt",), max_archive_bytes=0))
+    with pytest.raises(TypeError, match="max_archive_bytes"):
+        asyncio.run(workspace.read_tar_bytes(("a.txt",), max_archive_bytes=True))
+
+
+def test_runner_workspace_read_tar_preflights_raw_archive_size(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    asyncio.run(workspace.write_bytes("a.txt", b"abc"))
+    asyncio.run(workspace.write_bytes("b.txt", b"def"))
+    paths = ("a.txt", "b.txt")
+    archive_bound = tar_archive_size_bound(6, paths)
+
+    data = asyncio.run(workspace.read_tar_bytes(paths, max_archive_bytes=archive_bound))
+
+    assert len(data) <= archive_bound
+    with pytest.raises(RuntimeError, match="tar exceeds max_archive_bytes"):
+        asyncio.run(
+            workspace.read_tar_bytes(
+                paths,
+                max_archive_bytes=archive_bound - 1,
+            )
+        )
+
+
+def test_tar_archive_size_bound_accounts_for_long_pax_paths() -> None:
+    paths = tuple(f"{index}/" + ("a" * 3998) for index in range(10))
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for path in paths:
+            info = tarfile.TarInfo(name=path)
+            info.size = 0
+            archive.addfile(info, io.BytesIO())
+
+    bound = tar_archive_size_bound(1, paths)
+
+    assert len(buffer.getvalue()) <= bound
 
 
 def test_runner_workspace_read_tar_validates_paths(tmp_path) -> None:
