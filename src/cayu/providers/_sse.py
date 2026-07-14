@@ -13,6 +13,10 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 
+class SseIdleTimeoutError(TimeoutError):
+    """Raised when an SSE stream produces no activity before its idle deadline."""
+
+
 async def aiter_sse_json_events(
     lines: AsyncIterator[str],
     *,
@@ -52,13 +56,13 @@ async def aiter_sse_json_events(
         elapsed = loop.time() - last_event_at
         remaining = idle_timeout_s - elapsed
         if remaining <= 0:
-            raise TimeoutError(idle_message)
+            raise SseIdleTimeoutError(idle_message)
         try:
             line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
         except StopAsyncIteration:
             break
         except TimeoutError:
-            raise TimeoutError(idle_message) from None
+            raise SseIdleTimeoutError(idle_message) from None
 
         if line.startswith(":"):
             # SSE comment / keep-alive heartbeat: count it as stream activity so a
@@ -89,4 +93,4 @@ async def aiter_sse_json_events(
             yield decode(data)
 
 
-__all__ = ["aiter_sse_json_events"]
+__all__ = ["SseIdleTimeoutError", "aiter_sse_json_events"]

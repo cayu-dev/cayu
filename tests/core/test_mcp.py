@@ -10,7 +10,10 @@ from typing import Any
 
 import pytest
 
+import cayu.mcp as mcp_module
 from cayu import (
+    DEFAULT_MCP_MAX_LIST_ITEMS,
+    DEFAULT_MCP_MAX_LIST_PAGES,
     AgentSpec,
     CayuApp,
     Environment,
@@ -1377,6 +1380,127 @@ def test_collect_paginated_rejects_repeated_cursor() -> None:
 
     with pytest.raises(McpProtocolError, match="repeated pagination cursor"):
         asyncio.run(collect_paginated(request, "tools/list", "tools"))
+
+
+def test_mcp_pagination_defaults_are_public_and_bounded() -> None:
+    assert DEFAULT_MCP_MAX_LIST_PAGES == mcp_module.DEFAULT_MCP_MAX_LIST_PAGES == 100
+    assert DEFAULT_MCP_MAX_LIST_ITEMS == mcp_module.DEFAULT_MCP_MAX_LIST_ITEMS == 10_000
+
+
+def test_collect_paginated_accepts_exact_page_and_item_limits() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    calls: list[dict[str, Any]] = []
+
+    async def request(method, params):
+        calls.append(params)
+        if not params:
+            return {"tools": [{"name": "first"}], "nextCursor": "next"}
+        return {"tools": [{"name": "second"}]}
+
+    result = asyncio.run(
+        collect_paginated(
+            request,
+            "tools/list",
+            "tools",
+            max_pages=2,
+            max_items=2,
+        )
+    )
+
+    assert [item["name"] for item in result] == ["first", "second"]
+    assert calls == [{}, {"cursor": "next"}]
+
+
+def test_collect_paginated_stops_before_requesting_page_over_limit() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    calls: list[dict[str, Any]] = []
+
+    async def request(method, params):
+        calls.append(params)
+        cursor_number = len(calls)
+        return {
+            "tools": [{"name": f"tool-{cursor_number}"}],
+            "nextCursor": f"cursor-{cursor_number}",
+        }
+
+    with pytest.raises(
+        McpProtocolError,
+        match=r"tools/list.*after 2 pages.*page 3.*max_list_pages=2",
+    ):
+        asyncio.run(
+            collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                max_pages=2,
+                max_items=10,
+            )
+        )
+
+    assert calls == [{}, {"cursor": "cursor-1"}]
+
+
+def test_collect_paginated_rejects_oversized_cumulative_items() -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    async def request(method, params):
+        if not params:
+            return {"resources": [{"uri": "one"}], "nextCursor": "next"}
+        return {"resources": [{"uri": "two"}, {"uri": "three"}]}
+
+    with pytest.raises(
+        McpProtocolError,
+        match=r"resources/list returned 3 items.*max_list_items=2",
+    ):
+        asyncio.run(
+            collect_paginated(
+                request,
+                "resources/list",
+                "resources",
+                max_pages=10,
+                max_items=2,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_type"),
+    [
+        ("max_pages", True, TypeError),
+        ("max_pages", 0, ValueError),
+        ("max_items", 1.5, TypeError),
+        ("max_items", -1, ValueError),
+    ],
+)
+def test_collect_paginated_rejects_invalid_limits(field, value, error_type) -> None:
+    from cayu.mcp._jsonrpc import collect_paginated
+
+    async def request(method, params):
+        raise AssertionError("invalid limits must fail before making a request")
+
+    kwargs = {"max_pages": 1, "max_items": 1, field: value}
+    with pytest.raises(error_type, match=field):
+        asyncio.run(collect_paginated(request, "tools/list", "tools", **kwargs))
+
+
+def test_stdio_mcp_client_applies_configured_page_limit() -> None:
+    spec = McpServerSpec(
+        name="local-mcp",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_PAGINATE": "1"},
+    )
+
+    async def run() -> None:
+        session = await StdioMcpClient(max_list_pages=1).connect(spec)
+        try:
+            with pytest.raises(McpProtocolError, match=r"tools/list.*max_list_pages=1"):
+                await session.list_tools()
+        finally:
+            await session.close()
+
+    asyncio.run(run())
 
 
 def test_collect_paginated_treats_blank_cursor_as_end_of_list() -> None:

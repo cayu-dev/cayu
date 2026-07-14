@@ -33,6 +33,8 @@ SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset(
 DEFAULT_MCP_REQUEST_TIMEOUT_S = 30.0
 DEFAULT_MCP_CLIENT_NAME = "cayu"
 DEFAULT_MCP_CLIENT_VERSION = "0.1.0"
+DEFAULT_MCP_MAX_LIST_PAGES = 100
+DEFAULT_MCP_MAX_LIST_ITEMS = 10_000
 JSONRPC_METHOD_NOT_FOUND = -32601
 
 
@@ -47,6 +49,14 @@ def validate_positive_number(value: float, field_name: str) -> float:
     if numeric <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
     return numeric
+
+
+def validate_positive_integer(value: int, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+    return value
 
 
 def initialize_params(client_name: str, client_version: str) -> dict[str, Any]:
@@ -97,6 +107,9 @@ async def collect_paginated(
     request: Callable[[str, dict[str, Any]], Awaitable[Any]],
     method: str,
     item_key: str,
+    *,
+    max_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
+    max_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
 ) -> list[Any]:
     """Drain a paginated list request, following ``nextCursor`` across pages.
 
@@ -105,17 +118,27 @@ async def collect_paginated(
     silently treated as the complete list — truncating tool/resource manifests
     (and their hashes) into a stable-looking but incomplete view.
     """
+    page_limit = validate_positive_integer(max_pages, "max_pages")
+    item_limit = validate_positive_integer(max_items, "max_items")
     items: list[Any] = []
     cursor: str | None = None
     seen_cursors: set[str] = set()
+    page_count = 0
     while True:
         params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
         result = await request(method, params)
+        page_count += 1
         if type(result) is not dict:
             raise McpProtocolError(f"MCP {method} result must be an object.")
         page = result.get(item_key, [])
         if not isinstance(page, list):
             raise McpProtocolError(f"MCP {method} result {item_key} must be a list.")
+        observed_items = len(items) + len(page)
+        if observed_items > item_limit:
+            raise McpProtocolError(
+                f"MCP {method} returned {observed_items} items, exceeding "
+                f"max_list_items={item_limit}."
+            )
         items.extend(page)
         next_cursor = result.get("nextCursor")
         if next_cursor is None:
@@ -133,6 +156,11 @@ async def collect_paginated(
                 f"MCP {method} repeated pagination cursor {cursor!r}; refusing to loop."
             )
         seen_cursors.add(cursor)
+        if page_count >= page_limit:
+            raise McpProtocolError(
+                f"MCP {method} returned a nextCursor after {page_count} pages; "
+                f"page {page_count + 1} would exceed max_list_pages={page_limit}."
+            )
 
 
 def initialize_result_from_payload(payload: dict[str, Any]) -> McpInitializeResult:

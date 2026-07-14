@@ -818,6 +818,7 @@ async def test_httpx_vertex_transport_populates_typed_error_fields(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             429,
+            headers={"retry-after": "4"},
             json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota"}},
         )
 
@@ -829,6 +830,7 @@ async def test_httpx_vertex_transport_populates_typed_error_fields(
 
     assert exc_info.value.status_code == 429
     assert exc_info.value.error_type == "RESOURCE_EXHAUSTED"
+    assert exc_info.value.retry_after_s == 4.0
 
 
 def test_vertex_provider_rejects_invalid_stream_idle_timeout() -> None:

@@ -1000,7 +1000,7 @@ async def test_provider_conformance_idle_failure_is_bounded(
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
     expected_error_type = (
-        "BedrockProtocolError" if registration.name == "bedrock" else "TimeoutError"
+        "BedrockProtocolError" if registration.name == "bedrock" else "SseIdleTimeoutError"
     )
     assert events[0].payload["error_type"] == expected_error_type
     assert events[0].payload["error"].strip()

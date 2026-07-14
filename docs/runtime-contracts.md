@@ -1070,10 +1070,19 @@ append assistant messages to the provider-neutral transcript.
 Built-in HTTP transports preserve concrete request exceptions in
 `provider_error_type` and mark transient transport failures as retryable, so
 classification survives provider error events without relying on message text.
+OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
+`Retry-After` delta-seconds and HTTP-date headers as `retry_after_s`; the runtime
+uses that delay in preference to exponential backoff, capped by
+`RetryPolicy.max_delay_s`. An SSE stream that produces no events before its idle
+deadline is normalized to a typed retryable provider error. Malformed SSE/JSON
+and provider protocol errors remain terminal and are not converted into
+transport retries.
 When retries are enabled, provider-derived `model.text.delta`, `model.error`,
 and `model.completed` events include `step`, `attempt`, and `max_attempts` so
 SSE consumers, dashboards, and replay tools can distinguish failed-attempt
-output from the successful attempt.
+output from the successful attempt. Incremental consumers must remove deltas
+matching the discarded `step` and `attempt` when `model.attempt_discarded`
+arrives, or failed-attempt partial output will remain visible beside the retry.
 
 Cayu does not retry tool execution. If a provider attempt emits tool calls and
 then fails before the model step completes, those tool calls have not executed
@@ -1716,7 +1725,15 @@ Cayu ships two MCP client transports, and `connect_mcp_toolset(server)` selects
 between them from the `McpServerSpec`: a spec with a `command` connects over stdio
 (`StdioMcpClient`); a spec with a `url` connects over Streamable HTTP
 (`HttpMcpClient`). Exactly one of `command` or `url` must be set. Neither client
-stores raw secrets in the spec. For stdio, `secret_env` is resolved and injected
+allows unbounded list discovery: `tools/list` and `resources/list` stop after
+`DEFAULT_MCP_MAX_LIST_PAGES` (100) pages or
+`DEFAULT_MCP_MAX_LIST_ITEMS` (10,000) items. Configure lower or higher positive
+integer ceilings with `max_list_pages=` and `max_list_items=` on either client;
+the values are carried into its session. A server that advertises another page
+at the page ceiling is rejected before that request is sent, and a page that
+would exceed the item ceiling is rejected before its items are retained. Both
+fail with `McpProtocolError` naming the list method and observed limit. The
+clients do not store raw secrets in the spec. For stdio, `secret_env` is resolved and injected
 into the subprocess environment before it starts. For HTTP, `secret_headers`
 (for example `{"Authorization": SecretRef(name="github_token")}`) require an
 HTTP client constructed with a secret resolver, such as

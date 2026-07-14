@@ -44,6 +44,7 @@ from cayu.environments import (
     WorkspaceSnapshot,
 )
 from cayu.providers import (
+    ChatCompletionsProvider,
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
@@ -14793,6 +14794,128 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
     assert events[3].payload["reason"] == "timeout"
     assert events[4].payload["reason"] == "timeout"
     assert events[4].payload["attempt"] == 1
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[1].content[0].text == "ok"
+
+
+def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StreamingResponse:
+        status_code = 200
+
+        def __init__(self, *, idle: bool) -> None:
+            self.idle = idle
+
+        async def aiter_lines(self):
+            if self.idle:
+                yield (
+                    'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                    '"model":"fake-model","choices":[{"index":0,'
+                    '"delta":{"content":"partial answer"},"finish_reason":null}]}'
+                )
+                yield ""
+                await asyncio.sleep(0.05)
+                yield ""
+                return
+            yield (
+                'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                '"model":"fake-model","choices":[{"index":0,'
+                '"delta":{"content":"ok"},"finish_reason":null}]}'
+            )
+            yield ""
+            yield (
+                'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                '"model":"fake-model","choices":[{"index":0,'
+                '"delta":{},"finish_reason":"stop"}]}'
+            )
+            yield ""
+            yield "data: [DONE]"
+            yield ""
+
+    class StreamContext:
+        def __init__(self, response: StreamingResponse) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> StreamingResponse:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class FlakyHttpClient:
+        calls = 0
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, *args: Any, **kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            return StreamContext(StreamingResponse(idle=type(self).calls == 1))
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", FlakyHttpClient)
+    store = InMemorySessionStore()
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        stream_idle_timeout_s=0.001,
+    )
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry_sse_idle",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_retry_sse_idle"))
+
+    assert FlakyHttpClient.calls == 2
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert events[2].payload == {
+        "delta": "partial answer",
+        "step": 1,
+        "attempt": 1,
+        "max_attempts": 2,
+    }
+    retry = events[4]
+    assert retry.payload["reason"] == "connection"
+    assert retry.payload["attempt"] == 1
+    assert retry.payload["next_attempt"] == 2
+    discarded = events[5]
+    assert discarded.payload["reason"] == "connection"
+    assert discarded.payload["attempt"] == 1
+    assert discarded.payload["next_attempt"] == 2
+    assert events[7].payload == {
+        "delta": "ok",
+        "step": 1,
+        "attempt": 2,
+        "max_attempts": 2,
+    }
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[1].content[0].text == "ok"
 

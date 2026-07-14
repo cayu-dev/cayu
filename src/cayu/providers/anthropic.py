@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank
@@ -1289,6 +1287,7 @@ def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) ->
 def _anthropic_api_error_from_response(
     response: httpx.Response,
     message: str,
+    retry_after_s: float | None,
 ) -> AnthropicAPIError:
     """Build a structured `AnthropicAPIError` from an HTTP error response.
 
@@ -1308,37 +1307,9 @@ def _anthropic_api_error_from_response(
         error_type=optional_error_string(error.get("type")),
         error_code=optional_error_string(error.get("code")),
         request_id=optional_error_string(response.headers.get("request-id")),
-        retry_after_s=_anthropic_retry_after_seconds(response),
+        retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
-
-
-def _anthropic_retry_after_seconds(response: httpx.Response) -> float | None:
-    """Parse a `Retry-After` header (delta-seconds or HTTP-date) into seconds."""
-    raw = response.headers.get("retry-after")
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw:
-        return None
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return _anthropic_retry_after_from_http_date(raw)
-    return seconds if seconds >= 0 else None
-
-
-def _anthropic_retry_after_from_http_date(raw: str) -> float | None:
-    try:
-        target = parsedate_to_datetime(raw)
-    except (TypeError, ValueError):
-        return None
-    if target is None:
-        return None
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=UTC)
-    delta = (target - datetime.now(UTC)).total_seconds()
-    return max(0.0, delta)
 
 
 def _is_anthropic_context_overflow(

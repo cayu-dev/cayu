@@ -1769,6 +1769,11 @@ This is how an agent gets GitHub (or any HTTP MCP server) tools with no custom
 `Tool` code. See the [PR-reviewer recipe](docs/recipes/pr-reviewer.md) for an
 end-to-end example.
 
+MCP tool/resource discovery is bounded by default to 100 pages and 10,000
+items. Both `HttpMcpClient` and `StdioMcpClient` accept positive integer
+`max_list_pages=` and `max_list_items=` overrides for servers with different
+manifest sizes.
+
 `connect_mcp_toolset(...)` fingerprints the discovered MCP tool contract as
 `toolset.manifest_hash`. The same value is exposed on each `McpToolAdapter` as
 `mcp_manifest_hash` and is included in structured MCP tool results for audit and

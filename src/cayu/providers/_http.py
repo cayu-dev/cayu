@@ -9,7 +9,10 @@ each adapter keeps only its provider-specific error classification and shaping.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator, Callable, Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -17,10 +20,11 @@ import certifi
 import httpx
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
 from cayu.providers.base import ModelContextOverflowError
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+_ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
 
 
 def new_async_client() -> httpx.AsyncClient:
@@ -86,7 +90,7 @@ async def post_json(
     protocol_error: type[Exception],
     error_response_text: Callable[[httpx.Response], str],
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
-    api_error_from_response: Callable[[httpx.Response, str], Exception] | None = None,
+    api_error_from_response: _ApiErrorFromResponse | None = None,
 ) -> Mapping[str, Any]:
     """POST a JSON payload and return the decoded JSON object response.
 
@@ -96,8 +100,8 @@ async def post_json(
     them); non-object response bodies raise ``protocol_error``.
     ``request_label``/``response_label`` prefix messages (e.g. ``"OpenAI API"``
     / ``"OpenAI"``). ``api_error_from_response`` lets an adapter build a
-    structured error (typed status/code fields) from the HTTP error response
-    instead of the flat ``api_error(message)``.
+    structured error (typed status/code fields) from the HTTP error response;
+    the shared layer supplies its parsed ``Retry-After`` delay.
     """
     try:
         response = await client.post(
@@ -118,9 +122,12 @@ async def post_json(
             f"{exc.response.status_code}: "
             f"{error_response_text(exc.response)}"
         )
-        if api_error_from_response is not None:
-            raise api_error_from_response(exc.response, message) from exc
-        raise api_error(message) from exc
+        raise _response_api_error(
+            exc.response,
+            message,
+            api_error=api_error,
+            api_error_from_response=api_error_from_response,
+        ) from exc
     except httpx.RequestError as exc:
         raise _request_api_error(
             api_error, request_label=request_label, url=url, cause=exc
@@ -149,14 +156,14 @@ async def stream_sse_json_events(
     protocol_error: type[Exception],
     error_response_text: Callable[[httpx.Response], str],
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
-    api_error_from_response: Callable[[httpx.Response, str], Exception] | None = None,
+    api_error_from_response: _ApiErrorFromResponse | None = None,
 ) -> AsyncIterator[Mapping[str, Any]]:
     """POST a streaming JSON payload and yield decoded SSE data objects.
 
     The caller-owned ``client`` is reused across requests; only the streaming
     response is opened and closed per call. ``api_error_from_response`` mirrors
     :func:`post_json`: adapters can build a structured error (typed status/code
-    fields) from the HTTP error response.
+    fields) while the shared layer supplies the parsed ``Retry-After`` delay.
     """
     timeout = httpx.Timeout(timeout_s, read=None)
     try:
@@ -180,9 +187,12 @@ async def stream_sse_json_events(
                     f"{response.status_code}: "
                     f"{error_response_text(response)}"
                 )
-                if api_error_from_response is not None:
-                    raise api_error_from_response(response, message)
-                raise api_error(message)
+                raise _response_api_error(
+                    response,
+                    message,
+                    api_error=api_error,
+                    api_error_from_response=api_error_from_response,
+                )
             async for event in aiter_sse_json_events(
                 response.aiter_lines(),
                 idle_timeout_s=stream_idle_timeout_s,
@@ -190,6 +200,12 @@ async def stream_sse_json_events(
                 protocol_error=protocol_error,
             ):
                 yield event
+    except SseIdleTimeoutError as exc:
+        raise api_error(
+            str(exc),
+            error_type=type(exc).__name__,
+            retryable=True,
+        ) from exc
     except httpx.RequestError as exc:
         raise _request_api_error(
             api_error, request_label=request_label, url=url, cause=exc
@@ -210,6 +226,23 @@ def _request_api_error(
     )
 
 
+def _response_api_error(
+    response: httpx.Response,
+    message: str,
+    *,
+    api_error: Callable[..., Exception],
+    api_error_from_response: _ApiErrorFromResponse | None,
+) -> Exception:
+    retry_after_s = retry_after_seconds(response)
+    if api_error_from_response is not None:
+        return api_error_from_response(response, message, retry_after_s)
+    return api_error(
+        message,
+        status_code=response.status_code,
+        retry_after_s=retry_after_s,
+    )
+
+
 def _is_retryable_transport_error(exc: httpx.RequestError) -> bool:
     # Local protocol and proxy failures usually require request/configuration changes;
     # only failures that can plausibly succeed unchanged are retried automatically.
@@ -221,6 +254,36 @@ def _is_retryable_transport_error(exc: httpx.RequestError) -> bool:
             httpx.RemoteProtocolError,
         ),
     )
+
+
+def retry_after_seconds(
+    response: httpx.Response,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Parse Retry-After delta-seconds or an HTTP-date into a non-negative delay."""
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if target is None:
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=UTC)
+        current = datetime.now(UTC) if now is None else now
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return max(0.0, (target - current).total_seconds())
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def validate_url(
@@ -385,6 +448,7 @@ __all__ = [
     "optional_error_string",
     "post_json",
     "response_json_object",
+    "retry_after_seconds",
     "safe_error_json",
     "safe_error_response_text",
     "safe_flat_error_json",

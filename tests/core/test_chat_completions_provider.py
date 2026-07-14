@@ -1366,7 +1366,7 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
             return httpx.Response(
                 429,
                 request=request,
-                headers={"content-type": "application/json"},
+                headers={"content-type": "application/json", "retry-after": "5"},
                 json={
                     "error": {
                         "code": 429,
@@ -1412,8 +1412,11 @@ async def test_chat_completions_transport_does_not_classify_quota_exhausted(
         timeout_s=1,
         stream_idle_timeout_s=1,
     )
-    with pytest.raises(ChatCompletionsAPIError):
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
         await stream.__anext__()
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after_s == 5.0
 
 
 def test_stream_options_is_configurable() -> None:

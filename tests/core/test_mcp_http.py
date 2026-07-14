@@ -476,6 +476,25 @@ def test_http_list_tools_follows_next_cursor() -> None:
     assert len(list_calls) == 2
 
 
+def test_http_mcp_client_applies_configured_page_limit() -> None:
+    server = FakeMcpHttpServer(paginate=True)
+
+    async def run() -> None:
+        session = await HttpMcpClient(
+            transport=server.transport,
+            max_list_pages=1,
+        ).connect(_server_spec())
+        try:
+            with pytest.raises(McpProtocolError, match=r"tools/list.*max_list_pages=1"):
+                await session.list_tools()
+        finally:
+            await session.close()
+
+    asyncio.run(run())
+    list_calls = [method for method, _headers in server.calls if method == "tools/list"]
+    assert list_calls == ["tools/list"]
+
+
 def test_http_close_sends_delete_and_is_idempotent() -> None:
     server = FakeMcpHttpServer()
 
@@ -593,6 +612,21 @@ def test_http_rejects_invalid_metadata_transport_config() -> None:
         client._resolve_transport_config(_server_spec(metadata={"timeout": -1}))
     with pytest.raises(ValueError, match="metadata.proxy"):
         client._resolve_transport_config(_server_spec(metadata={"proxy": 123}))
+
+
+@pytest.mark.parametrize("client_type", [HttpMcpClient, StdioMcpClient])
+@pytest.mark.parametrize(
+    ("field", "value", "error_type"),
+    [
+        ("max_list_pages", True, TypeError),
+        ("max_list_pages", 0, ValueError),
+        ("max_list_items", 1.5, TypeError),
+        ("max_list_items", -1, ValueError),
+    ],
+)
+def test_mcp_clients_reject_invalid_list_limits(client_type, field, value, error_type) -> None:
+    with pytest.raises(error_type, match=field):
+        client_type(**{field: value})
 
 
 def test_http_client_accepts_tls_verify_options() -> None:

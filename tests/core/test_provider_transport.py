@@ -11,20 +11,31 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import pytest
 
 from cayu.providers import (
+    AnthropicAPIError,
+    ChatCompletionsAPIError,
     ChatCompletionsProtocolError,
+    HttpxAnthropicTransport,
     HttpxChatCompletionsTransport,
     HttpxOpenAITransport,
+    HttpxVertexTransport,
     OpenAIAPIError,
     OpenAIProtocolError,
+    VertexAPIError,
 )
-from cayu.providers._http import SharedAsyncClient, validate_base_url, validate_url
-from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers._http import (
+    SharedAsyncClient,
+    retry_after_seconds,
+    validate_base_url,
+    validate_url,
+)
+from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
 
 
 class _StreamingResponse:
@@ -100,6 +111,39 @@ def _request_error_client_factory(error_type: type[httpx.RequestError]) -> type:
             raise error_type("forced request failure", request=request)
 
     return RequestErrorClient
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("12", 12.0),
+        ("2.5", 2.5),
+        ("Wed, 21 Oct 2015 07:28:10 GMT", 10.0),
+        ("Wed, 21 Oct 2015 07:27:40 GMT", 0.0),
+        ("", None),
+        ("-1", None),
+        ("nan", None),
+        ("inf", None),
+        ("not-a-date", None),
+    ],
+)
+def test_retry_after_seconds_supports_bounded_seconds_and_http_dates(
+    value: str,
+    expected: float | None,
+) -> None:
+    response = httpx.Response(429, headers={"retry-after": value})
+
+    assert (
+        retry_after_seconds(
+            response,
+            now=datetime(2015, 10, 21, 7, 28, tzinfo=UTC),
+        )
+        == expected
+    )
+
+
+def test_retry_after_seconds_returns_none_without_header() -> None:
+    assert retry_after_seconds(httpx.Response(429)) is None
 
 
 @pytest.mark.parametrize(
@@ -197,6 +241,77 @@ async def test_chat_completions_transport_survives_keepalive_heartbeats(monkeypa
     ]
 
     assert events == [{"ok": True}]
+
+
+@pytest.mark.parametrize(
+    ("transport_type", "stream_method", "api_error_type"),
+    [
+        pytest.param(
+            HttpxOpenAITransport,
+            "stream_response_events",
+            OpenAIAPIError,
+            id="openai",
+        ),
+        pytest.param(
+            HttpxAnthropicTransport,
+            "stream_message_events",
+            AnthropicAPIError,
+            id="anthropic",
+        ),
+        pytest.param(
+            HttpxChatCompletionsTransport,
+            "stream_chat_completions",
+            ChatCompletionsAPIError,
+            id="chat-completions",
+        ),
+        pytest.param(
+            HttpxVertexTransport,
+            "stream_message_events",
+            VertexAPIError,
+            id="vertex",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_http_sse_idle_timeout_is_a_typed_retryable_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+    transport_type: type,
+    stream_method: str,
+    api_error_type: type[Exception],
+) -> None:
+    response = _StreamingResponse([""], heartbeat_sleep_s=0.05)
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+
+    transport = transport_type()
+    stream = getattr(transport, stream_method)(
+        url="https://provider.example/v1/stream",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        stream_idle_timeout_s=0.001,
+    )
+    with pytest.raises(api_error_type) as captured:
+        await stream.__anext__()
+
+    assert captured.value.retryable is True
+    assert captured.value.error_type == "SseIdleTimeoutError"
+    assert isinstance(captured.value.__cause__, SseIdleTimeoutError)
+
+
+@pytest.mark.anyio
+async def test_http_sse_protocol_errors_remain_permanent(monkeypatch) -> None:
+    response = _StreamingResponse(["data: not-json", ""])
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+
+    stream = HttpxOpenAITransport().stream_response_events(
+        url="https://api.openai.com/v1/responses",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        stream_idle_timeout_s=1.0,
+    )
+    with pytest.raises(OpenAIProtocolError):
+        await stream.__anext__()
 
 
 @pytest.mark.anyio

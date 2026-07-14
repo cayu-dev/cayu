@@ -34,6 +34,8 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
+    DEFAULT_MCP_MAX_LIST_ITEMS,
+    DEFAULT_MCP_MAX_LIST_PAGES,
     McpProtocolError,
     collect_paginated,
     initialize_params,
@@ -45,6 +47,7 @@ from cayu.mcp._jsonrpc import (
     tool_definition_from_payload,
     tool_result_from_payload,
     validate_negotiated_protocol_version,
+    validate_positive_integer,
     validate_positive_number,
 )
 from cayu.mcp.base import (
@@ -88,6 +91,8 @@ class HttpMcpClient(McpClient):
         verify: bool | str | None = None,
         client_name: str = DEFAULT_MCP_CLIENT_NAME,
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
+        max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
+        max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
         transport: httpx.AsyncBaseTransport | None = None,
         secret_resolver: SecretResolver | None = None,
     ) -> None:
@@ -102,6 +107,8 @@ class HttpMcpClient(McpClient):
         self.verify = verify
         self.client_name = require_clean_nonblank(client_name, "client_name")
         self.client_version = require_clean_nonblank(client_version, "client_version")
+        self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
+        self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
         self._transport = transport
         if secret_resolver is not None:
             validate_secret_resolver(secret_resolver)
@@ -161,6 +168,8 @@ class HttpMcpClient(McpClient):
             url=server.url,
             client_name=self.client_name,
             client_version=self.client_version,
+            max_list_pages=self.max_list_pages,
+            max_list_items=self.max_list_items,
             secret_redactor=secret_redactor,
         )
         try:
@@ -190,12 +199,16 @@ class HttpMcpSession(McpSession):
         url: str,
         client_name: str,
         client_version: str,
+        max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
+        max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self.server = server
         self._secret_redactor = secret_redactor or SecretRedactor()
         self.client_name = client_name
         self.client_version = client_version
+        self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
+        self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
         self._http = http_client
         self._url = url
         self._initialize_result: McpInitializeResult | None = None
@@ -222,7 +235,13 @@ class HttpMcpSession(McpSession):
         await self._notify("notifications/initialized", {})
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
-        tools = await collect_paginated(self._request, "tools/list", "tools")
+        tools = await collect_paginated(
+            self._request,
+            "tools/list",
+            "tools",
+            max_pages=self.max_list_pages,
+            max_items=self.max_list_items,
+        )
         return tuple(tool_definition_from_payload(tool, self.server.name) for tool in tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
@@ -239,7 +258,13 @@ class HttpMcpSession(McpSession):
         return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
-        resources = await collect_paginated(self._request, "resources/list", "resources")
+        resources = await collect_paginated(
+            self._request,
+            "resources/list",
+            "resources",
+            max_pages=self.max_list_pages,
+            max_items=self.max_list_items,
+        )
         return tuple(
             resource_definition_from_payload(resource, self.server.name) for resource in resources
         )

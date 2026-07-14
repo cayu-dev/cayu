@@ -2649,7 +2649,7 @@ def test_is_stale_chain_error_uses_typed_identity_not_message_text() -> None:
 def test_openai_api_error_from_response_captures_typed_identity() -> None:
     response = httpx.Response(
         404,
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "retry-after": "3.5"},
         json={
             "error": {
                 "message": "Previous response with id 'resp_prev' not found.",
@@ -2661,7 +2661,11 @@ def test_openai_api_error_from_response_captures_typed_identity() -> None:
         },
     )
 
-    error = openai_module._openai_api_error_from_response(response, "OpenAI API request failed")
+    error = openai_module._openai_api_error_from_response(
+        response,
+        "OpenAI API request failed",
+        3.5,
+    )
 
     assert isinstance(error, OpenAIAPIError)
     assert str(error) == "OpenAI API request failed"
@@ -2670,13 +2674,18 @@ def test_openai_api_error_from_response_captures_typed_identity() -> None:
     assert error.error_code == "previous_response_not_found"
     assert error.param == "previous_response_id"
     assert error.request_id == "req_123"
+    assert error.retry_after_s == 3.5
     assert openai_module._is_stale_chain_error(error)
 
 
 def test_openai_api_error_from_response_tolerates_non_json_body() -> None:
     response = httpx.Response(502, headers={"content-type": "text/html"}, text="bad gateway")
 
-    error = openai_module._openai_api_error_from_response(response, "OpenAI API request failed")
+    error = openai_module._openai_api_error_from_response(
+        response,
+        "OpenAI API request failed",
+        None,
+    )
 
     assert error.status_code == 502
     assert error.error_type is None

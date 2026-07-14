@@ -546,7 +546,11 @@ def _is_vertex_context_overflow(*, status_code: int, message: str | None) -> boo
     return _anthropic_overflow_message(message)
 
 
-def _vertex_api_error_from_response(response: httpx.Response, message: str) -> VertexAPIError:
+def _vertex_api_error_from_response(
+    response: httpx.Response,
+    message: str,
+    retry_after_s: float | None,
+) -> VertexAPIError:
     """Build a structured `VertexAPIError` from an HTTP error response.
 
     Keeps the GCP error body's typed identity (``status`` as error_type) and the
@@ -558,6 +562,7 @@ def _vertex_api_error_from_response(response: httpx.Response, message: str) -> V
         message,
         status_code=response.status_code,
         error_type=optional_error_string(error.get("status")),
+        retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
 

@@ -1777,7 +1777,11 @@ def _format_error_json(decoded: Any) -> str | None:
     return _safe_error_json(decoded)
 
 
-def _openai_api_error_from_response(response: httpx.Response, message: str) -> OpenAIAPIError:
+def _openai_api_error_from_response(
+    response: httpx.Response,
+    message: str,
+    retry_after_s: float | None,
+) -> OpenAIAPIError:
     """Build a structured `OpenAIAPIError` from an HTTP error response.
 
     Keeps the OpenAI error body's typed identity (status/type/code/param/
@@ -1800,6 +1804,7 @@ def _openai_api_error_from_response(response: httpx.Response, message: str) -> O
         error_code=optional_error_string(error.get("code")),
         param=optional_error_string(error.get("param")),
         request_id=optional_error_string(request_id),
+        retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
 
