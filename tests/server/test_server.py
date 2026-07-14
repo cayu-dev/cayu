@@ -6158,6 +6158,60 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     assert len(client.get("/api/tasks").json()) == 1
 
 
+def test_streaming_mutation_id_creates_an_exact_durable_acceptance_event() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session-mutation-identity"
+    mutation_id = "mutation-run-identity"
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello", "session_id": session_id},
+        headers={"Cayu-Mutation-ID": mutation_id},
+    ) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    markers = [
+        frame["data"]
+        for frame in frames
+        if frame["data"]["type"] == EventType.SERVER_MUTATION_ACCEPTED
+    ]
+    assert len(markers) == 1
+    marker = markers[0]
+    assert marker["session_id"] == session_id
+    assert marker["payload"] == {
+        "mutation_id": mutation_id,
+        "mutation_kind": "run",
+        "accepted_event_id": frames[0]["data"]["id"],
+        "accepted_event_type": frames[0]["data"]["type"],
+    }
+    assert frames.index(next(frame for frame in frames if frame["data"] == marker)) > 0
+
+    events = client.get(
+        f"/api/sessions/{session_id}/events",
+        params={"event_type": EventType.SERVER_MUTATION_ACCEPTED},
+    ).json()["events"]
+    assert [event["id"] for event in events] == [marker["id"]]
+
+
+def test_streaming_mutation_id_header_rejects_unsafe_values_before_execution() -> None:
+    app = CayuApp()
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.post(
+        "/api/run",
+        json={"prompt": "hello", "session_id": "session-invalid-mutation-id"},
+        headers={"Cayu-Mutation-ID": "invalid mutation id"},
+    )
+
+    assert response.status_code == 422
+    assert asyncio.run(app.session_store.load_state("session-invalid-mutation-id")) is None
+
+
 def test_run_disconnect_after_http_acceptance_before_first_body_replays_from_start() -> None:
     task_store = InMemoryTaskStore()
     app = CayuApp(task_store=task_store)
@@ -6885,18 +6939,19 @@ def test_replay_does_not_accept_custom_event_as_terminal_lineage() -> None:
 
 
 @pytest.mark.parametrize(
-    "cascade_event_type",
+    "post_terminal_event_type",
     [
+        EventType.SERVER_MUTATION_ACCEPTED,
         EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
         EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
         EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
     ],
 )
-def test_replay_recognizes_framework_post_terminal_cascade_marker(
-    cascade_event_type: EventType,
+def test_replay_recognizes_framework_post_terminal_marker(
+    post_terminal_event_type: EventType,
 ) -> None:
     app = CayuApp(enable_logging=False)
-    session_id = f"session_replay_{cascade_event_type.value}"
+    session_id = f"session_replay_{post_terminal_event_type.value}"
 
     async def seed() -> None:
         await app.session_store.create(
@@ -6917,8 +6972,8 @@ def test_replay_recognizes_framework_post_terminal_cascade_marker(
                     agent_name="assistant",
                 ),
                 Event(
-                    id="event_cascade",
-                    type=cascade_event_type,
+                    id="event_post_terminal",
+                    type=post_terminal_event_type,
                     session_id=session_id,
                     agent_name="assistant",
                 ),
@@ -6933,7 +6988,7 @@ def test_replay_recognizes_framework_post_terminal_cascade_marker(
         "POST",
         "/api/resume",
         json={"session_id": session_id, "prompt": "ignored during replay"},
-        headers={"Last-Event-ID": f"{session_id}:event_cascade"},
+        headers={"Last-Event-ID": f"{session_id}:event_post_terminal"},
     ) as response:
         assert response.status_code == 200
         frames = _sse_frames(response)

@@ -495,6 +495,7 @@
           "title": "Environment Name"
         },
         "id": {
+          "maxLength": 512,
           "title": "Id",
           "type": "string"
         },
@@ -4496,6 +4497,24 @@
           "title": "Max Event Data Bytes",
           "type": "integer"
         },
+        "max_event_id_chars": {
+          "default": 512,
+          "minimum": 1.0,
+          "title": "Max Event Id Chars",
+          "type": "integer"
+        },
+        "mutation_acceptance_event_type": {
+          "const": "server.mutation.accepted",
+          "default": "server.mutation.accepted",
+          "title": "Mutation Acceptance Event Type",
+          "type": "string"
+        },
+        "mutation_id_header": {
+          "const": "Cayu-Mutation-ID",
+          "default": "Cayu-Mutation-ID",
+          "title": "Mutation Id Header",
+          "type": "string"
+        },
         "replay_header": {
           "const": "Last-Event-ID",
           "default": "Last-Event-ID",
@@ -4608,6 +4627,7 @@
           "title": "Environment Name"
         },
         "id": {
+          "maxLength": 512,
           "title": "Id",
           "type": "string"
         },
@@ -6933,7 +6953,28 @@
     "/api/resume": {
       "post": {
         "operation_id": "resume_agent_api_resume_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -6985,7 +7026,28 @@
     "/api/run": {
       "post": {
         "operation_id": "run_agent_api_run_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -7878,6 +7940,26 @@
         "operation_id": "interrupt_session_api_sessions__session_id__interrupt_post",
         "parameters": [
           {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          },
+          {
             "in": "path",
             "name": "session_id",
             "required": true,
@@ -8592,7 +8674,28 @@
     "/api/tool-approvals/recover": {
       "post": {
         "operation_id": "recover_tool_approval_api_tool_approvals_recover_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -8644,7 +8747,28 @@
     "/api/tool-approvals/resolve": {
       "post": {
         "operation_id": "resolve_tool_approval_api_tool_approvals_resolve_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -8696,7 +8820,28 @@
     "/api/tool-rounds/recover": {
       "post": {
         "operation_id": "recover_tool_round_api_tool_rounds_recover_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -8748,7 +8893,28 @@
     "/api/user-input/recover": {
       "post": {
         "operation_id": "recover_user_input_api_user_input_recover_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {
@@ -8800,7 +8966,28 @@
     "/api/user-input/resolve": {
       "post": {
         "operation_id": "resolve_user_input_api_user_input_resolve_post",
-        "parameters": [],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          }
+        ],
         "request_body": {
           "content": {
             "application/json": {

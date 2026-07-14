@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
+from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     CostLineItem,
@@ -43,7 +44,7 @@ class ApiErrorResponse(ApiBaseModel):
 class SseEventEnvelope(ApiBaseModel):
     """JSON payload in each runtime event SSE ``data:`` frame."""
 
-    id: str
+    id: str = Field(max_length=EVENT_ID_MAX_CHARS)
     type: str
     session_id: str
     agent_name: str | None
@@ -101,6 +102,9 @@ class SseContract(ApiBaseModel):
     content_type: Literal["text/event-stream"] = SSE_CONTENT_TYPE
     event_id_format: Literal["session_id:event_id"] = SSE_LAST_EVENT_ID_FORMAT
     replay_header: Literal["Last-Event-ID"] = "Last-Event-ID"
+    max_event_id_chars: StrictInt = Field(default=EVENT_ID_MAX_CHARS, ge=1)
+    mutation_id_header: Literal["Cayu-Mutation-ID"] = "Cayu-Mutation-ID"
+    mutation_acceptance_event_type: Literal["server.mutation.accepted"] = "server.mutation.accepted"
     replay_start_marker_format: Literal["session_id:"] = SSE_REPLAY_START_MARKER_FORMAT
     unknown_event_marker_behavior: Literal["reject"] = "reject"
     event_data_schema: Literal["SseEventEnvelope"] = "SseEventEnvelope"
@@ -146,7 +150,7 @@ class ServerContractResponse(ApiBaseModel):
 
 class ApiEventRecord(ApiBaseModel):
     sequence: StrictInt = Field(ge=0)
-    id: str
+    id: str = Field(max_length=EVENT_ID_MAX_CHARS)
     type: str
     session_id: str
     agent_name: str | None

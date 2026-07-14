@@ -2384,6 +2384,18 @@ export type SseContract = {
      */
     max_event_data_bytes?: number;
     /**
+     * Max Event Id Chars
+     */
+    max_event_id_chars?: number;
+    /**
+     * Mutation Acceptance Event Type
+     */
+    mutation_acceptance_event_type?: 'server.mutation.accepted';
+    /**
+     * Mutation Id Header
+     */
+    mutation_id_header?: 'Cayu-Mutation-ID';
+    /**
      * Replay Header
      */
     replay_header?: 'Last-Event-ID';
@@ -3687,6 +3699,14 @@ export type ListPendingActionsApiPendingActionsGetResponse = ListPendingActionsA
 
 export type ResumeAgentApiResumePostData = {
     body: ResumeBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/resume';
@@ -3724,6 +3744,14 @@ export type ResumeAgentApiResumePostResponse = ResumeAgentApiResumePostResponses
 
 export type RunAgentApiRunPostData = {
     body: RunBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/run';
@@ -4106,6 +4134,14 @@ export type InterruptSessionApiSessionsSessionIdInterruptPostData = {
      * Body
      */
     body?: InterruptSessionBody | null;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path: {
         /**
          * Session Id
@@ -4565,6 +4601,14 @@ export type ResumeTaskApiTasksTaskIdResumePostResponse = ResumeTaskApiTasksTaskI
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostData = {
     body: ToolApprovalRecoveryBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/tool-approvals/recover';
@@ -4602,6 +4646,14 @@ export type RecoverToolApprovalApiToolApprovalsRecoverPostResponse = RecoverTool
 
 export type ResolveToolApprovalApiToolApprovalsResolvePostData = {
     body: ToolApprovalBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/tool-approvals/resolve';
@@ -4639,6 +4691,14 @@ export type ResolveToolApprovalApiToolApprovalsResolvePostResponse = ResolveTool
 
 export type RecoverToolRoundApiToolRoundsRecoverPostData = {
     body: ToolRoundRecoveryBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/tool-rounds/recover';
@@ -4676,6 +4736,14 @@ export type RecoverToolRoundApiToolRoundsRecoverPostResponse = RecoverToolRoundA
 
 export type RecoverUserInputApiUserInputRecoverPostData = {
     body: UserInputRecoveryBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/user-input/recover';
@@ -4713,6 +4781,14 @@ export type RecoverUserInputApiUserInputRecoverPostResponse = RecoverUserInputAp
 
 export type ResolveUserInputApiUserInputResolvePostData = {
     body: UserInputResolveBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
     path?: never;
     query?: never;
     url: '/api/user-input/resolve';

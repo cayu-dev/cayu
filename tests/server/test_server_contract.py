@@ -12,7 +12,7 @@ pytest.importorskip("sse_starlette")
 from fastapi.testclient import TestClient
 
 from cayu import CayuApp
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.server import create_server
 from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT
 from cayu.server.sse import (
@@ -134,6 +134,9 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     ]
     assert body["sse"]["content_type"] == "text/event-stream"
     assert body["sse"]["event_id_format"] == SSE_LAST_EVENT_ID_FORMAT
+    assert body["sse"]["max_event_id_chars"] == EVENT_ID_MAX_CHARS
+    assert body["sse"]["mutation_id_header"] == "Cayu-Mutation-ID"
+    assert body["sse"]["mutation_acceptance_event_type"] == "server.mutation.accepted"
     assert body["sse"]["replay_start_marker_format"] == SSE_REPLAY_START_MARKER_FORMAT
     assert body["sse"]["unknown_event_marker_behavior"] == "reject"
     assert body["sse"]["event_data_schema"] == "SseEventEnvelope"
@@ -257,6 +260,7 @@ def test_sse_replay_markers_distinguish_events_from_explicit_start() -> None:
     assert parse_last_event_id(":event_1") is None
     assert parse_last_event_id(" session_1:event_1") is None
     assert parse_last_event_id("session_1:event_1\n") is None
+    assert parse_last_event_id(f"session_1:{'e' * (EVENT_ID_MAX_CHARS + 1)}") is None
 
 
 def test_sse_event_frame_limit_rejects_before_serializing_durable_payload(

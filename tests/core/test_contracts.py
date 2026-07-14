@@ -29,6 +29,7 @@ from cayu.artifacts import (
     file_attachment_from_payload,
 )
 from cayu.core import (
+    EVENT_ID_MAX_CHARS,
     AgentSpec,
     Event,
     EventType,
@@ -146,6 +147,21 @@ def test_event_rejects_blank_identity_fields():
             type=EventType.SESSION_STARTED,
             session_id="sess_1",
             environment_name=" ",
+        )
+
+
+def test_event_rejects_ids_beyond_the_public_replay_limit():
+    Event(
+        type=EventType.SESSION_STARTED,
+        session_id="sess_1",
+        id="e" * EVENT_ID_MAX_CHARS,
+    )
+
+    with pytest.raises(ValidationError, match="at most 512 characters"):
+        Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess_1",
+            id="e" * (EVENT_ID_MAX_CHARS + 1),
         )
 
 

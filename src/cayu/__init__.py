@@ -29,7 +29,7 @@ from cayu.artifacts import (
     validate_file_attachment_content_type,
 )
 from cayu.core.agents import Agent, AgentSpec
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -641,6 +641,7 @@ __all__ = [
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "E2B_SANDBOX_ID_MAX_BYTES",
     "EVAL_SCHEMA_VERSION",
+    "EVENT_ID_MAX_CHARS",
     "FILE_ATTACHMENT_TYPE",
     "MAX_PENDING_ACTION_RESULT_BYTES",
     "MCP_PROTOCOL_VERSION",

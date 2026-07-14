@@ -11,9 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 
 _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+EVENT_ID_MAX_CHARS = 512
 
 
 class EventType(StrEnum):
+    SERVER_MUTATION_ACCEPTED = "server.mutation.accepted"
+
     SESSION_STARTED = "session.started"
     SESSION_RESUMED = "session.resumed"
     SESSION_COMPLETED = "session.completed"
@@ -133,7 +136,7 @@ class Event(BaseModel):
     # (`| str` also admits `custom.*` types, which stay plain strings.)
     type: EventType | str
     session_id: str
-    id: str = Field(default_factory=lambda: str(uuid4()))
+    id: str = Field(default_factory=lambda: str(uuid4()), max_length=EVENT_ID_MAX_CHARS)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     agent_name: str | None = None
     environment_name: str | None = None

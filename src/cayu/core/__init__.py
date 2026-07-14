@@ -1,7 +1,7 @@
 """Core Cayu contracts."""
 
 from cayu.core.agents import Agent, AgentSpec
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -17,6 +17,7 @@ from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.core.workflows import Workflow, WorkflowSpec
 
 __all__ = [
+    "EVENT_ID_MAX_CHARS",
     "Agent",
     "AgentSpec",
     "Event",

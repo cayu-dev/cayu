@@ -12,7 +12,7 @@ from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import (
     BaseModel,
@@ -196,6 +196,21 @@ ReplaySafeSessionId = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
     ),
 ]
+MutationIdHeader = Annotated[
+    str | None,
+    Header(
+        alias="Cayu-Mutation-ID",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+        description=(
+            "Client-generated mutation identity used to correlate an ambiguous "
+            "SSE reconnect with its durable server acceptance event. Send the same "
+            "value on the initial mutation and every Last-Event-ID replay request; "
+            "it is a replay correlation key, not permission to repeat the POST."
+        ),
+    ),
+]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
 # Server-entrypoint step budget. The default preserves the historical value while the
 # ceiling matches the runtime's own ``max_steps`` bound (RunRequest/ResumeRequest and the
@@ -237,6 +252,7 @@ _REPLAY_TERMINAL_LINEAGE_EVENT_TYPES = {
     EventType.HOOK_FAILED,
 }
 _REPLAY_POST_TERMINAL_EVENT_TYPES = {
+    EventType.SERVER_MUTATION_ACCEPTED,
     EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
     EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
     EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
@@ -1774,6 +1790,47 @@ def create_router(
 
     optional_auth_context = Depends(_optional_auth_context)
 
+    def _mutation_acceptance_callback(
+        *,
+        mutation_id: str | None,
+        mutation_kind: str,
+        session_id: str,
+        after_accept: Callable[[Event], Awaitable[None]] | None = None,
+    ) -> Callable[[Event], Awaitable[None]] | None:
+        """Compose route bookkeeping with an exact durable mutation boundary."""
+        if mutation_id is None:
+            return after_accept
+
+        async def record_acceptance(first_event: Event) -> None:
+            # Route-owned setup remains part of acceptance. The mutation marker
+            # is deliberately written last so it never claims that a request was
+            # accepted when prerequisite setup failed.
+            if after_accept is not None:
+                await after_accept(first_event)
+            if first_event.session_id != session_id:
+                raise RuntimeError(
+                    "Mutation acceptance event belongs to a different session: "
+                    f"{first_event.session_id}"
+                )
+            await cayu_app.emit_event(
+                Event(
+                    type=EventType.SERVER_MUTATION_ACCEPTED,
+                    session_id=session_id,
+                    agent_name=first_event.agent_name,
+                    environment_name=first_event.environment_name,
+                    workflow_name=first_event.workflow_name,
+                    tool_name=first_event.tool_name,
+                    payload={
+                        "mutation_id": mutation_id,
+                        "mutation_kind": mutation_kind,
+                        "accepted_event_id": first_event.id,
+                        "accepted_event_type": str(first_event.type),
+                    },
+                )
+            )
+
+        return record_acceptance
+
     @router.get("/contract", response_model=ServerContractResponse, dependencies=protected)
     async def get_contract():
         return ServerContractResponse(
@@ -2028,6 +2085,7 @@ def create_router(
         body: RunBody,
         http_request: Request,
         trace_metadata: TraceContextMetadata,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2093,7 +2151,12 @@ def create_router(
             cayu_app.run(request),
             cayu_app=cayu_app,
             session_id=session_id,
-            after_accept=after_accept,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="run",
+                session_id=session_id,
+                after_accept=after_accept,
+            ),
         )
 
     @router.post(
@@ -2106,6 +2169,7 @@ def create_router(
         body: ResumeBody,
         http_request: Request,
         trace_metadata: TraceContextMetadata,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2136,6 +2200,11 @@ def create_router(
             cayu_app.resume(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="resume",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2149,6 +2218,7 @@ def create_router(
         http_request: Request,
         body: InterruptSessionBody | None = None,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2181,6 +2251,11 @@ def create_router(
             cayu_app.interrupt_session(request),
             cayu_app=cayu_app,
             session_id=session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="interrupt",
+                session_id=session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2193,6 +2268,7 @@ def create_router(
         body: ToolApprovalBody,
         http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2226,6 +2302,11 @@ def create_router(
             cayu_app.resolve_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="tool_approval.resolve",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2238,6 +2319,7 @@ def create_router(
         body: ToolApprovalRecoveryBody,
         http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2275,6 +2357,11 @@ def create_router(
             cayu_app.recover_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="tool_approval.recover",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2287,6 +2374,7 @@ def create_router(
         body: ToolRoundRecoveryBody,
         http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2324,6 +2412,11 @@ def create_router(
             cayu_app.recover_tool_round(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="tool_round.recover",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2336,6 +2429,7 @@ def create_router(
         body: UserInputResolveBody,
         http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2370,6 +2464,11 @@ def create_router(
             cayu_app.resolve_user_input(response),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="user_input.resolve",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
@@ -2382,6 +2481,7 @@ def create_router(
         body: UserInputRecoveryBody,
         http_request: Request,
         auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -2420,6 +2520,11 @@ def create_router(
             cayu_app.recover_user_input(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="user_input.recover",
+                session_id=body.session_id,
+            ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 

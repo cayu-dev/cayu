@@ -6,7 +6,7 @@ import json
 from typing import Any, Literal
 
 from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
-from cayu.core.events import Event
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event
 
 SSE_EVENT_DATA_MAX_BYTES = 2 * 1024 * 1024
 SSE_ERROR_TEXT_MAX_BYTES = 512
@@ -254,7 +254,7 @@ def parse_last_event_id(
         return None
     if not event_id:
         return session_id, None
-    if not _valid_sse_marker_component(event_id):
+    if not _valid_sse_marker_component(event_id) or len(event_id) > EVENT_ID_MAX_CHARS:
         return None
     return session_id, event_id
 
