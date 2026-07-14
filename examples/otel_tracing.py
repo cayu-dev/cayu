@@ -52,7 +52,7 @@ async def main() -> None:
         print("Set GEMINI_API_KEY to run this OpenTelemetry tracing example.")
         return
 
-    model = os.environ.get("CAYU_GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.environ.get("CAYU_GEMINI_MODEL", "gemini-3.5-flash")
     root = Path(__file__).resolve().parents[1] / ".examples-workspaces" / "otel-tracing"
     root.mkdir(parents=True, exist_ok=True)
     workspace = LocalWorkspace(root, workspace_id="otel-tracing-demo")
@@ -64,7 +64,7 @@ async def main() -> None:
     )
     app.register_provider(
         ChatCompletionsProvider(
-            name="gemini",
+            name="google",
             api_key_env="GEMINI_API_KEY",
             base_url=GEMINI_BASE_URL,
             document_encoding="image_url",

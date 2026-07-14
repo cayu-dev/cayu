@@ -39,6 +39,7 @@ from cayu import (
     LocalArtifactStore,
     Message,
     MessageRole,
+    ModelCatalog,
     SecretRedactor,
     Task,
     TaskCreate,
@@ -47,6 +48,7 @@ from cayu import (
     ThinkingPart,
     UserInputTool,
     WorkspaceBinding,
+    default_model_catalog,
 )
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
@@ -312,6 +314,24 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["status"] == "completed"
     assert tasks[0]["worker_id"] is None
     assert tasks[0]["lease_expires_at"] is None
+
+
+def test_server_dashboard_accepts_default_model_catalog_config() -> None:
+    app = CayuApp()
+    catalog = default_model_catalog()
+    client = TestClient(
+        create_server(
+            app,
+            dev=True,
+            dashboard_config={"pricingCatalog": catalog},
+        )
+    )
+
+    dashboard = client.get("/cayu/")
+
+    assert dashboard.status_code == 200
+    assert f'"catalog_version":"{catalog.catalog_version}"' in dashboard.text
+    assert '"models":[' in dashboard.text
 
 
 def test_server_run_rejection_before_session_creates_no_task() -> None:
@@ -2164,15 +2184,35 @@ def test_server_exposes_filtered_sessions_summary() -> None:
         ],
         json={
             "pricing": {
-                "prices": [
+                "catalog_version": "test",
+                "generated_at": "2026-07-13",
+                "models": [
                     {
                         "provider_name": "fake",
                         "model": "fake-model",
-                        "input_per_million": "1",
-                        "output_per_million": "2",
-                        "cache_read_input_per_million": "0.25",
+                        "pricing": {
+                            "standard": [
+                                {
+                                    "max_input_tokens": 5,
+                                    "input_per_million": "1",
+                                    "output_per_million": "2",
+                                    "cache_read_input_per_million": "0.25",
+                                },
+                                {
+                                    "max_input_tokens": None,
+                                    "input_per_million": "10",
+                                    "output_per_million": "20",
+                                    "cache_read_input_per_million": "2",
+                                },
+                            ]
+                        },
+                        "provenance": {
+                            "source": "official",
+                            "url": "https://example.com/pricing",
+                            "as_of": "2026-07-13",
+                        },
                     }
-                ]
+                ],
             }
         },
     )
@@ -2235,7 +2275,13 @@ def test_server_exposes_filtered_sessions_summary() -> None:
         }
     ]
     assert body["cost"]["session_count"] == 2
-    assert body["cost"]["total_cost"] == "0.000020"
+    assert body["cost"]["total_cost"] == "0.00020"
+    assert body["cost"]["line_items"][0]["pricing_tier_max_input_tokens"] is None
+    assert body["cost"]["line_items"][0]["pricing_provenance"] == {
+        "source": "official",
+        "url": "https://example.com/pricing",
+        "as_of": "2026-07-13",
+    }
     assert [item["session_id"] for item in body["cost"]["session_costs"]] == [
         "summary_filter_invoice",
         "summary_filter_research",
@@ -2991,7 +3037,8 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "requested_model": "fake-model",
                 "pricing_provider_name": "fake",
                 "pricing_model": "fake-model",
-                "pricing_match": "exact",
+                "pricing_match": "prefix",
+                "pricing_provenance": None,
                 "pricing_tier_max_input_tokens": None,
                 "priced": True,
                 "currency": "USD",
@@ -3011,7 +3058,76 @@ def test_server_exposes_session_cost_estimate() -> None:
     }
 
 
-def test_server_exposes_causal_budget_usage_and_cost() -> None:
+def test_server_cost_accepts_tiered_model_catalog() -> None:
+    app = CayuApp()
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="tiered_cost",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+    catalog = {
+        "catalog_version": "test",
+        "generated_at": "2026-07-13",
+        "models": [
+            {
+                "provider_name": "fake",
+                "model": "fake-model",
+                "pricing": {
+                    "standard": [
+                        {
+                            "max_input_tokens": 5,
+                            "input_per_million": "1",
+                            "output_per_million": "2",
+                            "cache_read_input_per_million": "0.25",
+                        },
+                        {
+                            "max_input_tokens": None,
+                            "input_per_million": "10",
+                            "output_per_million": "20",
+                            "cache_read_input_per_million": "2",
+                        },
+                    ]
+                },
+                "provenance": {
+                    "source": "official",
+                    "url": "https://example.com/pricing",
+                    "as_of": "2026-07-13",
+                },
+            }
+        ],
+    }
+
+    client = TestClient(create_server(app, dev=True))
+    response = client.post(
+        "/api/sessions/tiered_cost/cost",
+        json={"pricing": catalog},
+    )
+    projected_response = client.post(
+        "/api/sessions/tiered_cost/cost",
+        json={
+            "pricing": ModelCatalog.model_validate(catalog)
+            .pricing_catalog()
+            .model_dump(mode="json")
+        },
+    )
+
+    assert response.status_code == 200
+    assert projected_response.status_code == 200
+    assert projected_response.json() == response.json()
+    body = response.json()
+    assert body["total_cost"] == "0.00010"
+    assert body["line_items"][0]["pricing_tier_max_input_tokens"] is None
+    assert body["line_items"][0]["pricing_provenance"] == catalog["models"][0]["provenance"]
+
+
+def test_server_exposes_causal_budget_usage_and_cost_with_tiered_model_catalog() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -3030,19 +3146,36 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
 
     client = TestClient(create_server(app, dev=True))
     usage_response = client.get("/api/causal-budgets/job_shared/usage")
-    pricing_body = {
-        "pricing": {
-            "prices": [
-                {
-                    "provider_name": "fake",
-                    "model": "fake-model",
-                    "input_per_million": "1",
-                    "output_per_million": "2",
-                    "cache_read_input_per_million": "0.25",
-                }
-            ]
-        },
+    catalog = {
+        "catalog_version": "test",
+        "generated_at": "2026-07-13",
+        "models": [
+            {
+                "provider_name": "fake",
+                "model": "fake-model",
+                "pricing": {
+                    "standard": [
+                        {
+                            "max_input_tokens": 5,
+                            "input_per_million": "1",
+                            "output_per_million": "2",
+                        },
+                        {
+                            "max_input_tokens": None,
+                            "input_per_million": "10",
+                            "output_per_million": "20",
+                        },
+                    ]
+                },
+                "provenance": {
+                    "source": "official",
+                    "url": "https://example.com/pricing",
+                    "as_of": "2026-07-13",
+                },
+            }
+        ],
     }
+    pricing_body = {"pricing": catalog}
     cost_response = client.post(
         "/api/causal-budgets/job_shared/cost",
         json=pricing_body,
@@ -3135,7 +3268,15 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
     assert cost_response.json()["session_ids"] == ["causal_parent", "causal_child"]
     assert cost_response.json()["session_count"] == 2
     assert cost_response.json()["model_steps"] == 2
-    assert cost_response.json()["total_cost"] == "0.000020"
+    assert cost_response.json()["total_cost"] == "0.00020"
+    assert all(
+        item["line_items"][0]["pricing_provenance"] == catalog["models"][0]["provenance"]
+        for item in cost_response.json()["session_costs"]
+    )
+    assert all(
+        item["line_items"][0]["pricing_tier_max_input_tokens"] is None
+        for item in cost_response.json()["session_costs"]
+    )
     assert [item["session_id"] for item in cost_response.json()["session_costs"]] == [
         "causal_parent",
         "causal_child",
@@ -3158,7 +3299,7 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
         assert item["events"]["counts_by_type"]["session.completed"] == 1
         assert item["events"]["latest_event"]["type"] == "session.completed"
     assert summary_body["usage"]["usage"]["total_tokens"] == 24
-    assert summary_body["cost"]["total_cost"] == "0.000020"
+    assert summary_body["cost"]["total_cost"] == "0.00020"
 
     missing_summary_response = client.post(
         "/api/causal-budgets/missing/summary",
@@ -3166,6 +3307,24 @@ def test_server_exposes_causal_budget_usage_and_cost() -> None:
     )
     assert missing_summary_response.status_code == 404
     assert missing_summary_response.json() == {"detail": "Causal budget not found"}
+
+
+def test_server_rejects_a_merged_flat_and_model_catalog_pricing_body() -> None:
+    app = CayuApp()
+    client = TestClient(create_server(app, dev=True))
+    ambiguous = {
+        "prices": [],
+        "catalog_version": "test",
+        "generated_at": "2026-07-13",
+        "models": [],
+    }
+
+    response = client.post(
+        "/api/causal-budgets/missing/cost",
+        json={"pricing": ambiguous},
+    )
+
+    assert response.status_code == 422
 
 
 def test_server_session_cost_reports_unpriced_steps() -> None:

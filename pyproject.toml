@@ -16,7 +16,7 @@ dependencies = [
   "certifi>=2024.0",
   "httpx>=0.27",
   "jsonschema>=4.23",
-  "pydantic>=2.8",
+  "pydantic>=2.12",
   "tzdata>=2024.0; sys_platform == 'win32'",
 ]
 
@@ -140,7 +140,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["cayu"]
+known-first-party = ["cayu", "maintenance"]
 
 [tool.ty.environment]
 python-version = "3.11"
@@ -148,7 +148,10 @@ extra-paths = ["src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cayu"]
-artifacts = ["src/cayu/server/dashboard/**"]
+artifacts = [
+  "src/cayu/data/**",
+  "src/cayu/server/dashboard/**",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [

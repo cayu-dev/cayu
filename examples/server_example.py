@@ -100,7 +100,7 @@ def _register_provider(app: CayuApp) -> str:
         from cayu import OpenAIProvider
 
         app.register_provider(OpenAIProvider(), default=True)
-        return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
+        return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.6")
 
     if os.environ.get("ANTHROPIC_API_KEY"):
         from cayu import AnthropicProvider
@@ -113,14 +113,14 @@ def _register_provider(app: CayuApp) -> str:
 
         app.register_provider(
             ChatCompletionsProvider(
-                name="gemini",
+                name="google",
                 api_key_env="GEMINI_API_KEY",
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai",
                 document_encoding="image_url",
             ),
             default=True,
         )
-        return os.environ.get("CAYU_GEMINI_MODEL", "gemini-2.5-flash")
+        return os.environ.get("CAYU_GEMINI_MODEL", "gemini-3.5-flash")
 
     raise RuntimeError(
         "Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY before starting "

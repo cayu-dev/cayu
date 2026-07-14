@@ -139,6 +139,7 @@ from cayu.runtime.budgets import (
     budget_check_from_events,
     budget_check_payload,
     budget_limits_for_session,
+    budget_price,
     budget_reconciliation_payload,
     budget_reservation_payload,
     copy_budget_policy,
@@ -169,6 +170,7 @@ from cayu.runtime.context_counting import (
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
+    ModelCatalog,
     PricingCatalog,
     SessionCostSummary,
     estimate_causal_budget_cost,
@@ -3081,7 +3083,7 @@ class CayuApp:
     async def get_session_cost(
         self,
         session_id: str,
-        pricing: PricingCatalog,
+        pricing: PricingCatalog | ModelCatalog,
         *,
         currency: str = "USD",
     ) -> SessionCostSummary:
@@ -3106,7 +3108,7 @@ class CayuApp:
     async def get_causal_budget_cost(
         self,
         causal_budget_id: str,
-        pricing: PricingCatalog,
+        pricing: PricingCatalog | ModelCatalog,
         *,
         currency: str = "USD",
     ) -> CausalBudgetCostSummary:
@@ -12848,7 +12850,8 @@ def _budget_check_from_stop_decision(
 def _budget_limit_preflight_error(*, session: Session, limit: BudgetLimit) -> str | None:
     if limit.allow_unpriced:
         return None
-    price = limit.pricing.match_price(
+    price = budget_price(
+        limit,
         provider_name=session.provider_name,
         model=session.model,
     )

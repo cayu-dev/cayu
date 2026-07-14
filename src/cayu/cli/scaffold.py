@@ -86,7 +86,7 @@ from tools.greet import GREET_TOOL_NAME
 
 ASSISTANT_AGENT = AgentSpec(
     name="assistant",
-    model="gpt-5.4-mini",
+    model="gpt-5.6-luna",
     system_prompt=f"Use {GREET_TOOL_NAME} when it directly helps the user.",
     workflow_tool_names=(GREET_TOOL_NAME,),
 )

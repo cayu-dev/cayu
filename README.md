@@ -112,7 +112,7 @@ app.register_environment(
 app.register_agent(
     AgentSpec(
         name="builder",
-        model="gpt-5.5",
+        model="gpt-5.6",
         system_prompt="You are a careful coding agent.",
     )
 )
@@ -212,7 +212,7 @@ from cayu import AgentSpec, CayuApp, Message, OpenAIProvider, RunRequest
 
 app = CayuApp()
 app.register_provider(OpenAIProvider(), default=True)  # reads OPENAI_API_KEY
-app.register_agent(AgentSpec(name="assistant", model="gpt-5.4-mini"))
+app.register_agent(AgentSpec(name="assistant", model="gpt-5.6-luna"))
 
 
 async def main() -> None:
@@ -411,9 +411,9 @@ To run commands on your own platform, implement a custom `Runner`: see the
 uv sync --extra dev
 uv run pytest
 uv run pytest tests/providers/test_provider_conformance.py -q
-uv run ruff check src/ tests/ examples/
-uv run ruff format src/ tests/ examples/
-uv run ty check src/cayu examples
+uv run ruff check src/ tests/ examples/ scripts/ maintenance/
+uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
+uv run ty check src/cayu examples maintenance
 ```
 
 The provider conformance command is deterministic and credential-free. It
@@ -510,7 +510,7 @@ environment = Environment(
 
 app.register_environment(environment, default=True)
 app.register_agent(
-    AgentSpec(name="assistant", model="gpt-5.5"),
+    AgentSpec(name="assistant", model="gpt-5.6"),
     tools=[ListKnowledgeTool(), SearchKnowledgeTool(), ReadKnowledgeTool()],
 )
 ```
@@ -776,7 +776,7 @@ follows the OpenAI-SDK convention (it includes the version path; the provider ap
 from cayu import ChatCompletionsProvider
 
 provider = ChatCompletionsProvider(
-    name="gemini",
+    name="google",
     api_key_env="GEMINI_API_KEY",
     base_url="https://generativelanguage.googleapis.com/v1beta/openai",
     document_encoding="image_url",  # Gemini carries PDFs via the image_url part
@@ -805,7 +805,7 @@ from cayu import AgentSpec, AnthropicProvider, CayuApp, Message, OpenAIProvider,
 app = CayuApp()
 app.register_provider(OpenAIProvider(), default=True, model_patterns=["gpt-*", "o*"])
 app.register_provider(AnthropicProvider(), model_patterns=["claude-*"])
-app.register_agent(AgentSpec(name="assistant", model="gpt-5.5"))
+app.register_agent(AgentSpec(name="assistant", model="gpt-5.6"))
 
 async for event in app.run(
     RunRequest(
@@ -1306,8 +1306,12 @@ before it is exposed to the authenticated control plane.
 
 Apps that want the bundled dashboard to estimate cost can inject a pricing
 catalog through `dashboard_config={"pricingCatalog": pricing.model_dump(mode="json")}`.
+For Cayu's reviewed default snapshot, use
+`default_model_catalog().model_dump(mode="json")` as that value so dashboard estimates
+retain context tiers and the configuration is explicitly JSON-compatible.
 The dashboard sends that catalog to summary endpoints when rendering usage
-views. Pricing remains application-owned and is not inferred or fetched by Cayu.
+views. The app still chooses the catalog explicitly; Cayu never fetches prices
+or changes them at runtime.
 
 Local generated agents should keep their runtime portable: put agent
 registration in a `CayuApp` factory and use `create_server(app, dev=True)` only
@@ -1386,7 +1390,7 @@ from cayu import AgentSpec
 app.register_agent(
     AgentSpec(
         name="assistant",
-        model="gpt-5.5",
+        model="gpt-5.6",
         provider_options={
             "openai": {
                 "prompt_cache_key": "tenant-a-agent",
@@ -1416,9 +1420,28 @@ request for that agent. Ordinary provider-backed compaction uses
 applies its own `options` recursively, because that call must extend the cached
 request shape.
 
-Estimate session cost from the same durable usage events by passing your own
-pricing table. Cayu does not ship hardcoded provider prices because those change
-outside the runtime:
+Estimate session cost from the same durable usage events with Cayu's bundled,
+dated snapshot:
+
+```python
+from cayu import default_model_catalog
+
+catalog = default_model_catalog()
+cost = await app.get_session_cost("session_123", catalog)
+
+print(cost.total_cost)
+print(cost.unpriced_model_steps)
+```
+
+The loader is explicit and offline. It reads the snapshot shipped in the installed
+Cayu release; it never contacts providers or updates itself while an application is
+running. Every full catalog record carries its official source URL and verification
+date. The default snapshot covers a deliberately small set of current, tool-capable
+models under provider keys `openai`, `anthropic`, `google`, `vertex`, and `azure`.
+Unknown providers and models remain unpriced rather than being treated as free.
+
+Applications can replace the bundled prices with their own account, region, or
+contract prices:
 
 ```python
 from decimal import Decimal
@@ -1430,7 +1453,6 @@ pricing = PricingCatalog(
         ModelPricing(
             provider_name="openai",
             model="gpt-5.5",
-            match="prefix",
             input_per_million=Decimal("2.00"),
             output_per_million=Decimal("8.00"),
             cache_read_input_per_million=Decimal("0.50"),
@@ -1444,18 +1466,32 @@ print(cost.total_cost)
 print(cost.unpriced_model_steps)
 ```
 
-Cost estimation walks each durable `model.completed` event, matches the
-provider-returned model against the pricing catalog, and falls back to the
-requested model recorded on the step when the provider returns a resolved or
-snapshot model name. A pricing entry can match an exact model name or a provider
-model-name prefix. Missing pricing is reported as unpriced line items instead of
+One-off `ModelPricing` entries default to raw prefix matching, so callers must choose narrow
+stable keys or set `match="exact"` for one literal ID. The bundled catalog uses exact
+canonical model IDs, exact aliases, and explicit narrow `match_prefixes` for known provider
+snapshot forms. For example, the exact `gpt-5.6` alias resolves to `gpt-5.6-sol` without pricing
+`gpt-5.6-mini` or `gpt-5.60`. Anthropic date forms use a narrow `-20` convention, Vertex
+additionally supports `@20` snapshot IDs, and Google numeric revisions use `-00`. This prefix default is a deliberate
+pre-v0.1.0 correction; the matching
+algorithm still prefers an exact match and then the longest prefix. Cost estimation walks each durable
+`model.completed` event and treats the provider-returned model as authoritative. It uses
+the requested model only when the provider reported no resolved model. A pricing entry can
+match an exact model name or a provider model-name prefix. Missing pricing is reported as
+unpriced line items instead of
 being silently treated as free. If cache read/write prices are omitted, Cayu
 falls back to the normal input-token price for those counters; provide explicit
 cache prices when your provider or account charges them differently.
 
+Provider registration names are part of pricing identity. Gemini-compatible providers must be
+registered as `google` to use the bundled Google rows; older applications using `gemini` should
+rename the provider or supply custom prices under that name. Model aliases are exact model keys
+and do not alias provider names. The low-level cost estimators may receive both a model catalog and a
+flat catalog; a same-currency flat entry then acts as the explicit override, and the model catalog
+fills unmatched models. Public app cost and budget APIs normally receive one complete source.
+
 The optional server exposes the same estimate at
-`POST /api/sessions/{session_id}/cost`. The request body supplies the pricing
-catalog because Cayu does not hardcode provider prices:
+`POST /api/sessions/{session_id}/cost`. The request body supplies the selected
+pricing source; clients can send the bundled `ModelCatalog` or an app-owned flat catalog:
 
 ```json
 {
@@ -1479,6 +1515,9 @@ For grouped work-item cost, send the same pricing body to
 `causal_budget_id`, `session_ids`, `session_count`, and the same estimated cost
 fields as session cost summaries, plus `session_costs` for per-session
 breakdown.
+
+See [Model catalog](docs/model-catalog.md) for coverage, provenance, overrides,
+budget use, and the reviewed refresh/release process.
 
 For grouped work-item status plus cost, send the same body to
 `POST /api/causal-budgets/{causal_budget_id}/summary`.
@@ -1508,7 +1547,9 @@ tool-approval continuation requests:
 ```python
 from decimal import Decimal
 
-from cayu import BudgetLimit, Message, RunLimits, RunRequest
+from cayu import BudgetLimit, Message, RunLimits, RunRequest, default_model_catalog
+
+catalog = default_model_catalog()
 
 request = RunRequest(
     agent_name="assistant",
@@ -1523,7 +1564,7 @@ request = RunRequest(
         BudgetLimit(
             scope="session",
             max_estimated_cost=Decimal("0.50"),
-            pricing=pricing,
+            pricing=catalog,
         ),
     ),
 )
@@ -1540,7 +1581,8 @@ enforces a lifetime estimated-cost budget, while `scope="run"` compares only
 estimated cost added during the current invocation.
 
 Budget limits are estimates derived from normalized usage metrics and the
-pricing catalog supplied by your app. They are not provider invoices. By
+pricing source supplied by your app. Passing a `ModelCatalog` retains context tiers;
+passing a flat `PricingCatalog` uses its configured flat rates. They are not provider invoices. By
 default, request-scoped interrupt budgets fail closed when a newly observed
 model step has no matching pricing entry, because Cayu cannot prove that the
 budget is still safe. Request-scoped notify budgets emit `budget.limit_reached`
@@ -1630,7 +1672,7 @@ app = CayuApp(
 )
 ```
 
-App budgets use the same caller-supplied pricing catalog as request
+App budgets use the same caller-supplied pricing source as request
 `BudgetLimit` entries. Rolling windows are UTC timestamp duration windows over
 durable model events, for example "the last hour." Calendar windows evaluate the
 current local `day`, `week`, or `month` for an explicit IANA timezone; days reset
@@ -1691,6 +1733,11 @@ app = CayuApp(
 
 Reservation amounts are application-provided upper bounds, not provider
 guarantees. Set them high enough for the model step you are willing to fund.
+For context-tiered catalogs, Cayu selects the reservation's pricing tier from the
+sum of `max_input_tokens`, `max_cache_read_input_tokens`, and
+`max_cache_write_input_tokens`, then charges those categories at their respective
+rates. Output tokens are charged by the selected tier but do not select an input-context
+tier.
 Reservation limits require matching pricing and cannot use `allow_unpriced=True`.
 Reservation limits also require `action="interrupt"` because reservations are
 hard-cap accounting, not observe-only alerts.
@@ -2039,7 +2086,7 @@ New sessions use the registered agent's default model. Resume uses the session's
 resume_request = ResumeRequest(
     session_id="sess_123",
     messages=[Message.text("user", "Continue with the larger model.")],
-    model="gpt-5.5",
+    model="gpt-5.6",
 )
 ```
 
@@ -2228,13 +2275,13 @@ subagents = SubagentTool(
 )
 
 app.register_agent(
-    AgentSpec(name="builder", model="gpt-5.5"),
+    AgentSpec(name="builder", model="gpt-5.6"),
     tools=[subagents, SubagentResultTool(app.session_store)],
 )
 app.register_agent(
     AgentSpec(
         name="security_reviewer",
-        model="gpt-5.5",
+        model="gpt-5.6",
         system_prompt="Review delegated work and return concrete risks only.",
     )
 )
@@ -2405,7 +2452,7 @@ Automatically inject relevant durable knowledge before each model call:
 from cayu import AgentSpec, KnowledgeInjectionPolicy, RecentTurnsContextPolicy
 
 app.register_agent(
-    AgentSpec(name="assistant", model="gpt-5.5"),
+    AgentSpec(name="assistant", model="gpt-5.6"),
     context_policy=KnowledgeInjectionPolicy(
         RecentTurnsContextPolicy(max_user_turns=10),
         namespace="project:cayu",
@@ -2431,7 +2478,7 @@ Scope tool authority per agent:
 from cayu import AgentSpec, ExecCommandTool, ListFilesTool, ReadFileTool, StaticToolPolicy
 
 app.register_agent(
-    AgentSpec(name="reviewer", model="gpt-5.5"),
+    AgentSpec(name="reviewer", model="gpt-5.6"),
     tools=[ReadFileTool(), ListFilesTool(), ExecCommandTool()],
     tool_policy=StaticToolPolicy(allow=["read_file", "list_files"]),
 )
@@ -2465,7 +2512,7 @@ policy = ParameterConstrainedToolPolicy(
 )
 
 app.register_agent(
-    AgentSpec(name="billing_assistant", model="gpt-5.5"),
+    AgentSpec(name="billing_assistant", model="gpt-5.6"),
     tools=[send_email_tool],
     tool_policy=policy,
 )
@@ -2500,7 +2547,7 @@ policy = TaintAwareToolPolicy(
 )
 
 app.register_agent(
-    AgentSpec(name="billing_assistant", model="gpt-5.5"),
+    AgentSpec(name="billing_assistant", model="gpt-5.6"),
     tools=[read_email_tool, read_pdf_tool, send_email_tool, make_payment_tool],
     tool_policy=policy,
 )

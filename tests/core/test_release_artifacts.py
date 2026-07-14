@@ -24,6 +24,8 @@ def test_validate_sdist_rejects_tests_tree(tmp_path) -> None:
         "README.md": "readme",
         "pyproject.toml": "project",
         "src/cayu/__init__.py": "",
+        "src/cayu/data/__init__.py": "",
+        "src/cayu/data/default_model_catalog.json": "{}",
         "tests/test_leaked.py": "",
     }
     with tarfile.open(sdist, "w:gz") as archive:
@@ -45,6 +47,8 @@ def test_validate_wheel_rejects_unexpected_top_level_paths(tmp_path) -> None:
         "cayu/cli/_targets.py": "",
         "cayu/cli/__init__.py": "",
         "cayu/cli/console.py": "",
+        "cayu/data/__init__.py": "",
+        "cayu/data/default_model_catalog.json": "{}",
         "cayu/guides/authoring.md": "",
         "cayu/guides/diagnostics.md": "",
         "cayu/server/dashboard/index.html": "",

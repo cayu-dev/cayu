@@ -1,0 +1,115 @@
+name: Model catalog refresh
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      verify_all:
+        description: Re-verify every bundled model
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-catalog-refresh
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Cayu and the browser maintenance tool
+        run: |
+          uv sync --frozen
+          npm install --global agent-browser@0.31.1
+          agent-browser install
+      - name: Re-verify official model pages
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          args=()
+          if [[ "${{ inputs.verify_all }}" == "true" ]]; then
+            args+=(--all)
+          fi
+          uv run python -m maintenance.model_catalog.refresh --audit-recommendations "${args[@]}"
+      - name: Validate the candidate snapshot
+        run: uv run python -m maintenance.model_catalog.check --skip-staleness
+      - name: Publish the maintenance report to the workflow summary
+        if: always()
+        run: |
+          if [[ ! -f model-catalog-refresh.md ]]; then
+            printf '## Model catalog refresh\n\nVerification failed before a report was produced. See the failed step logs.\n' > model-catalog-refresh.md
+          fi
+          cat model-catalog-refresh.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve the reviewed candidate and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-catalog-refresh
+          path: |
+            src/cayu/data/default_model_catalog.json
+            model-catalog-refresh.md
+          if-no-files-found: warn
+          retention-days: 1
+
+  freshness-audit:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-catalog-refresh
+          path: .
+      - name: Enforce the wall-clock freshness policy
+        run: uv run python -m maintenance.model_catalog.check
+
+  open-pull-request:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-catalog-refresh
+          path: .
+      - name: Open a reviewed catalog PR when records changed
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          add-paths: src/cayu/data/default_model_catalog.json
+          branch: automation/model-catalog-refresh
+          delete-branch: true
+          commit-message: "chore: refresh bundled model catalog"
+          title: "Refresh bundled model catalog"
+          body-path: model-catalog-refresh.md
+          labels: model-catalog

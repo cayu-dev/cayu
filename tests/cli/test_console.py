@@ -35,6 +35,7 @@ def build_app():
     global build_count
     build_count += 1
     app = CayuApp(enable_logging=False)
+    app.build_count = build_count
     app.factory_cwd = Path.cwd()
     app.secret_token = "do-not-print-this"
     app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
@@ -68,7 +69,8 @@ def build_app():
     assert namespace["app"].factory_cwd == project
     assert launch["cwd"] == project
     assert launch["argv"] == []
-    assert sys.modules["console_project_app"].build_count == 1
+    assert namespace["app"].build_count == 1
+    assert "console_project_app" not in sys.modules
 
     output = capsys.readouterr().out
     assert "Cayu 0.1.0 console" in output

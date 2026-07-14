@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -24,21 +25,28 @@ from cayu import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    Event,
     EventNotOccurred,
     EventOccurred,
     EventType,
     FinalOutputContains,
     LocalWorkspace,
+    MaxEstimatedCost,
     MaxModelSteps,
     MaxToolCalls,
     MaxTotalTokens,
     Message,
+    ModelCatalog,
+    ModelInfo,
+    PriceTier,
+    Provenance,
     RunRequest,
     ScriptedModelProvider,
     SessionCompleted,
     SessionFailed,
     SubagentSpec,
     SubagentTool,
+    TieredPricing,
     Tool,
     ToolArgsContain,
     ToolCalled,
@@ -920,6 +928,71 @@ def test_max_total_tokens_fails_when_usage_missing():
     ctx = _context()
     result = asyncio.run(MaxTotalTokens(100).evaluate(ctx))
     assert result.passed is False
+
+
+def test_max_estimated_cost_accepts_tiered_model_catalog():
+    boundary = 100_000
+    model = ModelInfo(
+        provider_name="fixture",
+        model="tiered-model",
+        context_window=200_000,
+        tool_calling=True,
+        pricing=TieredPricing(
+            standard=(
+                PriceTier(
+                    max_input_tokens=boundary,
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                ),
+                PriceTier(
+                    input_per_million=Decimal("10"),
+                    output_per_million=Decimal("20"),
+                ),
+            )
+        ),
+        provenance=Provenance(
+            source="fixture",
+            url="https://example.test/pricing",
+            as_of="2026-07-13",
+        ),
+    )
+    catalog = ModelCatalog(
+        catalog_version="fixture",
+        generated_at="2026-07-13",
+        models=(model,),
+    )
+    input_tokens = boundary + 1
+    tier = model.pricing_at(input_tokens)
+    maximum = Decimal(input_tokens) * model.pricing.base().input_per_million / Decimal(1_000_000)
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_eval",
+        payload={
+            "usage_metrics": {
+                "provider_name": model.provider_name,
+                "model": model.model,
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "total_tokens": input_tokens,
+            }
+        },
+    )
+    ctx = _context(
+        session=Session(
+            id="sess_eval",
+            agent_name="agent",
+            provider_name=model.provider_name,
+            model=model.model,
+            causal_budget_id="cb",
+        ),
+        events=(event,),
+    )
+
+    result = asyncio.run(MaxEstimatedCost(maximum, pricing=catalog).evaluate(ctx))
+
+    expected = Decimal(input_tokens) * tier.input_per_million / Decimal(1_000_000)
+    assert result.passed is False
+    assert result.metadata["estimated_cost"] == str(expected)
 
 
 def test_tool_not_called_reports_when_tool_was_called():

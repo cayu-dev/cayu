@@ -158,7 +158,7 @@ def _provider_config() -> tuple[str, str]:
     if requested == "openai":
         if not os.environ.get("OPENAI_API_KEY"):
             raise RuntimeError("Set OPENAI_API_KEY or choose CAYU_PROVIDER=anthropic.")
-        return "openai", os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
+        return "openai", os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.6")
     if requested == "anthropic":
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("Set ANTHROPIC_API_KEY or choose CAYU_PROVIDER=openai.")

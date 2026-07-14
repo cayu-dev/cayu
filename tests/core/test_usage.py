@@ -22,6 +22,7 @@ from cayu.runtime import (
     RunRequest,
     SessionBudgetStore,
     SessionIdentity,
+    default_model_catalog,
 )
 from cayu.runtime.budgets import (
     InMemoryBudgetStore,
@@ -2150,7 +2151,7 @@ def test_estimate_session_cost_prices_each_model_step() -> None:
     assert summary.total_cost == Decimal("0.00684")
 
 
-def test_estimate_session_cost_falls_back_to_requested_model() -> None:
+def test_estimate_session_cost_matches_a_provider_dated_model_prefix() -> None:
     events = [
         Event(
             type=EventType.MODEL_COMPLETED,
@@ -2179,7 +2180,7 @@ def test_estimate_session_cost_falls_back_to_requested_model() -> None:
             ModelPricing(
                 provider_name="openai",
                 model="gpt-5.4-mini",
-                match="exact",
+                match="prefix",
                 input_per_million=Decimal("0.25"),
                 output_per_million=Decimal("2.00"),
             ),
@@ -2193,7 +2194,7 @@ def test_estimate_session_cost_falls_back_to_requested_model() -> None:
     assert summary.line_items[0].model == "gpt-5.4-mini-2026-06-01"
     assert summary.line_items[0].requested_model == "gpt-5.4-mini"
     assert summary.line_items[0].pricing_model == "gpt-5.4-mini"
-    assert summary.line_items[0].pricing_match == "exact"
+    assert summary.line_items[0].pricing_match == "prefix"
     assert summary.total_cost == Decimal("0.00045")
 
 
@@ -2715,7 +2716,7 @@ def test_cayu_app_get_session_cost_uses_durable_events() -> None:
             ),
             identity=SessionIdentity(
                 provider_name="openai",
-                model="gpt-5.5",
+                model="gpt-5.6",
                 runtime_name="cayu",
                 runtime_version=None,
             ),
@@ -2760,3 +2761,63 @@ def test_cayu_app_get_session_cost_uses_durable_events() -> None:
     summary = asyncio.run(app.get_session_cost("cost_session", pricing))
 
     assert summary.total_cost == Decimal("0.002")
+
+
+def test_cayu_app_cost_methods_preserve_catalog_projection_semantics() -> None:
+    async def run():
+        app = CayuApp()
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hi")],
+                session_id="tiered_cost_session",
+                causal_budget_id="tiered_cost_job",
+            ),
+            identity=SessionIdentity(
+                provider_name="openai",
+                model="gpt-5.5",
+                runtime_name="cayu",
+                runtime_version=None,
+            ),
+        )
+        await app.session_store.append_event(
+            "tiered_cost_session",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="tiered_cost_session",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "openai",
+                        "model": "gpt-5.6",
+                        "input_tokens": 300_000,
+                        "output_tokens": 0,
+                        "total_tokens": 300_000,
+                        "reasoning_output_tokens": 0,
+                        "cache": {
+                            "read_tokens": 0,
+                            "write_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "uncached_input_tokens": 300_000,
+                        },
+                    }
+                },
+            ),
+        )
+        catalog = default_model_catalog()
+        projected = catalog.pricing_catalog()
+        return (
+            await app.get_session_cost("tiered_cost_session", catalog),
+            await app.get_session_cost("tiered_cost_session", projected),
+            await app.get_causal_budget_cost("tiered_cost_job", catalog),
+            await app.get_causal_budget_cost("tiered_cost_job", projected),
+        )
+
+    direct_session, projected_session, direct_causal, projected_causal = asyncio.run(run())
+
+    assert projected_session == direct_session
+    assert projected_causal == direct_causal
+    model = default_model_catalog().resolve(provider_name="openai", model="gpt-5.6")
+    assert model is not None
+    expected = model.pricing_at(300_000).input_per_million * Decimal("0.3")
+    assert direct_session.total_cost == expected
+    assert direct_session.line_items[0].pricing_provenance is not None

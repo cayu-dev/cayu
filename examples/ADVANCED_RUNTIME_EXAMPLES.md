@@ -89,7 +89,7 @@ ANTHROPIC_API_KEY=... uv run python -m examples.cache_aware_research_council.app
 
 Replace the module name to run another example. Defaults can be overridden with
 `CAYU_GEMINI_MODEL`, `CAYU_OPENAI_MODEL`, and `CAYU_ANTHROPIC_MODEL`. The current
-defaults are `gemini-3.1-flash-lite`, `gpt-5.4-mini`, and
+defaults are `gemini-3.1-flash-lite`, `gpt-5.6-luna`, and
 `claude-sonnet-4-6`.
 
 `prompt_cache_compaction` is intentionally Anthropic-only in live mode because

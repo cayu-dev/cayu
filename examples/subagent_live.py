@@ -174,7 +174,7 @@ def _provider_name() -> str:
 
 def _model(provider_name: str) -> str:
     if provider_name == "openai":
-        return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.5")
+        return os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.6")
     return os.environ.get("CAYU_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 

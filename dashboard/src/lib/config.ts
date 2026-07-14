@@ -1,9 +1,9 @@
-import type { PricingCatalog } from "./generated/server-api"
+import type { ModelCatalog, PricingCatalog } from "./generated/server-api"
 
 export type DashboardConfig = {
   basePath: string
   apiBaseUrl: string
-  pricingCatalog: PricingCatalog | null
+  pricingCatalog: PricingCatalog | ModelCatalog | null
 }
 
 declare global {

@@ -52,7 +52,7 @@ OPENAI_API_KEY=sk-...  GITHUB_TOKEN=ghp-... \
   PYTHONPATH=src python examples/github_pr_reviewer/pr_reviewer.py --live owner/repo#123
 ```
 
-Set `CAYU_MODEL` to override the model (defaults: `gpt-5.4-mini` for OpenAI,
+Set `CAYU_MODEL` to override the model (defaults: `gpt-5.6-luna` for OpenAI,
 `claude-sonnet-4-6` for Anthropic).
 
 To run the webhook trigger instead of a one-shot review, serve

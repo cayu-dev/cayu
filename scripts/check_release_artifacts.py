@@ -15,6 +15,8 @@ _SDIST_REQUIRED = {
     "README.md",
     "pyproject.toml",
     "src/cayu/__init__.py",
+    "src/cayu/data/__init__.py",
+    "src/cayu/data/default_model_catalog.json",
 }
 _SDIST_ALLOWED_ROOTS = {
     ".gitignore",
@@ -30,6 +32,8 @@ _WHEEL_REQUIRED = {
     "cayu/cli/_targets.py",
     "cayu/cli/__init__.py",
     "cayu/cli/console.py",
+    "cayu/data/__init__.py",
+    "cayu/data/default_model_catalog.json",
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
     "cayu/server/dashboard/index.html",

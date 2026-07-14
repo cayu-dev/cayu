@@ -111,14 +111,18 @@ from cayu.runtime import (
     KnowledgeInjectionPolicy,
     LoopPolicy,
     MessageWindowContextPolicy,
+    ModelCatalog,
     ModelCompactor,
+    ModelInfo,
     ModelPricing,
     NativeStructuredOutputUnsupported,
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
     PendingToolApproval,
+    PriceTier,
     PricingCatalog,
     PromptCacheCompactor,
+    Provenance,
     RecentTurnsContextPolicy,
     RequiredAllowlistRule,
     ResolutionActor,
@@ -139,6 +143,7 @@ from cayu.runtime import (
     TaintAwareToolPolicy,
     TaskCreate,
     TaskStatus,
+    TieredPricing,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -7664,6 +7669,98 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
     assert reconciliations[0].payload["actual_amount"] == "0.25"
     assert reconciliations[0].payload["reason"] == "model completed"
     assert EventType.BUDGET_RESERVATION_RELEASED not in [event.type for event in events]
+
+
+def test_cayu_app_tiered_causal_reservation_counts_cached_input_for_tier() -> None:
+    class AnthropicBudgetProvider(FakeProvider):
+        name = "anthropic"
+
+    provider = AnthropicBudgetProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 100_000,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 150_000,
+                    },
+                }
+            )
+        ]
+    )
+    catalog = ModelCatalog(
+        catalog_version="test",
+        generated_at="2026-01-01",
+        models=(
+            ModelInfo(
+                provider_name="anthropic",
+                model="claude-test",
+                pricing=TieredPricing(
+                    standard=(
+                        PriceTier(
+                            max_input_tokens=200_000,
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("2"),
+                            cache_read_input_per_million=Decimal("0.1"),
+                        ),
+                        PriceTier(
+                            max_input_tokens=None,
+                            input_per_million=Decimal("10"),
+                            output_per_million=Decimal("20"),
+                            cache_read_input_per_million=Decimal("1"),
+                        ),
+                    )
+                ),
+                provenance=Provenance(
+                    source="official",
+                    url="https://example.test/pricing",
+                    as_of="2026-01-01",
+                ),
+            ),
+        ),
+    )
+    app = CayuApp(
+        session_store=InMemorySessionStore(),
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="causal",
+                    key="job-tiered",
+                    max_estimated_cost=Decimal("2"),
+                    pricing=catalog,
+                    reservation=BudgetReservation(
+                        max_input_tokens=100_000,
+                        max_output_tokens=0,
+                        max_cache_read_input_tokens=150_000,
+                    ),
+                ),
+            )
+        ),
+        budget_ledger=InMemoryBudgetLedger(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="claude-test-2026-07-01"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_tiered_cache_reservation",
+                causal_budget_id="job-tiered",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    reserved = next(event for event in events if event.type == EventType.BUDGET_RESERVED)
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    reconciled = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+    assert reserved.payload["requested"] == "1.15"
+    assert completed.payload["usage_metrics"]["input_tokens"] == 250_000
+    assert reconciled.payload["actual_amount"] == "1.15"
+    assert reconciled.payload["released_amount"] == "0"
 
 
 def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unavailable():

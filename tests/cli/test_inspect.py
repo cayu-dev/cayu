@@ -20,7 +20,9 @@ def test_inspect_json_discovers_nested_project_and_builds_factory_once(
         encoding="utf-8",
     )
     (project / "inspect_project.py").write_text(
-        """from cayu import (
+        """from pathlib import Path
+
+from cayu import (
     AgentSpec,
     CayuApp,
     Environment,
@@ -49,6 +51,7 @@ build_count = 0
 def build_app():
     global build_count
     build_count += 1
+    Path("build-count.txt").write_text(str(build_count), encoding="utf-8")
     app = CayuApp(enable_logging=False)
     app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
     app.register_agent(AgentSpec(name="reviewer", model="test-model"), tools=[ReviewTool()])
@@ -74,7 +77,8 @@ def build_app():
         output["agents"][0]["tools"][0]["implementation_provenance"]["location"]
         == "inspect_project.py"
     )
-    assert sys.modules["inspect_project"].build_count == 1
+    assert (project / "build-count.txt").read_text(encoding="utf-8") == "1"
+    assert "inspect_project" not in sys.modules
 
 
 def test_inspect_subject_filter_and_missing_subject_use_structured_contract(

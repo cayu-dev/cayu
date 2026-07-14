@@ -164,7 +164,7 @@ def _app(*, workspace: LocalWorkspace, runner: LocalRunner) -> CayuApp:
     app = CayuApp(enable_logging=False)
     app.register_provider(
         ChatCompletionsProvider(
-            name="gemini",
+            name="google",
             api_key_env="GEMINI_API_KEY",
             base_url=GEMINI_BASE_URL,
             document_encoding="image_url",

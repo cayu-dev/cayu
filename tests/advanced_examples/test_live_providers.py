@@ -20,7 +20,7 @@ from cayu import AnthropicProvider, ChatCompletionsProvider, OpenAIProvider
             ChatCompletionsProvider,
             "gemini-3.1-flash-lite",
         ),
-        ("openai", "OPENAI_API_KEY", "CAYU_OPENAI_MODEL", OpenAIProvider, "gpt-5.4-mini"),
+        ("openai", "OPENAI_API_KEY", "CAYU_OPENAI_MODEL", OpenAIProvider, "gpt-5.6-luna"),
         (
             "anthropic",
             "ANTHROPIC_API_KEY",

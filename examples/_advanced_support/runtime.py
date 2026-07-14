@@ -264,7 +264,7 @@ def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]
             raise RuntimeError("Set GEMINI_API_KEY to run the live Gemini examples.")
         return (
             ChatCompletionsProvider(
-                name="gemini",
+                name="google",
                 api_key_env="GEMINI_API_KEY",
                 base_url=GEMINI_BASE_URL,
                 document_encoding="image_url",
@@ -276,7 +276,7 @@ def live_provider(provider_name: str | None = None) -> tuple[ModelProvider, str]
     if selected == "openai":
         if not os.environ.get("OPENAI_API_KEY"):
             raise RuntimeError("Set OPENAI_API_KEY to run the live OpenAI examples.")
-        return OpenAIProvider(), os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.4-mini")
+        return OpenAIProvider(), os.environ.get("CAYU_OPENAI_MODEL", "gpt-5.6-luna")
     if selected == "anthropic":
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("Set ANTHROPIC_API_KEY to run the live Anthropic examples.")

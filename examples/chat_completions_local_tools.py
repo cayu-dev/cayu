@@ -52,7 +52,7 @@ async def main() -> None:
         print("Set GEMINI_API_KEY to run this live Chat Completions example.")
         return
 
-    model = os.environ.get("CAYU_GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.environ.get("CAYU_GEMINI_MODEL", "gemini-3.5-flash")
     root = (
         Path(__file__).resolve().parents[1]
         / ".examples-workspaces"
@@ -67,7 +67,7 @@ async def main() -> None:
     app = CayuApp()
     app.register_provider(
         ChatCompletionsProvider(
-            name="gemini",
+            name="google",
             api_key_env="GEMINI_API_KEY",
             base_url=GEMINI_BASE_URL,
             document_encoding="image_url",

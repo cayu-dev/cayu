@@ -16,3 +16,5 @@ build/
 .examples-workspaces/
 node_modules/
 dashboard/dist/
+model-catalog-refresh.md
+.claude/worktrees/

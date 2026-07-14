@@ -806,7 +806,7 @@ Normal agent runs accept stable provider options on `AgentSpec`:
 ```python
 AgentSpec(
     name="assistant",
-    model="gpt-5.5",
+    model="gpt-5.6",
     provider_options={
         "openai": {
             "prompt_cache_key": "tenant-a-agent",
@@ -845,11 +845,14 @@ are included. The optional server exposes this grouped view at
 `GET /api/causal-budgets/{causal_budget_id}/usage`.
 
 `PricingCatalog` and `ModelPricing` estimate session cost from durable
-`model.completed` events. Pricing is caller supplied; Cayu does not hardcode
-provider prices. `CayuApp.get_session_cost(session_id, pricing)` walks each
+`model.completed` events. Cayu ships a dated `default_model_catalog()` snapshot,
+which callers can pass directly for context-tier pricing; callers can also supply a
+flat `PricingCatalog`. Loading the default is offline and never refreshes data at
+runtime. `CayuApp.get_session_cost(session_id, pricing)` walks each
 model step, matches the provider-returned model to exact or prefix pricing
-entries, then falls back to the requested model recorded on the step when the
-provider returned a resolved/snapshot name. It returns a `SessionCostSummary`
+entries using raw prefix semantics. The bundled catalog keeps its canonical entries exact
+and declares narrow snapshot prefixes separately. The provider-returned model is authoritative; the
+requested model is consulted only when the provider reported no model identity. It returns a `SessionCostSummary`
 with per-step `CostLineItem` records. Missing usage or missing pricing is
 reported as unpriced line items so dashboards and operators can see estimation
 gaps instead of silently treating them as free. If cache read/write prices are
@@ -964,8 +967,10 @@ this primitive only after the app has supplied pricing appropriate for its
 deployment.
 
 `RunLimits` provides hard token/tool/time stop controls for runtime calls.
-`BudgetLimit` provides estimated-cost stop controls backed by a caller-supplied
-`PricingCatalog`. Request-scoped `BudgetLimit` entries can be attached through
+`BudgetLimit` provides estimated-cost stop controls backed by an explicitly selected
+`PricingCatalog` or tier-aware `ModelCatalog`. Pass `default_model_catalog()` directly so
+context-tier pricing is selected from each completed model step. Request-scoped
+`BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
 `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `scope="session"` is
 the default: token, tool-call, and cost limits are session-cumulative because
@@ -1041,7 +1046,11 @@ Strict concurrent hard caps use `BudgetLimit.reservation` plus a
 `BudgetLedger`. A reservation declares the maximum input, output, cache-read,
 and cache-write tokens the application is willing to fund for one provider step.
 Before the provider call, Cayu prices that worst-case step with the same
-`PricingCatalog` and atomically reserves it in the ledger. Accepted reservations
+pricing source and atomically reserves it in the ledger. For a tiered `ModelCatalog`,
+the input-context tier is selected from maximum input plus maximum cache-read and
+cache-write input; each category is then charged at its corresponding rate. Maximum
+output is charged at that tier's output rate but does not select the input-context tier.
+Accepted reservations
 emit `budget.reserved`; failed reservations emit `budget.reservation_failed`,
 then `budget.limit_reached`, and stop before the provider request. After
 `model.completed`, Cayu reconciles the reservation to actual normalized usage
@@ -1963,7 +1972,7 @@ environment = Environment(
 
 app.register_environment(environment, default=True)
 app.register_agent(
-    AgentSpec(name="assistant", model="gpt-5.5"),
+    AgentSpec(name="assistant", model="gpt-5.6"),
     tools=[ListKnowledgeTool(), SearchKnowledgeTool(), ReadKnowledgeTool()],
 )
 ```

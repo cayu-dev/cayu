@@ -76,5 +76,5 @@ def build_provider() -> tuple[object, str]:
     if os.environ.get("OPENAI_API_KEY"):
         from cayu import OpenAIProvider
 
-        return OpenAIProvider(), os.environ.get("CAYU_MODEL", "gpt-5.4-mini")
+        return OpenAIProvider(), os.environ.get("CAYU_MODEL", "gpt-5.6-luna")
     raise RuntimeError("Set ANTHROPIC_API_KEY or OPENAI_API_KEY to run a live review.")

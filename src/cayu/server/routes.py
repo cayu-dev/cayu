@@ -54,7 +54,12 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
-from cayu.runtime.costs import CausalBudgetCostSummary, PricingCatalog, SessionCostSummary
+from cayu.runtime.costs import (
+    CausalBudgetCostSummary,
+    ModelCatalog,
+    PricingCatalog,
+    SessionCostSummary,
+)
 from cayu.runtime.costs import (
     estimate_causal_budget_cost as build_causal_budget_cost_summary,
 )
@@ -800,12 +805,12 @@ class UpdateSessionMetadataBody(BaseModel):
 
 
 class SessionCostBody(BaseModel):
-    pricing: PricingCatalog
+    pricing: PricingCatalog | ModelCatalog
     currency: NonBlankString = "USD"
 
 
 class SessionsSummaryBody(BaseModel):
-    pricing: PricingCatalog | None = None
+    pricing: PricingCatalog | ModelCatalog | None = None
     currency: NonBlankString = "USD"
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -99,12 +100,15 @@ def test_eval_run_imports_target_from_cwd_without_leaking_path(
     first_project.mkdir()
     second_project.mkdir()
     (first_project / f"{module_name}.py").write_text(
-        """calls = 0
+        """from pathlib import Path
+
+calls = 0
 
 
 def build():
     global calls
     calls += 1
+    Path("build-count.txt").write_text(str(calls), encoding="utf-8")
     return object()
 """,
         encoding="utf-8",
@@ -117,7 +121,8 @@ def build():
 
     assert main(["eval", "run", f"{module_name}:build"]) == 1
     assert "Eval target must return EvalPlan" in capsys.readouterr().err
-    assert vars(sys.modules[module_name])["calls"] == 1
+    assert (first_project / "build-count.txt").read_text(encoding="utf-8") == "1"
+    assert module_name not in sys.modules
     assert sys.path == original_path
 
     sys.modules.pop(module_name, None)
@@ -142,10 +147,16 @@ def test_eval_run_prioritizes_preexisting_cwd_path_and_restores_order(
         encoding="utf-8",
     )
     (project / f"{module_name}.py").write_text(
-        """import sys
+        """import json
+import sys
+from pathlib import Path
 
 source = "local"
 import_path = list(sys.path)
+Path("import-state.json").write_text(
+    json.dumps({"source": source, "import_path": import_path}),
+    encoding="utf-8",
+)
 
 
 def build():
@@ -166,12 +177,12 @@ def build():
 
     assert main(["eval", "run", f"{module_name}:build"]) == 1
     assert "Eval target must return EvalPlan" in capsys.readouterr().err
-    loaded = vars(sys.modules[module_name])
+    loaded = json.loads((project / "import-state.json").read_text(encoding="utf-8"))
     assert loaded["source"] == "local"
     assert loaded["import_path"][0] == cwd
     assert loaded["import_path"].count(cwd) == 1
     assert sys.path == existing_path
-    sys.modules.pop(module_name, None)
+    assert module_name not in sys.modules
 
 
 def test_eval_run_reports_clear_target_resolution_errors(

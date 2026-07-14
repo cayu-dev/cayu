@@ -21,7 +21,15 @@ from pydantic import (
 
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
-from cayu.runtime.costs import PricingCatalog, SessionCostSummary, estimate_session_cost
+from cayu.runtime.costs import (
+    ModelCatalog,
+    ModelPricing,
+    PricingCatalog,
+    PricingSource,
+    SessionCostSummary,
+    estimate_session_cost,
+    pricing_source_price,
+)
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
 BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
@@ -155,7 +163,7 @@ class BudgetLimit(BaseModel):
 
     scope: BudgetScope = "session"
     max_estimated_cost: Decimal = Field(gt=0)
-    pricing: PricingCatalog
+    pricing: PricingCatalog | ModelCatalog
     currency: str = "USD"
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     key: str | None = None
@@ -1040,7 +1048,7 @@ def _budget_preflight_error(
     provider_name: str | None,
     model: str | None,
 ) -> str | None:
-    price = limit.pricing.match_price(provider_name=provider_name, model=model)
+    price = budget_price(limit, provider_name=provider_name, model=model)
     if price is None:
         return f"Budget cannot be verified because {provider_name}/{model} has no matching pricing."
     if price.currency.upper() != limit.currency.upper():
@@ -1115,7 +1123,18 @@ def _budget_reservation_amount(
 ) -> Decimal:
     if limit.reservation is None:
         raise ValueError("Budget limit does not define a reservation policy.")
-    price = limit.pricing.match_price(provider_name=provider_name, model=model)
+    reservation = limit.reservation
+    reserved_input_tokens = (
+        reservation.max_input_tokens
+        + reservation.max_cache_read_input_tokens
+        + reservation.max_cache_write_input_tokens
+    )
+    price = budget_price(
+        limit,
+        provider_name=provider_name,
+        model=model,
+        input_tokens=reserved_input_tokens,
+    )
     if price is None:
         raise ValueError(f"Budget reservation cannot be priced for {provider_name}/{model}.")
     if price.currency.upper() != limit.currency.upper():
@@ -1132,7 +1151,6 @@ def _budget_reservation_amount(
         if price.cache_write_input_per_million is not None
         else price.input_per_million
     )
-    reservation = limit.reservation
     return (
         _token_cost(reservation.max_input_tokens, price.input_per_million)
         + _token_cost(reservation.max_output_tokens, price.output_per_million)
@@ -1143,6 +1161,22 @@ def _budget_reservation_amount(
 
 def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
     return Decimal(tokens) * price_per_million / _TOKENS_PER_MILLION
+
+
+def budget_price(
+    limit: BudgetLimit,
+    *,
+    provider_name: str | None,
+    model: str | None,
+    input_tokens: int = 0,
+) -> ModelPricing | None:
+    source: PricingSource = limit.pricing
+    return pricing_source_price(
+        source,
+        provider_name=provider_name,
+        model=model,
+        input_tokens=input_tokens,
+    )
 
 
 def _ledger_used_amount(

@@ -77,7 +77,7 @@ async def _build_app(provider_name: str) -> tuple[CayuApp, Any]:
             raise SystemExit("Set OPENAI_API_KEY to run the live OpenAI workflow example.")
         provider = OpenAIProvider()
         app.register_provider(provider, default=True)
-        app.register_agent(AgentSpec(name="summarizer", model="gpt-5.4-mini"))
+        app.register_agent(AgentSpec(name="summarizer", model="gpt-5.6-luna"))
         return app, provider
     raise SystemExit("CAYU_WORKFLOW_PROVIDER must be scripted or openai.")
 

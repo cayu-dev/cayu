@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -22,8 +23,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --python 3.11
-      - run: uv run ruff check src/ tests/ examples/ scripts/
-      - run: uv run ruff format --check src/ tests/ examples/ scripts/
+      - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
+      - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
 
   typecheck:
     name: Type diagnostics (ty)
@@ -34,7 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --extra server --python 3.11
-      - run: uv run ty check src/cayu examples
+      - run: uv run ty check src/cayu examples maintenance
 
   test:
     name: Test (Python 3.14)
@@ -85,6 +86,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
+      # PR and main CI must be deterministic. Freshness is wall-clock policy enforced by
+      # scheduled maintenance and release-tag validation; this check validates the committed
+      # artifact without making an unchanged branch fail as time passes.
+      - run: uv run python -m maintenance.model_catalog.check --skip-staleness
+      - name: Enforce freshness for release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: uv run python -m maintenance.model_catalog.check
       - run: uv build --out-dir dist/first
       - run: uv build --out-dir dist/second
       - name: Check reproducible archives
@@ -94,7 +102,26 @@ jobs:
       - run: uv run python scripts/check_release_artifacts.py dist/first/*
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
-      - run: .release-venv/bin/python -c "import cayu; assert cayu.__name__ == 'cayu'"
+      - name: Check bundled model catalog from the installed wheel
+        run: |
+          .release-venv/bin/python - <<'PY'
+          import cayu
+
+          catalog = cayu.default_model_catalog()
+          assert cayu.__name__ == "cayu"
+          assert catalog.models
+          assert catalog.pricing_catalog().prices
+          for model in catalog.models:
+              assert catalog.match(
+                  provider_name=model.provider_name,
+                  model=model.model,
+              ) == model
+              for prefix in model.match_prefixes:
+                  assert catalog.resolve(
+                      provider_name=model.provider_name,
+                      model=f"{prefix}fixture",
+                  ) == model
+          PY
       - name: Check built-wheel authoring contract
         run: |
           uv pip install --python .release-venv/bin/python pytest

@@ -405,7 +405,7 @@ from tools.{tool_name} import {tool_name_constant}
 
 {agent_constant} = AgentSpec(
     name="{name}",
-    model="gpt-5.4-mini",
+    model="gpt-5.6-luna",
     system_prompt=f"Use {{{tool_name_constant}}} when it directly answers the user's request.",
     workflow_tool_names=({tool_name_constant},),
 )

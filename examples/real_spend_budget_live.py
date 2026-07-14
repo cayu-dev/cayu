@@ -26,7 +26,7 @@ from cayu import (
 from cayu.providers import ModelProvider, OpenAIProvider
 
 PROVIDER_NAME = "openai"
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-5.6-luna"
 MAX_INPUT_TOKENS = 1_024
 MAX_OUTPUT_TOKENS = 16
 OPENAI_PROVIDER_OPTIONS = {"openai": {"max_output_tokens": MAX_OUTPUT_TOKENS}}
