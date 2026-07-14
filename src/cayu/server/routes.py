@@ -126,9 +126,18 @@ from cayu.server.contracts import (
     UsageBreakdownItem,
 )
 from cayu.server.sse import (
+    SSE_OBSERVER_MAX_BYTES,
+    SSE_OBSERVER_MAX_FRAMES,
+    SSE_REPLAY_PAGE_EVENTS,
+    SSE_SEND_TIMEOUT_SECONDS,
+    SseErrorCode,
+    SseErrorKind,
+    SseEventFrameTooLargeError,
+    SseObserverLaggedError,
     error_to_sse_message,
     event_to_sse_message,
     parse_last_event_id,
+    sse_message_data_bytes,
 )
 from cayu.storage import (
     KnowledgeChunk,
@@ -227,7 +236,43 @@ async def _fail_task_on_prestream_error(
         raise
 
 
-def _detached_event_stream_response(event_stream: AsyncIterator[Event]) -> EventSourceResponse:
+def _redacted_stream_error_text(cayu_app: Any, error: BaseException) -> str:
+    """Return a secret-redacted error string, or a non-sensitive fallback."""
+    fallback = f"{type(error).__name__}: stream failed."
+    try:
+        redacted = cayu_app.redact_json(str(error))
+    except Exception:
+        return fallback
+    if type(redacted) is not str:
+        return fallback
+    return redacted
+
+
+def _stream_error_sse_message(
+    cayu_app: Any,
+    error: BaseException,
+    *,
+    kind: SseErrorKind,
+    code: SseErrorCode,
+    retryable: bool,
+    session_id: str,
+) -> dict[str, str]:
+    return error_to_sse_message(
+        error,
+        kind=kind,
+        code=code,
+        retryable=retryable,
+        session_id=session_id,
+        error_text=_redacted_stream_error_text(cayu_app, error),
+    )
+
+
+def _detached_event_stream_response(
+    event_stream: AsyncIterator[Event],
+    *,
+    cayu_app: Any,
+    session_id: str,
+) -> EventSourceResponse:
     """Run ``event_stream`` to completion in a detached task; stream it as an observer.
 
     The run is driven by the pump task, not by the SSE consumer: a client disconnect
@@ -236,34 +281,141 @@ def _detached_event_stream_response(event_stream: AsyncIterator[Event]) -> Event
     failure surfaces as a terminal structured ``error`` frame instead of an aborted
     connection.
     """
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    # Reserve one slot for the terminal done/error signal in addition to the
+    # advertised data-frame window. A producer that emits exactly the maximum
+    # number of data frames must still be able to close cleanly.
+    queue: asyncio.Queue[tuple[str, Any, int]] = asyncio.Queue(maxsize=SSE_OBSERVER_MAX_FRAMES + 1)
+    queued_bytes = 0
+    queued_event_frames = 0
+    observer_accepting = True
+    observer_terminal = False
+
+    def discard_queued_items() -> None:
+        nonlocal queued_bytes, queued_event_frames
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        queued_bytes = 0
+        queued_event_frames = 0
+
+    def force_observer_error(item: BaseException) -> None:
+        nonlocal observer_terminal
+        if not observer_accepting or observer_terminal:
+            return
+        observer_terminal = True
+        discard_queued_items()
+        queue.put_nowait(("observer_error", item, 0))
+
+    def observer_capacity_exceeded(kind: str, data_bytes: int) -> bool:
+        return (
+            (kind == "event" and queued_event_frames >= SSE_OBSERVER_MAX_FRAMES)
+            or queue.full()
+            or queued_bytes + data_bytes > SSE_OBSERVER_MAX_BYTES
+        )
+
+    async def enqueue(
+        kind: str,
+        item: Any,
+        *,
+        data_bytes: int = 0,
+        terminal: bool = False,
+    ) -> None:
+        nonlocal observer_terminal, queued_bytes, queued_event_frames
+        if not observer_accepting or observer_terminal:
+            return
+        if observer_capacity_exceeded(kind, data_bytes):
+            # A synchronous event source can produce a full window without an
+            # await. Give an already-running observer one scheduling turn to
+            # consume queued work before deciding that it has actually lagged.
+            # This does not wait for a slow network client or backpressure the
+            # detached runtime beyond that single cooperative handoff.
+            await asyncio.sleep(0)
+            if not observer_accepting or observer_terminal:
+                return
+        if observer_capacity_exceeded(kind, data_bytes):
+            force_observer_error(
+                SseObserverLaggedError(
+                    "The live observer fell behind its bounded buffer; "
+                    "reconnect from the last received event or use durable history."
+                )
+            )
+            return
+        queue.put_nowait((kind, item, data_bytes))
+        queued_bytes += data_bytes
+        if kind == "event":
+            queued_event_frames += 1
+        if terminal:
+            observer_terminal = True
 
     async def pump() -> None:
         try:
             async for event in event_stream:
-                queue.put_nowait(("event", event))
-        except BaseException as exc:
-            queue.put_nowait(("error", exc))
-            if not isinstance(exc, Exception):
-                raise
+                if not observer_accepting or observer_terminal:
+                    continue
+                try:
+                    message = event_to_sse_message(event)
+                except SseEventFrameTooLargeError as exc:
+                    await enqueue("observer_error", exc, terminal=True)
+                    continue
+                await enqueue(
+                    "event",
+                    message,
+                    data_bytes=sse_message_data_bytes(message),
+                )
+        except asyncio.CancelledError:
+            await enqueue("done", None, terminal=True)
+            raise
+        except Exception as exc:
+            await enqueue("runtime_error", exc, terminal=True)
+        except BaseException:
+            await enqueue("done", None, terminal=True)
+            raise
         else:
-            queue.put_nowait(("done", None))
+            await enqueue("done", None, terminal=True)
 
     pump_task = asyncio.create_task(pump())
     _detached_event_pumps.add(pump_task)
     pump_task.add_done_callback(_detached_event_pumps.discard)
 
     async def observe() -> AsyncIterator[dict[str, str]]:
-        while True:
-            kind, item = await queue.get()
-            if kind == "event":
-                yield event_to_sse_message(item)
-                continue
-            if kind == "error":
-                yield error_to_sse_message(item)
-            return
+        nonlocal observer_accepting, queued_bytes, queued_event_frames
+        try:
+            while True:
+                kind, item, data_bytes = await queue.get()
+                queued_bytes -= data_bytes
+                if kind == "event":
+                    queued_event_frames -= 1
+                    yield item
+                    continue
+                if kind == "runtime_error":
+                    yield _stream_error_sse_message(
+                        cayu_app,
+                        item,
+                        kind="runtime",
+                        code="runtime_failed",
+                        retryable=False,
+                        session_id=session_id,
+                    )
+                    return
+                if kind == "observer_error":
+                    frame_too_large = isinstance(item, SseEventFrameTooLargeError)
+                    yield _stream_error_sse_message(
+                        cayu_app,
+                        item,
+                        kind="observer",
+                        code=("event_frame_too_large" if frame_too_large else "observer_lagged"),
+                        retryable=not frame_too_large,
+                        session_id=session_id,
+                    )
+                    return
+                return
+        finally:
+            observer_accepting = False
+            discard_queued_items()
 
-    return EventSourceResponse(observe())
+    return EventSourceResponse(observe(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
 
 
 class RunBody(BaseModel):
@@ -1352,32 +1504,51 @@ def create_router(
             loop = asyncio.get_running_loop()
             idle_deadline = loop.time() + replay_idle_timeout_s
             poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
+
             while True:
                 page = await session_store.query_events(
                     EventQuery(
                         session_id=session_id,
                         after_sequence=after_sequence,
-                        limit=_EVENT_PAGE_LIMIT_MAX,
+                        limit=SSE_REPLAY_PAGE_EVENTS,
                     )
                 )
                 for record in page:
+                    try:
+                        message = event_to_sse_message(record.event)
+                    except SseEventFrameTooLargeError as exc:
+                        yield _stream_error_sse_message(
+                            cayu_app,
+                            exc,
+                            kind="observer",
+                            code="event_frame_too_large",
+                            retryable=False,
+                            session_id=session_id,
+                        )
+                        return
                     after_sequence = record.sequence
-                    yield event_to_sse_message(record.event)
+                    yield message
                 if page:
                     idle_deadline = loop.time() + replay_idle_timeout_s
                     poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
-                if len(page) == _EVENT_PAGE_LIMIT_MAX:
+                if len(page) == SSE_REPLAY_PAGE_EVENTS:
                     continue
                 current = await session_store.load_state(session_id)
                 if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
                     return
                 remaining = idle_deadline - loop.time()
                 if remaining <= 0:
-                    yield error_to_sse_message(
-                        TimeoutError(
-                            f"Replay for session {session_id} received no events for "
-                            f"{replay_idle_timeout_s:g} seconds."
-                        )
+                    timeout_error = TimeoutError(
+                        f"Replay for session {session_id} received no events for "
+                        f"{replay_idle_timeout_s:g} seconds."
+                    )
+                    yield _stream_error_sse_message(
+                        cayu_app,
+                        timeout_error,
+                        kind="observer",
+                        code="replay_idle_timeout",
+                        retryable=True,
+                        session_id=session_id,
                     )
                     return
                 await asyncio.sleep(min(poll_interval, remaining))
@@ -1386,7 +1557,7 @@ def create_router(
                     received_events=bool(page),
                 )
 
-        return EventSourceResponse(replay())
+        return EventSourceResponse(replay(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
 
     @router.post(
         "/run",
@@ -1439,7 +1610,11 @@ def create_router(
             event_stream = _fail_task_on_prestream_error(
                 event_stream, task_store=task_store, task_id=task_id
             )
-        return _detached_event_stream_response(event_stream)
+        return _detached_event_stream_response(
+            event_stream,
+            cayu_app=cayu_app,
+            session_id=session_id,
+        )
 
     @router.post(
         "/resume",
@@ -1477,7 +1652,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.resume(request))
+        return _detached_event_stream_response(
+            cayu_app.resume(request),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.post(
         "/sessions/{session_id}/interrupt",
@@ -1541,11 +1720,15 @@ def create_router(
             raise
 
         async def generate():
-            yield event_to_sse_message(first_event)
+            yield first_event
             async for event in event_stream:
-                yield event_to_sse_message(event)
+                yield event
 
-        return EventSourceResponse(generate())
+        return _detached_event_stream_response(
+            generate(),
+            cayu_app=cayu_app,
+            session_id=session_id,
+        )
 
     @router.post(
         "/tool-approvals/resolve",
@@ -1585,7 +1768,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.resolve_tool_approval(request))
+        return _detached_event_stream_response(
+            cayu_app.resolve_tool_approval(request),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.post(
         "/tool-approvals/recover",
@@ -1629,7 +1816,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.recover_tool_approval(request))
+        return _detached_event_stream_response(
+            cayu_app.recover_tool_approval(request),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.post(
         "/tool-rounds/recover",
@@ -1673,7 +1864,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.recover_tool_round(request))
+        return _detached_event_stream_response(
+            cayu_app.recover_tool_round(request),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.post(
         "/user-input/resolve",
@@ -1714,7 +1909,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.resolve_user_input(response))
+        return _detached_event_stream_response(
+            cayu_app.resolve_user_input(response),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.post(
         "/user-input/recover",
@@ -1759,7 +1958,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(cayu_app.recover_user_input(request))
+        return _detached_event_stream_response(
+            cayu_app.recover_user_input(request),
+            cayu_app=cayu_app,
+            session_id=body.session_id,
+        )
 
     @router.get("/agents", response_model=AgentsResponse, dependencies=protected)
     async def list_agents():

@@ -15,7 +15,16 @@ from cayu import CayuApp
 from cayu.core.events import Event, EventType
 from cayu.server import create_server
 from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT
-from cayu.server.sse import event_to_sse_data, event_to_sse_message
+from cayu.server.sse import (
+    SSE_ERROR_SESSION_ID_MAX_BYTES,
+    SSE_ERROR_TEXT_MAX_BYTES,
+    SSE_ERROR_TYPE_MAX_BYTES,
+    SSE_EVENT_DATA_MAX_BYTES,
+    SseEventFrameTooLargeError,
+    error_to_sse_message,
+    event_to_sse_data,
+    event_to_sse_message,
+)
 
 _SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "openapi-contract-summary.json"
 _STREAMING_ROUTES = {
@@ -125,6 +134,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["sse"]["event_id_format"] == SSE_LAST_EVENT_ID_FORMAT
     assert body["sse"]["event_data_schema"] == "SseEventEnvelope"
     assert body["sse"]["error_data_schema"] == "SseErrorEnvelope"
+    assert body["sse"]["max_event_data_bytes"] == SSE_EVENT_DATA_MAX_BYTES
+    assert body["sse"]["max_error_text_bytes"] == SSE_ERROR_TEXT_MAX_BYTES
     assert body["client_generation"] == {
         "openapi_url": "/openapi.json",
         "supported_targets": ["typescript", "python"],
@@ -222,3 +233,125 @@ def test_sse_serialization_matches_contract_envelope() -> None:
     assert data["payload"] == {"path": "README.md"}
     assert isinstance(data["timestamp"], str)
     assert event_to_sse_message(event)["id"] == "session_1:event_1"
+
+
+def test_sse_event_frame_limit_rejects_before_serializing_durable_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = Event(
+        id="event_large",
+        type="custom.large",
+        session_id="session_large",
+        payload={"value": "x" * SSE_EVENT_DATA_MAX_BYTES},
+    )
+
+    def fail_if_serialized(*args: object, **kwargs: object) -> str:
+        pytest.fail("oversized SSE payload reached json.dumps")
+
+    monkeypatch.setattr("cayu.server.sse.json.dumps", fail_if_serialized)
+    with pytest.raises(SseEventFrameTooLargeError) as captured:
+        event_to_sse_message(event)
+
+    assert captured.value.session_id == "session_large"
+    assert captured.value.actual_bytes is None
+    assert captured.value.max_bytes == SSE_EVENT_DATA_MAX_BYTES
+    assert len(event.payload["value"]) == SSE_EVENT_DATA_MAX_BYTES
+
+
+def test_sse_event_frame_preflight_matches_compact_utf8_encoding() -> None:
+    event = Event(
+        id="event_utf8",
+        type="custom.utf8",
+        session_id="session_utf8",
+        payload={"value": 'é"\n😀'},
+    )
+    data = event_to_sse_data(event)
+    data_bytes = len(data.encode("utf-8"))
+
+    assert event_to_sse_message(event, max_data_bytes=data_bytes)["data"] == data
+    with pytest.raises(SseEventFrameTooLargeError):
+        event_to_sse_message(event, max_data_bytes=data_bytes - 1)
+
+
+def test_sse_event_frame_preflight_counts_ascii_del_escape() -> None:
+    event = Event(
+        id="event_del",
+        type="custom.utf8",
+        session_id="session_del",
+        payload={"value": "\x7f"},
+    )
+    data = event_to_sse_data(event)
+    data_bytes = len(data.encode("utf-8"))
+
+    assert "\\u007f" in data
+    assert event_to_sse_message(event, max_data_bytes=data_bytes)["data"] == data
+    with pytest.raises(SseEventFrameTooLargeError) as captured:
+        event_to_sse_message(event, max_data_bytes=data_bytes - 1)
+
+    assert captured.value.actual_bytes is None
+
+
+def test_sse_event_frame_handles_lone_unicode_surrogates_safely() -> None:
+    event = Event(
+        id="event_surrogate",
+        type="custom.utf8",
+        session_id="session_surrogate",
+        payload={"value": "\ud800"},
+    )
+
+    message = event_to_sse_message(event)
+
+    assert json.loads(message["data"])["payload"] == {"value": "\ud800"}
+
+
+def test_sse_error_frame_is_classified_and_utf8_bounded() -> None:
+    message = error_to_sse_message(
+        RuntimeError("raw secret must not be used"),
+        kind="observer",
+        code="observer_lagged",
+        retryable=True,
+        session_id="session_1",
+        error_text="é" * SSE_ERROR_TEXT_MAX_BYTES,
+    )
+    data = json.loads(message["data"])
+
+    assert message["event"] == "error"
+    assert data["type"] == "stream.error"
+    assert data["kind"] == "observer"
+    assert data["code"] == "observer_lagged"
+    assert data["retryable"] is True
+    assert data["session_id"] == "session_1"
+    assert data["error_type"] == "RuntimeError"
+    assert "raw secret" not in data["error"]
+    assert data["error"].endswith("... [truncated]")
+    assert len(data["error"].encode("utf-8")) <= SSE_ERROR_TEXT_MAX_BYTES
+
+
+def test_sse_error_frame_bounds_auxiliary_identity_fields() -> None:
+    oversized_error_type = type("X" * (SSE_ERROR_TYPE_MAX_BYTES + 100), (RuntimeError,), {})
+    message = error_to_sse_message(
+        oversized_error_type("raw-secret"),
+        kind="runtime",
+        code="runtime_failed",
+        retryable=False,
+        session_id="s" * (SSE_ERROR_SESSION_ID_MAX_BYTES + 1),
+    )
+    data = json.loads(message["data"])
+
+    assert len(data["error_type"].encode("utf-8")) <= SSE_ERROR_TYPE_MAX_BYTES
+    assert data["error_type"].endswith("... [truncated]")
+    assert data["session_id"] is None
+    assert "raw-secret" not in data["error"]
+
+
+def test_sse_error_frame_handles_lone_unicode_surrogates_safely() -> None:
+    message = error_to_sse_message(
+        RuntimeError("failed"),
+        kind="runtime",
+        code="runtime_failed",
+        retryable=False,
+        session_id="session_surrogate",
+        error_text="bad \ud800 value",
+    )
+
+    assert json.loads(message["data"])["error"] == "bad � value"

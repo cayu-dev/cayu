@@ -26,6 +26,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without 
     ) from exc
 
 from cayu._validation import (
+    JsonUtf8SizeCounter,
     copy_json_object,
     copy_json_value,
     copy_label_map,
@@ -90,7 +91,6 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     _activate_session_run_fence,
     _assert_session_run_epoch,
-    _BoundedJsonSize,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
@@ -5111,7 +5111,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 ):
                     processable_ids.append(session_id)
                     continue
-                session_size = _BoundedJsonSize(query.max_result_bytes)
+                session_size = JsonUtf8SizeCounter(query.max_result_bytes)
                 session_fits = session_size.value(session)
                 source_metadata = source_metadata_by_session_id.get(session_id)
                 if not session_fits or source_metadata is None:

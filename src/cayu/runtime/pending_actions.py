@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from cayu._validation import copy_json_value
+from cayu._validation import JsonUtf8SizeCounter, copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -20,7 +20,6 @@ from cayu.runtime.sessions import (
     PendingActionRecord,
     PendingActionSession,
     SessionStatus,
-    _BoundedJsonSize,
 )
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 
@@ -118,7 +117,7 @@ def pending_action_checkpoint_metrics(
     tool_call_count = len(tool_calls) if type(tool_calls) is list else 0
     if tool_call_count > MAX_PENDING_ACTION_TOOL_CALLS:
         return 0, tool_call_count, flags
-    counter = _BoundedJsonSize(2**63 - 1)
+    counter = JsonUtf8SizeCounter(2**63 - 1)
     if not counter.value(projected):  # pragma: no cover - in-memory JSON cannot reach int64 bytes.
         raise ValueError("Pending-action checkpoint projection is too large to measure.")
     return (2**63 - 1) - counter.remaining, tool_call_count, flags
@@ -202,7 +201,7 @@ def pending_action_event_storage_values(
         "tool_name": event.tool_name,
         "payload": payload_view,
     }
-    counter = _BoundedJsonSize(MAX_PENDING_ACTION_RESULT_BYTES)
+    counter = JsonUtf8SizeCounter(MAX_PENDING_ACTION_RESULT_BYTES)
     if not counter.value(projection_view):
         return (
             lookup_key,

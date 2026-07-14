@@ -4107,6 +4107,20 @@
         "examples": {
           "$ref": "#/components/schemas/SseFrameExamples"
         },
+        "max_error_text_bytes": {
+          "default": 512,
+          "description": "Maximum UTF-8 bytes in the redacted error field.",
+          "minimum": 1.0,
+          "title": "Max Error Text Bytes",
+          "type": "integer"
+        },
+        "max_event_data_bytes": {
+          "default": 2097152,
+          "description": "Maximum UTF-8 bytes in one live SSE event data value.",
+          "minimum": 1.0,
+          "title": "Max Event Data Bytes",
+          "type": "integer"
+        },
         "replay_header": {
           "const": "Last-Event-ID",
           "default": "Last-Event-ID",
@@ -4119,8 +4133,18 @@
     },
     "SseErrorEnvelope": {
       "additionalProperties": false,
-      "description": "JSON payload in terminal SSE ``event: error`` frames.",
+      "description": "JSON payload in classified terminal SSE ``event: error`` frames.",
       "properties": {
+        "code": {
+          "enum": [
+            "runtime_failed",
+            "observer_lagged",
+            "event_frame_too_large",
+            "replay_idle_timeout"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
         "error": {
           "title": "Error",
           "type": "string"
@@ -4128,6 +4152,29 @@
         "error_type": {
           "title": "Error Type",
           "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "runtime",
+            "observer"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
         },
         "type": {
           "const": "stream.error",
@@ -4137,8 +4184,12 @@
       },
       "required": [
         "type",
+        "kind",
+        "code",
         "error",
-        "error_type"
+        "error_type",
+        "retryable",
+        "session_id"
       ],
       "title": "SseErrorEnvelope",
       "type": "object"

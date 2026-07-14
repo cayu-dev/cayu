@@ -1279,6 +1279,20 @@ pass `api_path="/cayu/api"` when dashboard and API should live under one product
 path. The dashboard shell, dashboard assets, and control-plane API routes use
 the same auth dependency outside `dev=True`.
 
+Mutation endpoints return bounded Server-Sent Events. Runtime data frames carry
+stable `session_id:event_id` identifiers; a reconnect that already has such a
+marker can send it as `Last-Event-ID` to replay durable events without executing
+the mutation again. Do not retry a mutation POST without a replay marker. The
+`/api/contract` response advertises the live frame limits. Replay reads durable
+history in bounded pages without imposing a connection-wide history ceiling.
+When a slow observer, oversized frame, or idle replay ends the live view, Cayu
+emits a classified `stream.error` envelope with
+`kind`, `code`, and `retryable` fields. Observer errors do not cancel detached
+runtime work or remove durable events; clients should continue through the
+bounded session state, event, and transcript endpoints. Terminal stream-error
+text is processed by the application's configured secret redactor and bounded
+before it is exposed to the authenticated control plane.
+
 Apps that want the bundled dashboard to estimate cost can inject a pricing
 catalog through `dashboard_config={"pricingCatalog": pricing.model_dump(mode="json")}`.
 The dashboard sends that catalog to summary endpoints when rendering usage

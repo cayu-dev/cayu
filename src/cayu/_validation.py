@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from math import isfinite
 from types import MappingProxyType
 from typing import Any, Never
+
+from pydantic import BaseModel
 
 _MAX_LABEL_KEY_LENGTH = 128
 _MAX_LABEL_VALUE_LENGTH = 512
@@ -223,6 +226,110 @@ def thaw_json_value(value: Any) -> Any:
     if type(value) is list:
         return [thaw_json_value(item) for item in value]
     return value
+
+
+class JsonUtf8SizeCounter:
+    """Count compact JSON UTF-8 bytes without building the serialized value."""
+
+    def __init__(self, limit: int, *, ensure_ascii: bool = False) -> None:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative integer.")
+        if type(ensure_ascii) is not bool:
+            raise TypeError("ensure_ascii must be a boolean.")
+        self.remaining = limit
+        self.ensure_ascii = ensure_ascii
+
+    def _consume(self, count: int) -> bool:
+        self.remaining -= count
+        return self.remaining >= 0
+
+    def _string(self, value: str) -> bool:
+        if not self._consume(2):  # opening and closing quotes
+            return False
+        for character in value:
+            codepoint = ord(character)
+            if character in {'"', "\\"} or character in "\b\f\n\r\t":
+                size = 2
+            elif codepoint < 0x20 or (self.ensure_ascii and 0x7F <= codepoint < 0x10000):
+                size = 6
+            elif self.ensure_ascii and codepoint >= 0x10000:
+                size = 12
+            elif codepoint < 0x80:
+                size = 1
+            elif codepoint < 0x800:
+                size = 2
+            elif codepoint < 0x10000:
+                size = 3
+            else:
+                size = 4
+            if not self._consume(size):
+                return False
+        return True
+
+    def value(self, value: Any) -> bool:
+        if value is None:
+            return self._consume(4)
+        if value is True:
+            return self._consume(4)
+        if value is False:
+            return self._consume(5)
+        if isinstance(value, str):
+            return self._string(value)
+        if isinstance(value, datetime):
+            # ``+00:00`` is five bytes longer than Pydantic's UTC ``Z`` form, so
+            # this intentionally provides a conservative upper bound.
+            return self._string(value.isoformat())
+        if type(value) in {int, float}:
+            return self._consume(len(str(value).encode("utf-8")))
+        if isinstance(value, BaseModel):
+            fields = type(value).model_fields
+            if not self._consume(2):
+                return False
+            for index, (name, field) in enumerate(fields.items()):
+                if index and not self._consume(1):
+                    return False
+                key = field.serialization_alias or field.alias or name
+                if not self._string(key) or not self._consume(1):
+                    return False
+                if not self.value(getattr(value, name)):
+                    return False
+            return True
+        if isinstance(value, Mapping):
+            if not self._consume(2):
+                return False
+            for index, (key, item) in enumerate(value.items()):
+                if index and not self._consume(1):
+                    return False
+                if not self._string(str(key)) or not self._consume(1):
+                    return False
+                if not self.value(item):
+                    return False
+            return True
+        if isinstance(value, (list, tuple)):
+            if not self._consume(2):
+                return False
+            for index, item in enumerate(value):
+                if index and not self._consume(1):
+                    return False
+                if not self.value(item):
+                    return False
+            return True
+        return False
+
+
+def json_utf8_size_within_limit(
+    value: Any,
+    max_bytes: int,
+    *,
+    ensure_ascii: bool = False,
+) -> bool:
+    """Whether compact, unescaped JSON for ``value`` fits ``max_bytes``.
+
+    The walk stops as soon as the limit is exceeded and never allocates a
+    serialized copy. Pydantic models and datetimes are supported for internal
+    response-size guards; ordinary JSON containers cover transport payloads.
+    """
+    return JsonUtf8SizeCounter(max_bytes, ensure_ascii=ensure_ascii).value(value)
 
 
 def require_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[str, Any]:

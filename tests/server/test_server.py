@@ -53,7 +53,15 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.server import create_server, mount_cayu, mount_dashboard
-from cayu.server.routes import _next_replay_poll_interval
+from cayu.server.routes import _detached_event_stream_response, _next_replay_poll_interval
+from cayu.server.sse import (
+    SSE_ERROR_TEXT_MAX_BYTES,
+    SSE_EVENT_DATA_MAX_BYTES,
+    SSE_OBSERVER_MAX_BYTES,
+    SSE_OBSERVER_MAX_FRAMES,
+    SSE_REPLAY_PAGE_EVENTS,
+    SSE_SEND_TIMEOUT_SECONDS,
+)
 
 
 class OneShotProvider(ModelProvider):
@@ -4913,6 +4921,125 @@ def _sse_frames(response) -> list[dict]:
     return frames
 
 
+def _detached_observer_first_message(events: list[Event]) -> tuple[dict[str, str], float, bool]:
+    async def scenario() -> tuple[dict[str, str], float, bool]:
+        completed = False
+
+        async def event_stream() -> AsyncIterator[Event]:
+            nonlocal completed
+            try:
+                for event in events:
+                    yield event
+            finally:
+                completed = True
+
+        response = _detached_event_stream_response(
+            event_stream(),
+            cayu_app=CayuApp(),
+            session_id="session_observer_bound",
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if completed:
+                break
+        iterator = response.body_iterator.__aiter__()
+        message = await anext(iterator)
+        await iterator.aclose()
+        await asyncio.sleep(0)
+        return message, response.send_timeout, completed
+
+    return asyncio.run(scenario())
+
+
+def test_detached_observer_frame_count_is_bounded_without_stopping_pump() -> None:
+    events = [
+        Event(
+            id=f"event_{index}",
+            type="custom.observer",
+            session_id="session_observer_bound",
+        )
+        for index in range(SSE_OBSERVER_MAX_FRAMES + 1)
+    ]
+
+    message, send_timeout, completed = _detached_observer_first_message(events)
+    data = json.loads(message["data"])
+
+    assert completed is True
+    assert send_timeout == SSE_SEND_TIMEOUT_SECONDS
+    assert message["event"] == "error"
+    assert data["kind"] == "observer"
+    assert data["code"] == "observer_lagged"
+    assert data["retryable"] is True
+
+
+def test_detached_observer_does_not_misclassify_a_healthy_synchronous_burst() -> None:
+    app = CayuApp()
+    completed = False
+
+    async def synchronous_burst(request: RunRequest) -> AsyncIterator[Event]:
+        nonlocal completed
+        try:
+            for index in range(SSE_OBSERVER_MAX_FRAMES + 1):
+                yield Event(
+                    id=f"event_{index}",
+                    type="custom.observer",
+                    session_id=request.session_id,
+                )
+        finally:
+            completed = True
+
+    app.run = synchronous_burst  # type: ignore[method-assign]
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert completed is True
+    assert len(frames) == SSE_OBSERVER_MAX_FRAMES + 1
+    assert [frame["data"]["id"] for frame in frames] == [
+        f"event_{index}" for index in range(SSE_OBSERVER_MAX_FRAMES + 1)
+    ]
+    assert all(frame.get("event") != "error" for frame in frames)
+
+
+def test_detached_observer_serialized_bytes_are_bounded() -> None:
+    payload_chars = SSE_OBSERVER_MAX_BYTES // 2 + 1024
+    events = [
+        Event(
+            id=f"event_{index}",
+            type="custom.observer",
+            session_id="session_observer_bound",
+            payload={"value": "x" * payload_chars},
+        )
+        for index in range(2)
+    ]
+
+    message, _, completed = _detached_observer_first_message(events)
+    data = json.loads(message["data"])
+
+    assert completed is True
+    assert data["kind"] == "observer"
+    assert data["code"] == "observer_lagged"
+
+
+def test_detached_oversized_frame_does_not_stop_runtime_pump() -> None:
+    event = Event(
+        id="event_large",
+        type="custom.observer",
+        session_id="session_observer_bound",
+        payload={"value": "x" * SSE_EVENT_DATA_MAX_BYTES},
+    )
+
+    message, _, completed = _detached_observer_first_message([event])
+    data = json.loads(message["data"])
+
+    assert completed is True
+    assert data["kind"] == "observer"
+    assert data["code"] == "event_frame_too_large"
+    assert data["retryable"] is False
+
+
 def test_replay_polling_backs_off_and_resets_after_events() -> None:
     interval = 0.05
     observed = []
@@ -4969,6 +5096,7 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     ]
     assert replayed[-1]["data"]["type"] == "session.completed"
     assert queries[0].event_id == frames[0]["data"]["id"]
+    assert queries[1].limit == SSE_REPLAY_PAGE_EVENTS
 
     with client.stream(
         "POST",
@@ -5043,8 +5171,127 @@ def test_replay_of_active_session_times_out_with_structured_error() -> None:
         frames = _sse_frames(response)
 
     assert frames[-1]["event"] == "error"
+    assert frames[-1]["data"]["kind"] == "observer"
+    assert frames[-1]["data"]["code"] == "replay_idle_timeout"
+    assert frames[-1]["data"]["retryable"] is True
+    assert frames[-1]["data"]["session_id"] == "session_stranded"
     assert frames[-1]["data"]["error_type"] == "TimeoutError"
     assert "session_stranded" in frames[-1]["data"]["error"]
+
+
+def test_replay_streams_complete_history_in_bounded_pages() -> None:
+    app = CayuApp()
+    event_count = 1_001
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_replay_bound",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "session_replay_bound",
+            [
+                Event(
+                    id="event_seen",
+                    type=EventType.SESSION_STARTED,
+                    session_id="session_replay_bound",
+                    agent_name="assistant",
+                ),
+                *[
+                    Event(
+                        id=f"event_{index}",
+                        type="custom.replay",
+                        session_id="session_replay_bound",
+                        agent_name="assistant",
+                    )
+                    for index in range(event_count)
+                ],
+            ],
+        )
+        await app.session_store.update_status("session_replay_bound", SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored during replay"},
+        headers={"Last-Event-ID": "session_replay_bound:event_seen"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert all(frame.get("event") != "error" for frame in frames)
+    assert len(frames) == event_count
+    event_frames = frames
+    assert event_frames[0]["data"]["id"] == "event_0"
+    assert event_frames[-1]["data"]["id"] == f"event_{event_count - 1}"
+
+
+def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_large_replay",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "session_large_replay",
+            [
+                Event(
+                    id="event_seen",
+                    type=EventType.SESSION_STARTED,
+                    session_id="session_large_replay",
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_large",
+                    type="custom.large",
+                    session_id="session_large_replay",
+                    agent_name="assistant",
+                    payload={"value": "x" * SSE_EVENT_DATA_MAX_BYTES},
+                ),
+            ],
+        )
+        await app.session_store.update_status("session_large_replay", SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored during replay"},
+        headers={"Last-Event-ID": "session_large_replay:event_seen"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert len(frames) == 1
+    assert frames[0]["event"] == "error"
+    assert frames[0]["data"]["kind"] == "observer"
+    assert frames[0]["data"]["code"] == "event_frame_too_large"
+    assert frames[0]["data"]["retryable"] is False
+
+    async def load_large_event() -> Event:
+        records = await app.session_store.query_events(
+            EventQuery(session_id="session_large_replay", event_id="event_large", limit=1)
+        )
+        assert len(records) == 1
+        return records[0].event
+
+    durable_event = asyncio.run(load_large_event())
+    assert len(cast("str", durable_event.payload["value"])) == SSE_EVENT_DATA_MAX_BYTES
 
 
 @pytest.mark.parametrize(
@@ -5317,13 +5564,13 @@ def test_client_disconnect_does_not_cancel_detached_run() -> None:
 
 
 def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
-    app = CayuApp()
+    app = CayuApp(secret_redactor=SecretRedactor("secret-token"))
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     client = TestClient(create_server(app, dev=True))
 
     async def broken_run(request):
-        raise RuntimeError("run exploded before streaming")
+        raise RuntimeError("run exploded with secret-token " + "x" * 1000)
         yield  # pragma: no cover - makes this an async generator
 
     app.run = broken_run
@@ -5335,11 +5582,66 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
     assert frames
     error_frame = frames[-1]
     assert error_frame.get("event") == "error"
-    assert error_frame["data"] == {
-        "type": "stream.error",
-        "error": "run exploded before streaming",
-        "error_type": "RuntimeError",
-    }
+    data = error_frame["data"]
+    assert data["type"] == "stream.error"
+    assert data["kind"] == "runtime"
+    assert data["code"] == "runtime_failed"
+    assert data["error_type"] == "RuntimeError"
+    assert data["retryable"] is False
+    assert data["session_id"].startswith("session-")
+    assert "secret-token" not in data["error"]
+    assert REDACTED_SECRET in data["error"]
+    assert data["error"].endswith("... [truncated]")
+    assert len(data["error"].encode("utf-8")) <= SSE_ERROR_TEXT_MAX_BYTES
+
+
+def test_interrupt_stream_uses_same_typed_redacted_runtime_error_contract() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("secret-token"))
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_interrupt_stream_error",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(
+            "session_interrupt_stream_error", SessionStatus.RUNNING
+        )
+
+    asyncio.run(seed())
+
+    async def broken_interrupt(request):
+        yield Event(
+            id="event_interrupted",
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
+        raise RuntimeError("interrupt failed with secret-token")
+
+    app.interrupt_session = broken_interrupt
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream(
+        "POST",
+        "/api/sessions/session_interrupt_stream_error/interrupt",
+        json={"reason": "operator request"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames[0]["data"]["id"] == "event_interrupted"
+    error_frame = frames[-1]
+    assert error_frame["event"] == "error"
+    assert error_frame["data"]["kind"] == "runtime"
+    assert error_frame["data"]["code"] == "runtime_failed"
+    assert error_frame["data"]["retryable"] is False
+    assert error_frame["data"]["session_id"] == "session_interrupt_stream_error"
+    assert "secret-token" not in error_frame["data"]["error"]
+    assert REDACTED_SECRET in error_frame["data"]["error"]
 
 
 class AskUserProvider(ModelProvider):

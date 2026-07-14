@@ -25,8 +25,10 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
+    JsonUtf8SizeCounter,
     copy_json_value,
     copy_label_map,
+    json_utf8_size_within_limit,
     require_clean_nonblank,
     require_nonblank,
 )
@@ -1064,98 +1066,13 @@ class PendingActionListResult(BaseModel):
     inspected_candidate_count: StrictInt = Field(default=0, ge=0)
 
 
-class _BoundedJsonSize:
-    """Count JSON UTF-8 bytes without allocating an unbounded serialized copy."""
-
-    def __init__(self, limit: int) -> None:
-        self.remaining = limit
-
-    def _consume(self, count: int) -> bool:
-        self.remaining -= count
-        return self.remaining >= 0
-
-    def _string(self, value: str) -> bool:
-        if not self._consume(2):  # opening and closing quotes
-            return False
-        for character in value:
-            codepoint = ord(character)
-            if character in {'"', "\\"} or character in "\b\f\n\r\t":
-                size = 2
-            elif codepoint < 0x20:
-                size = 6
-            elif codepoint < 0x80:
-                size = 1
-            elif codepoint < 0x800:
-                size = 2
-            elif codepoint < 0x10000:
-                size = 3
-            else:
-                size = 4
-            if not self._consume(size):
-                return False
-        return True
-
-    def value(self, value: Any) -> bool:
-        if value is None:
-            return self._consume(4)
-        if value is True:
-            return self._consume(4)
-        if value is False:
-            return self._consume(5)
-        if isinstance(value, str):
-            return self._string(value)
-        if isinstance(value, datetime):
-            # ``+00:00`` is five bytes longer than Pydantic's UTC ``Z`` form, so
-            # this intentionally provides a conservative upper bound.
-            return self._string(value.isoformat())
-        if type(value) in {int, float}:
-            return self._consume(len(str(value).encode("utf-8")))
-        if isinstance(value, BaseModel):
-            fields = type(value).model_fields
-            if not self._consume(2):
-                return False
-            for index, (name, field) in enumerate(fields.items()):
-                if index and not self._consume(1):
-                    return False
-                key = field.serialization_alias or field.alias or name
-                if not self._string(key) or not self._consume(1):
-                    return False
-                if not self.value(getattr(value, name)):
-                    return False
-            return True
-        if isinstance(value, Mapping):
-            if not self._consume(2):
-                return False
-            for index, (key, item) in enumerate(value.items()):
-                if index and not self._consume(1):
-                    return False
-                if not self._string(str(key)) or not self._consume(1):
-                    return False
-                if not self.value(item):
-                    return False
-            return True
-        if isinstance(value, (list, tuple)):
-            if not self._consume(2):
-                return False
-            for index, item in enumerate(value):
-                if index and not self._consume(1):
-                    return False
-                if not self.value(item):
-                    return False
-            return True
-        # Pending-action models contain JSON values, strings/enums, datetimes,
-        # and primitives only. Reject an unexpected value conservatively.
-        return False
-
-
 def enforce_pending_action_result_size(
     result: PendingActionListResult,
     *,
     max_bytes: int,
 ) -> PendingActionListResult:
     """Return ``result`` or fail before an oversized API body is serialized."""
-    counter = _BoundedJsonSize(max_bytes)
-    if not counter.value(result):
+    if not json_utf8_size_within_limit(result, max_bytes):
         raise PendingActionResultTooLarge(max_bytes)
     return result
 
@@ -2476,7 +2393,7 @@ class InMemorySessionStore(SessionStore):
                     type(pending_tool_calls) is list
                     and len(pending_tool_calls) > MAX_PENDING_ACTION_TOOL_CALLS
                 )
-                candidate_size = _BoundedJsonSize(query.max_result_bytes)
+                candidate_size = JsonUtf8SizeCounter(query.max_result_bytes)
                 source_fits = (
                     not source_too_complex
                     and candidate_size.value(projected_session)

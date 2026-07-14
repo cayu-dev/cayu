@@ -14,6 +14,12 @@ from cayu.runtime.costs import (
     SessionCostSummary,
 )
 from cayu.runtime.usage import CausalBudgetUsageSummary, SessionUsageSummary, UsageMetrics
+from cayu.server.sse import (
+    SSE_ERROR_TEXT_MAX_BYTES,
+    SSE_EVENT_DATA_MAX_BYTES,
+    SseErrorCode,
+    SseErrorKind,
+)
 
 SERVER_API_PREFIX = "/api"
 SERVER_CONTRACT_VERSION = "1"
@@ -48,11 +54,15 @@ class SseEventEnvelope(ApiBaseModel):
 
 
 class SseErrorEnvelope(ApiBaseModel):
-    """JSON payload in terminal SSE ``event: error`` frames."""
+    """JSON payload in classified terminal SSE ``event: error`` frames."""
 
     type: Literal["stream.error"]
+    kind: SseErrorKind
+    code: SseErrorCode
     error: str
     error_type: str
+    retryable: StrictBool
+    session_id: str | None
 
 
 def _sse_event_example() -> SseEventEnvelope:
@@ -72,8 +82,12 @@ def _sse_event_example() -> SseEventEnvelope:
 def _sse_error_example() -> SseErrorEnvelope:
     return SseErrorEnvelope(
         type="stream.error",
+        kind="runtime",
+        code="runtime_failed",
         error="Runtime stream failed.",
         error_type="RuntimeError",
+        retryable=False,
+        session_id="session-123",
     )
 
 
@@ -89,6 +103,16 @@ class SseContract(ApiBaseModel):
     event_data_schema: Literal["SseEventEnvelope"] = "SseEventEnvelope"
     error_event_name: Literal["error"] = "error"
     error_data_schema: Literal["SseErrorEnvelope"] = "SseErrorEnvelope"
+    max_event_data_bytes: StrictInt = Field(
+        default=SSE_EVENT_DATA_MAX_BYTES,
+        ge=1,
+        description="Maximum UTF-8 bytes in one live SSE event data value.",
+    )
+    max_error_text_bytes: StrictInt = Field(
+        default=SSE_ERROR_TEXT_MAX_BYTES,
+        ge=1,
+        description="Maximum UTF-8 bytes in the redacted error field.",
+    )
     examples: SseFrameExamples = Field(default_factory=SseFrameExamples)
 
 
@@ -495,8 +519,9 @@ STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "description": (
             "Server-Sent Events stream. Each runtime event is emitted as an SSE frame "
-            "whose `data:` value is a JSON SseEventEnvelope. A terminal runtime "
-            "failure is emitted as `event: error` with a SseErrorEnvelope payload."
+            "whose `data:` value is a JSON SseEventEnvelope. A classified terminal "
+            "runtime or observer condition is emitted as `event: error` with a "
+            "SseErrorEnvelope payload."
         ),
         "content": {
             SSE_CONTENT_TYPE: {

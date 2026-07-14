@@ -2186,6 +2186,18 @@ export type SseContract = {
     event_id_format?: 'session_id:event_id';
     examples?: SseFrameExamples;
     /**
+     * Max Error Text Bytes
+     *
+     * Maximum UTF-8 bytes in the redacted error field.
+     */
+    max_error_text_bytes?: number;
+    /**
+     * Max Event Data Bytes
+     *
+     * Maximum UTF-8 bytes in one live SSE event data value.
+     */
+    max_event_data_bytes?: number;
+    /**
      * Replay Header
      */
     replay_header?: 'Last-Event-ID';
@@ -2194,9 +2206,13 @@ export type SseContract = {
 /**
  * SseErrorEnvelope
  *
- * JSON payload in terminal SSE ``event: error`` frames.
+ * JSON payload in classified terminal SSE ``event: error`` frames.
  */
 export type SseErrorEnvelope = {
+    /**
+     * Code
+     */
+    code: 'runtime_failed' | 'observer_lagged' | 'event_frame_too_large' | 'replay_idle_timeout';
     /**
      * Error
      */
@@ -2205,6 +2221,18 @@ export type SseErrorEnvelope = {
      * Error Type
      */
     error_type: string;
+    /**
+     * Kind
+     */
+    kind: 'runtime' | 'observer';
+    /**
+     * Retryable
+     */
+    retryable: boolean;
+    /**
+     * Session Id
+     */
+    session_id: string | null;
     /**
      * Type
      */
