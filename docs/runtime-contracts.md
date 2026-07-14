@@ -1450,7 +1450,7 @@ Lambda MicroVM files use the existing `RunnerWorkspace` module rather than a dup
 workspace adapter. The first-party sidecar image guarantees `python3` and `/workspace`, so
 `RunnerWorkspace(LambdaMicroVMRunner(...))` keeps file and command operations in the same
 MicroVM while retaining the common path-safety and bounded-list/read behavior. The recipe in
-`examples/environments/lambda_microvm.py` composes that pair with an `EnvironmentFactory` and a
+`examples/aws/environments/lambda_microvm.py` composes that pair with an `EnvironmentFactory` and a
 lifecycle binding: resume reattaches from non-secret MicroVM id/endpoint/region/image metadata,
 forks allocate a fresh MicroVM, interrupted finalization suspends, and completed/failed
 finalization terminates.
@@ -1459,6 +1459,11 @@ finalization terminates.
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
 `LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
+`EFSAccessPointBinding` and `S3FilesAccessPointBinding` mount an exact AWS access
+point at the runner's workspace path using an explicit mount-target IPv4
+address. They flush and unmount before runner lifecycle teardown. These
+bindings are stateless; durable identity lives in the filesystem/access point,
+so a replacement Fargate control task can recreate the binding safely.
 Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
 The built-in `read_file(path=...)` treats byte-level binary evidence as stronger than filename/MIME hints, so binary bytes are not decoded into model context just because a path has a text-like extension. Text-looking source files remain readable even when platform MIME tables classify an extension incorrectly.
 
@@ -1603,6 +1608,11 @@ Applications that need strict control can pass `artifact_readers=[...]` instead.
 
 Provider-native file upload APIs can be added later as provider-specific optimizations behind the same artifact reference boundary. Remote stores such as S3 can be added as `ArtifactStore` implementations without changing the model-facing tool contract.
 
+`S3ArtifactStore` is the built-in AWS remote store. It writes content before a
+JSON metadata commit marker, lists only committed artifacts, uses ranged object
+reads for `max_bytes`, and maps missing objects separately from unavailable S3
+backends.
+
 Artifact result objects enforce consistent metadata:
 
 - `ArtifactReadResult`: `truncated` must equal `len(content) < total_bytes`
@@ -1629,6 +1639,11 @@ The built-in local implementations are:
 
 - `LocalEnvVault`: maps secret names to environment variables in the trusted app process.
 - `StaticVault`: stores in-memory secrets for tests and trusted local development.
+
+`SecretsManagerVault` is the built-in AWS implementation. Its required mapping
+allows trusted application code to expose logical names without accepting
+arbitrary secret identifiers from a model or sandbox. It resolves text secrets
+lazily through Boto3 and keeps the raw value inside trusted runtime code.
 
 The built-in composition vaults combine other vaults behind one `Vault` (e.g. static API keys +
 per-tenant dynamic tokens in one environment):

@@ -115,15 +115,17 @@ The environment-factory recipe persists only non-secret reconnect metadata:
   "endpoint": "...lambda-microvm...on.aws",
   "region": "us-west-2",
   "image_identifier": "arn:...",
-  "image_version": "..."
+  "image_version": "...",
+  "session_id": "..."
 }
 ```
 
 It never persists the JWE endpoint token. Tokens are generated through
 `create_microvm_auth_token`, cached only in memory until shortly before expiry, refreshed on
 authorization failure once, and discarded on close. A resume factory attaches with
-`from_existing(...)`; a fork creates a fresh MicroVM instead of inheriting the parent's
-MicroVM.
+`from_existing(...)`; the session owner stamp distinguishes a child's own reconnect
+record from metadata inherited in a fork checkpoint, so a fork creates a fresh
+MicroVM and a later child resume reattaches that child's MicroVM.
 
 The recipe uses a small lifecycle binding that delegates native bind behavior, suspends on an
 `interrupted` finalize outcome, and terminates on `completed` or `failed` after workspace
@@ -284,7 +286,7 @@ Add `tests/core/test_bedrock_provider.py` with injected fake clients/event strea
 
 ### Live verification
 
-`examples/bedrock_provider_live.py` is gated by an explicit live flag plus region/model. Boto3
+`examples/aws/bedrock_provider_live.py` is gated by an explicit live flag plus region/model. Boto3
 resolves the standard credential chain only after the operator opts in. It runs text, tool,
 tool-result, structured-output, and token-counting paths and emits structured nightly evidence.
 Register it in
@@ -295,7 +297,7 @@ when prerequisites are absent. It is not CI-enforced.
 
 ### Implementation
 
-1. Add `src/cayu/runners/lambda_microvm.py` with:
+1. Add `src/cayu/runners/aws_lambda_microvm.py` with:
    - lazy/injected `lambda-microvms` client construction;
    - `create`, `from_existing`, readiness, auth-token refresh, reconnect properties;
    - sidecar command start/poll/cancel translation;
@@ -303,10 +305,10 @@ when prerequisites are absent. It is not CI-enforced.
    - timeout/cancellation policies using Cayu's existing cleanup artifact vocabulary;
    - bounded late-start cleanup using the caller-generated command ID;
    - suspend/resume/terminate/none lifecycle behavior and idempotent close.
-2. Add a deployable template under `examples/lambda_microvm_sidecar/` containing the sidecar,
+2. Add a deployable template under `examples/aws/lambda_microvm_sidecar/` containing the sidecar,
    Dockerfile, requirements, and image-build instructions. Keep the sidecar protocol versioned
    and test its command supervisor separately from HTTP routing.
-3. Compose `RunnerWorkspace` in `examples/environments/lambda_microvm.py`. Include the
+3. Compose `RunnerWorkspace` in `examples/aws/environments/lambda_microvm.py`. Include the
    environment factory and lifecycle binding that:
    - creates a MicroVM for a new session;
    - reattaches on resume from non-secret reconnect metadata;
@@ -321,7 +323,7 @@ when prerequisites are absent. It is not CI-enforced.
 
 ### Tests
 
-Add `tests/runners/test_lambda_microvm.py` and sidecar tests covering:
+Add `tests/runners/test_aws_lambda_microvm.py` and sidecar tests covering:
 
 - create/from-existing calls and validation of image, region, connectors, and idle policy;
 - authenticated readiness instead of trusting eventually consistent state;
@@ -344,7 +346,7 @@ call AWS.
 
 ### Live verification
 
-Add `examples/lambda_microvm_runner_live.py`, gated by an explicit live flag, AWS region, and
+Add `examples/aws/lambda_microvm_runner_live.py`, gated by an explicit live flag, AWS region, and
 image identifier. It verifies:
 
 - create/readiness and authenticated endpoint access;
@@ -376,15 +378,15 @@ Targeted during development:
 
 ```bash
 uv run pytest tests/core/test_bedrock_provider.py -q
-uv run pytest tests/runners/test_lambda_microvm.py -q
-uv run pytest tests/environments/test_lambda_microvm_factory.py -q
+uv run pytest tests/runners/test_aws_lambda_microvm.py -q
+uv run pytest tests/environments/test_aws_lambda_microvm_factory.py -q
 ```
 
 ### Manual / credentialed
 
 ```bash
-uv run --extra aws python examples/bedrock_provider_live.py
-uv run --extra aws python examples/lambda_microvm_runner_live.py
+uv run --extra aws python -m examples.aws.bedrock_provider_live
+uv run --extra aws python -m examples.aws.lambda_microvm_runner_live
 uv run python scripts/nightly_verification.py --check bedrock-provider-live
 uv run python scripts/nightly_verification.py --check lambda-microvm-live
 ```

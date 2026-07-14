@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.egress import (
     CredentialKind,
@@ -106,6 +107,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         adapter_registry: EgressAdapterRegistry | None = None,
         runner_kind: str = "docker",
         inner_binding: WorkspaceBinding | None = None,
+        artifact_store: ArtifactStore | None = None,
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
@@ -129,6 +131,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._adapter_registry = adapter_registry
         self._runner_kind = adapter.runner_kind if adapter is not None else runner_kind
         self._inner_binding = inner_binding or NoWorkspaceBinding()
+        if artifact_store is not None and not isinstance(artifact_store, ArtifactStore):
+            raise TypeError("artifact_store must be an ArtifactStore.")
+        self._artifact_store = artifact_store
         self._emitter = event_emitter
         self._upstream = upstream
         self._require_test_mode = require_test_mode_credentials
@@ -199,11 +204,16 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 guest_ca_path=guest_ca_path,
                 setup_commands=self._setup_commands,
                 egress_destinations=tuple(grant.destination for grant in grants),
+                session_id=request.session_id,
+                parent_session_id=request.parent_session_id,
+                reconnect_metadata=request.reconnect_metadata,
             )
             runner = await adapter.create_runner(runner_request)
+            reconnect_metadata = adapter.reconnect_metadata(runner)
 
             managed_runner = _EgressManagedRunner(
                 runner=runner,
+                adapter=adapter,
                 egress_binding=binding,
                 ca_dir=ca_dir,
                 grant_revoker=grant_revoker,
@@ -216,7 +226,6 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 inner=self._inner_binding,
                 runner=managed_runner,
                 grants=grants,
-                grant_revoker=grant_revoker,
                 emitter=self._emitter,
                 audit=audit,
                 session_id=request.session_id,
@@ -248,10 +257,14 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         environment = Environment(
             spec,
+            artifact_store=self._artifact_store,
             runner=managed_runner,
             binding=teardown_binding,
         )
-        return EnvironmentFactoryResult(environment=environment)
+        return EnvironmentFactoryResult(
+            environment=environment,
+            reconnect_metadata=reconnect_metadata,
+        )
 
     def _resolve_adapter(self, loop: asyncio.AbstractEventLoop):
         if self._adapter_registry is not None:
@@ -365,12 +378,14 @@ class _EgressManagedRunner(Runner):
         self,
         *,
         runner: Runner,
+        adapter: SandboxEgressAdapter,
         egress_binding: EgressBinding,
         ca_dir: str,
         grant_revoker: _EgressGrantRevoker,
         audit: _EgressAuditBridge | None = None,
     ) -> None:
         self._runner = runner
+        self._adapter = adapter
         self._egress_binding = egress_binding
         self._ca_dir = ca_dir
         self._grant_revoker = grant_revoker
@@ -402,32 +417,47 @@ class _EgressManagedRunner(Runner):
         )
 
     async def close(self) -> None:
+        await self.finalize(outcome=None)
+
+    async def revoke_grants(self) -> bool:
+        return await self._grant_revoker.revoke()
+
+    async def finalize(self, *, outcome: str | None) -> None:
         if self._closed:
             return
         cancelled = False
-        revocation_error: BaseException | None = None
-        grants_drained = False
+        cleanup_error: BaseException | None = None
         try:
-            cancelled = await self._grant_revoker.revoke()
-            grants_drained = True
+            cancelled = await self.revoke_grants()
         except asyncio.CancelledError as exc:
-            cancelled = True
-            revocation_error = exc
+            cleanup_error = exc
         except Exception as exc:
-            revocation_error = exc
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            cancelled = await _await_cleanup(self._runner.close()) or cancelled
-        with contextlib.suppress(Exception, asyncio.CancelledError):
+            cleanup_error = exc
+        try:
+            cancelled = (
+                await _await_cleanup(self._adapter.finalize_runner(self._runner, outcome=outcome))
+                or cancelled
+            )
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        try:
             cancelled = await _await_cleanup(self._egress_binding.close()) or cancelled
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
         if self._audit is not None:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
+            try:
                 cancelled = await _await_cleanup(self._audit.drain()) or cancelled
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         with contextlib.suppress(Exception, asyncio.CancelledError):
             shutil.rmtree(self._ca_dir, ignore_errors=True)
-        if revocation_error is None and grants_drained:
+        if cleanup_error is None:
             self._closed = True
-        if revocation_error is not None:
-            raise revocation_error
+        if cleanup_error is not None:
+            raise cleanup_error
         if cancelled:
             raise asyncio.CancelledError()
 
@@ -513,9 +543,8 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self,
         *,
         inner: WorkspaceBinding,
-        runner: Runner,
+        runner: _EgressManagedRunner,
         grants: Sequence[VirtualCredentialGrant],
-        grant_revoker: _EgressGrantRevoker | None = None,
         emitter: EventEmitter | None,
         audit: _EgressAuditBridge | None,
         session_id: str,
@@ -525,7 +554,6 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._inner = inner
         self._runner = runner
         self._grants = tuple(grants)
-        self._grant_revoker = grant_revoker
         self._emitter = emitter
         self._audit = audit
         self._session_id = session_id
@@ -559,6 +587,10 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 await self._close_resources()
             except asyncio.CancelledError:
                 cancelled = True
+            except Exception:
+                # Preserve the binding failure; there is no successfully
+                # returned runner/binding handle for the caller to retry.
+                pass
             await self._drain_audit()
             await self._emit_revoked()
             if cancelled:
@@ -572,41 +604,43 @@ class _EgressTeardownBinding(WorkspaceBinding):
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> WorkspaceSnapshot | None:
+        snapshot: WorkspaceSnapshot | None = None
+        inner_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
         cancelled = False
         try:
-            cancelled = await self._revoke_grants() or cancelled
-        except asyncio.CancelledError:
-            cancelled = True
+            # Disable guest-side authority before workspace commands run. The
+            # runner stays alive until the workspace has flushed and unmounted.
+            cancelled = await self._runner.revoke_grants()
+        except BaseException as exc:
+            cleanup_error = exc
         try:
-            return await self._inner.finalize(bound, outcome=outcome, metadata=metadata)
-        finally:
-            # Grants are already revoked before sync-back; this closes the slower
-            # runner/proxy/CA resources even if the inner binding failed.
-            try:
-                await self._close_resources(revoke=False)
-            except asyncio.CancelledError:
-                cancelled = True
-            await self._drain_audit()
-            await self._emit_revoked()
-            if cancelled:
-                raise asyncio.CancelledError()
-
-    async def _revoke_grants(self) -> bool:
-        if self._grant_revoker is None:
-            return False
+            snapshot = await self._inner.finalize(bound, outcome=outcome, metadata=metadata)
+        except BaseException as exc:
+            inner_error = exc
         try:
-            return await self._grant_revoker.revoke()
-        except asyncio.CancelledError:
-            return True
-        except Exception:
-            return False
+            # Workspace sync/unmount must finish before an interrupted MicroVM
+            # is suspended or a terminal MicroVM is terminated.
+            await self._close_resources(outcome=outcome)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        await self._drain_audit()
+        await self._emit_revoked()
+        if inner_error is not None:
+            raise inner_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        if cancelled:
+            raise asyncio.CancelledError()
+        return snapshot
 
-    async def _close_resources(self, *, revoke: bool = True) -> None:
-        cancelled = False
-        if revoke:
-            cancelled = await self._revoke_grants() or cancelled
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            cancelled = await _await_cleanup(self._runner.close()) or cancelled
+    async def _close_resources(
+        self,
+        *,
+        outcome: str | None = None,
+    ) -> None:
+        cancelled = await _await_cleanup(self._runner.finalize(outcome=outcome))
         if cancelled:
             raise asyncio.CancelledError()
 

@@ -9,7 +9,9 @@ import pytest
 from cayu import EnvironmentFactoryRequest, RunnerWorkspace
 from cayu.runners import LambdaMicroVMProtocolError
 
-_EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "environments" / "lambda_microvm.py"
+_EXAMPLE = (
+    Path(__file__).resolve().parents[2] / "examples" / "aws" / "environments" / "lambda_microvm.py"
+)
 _SPEC = importlib.util.spec_from_file_location("lambda_microvm_environment_example", _EXAMPLE)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)

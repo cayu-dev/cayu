@@ -187,13 +187,14 @@ added and dependencies change; the generated report records current counts.
 ## Live Examples
 
 The advanced runtime suite uses package directories rather than the
-`examples/*_live.py` naming convention. Primary Gemini registrations run five
+`*_live.py` naming convention under `examples/` and provider subdirectories.
+Primary Gemini registrations run five
 trials when invoked; OpenAI and Anthropic portability registrations run one
 trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 26 `examples/*_live.py` files:
+There are 26 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
@@ -201,8 +202,8 @@ There are 26 `examples/*_live.py` files:
 | `sbx` | `sbx_interrupt_live.py`, `sbx_sync_binding_live.py` |
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py` |
 | E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
-| AWS credentials, region, and Lambda MicroVM image | `lambda_microvm_runner_live.py` |
-| AWS credentials, region, and Bedrock model | `bedrock_provider_live.py` |
+| AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py` |
+| AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |
 | OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |

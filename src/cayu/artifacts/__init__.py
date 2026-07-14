@@ -18,6 +18,7 @@ from cayu.artifacts.attachments import (
     validate_file_attachment_bytes,
     validate_file_attachment_content_type,
 )
+from cayu.artifacts.aws_s3 import S3ArtifactStore
 from cayu.artifacts.base import (
     ArtifactListResult,
     ArtifactMetadata,
@@ -58,6 +59,7 @@ __all__ = [
     "InvalidArtifactIdError",
     "LocalArtifactStore",
     "ResolvedFileAttachment",
+    "S3ArtifactStore",
     "WorkspaceToArtifactResult",
     "copy_artifact_read_result",
     "copy_artifact_to_workspace",

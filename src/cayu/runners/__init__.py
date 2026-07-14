@@ -5,6 +5,16 @@ from cayu.runners._cleanup import (
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
     RunnerCleanupPolicy,
 )
+from cayu.runners.aws_lambda_microvm import (
+    DEFAULT_LAMBDA_MICROVM_CWD,
+    HttpxLambdaMicroVMEndpointTransport,
+    LambdaMicroVMCloseAction,
+    LambdaMicroVMEndpointTransport,
+    LambdaMicroVMEndpointUnauthorized,
+    LambdaMicroVMError,
+    LambdaMicroVMProtocolError,
+    LambdaMicroVMRunner,
+)
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -25,16 +35,6 @@ from cayu.runners.e2b import (
     E2B_SANDBOX_ID_MAX_BYTES,
     E2BCloseAction,
     E2BRunner,
-)
-from cayu.runners.lambda_microvm import (
-    DEFAULT_LAMBDA_MICROVM_CWD,
-    HttpxLambdaMicroVMEndpointTransport,
-    LambdaMicroVMCloseAction,
-    LambdaMicroVMEndpointTransport,
-    LambdaMicroVMEndpointUnauthorized,
-    LambdaMicroVMError,
-    LambdaMicroVMProtocolError,
-    LambdaMicroVMRunner,
 )
 from cayu.runners.local import LocalRunner
 from cayu.runners.microsandbox import (

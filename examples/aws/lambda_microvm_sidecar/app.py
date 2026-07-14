@@ -21,6 +21,12 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "protocol_version": PROTOCOL_VERSION}
 
 
+@app.post("/aws/lambda-microvms/runtime/v1/ready")
+async def ready_hook() -> dict[str, str]:
+    """Tell the image builder the command sidecar is ready to snapshot."""
+    return {"status": "ok"}
+
+
 @app.post("/v1/commands", status_code=202)
 async def start_command(payload: dict[str, Any]) -> dict[str, Any]:
     command_id = payload.get("command_id")

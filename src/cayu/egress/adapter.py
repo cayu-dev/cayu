@@ -73,6 +73,9 @@ class VirtualEgressRunnerRequest:
     guest_ca_path: str
     setup_commands: tuple[str, ...]
     egress_destinations: tuple[str, ...]
+    session_id: str | None = None
+    parent_session_id: str | None = None
+    reconnect_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 class SandboxEgressAdapter(ABC):
@@ -102,6 +105,14 @@ class SandboxEgressAdapter(ABC):
     @abstractmethod
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         """Create a runner that applies this adapter's binding without downgrade."""
+
+    def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
+        """Return durable identity required to reattach to ``runner``."""
+        return {}
+
+    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+        """Map a session outcome to the runner's lifecycle action."""
+        await runner.close()
 
 
 class UnsupportedEgressAdapter(SandboxEgressAdapter):

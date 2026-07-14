@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from ipaddress import IPv4Address, ip_address
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -75,3 +76,40 @@ class MicrosandboxHostProxyExposure:
         if local_port <= 0:
             raise ValueError("local_port must be positive.")
         return ExposedProxy(proxy_url=f"http://{MICROSANDBOX_HOST}:{local_port}")
+
+
+class VpcTaskProxyExposure:
+    """Advertise a proxy listener through the private IPv4 of its VPC task.
+
+    This exposure is intended for a Cayu control plane running in ECS/Fargate.
+    Lambda MicroVMs reach the in-process proxy through a VPC egress connector;
+    the address is deliberately restricted to RFC 1918 space so an accidental
+    public listener cannot become the credential-broker boundary.
+    """
+
+    def __init__(self, task_ipv4: str) -> None:
+        try:
+            address = ip_address(task_ipv4)
+        except ValueError as exc:
+            raise ValueError("task_ipv4 must be a private IPv4 address.") from exc
+        if not isinstance(address, IPv4Address) or not _is_rfc1918(address):
+            raise ValueError("task_ipv4 must be a private IPv4 address.")
+        self.task_ipv4 = str(address)
+
+    async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
+        if local_host.strip() != "0.0.0.0":
+            raise UnsupportedEgressError(
+                "VPC task proxy exposure requires Cayu to listen on 0.0.0.0."
+            )
+        if local_port <= 0:
+            raise ValueError("local_port must be positive.")
+        return ExposedProxy(proxy_url=f"http://{self.task_ipv4}:{local_port}")
+
+
+def _is_rfc1918(address: IPv4Address) -> bool:
+    value = int(address)
+    return (
+        int(IPv4Address("10.0.0.0")) <= value <= int(IPv4Address("10.255.255.255"))
+        or int(IPv4Address("172.16.0.0")) <= value <= int(IPv4Address("172.31.255.255"))
+        or int(IPv4Address("192.168.0.0")) <= value <= int(IPv4Address("192.168.255.255"))
+    )

@@ -91,6 +91,7 @@ async def run_enforcement_preflight(
     request: VirtualEgressRunnerRequest,
     *,
     timeout_s: int,
+    probe_metadata: bool = True,
 ) -> None:
     if not request.egress_destinations:
         raise UnsupportedEgressError(
@@ -109,6 +110,7 @@ async def run_enforcement_preflight(
         proxy_port=endpoint.port,
         destination=destination,
         guest_ca_path=request.guest_ca_path,
+        probe_metadata=probe_metadata,
     )
     result = await runner.exec(
         ExecCommand.process("python3", "-c", script),
@@ -137,6 +139,7 @@ def _preflight_script(
     proxy_port: int,
     destination: str,
     guest_ca_path: str,
+    probe_metadata: bool,
 ) -> str:
     return f"""
 import socket
@@ -202,10 +205,10 @@ def metadata_reachable(host, port):
         host, port, token_request
     )
 
-for host, port, probe in (
-    ("1.1.1.1", 443, tls_reachable),
-    ("169.254.169.254", 80, metadata_reachable),
-):
+probes = [("1.1.1.1", 443, tls_reachable)]
+if {probe_metadata!r}:
+    probes.append(("169.254.169.254", 80, metadata_reachable))
+for host, port, probe in probes:
     print(f"preflight: probing direct {{host}}:{{port}}", flush=True)
     if probe(host, port):
         raise RuntimeError(f"direct egress unexpectedly reached {{host}}:{{port}}")

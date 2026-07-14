@@ -6,7 +6,8 @@ import asyncio
 import json
 import os
 
-from _live_checks import require
+from examples._live_checks import require
+
 from cayu import (
     AgentSpec,
     BedrockProvider,

@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -123,15 +124,17 @@ class HttpxUpstream:
         *,
         timeout_s: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        routes: Mapping[str, str] | None = None,
     ) -> None:
         self._timeout_s = timeout_s
         self._transport = transport
+        self._routes = _validated_upstream_routes(routes or {})
 
     async def send(self, request: CapturedRequest) -> CapturedResponse:
         async with httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport) as client:
             response = await client.request(
                 request.method,
-                request.url(),
+                self._url(request),
                 headers=_forwardable_headers(request.headers),
                 content=request.body or None,
             )
@@ -140,6 +143,47 @@ class HttpxUpstream:
             headers=_decoded_response_headers(dict(response.headers)),
             body=response.content,
         )
+
+    def _url(self, request: CapturedRequest) -> str:
+        route = self._routes.get(request.host)
+        if route is None:
+            return request.url()
+        suffix = f"?{request.query}" if request.query else ""
+        return f"{route}{request.path}{suffix}"
+
+
+def _validated_upstream_routes(routes: Mapping[str, str]) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for logical_host, target in routes.items():
+        host = require_clean_nonblank(logical_host, "HttpxUpstream route host").lower()
+        if any(character in host for character in "/:@") or any(
+            character.isspace() for character in host
+        ):
+            raise ValueError("HttpxUpstream route host must be a bare hostname.")
+        split = urlsplit(target)
+        if (
+            split.scheme not in {"http", "https"}
+            or split.hostname is None
+            or split.username is not None
+            or split.password is not None
+            or split.path not in {"", "/"}
+            or split.query
+            or split.fragment
+        ):
+            raise ValueError(
+                "HttpxUpstream route target must be an absolute HTTP(S) origin without "
+                "credentials, path, query, or fragment."
+            )
+        try:
+            port = split.port
+        except ValueError as exc:
+            raise ValueError("HttpxUpstream route target has an invalid port.") from exc
+        if port is not None and port <= 0:
+            raise ValueError("HttpxUpstream route target has an invalid port.")
+        if host in validated:
+            raise ValueError(f"HttpxUpstream route host {host!r} is duplicated.")
+        validated[host] = target.rstrip("/")
+    return validated
 
 
 class TransparentEgressBroker:

@@ -1,5 +1,6 @@
 """Vault contracts."""
 
+from cayu.vaults.aws_secrets_manager import SecretsManagerVault
 from cayu.vaults.base import (
     ResolvedSecret,
     SecretEnv,
@@ -31,6 +32,7 @@ __all__ = [
     "SecretRedactor",
     "SecretRef",
     "SecretResolver",
+    "SecretsManagerVault",
     "StaticVault",
     "Vault",
     "VaultError",

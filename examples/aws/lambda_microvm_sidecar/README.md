@@ -33,7 +33,7 @@ the managed ingress connector so Cayu can reach port 8080. Add only the egress c
 guest workload actually needs; an unrestricted internet connector is not required by the
 sidecar itself.
 
-See [AWS credentials for Cayu](../../docs/aws-credentials.md) for the developer profile,
+See [AWS credentials for Cayu](../../../docs/aws-credentials.md) for the developer profile,
 coding-agent, runtime-role, and image-builder security boundaries.
 
 A production AWS deployment can keep the Cayu web/worker control plane on ECS/Fargate with its

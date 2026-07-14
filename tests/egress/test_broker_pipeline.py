@@ -315,6 +315,50 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
     assert "content-length" not in {key.lower() for key in response.headers}
 
 
+def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(202, json={"accepted": True}, request=request)
+
+    async def run() -> CapturedResponse:
+        upstream = HttpxUpstream(
+            routes={"receiver.internal": "http://receiver.service.local:8080"},
+            transport=httpx.MockTransport(handler),
+        )
+        return await upstream.send(
+            CapturedRequest(
+                method="POST",
+                host="receiver.internal",
+                path="/v1/actions",
+                query="mode=safe",
+                headers={"Authorization": "Bearer real-secret"},
+                body=b"{}",
+            )
+        )
+
+    response = asyncio.run(run())
+
+    assert response.status_code == 202
+    assert str(captured[0].url) == ("http://receiver.service.local:8080/v1/actions?mode=safe")
+    assert captured[0].headers["authorization"] == "Bearer real-secret"
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "receiver.service.local:8080",
+        "ftp://receiver.service.local",
+        "http://user:password@receiver.service.local",
+        "http://receiver.service.local/base?unsafe=1",
+    ],
+)
+def test_httpx_upstream_rejects_unsafe_private_service_route(route: str) -> None:
+    with pytest.raises(ValueError, match="route"):
+        HttpxUpstream(routes={"receiver.internal": route})
+
+
 def test_deny_body_is_valid_json() -> None:
     import json
 

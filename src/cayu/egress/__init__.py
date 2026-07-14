@@ -37,6 +37,7 @@ from cayu.egress.policy import (
     EgressRequest,
     HttpEgressPolicy,
 )
+from cayu.egress.proxy_exposure import VpcTaskProxyExposure
 
 __all__ = [
     "CapturedRequest",
@@ -61,4 +62,5 @@ __all__ = [
     "VirtualCredentialLease",
     "VirtualCredentialRegistry",
     "VirtualEgressRunnerRequest",
+    "VpcTaskProxyExposure",
 ]

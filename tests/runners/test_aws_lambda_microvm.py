@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-import cayu.runners.lambda_microvm as lambda_microvm_module
+import cayu.runners.aws_lambda_microvm as lambda_microvm_module
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 from cayu.runners import (
     LambdaMicroVMEndpointUnauthorized,
@@ -18,7 +18,11 @@ from cayu.runners import (
 )
 
 SUPERVISOR_PATH = (
-    Path(__file__).resolve().parents[2] / "examples" / "lambda_microvm_sidecar" / "supervisor.py"
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "aws"
+    / "lambda_microvm_sidecar"
+    / "supervisor.py"
 )
 SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
     "cayu_lambda_microvm_runner_supervisor", SUPERVISOR_PATH
@@ -493,6 +497,34 @@ async def test_lambda_microvm_runner_attaches_to_existing_microvm() -> None:
     assert runner.image_identifier == "arn:aws:lambda:us-west-2:123:microvm-image:cayu"
     assert runner.image_version == "7"
     assert transport.health_calls[0]["token"] == "token-123"
+
+
+@pytest.mark.anyio
+async def test_lambda_microvm_runner_applies_trusted_env_overlay_last() -> None:
+    client = FakeLambdaMicroVMClient()
+    transport = FakeEndpointTransport()
+    runner = await LambdaMicroVMRunner.create(
+        "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+        client=client,
+        endpoint_transport=transport,
+        poll_interval_s=0,
+        close_action="none",
+        env_overlay={
+            "HTTPS_PROXY": "http://10.0.1.10:8443",
+            "VIRTUAL_TOKEN": "cayu_virtual",
+        },
+    )
+
+    await runner.exec(
+        ExecCommand.process("true"),
+        env={"HTTPS_PROXY": "http://attacker.invalid", "CALLER": "kept"},
+    )
+
+    assert transport.start_calls[0]["payload"]["env"] == {
+        "HTTPS_PROXY": "http://10.0.1.10:8443",
+        "VIRTUAL_TOKEN": "cayu_virtual",
+        "CALLER": "kept",
+    }
 
 
 @pytest.mark.anyio

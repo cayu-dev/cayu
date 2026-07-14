@@ -624,7 +624,7 @@ variables. Treat those values as visible to code running in the sandbox, and use
 them only for non-secret boot/config values.
 
 For AWS Lambda MicroVM execution, build the sidecar image under
-`examples/lambda_microvm_sidecar/`, install `cayu[aws]`, and pass the image ARN explicitly:
+`examples/aws/lambda_microvm_sidecar/`, install `cayu[aws]`, and pass the image ARN explicitly:
 
 ```python
 from cayu import LambdaMicroVMRunner, RunnerWorkspace
@@ -659,7 +659,7 @@ See [AWS credentials for Cayu](docs/aws-credentials.md) for secure developer, co
 CI, and workload-role setup plus the required Lambda permissions.
 
 For one MicroVM per durable session, use the environment-factory recipe in
-`examples/environments/lambda_microvm.py`. It stores only MicroVM identity/region/image metadata,
+`examples/aws/environments/lambda_microvm.py`. It stores only MicroVM identity/region/image metadata,
 reattaches on resume, creates a fresh MicroVM for forks, suspends interrupted sessions, and
 terminates completed or failed sessions through binding finalization.
 

@@ -6,8 +6,9 @@ import asyncio
 import json
 import os
 
-from _live_checks import require, require_exec_success
-from _runner_conformance import verify_bounded_output_drain
+from examples._live_checks import require, require_exec_success
+from examples._runner_conformance import verify_bounded_output_drain
+
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="

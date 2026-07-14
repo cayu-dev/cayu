@@ -346,6 +346,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `docker` | Enforced (internal network + sidecar + TLS MITM). |
 | `microsandbox` | Enforced with a deny-by-default host policy allowing only the Cayu proxy port. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. |
+| `lambda-microvm` | Enforced with a VPC egress connector that can reach only the private ECS/Fargate proxy and workspace mount target. |
 | `local`, `sbx` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
@@ -355,6 +356,18 @@ Notes on the Docker adapter:
 - `setup_commands` run on the enforced network with the egress overlay applied, so they are
   subject to the **same egress policy** as the app. Bake tools that need arbitrary hosts into the
   image rather than installing them from `setup_commands` under `virtual_egress`.
+
+The Lambda MicroVM adapter uses `VpcTaskProxyExposure` to advertise the trusted
+Fargate task's private IPv4 address. Startup proves the proxy and session CA work
+and that direct public-IP and instance-metadata connections fail. Interrupt
+finalization syncs/unmounts the workspace, revokes the grant, then suspends the
+MicroVM. Terminal outcomes terminate it. Durable reconnect metadata includes
+the owning session id: forks ignore inherited parent metadata and create a new
+MicroVM, while an interrupted child can reattach its own MicroVM.
+
+`examples/aws/lambda_microvm_agent` composes this adapter with an EFS access
+point (default), an opt-in S3 Files access point, S3 artifacts, Secrets Manager,
+a private Fargate receiver, and an exact host/method/path egress policy.
 
 ## Verification
 

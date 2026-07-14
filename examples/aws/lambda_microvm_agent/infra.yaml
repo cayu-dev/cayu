@@ -1,0 +1,791 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Cayu ECS control plane with Lambda MicroVM sandboxes and durable AWS storage
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: One private subnet with AWS API access through NAT or VPC endpoints.
+  LoadBalancerSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets for the control-plane ALB.
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the public HTTPS control-plane listener.
+  ControlImageUri:
+    Type: String
+    Description: ECR image built from examples/aws/lambda_microvm_agent/Dockerfile.
+  ReceiverImageUri:
+    Type: String
+    Description: Usually the same image; ECS overrides its command to run receiver.py.
+  MicrovmCodeBucket:
+    Type: String
+  MicrovmCodeKey:
+    Type: String
+    Description: Zip package built from the microvm Dockerfile context.
+  DatabaseUrlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN containing a migrated Cayu PostgreSQL connection URL.
+  DatabaseSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group attached to the private PostgreSQL database.
+  DatabasePort:
+    Type: Number
+    Default: 5432
+  BedrockModel:
+    Type: String
+  WorkspaceBackend:
+    Type: String
+    Default: efs
+    AllowedValues: [efs, s3files]
+  EfsMountTargetIp:
+    Type: String
+    Description: Unused private IPv4 in PrivateSubnetId reserved for the EFS mount target.
+  S3FilesMountTargetIp:
+    Type: String
+    Default: ""
+    Description: Required only for WorkspaceBackend=s3files; an unused private IPv4 in PrivateSubnetId.
+
+Conditions:
+  UseS3Files: !Equals [!Ref WorkspaceBackend, s3files]
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  WorkspaceBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseS3Files
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  InternalServiceToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Token resolved only by the Cayu broker and injected only into the receiver.
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 48
+
+  ServerPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 32
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: service.local
+      Vpc: !Ref VpcId
+
+  ReceiverDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: receiver
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords:
+          - TTL: 10
+            Type: A
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS entry to the Cayu control plane
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  ControlSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trusted Cayu control plane and per-session CONNECT proxies
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  ReceiverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private receiver reachable only from the Cayu control plane
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  MicrovmConnectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda MicroVM egress restricted to Cayu proxy ports and file mounts
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  StorageSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NFS mount targets reachable only from Lambda MicroVM connector ENIs
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  LoadBalancerHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  LoadBalancerToControl:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 800
+      ToPort: 800
+      DestinationSecurityGroupId: !Ref ControlSecurityGroup
+
+  ControlFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ControlSecurityGroup
+      IpProtocol: tcp
+      FromPort: 800
+      ToPort: 800
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  ControlFromMicrovm:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ControlSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1024
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref MicrovmConnectorSecurityGroup
+
+  MicrovmToControl:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref MicrovmConnectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1024
+      ToPort: 65535
+      DestinationSecurityGroupId: !Ref ControlSecurityGroup
+
+  ControlToReceiver:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ControlSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      DestinationSecurityGroupId: !Ref ReceiverSecurityGroup
+
+  ReceiverFromControl:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ReceiverSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref ControlSecurityGroup
+
+  ControlAwsApiEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ControlSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  ControlToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ControlSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroupId
+
+  DatabaseFromControl:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref DatabasePort
+      ToPort: !Ref DatabasePort
+      SourceSecurityGroupId: !Ref ControlSecurityGroup
+
+  MicrovmToStorage:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref MicrovmConnectorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref StorageSecurityGroup
+
+  StorageFromMicrovm:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref StorageSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref MicrovmConnectorSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Subnets: !Ref LoadBalancerSubnets
+      Type: application
+
+  ControlTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /api/health
+      Port: 800
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ControlTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      IpAddress: !Ref EfsMountTargetIp
+      SecurityGroups: [!Ref StorageSecurityGroup]
+      SubnetId: !Ref PrivateSubnetId
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /sessions
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0770"
+
+  S3FilesSyncRole:
+    Type: AWS::IAM::Role
+    Condition: UseS3Files
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workspace-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions]
+                Resource: !GetAtt WorkspaceBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${WorkspaceBucket.Arn}/workspace/*"
+              - Effect: Allow
+                Action:
+                  - events:DeleteRule
+                  - events:DisableRule
+                  - events:EnableRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-S3-Files*"
+              - Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListRuleNamesByTarget
+                  - events:ListRules
+                  - events:ListTargetsByRule
+                Resource: "*"
+
+  S3FilesFileSystem:
+    Type: AWS::S3Files::FileSystem
+    Condition: UseS3Files
+    Properties:
+      AcceptBucketWarning: true
+      Bucket: !GetAtt WorkspaceBucket.Arn
+      Prefix: workspace/
+      RoleArn: !GetAtt S3FilesSyncRole.Arn
+
+  S3FilesMountTarget:
+    Type: AWS::S3Files::MountTarget
+    Condition: UseS3Files
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      IpAddressType: IPV4_ONLY
+      Ipv4Address: !Ref S3FilesMountTargetIp
+      SecurityGroups: [!Ref StorageSecurityGroup]
+      SubnetId: !Ref PrivateSubnetId
+
+  S3FilesAccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Condition: UseS3Files
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /sessions
+        CreationPermissions:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0770"
+
+  MicrovmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: scoped-workspace-mount
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !GetAtt EfsFileSystem.Arn
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn: !GetAtt EfsAccessPoint.Arn
+              - !If
+                - UseS3Files
+                - Effect: Allow
+                  Action:
+                    - s3files:ClientMount
+                    - s3files:ClientWrite
+                    - s3files:ClientRootAccess
+                  Resource: !GetAtt S3FilesFileSystem.FileSystemArn
+                  Condition:
+                    StringEquals:
+                      s3files:AccessPointArn: !GetAtt S3FilesAccessPoint.AccessPointArn
+                - !Ref AWS::NoValue
+
+  S3FilesPolicy:
+    Type: AWS::S3Files::FileSystemPolicy
+    Condition: UseS3Files
+    Properties:
+      FileSystemId: !GetAtt S3FilesFileSystem.FileSystemId
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowExecutionRoleThroughOneAccessPoint
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt MicrovmExecutionRole.Arn
+            Action: s3files:Client*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                s3files:AccessPointArn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          - Sid: DenyOtherAccessPoints
+            Effect: Deny
+            Principal: "*"
+            Action: s3files:Client*
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                s3files:AccessPointArn: !GetAtt S3FilesAccessPoint.AccessPointArn
+
+  NetworkOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - network-connectors.lambda.amazonaws.com
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSLambdaNetworkConnectorOperatorPolicy"
+
+  MicrovmNetworkConnector:
+    Type: AWS::Lambda::NetworkConnector
+    Properties:
+      Name: !Sub "${AWS::StackName}-microvm"
+      OperatorRole: !GetAtt NetworkOperatorRole.Arn
+      Configuration:
+        VpcEgressConfiguration:
+          AssociatedComputeResourceTypes: [MicroVm]
+          NetworkProtocol: IPv4
+          SecurityGroupIds: [!Ref MicrovmConnectorSecurityGroup]
+          SubnetIds: [!Ref PrivateSubnetId]
+
+  MicrovmBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  MicrovmBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: image-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${MicrovmCodeBucket}/${MicrovmCodeKey}"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt MicrovmBuildLogGroup.Arn
+
+  MicrovmImage:
+    Type: AWS::Lambda::MicrovmImage
+    Properties:
+      Name: !Sub "${AWS::StackName}-agent"
+      Description: Cayu sidecar with EFS and S3 Files mount helpers
+      BaseImageArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:microvm-image:al2023-1"
+      BaseImageVersion: "0"
+      BuildRoleArn: !GetAtt MicrovmBuildRole.Arn
+      CodeArtifact:
+        Uri: !Sub "s3://${MicrovmCodeBucket}/${MicrovmCodeKey}"
+      AdditionalOsCapabilities: [ALL]
+      CpuConfigurations:
+        - Architecture: ARM_64
+      # Image builds need package-repository access. The deny-by-default connector
+      # is attached when each MicroVM starts, not while this image is built.
+      EgressNetworkConnectors: []
+      EnvironmentVariables: []
+      Hooks:
+        Port: 8080
+        MicrovmHooks:
+          Run: ENABLED
+          Resume: ENABLED
+          Suspend: ENABLED
+          Terminate: ENABLED
+        MicrovmImageHooks:
+          Ready: ENABLED
+      Logging:
+        CloudWatch:
+          LogGroup: !Ref MicrovmBuildLogGroup
+      Resources:
+        - MinimumMemoryInMiB: 1024
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: task-secret-injection
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref InternalServiceToken
+                  - !Ref ServerPassword
+                  - !Ref DatabaseUrlSecretArn
+
+  ControlTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cayu-control-plane
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref InternalServiceToken
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/cayu/artifacts/*"
+              - Effect: Allow
+                Action:
+                  - lambda:RunMicrovm
+                  - lambda:GetMicrovm
+                  - lambda:CreateMicrovmAuthToken
+                  - lambda:SuspendMicrovm
+                  - lambda:ResumeMicrovm
+                  - lambda:TerminateMicrovm
+                Resource: "*"
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Ref MicrovmNetworkConnector
+                  - !Sub >-
+                      arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:ALL_INGRESS
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt MicrovmExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:CountTokens
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+
+  ControlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ReceiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ControlTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ControlTaskRole.Arn
+      ContainerDefinitions:
+        - Name: control
+          Image: !Ref ControlImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 800
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: CAYU_BEDROCK_MODEL
+              Value: !Ref BedrockModel
+            - Name: CAYU_LAMBDA_MICROVM_IMAGE
+              Value: !GetAtt MicrovmImage.ImageArn
+            - Name: CAYU_LAMBDA_MICROVM_EGRESS_CONNECTOR
+              Value: !Ref MicrovmNetworkConnector
+            - Name: CAYU_LAMBDA_MICROVM_EXECUTION_ROLE
+              Value: !GetAtt MicrovmExecutionRole.Arn
+            - Name: CAYU_ARTIFACT_BUCKET
+              Value: !Ref ArtifactBucket
+            - Name: CAYU_INTERNAL_SERVICE_SECRET
+              Value: !Ref InternalServiceToken
+            - Name: CAYU_INTERNAL_SERVICE_ORIGIN
+              Value: http://receiver.service.local:8080
+            - Name: CAYU_WORKSPACE_BACKEND
+              Value: !Ref WorkspaceBackend
+            - Name: CAYU_EFS_FILE_SYSTEM_ID
+              Value: !Ref EfsFileSystem
+            - Name: CAYU_EFS_ACCESS_POINT_ID
+              Value: !Ref EfsAccessPoint
+            - Name: CAYU_EFS_MOUNT_TARGET_IP
+              Value: !Ref EfsMountTargetIp
+            - !If
+              - UseS3Files
+              - Name: CAYU_S3FILES_FILE_SYSTEM_ID
+                Value: !GetAtt S3FilesFileSystem.FileSystemId
+              - !Ref AWS::NoValue
+            - !If
+              - UseS3Files
+              - Name: CAYU_S3FILES_ACCESS_POINT_ID
+                Value: !Ref S3FilesAccessPoint
+              - !Ref AWS::NoValue
+            - !If
+              - UseS3Files
+              - Name: CAYU_S3FILES_MOUNT_TARGET_IP
+                Value: !Ref S3FilesMountTargetIp
+              - !Ref AWS::NoValue
+            - !If
+              - UseS3Files
+              - Name: CAYU_S3FILES_AZ_ID
+                Value: !GetAtt S3FilesMountTarget.AvailabilityZoneId
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: CAYU_SERVER_PASSWORD
+              ValueFrom: !Ref ServerPassword
+            - Name: CAYU_DATABASE_URL
+              ValueFrom: !Ref DatabaseUrlSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ControlLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: control
+
+  ReceiverTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: receiver
+          Image: !Ref ReceiverImageUri
+          Essential: true
+          Command:
+            - uvicorn
+            - examples.aws.lambda_microvm_agent.receiver:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Secrets:
+            - Name: INTERNAL_SERVICE_TOKEN
+              ValueFrom: !Ref InternalServiceToken
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ReceiverLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: receiver
+
+  ReceiverService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ReceiverSecurityGroup]
+          Subnets: [!Ref PrivateSubnetId]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ReceiverDiscoveryService.Arn
+      TaskDefinition: !Ref ReceiverTaskDefinition
+
+  ControlService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: control
+          ContainerPort: 800
+          TargetGroupArn: !Ref ControlTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ControlSecurityGroup]
+          Subnets: [!Ref PrivateSubnetId]
+      TaskDefinition: !Ref ControlTaskDefinition
+
+Outputs:
+  ControlPlaneUrl:
+    Value: !Sub "https://${LoadBalancer.DNSName}"
+  ArtifactBucket:
+    Value: !Ref ArtifactBucket
+  EfsFileSystemId:
+    Value: !Ref EfsFileSystem
+  EfsAccessPointId:
+    Value: !Ref EfsAccessPoint
+  S3FilesFileSystemId:
+    Condition: UseS3Files
+    Value: !GetAtt S3FilesFileSystem.FileSystemId
+  S3FilesAccessPointId:
+    Condition: UseS3Files
+    Value: !Ref S3FilesAccessPoint
+  MicrovmImageArn:
+    Value: !GetAtt MicrovmImage.ImageArn
+  MicrovmNetworkConnectorArn:
+    Value: !Ref MicrovmNetworkConnector
+  InternalServiceSecretArn:
+    Value: !Ref InternalServiceToken

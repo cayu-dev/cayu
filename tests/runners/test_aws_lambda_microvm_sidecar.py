@@ -12,7 +12,11 @@ from typing import Any
 import pytest
 
 SUPERVISOR_PATH = (
-    Path(__file__).resolve().parents[2] / "examples" / "lambda_microvm_sidecar" / "supervisor.py"
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "aws"
+    / "lambda_microvm_sidecar"
+    / "supervisor.py"
 )
 SPEC = importlib.util.spec_from_file_location("cayu_lambda_microvm_supervisor", SUPERVISOR_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -43,15 +47,16 @@ def test_sidecar_health_reports_protocol_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CAYU_MICROVM_WORKSPACE_ROOT", str(tmp_path))
-    sys.modules.pop("examples.lambda_microvm_sidecar.app", None)
-    app_module = importlib.import_module("examples.lambda_microvm_sidecar.app")
+    sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
+    app_module = importlib.import_module("examples.aws.lambda_microvm_sidecar.app")
     try:
         assert asyncio.run(app_module.health()) == {
             "status": "ok",
             "protocol_version": "1",
         }
+        assert asyncio.run(app_module.ready_hook()) == {"status": "ok"}
     finally:
-        sys.modules.pop("examples.lambda_microvm_sidecar.app", None)
+        sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
 
 
 def wait_for_terminal(

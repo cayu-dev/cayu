@@ -35,11 +35,11 @@ def _load_source(module_name: str, path: Path) -> ModuleType:
 _live_checks = _load_source("cayu_test_live_checks", EXAMPLES_DIR / "_live_checks.py")
 
 
-def _load_example(name: str) -> ModuleType:
+def _load_example(name: str, *, directory: Path = EXAMPLES_DIR) -> ModuleType:
     previous = sys.modules.get("_live_checks")
     sys.modules["_live_checks"] = _live_checks
     try:
-        return _load_source(f"cayu_test_{name}", EXAMPLES_DIR / f"{name}.py")
+        return _load_source(f"cayu_test_{name}", directory / f"{name}.py")
     finally:
         if previous is None:
             sys.modules.pop("_live_checks", None)
@@ -48,7 +48,7 @@ def _load_example(name: str) -> ModuleType:
 
 
 artifact_file_live = _load_example("artifact_file_live")
-bedrock_provider_live = _load_example("bedrock_provider_live")
+bedrock_provider_live = _load_example("bedrock_provider_live", directory=EXAMPLES_DIR / "aws")
 context_counting_live = _load_example("context_counting_live")
 knowledge_embedding_live = _load_example("knowledge_embedding_live")
 real_spend_budget_live = _load_example("real_spend_budget_live")

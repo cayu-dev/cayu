@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from examples._runner_conformance import verify_bounded_output_drain
-from examples.lambda_microvm_sidecar.supervisor import CommandSupervisor
+from examples.aws.lambda_microvm_sidecar.supervisor import CommandSupervisor
 from tests.runners.conformance import (
     CapabilityClaim,
     ConformanceEvidence,

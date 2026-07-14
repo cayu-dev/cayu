@@ -229,6 +229,7 @@ class LambdaMicroVMRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
     ) -> None:
         if client is None:
             raise TypeError("LambdaMicroVMRunner client cannot be None.")
@@ -251,6 +252,7 @@ class LambdaMicroVMRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        self.env_overlay = dict(env_overlay) if env_overlay else {}
         self._endpoint_transport = (
             endpoint_transport
             if endpoint_transport is not None
@@ -293,6 +295,7 @@ class LambdaMicroVMRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
     ) -> LambdaMicroVMRunner:
         image = require_clean_nonblank(image_identifier, "image_identifier")
         control_client, owns_client = _control_client(
@@ -339,6 +342,7 @@ class LambdaMicroVMRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_cleanup,
             timeout_cleanup=timeout_cleanup,
+            env_overlay=env_overlay,
         )
         try:
             await runner._wait_until_ready(ready_timeout_s)
@@ -368,6 +372,7 @@ class LambdaMicroVMRunner(Runner):
         cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
         cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
         timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
     ) -> LambdaMicroVMRunner:
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
         control_client, owns_client = _control_client(
@@ -400,6 +405,7 @@ class LambdaMicroVMRunner(Runner):
             cancel_timeout_s=cancel_timeout_s,
             cancellation_cleanup=cancellation_cleanup,
             timeout_cleanup=timeout_cleanup,
+            env_overlay=env_overlay,
         )
         try:
             await runner._prepare_existing_for_attach(state, ready_timeout_s)
@@ -423,6 +429,9 @@ class LambdaMicroVMRunner(Runner):
         self._ensure_exec_open()
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
+        if self.env_overlay:
+            # Applied last: enforced egress configuration must win over model env.
+            environment.update(self.env_overlay)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
         output_limit = validate_output_limit(output_limit_bytes)
