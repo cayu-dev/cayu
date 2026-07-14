@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-from collections.abc import AsyncIterator, Callable
-from typing import Annotated, Any, Literal
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
@@ -23,6 +24,9 @@ from pydantic import (
     field_validator,
 )
 from sse_starlette.sse import EventSourceResponse
+
+if TYPE_CHECKING:
+    from starlette.types import Receive, Scope, Send
 
 from cayu._validation import (
     copy_json_value,
@@ -126,9 +130,11 @@ from cayu.server.contracts import (
     UsageBreakdownItem,
 )
 from cayu.server.sse import (
+    SSE_ERROR_TEXT_MAX_BYTES,
     SSE_OBSERVER_MAX_BYTES,
     SSE_OBSERVER_MAX_FRAMES,
     SSE_REPLAY_PAGE_EVENTS,
+    SSE_REPLAY_START_MARKER_FORMAT,
     SSE_SEND_TIMEOUT_SECONDS,
     SseErrorCode,
     SseErrorKind,
@@ -147,7 +153,44 @@ from cayu.storage import (
     KnowledgeVisibility,
 )
 
+logger = logging.getLogger(__name__)
+
+
+class _ObserverLifecycleEventSourceResponse(EventSourceResponse):
+    """Release a waiting detached pump even if response startup fails."""
+
+    def __init__(
+        self,
+        *args: Any,
+        observer_started: asyncio.Event,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._observer_started = observer_started
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._observer_started.set()
+
+
+_MutationAcceptanceStage = Literal[
+    "empty",
+    "before_first_event",
+    "after_first_event",
+    "accepted",
+]
+
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ReplaySafeSessionId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+    ),
+]
 ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
 # Server-entrypoint step budget. The default preserves the historical value while the
 # ceiling matches the runtime's own ``max_steps`` bound (RunRequest/ResumeRequest and the
@@ -177,6 +220,28 @@ _REPLAY_ACTIVE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
     SessionStatus.INTERRUPTING,
 }
+_REPLAY_TERMINAL_EVENT_BY_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
+_REPLAY_TERMINAL_EVENT_TYPES = frozenset(_REPLAY_TERMINAL_EVENT_BY_STATUS.values())
+_REPLAY_TERMINAL_LINEAGE_EVENT_TYPES = {
+    EventType.HOOK_STARTED,
+    EventType.HOOK_COMPLETED,
+    EventType.HOOK_FAILED,
+}
+_REPLAY_POST_TERMINAL_EVENT_TYPES = {
+    EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
+    EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+    EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+}
+_REPLAY_OPERATION_START_EVENT_TYPES = {
+    EventType.SESSION_STARTED,
+    EventType.SESSION_RESUMED,
+    EventType.ENVIRONMENT_FACTORY_STARTED,
+    EventType.ENVIRONMENT_BINDING_STARTED,
+}
 # Replays check quickly after reconnect, then back off while a live session is
 # quiet so idle streams do not continuously hammer the durable stores.
 _REPLAY_POLL_INTERVAL_MIN_S = 0.05
@@ -187,6 +252,21 @@ def _next_replay_poll_interval(current: float, *, received_events: bool) -> floa
     if received_events:
         return _REPLAY_POLL_INTERVAL_MIN_S
     return min(current * 2, _REPLAY_POLL_INTERVAL_MAX_S)
+
+
+def _replay_terminal_boundary_id(event: Event) -> str | None:
+    """Return the terminal session event represented by an observed record."""
+    if event.type in _REPLAY_TERMINAL_EVENT_TYPES:
+        return event.id
+    if event.type not in _REPLAY_TERMINAL_LINEAGE_EVENT_TYPES:
+        return None
+    terminal_event_type = event.payload.get("terminal_event_type")
+    if terminal_event_type not in _REPLAY_TERMINAL_EVENT_TYPES:
+        return None
+    terminal_event_id = event.payload.get("terminal_event_id")
+    if type(terminal_event_id) is str and terminal_event_id.strip():
+        return terminal_event_id
+    return None
 
 
 # Detached event pumps must outlive their SSE consumer (a client disconnect must not
@@ -206,34 +286,6 @@ _ARTIFACT_SAFE_INLINE_CONTENT_TYPES = frozenset(
         "text/plain",
     }
 )
-
-
-async def _fail_task_on_prestream_error(
-    event_stream: AsyncIterator[Event],
-    *,
-    task_store: Any,
-    task_id: str,
-) -> AsyncIterator[Event]:
-    """Fail the route-created task when the run dies before its first event.
-
-    A pre-session failure (request validation, unknown agent, unsupported
-    native structured output) would otherwise strand the task as ``pending``
-    with no session ever attached. Once a first event exists, the session owns
-    the task lifecycle and failures are recorded through it.
-    """
-    emitted = False
-    try:
-        async for event in event_stream:
-            emitted = True
-            yield event
-    except BaseException as exc:
-        if not emitted:
-            with contextlib.suppress(Exception):
-                await task_store.fail_task(
-                    task_id,
-                    {"error": str(exc), "error_type": type(exc).__name__},
-                )
-        raise
 
 
 def _redacted_stream_error_text(cayu_app: Any, error: BaseException) -> str:
@@ -267,12 +319,160 @@ def _stream_error_sse_message(
     )
 
 
+async def _close_event_stream(event_stream: AsyncIterator[Event]) -> None:
+    close = getattr(event_stream, "aclose", None)
+    if close is not None:
+        # Cleanup is best-effort and must not replace the primary stream outcome.
+        # CancelledError is a BaseException, so suppress it explicitly rather than
+        # letting a secondary close failure bypass the observer's terminal signal.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await close()
+
+
+def _preaccept_error_detail(cayu_app: Any, error: BaseException) -> str:
+    text = _redacted_stream_error_text(cayu_app, error)
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= SSE_ERROR_TEXT_MAX_BYTES:
+        return encoded.decode("utf-8")
+    suffix = b"..."
+    prefix = encoded[: SSE_ERROR_TEXT_MAX_BYTES - len(suffix)].decode("utf-8", errors="ignore")
+    return prefix + suffix.decode()
+
+
+def _log_mutation_acceptance_failure(
+    cayu_app: Any,
+    error: BaseException,
+    *,
+    session_id: str,
+    stage: str,
+) -> None:
+    """Record a bounded, redacted diagnostic for a sanitized HTTP 500."""
+    with contextlib.suppress(Exception):
+        logger.error(
+            "SSE mutation acceptance failed: stage=%s session_id=%r error_type=%s error=%r",
+            stage,
+            session_id,
+            type(error).__name__,
+            _preaccept_error_detail(cayu_app, error),
+        )
+
+
+async def _accepted_event_stream_response(
+    event_stream: AsyncIterator[Event],
+    *,
+    cayu_app: Any,
+    session_id: str,
+    after_accept: Callable[[Event], Awaitable[None]] | None = None,
+    conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
+) -> EventSourceResponse:
+    """Establish one durable event before accepting an SSE mutation response.
+
+    Reconnects are allowed only after the mutation has a durable replay boundary.
+    Advancing the runtime here also makes a new session's store insert the atomic
+    identity claim before route-owned task creation or an HTTP 200 response.
+    """
+    loop = asyncio.get_running_loop()
+    acceptance: asyncio.Future[tuple[BaseException | None, _MutationAcceptanceStage]] = (
+        loop.create_future()
+    )
+    observer_started = asyncio.Event()
+
+    response, pump_task, abandon_observer = _start_detached_event_stream_response(
+        event_stream,
+        cayu_app=cayu_app,
+        session_id=session_id,
+        acceptance=acceptance,
+        after_first_event=after_accept,
+        observer_started=observer_started,
+    )
+    try:
+        acceptance_error, stage = await asyncio.shield(acceptance)
+    except asyncio.CancelledError:
+        # Starting the detached driver transfers runtime ownership away from the
+        # request task. A client timeout/disconnect must abandon only its observer;
+        # cancelling the driver is reserved for Cayu's interruption protocol.
+        abandon_observer()
+        raise
+    except BaseException:
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pump_task
+        raise
+
+    if acceptance_error is None:
+        return response
+
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await pump_task
+    if not isinstance(acceptance_error, Exception):
+        raise acceptance_error
+    if stage == "empty":
+        _log_mutation_acceptance_failure(
+            cayu_app,
+            acceptance_error,
+            session_id=session_id,
+            stage="before_first_event",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Mutation completed without producing a durable event.",
+        ) from acceptance_error
+    if stage == "after_first_event":
+        _log_mutation_acceptance_failure(
+            cayu_app,
+            acceptance_error,
+            session_id=session_id,
+            stage=stage,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Mutation setup failed after its durable acceptance event.",
+        ) from acceptance_error
+    if isinstance(acceptance_error, KeyError):
+        raise HTTPException(
+            status_code=404,
+            detail=_preaccept_error_detail(cayu_app, acceptance_error),
+        ) from acceptance_error
+    if isinstance(acceptance_error, conflict_error_types):
+        raise HTTPException(
+            status_code=409,
+            detail=_preaccept_error_detail(cayu_app, acceptance_error),
+        ) from acceptance_error
+    _log_mutation_acceptance_failure(
+        cayu_app,
+        acceptance_error,
+        session_id=session_id,
+        stage=stage,
+    )
+    raise HTTPException(
+        status_code=500,
+        detail="Mutation failed before streaming began.",
+    ) from acceptance_error
+
+
 def _detached_event_stream_response(
     event_stream: AsyncIterator[Event],
     *,
     cayu_app: Any,
     session_id: str,
 ) -> EventSourceResponse:
+    response, _pump_task, _abandon_observer = _start_detached_event_stream_response(
+        event_stream,
+        cayu_app=cayu_app,
+        session_id=session_id,
+    )
+    return response
+
+
+def _start_detached_event_stream_response(
+    event_stream: AsyncIterator[Event],
+    *,
+    cayu_app: Any,
+    session_id: str,
+    acceptance: asyncio.Future[tuple[BaseException | None, _MutationAcceptanceStage]] | None = None,
+    after_first_event: Callable[[Event], Awaitable[None]] | None = None,
+    observer_started: asyncio.Event | None = None,
+) -> tuple[EventSourceResponse, asyncio.Task[None], Callable[[], None]]:
     """Run ``event_stream`` to completion in a detached task; stream it as an observer.
 
     The run is driven by the pump task, not by the SSE consumer: a client disconnect
@@ -307,6 +507,13 @@ def _detached_event_stream_response(
         observer_terminal = True
         discard_queued_items()
         queue.put_nowait(("observer_error", item, 0))
+
+    def abandon_observer() -> None:
+        nonlocal observer_accepting
+        observer_accepting = False
+        discard_queued_items()
+        if observer_started is not None:
+            observer_started.set()
 
     def observer_capacity_exceeded(kind: str, data_bytes: int) -> bool:
         return (
@@ -349,27 +556,124 @@ def _detached_event_stream_response(
         if terminal:
             observer_terminal = True
 
-    async def pump() -> None:
+    def resolve_acceptance(
+        error: BaseException | None,
+        stage: _MutationAcceptanceStage,
+    ) -> None:
+        if acceptance is not None and not acceptance.done():
+            acceptance.set_result((error, stage))
+
+    async def publish_event(event: Event) -> None:
+        if not observer_accepting or observer_terminal:
+            return
         try:
-            async for event in event_stream:
-                if not observer_accepting or observer_terminal:
-                    continue
+            message = event_to_sse_message(event)
+        except SseEventFrameTooLargeError as exc:
+            await enqueue("observer_error", exc, terminal=True)
+            return
+        await enqueue(
+            "event",
+            message,
+            data_bytes=sse_message_data_bytes(message),
+        )
+
+    async def pump() -> None:
+        saw_first_event = False
+        deferred_cancellation: asyncio.CancelledError | None = None
+
+        async def publish_without_losing_cancellation(event: Event) -> None:
+            nonlocal deferred_cancellation
+            while True:
                 try:
-                    message = event_to_sse_message(event)
-                except SseEventFrameTooLargeError as exc:
-                    await enqueue("observer_error", exc, terminal=True)
+                    await publish_event(event)
+                    return
+                except asyncio.CancelledError as exc:
+                    # The runtime iterator is paused at its yield boundary here.
+                    # Preserve the cancellation and retry the bounded observer write;
+                    # the main loop reissues it only after resuming the iterator.
+                    deferred_cancellation = exc
+
+        async def finish_after_first_event_callback(event: Event) -> None:
+            """Finish acceptance bookkeeping without swallowing an interrupt."""
+            nonlocal deferred_cancellation
+            if after_first_event is None:
+                return
+            callback_task = asyncio.ensure_future(after_first_event(event))
+            while True:
+                try:
+                    await asyncio.shield(callback_task)
+                except asyncio.CancelledError as exc:
+                    if callback_task.cancelled():
+                        raise RuntimeError(
+                            "Mutation acceptance bookkeeping was cancelled."
+                        ) from exc
+                    # The runtime owns this task, so an operator interruption can
+                    # arrive while route-owned task bookkeeping is in progress.
+                    # Let that one-shot write finish, then redeliver cancellation
+                    # after the runtime iterator has resumed past its yield.
+                    deferred_cancellation = exc
                     continue
-                await enqueue(
-                    "event",
-                    message,
-                    data_bytes=sse_message_data_bytes(message),
-                )
-        except asyncio.CancelledError:
+                return
+
+        try:
+            while True:
+                if deferred_cancellation is not None:
+                    current_task = asyncio.current_task()
+                    if current_task is None:
+                        raise deferred_cancellation
+                    # Scheduling (rather than immediately throwing) lets anext()
+                    # resume through wrapper yield boundaries first. Cancellation is
+                    # then delivered at the runtime's next real await (factory,
+                    # binding, provider stream, or interruption status check).
+                    asyncio.get_running_loop().call_soon(current_task.cancel)
+                    deferred_cancellation = None
+                try:
+                    event = await anext(event_stream)
+                except StopAsyncIteration:
+                    if not saw_first_event:
+                        resolve_acceptance(
+                            RuntimeError("Mutation completed without producing a durable event."),
+                            "empty",
+                        )
+                    break
+
+                is_first_event = not saw_first_event
+                saw_first_event = True
+                if is_first_event and acceptance is not None:
+                    try:
+                        await finish_after_first_event_callback(event)
+                    except BaseException as exc:
+                        resolve_acceptance(exc, "after_first_event")
+                        await _close_event_stream(event_stream)
+                        raise
+                    else:
+                        resolve_acceptance(None, "accepted")
+
+                await publish_without_losing_cancellation(event)
+
+                if (
+                    is_first_event
+                    and observer_started is not None
+                    and deferred_cancellation is None
+                ):
+                    try:
+                        await observer_started.wait()
+                    except asyncio.CancelledError as exc:
+                        deferred_cancellation = exc
+        except asyncio.CancelledError as exc:
+            if not saw_first_event:
+                resolve_acceptance(exc, "before_first_event")
             await enqueue("done", None, terminal=True)
             raise
         except Exception as exc:
+            if not saw_first_event:
+                resolve_acceptance(exc, "before_first_event")
+            await _close_event_stream(event_stream)
             await enqueue("runtime_error", exc, terminal=True)
-        except BaseException:
+        except BaseException as exc:
+            if not saw_first_event:
+                resolve_acceptance(exc, "before_first_event")
+            await _close_event_stream(event_stream)
             await enqueue("done", None, terminal=True)
             raise
         else:
@@ -381,6 +685,8 @@ def _detached_event_stream_response(
 
     async def observe() -> AsyncIterator[dict[str, str]]:
         nonlocal observer_accepting, queued_bytes, queued_event_frames
+        if observer_started is not None:
+            observer_started.set()
         try:
             while True:
                 kind, item, data_bytes = await queue.get()
@@ -412,14 +718,29 @@ def _detached_event_stream_response(
                     return
                 return
         finally:
-            observer_accepting = False
-            discard_queued_items()
+            abandon_observer()
 
-    return EventSourceResponse(observe(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
+    if observer_started is None:
+        response = EventSourceResponse(observe(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
+    else:
+        response = _ObserverLifecycleEventSourceResponse(
+            observe(),
+            send_timeout=SSE_SEND_TIMEOUT_SECONDS,
+            observer_started=observer_started,
+        )
+    return response, pump_task, abandon_observer
 
 
 class RunBody(BaseModel):
     prompt: NonBlankString
+    session_id: ReplaySafeSessionId | None = Field(
+        default=None,
+        description=(
+            "Optional caller-selected identity for replay-safe run observation. "
+            f"Before the first event, reconnect with `{SSE_REPLAY_START_MARKER_FORMAT}` "
+            "using this session ID."
+        ),
+    )
     agent: NonBlankString = "assistant"
     model: NonBlankString | None = None
     causal_budget_id: NonBlankString | None = None
@@ -1455,16 +1776,91 @@ def create_router(
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
         )
 
-    async def _marker_sequence(session_id: str, event_id: str) -> int | None:
-        """Sequence of the persisted event named by a ``Last-Event-ID`` marker.
+    async def _marker_record(session_id: str, event_id: str) -> EventRecord:
+        """Persisted event named by a ``Last-Event-ID`` marker.
 
-        Returns ``None`` when the marker event is unknown, so the caller replays the
-        full history (at-least-once delivery beats silently dropping events).
+        Unknown event markers are rejected rather than silently widening the replay
+        to full history. The explicit ``session_id:`` marker owns replay-from-start.
         """
         records = await session_store.query_events(
             EventQuery(session_id=session_id, event_id=event_id, limit=1)
         )
-        return records[0].sequence if records else None
+        if not records:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Last-Event-ID event was not found in the requested session. "
+                    f"Use `{SSE_REPLAY_START_MARKER_FORMAT}` only for explicit "
+                    "replay from the beginning."
+                ),
+            )
+        return records[0]
+
+    async def _marker_terminal_boundary_id(marker_record: EventRecord) -> str | None:
+        """Resolve terminal lineage represented by a durable replay marker.
+
+        Terminal events carry their own lineage. Terminal-hook telemetry names its
+        terminal event explicitly, but that reference still has to resolve to a
+        matching durable record in the same operation epoch. Interruption-cascade
+        telemetry is also framework-owned and post-terminal, but does not carry an
+        explicit reference, so resolve its latest prior terminal event. Reject both
+        indirect associations if a later operation started before the marker.
+        """
+        marker_event = marker_record.event
+        if marker_event.type in _REPLAY_TERMINAL_EVENT_TYPES:
+            return marker_event.id
+
+        terminal_record: EventRecord | None = None
+        if marker_event.type in _REPLAY_TERMINAL_LINEAGE_EVENT_TYPES:
+            referenced_terminal_id = _replay_terminal_boundary_id(marker_event)
+            if referenced_terminal_id is None:
+                return None
+            terminal_records = await session_store.query_events(
+                EventQuery(
+                    session_id=marker_event.session_id,
+                    event_id=referenced_terminal_id,
+                    limit=1,
+                )
+            )
+            if not terminal_records:
+                return None
+            candidate = terminal_records[0]
+            if (
+                candidate.sequence >= marker_record.sequence
+                or candidate.event.type != marker_event.payload.get("terminal_event_type")
+                or candidate.event.type not in _REPLAY_TERMINAL_EVENT_TYPES
+            ):
+                return None
+            terminal_record = candidate
+        elif marker_event.type in _REPLAY_POST_TERMINAL_EVENT_TYPES:
+            terminal_records = await session_store.query_events(
+                EventQuery(
+                    session_id=marker_event.session_id,
+                    event_types=tuple(sorted(_REPLAY_TERMINAL_EVENT_TYPES, key=str)),
+                    before_sequence=marker_record.sequence,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            )
+            if terminal_records:
+                terminal_record = terminal_records[0]
+        else:
+            return None
+
+        if terminal_record is None:
+            return None
+        later_operation_starts = await session_store.query_events(
+            EventQuery(
+                session_id=marker_event.session_id,
+                event_types=tuple(sorted(_REPLAY_OPERATION_START_EVENT_TYPES, key=str)),
+                after_sequence=terminal_record.sequence,
+                before_sequence=marker_record.sequence,
+                limit=1,
+            )
+        )
+        if later_operation_starts:
+            return None
+        return terminal_record.event.id
 
     async def _replay_events_response(
         http_request: Request,
@@ -1480,11 +1876,17 @@ def create_router(
         last_event_id = http_request.headers.get("last-event-id")
         if last_event_id is None:
             return None
-        marker = parse_last_event_id(last_event_id)
+        marker = parse_last_event_id(
+            last_event_id,
+            expected_session_id=expected_session_id,
+        )
         if marker is None:
             raise HTTPException(
                 status_code=422,
-                detail="Last-Event-ID must use `session_id:event_id`.",
+                detail=(
+                    "Last-Event-ID must use `session_id:event_id` or the explicit "
+                    f"`{SSE_REPLAY_START_MARKER_FORMAT}` start marker."
+                ),
             )
         session_id, last_seen_event_id = marker
         if expected_session_id is not None and session_id != expected_session_id:
@@ -1498,9 +1900,21 @@ def create_router(
                 status_code=404,
                 detail=f"Session not found: {session_id}",
             )
+        marker_record = (
+            None
+            if last_seen_event_id is None
+            else await _marker_record(session_id, last_seen_event_id)
+        )
+        after_sequence = None if marker_record is None else marker_record.sequence
 
         async def replay() -> AsyncIterator[dict[str, str]]:
-            after_sequence = await _marker_sequence(session_id, last_seen_event_id)
+            replay_after_sequence = after_sequence
+            operation_in_progress = state.status in _REPLAY_ACTIVE_SESSION_STATUSES
+            observed_terminal_event_id = (
+                None
+                if marker_record is None or operation_in_progress
+                else await _marker_terminal_boundary_id(marker_record)
+            )
             loop = asyncio.get_running_loop()
             idle_deadline = loop.time() + replay_idle_timeout_s
             poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
@@ -1509,7 +1923,7 @@ def create_router(
                 page = await session_store.query_events(
                     EventQuery(
                         session_id=session_id,
-                        after_sequence=after_sequence,
+                        after_sequence=replay_after_sequence,
                         limit=SSE_REPLAY_PAGE_EVENTS,
                     )
                 )
@@ -1526,7 +1940,27 @@ def create_router(
                             session_id=session_id,
                         )
                         return
-                    after_sequence = record.sequence
+                    replay_after_sequence = record.sequence
+                    terminal_boundary_id = _replay_terminal_boundary_id(record.event)
+                    if record.event.type in _REPLAY_TERMINAL_EVENT_TYPES:
+                        observed_terminal_event_id = terminal_boundary_id
+                        operation_in_progress = False
+                    elif record.event.type in _REPLAY_OPERATION_START_EVENT_TYPES:
+                        observed_terminal_event_id = None
+                        operation_in_progress = True
+                    elif (
+                        terminal_boundary_id is not None
+                        and not operation_in_progress
+                        and terminal_boundary_id != observed_terminal_event_id
+                    ):
+                        # A hook may establish a boundary when replay began after
+                        # the terminal event. Validate its durable reference and
+                        # operation epoch before trusting payload-carried lineage.
+                        validated_boundary_id = await _marker_terminal_boundary_id(record)
+                        if validated_boundary_id is not None:
+                            observed_terminal_event_id = validated_boundary_id
+                    elif operation_in_progress:
+                        observed_terminal_event_id = None
                     yield message
                 if page:
                     idle_deadline = loop.time() + replay_idle_timeout_s
@@ -1534,7 +1968,27 @@ def create_router(
                 if len(page) == SSE_REPLAY_PAGE_EVENTS:
                     continue
                 current = await session_store.load_state(session_id)
-                if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
+                if current is None:
+                    return
+                terminal_event_type = _REPLAY_TERMINAL_EVENT_BY_STATUS.get(current.status)
+                if terminal_event_type is not None:
+                    terminal_records = await session_store.query_events(
+                        EventQuery(
+                            session_id=session_id,
+                            event_type=terminal_event_type,
+                            order_by=EventOrder.SEQUENCE_DESC,
+                            limit=1,
+                        )
+                    )
+                    if (
+                        terminal_records
+                        and observed_terminal_event_id == terminal_records[0].event.id
+                    ):
+                        return
+                elif current.status in _REPLAY_ACTIVE_SESSION_STATUSES:
+                    operation_in_progress = True
+                    observed_terminal_event_id = None
+                else:
                     return
                 remaining = idle_deadline - loop.time()
                 if remaining <= 0:
@@ -1570,23 +2024,48 @@ def create_router(
         http_request: Request,
         trace_metadata: TraceContextMetadata,
     ):
-        replay = await _replay_events_response(http_request)
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=body.session_id,
+        )
         if replay is not None:
             return replay
-        session_id = f"session-{uuid4().hex[:8]}"
+        session_id = body.session_id or f"session-{uuid4().hex}"
 
         if task_store is not None:
-            task = await task_store.create_task(
-                TaskCreate(
-                    type="run",
-                    title=body.prompt[:80],
-                    assigned_agent_name=body.agent,
-                    input={"prompt": body.prompt},
+            task_id = str(uuid4())
+
+            async def create_run_task(first_event: Event) -> None:
+                if first_event.session_id != session_id:
+                    raise RuntimeError(
+                        "Run acceptance event belongs to a different session: "
+                        f"{first_event.session_id}"
+                    )
+                state = await session_store.load_state(session_id)
+                if state is None:
+                    raise RuntimeError(f"Run session disappeared during acceptance: {session_id}")
+                # The runtime is paused at ``first_event`` while this callback
+                # executes. COMPLETED/FAILED therefore describe a terminal-prefix
+                # stream that needs no task. INTERRUPTING/INTERRUPTED can instead
+                # be a concurrent operator request; the task must still be linked
+                # so the interrupted session can resume it later.
+                if state.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+                    return
+                await task_store.create_running_task(
+                    TaskCreate(
+                        task_id=task_id,
+                        type="run",
+                        title=body.prompt[:80],
+                        session_id=session_id,
+                        assigned_agent_name=body.agent,
+                        input={"prompt": body.prompt},
+                    )
                 )
-            )
-            task_id = task.id
+
+            after_accept = create_run_task
         else:
             task_id = None
+            after_accept = None
 
         request = RunRequest(
             agent_name=body.agent,
@@ -1605,15 +2084,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        event_stream: AsyncIterator[Event] = cayu_app.run(request)
-        if task_id is not None:
-            event_stream = _fail_task_on_prestream_error(
-                event_stream, task_store=task_store, task_id=task_id
-            )
-        return _detached_event_stream_response(
-            event_stream,
+        return await _accepted_event_stream_response(
+            cayu_app.run(request),
             cayu_app=cayu_app,
             session_id=session_id,
+            after_accept=after_accept,
         )
 
     @router.post(
@@ -1652,10 +2127,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.resume(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1696,38 +2172,11 @@ def create_router(
                 body.requested_by if body is not None else None,
             ),
         )
-        event_stream = cayu_app.interrupt_session(request)
-        try:
-            first_event = await anext(event_stream)
-        except StopAsyncIteration as exc:
-            await event_stream.aclose()
-            raise HTTPException(
-                status_code=500,
-                detail="Session interruption produced no events.",
-            ) from exc
-        except ValueError as exc:
-            await event_stream.aclose()
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except TimeoutError as exc:
-            await event_stream.aclose()
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except KeyError as exc:
-            await event_stream.aclose()
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except Exception:
-            with contextlib.suppress(Exception):
-                await event_stream.aclose()
-            raise
-
-        async def generate():
-            yield first_event
-            async for event in event_stream:
-                yield event
-
-        return _detached_event_stream_response(
-            generate(),
+        return await _accepted_event_stream_response(
+            cayu_app.interrupt_session(request),
             cayu_app=cayu_app,
             session_id=session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1768,10 +2217,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.resolve_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1816,10 +2266,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.recover_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1864,10 +2315,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.recover_tool_round(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1909,10 +2361,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.resolve_user_input(response),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.post(
@@ -1958,10 +2411,11 @@ def create_router(
             thinking=body.thinking,
         )
 
-        return _detached_event_stream_response(
+        return await _accepted_event_stream_response(
             cayu_app.recover_user_input(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
     @router.get("/agents", response_model=AgentsResponse, dependencies=protected)

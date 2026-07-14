@@ -1282,9 +1282,20 @@ the same auth dependency outside `dev=True`.
 Mutation endpoints return bounded Server-Sent Events. Runtime data frames carry
 stable `session_id:event_id` identifiers; a reconnect that already has such a
 marker can send it as `Last-Event-ID` to replay durable events without executing
-the mutation again. Do not retry a mutation POST without a replay marker. The
-`/api/contract` response advertises the live frame limits. Replay reads durable
-history in bounded pages without imposing a connection-wide history ceiling.
+the mutation again. A caller that chooses `/run`'s optional `session_id` can use
+the explicit `session_id:` start marker when the connection fails before its
+first event. A mutation does not return HTTP `200` until its first event is
+durable, so every accepted response has a replay boundary even when the browser
+receives no SSE data. Unknown event markers return `409` rather than being
+treated as an implicit full-history request. Before changing an existing
+session, resumable clients capture its latest unfiltered durable event as their
+replay baseline. Do not retry a mutation POST without either that baseline or
+the explicit start marker. The `/api/contract` response advertises the marker
+formats and live frame limits. Replay reads durable history in bounded pages
+without imposing a connection-wide history ceiling, and a terminal status does
+not close replay until the matching durable terminal event has been observed.
+Once the detached runtime driver starts, cancellation of the HTTP request drops
+only that observer; it does not cancel the accepted operation.
 When a slow observer, oversized frame, or idle replay ends the live view, Cayu
 emits a classified `stream.error` envelope with
 `kind`, `code`, and `retryable` fields. Observer errors do not cancel detached

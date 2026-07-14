@@ -82,6 +82,7 @@ from cayu.runtime.tasks import (
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _ensure_not_terminal,
+    _running_task_from_create,
     _task_from_create,
     copy_task_create,
     copy_task_query,
@@ -2398,41 +2399,51 @@ class SQLiteTaskStore(TaskStore):
         request = copy_task_create(request)
         async with self._lock:
             task = _task_from_create(request)
-            try:
-                with self._connection:
-                    self._connection.execute(
-                        """
-                        INSERT INTO cayu_tasks (
-                            id,
-                            type,
-                            title,
-                            description,
-                            status,
-                            session_id,
-                            parent_task_id,
-                            assigned_agent_name,
-                            worker_id,
-                            lease_expires_at,
-                            status_reason,
-                            status_payload_json,
-                            input_json,
-                            result_json,
-                            error_json,
-                            metadata_json,
-                            created_at,
-                            updated_at,
-                            started_at,
-                            completed_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        sqlite_support.task_to_row_values(task),
-                    )
-            except sqlite3.IntegrityError as exc:
-                if self._task_exists_unlocked(task.id):
-                    raise ValueError(f"Task already exists: {task.id}") from exc
-                raise
+            self._insert_task_unlocked(task)
             return task.model_copy(deep=True)
+
+    async def create_running_task(self, request: TaskCreate) -> Task:
+        request = copy_task_create(request)
+        async with self._lock:
+            task = _running_task_from_create(request)
+            self._insert_task_unlocked(task)
+            return task.model_copy(deep=True)
+
+    def _insert_task_unlocked(self, task: Task) -> None:
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO cayu_tasks (
+                        id,
+                        type,
+                        title,
+                        description,
+                        status,
+                        session_id,
+                        parent_task_id,
+                        assigned_agent_name,
+                        worker_id,
+                        lease_expires_at,
+                        status_reason,
+                        status_payload_json,
+                        input_json,
+                        result_json,
+                        error_json,
+                        metadata_json,
+                        created_at,
+                        updated_at,
+                        started_at,
+                        completed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    sqlite_support.task_to_row_values(task),
+                )
+        except sqlite3.IntegrityError as exc:
+            if self._task_exists_unlocked(task.id):
+                raise ValueError(f"Task already exists: {task.id}") from exc
+            raise
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")

@@ -54,6 +54,44 @@ def test_task_stores_create_load_and_copy_boundary(store_factory: StoreFactory, 
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_create_running_task_atomically(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        running = await store.create_running_task(
+            TaskCreate(
+                task_id="task_atomic_run",
+                type="run",
+                session_id="sess_atomic_run",
+                input={"prompt": "hello"},
+            )
+        )
+
+        assert running.status is TaskStatus.RUNNING
+        assert running.session_id == "sess_atomic_run"
+        assert running.started_at is not None
+        assert running.completed_at is None
+        assert await store.claim_task("worker_a") is None
+
+        loaded = await store.load_task("task_atomic_run")
+        assert loaded == running
+        with pytest.raises(ValueError, match="Task already exists"):
+            await store.create_running_task(
+                TaskCreate(
+                    task_id="task_atomic_run",
+                    type="duplicate",
+                    session_id="sess_other",
+                )
+            )
+        with pytest.raises(ValueError, match="session_id is required"):
+            await store.create_running_task(TaskCreate(task_id="task_missing_session", type="run"))
+        assert await store.load_task("task_missing_session") is None
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_lifecycle_and_terminal_guards(store_factory: StoreFactory, tmp_path):
     store = _make_store(store_factory, tmp_path)
 

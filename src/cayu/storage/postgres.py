@@ -125,6 +125,7 @@ from cayu.runtime.tasks import (
     _ensure_can_transition,
     _ensure_claim_query_supported,
     _ensure_not_terminal,
+    _running_task_from_create,
     _task_from_create,
     copy_task_create,
     copy_task_query,
@@ -5711,6 +5712,17 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         request = copy_task_create(request)
         await self._ensure_ready()
         task = _task_from_create(request)
+        await self._insert_task(task)
+        return task.model_copy(deep=True)
+
+    async def create_running_task(self, request: TaskCreate) -> Task:
+        request = copy_task_create(request)
+        await self._ensure_ready()
+        task = _running_task_from_create(request)
+        await self._insert_task(task)
+        return task.model_copy(deep=True)
+
+    async def _insert_task(self, task: Task) -> None:
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -5729,7 +5741,6 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             except UniqueViolation as exc:
                 await conn.rollback()
                 raise ValueError(f"Task already exists: {task.id}") from exc
-        return task.model_copy(deep=True)
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")

@@ -86,6 +86,38 @@ def test_postgres_task_store_create_load_and_copy_boundary(postgres_dsn):
     _run(postgres_dsn, ops)
 
 
+def test_postgres_task_store_creates_running_task_atomically(postgres_dsn):
+    async def ops(store):
+        running = await store.create_running_task(
+            TaskCreate(
+                task_id="task_atomic_run",
+                type="run",
+                session_id="sess_atomic_run",
+                input={"prompt": "hello"},
+            )
+        )
+
+        assert running.status is TaskStatus.RUNNING
+        assert running.session_id == "sess_atomic_run"
+        assert running.started_at is not None
+        assert running.completed_at is None
+        assert await store.claim_task("worker_a") is None
+
+        with pytest.raises(ValueError, match="Task already exists"):
+            await store.create_running_task(
+                TaskCreate(
+                    task_id="task_atomic_run",
+                    type="duplicate",
+                    session_id="sess_other",
+                )
+            )
+        with pytest.raises(ValueError, match="session_id is required"):
+            await store.create_running_task(TaskCreate(task_id="task_missing_session", type="run"))
+        assert await store.load_task("task_missing_session") is None
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_task_store_lifecycle_and_terminal_guards(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_lifecycle", type="analyze_repository"))

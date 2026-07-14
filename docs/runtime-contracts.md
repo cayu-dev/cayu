@@ -425,6 +425,31 @@ excluded events. When an ascending response has another matching page,
 `scan_through_sequence` stops at the last returned event so a tail reader cannot
 skip matching records.
 
+The server's streaming mutation endpoints treat `Last-Event-ID` as a replay
+request and do not execute the mutation body again. A received event supplies a
+`session_id:event_id` marker. A caller that selects `/run`'s optional,
+replay-safe `session_id` can use the collision-free `session_id:` marker to
+recover after HTTP acceptance but before the first event. Event markers must
+name a durable event in that session; an unknown event returns `409` instead of
+silently widening to full-history replay. For mutations of an existing session,
+clients capture the latest unfiltered durable event before sending the command
+and retain it as the pre-mutation replay baseline. Replay remains bounded in
+memory and reads complete durable history in fixed-size pages. The server
+advances every mutation through its first durable event before returning HTTP
+`200`; a rejected command therefore has no ambiguous accepted-without-history
+window, while a transport loss before the first body frame remains recoverable.
+For `/run`, the session store's unique create is also the identity claim, and a
+route-owned task is created only after that claim succeeds. The detached runtime
+driver owns the operation independently of the HTTP request task: request
+cancellation abandons its observer but does not inject runtime cancellation.
+Replay treats terminal status as provisional until it has observed the matching
+durable `session.completed`, `session.failed`, or `session.interrupted` event, so
+the status/event persistence window cannot silently truncate a reconnect.
+Framework hook and interruption-cascade telemetry persisted after a terminal
+event retains that terminal replay boundary only when its referenced or nearest
+prior terminal event is durable and no newer operation started before the
+telemetry marker. Arbitrary custom-event payloads cannot claim terminal lineage.
+
 `GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
 It returns the session id, status, update/activity timestamps, and typed
 interruption-cascade state. `SessionStore.load_state` projects the mutable
@@ -473,6 +498,7 @@ A task is not a PM-specific object. It is a generic work item that can represent
 `Task` values have type, status, optional session/parent-task/assigned-agent identity, JSON-object input, optional JSON-object result/error, JSON-object metadata, and lifecycle timestamps. `TaskStore` exposes:
 
 - `create_task(TaskCreate(...))`
+- `create_running_task(TaskCreate(session_id=...))`
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=...)`
@@ -488,6 +514,11 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `complete_task(task_id, result)`
 - `fail_task(task_id, error)`
 - `cancel_task(task_id, error=...)`
+
+`create_running_task(...)` performs one store-atomic insert with `status=running`,
+the required session attachment, and `started_at`. It is intended for control-plane
+commands that have already durably claimed their session and must not expose a
+crash window containing an attached, unclaimable pending task.
 
 Valid task lifecycle is intentionally small for the foundation:
 

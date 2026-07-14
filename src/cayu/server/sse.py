@@ -15,6 +15,7 @@ SSE_ERROR_SESSION_ID_MAX_BYTES = 512
 SSE_OBSERVER_MAX_FRAMES = 256
 SSE_OBSERVER_MAX_BYTES = 2 * 1024 * 1024
 SSE_REPLAY_PAGE_EVENTS = 32
+SSE_REPLAY_START_MARKER_FORMAT = "session_id:"
 SSE_SEND_TIMEOUT_SECONDS = 30.0
 
 SseErrorKind = Literal["runtime", "observer"]
@@ -227,14 +228,40 @@ def _valid_utf8_within_limit(value: str, max_bytes: int) -> bool:
     return True
 
 
-def parse_last_event_id(value: str) -> tuple[str, str] | None:
-    """Parse a ``Last-Event-ID`` header (``<session_id>:<event_id>``).
+def parse_last_event_id(
+    value: str,
+    *,
+    expected_session_id: str | None = None,
+) -> tuple[str, str | None] | None:
+    """Parse an event marker or the explicit ``<session_id>:`` start marker.
 
-    Returns ``None`` when the value does not carry both parts.
+    A ``None`` event id means replay from the start of the named session. Supplying
+    ``expected_session_id`` preserves existing session identities that contain a
+    colon by removing the exact known prefix instead of guessing a split point.
+    Marker components are intentionally strict because a reconnect request must
+    never fall back from a malformed or unknown boundary to an ambiguous mutation.
     """
-    session_id, sep, event_id = value.partition(":")
-    session_id = session_id.strip()
-    event_id = event_id.strip()
-    if not sep or not session_id or not event_id:
+    if type(value) is not str or value != value.strip():
+        return None
+    expected_prefix = f"{expected_session_id}:" if expected_session_id is not None else ""
+    if expected_session_id is not None and value.startswith(expected_prefix):
+        session_id = expected_session_id
+        event_id = value[len(expected_prefix) :]
+        sep = ":"
+    else:
+        session_id, sep, event_id = value.partition(":")
+    if not sep or not _valid_sse_marker_component(session_id):
+        return None
+    if not event_id:
+        return session_id, None
+    if not _valid_sse_marker_component(event_id):
         return None
     return session_id, event_id
+
+
+def _valid_sse_marker_component(value: str) -> bool:
+    return (
+        bool(value)
+        and value == value.strip()
+        and not any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    )

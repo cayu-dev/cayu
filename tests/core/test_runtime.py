@@ -3116,6 +3116,46 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
     assert tool_events[0].payload["result"]["structured"] == {"workspace_id": workspace.id}
 
 
+def test_environment_factory_completion_payload_is_isolated_from_started_event():
+    async def run():
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic")),
+            metadata={"sandbox_id": "sbx_isolated"},
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_payload_isolation",
+                messages=[Message.text("user", "run")],
+            )
+        )
+        started = await anext(stream)
+        started.payload["factory_type"] = "consumer-spoof"
+        started.payload["consumer_only"] = True
+        remaining = [event async for event in stream]
+        return started, remaining
+
+    started, remaining = asyncio.run(run())
+
+    assert started.type == EventType.ENVIRONMENT_FACTORY_STARTED
+    completed = remaining[0]
+    assert completed.type == EventType.ENVIRONMENT_FACTORY_COMPLETED
+    assert completed.payload["factory_type"] == "RecordingEnvironmentFactory"
+    assert "consumer_only" not in completed.payload
+
+
 def test_cayu_app_run_without_a_default_does_not_select_a_static_environment():
     async def run():
         store = InMemorySessionStore()
@@ -3492,6 +3532,73 @@ def test_cayu_app_environment_factory_failure_fails_session_before_start_event(t
     assert events[2].payload["error_type"] == "RuntimeError"
     assert len(factory.requests) == 1
     assert provider.requests == []
+
+
+def test_cayu_app_environment_factory_failure_fails_worker_claimed_task(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        task = await tasks.create_task(TaskCreate(task_id="task_factory_claim", type="run"))
+        claimed = await tasks.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
+        assert claimed.id == task.id
+        workspace_root = tmp_path / "factory-claimed-task"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(
+                    workspace_root,
+                    workspace_id="factory-claimed-task-workspace",
+                ),
+            ),
+            fail_create=True,
+        )
+        provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(
+            session_store=store,
+            task_store=tasks,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_claim_failure",
+                task_id=task.id,
+                task_worker_id="worker_a",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, await tasks.load_task(task.id)
+
+    events, task = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.TASK_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.TASK_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert task.session_id == "sess_factory_claim_failure"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert task.error == {
+        "message": "factory failed",
+        "type": "RuntimeError",
+        "session_id": "sess_factory_claim_failure",
+    }
 
 
 def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_fails():
@@ -4523,6 +4630,47 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
 
     tool_events = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
     assert tool_events[0].payload["result"]["structured"] == {"workspace_id": bound_workspace.id}
+
+
+def test_environment_binding_completion_payload_is_isolated_from_started_event():
+    async def run():
+        configured_workspace = MemoryWorkspace("configured")
+        binding = RecordingWorkspaceBinding()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                workspace=configured_workspace,
+                binding=binding,
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_binding_payload_isolation",
+                messages=[Message.text("user", "run")],
+            )
+        )
+        started = await anext(stream)
+        started.payload["binding_type"] = "consumer-spoof"
+        started.payload["consumer_only"] = True
+        remaining = [event async for event in stream]
+        return started, remaining
+
+    started, remaining = asyncio.run(run())
+
+    assert started.type == EventType.ENVIRONMENT_BINDING_STARTED
+    completed = remaining[0]
+    assert completed.type == EventType.ENVIRONMENT_BINDING_COMPLETED
+    assert completed.payload["binding_type"] == "RecordingWorkspaceBinding"
+    assert "consumer_only" not in completed.payload
 
 
 def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):

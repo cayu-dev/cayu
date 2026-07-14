@@ -1896,6 +1896,12 @@ export type RunBody = {
      */
     prompt: string;
     retry_policy?: RetryPolicy | null;
+    /**
+     * Session Id
+     *
+     * Optional caller-selected identity for replay-safe run observation. Before the first event, reconnect with `session_id:` using this session ID.
+     */
+    session_id?: string | null;
     structured_output?: StructuredOutputSpec | null;
     thinking?: ThinkingConfig | null;
 };
@@ -2201,6 +2207,14 @@ export type SseContract = {
      * Replay Header
      */
     replay_header?: 'Last-Event-ID';
+    /**
+     * Replay Start Marker Format
+     */
+    replay_start_marker_format?: 'session_id:';
+    /**
+     * Unknown Event Marker Behavior
+     */
+    unknown_event_marker_behavior?: 'reject';
 };
 
 /**
@@ -3468,9 +3482,21 @@ export type ResumeAgentApiResumePostData = {
 
 export type ResumeAgentApiResumePostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type ResumeAgentApiResumePostError = ResumeAgentApiResumePostErrors[keyof ResumeAgentApiResumePostErrors];
@@ -3493,9 +3519,21 @@ export type RunAgentApiRunPostData = {
 
 export type RunAgentApiRunPostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type RunAgentApiRunPostError = RunAgentApiRunPostErrors[keyof RunAgentApiRunPostErrors];
@@ -3868,9 +3906,21 @@ export type InterruptSessionApiSessionsSessionIdInterruptPostData = {
 
 export type InterruptSessionApiSessionsSessionIdInterruptPostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type InterruptSessionApiSessionsSessionIdInterruptPostError = InterruptSessionApiSessionsSessionIdInterruptPostErrors[keyof InterruptSessionApiSessionsSessionIdInterruptPostErrors];
@@ -4310,9 +4360,21 @@ export type RecoverToolApprovalApiToolApprovalsRecoverPostData = {
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostError = RecoverToolApprovalApiToolApprovalsRecoverPostErrors[keyof RecoverToolApprovalApiToolApprovalsRecoverPostErrors];
@@ -4335,9 +4397,21 @@ export type ResolveToolApprovalApiToolApprovalsResolvePostData = {
 
 export type ResolveToolApprovalApiToolApprovalsResolvePostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type ResolveToolApprovalApiToolApprovalsResolvePostError = ResolveToolApprovalApiToolApprovalsResolvePostErrors[keyof ResolveToolApprovalApiToolApprovalsResolvePostErrors];
@@ -4360,9 +4434,21 @@ export type RecoverToolRoundApiToolRoundsRecoverPostData = {
 
 export type RecoverToolRoundApiToolRoundsRecoverPostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type RecoverToolRoundApiToolRoundsRecoverPostError = RecoverToolRoundApiToolRoundsRecoverPostErrors[keyof RecoverToolRoundApiToolRoundsRecoverPostErrors];
@@ -4385,9 +4471,21 @@ export type RecoverUserInputApiUserInputRecoverPostData = {
 
 export type RecoverUserInputApiUserInputRecoverPostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type RecoverUserInputApiUserInputRecoverPostError = RecoverUserInputApiUserInputRecoverPostErrors[keyof RecoverUserInputApiUserInputRecoverPostErrors];
@@ -4410,9 +4508,21 @@ export type ResolveUserInputApiUserInputResolvePostData = {
 
 export type ResolveUserInputApiUserInputResolvePostErrors = {
     /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
 };
 
 export type ResolveUserInputApiUserInputResolvePostError = ResolveUserInputApiUserInputResolvePostErrors[keyof ResolveUserInputApiUserInputResolvePostErrors];

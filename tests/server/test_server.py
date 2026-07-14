@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ import pytest
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
+httpx = pytest.importorskip("httpx")
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -25,6 +27,9 @@ from cayu import (
     ArtifactScope,
     CayuApp,
     Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     EnvironmentSpec,
     InMemoryKnowledgeStore,
     InMemoryTaskStore,
@@ -35,25 +40,33 @@ from cayu import (
     Message,
     MessageRole,
     SecretRedactor,
+    Task,
     TaskCreate,
     TaskStatus,
     TextPart,
     ThinkingPart,
     UserInputTool,
+    WorkspaceBinding,
 )
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     EventQuery,
+    EventRecord,
     InMemorySessionStore,
+    InterruptSessionRequest,
     PendingActionListResult,
     RunRequest,
     SessionIdentity,
     SessionStatus,
 )
 from cayu.server import create_server, mount_cayu, mount_dashboard
-from cayu.server.routes import _detached_event_stream_response, _next_replay_poll_interval
+from cayu.server.routes import (
+    _accepted_event_stream_response,
+    _detached_event_stream_response,
+    _next_replay_poll_interval,
+)
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_EVENT_DATA_MAX_BYTES,
@@ -301,17 +314,16 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["lease_expires_at"] is None
 
 
-def test_server_run_failure_before_session_does_not_strand_pending_task() -> None:
+def test_server_run_rejection_before_session_creates_no_task() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     client = TestClient(create_server(app, dev=True))
 
-    # Unsupported NATIVE structured output fails before any session exists; the
-    # route-created task must end failed, not sit pending with no session.
-    with client.stream(
-        "POST",
+    # The runtime is advanced through its atomic session claim before the route
+    # creates a task. A rejected command therefore has neither resource to clean up.
+    response = client.post(
         "/api/run",
         json={
             "prompt": "hello",
@@ -320,23 +332,227 @@ def test_server_run_failure_before_session_does_not_strand_pending_task() -> Non
                 "strategy": "native",
             },
         },
+    )
+    assert response.status_code == 409
+    assert "Native structured output" in response.json()["detail"]
+
+    assert client.get("/api/tasks").json() == []
+    assert client.get("/api/sessions").json()["sessions"] == []
+
+    response = client.post("/api/run", json={"prompt": "x", "agent": "ghost"})
+    assert response.status_code == 404
+
+    assert client.get("/api/tasks").json() == []
+    assert client.get("/api/sessions").json()["sessions"] == []
+
+
+def test_server_run_failure_before_acceptance_is_generic_and_creates_no_task(caplog) -> None:
+    app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        secret_redactor=SecretRedactor("secret-token"),
+    )
+
+    async def broken_run(request):
+        raise OSError("storage failed with secret-token")
+        yield  # pragma: no cover
+
+    app.run = broken_run
+    client = TestClient(create_server(app, dev=True))
+
+    with caplog.at_level(logging.ERROR, logger="cayu.server.routes"):
+        response = client.post("/api/run", json={"prompt": "hello"})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Mutation failed before streaming began."}
+    assert "secret-token" not in response.text
+    assert "secret-token" not in caplog.text
+    assert REDACTED_SECRET in caplog.text
+    assert "stage=before_first_event" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    assert client.get("/api/tasks").json() == []
+    assert client.get("/api/sessions").json()["sessions"] == []
+
+
+def test_server_run_task_setup_failure_finalizes_claimed_session(caplog) -> None:
+    class FailingTaskStore(InMemoryTaskStore):
+        async def create_running_task(self, request):
+            raise OSError("task store unavailable with secret-token")
+
+    app = CayuApp(
+        task_store=FailingTaskStore(),
+        secret_redactor=SecretRedactor("secret-token"),
+    )
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session_task_setup_failure"
+
+    with caplog.at_level(logging.ERROR, logger="cayu.server.routes"):
+        response = client.post(
+            "/api/run",
+            json={"prompt": "hello", "session_id": session_id},
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Mutation setup failed after its durable acceptance event."
+    }
+    assert "secret-token" not in caplog.text
+    assert REDACTED_SECRET in caplog.text
+    assert "stage=after_first_event" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    state = asyncio.run(app.session_store.load_state(session_id))
+    assert state is not None
+    assert state.status is SessionStatus.INTERRUPTED
+
+
+def test_server_run_terminal_prefix_does_not_create_a_running_task() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def terminal_run(request):
+        session = await app.session_store.create(
+            request,
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session.id, SessionStatus.FAILED)
+        turn_completed = Event(
+            id="event_terminal_prefix",
+            type=EventType.TURN_COMPLETED,
+            session_id=session.id,
+            agent_name=request.agent_name,
+        )
+        await app.session_store.append_event(session.id, turn_completed)
+        yield turn_completed
+        session_failed = Event(
+            id="event_terminal_failure",
+            type=EventType.SESSION_FAILED,
+            session_id=session.id,
+            agent_name=request.agent_name,
+        )
+        await app.session_store.append_event(session.id, session_failed)
+        yield session_failed
+
+    app.run = terminal_run
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.post(
+        "/api/run",
+        json={"prompt": "hello", "session_id": "session_terminal_prefix"},
+    )
+
+    assert response.status_code == 200
+    assert client.get("/api/tasks").json() == []
+
+
+def test_server_run_environment_factory_failure_terminalizes_linked_task() -> None:
+    class FailingEnvironmentFactory(EnvironmentFactory):
+        async def create(
+            self,
+            _request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            raise RuntimeError("factory failed")
+
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        FailingEnvironmentFactory(),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session_factory_failure"
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello", "session_id": session_id},
     ) as response:
         assert response.status_code == 200
-        stream_text = "\n".join(response.iter_lines())
-    assert "NativeStructuredOutputUnsupported" in stream_text
+        events = [frame["data"] for frame in _sse_frames(response) if "data" in frame]
 
-    tasks = client.get("/api/tasks").json()
-    assert [task["status"] for task in tasks] == ["failed"]
-    assert tasks[0]["session_id"] is None
+    assert [event["type"] for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.TASK_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.TASK_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    tasks = asyncio.run(task_store.list_tasks())
+    assert len(tasks) == 1
+    assert tasks[0].status is TaskStatus.FAILED
+    assert tasks[0].session_id == session_id
+    assert tasks[0].error == {
+        "message": "factory failed",
+        "type": "RuntimeError",
+        "session_id": session_id,
+    }
 
-    # The cleanup is generic: any pre-session failure (here an unregistered
-    # agent) fails its task the same way.
-    with client.stream("POST", "/api/run", json={"prompt": "x", "agent": "ghost"}) as response:
+
+def test_server_run_binding_failure_terminalizes_prestarted_task() -> None:
+    class FailingWorkspaceBinding(WorkspaceBinding):
+        async def bind(
+            self,
+            workspace,
+            runner,
+            *,
+            session_id: str,
+            agent_name: str | None = None,
+            environment_name: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ):
+            raise RuntimeError("binding failed")
+
+        async def finalize(
+            self,
+            bound,
+            *,
+            outcome: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ):
+            raise AssertionError("A failed binding must not be finalized.")
+
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="bound"),
+            binding=FailingWorkspaceBinding(),
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session_binding_failure"
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "hello", "session_id": session_id},
+    ) as response:
         assert response.status_code == 200
-        list(response.iter_lines())
+        events = [frame["data"] for frame in _sse_frames(response) if "data" in frame]
 
-    tasks = client.get("/api/tasks").json()
-    assert sorted(task["status"] for task in tasks) == ["failed", "failed"]
+    assert [event["type"] for event in events] == [
+        EventType.ENVIRONMENT_BINDING_STARTED,
+        EventType.TASK_STARTED,
+        EventType.ENVIRONMENT_BINDING_FAILED,
+        EventType.TASK_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    tasks = asyncio.run(task_store.list_tasks())
+    assert len(tasks) == 1
+    assert tasks[0].status is TaskStatus.FAILED
+    assert tasks[0].session_id == session_id
+    assert tasks[0].error == {
+        "message": "binding failed",
+        "type": "RuntimeError",
+        "session_id": session_id,
+    }
 
 
 def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> None:
@@ -4266,13 +4482,19 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
 
     async def resolve_tool_approval(request):
         resolved_requests.append(request)
-        if False:
-            yield None
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
 
     async def recover_tool_approval(request):
         recovered_requests.append(request)
-        if False:
-            yield None
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
 
     app.resolve_tool_approval = resolve_tool_approval
     app.recover_tool_approval = recover_tool_approval
@@ -4339,13 +4561,19 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
 
     async def resolve_tool_approval(request):
         captured.append(request)
-        if False:
-            yield None
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
 
     async def recover_tool_round(request):
         captured_tool_round.append(request)
-        if False:
-            yield None
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
 
     app.resolve_tool_approval = resolve_tool_approval
     app.recover_tool_round = recover_tool_round
@@ -4921,6 +5149,625 @@ def _sse_frames(response) -> list[dict]:
     return frames
 
 
+async def _post_and_disconnect_before_first_body(
+    server: FastAPI,
+    path: str,
+    body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Send one ASGI POST and disconnect immediately after HTTP acceptance."""
+    request_sent = False
+    response_started = asyncio.Event()
+    disconnect_delivered = asyncio.Event()
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(body).encode(),
+                "more_body": False,
+            }
+        await response_started.wait()
+        disconnect_delivered.set()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body" and disconnect_delivered.is_set():
+            # The server may race one write already queued at its ASGI boundary;
+            # model the socket loss by dropping it before the client receives it.
+            return
+        messages.append(message)
+        if message["type"] == "http.response.start":
+            response_started.set()
+            # Do not let the response task emit its first body frame before the
+            # disconnect listener has observed the injected network loss.
+            await disconnect_delivered.wait()
+
+    await server(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("testserver", 80),
+        },
+        receive,
+        send,
+    )
+    return messages
+
+
+def test_run_accepts_and_detaches_before_environment_factory_finishes() -> None:
+    class BlockingEnvironmentFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def create(
+            self,
+            _request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            self.started.set()
+            await self.release.wait()
+            return EnvironmentFactoryResult(
+                environment=Environment(EnvironmentSpec(name="dynamic"))
+            )
+
+    factory = BlockingEnvironmentFactory()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        factory,
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    server = create_server(app, dev=True)
+    session_id = "session_factory_acceptance_boundary"
+
+    async def exercise() -> tuple[bool, list[dict[str, Any]]]:
+        request_task = asyncio.create_task(
+            _post_and_disconnect_before_first_body(
+                server,
+                "/api/run",
+                {"prompt": "hello", "session_id": session_id},
+            )
+        )
+        await asyncio.wait_for(factory.started.wait(), timeout=1)
+        done, _ = await asyncio.wait({request_task}, timeout=0.2)
+        accepted_before_release = request_task in done
+        state = await app.session_store.load_state(session_id)
+        assert state is not None
+        assert state.status is SessionStatus.RUNNING
+        active_runs = app._active_session_run_records(session_id)
+        assert len(active_runs) == 1
+        assert active_runs[0].runtime_task is not request_task
+        assert not active_runs[0].runtime_task.done()
+
+        factory.release.set()
+        messages = await asyncio.wait_for(request_task, timeout=5)
+        deadline = asyncio.get_running_loop().time() + 5
+        while True:
+            state = await app.session_store.load_state(session_id)
+            if state is not None and state.status is SessionStatus.COMPLETED:
+                return accepted_before_release, messages
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("detached run did not complete after factory release")
+            await asyncio.sleep(0.01)
+
+    accepted_before_release, messages = asyncio.run(exercise())
+
+    assert accepted_before_release
+    starts = [message for message in messages if message["type"] == "http.response.start"]
+    assert [message["status"] for message in starts] == [200]
+
+
+def test_interrupt_after_run_acceptance_cancels_detached_provider() -> None:
+    class BlockingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.cancelled: asyncio.Event | None = None
+            self.never_complete: asyncio.Event | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            if self.started is None or self.cancelled is None or self.never_complete is None:
+                raise AssertionError("BlockingProvider test events were not initialized.")
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = BlockingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    server = create_server(app, dev=True)
+    session_id = "session_detached_interrupt_ownership"
+
+    async def exercise() -> tuple[list[dict[str, Any]], list[Event]]:
+        provider.started = asyncio.Event()
+        provider.cancelled = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+        request_task = asyncio.create_task(
+            _post_and_disconnect_before_first_body(
+                server,
+                "/api/run",
+                {"prompt": "hello", "session_id": session_id},
+            )
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        messages = await asyncio.wait_for(request_task, timeout=1)
+
+        active_runs = app._active_session_run_records(session_id)
+        assert len(active_runs) == 1
+        assert active_runs[0].runtime_task is not request_task
+        assert not active_runs[0].runtime_task.done()
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(session_id=session_id, reason="operator stop")
+            )
+        ]
+        await asyncio.wait_for(provider.cancelled.wait(), timeout=1)
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return messages, interrupt_events
+
+    messages, interrupt_events = asyncio.run(exercise())
+
+    starts = [message for message in messages if message["type"] == "http.response.start"]
+    assert [message["status"] for message in starts] == [200]
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+
+
+def test_interrupt_after_acceptance_before_observer_start_reaches_runtime() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    session_id = "session_interrupt_before_observer_start"
+
+    async def exercise() -> tuple[list[Event], list[dict[str, str]], SessionStatus]:
+        response = await _accepted_event_stream_response(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ),
+            cayu_app=app,
+            session_id=session_id,
+        )
+        active_runs = app._active_session_run_records(session_id)
+        assert len(active_runs) == 1
+        assert not active_runs[0].runtime_task.done()
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(session_id=session_id, reason="operator stop")
+            )
+        ]
+        observed = [message async for message in response.body_iterator]
+        state = await app.session_store.load_state(session_id)
+        assert state is not None
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return interrupt_events, observed, state.status
+
+    interrupt_events, observed, status = asyncio.run(exercise())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    observed_types = [json.loads(message["data"])["type"] for message in observed]
+    assert observed_types[0] == EventType.SESSION_STARTED
+    assert observed_types[-1] == EventType.SESSION_INTERRUPTED
+    assert status is SessionStatus.INTERRUPTED
+
+
+def test_interrupt_before_observer_start_cancels_environment_factory() -> None:
+    class BlockingEnvironmentFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.never_complete = asyncio.Event()
+
+        async def create(
+            self,
+            _request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            self.started.set()
+            try:
+                await self.never_complete.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+    factory = BlockingEnvironmentFactory()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        factory,
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    session_id = "session_interrupt_factory_before_observer_start"
+
+    async def exercise() -> tuple[list[Event], list[dict[str, str]], SessionStatus]:
+        response = await _accepted_event_stream_response(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ),
+            cayu_app=app,
+            session_id=session_id,
+        )
+        assert not factory.started.is_set()
+
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(session_id=session_id, reason="operator stop")
+            )
+        ]
+        observed = [message async for message in response.body_iterator]
+        await asyncio.wait_for(factory.started.wait(), timeout=1)
+        await asyncio.wait_for(factory.cancelled.wait(), timeout=1)
+        state = await app.session_store.load_state(session_id)
+        assert state is not None
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        return interrupt_events, observed, state.status
+
+    interrupt_events, observed, status = asyncio.run(exercise())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    observed_types = [json.loads(message["data"])["type"] for message in observed]
+    assert observed_types[0] == EventType.ENVIRONMENT_FACTORY_STARTED
+    assert observed_types[-1] == EventType.SESSION_INTERRUPTED
+    assert status is SessionStatus.INTERRUPTED
+
+
+def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
+    class BlockingTaskStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.create_started = asyncio.Event()
+            self.release_create = asyncio.Event()
+
+        async def create_running_task(self, request):
+            self.create_started.set()
+            await self.release_create.wait()
+            return await super().create_running_task(request)
+
+    task_store = BlockingTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    session_id = "session_interrupt_during_acceptance_bookkeeping"
+
+    async def exercise() -> tuple[list[Event], list[dict[str, str]], SessionStatus]:
+        async def interrupt() -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(session_id=session_id, reason="operator stop")
+                )
+            ]
+
+        response_task = asyncio.create_task(
+            _accepted_event_stream_response(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        task_id="task_interrupt_during_acceptance_bookkeeping",
+                        messages=[Message.text("user", "hello")],
+                    )
+                ),
+                cayu_app=app,
+                session_id=session_id,
+                after_accept=lambda _event: task_store.create_running_task(
+                    TaskCreate(
+                        task_id="task_interrupt_during_acceptance_bookkeeping",
+                        type="run",
+                        session_id=session_id,
+                    )
+                ),
+            )
+        )
+        await asyncio.wait_for(task_store.create_started.wait(), timeout=1)
+        interrupt_task = asyncio.create_task(interrupt())
+        await asyncio.sleep(0)
+        assert not response_task.done()
+
+        task_store.release_create.set()
+        response, interrupt_events = await asyncio.gather(response_task, interrupt_task)
+        observed = [message async for message in response.body_iterator]
+        state = await app.session_store.load_state(session_id)
+        assert state is not None
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+        tasks = await task_store.list_tasks()
+        assert [task.id for task in tasks] == ["task_interrupt_during_acceptance_bookkeeping"]
+        return interrupt_events, observed, state.status
+
+    interrupt_events, observed, status = asyncio.run(exercise())
+
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    observed_types = [json.loads(message["data"])["type"] for message in observed]
+    assert observed_types[0] == EventType.SESSION_STARTED
+    assert observed_types[-1] == EventType.SESSION_INTERRUPTED
+    assert status is SessionStatus.INTERRUPTED
+
+
+def test_run_route_interrupt_during_acceptance_state_read_keeps_task_linked() -> None:
+    class BlockingAcceptanceStateStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_next_state_read = True
+            self.state_read_started = asyncio.Event()
+            self.release_state_read = asyncio.Event()
+
+        async def load_state(self, session_id: str):
+            if self.block_next_state_read:
+                self.block_next_state_read = False
+                self.state_read_started.set()
+                await self.release_state_read.wait()
+            return await super().load_state(session_id)
+
+    session_store = BlockingAcceptanceStateStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    server = create_server(app, dev=True)
+    session_id = "session_interrupt_during_acceptance_state_read"
+
+    async def exercise() -> tuple[httpx.Response, list[Event], SessionStatus, list[Task]]:
+        async def interrupt() -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(session_id=session_id, reason="operator stop")
+                )
+            ]
+
+        transport = httpx.ASGITransport(app=server)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    "/api/run",
+                    json={"prompt": "hello", "session_id": session_id},
+                )
+            )
+            await asyncio.wait_for(session_store.state_read_started.wait(), timeout=1)
+            interrupt_task = asyncio.create_task(interrupt())
+            await asyncio.sleep(0)
+            session_store.release_state_read.set()
+            response, interrupt_events = await asyncio.wait_for(
+                asyncio.gather(request_task, interrupt_task),
+                timeout=2,
+            )
+
+        state = await session_store.load_state(session_id)
+        assert state is not None
+        return response, interrupt_events, state.status, await task_store.list_tasks()
+
+    response, interrupt_events, status, tasks = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    frames = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert frames[-1]["data"]["type"] == EventType.SESSION_INTERRUPTED
+    assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
+    assert status is SessionStatus.INTERRUPTED
+    assert len(tasks) == 1
+    assert tasks[0].session_id == session_id
+    assert tasks[0].status is TaskStatus.RUNNING
+
+
+def test_request_cancellation_during_acceptance_does_not_cancel_detached_run() -> None:
+    class BlockingProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.started.set()
+            await self.release.wait()
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = BlockingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    session_id = "session_cancelled_acceptance_owner"
+
+    async def exercise() -> tuple[SessionStatus, list[EventType | str]]:
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+
+        async def after_accept(_event: Event) -> None:
+            callback_started.set()
+            await release_callback.wait()
+
+        response_task = asyncio.create_task(
+            _accepted_event_stream_response(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    )
+                ),
+                cayu_app=app,
+                session_id=session_id,
+                after_accept=after_accept,
+            )
+        )
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
+        response_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+        release_callback.set()
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        active_runs = app._active_session_run_records(session_id)
+        assert len(active_runs) == 1
+        assert not active_runs[0].runtime_task.done()
+
+        provider.release.set()
+        deadline = asyncio.get_running_loop().time() + 1
+        while True:
+            state = await app.session_store.load_state(session_id)
+            if state is not None and state.status is SessionStatus.COMPLETED:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("detached run did not complete after request cancellation")
+            await asyncio.sleep(0.01)
+
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        assert app._active_session_run_records(session_id) == ()
+        return state.status, [record.event.type for record in records]
+
+    status, event_types = asyncio.run(exercise())
+
+    assert status is SessionStatus.COMPLETED
+    assert event_types[-1] == EventType.SESSION_COMPLETED
+
+
+def test_event_source_cancellation_before_acceptance_does_not_hang_request() -> None:
+    async def cancelled_stream() -> AsyncIterator[Event]:
+        raise asyncio.CancelledError
+        yield  # pragma: no cover - makes this an async generator
+
+    async def exercise() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                _accepted_event_stream_response(
+                    cancelled_stream(),
+                    cayu_app=CayuApp(enable_logging=False),
+                    session_id="session_cancelled_before_acceptance",
+                ),
+                timeout=1,
+            )
+
+    asyncio.run(exercise())
+
+
+def test_runtime_failure_survives_cancelled_stream_cleanup() -> None:
+    class CancelledCloseStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __aiter__(self) -> CancelledCloseStream:
+            return self
+
+        async def __anext__(self) -> Event:
+            self.calls += 1
+            if self.calls == 1:
+                return Event(
+                    id="event_before_runtime_failure",
+                    type="custom.before_runtime_failure",
+                    session_id="session_cancelled_stream_cleanup",
+                )
+            raise RuntimeError("runtime failed")
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    async def exercise() -> list[dict[str, str]]:
+        response = await _accepted_event_stream_response(
+            CancelledCloseStream(),
+            cayu_app=CayuApp(enable_logging=False),
+            session_id="session_cancelled_stream_cleanup",
+        )
+
+        async def collect() -> list[dict[str, str]]:
+            return [message async for message in response.body_iterator]
+
+        return await asyncio.wait_for(collect(), timeout=1)
+
+    messages = asyncio.run(exercise())
+
+    assert messages[0]["id"] == ("session_cancelled_stream_cleanup:event_before_runtime_failure")
+    assert messages[-1]["event"] == "error"
+    error = json.loads(messages[-1]["data"])
+    assert error["kind"] == "runtime"
+    assert error["code"] == "runtime_failed"
+
+
+def test_accepted_stream_driver_finishes_when_response_start_send_fails() -> None:
+    async def exercise() -> bool:
+        completed = asyncio.Event()
+
+        async def event_stream() -> AsyncIterator[Event]:
+            yield Event(
+                id="event_response_start_failure",
+                type="custom.accepted",
+                session_id="session_response_start_failure",
+            )
+            completed.set()
+
+        response = await _accepted_event_stream_response(
+            event_stream(),
+            cayu_app=CayuApp(enable_logging=False),
+            session_id="session_response_start_failure",
+        )
+
+        async def receive() -> dict[str, Any]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def send(_message: dict[str, Any]) -> None:
+            raise OSError("response send failed")
+
+        with pytest.raises(OSError, match="response send failed"):
+            await response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.3"},
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/api/run",
+                    "raw_path": b"/api/run",
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": [],
+                    "client": ("127.0.0.1", 50000),
+                    "server": ("testserver", 80),
+                },
+                receive,
+                send,
+            )
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        return completed.is_set()
+
+    assert asyncio.run(exercise()) is True
+
+
 def _detached_observer_first_message(events: list[Event]) -> tuple[dict[str, str], float, bool]:
     async def scenario() -> tuple[dict[str, str], float, bool]:
         completed = False
@@ -5057,12 +5904,14 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     client = TestClient(create_server(app, dev=True))
 
-    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+    session_id = "session-dashboard-run"
+    run_body = {"prompt": "hello", "session_id": session_id}
+    with client.stream("POST", "/api/run", json=run_body) as response:
         assert response.status_code == 200
         frames = [frame for frame in _sse_frames(response) if "data" in frame]
 
     assert frames
-    session_id = frames[0]["data"]["session_id"]
+    assert frames[0]["data"]["session_id"] == session_id
     # Every frame carries a resumable id of the form `<session_id>:<event_id>`.
     for frame in frames:
         assert frame["id"] == f"{session_id}:{frame['data']['id']}"
@@ -5071,6 +5920,16 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
         raise AssertionError("SSE replay must use the bounded state projection")
 
     app.session_store.load = fail_unbounded_session_load  # type: ignore[method-assign]
+
+    executed = []
+
+    async def unexpected_execution(request):
+        executed.append(request)
+        if False:
+            yield None
+
+    app.run = unexpected_execution
+    app.resume = unexpected_execution
 
     # A reconnect with Last-Event-ID replays the persisted events the client missed
     # instead of starting a new run.
@@ -5085,7 +5944,7 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     with client.stream(
         "POST",
         "/api/run",
-        json={"prompt": "hello"},
+        json=run_body,
         headers={"Last-Event-ID": frames[0]["id"]},
     ) as response:
         assert response.status_code == 200
@@ -5109,9 +5968,241 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     assert [frame["data"]["id"] for frame in resume_replayed] == [
         frame["data"]["id"] for frame in frames[1:]
     ]
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json=run_body,
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        assert response.status_code == 200
+        replayed_from_start = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in replayed_from_start] == [
+        frame["data"]["id"] for frame in frames
+    ]
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        assert response.status_code == 200
+        resume_replayed_from_start = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in resume_replayed_from_start] == [
+        frame["data"]["id"] for frame in frames
+    ]
+    assert executed == []
     # No new session was created by the replay request.
     sessions = client.get("/api/sessions").json()["sessions"]
     assert [session["id"] for session in sessions] == [session_id]
+    assert len(client.get("/api/tasks").json()) == 1
+
+
+def test_run_disconnect_after_http_acceptance_before_first_body_replays_from_start() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    server = create_server(app, dev=True)
+    session_id = "session_pre_first_disconnect"
+
+    async def exercise_disconnect() -> list[str]:
+        messages = await _post_and_disconnect_before_first_body(
+            server,
+            "/api/run",
+            {"prompt": "hello", "session_id": session_id},
+        )
+        starts = [message for message in messages if message["type"] == "http.response.start"]
+        assert [message["status"] for message in starts] == [200]
+        assert not any(
+            message.get("body") for message in messages if message["type"] == "http.response.body"
+        )
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while True:
+            state = await app.session_store.load_state(session_id)
+            if state is not None and state.status is SessionStatus.COMPLETED:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(
+                    "detached run did not complete after the observer disconnected"
+                )
+            await asyncio.sleep(0.01)
+
+        tasks = await task_store.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].status is TaskStatus.COMPLETED
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        return [record.event.id for record in records]
+
+    durable_event_ids = asyncio.run(exercise_disconnect())
+    assert durable_event_ids
+
+    executed = []
+
+    async def unexpected_run(request):
+        executed.append(request)
+        if False:
+            yield None
+
+    app.run = unexpected_run
+    with TestClient(server).stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored", "session_id": session_id},
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        assert response.status_code == 200
+        replayed = [frame["data"]["id"] for frame in _sse_frames(response) if "data" in frame]
+
+    assert replayed == durable_event_ids
+    assert executed == []
+
+
+def test_existing_session_reconnect_cannot_race_accepted_mutation_transition() -> None:
+    app = CayuApp()
+    session_id = "session_resume_pre_first_disconnect"
+    baseline_id = "event_before_resume"
+    executions = 0
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_event(
+            session_id,
+            Event(
+                id=baseline_id,
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session_id,
+                agent_name="assistant",
+            ),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+
+    async def accepted_resume(request):
+        nonlocal executions
+        executions += 1
+        await app.session_store.transition_status(
+            session_id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.RUNNING,
+        )
+        resumed = Event(
+            id="event_resume_accepted",
+            type=EventType.SESSION_RESUMED,
+            session_id=session_id,
+            agent_name="assistant",
+        )
+        await app.session_store.append_event(session_id, resumed)
+        yield resumed
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+        completed = Event(
+            id="event_resume_completed",
+            type=EventType.SESSION_COMPLETED,
+            session_id=session_id,
+            agent_name="assistant",
+        )
+        await app.session_store.append_event(session_id, completed)
+        yield completed
+
+    app.resume = accepted_resume
+    server = create_server(app, dev=True)
+
+    async def exercise_disconnect() -> None:
+        messages = await _post_and_disconnect_before_first_body(
+            server,
+            "/api/resume",
+            {"session_id": session_id, "prompt": "continue"},
+        )
+        starts = [message for message in messages if message["type"] == "http.response.start"]
+        assert [message["status"] for message in starts] == [200]
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while True:
+            state = await app.session_store.load_state(session_id)
+            if state is not None and state.status is SessionStatus.COMPLETED:
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("accepted resume did not complete after disconnect")
+            await asyncio.sleep(0.01)
+
+    asyncio.run(exercise_disconnect())
+    assert executions == 1
+
+    async def unexpected_resume(request):
+        raise AssertionError(f"replay re-executed resume for {request.session_id}")
+        yield  # pragma: no cover
+
+    app.resume = unexpected_resume
+    with TestClient(server).stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored"},
+        headers={"Last-Event-ID": f"{session_id}:{baseline_id}"},
+    ) as response:
+        assert response.status_code == 200
+        replayed = [frame["data"]["id"] for frame in _sse_frames(response) if "data" in frame]
+
+    assert replayed == ["event_resume_accepted", "event_resume_completed"]
+    assert executions == 1
+
+
+def test_concurrent_client_run_identity_creates_one_session_and_one_task() -> None:
+    class CoordinatedRunStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.claims = 0
+            self.both_claiming = asyncio.Event()
+
+        async def create(self, request, *, identity):
+            if request.session_id == "session_concurrent_claim":
+                self.claims += 1
+                if self.claims == 2:
+                    self.both_claiming.set()
+                await self.both_claiming.wait()
+            return await super().create(request, identity=identity)
+
+    store = CoordinatedRunStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(session_store=store, task_store=task_store)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    server = create_server(app, dev=True)
+
+    async def submit_concurrently():
+        transport = httpx.ASGITransport(app=server)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await asyncio.gather(
+                client.post(
+                    "/api/run",
+                    json={"prompt": "first", "session_id": "session_concurrent_claim"},
+                ),
+                client.post(
+                    "/api/run",
+                    json={"prompt": "second", "session_id": "session_concurrent_claim"},
+                ),
+            )
+
+    responses = asyncio.run(submit_concurrently())
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["detail"] == "Session already exists: session_concurrent_claim"
+
+    tasks = asyncio.run(task_store.list_tasks())
+    assert len(tasks) == 1
+    assert tasks[0].status is TaskStatus.COMPLETED
+    state = asyncio.run(store.load_state("session_concurrent_claim"))
+    assert state is not None
+    assert state.status is SessionStatus.COMPLETED
 
 
 def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> None:
@@ -5122,17 +6213,115 @@ def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> Non
 
     malformed = client.post(
         "/api/run",
-        json={"prompt": "hello"},
+        json={"prompt": "hello", "session_id": "session_marker_validation"},
         headers={"Last-Event-ID": "not-a-marker"},
     )
     assert malformed.status_code == 422
 
-    unknown = client.post(
+    for marker in ("missing_session:event_1", "missing_session:"):
+        unknown = client.post(
+            "/api/run",
+            json={"prompt": "hello", "session_id": "missing_session"},
+            headers={"Last-Event-ID": marker},
+        )
+        assert unknown.status_code == 404
+
+
+def test_run_replay_rejects_unknown_event_and_mismatched_body_identity() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_marker_validation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_event(
+            "session_marker_validation",
+            Event(
+                id="event_seen",
+                type=EventType.SESSION_STARTED,
+                session_id="session_marker_validation",
+                agent_name="assistant",
+            ),
+        )
+        await app.session_store.update_status(
+            "session_marker_validation",
+            SessionStatus.INTERRUPTED,
+        )
+
+    asyncio.run(seed())
+    executed = []
+
+    async def unexpected_execution(request):
+        executed.append(request)
+        if False:
+            yield None
+
+    app.run = unexpected_execution
+    client = TestClient(create_server(app, dev=True))
+
+    unknown_event = client.post(
         "/api/run",
-        json={"prompt": "hello"},
-        headers={"Last-Event-ID": "missing_session:event_1"},
+        json={"prompt": "ignored", "session_id": "session_marker_validation"},
+        headers={"Last-Event-ID": "session_marker_validation:event_missing"},
     )
-    assert unknown.status_code == 404
+    mismatched_session = client.post(
+        "/api/run",
+        json={"prompt": "ignored", "session_id": "session_marker_validation"},
+        headers={"Last-Event-ID": "session_other:event_seen"},
+    )
+
+    assert unknown_event.status_code == 409
+    assert "event was not found" in unknown_event.json()["detail"]
+    assert mismatched_session.status_code == 422
+    assert "does not match" in mismatched_session.json()["detail"]
+    assert executed == []
+    assert client.get("/api/tasks").json() == []
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ["session:colon", " leading-space", "slash/not-allowed", "x" * 129],
+)
+def test_run_rejects_session_ids_that_are_not_replay_safe(session_id: str) -> None:
+    response = TestClient(create_server(CayuApp(), dev=True)).post(
+        "/api/run",
+        json={"prompt": "hello", "session_id": session_id},
+    )
+
+    assert response.status_code == 422
+
+
+def test_run_rejects_duplicate_client_session_id_before_starting_work() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_duplicate",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.post(
+        "/api/run",
+        json={"prompt": "hello", "session_id": "session_duplicate"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Session already exists: session_duplicate"
+    assert client.get("/api/tasks").json() == []
 
 
 def test_replay_of_active_session_times_out_with_structured_error() -> None:
@@ -5179,6 +6368,560 @@ def test_replay_of_active_session_times_out_with_structured_error() -> None:
     assert "session_stranded" in frames[-1]["data"]["error"]
 
 
+def test_replay_waits_for_terminal_event_after_terminal_status() -> None:
+    class DelayedTerminalEventStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.injected_terminal_race = False
+            self.terminal_append_task: asyncio.Task[None] | None = None
+
+        async def query_events(
+            self,
+            query: EventQuery | None = None,
+        ) -> list[EventRecord]:
+            records = await super().query_events(query)
+            if (
+                query is not None
+                and query.session_id is not None
+                and query.after_sequence is not None
+                and query.event_id is None
+                and query.event_type is None
+                and not query.event_types
+                and not self.injected_terminal_race
+            ):
+                self.injected_terminal_race = True
+                session_id = query.session_id
+                await self.update_status(session_id, SessionStatus.INTERRUPTED)
+
+                async def append_terminal_event() -> None:
+                    await asyncio.sleep(0.05)
+                    await self.append_event(
+                        session_id,
+                        Event(
+                            id="event_delayed_terminal",
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=session_id,
+                            agent_name="assistant",
+                        ),
+                    )
+
+                self.terminal_append_task = asyncio.create_task(append_terminal_event())
+            return records
+
+    store = DelayedTerminalEventStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    session_id = "session_replay_terminal_status_race"
+
+    async def exercise() -> httpx.Response:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_initial_start",
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_previous_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+            ],
+        )
+        await store.update_status(session_id, SessionStatus.RUNNING)
+        await store.append_event(
+            session_id,
+            Event(
+                id="event_resume_baseline",
+                type=EventType.SESSION_RESUMED,
+                session_id=session_id,
+                agent_name="assistant",
+            ),
+        )
+
+        transport = httpx.ASGITransport(app=create_server(app, dev=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/resume",
+                json={"session_id": session_id, "prompt": "ignored during replay"},
+                headers={"Last-Event-ID": f"{session_id}:event_previous_terminal"},
+            )
+        if store.terminal_append_task is not None:
+            await store.terminal_append_task
+        return response
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    frames = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in frames] == [
+        "event_resume_baseline",
+        "event_delayed_terminal",
+    ]
+    assert frames[-1]["data"]["type"] == EventType.SESSION_INTERRUPTED
+
+
+def test_replay_recognizes_post_terminal_hook_marker() -> None:
+    app = CayuApp(enable_logging=False)
+    session_id = "session_replay_post_terminal_hook"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_hook_completed",
+                    type=EventType.HOOK_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                    payload={
+                        "terminal_event_id": "event_terminal",
+                        "terminal_event_type": str(EventType.SESSION_COMPLETED),
+                    },
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:event_hook_completed"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames == []
+
+
+@pytest.mark.parametrize(
+    "hook_event_type",
+    [EventType.HOOK_STARTED, EventType.HOOK_COMPLETED, EventType.HOOK_FAILED],
+)
+def test_replay_does_not_attach_stale_hook_marker_across_operation_start(
+    hook_event_type: EventType,
+) -> None:
+    class DelayedTerminalStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_append_task: asyncio.Task[None] | None = None
+
+        async def load_state(self, session_id: str):
+            state = await super().load_state(session_id)
+            if self.terminal_append_task is None:
+
+                async def append_terminal_event() -> None:
+                    await asyncio.sleep(0.05)
+                    await self.append_event(
+                        session_id,
+                        Event(
+                            id="event_current_terminal",
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=session_id,
+                            agent_name="assistant",
+                        ),
+                    )
+
+                self.terminal_append_task = asyncio.create_task(append_terminal_event())
+            return state
+
+    store = DelayedTerminalStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    session_id = f"session_replay_stale_{hook_event_type.value}"
+
+    async def exercise() -> httpx.Response:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_previous_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_operation_start",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_stale_hook",
+                    type=hook_event_type,
+                    session_id=session_id,
+                    agent_name="assistant",
+                    payload={
+                        "terminal_event_id": "event_previous_terminal",
+                        "terminal_event_type": str(EventType.SESSION_INTERRUPTED),
+                    },
+                ),
+            ],
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        transport = httpx.ASGITransport(app=create_server(app, dev=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/resume",
+                json={"session_id": session_id, "prompt": "ignored during replay"},
+                headers={"Last-Event-ID": f"{session_id}:event_stale_hook"},
+            )
+        if store.terminal_append_task is not None:
+            await store.terminal_append_task
+        return response
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    frames = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in frames] == ["event_current_terminal"]
+
+
+def test_replay_unverified_hook_does_not_erase_observed_terminal_boundary() -> None:
+    app = CayuApp(enable_logging=False)
+    session_id = "session_replay_unverified_hook_after_terminal"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_operation_start",
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_unverified_hook",
+                    type=EventType.HOOK_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                    payload={
+                        "terminal_event_id": "event_missing_terminal",
+                        "terminal_event_type": str(EventType.SESSION_COMPLETED),
+                    },
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:event_operation_start"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert [frame["data"]["id"] for frame in frames] == [
+        "event_terminal",
+        "event_unverified_hook",
+    ]
+
+
+def test_replay_does_not_accept_custom_event_as_terminal_lineage() -> None:
+    app = CayuApp(enable_logging=False)
+    session_id = "session_replay_forged_terminal_lineage"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_custom",
+                    type="custom.forged_terminal_lineage",
+                    session_id=session_id,
+                    agent_name="assistant",
+                    payload={
+                        "terminal_event_id": "event_terminal",
+                        "terminal_event_type": str(EventType.SESSION_COMPLETED),
+                    },
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:event_custom"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames[-1]["event"] == "error"
+    assert frames[-1]["data"]["code"] == "replay_idle_timeout"
+
+
+@pytest.mark.parametrize(
+    "cascade_event_type",
+    [
+        EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
+        EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+        EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+    ],
+)
+def test_replay_recognizes_framework_post_terminal_cascade_marker(
+    cascade_event_type: EventType,
+) -> None:
+    app = CayuApp(enable_logging=False)
+    session_id = f"session_replay_{cascade_event_type.value}"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_cascade",
+                    type=cascade_event_type,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:event_cascade"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames == []
+
+
+def test_replay_cascade_marker_uses_latest_completed_operation_boundary() -> None:
+    app = CayuApp(enable_logging=False)
+    session_id = "session_replay_stale_cascade_after_completion"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_previous_interrupt",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_operation_start",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_current_completion",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_stale_cascade",
+                    type=EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True, replay_idle_timeout_s=0.01))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"session_id": session_id, "prompt": "ignored during replay"},
+        headers={"Last-Event-ID": f"{session_id}:event_stale_cascade"},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert frames == []
+
+
+def test_replay_does_not_attach_stale_cascade_marker_across_operation_start() -> None:
+    class DelayedTerminalStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal_append_task: asyncio.Task[None] | None = None
+
+        async def load_state(self, session_id: str):
+            state = await super().load_state(session_id)
+            if self.terminal_append_task is None:
+
+                async def append_terminal_event() -> None:
+                    await asyncio.sleep(0.05)
+                    await self.append_event(
+                        session_id,
+                        Event(
+                            id="event_current_terminal",
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=session_id,
+                            agent_name="assistant",
+                        ),
+                    )
+
+                self.terminal_append_task = asyncio.create_task(append_terminal_event())
+            return state
+
+    store = DelayedTerminalStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    session_id = "session_replay_stale_cascade_marker"
+
+    async def exercise() -> httpx.Response:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_previous_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_operation_start",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+                Event(
+                    id="event_stale_cascade",
+                    type=EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                ),
+            ],
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        transport = httpx.ASGITransport(app=create_server(app, dev=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/resume",
+                json={"session_id": session_id, "prompt": "ignored during replay"},
+                headers={"Last-Event-ID": f"{session_id}:event_stale_cascade"},
+            )
+        if store.terminal_append_task is not None:
+            await store.terminal_append_task
+        return response
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    frames = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in frames] == ["event_current_terminal"]
+
+
 def test_replay_streams_complete_history_in_bounded_pages() -> None:
     app = CayuApp()
     event_count = 1_001
@@ -5210,6 +6953,12 @@ def test_replay_streams_complete_history_in_bounded_pages() -> None:
                     )
                     for index in range(event_count)
                 ],
+                Event(
+                    id="event_replay_terminal",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="session_replay_bound",
+                    agent_name="assistant",
+                ),
             ],
         )
         await app.session_store.update_status("session_replay_bound", SessionStatus.INTERRUPTED)
@@ -5227,10 +6976,11 @@ def test_replay_streams_complete_history_in_bounded_pages() -> None:
         frames = _sse_frames(response)
 
     assert all(frame.get("event") != "error" for frame in frames)
-    assert len(frames) == event_count
+    assert len(frames) == event_count + 1
     event_frames = frames
     assert event_frames[0]["data"]["id"] == "event_0"
-    assert event_frames[-1]["data"]["id"] == f"event_{event_count - 1}"
+    assert event_frames[-2]["data"]["id"] == f"event_{event_count - 1}"
+    assert event_frames[-1]["data"]["id"] == "event_replay_terminal"
 
 
 def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly() -> None:
@@ -5350,7 +7100,19 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
         ),
     ],
 )
-def test_mutation_routes_replay_without_reexecuting(path: str, body: dict) -> None:
+@pytest.mark.parametrize(
+    ("last_event_id", "expected_event_ids"),
+    [
+        ("session_approval_replay:event_seen", ["event_missed"]),
+        ("session_approval_replay:", ["event_seen", "event_missed"]),
+    ],
+)
+def test_mutation_routes_replay_without_reexecuting(
+    path: str,
+    body: dict,
+    last_event_id: str,
+    expected_event_ids: list[str],
+) -> None:
     app = CayuApp()
 
     async def seed() -> None:
@@ -5401,12 +7163,12 @@ def test_mutation_routes_replay_without_reexecuting(path: str, body: dict) -> No
         "POST",
         path,
         json=body,
-        headers={"Last-Event-ID": "session_approval_replay:event_seen"},
+        headers={"Last-Event-ID": last_event_id},
     ) as response:
         assert response.status_code == 200
         frames = [frame for frame in _sse_frames(response) if "data" in frame]
 
-    assert [frame["data"]["id"] for frame in frames] == ["event_missed"]
+    assert [frame["data"]["id"] for frame in frames] == expected_event_ids
     assert executed == []
 
 
@@ -5570,8 +7332,12 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
     client = TestClient(create_server(app, dev=True))
 
     async def broken_run(request):
+        yield Event(
+            type=EventType.SESSION_STARTED,
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+        )
         raise RuntimeError("run exploded with secret-token " + "x" * 1000)
-        yield  # pragma: no cover - makes this an async generator
 
     app.run = broken_run
 

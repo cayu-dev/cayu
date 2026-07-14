@@ -3576,6 +3576,21 @@
             }
           ]
         },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional caller-selected identity for replay-safe run observation. Before the first event, reconnect with `session_id:` using this session ID.",
+          "title": "Session Id"
+        },
         "structured_output": {
           "anyOf": [
             {
@@ -4125,6 +4140,18 @@
           "const": "Last-Event-ID",
           "default": "Last-Event-ID",
           "title": "Replay Header",
+          "type": "string"
+        },
+        "replay_start_marker_format": {
+          "const": "session_id:",
+          "default": "session_id:",
+          "title": "Replay Start Marker Format",
+          "type": "string"
+        },
+        "unknown_event_marker_behavior": {
+          "const": "reject",
+          "default": "reject",
+          "title": "Unknown Event Marker Behavior",
           "type": "string"
         }
       },
@@ -6498,10 +6525,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -6529,10 +6577,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -7417,10 +7486,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -8094,10 +8184,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -8125,10 +8236,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -8156,10 +8288,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -8187,10 +8340,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -8218,10 +8392,31 @@
               }
             }
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }

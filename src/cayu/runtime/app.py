@@ -2183,11 +2183,40 @@ class CayuApp:
         # _run_session. Every earlier exit must revoke it, including cancellation
         # and failures while recording the original setup failure.
         release_before_run = True
+        pre_run_task_started = False
         try:
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
+                async for queued_event in self._drain_out_of_band_session_events(session.id):
+                    yield queued_event
+                if request.task_id is not None:
+                    task = await self._start_task(
+                        task_id=request.task_id,
+                        session=session,
+                        worker_id=request.task_worker_id,
+                    )
+                    pre_run_task_started = True
+                    if active_factory_run is not None:
+                        active_factory_run.task_started = True
+                    yield await self._event_writer.emit(
+                        _task_event(
+                            event_type=EventType.TASK_STARTED,
+                            task=task,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                        )
+                    )
             resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = resolution.registered_environment
             for event in resolution.events:
@@ -2197,17 +2226,31 @@ class CayuApp:
             async for queued_event in self._drain_out_of_band_session_events(session.id):
                 yield queued_event
             if resolution.error is not None:
+                task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
+                    task_id=request.task_id,
+                    task_worker_id=request.task_worker_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    error=resolution.error,
+                )
+                if task_failure_event is not None:
+                    yield task_failure_event
                 session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+                failure_payload: dict[str, Any] = {
+                    "error": str(resolution.error),
+                    "error_type": type(resolution.error).__name__,
+                }
+                if task_failure_error is not None:
+                    failure_payload["task_update_error"] = str(task_failure_error)
+                    failure_payload["task_update_error_type"] = type(task_failure_error).__name__
                 async for event in self._emit_terminal_event_with_hooks(
                     event=Event(
                         type=EventType.SESSION_FAILED,
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=_environment_name(registered_environment),
-                        payload={
-                            "error": str(resolution.error),
-                            "error_type": type(resolution.error).__name__,
-                        },
+                        payload=failure_payload,
                     ),
                     phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
                     session=session,
@@ -2236,17 +2279,31 @@ class CayuApp:
                 return
             raise
         except Exception as exc:
+            task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
+                task_id=request.task_id,
+                task_worker_id=request.task_worker_id,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                error=exc,
+            )
+            if task_failure_event is not None:
+                yield task_failure_event
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            failure_payload = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            if task_failure_error is not None:
+                failure_payload["task_update_error"] = str(task_failure_error)
+                failure_payload["task_update_error_type"] = type(task_failure_error).__name__
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=_environment_name(registered_environment),
-                    payload={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    },
+                    payload=failure_payload,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
                 session=session,
@@ -2296,6 +2353,7 @@ class CayuApp:
                 task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
                 start_event_payload={"agent_name": registered_agent.spec.name},
+                start_task_on_enter=not pre_run_task_started,
             )
         except BaseException:
             await self.session_store.release_run_fence(session.id)
@@ -3434,10 +3492,18 @@ class CayuApp:
         try:
             transcript = await self.session_store.load_transcript(session.id)
             resume_events = await self.session_store.load_events(session.id)
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -3460,10 +3526,18 @@ class CayuApp:
                         },
                     )
                 )
+            binding_started_event = await self._emit_environment_binding_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if binding_started_event is not None:
+                yield binding_started_event
             binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=binding_started_event,
             )
             registered_environment = binding_result.registered_environment
             for event in binding_result.events:
@@ -3783,10 +3857,18 @@ class CayuApp:
                 tool_call_id=request.tool_call_id,
                 input_id=pending.input_id,
             )
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -4066,10 +4148,18 @@ class CayuApp:
                 events=approval_events,
                 approval=pending_approval,
             )
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -4114,10 +4204,18 @@ class CayuApp:
             }:
                 raise ValueError(f"Unsupported tool approval decision: {request.decision}")
 
+            binding_started_event = await self._emit_environment_binding_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if binding_started_event is not None:
+                yield binding_started_event
             binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=binding_started_event,
             )
             registered_environment = binding_result.registered_environment
             for event in binding_result.events:
@@ -4570,10 +4668,18 @@ class CayuApp:
                 approval=pending_approval,
                 tool_call_id=request.tool_call_id,
             )
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -4847,10 +4953,18 @@ class CayuApp:
                 pending_round=pending_round,
                 tool_call_id=request.tool_call_id,
             )
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5102,6 +5216,7 @@ class CayuApp:
         effective_thinking = thinking if thinking is not None else registered_agent.spec.thinking
         environment_name = _environment_name(registered_environment)
         task_started = task_id is not None and not start_task_on_enter
+        task_start_attempted = task_started
         task_finished = False
         current_task = asyncio.current_task()
         active_run: _ActiveSessionRun | None = None
@@ -5151,11 +5266,50 @@ class CayuApp:
                 turn_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
             )
+
+        async def start_linked_task_if_needed(*, only_if_exists: bool = False) -> Event | None:
+            nonlocal task_start_attempted, task_started
+            if task_id is None or task_started:
+                return None
+            if self.task_store is None:
+                raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+            if only_if_exists and await self.task_store.load_task(task_id) is None:
+                return None
+            task_start_attempted = True
+            task = await self._start_task(
+                task_id=task_id,
+                session=session,
+                worker_id=task_worker_id,
+            )
+            task_started = True
+            if active_run is not None:
+                active_run.task_started = True
+            return await self._event_writer.emit(
+                _task_event(
+                    event_type=EventType.TASK_STARTED,
+                    task=task,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            )
+
         try:
+            factory_started_event = await self._emit_environment_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
+                task_start_event = await start_linked_task_if_needed()
+                if task_start_event is not None:
+                    yield task_start_event
             factory_resolution = await self._resolve_registered_environment_factory_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=factory_started_event,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5165,10 +5319,21 @@ class CayuApp:
                 yield event
             if factory_resolution.error is not None:
                 raise factory_resolution.error
+            binding_started_event = await self._emit_environment_binding_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if binding_started_event is not None:
+                yield binding_started_event
+                task_start_event = await start_linked_task_if_needed()
+                if task_start_event is not None:
+                    yield task_start_event
             binding_result = await self._bind_registered_environment_for_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
+                started_event=binding_started_event,
             )
             registered_environment = binding_result.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5211,24 +5376,9 @@ class CayuApp:
             _require_native_structured_output_support(
                 structured_output, registered_provider=registered_provider
             )
-            if task_id is not None and start_task_on_enter:
-                task = await self._start_task(
-                    task_id=task_id,
-                    session=session,
-                    worker_id=task_worker_id,
-                )
-                task_started = True
-                if active_run is not None:
-                    active_run.task_started = True
-                yield await self._event_writer.emit(
-                    _task_event(
-                        event_type=EventType.TASK_STARTED,
-                        task=task,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                    )
-                )
+            task_start_event = await start_linked_task_if_needed()
+            if task_start_event is not None:
+                yield task_start_event
             await self.session_store.append_transcript_messages(
                 session.id,
                 messages_to_append,
@@ -5988,6 +6138,18 @@ class CayuApp:
         except Exception as exc:
             task_failure_error: Exception | None = None
             if (
+                not task_started
+                and not task_start_attempted
+                and task_id is not None
+                and self.task_store is not None
+            ):
+                try:
+                    task_start_event = await start_linked_task_if_needed(only_if_exists=True)
+                    if task_start_event is not None:
+                        yield task_start_event
+                except Exception as task_exc:
+                    task_failure_error = task_exc
+            if (
                 task_started
                 and not task_finished
                 and task_id is not None
@@ -6160,6 +6322,15 @@ class CayuApp:
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
+        existing = await self.task_store.load_task(task_id)
+        if (
+            worker_id is None
+            and existing is not None
+            and existing.status is TaskStatus.RUNNING
+            and existing.session_id == session.id
+            and existing.worker_id is None
+        ):
+            return existing
         if worker_id is not None:
             return await self.task_store.attach_task(
                 task_id,
@@ -6167,6 +6338,65 @@ class CayuApp:
                 worker_id=worker_id,
             )
         return await self.task_store.start_task(task_id, session_id=session.id)
+
+    async def _fail_task_for_run_setup_error(
+        self,
+        *,
+        task_id: str | None,
+        task_worker_id: str | None,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        error: Exception,
+    ) -> tuple[Event | None, Exception | None]:
+        """Fail only a task this run can prove it owns before `_run_session`."""
+        if task_id is None:
+            return None, None
+        if self.task_store is None:
+            return None, RuntimeError("task_store is required when RunRequest.task_id is set.")
+        try:
+            task = await self.task_store.load_task(task_id)
+            if task is None:
+                return None, KeyError(f"Task not found: {task_id}")
+            worker_matches = task.worker_id == task_worker_id
+            attached_to_session = task.session_id == session.id
+            owned_claim = (
+                task_worker_id is not None
+                and task.status is TaskStatus.CLAIMED
+                and task.session_id is None
+                and worker_matches
+            )
+            unclaimed_pending = (
+                task_worker_id is None
+                and task.status is TaskStatus.PENDING
+                and task.session_id is None
+                and task.worker_id is None
+            )
+            if not ((attached_to_session and worker_matches) or owned_claim or unclaimed_pending):
+                return None, None
+            task = await self.task_store.fail_task(
+                task_id,
+                {
+                    "message": str(error),
+                    "type": type(error).__name__,
+                    "session_id": session.id,
+                },
+                worker_id=task_worker_id,
+            )
+            return (
+                await self._event_writer.emit(
+                    _task_event(
+                        event_type=EventType.TASK_FAILED,
+                        task=task,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                ),
+                None,
+            )
+        except Exception as task_error:
+            return None, task_error
 
     async def _linked_running_task_id(self, session_id: str) -> str | None:
         """Find the one running task already attached to a resumed session.
@@ -10054,39 +10284,55 @@ class CayuApp:
         self._queue_out_of_band_session_event(emitted)
         return emitted
 
+    async def _emit_environment_factory_started(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        """Persist the factory acceptance boundary before provisioning begins."""
+        if registered_environment is None or registered_environment.factory is None:
+            return None
+        environment_name = registered_environment.spec.name
+        return await self._event_writer.emit(
+            Event(
+                type=EventType.ENVIRONMENT_FACTORY_STARTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=_environment_factory_base_payload(
+                    session=session,
+                    registered_environment=registered_environment,
+                ),
+            )
+        )
+
     async def _resolve_registered_environment_factory_for_session(
         self,
         *,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        started_event: Event | None,
     ) -> _EnvironmentFactoryResolutionResult:
         if registered_environment is None or registered_environment.factory is None:
+            if started_event is not None:
+                raise AssertionError("Factory start event exists without a registered factory.")
             return _EnvironmentFactoryResolutionResult(
                 registered_environment=registered_environment,
                 events=[],
             )
+        if started_event is None:
+            raise AssertionError("Registered environment factory was not started.")
 
         factory = registered_environment.factory
         environment_name = registered_environment.spec.name
-        base_payload = {
-            "factory_type": type(factory).__name__,
-            "requested_environment_name": environment_name,
-            "parent_session_id": session.parent_session_id,
-            "causal_budget_id": session.causal_budget_id,
-            "labels": copy_label_map(session.labels, "labels"),
-        }
-        events: list[Event] = [
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_FACTORY_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=base_payload,
-                )
-            )
-        ]
+        base_payload = _environment_factory_base_payload(
+            session=session,
+            registered_environment=registered_environment,
+        )
+        events: list[Event] = []
         result: EnvironmentFactoryResult | None = None
         environment: Environment | None = None
         try:
@@ -10246,41 +10492,64 @@ class CayuApp:
             _replace_checkpoint_preserving_interruption_cascade(copied_checkpoint),
         )
 
+    async def _emit_environment_binding_started(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        """Persist the binding acceptance boundary before workspace setup begins."""
+        if (
+            registered_environment is None
+            or registered_environment.bound_workspace is not None
+            or registered_environment.environment.binding is None
+        ):
+            return None
+        environment_name = _environment_name(registered_environment)
+        return await self._event_writer.emit(
+            Event(
+                type=EventType.ENVIRONMENT_BINDING_STARTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=_binding_base_payload(registered_environment),
+            )
+        )
+
     async def _bind_registered_environment_for_session(
         self,
         *,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        started_event: Event | None,
     ) -> _EnvironmentBindingResult:
         if registered_environment is None:
+            if started_event is not None:
+                raise AssertionError("Binding start event exists without an environment.")
             return _EnvironmentBindingResult(registered_environment=None, events=[])
         if registered_environment.bound_workspace is not None:
+            if started_event is not None:
+                raise AssertionError("Binding start event exists for an already-bound workspace.")
             return _EnvironmentBindingResult(
                 registered_environment=registered_environment,
                 events=[],
             )
         binding = registered_environment.environment.binding
         if binding is None:
+            if started_event is not None:
+                raise AssertionError("Binding start event exists without a workspace binding.")
             return _EnvironmentBindingResult(
                 registered_environment=registered_environment,
                 events=[],
             )
+        if started_event is None:
+            raise AssertionError("Registered workspace binding was not started.")
 
         environment_name = _environment_name(registered_environment)
         events: list[Event] = []
         base_payload = _binding_base_payload(registered_environment)
-        events.append(
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=base_payload,
-                )
-            )
-        )
         try:
             bound = await binding.bind(
                 registered_environment.environment.workspace,
@@ -11756,6 +12025,24 @@ def _session_trace_event_fields(
         if isinstance(tracestate, str) and tracestate:
             fields["tracestate"] = tracestate
     return fields
+
+
+def _environment_factory_base_payload(
+    *,
+    session: Session,
+    registered_environment: runtime_records.RegisteredEnvironment,
+) -> dict[str, Any]:
+    factory = registered_environment.factory
+    if factory is None:
+        raise AssertionError("Environment factory payload requires a registered factory.")
+    environment_name = registered_environment.spec.name
+    return {
+        "factory_type": type(factory).__name__,
+        "requested_environment_name": environment_name,
+        "parent_session_id": session.parent_session_id,
+        "causal_budget_id": session.causal_budget_id,
+        "labels": copy_label_map(session.labels, "labels"),
+    }
 
 
 def _binding_base_payload(

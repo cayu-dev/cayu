@@ -183,6 +183,15 @@ class TaskStore(ABC):
         """Create a task."""
 
     @abstractmethod
+    async def create_running_task(self, request: TaskCreate) -> Task:
+        """Atomically create a running task already attached to its session.
+
+        ``request.session_id`` is required. This avoids leaving an attached,
+        unclaimable pending task if a process stops between separate create and
+        start operations.
+        """
+
+    @abstractmethod
     async def load_task(self, task_id: str) -> Task | None:
         """Load a task by id."""
 
@@ -317,6 +326,15 @@ class InMemoryTaskStore(TaskStore):
         request = copy_task_create(request)
         async with self._lock:
             task = _task_from_create(request)
+            if task.id in self._tasks:
+                raise ValueError(f"Task already exists: {task.id}")
+            self._tasks[task.id] = task
+            return task.model_copy(deep=True)
+
+    async def create_running_task(self, request: TaskCreate) -> Task:
+        request = copy_task_create(request)
+        async with self._lock:
+            task = _running_task_from_create(request)
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._tasks[task.id] = task
@@ -770,6 +788,18 @@ def _task_from_create(request: TaskCreate) -> Task:
         metadata=copy_json_object(request.metadata, "metadata"),
         created_at=now,
         updated_at=now,
+    )
+
+
+def _running_task_from_create(request: TaskCreate) -> Task:
+    task = _task_from_create(request)
+    if task.session_id is None:
+        raise ValueError("TaskCreate.session_id is required to create a running task.")
+    return task.model_copy(
+        update={
+            "status": TaskStatus.RUNNING,
+            "started_at": task.created_at,
+        }
     )
 
 

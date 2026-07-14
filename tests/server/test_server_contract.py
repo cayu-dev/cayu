@@ -20,10 +20,12 @@ from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_ERROR_TYPE_MAX_BYTES,
     SSE_EVENT_DATA_MAX_BYTES,
+    SSE_REPLAY_START_MARKER_FORMAT,
     SseEventFrameTooLargeError,
     error_to_sse_message,
     event_to_sse_data,
     event_to_sse_message,
+    parse_last_event_id,
 )
 
 _SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "openapi-contract-summary.json"
@@ -132,6 +134,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     ]
     assert body["sse"]["content_type"] == "text/event-stream"
     assert body["sse"]["event_id_format"] == SSE_LAST_EVENT_ID_FORMAT
+    assert body["sse"]["replay_start_marker_format"] == SSE_REPLAY_START_MARKER_FORMAT
+    assert body["sse"]["unknown_event_marker_behavior"] == "reject"
     assert body["sse"]["event_data_schema"] == "SseEventEnvelope"
     assert body["sse"]["error_data_schema"] == "SseErrorEnvelope"
     assert body["sse"]["max_event_data_bytes"] == SSE_EVENT_DATA_MAX_BYTES
@@ -170,6 +174,10 @@ def test_streaming_routes_document_sse_response_contract() -> None:
         description = response["content"]["text/event-stream"]["schema"]["description"]
         assert "SseEventEnvelope" in description
         assert "SseErrorEnvelope" in description
+        for status_code in ("404", "409", "500"):
+            assert operation["responses"][status_code]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+            }
 
 
 def test_artifact_routes_document_typed_errors_and_content_response() -> None:
@@ -233,6 +241,22 @@ def test_sse_serialization_matches_contract_envelope() -> None:
     assert data["payload"] == {"path": "README.md"}
     assert isinstance(data["timestamp"], str)
     assert event_to_sse_message(event)["id"] == "session_1:event_1"
+
+
+def test_sse_replay_markers_distinguish_events_from_explicit_start() -> None:
+    assert parse_last_event_id("session_1:event_1") == ("session_1", "event_1")
+    assert parse_last_event_id("session_1:") == ("session_1", None)
+    assert parse_last_event_id(
+        "tenant:session_1:event_1",
+        expected_session_id="tenant:session_1",
+    ) == ("tenant:session_1", "event_1")
+    assert parse_last_event_id(
+        "tenant:session_1:",
+        expected_session_id="tenant:session_1",
+    ) == ("tenant:session_1", None)
+    assert parse_last_event_id(":event_1") is None
+    assert parse_last_event_id(" session_1:event_1") is None
+    assert parse_last_event_id("session_1:event_1\n") is None
 
 
 def test_sse_event_frame_limit_rejects_before_serializing_durable_payload(

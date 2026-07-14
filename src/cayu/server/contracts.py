@@ -17,6 +17,7 @@ from cayu.runtime.usage import CausalBudgetUsageSummary, SessionUsageSummary, Us
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_EVENT_DATA_MAX_BYTES,
+    SSE_REPLAY_START_MARKER_FORMAT,
     SseErrorCode,
     SseErrorKind,
 )
@@ -100,6 +101,8 @@ class SseContract(ApiBaseModel):
     content_type: Literal["text/event-stream"] = SSE_CONTENT_TYPE
     event_id_format: Literal["session_id:event_id"] = SSE_LAST_EVENT_ID_FORMAT
     replay_header: Literal["Last-Event-ID"] = "Last-Event-ID"
+    replay_start_marker_format: Literal["session_id:"] = SSE_REPLAY_START_MARKER_FORMAT
+    unknown_event_marker_behavior: Literal["reject"] = "reject"
     event_data_schema: Literal["SseEventEnvelope"] = "SseEventEnvelope"
     error_event_name: Literal["error"] = "error"
     error_data_schema: Literal["SseErrorEnvelope"] = "SseErrorEnvelope"
@@ -534,7 +537,22 @@ STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
                 }
             }
         },
-    }
+    },
+    404: {
+        "description": "The replay session or mutation target does not exist.",
+        "model": ApiErrorResponse,
+    },
+    409: {
+        "description": (
+            "The replay event marker is unknown or the mutation conflicts with "
+            "the current session state."
+        ),
+        "model": ApiErrorResponse,
+    },
+    500: {
+        "description": "The mutation could not open an accepted durable stream.",
+        "model": ApiErrorResponse,
+    },
 }
 
 

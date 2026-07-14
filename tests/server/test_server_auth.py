@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from cayu import AgentSpec, CayuApp, InMemoryTaskStore
+from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.server import AuthContext, BasicAuth, create_server, mount_cayu
 
@@ -418,8 +419,11 @@ def _approval_capture_app() -> tuple[CayuApp, list]:
 
     async def resolve_tool_approval(request):
         captured.append(request)
-        if False:
-            yield None
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
 
     app.resolve_tool_approval = resolve_tool_approval
     return app, captured
