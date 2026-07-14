@@ -129,6 +129,7 @@ from cayu.runtime.budgets import (
     BudgetLedger,
     BudgetLimit,
     BudgetPolicy,
+    BudgetReconciliation,
     BudgetReservationRecord,
     BudgetReservationResult,
     BudgetStore,
@@ -378,6 +379,32 @@ class _ModelAttemptFailed(Exception):
         self.emitted_error_event = emitted_error_event
         self.cause = cause
         super().__init__(self.message)
+
+
+class _BudgetReservationLeaseLost(RuntimeError):
+    """Raised when a live model step can no longer prove its budget reservation."""
+
+
+class _BudgetReservationLeaseLostBeforeModelDispatch(_BudgetReservationLeaseLost):
+    """Raised when lease loss is detected before any provider attempt starts."""
+
+
+def _budget_heartbeat_task_failure(task: asyncio.Task[None]) -> BaseException:
+    if task.cancelled():
+        return _BudgetReservationLeaseLost(
+            "Budget reservation heartbeat was cancelled unexpectedly."
+        )
+    failure = task.exception()
+    if failure is None:
+        # Defensive invariant: the heartbeat loop does not currently return normally.
+        return _BudgetReservationLeaseLost("Budget reservation heartbeat stopped unexpectedly.")
+    return failure
+
+
+async def _next_model_step_item(
+    iterator: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
+) -> tuple[Event | None, AssistantStepResult | None]:
+    return await anext(iterator)
 
 
 @dataclass
@@ -5593,6 +5620,20 @@ class CayuApp:
                         yield event
                     return
 
+                if budget_reservations and self.budget_ledger.reservation_ttl_seconds is not None:
+                    try:
+                        await self._renew_budget_reservations(budget_reservations)
+                    except _BudgetReservationLeaseLost:
+                        async for event in self._release_budget_reservations(
+                            budget_reservations,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            reason="reservation lease expired before model step",
+                        ):
+                            yield event
+                        raise
+
                 assistant_message: Message | None = None
                 assistant_step_result: AssistantStepResult | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
@@ -5615,7 +5656,11 @@ class CayuApp:
                         retry_policy=retry_policy,
                         transcript_cursor_before_request=len(messages),
                     )
-                    async for event, result in model_step_events:
+                    guarded_model_step_events = self._model_step_events_with_budget_heartbeat(
+                        model_step_events,
+                        reservations=budget_reservations,
+                    )
+                    async for event, result in guarded_model_step_events:
                         if event is not None:
                             if event.type == EventType.MODEL_COMPLETED:
                                 model_completed_event = event
@@ -5624,6 +5669,26 @@ class CayuApp:
                             assistant_step_result = result
                             assistant_message = result.assistant_message
                             tool_calls = result.tool_calls
+                except _BudgetReservationLeaseLostBeforeModelDispatch:
+                    async for event in self._release_budget_reservations(
+                        budget_reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        reason="reservation lease expired before model dispatch",
+                    ):
+                        yield event
+                    raise
+                except _BudgetReservationLeaseLost:
+                    async for event in self._reconcile_uncertain_budget_reservations(
+                        budget_reservations,
+                        model_completed_event=model_completed_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    ):
+                        yield event
+                    raise
                 except _SessionInterruptedByRequest:
                     async for event in self._release_budget_reservations(
                         budget_reservations,
@@ -7635,6 +7700,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
     ) -> AsyncIterator[Event]:
+        reconciliations: list[BudgetReconciliation] = []
         for reservation in reservations:
             try:
                 actual_amount = budget_actual_cost_for_event(
@@ -7651,6 +7717,9 @@ class CayuApp:
                 reason=reason,
                 occurred_at=model_completed_event.timestamp,
             )
+            reconciliations.append(reconciliation)
+
+        for reconciliation in reconciliations:
             yield await self._event_writer.emit(
                 Event(
                     type=EventType.BUDGET_RECONCILED,
@@ -7660,6 +7729,199 @@ class CayuApp:
                     payload=budget_reconciliation_payload(reconciliation),
                 )
             )
+
+    async def _reconcile_uncertain_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        model_completed_event: Event | None,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> AsyncIterator[Event]:
+        if model_completed_event is not None:
+            async for event in self._reconcile_budget_reservations(
+                reservations,
+                model_completed_event=model_completed_event,
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+            ):
+                yield event
+            return
+
+        reconciled_at = self._clock()
+        reconciliations: list[BudgetReconciliation] = []
+        for reservation in reservations:
+            reconciliation = await self.budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=reservation.record.reserved_amount,
+                reason="reservation heartbeat lost; charged reserved amount",
+                occurred_at=reconciled_at,
+            )
+            reconciliations.append(reconciliation)
+
+        for reconciliation in reconciliations:
+            yield await self._event_writer.emit(
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=budget_reconciliation_payload(reconciliation),
+                )
+            )
+
+    async def _model_step_events_with_budget_heartbeat(
+        self,
+        model_step_events: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
+        *,
+        reservations: list[_BudgetStepReservation],
+    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        ttl_seconds = self.budget_ledger.reservation_ttl_seconds
+        if not reservations or ttl_seconds is None:
+            async for item in model_step_events:
+                yield item
+            return
+
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_budget_reservations(
+                reservations,
+                interval_seconds=ttl_seconds / 3,
+            )
+        )
+        iterator = model_step_events.__aiter__()
+        next_item_task: asyncio.Task[tuple[Event | None, AssistantStepResult | None]] | None = None
+        exhausted = False
+        provider_work_started = False
+        validate_before_provider_dispatch = False
+        try:
+            while True:
+                if heartbeat_task.done():
+                    heartbeat_failure = _budget_heartbeat_task_failure(heartbeat_task)
+                    if not provider_work_started:
+                        raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                            "Budget reservation lease was lost before model dispatch."
+                        ) from heartbeat_failure
+                    raise heartbeat_failure
+
+                if validate_before_provider_dispatch:
+                    try:
+                        await self._renew_budget_reservations(reservations)
+                    except _BudgetReservationLeaseLost as exc:
+                        if not provider_work_started:
+                            raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                                "Budget reservation lease was lost before model dispatch."
+                            ) from exc
+                        raise
+                    if heartbeat_task.done():
+                        heartbeat_failure = _budget_heartbeat_task_failure(heartbeat_task)
+                        if not provider_work_started:
+                            raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                                "Budget reservation lease was lost before model dispatch."
+                            ) from heartbeat_failure
+                        raise heartbeat_failure
+                    provider_work_started = True
+                    validate_before_provider_dispatch = False
+
+                next_item_task = asyncio.create_task(_next_model_step_item(iterator))
+                done, _ = await asyncio.wait(
+                    {next_item_task, heartbeat_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if heartbeat_task in done:
+                    heartbeat_failure = _budget_heartbeat_task_failure(heartbeat_task)
+                    completed_item: tuple[Event | None, AssistantStepResult | None] | None = None
+                    provider_failure: Exception | None = None
+                    if not next_item_task.done():
+                        next_item_task.cancel()
+                        try:
+                            await next_item_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            provider_failure = exc
+                    else:
+                        try:
+                            completed_item = next_item_task.result()
+                        except (StopAsyncIteration, asyncio.CancelledError):
+                            pass
+                        except Exception as exc:
+                            provider_failure = exc
+                    if provider_failure is not None:
+                        heartbeat_failure.add_note(
+                            "Provider iterator failed while budget lease loss was being handled: "
+                            f"{type(provider_failure).__name__}: {provider_failure}"
+                        )
+                    if completed_item is not None:
+                        # Preserve an item that completed in the same loop turn. In
+                        # particular, MODEL_COMPLETED lets the caller reconcile known
+                        # actual usage before the lease failure terminates the session.
+                        next_item_task = None
+                        yield completed_item
+                    if not provider_work_started:
+                        raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                            "Budget reservation lease was lost before model dispatch."
+                        ) from heartbeat_failure
+                    raise heartbeat_failure
+                try:
+                    item = next_item_task.result()
+                except StopAsyncIteration:
+                    exhausted = True
+                    break
+                next_item_task = None
+                item_event, _ = item
+                if item_event is not None and item_event.type == EventType.MODEL_STARTED:
+                    validate_before_provider_dispatch = True
+                yield item
+
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+            await self._renew_budget_reservations(reservations)
+        finally:
+            if next_item_task is not None and not next_item_task.done():
+                next_item_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await next_item_task
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            if not exhausted:
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        await close()
+
+    async def _heartbeat_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        interval_seconds: float,
+    ) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await self._renew_budget_reservations(reservations)
+
+    async def _renew_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+    ) -> None:
+        for reservation in reservations:
+            reservation_id = reservation.record.reservation_id
+            try:
+                renewed = await self.budget_ledger.heartbeat(
+                    reservation_id=reservation_id,
+                )
+            except Exception as exc:
+                raise _BudgetReservationLeaseLost(
+                    f"Could not renew budget reservation: {reservation_id}"
+                ) from exc
+            if not renewed:
+                raise _BudgetReservationLeaseLost(
+                    f"Budget reservation lease was lost: {reservation_id}"
+                )
 
     async def _release_budget_reservations(
         self,

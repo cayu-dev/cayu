@@ -200,6 +200,76 @@ class FakeProvider(ModelProvider):
             yield event
 
 
+class BlockingBudgetProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 250_000,
+                    "output_tokens": 0,
+                    "total_tokens": 250_000,
+                },
+            }
+        )
+
+
+class CancellationCleanupFailingBudgetProvider(BlockingBudgetProvider):
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise RuntimeError("provider cancellation cleanup failed") from None
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class RejectingHeartbeatBudgetLedger(InMemoryBudgetLedger):
+    def __init__(self, *, successful_heartbeat_calls: int = 2) -> None:
+        super().__init__(reservation_ttl_seconds=1)
+        self.successful_heartbeat_calls = successful_heartbeat_calls
+        self.heartbeat_calls = 0
+        self.rejected = asyncio.Event()
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        self.heartbeat_calls += 1
+        if self.heartbeat_calls <= self.successful_heartbeat_calls:
+            return await super().heartbeat(reservation_id=reservation_id)
+        self.rejected.set()
+        return False
+
+
+class ObservingHeartbeatBudgetLedger(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__(reservation_ttl_seconds=1)
+        self.heartbeat_calls = 0
+        self.renewed_past_initial_ttl = asyncio.Event()
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        renewed = await super().heartbeat(reservation_id=reservation_id)
+        self.heartbeat_calls += 1
+        if self.heartbeat_calls >= 6:
+            self.renewed_past_initial_ttl.set()
+        return renewed
+
+
 class CountingProvider(FakeProvider):
     def __init__(
         self,
@@ -7108,6 +7178,492 @@ def test_cayu_app_budget_reservation_reconciles_model_step():
     assert reserved.payload["actual"] == "1"
     assert reconciled.payload["actual_amount"] == "0.25"
     assert reconciled.payload["released_amount"] == "0.75"
+
+
+def test_cayu_app_heartbeats_silent_live_budget_reservation() -> None:
+    async def run():
+        provider = BlockingBudgetProvider()
+        ledger = ObservingHeartbeatBudgetLedger()
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_live_reservation",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await provider.started.wait()
+        await asyncio.wait_for(ledger.renewed_past_initial_ttl.wait(), timeout=5)
+        blocked = await ledger.reserve(
+            limit=limit,
+            session_id="sess_concurrent",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        provider.release.set()
+        events = await run_task
+        return blocked, events
+
+    blocked, events = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert EventType.BUDGET_RECONCILED in [event.type for event in events]
+
+
+def test_cayu_app_does_not_start_model_after_reservation_expires_during_event_pause() -> None:
+    async def run():
+        provider = BlockingBudgetProvider()
+        now = [datetime.now(UTC)]
+        ledger = InMemoryBudgetLedger(
+            clock=lambda: now[0],
+            reservation_ttl_seconds=1,
+        )
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_expired_before_model",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        events: list[Event] = []
+        async for event in stream:
+            events.append(event)
+            if event.type == EventType.BUDGET_RESERVED:
+                break
+
+        assert provider.started.is_set() is False
+        now[0] += timedelta(seconds=2)
+        replacement = await ledger.reserve(
+            limit=limit,
+            session_id="sess_replacement",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        async for event in stream:
+            events.append(event)
+        return provider, replacement, events
+
+    provider, replacement, events = asyncio.run(run())
+
+    assert replacement.accepted is True
+    assert provider.started.is_set() is False
+    assert EventType.BUDGET_RESERVATION_RELEASED in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+@pytest.mark.parametrize(
+    "pause_at",
+    [
+        pytest.param(EventType.MODEL_STARTED, id="model-started"),
+        pytest.param(EventType.CONTEXT_PRESSURE_ESTIMATED, id="context-pressure"),
+    ],
+)
+def test_cayu_app_validates_budget_lease_immediately_before_provider_dispatch(
+    pause_at: EventType,
+) -> None:
+    async def run():
+        provider = BlockingBudgetProvider()
+        now = [datetime.now(UTC)]
+        ledger = InMemoryBudgetLedger(
+            clock=lambda: now[0],
+            reservation_ttl_seconds=1,
+        )
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+            context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_expired_at_{pause_at.value}",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        events: list[Event] = []
+        async for event in stream:
+            events.append(event)
+            if event.type == pause_at:
+                break
+
+        assert provider.started.is_set() is False
+        now[0] += timedelta(seconds=2)
+        replacement = await ledger.reserve(
+            limit=limit,
+            session_id=f"sess_replacement_for_{pause_at.value}",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        async for event in stream:
+            events.append(event)
+        return provider, replacement, events
+
+    provider, replacement, events = asyncio.run(run())
+
+    event_types = [event.type for event in events]
+    assert replacement.accepted is True
+    assert provider.started.is_set() is False
+    assert EventType.BUDGET_RESERVATION_RELEASED in event_types
+    assert EventType.BUDGET_RECONCILED not in event_types
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_cayu_app_does_not_advance_provider_when_budget_heartbeat_is_terminal() -> None:
+    async def run():
+        provider = BlockingBudgetProvider()
+        ledger = RejectingHeartbeatBudgetLedger(successful_heartbeat_calls=1)
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_heartbeat_before_dispatch",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        events: list[Event] = []
+        async for event in stream:
+            events.append(event)
+            if event.type == EventType.MODEL_STARTED:
+                break
+
+        assert provider.started.is_set() is False
+        await asyncio.wait_for(ledger.rejected.wait(), timeout=5)
+        async for event in stream:
+            events.append(event)
+        return provider, ledger, events
+
+    provider, ledger, events = asyncio.run(run())
+
+    event_types = [event.type for event in events]
+    assert ledger.heartbeat_calls == 2
+    assert provider.started.is_set() is False
+    assert EventType.BUDGET_RESERVATION_RELEASED in event_types
+    assert EventType.BUDGET_RECONCILED not in event_types
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_cayu_app_reconciles_all_limits_before_yielding_reconciliation_events() -> None:
+    async def run():
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 250_000,
+                            "output_tokens": 0,
+                            "total_tokens": 250_000,
+                        },
+                    }
+                )
+            ]
+        )
+        now = [datetime.now(UTC)]
+        ledger = InMemoryBudgetLedger(
+            clock=lambda: now[0],
+            reservation_ttl_seconds=1,
+        )
+        reservation = BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=0,
+        )
+        pricing = fake_budget_limit("10").pricing
+        app_limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+            reservation=reservation,
+        )
+        agent_limit = BudgetLimit(
+            scope="agent",
+            key="assistant",
+            max_estimated_cost=Decimal("1"),
+            pricing=pricing,
+            reservation=reservation,
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(app_limit, agent_limit)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_multi_limit_reconciliation",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        events: list[Event] = []
+        async for event in stream:
+            events.append(event)
+            if event.type == EventType.BUDGET_RECONCILED:
+                break
+
+        now[0] += timedelta(seconds=2)
+        blocked = await ledger.reserve(
+            limit=agent_limit,
+            session_id="sess_concurrent",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        async for event in stream:
+            events.append(event)
+        return blocked, events
+
+    blocked, events = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("1.25")
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert [event.type for event in events].count(EventType.BUDGET_RECONCILED) == 2
+
+
+def test_cayu_app_fails_closed_and_charges_reservation_when_heartbeat_is_lost() -> None:
+    async def run():
+        provider = BlockingBudgetProvider()
+        ledger = RejectingHeartbeatBudgetLedger()
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_lost_reservation",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+        return provider, ledger, events
+
+    provider, ledger, events = asyncio.run(run())
+
+    assert provider.cancelled.is_set()
+    assert ledger.heartbeat_calls == 3
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert EventType.BUDGET_RESERVATION_RELEASED not in [event.type for event in events]
+    reconciliation = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+    assert reconciliation.payload["actual_amount"] == "1"
+    assert reconciliation.payload["reason"] == (
+        "reservation heartbeat lost; charged reserved amount"
+    )
+
+
+def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -> None:
+    async def run():
+        provider = CancellationCleanupFailingBudgetProvider()
+        ledger = RejectingHeartbeatBudgetLedger()
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=fake_budget_limit("10").pricing,
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        app = CayuApp(
+            budget_policy=BudgetPolicy(limits=(limit,)),
+            budget_ledger=ledger,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        unhandled: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            events = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_provider_cleanup_failed_after_lease_loss",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+        return provider, ledger, events, unhandled
+
+    provider, ledger, events, unhandled = asyncio.run(run())
+
+    event_types = [event.type for event in events]
+    assert provider.started.is_set()
+    assert provider.cancelled.is_set()
+    assert ledger.heartbeat_calls == 3
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert event_types.count(EventType.BUDGET_RECONCILED) == 1
+    assert EventType.BUDGET_RESERVATION_RELEASED not in event_types
+    reconciliation = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+    assert reconciliation.payload["actual_amount"] == "1"
+    assert reconciliation.payload["reason"] == (
+        "reservation heartbeat lost; charged reserved amount"
+    )
+    assert unhandled == []
+
+
+def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_wait = asyncio.wait
+
+    async def force_terminal_item_and_heartbeat_into_same_done_set(
+        tasks,
+        *,
+        return_when,
+    ):
+        done, pending = await real_wait(tasks, return_when=return_when)
+        for task in done:
+            if task.cancelled() or task.exception() is not None:
+                continue
+            result = task.result()
+            if (
+                isinstance(result, tuple)
+                and result
+                and isinstance(result[0], Event)
+                and result[0].type == EventType.MODEL_COMPLETED
+            ):
+                await asyncio.gather(*pending, return_exceptions=True)
+                return set(tasks), set()
+        return done, pending
+
+    monkeypatch.setattr(
+        runtime_app_module.asyncio,
+        "wait",
+        force_terminal_item_and_heartbeat_into_same_done_set,
+    )
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 250_000,
+                        "output_tokens": 0,
+                        "total_tokens": 250_000,
+                    },
+                }
+            )
+        ]
+    )
+    ledger = RejectingHeartbeatBudgetLedger()
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("1"),
+        pricing=fake_budget_limit("10").pricing,
+        reservation=BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=0,
+        ),
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(limit,)),
+        budget_ledger=ledger,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_same_turn_completion_and_lease_loss",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert EventType.MODEL_COMPLETED in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_FAILED
+    reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+    assert len(reconciliations) == 1
+    assert reconciliations[0].payload["actual_amount"] == "0.25"
+    assert reconciliations[0].payload["reason"] == "model completed"
+    assert EventType.BUDGET_RESERVATION_RELEASED not in [event.type for event in events]
 
 
 def test_cayu_app_budget_reservation_stops_before_provider_when_capacity_is_unavailable():

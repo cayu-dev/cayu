@@ -1051,6 +1051,22 @@ With rolling or calendar budget windows, unresolved active reservations continue
 to consume capacity until they are reconciled or released; reconciled spend ages
 out by the reconciliation/model-completion timestamp.
 
+Built-in ledgers treat an active reservation as a renewable lease. The default
+lease duration is one hour, and Cayu heartbeats every one-third of that duration
+while the provider step is live, including silent streams and retries. A live
+reservation is counted even when its creation or latest heartbeat falls outside
+the current rolling/calendar window. Cayu also validates the lease immediately
+before provider work, so a reservation that safely expires while the event stream
+is paused cannot later start an unprotected model call. If the runtime cannot
+renew a live lease, it fails the step closed and reconciles known actual usage,
+or the full reserved amount when the provider outcome is uncertain. Set
+`reservation_ttl_seconds=None` only when reservations should never expire
+automatically; a crashed worker can then hold capacity until an operator or
+recovery path releases it. All workers sharing a durable ledger must use the same
+TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
+implementations must advertise their TTL and implement `heartbeat`; the base
+custom-ledger contract is non-expiring.
+
 `InMemoryBudgetLedger` is the default and is only strict inside one process.
 Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`
 or their own `BudgetLedger` implementation. Reservation amounts are

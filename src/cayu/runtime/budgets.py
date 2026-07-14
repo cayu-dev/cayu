@@ -454,6 +454,27 @@ class BudgetStore(ABC):
 class BudgetLedger(ABC):
     """Atomic reservation ledger for strict budget enforcement."""
 
+    @property
+    def reservation_ttl_seconds(self) -> int | None:
+        """Active-reservation lease duration, or ``None`` for non-expiring ledgers.
+
+        Custom ledgers remain non-expiring by default. A ledger that advertises
+        a finite TTL must also implement :meth:`heartbeat` so the runtime can
+        keep live provider calls reserved.
+        """
+
+        return None
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        """Renew one active reservation lease.
+
+        Return ``False`` when the reservation is terminal or its lease already
+        expired. Unknown reservation ids raise ``KeyError``. The default is
+        intentionally unsupported because the base ledger advertises no TTL.
+        """
+
+        raise NotImplementedError("This budget ledger does not use expiring reservations.")
+
     @abstractmethod
     async def reserve(
         self,
@@ -593,6 +614,10 @@ class InMemoryBudgetLedger(BudgetLedger):
         self._clock = _clock_or_utc_now(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
+    @property
+    def reservation_ttl_seconds(self) -> int | None:
+        return self._reservation_ttl_seconds
+
     async def reserve(
         self,
         *,
@@ -609,13 +634,10 @@ class InMemoryBudgetLedger(BudgetLedger):
         )
         now = self._clock()
         async with self._lock:
-            self._reap_expired_unlocked(now)
+            self._reap_expired_unlocked(now, limit=limit)
             current = _ledger_used_amount(
                 self._records.values(),
-                scope=limit.scope,
-                key=limit.key,
-                window=limit.window,
-                currency=limit.currency,
+                limit=limit,
                 now=now,
             )
             projected = current + request
@@ -654,6 +676,25 @@ class InMemoryBudgetLedger(BudgetLedger):
                 ),
                 record=record,
             )
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        now = self._clock()
+        async with self._lock:
+            record = self._records.get(reservation_id)
+            if record is None:
+                raise KeyError(f"Budget reservation not found: {reservation_id}")
+            if record.status != "active" or _reservation_is_expired(
+                record,
+                now=now,
+                ttl_seconds=self._reservation_ttl_seconds,
+            ):
+                return False
+            self._records[reservation_id] = record.model_copy(
+                update={"updated_at": now},
+                deep=True,
+            )
+            return True
 
     async def reconcile(
         self,
@@ -701,12 +742,19 @@ class InMemoryBudgetLedger(BudgetLedger):
             self._records[reservation_id] = released
             return _reconciliation_from_record(released)
 
-    def _reap_expired_unlocked(self, now: datetime) -> None:
+    def _reap_expired_unlocked(self, now: datetime, *, limit: BudgetLimit) -> None:
         if self._reservation_ttl_seconds is None:
             return
-        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
         for reservation_id, record in self._records.items():
-            if record.status != "active" or record.updated_at > cutoff:
+            if (
+                record.status != "active"
+                or not _reservation_matches_limit(record, limit)
+                or not _reservation_is_expired(
+                    record,
+                    now=now,
+                    ttl_seconds=self._reservation_ttl_seconds,
+                )
+            ):
                 continue
             self._records[reservation_id] = record.model_copy(
                 update={
@@ -1100,31 +1148,32 @@ def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
 def _ledger_used_amount(
     records: Iterable[BudgetReservationRecord],
     *,
-    scope: BudgetScope,
-    key: str | None,
-    window: BudgetWindow,
-    currency: str,
+    limit: BudgetLimit,
     now: datetime | None = None,
 ) -> Decimal:
     total = Decimal("0")
-    since, until = window.bounds(now=now)
+    since, until = limit.window.bounds(now=now)
     for record in records:
-        if (
-            record.scope != scope
-            or record.key != key
-            or record.window.storage_key != window.storage_key
-            or record.currency.upper() != currency.upper()
-        ):
-            continue
-        if since is not None and record.updated_at < since:
-            continue
-        if until is not None and record.updated_at >= until:
+        if not _reservation_matches_limit(record, limit):
             continue
         if record.status == "active":
             total += record.reserved_amount
         elif record.status == "reconciled":
+            if since is not None and record.updated_at < since:
+                continue
+            if until is not None and record.updated_at >= until:
+                continue
             total += record.actual_amount or Decimal("0")
     return total
+
+
+def _reservation_matches_limit(record: BudgetReservationRecord, limit: BudgetLimit) -> bool:
+    return (
+        record.scope == limit.scope
+        and record.key == limit.key
+        and record.window.storage_key == limit.window.storage_key
+        and record.currency.upper() == limit.currency.upper()
+    )
 
 
 def _validate_reservation_ttl(value: int | None) -> int | None:
@@ -1133,6 +1182,18 @@ def _validate_reservation_ttl(value: int | None) -> int | None:
     if type(value) is not int or value < 1:
         raise ValueError("reservation_ttl_seconds must be a positive integer or None.")
     return value
+
+
+def _reservation_is_expired(
+    record: BudgetReservationRecord,
+    *,
+    now: datetime,
+    ttl_seconds: int | None,
+) -> bool:
+    if ttl_seconds is None:
+        return False
+    cutoff = now - timedelta(seconds=ttl_seconds)
+    return record.updated_at <= cutoff
 
 
 _EXPIRED_RESERVATION_REASON_PREFIX = "Reservation expired:"

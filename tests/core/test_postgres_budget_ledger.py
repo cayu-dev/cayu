@@ -52,9 +52,11 @@ def _reservation_budget_limit(
     max_cost: str = "1",
     *,
     window: BudgetWindow | str | None = None,
+    key: str | None = None,
 ) -> BudgetLimit:
     return BudgetLimit(
-        scope="app",
+        scope="app" if key is None else "agent",
+        key=key,
         max_estimated_cost=Decimal(max_cost),
         window=BudgetWindow.all_time() if window is None else window,
         pricing=PricingCatalog(
@@ -204,11 +206,94 @@ def test_postgres_budget_ledger_window_bounds_active_reservations(postgres_dsn) 
     assert rolling_first.accepted is True
     assert blocked_now.accepted is False
     assert blocked_now.actual == Decimal("0.44")
-    assert rolling_second.accepted is True
-    assert rolling_second.actual == Decimal("0.22")
+    assert rolling_second.accepted is False
+    assert rolling_second.actual == Decimal("0.44")
     assert all_time_first.accepted is True
     assert all_time_second.accepted is False
     assert all_time_second.actual == Decimal("0.44")
+
+
+def test_postgres_budget_ledger_keeps_active_reservation_across_calendar_boundary(
+    postgres_dsn,
+) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, 23, 59, tzinfo=UTC))
+
+    async def ops(ledger):
+        limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.calendar(period="day", timezone="UTC"),
+        )
+        first = await _reserve(ledger, limit, "sess_before_midnight")
+        clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
+        blocked = await _reserve(ledger, limit, "sess_after_midnight")
+        return first, blocked
+
+    first, blocked = _run(postgres_dsn, ops, clock=clock)
+
+    assert first.accepted is True
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+
+
+def test_postgres_budget_ledger_uses_reconciliation_time_for_rolling_window(
+    postgres_dsn,
+) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    async def ops(ledger):
+        limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.rolling(seconds=60),
+        )
+        first = await _reserve(ledger, limit, "sess_1")
+        assert first.record is not None
+        await ledger.reconcile(
+            reservation_id=first.record.reservation_id,
+            actual_amount=Decimal("0.22"),
+            occurred_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
+        )
+        clock.value = datetime(2026, 1, 1, 12, 2, 30, tzinfo=UTC)
+        blocked = await _reserve(ledger, limit, "sess_2")
+        clock.value = datetime(2026, 1, 1, 12, 3, 1, tzinfo=UTC)
+        accepted = await _reserve(ledger, limit, "sess_3")
+        return blocked, accepted
+
+    blocked, accepted = _run(postgres_dsn, ops, clock=clock)
+
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
+    assert accepted.accepted is True
+    assert accepted.actual == Decimal("0.22")
+
+
+def test_postgres_budget_ledger_uses_reconciliation_time_for_calendar_window(
+    postgres_dsn,
+) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    async def ops(ledger):
+        limit = _reservation_budget_limit(
+            max_cost="0.25",
+            window=BudgetWindow.calendar(period="day", timezone="UTC"),
+        )
+        first = await _reserve(ledger, limit, "sess_1")
+        assert first.record is not None
+        await ledger.reconcile(
+            reservation_id=first.record.reservation_id,
+            actual_amount=Decimal("0.22"),
+            occurred_at=datetime(2026, 1, 1, 23, 59, tzinfo=UTC),
+        )
+        clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
+        next_day = await _reserve(ledger, limit, "sess_2")
+        active = await _reserve(ledger, limit, "sess_3")
+        return next_day, active
+
+    next_day, active = _run(postgres_dsn, ops, clock=clock)
+
+    assert next_day.accepted is True
+    assert next_day.window.storage_key == "calendar:day:UTC"
+    assert active.accepted is False
+    assert active.actual == Decimal("0.44")
 
 
 def test_postgres_budget_ledger_reaps_expired_active_reservations(postgres_dsn) -> None:
@@ -235,6 +320,34 @@ def test_postgres_budget_ledger_reaps_expired_active_reservations(postgres_dsn) 
     assert recovered.actual == Decimal("0.22")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
+
+
+def test_postgres_budget_ledger_heartbeat_keeps_live_reservation_active(postgres_dsn) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    async def ops(ledger):
+        limit = _reservation_budget_limit(max_cost="0.25")
+        first = await _reserve(ledger, limit, "sess_live")
+        assert first.record is not None
+        clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
+        assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
+        clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
+        blocked = await _reserve(ledger, limit, "sess_blocked")
+        clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
+        late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
+        recovered = await _reserve(ledger, limit, "sess_recovered")
+        return blocked, late_heartbeat, recovered
+
+    blocked, late_heartbeat, recovered = _run(
+        postgres_dsn,
+        ops,
+        clock=clock,
+        reservation_ttl_seconds=60,
+    )
+
+    assert blocked.accepted is False
+    assert late_heartbeat is False
+    assert recovered.accepted is True
 
 
 def test_postgres_budget_ledger_release_tolerates_ttl_reaped_reservation(postgres_dsn) -> None:

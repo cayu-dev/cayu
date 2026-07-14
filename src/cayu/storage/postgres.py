@@ -49,6 +49,7 @@ from cayu.runtime.budgets import (
     _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
+    _reservation_is_expired,
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
@@ -1836,6 +1837,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         self._clock = _clock_or_utc_now(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
+    @property
+    def reservation_ttl_seconds(self) -> int | None:
+        return self._reservation_ttl_seconds
+
     async def reserve(
         self,
         *,
@@ -1865,7 +1870,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         (_budget_advisory_lock_key(limit),),
                     )
                     now = self._clock()
-                    await self._reap_expired(cur, now)
+                    await self._reap_expired(cur, now, limit=limit)
                     current = await self._used_amount(cur, limit, now=now)
                     projected = current + requested
                     if projected > limit.max_estimated_cost:
@@ -1906,6 +1911,29 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             message=(f"Budget reserved: {requested} {limit.currency} for {provider_name}/{model}."),
             record=record,
         )
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    record = await self._load_record_for_update(cur, reservation_id)
+                    now = self._clock()
+                    if record.status != "active" or _reservation_is_expired(
+                        record,
+                        now=now,
+                        ttl_seconds=self._reservation_ttl_seconds,
+                    ):
+                        await conn.commit()
+                        return False
+                    renewed = record.model_copy(update={"updated_at": now}, deep=True)
+                    await self._update_record(cur, renewed)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
 
     async def reconcile(
         self,
@@ -1968,10 +1996,13 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 raise
         return _reconciliation_from_record(released)
 
-    async def _reap_expired(self, cur: Any, now: datetime) -> None:
+    async def _reap_expired(self, cur: Any, now: datetime, *, limit: BudgetLimit) -> None:
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        # Keep the matching dimensions and inclusive expiry boundary aligned with
+        # _reservation_matches_limit() and _reservation_is_expired(). ``IS NOT
+        # DISTINCT FROM`` keeps the nullable budget key comparison null-safe.
         await cur.execute(
             """
             UPDATE cayu_budget_reservations
@@ -1980,17 +2011,25 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 updated_at = %s
             WHERE status = 'active'
               AND updated_at <= %s
+              AND scope = %s
+              AND budget_key IS NOT DISTINCT FROM %s
+              AND budget_window = %s
+              AND currency = %s
             """,
             (
                 _expired_reservation_reason(self._reservation_ttl_seconds),
                 pg_support.to_utc(now),
                 pg_support.to_utc(cutoff),
+                limit.scope,
+                limit.key,
+                limit.window.storage_key,
+                limit.currency.upper(),
             ),
         )
 
     async def _used_amount(self, cur: Any, limit: BudgetLimit, *, now: datetime) -> Decimal:
         since, until = limit.window.bounds(now=now)
-        bound_sql = ""
+        reconciled_bound_sql = ""
         params: list[object] = [
             limit.scope,
             limit.key,
@@ -1998,10 +2037,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             limit.currency.upper(),
         ]
         if since is not None:
-            bound_sql += " AND updated_at >= %s"
+            reconciled_bound_sql += " AND updated_at >= %s"
             params.append(pg_support.to_utc(since))
         if until is not None:
-            bound_sql += " AND updated_at < %s"
+            reconciled_bound_sql += " AND updated_at < %s"
             params.append(pg_support.to_utc(until))
         await cur.execute(
             f"""
@@ -2012,7 +2051,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
               AND budget_window = %s
               AND currency = %s
               AND status IN ('active', 'reconciled')
-            {bound_sql}
+              AND (
+                    status = 'active'
+                    OR (status = 'reconciled' {reconciled_bound_sql})
+              )
             """,
             params,
         )

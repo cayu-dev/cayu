@@ -21,6 +21,7 @@ from cayu.runtime.budgets import (
     _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
+    _reservation_is_expired,
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
@@ -62,6 +63,10 @@ class SQLiteBudgetLedger(BudgetLedger):
         self._connection.row_factory = sqlite3.Row
         sqlite_support.reconcile_schema(self._connection, schema_mode)
 
+    @property
+    def reservation_ttl_seconds(self) -> int | None:
+        return self._reservation_ttl_seconds
+
     async def reserve(
         self,
         *,
@@ -87,7 +92,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 now = self._clock()
-                self._reap_expired_unlocked(now)
+                self._reap_expired_unlocked(now, limit=limit)
                 current = self._used_amount_unlocked(limit, now=now)
                 projected = current + requested
                 if projected > limit.max_estimated_cost:
@@ -129,6 +134,28 @@ class SQLiteBudgetLedger(BudgetLedger):
                     ),
                     record=record,
                 )
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    async def heartbeat(self, *, reservation_id: str) -> bool:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                record = self._load_record_unlocked(reservation_id)
+                now = self._clock()
+                if record.status != "active" or _reservation_is_expired(
+                    record,
+                    now=now,
+                    ttl_seconds=self._reservation_ttl_seconds,
+                ):
+                    self._connection.commit()
+                    return False
+                renewed = record.model_copy(update={"updated_at": now}, deep=True)
+                self._update_record_unlocked(renewed)
+                self._connection.commit()
+                return True
             except Exception:
                 self._connection.rollback()
                 raise
@@ -213,8 +240,14 @@ class SQLiteBudgetLedger(BudgetLedger):
               AND budget_window = ?
               AND currency = ?
               AND status IN ('active', 'reconciled')
-              AND (? IS NULL OR updated_at >= ?)
-              AND (? IS NULL OR updated_at < ?)
+              AND (
+                    status = 'active'
+                    OR (
+                        status = 'reconciled'
+                        AND (? IS NULL OR updated_at >= ?)
+                        AND (? IS NULL OR updated_at < ?)
+                    )
+              )
             """,
             (
                 limit.scope,
@@ -235,10 +268,13 @@ class SQLiteBudgetLedger(BudgetLedger):
                 total += Decimal(row["actual_amount"] or "0")
         return total
 
-    def _reap_expired_unlocked(self, now: datetime) -> None:
+    def _reap_expired_unlocked(self, now: datetime, *, limit: BudgetLimit) -> None:
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        # Keep the matching dimensions and inclusive expiry boundary aligned with
+        # _reservation_matches_limit() and _reservation_is_expired(). ``IS`` keeps
+        # the nullable budget key comparison null-safe in SQLite.
         self._connection.execute(
             """
             UPDATE cayu_budget_reservations
@@ -247,11 +283,19 @@ class SQLiteBudgetLedger(BudgetLedger):
                 updated_at = ?
             WHERE status = 'active'
               AND updated_at <= ?
+              AND scope = ?
+              AND budget_key IS ?
+              AND budget_window = ?
+              AND currency = ?
             """,
             (
                 _expired_reservation_reason(self._reservation_ttl_seconds),
                 sqlite_support.format_datetime(now),
                 sqlite_support.format_datetime(cutoff),
+                limit.scope,
+                limit.key,
+                limit.window.storage_key,
+                limit.currency.upper(),
             ),
         )
 

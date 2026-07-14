@@ -267,9 +267,11 @@ def _reservation_budget_limit(
     max_cost: str = "1",
     *,
     window: BudgetWindow | str | None = None,
+    key: str | None = None,
 ) -> BudgetLimit:
     return BudgetLimit(
-        scope="app",
+        scope="app" if key is None else "agent",
+        key=key,
         max_estimated_cost=Decimal(max_cost),
         window=BudgetWindow.all_time() if window is None else window,
         pricing=PricingCatalog(
@@ -411,8 +413,8 @@ def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
     assert rolling_first.accepted is True
     assert blocked_now.accepted is False
     assert blocked_now.actual == Decimal("0.44")
-    assert rolling_second.accepted is True
-    assert rolling_second.actual == Decimal("0.22")
+    assert rolling_second.accepted is False
+    assert rolling_second.actual == Decimal("0.44")
     assert all_time_first.accepted is True
     assert all_time_second.accepted is False
     assert all_time_second.actual == Decimal("0.44")
@@ -508,6 +510,51 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_calendar_window() 
     assert next_day.accepted is True
     assert active.accepted is False
     assert active.actual == Decimal("0.44")
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_budget_ledgers_keep_active_reservation_across_calendar_boundary(
+    tmp_path,
+    backend: str,
+) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 23, 59, tzinfo=UTC))
+        ledger = (
+            InMemoryBudgetLedger(clock=clock)
+            if backend == "memory"
+            else SQLiteBudgetLedger(tmp_path / "budget.sqlite", clock=clock)
+        )
+        try:
+            limit = _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.calendar(period="day", timezone="UTC"),
+            )
+            first = await ledger.reserve(
+                limit=limit,
+                session_id="sess_before_midnight",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
+            blocked = await ledger.reserve(
+                limit=limit,
+                session_id="sess_after_midnight",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return first, blocked
+        finally:
+            close = getattr(ledger, "close", None)
+            if close is not None:
+                await close()
+
+    first, blocked = asyncio.run(run())
+
+    assert first.accepted is True
+    assert blocked.accepted is False
+    assert blocked.actual == Decimal("0.44")
 
 
 def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None:
@@ -661,8 +708,8 @@ def test_sqlite_budget_ledger_window_bounds_active_reservations(tmp_path) -> Non
     assert rolling_first.accepted is True
     assert blocked_now.accepted is False
     assert blocked_now.actual == Decimal("0.44")
-    assert rolling_second.accepted is True
-    assert rolling_second.actual == Decimal("0.22")
+    assert rolling_second.accepted is False
+    assert rolling_second.actual == Decimal("0.44")
     assert all_time_first.accepted is True
     assert all_time_second.accepted is False
     assert all_time_second.actual == Decimal("0.44")
@@ -805,6 +852,103 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
     assert reconciled.actual_amount == Decimal("0.01")
 
 
+def test_in_memory_budget_ledger_heartbeat_keeps_live_reservation_active() -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        first = await ledger.reserve(
+            limit=limit,
+            session_id="sess_live",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        assert first.record is not None
+        clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
+        assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
+        clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
+        blocked = await ledger.reserve(
+            limit=limit,
+            session_id="sess_blocked",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
+        late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
+        recovered = await ledger.reserve(
+            limit=limit,
+            session_id="sess_recovered",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        return blocked, late_heartbeat, recovered
+
+    blocked, late_heartbeat, recovered = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert late_heartbeat is False
+    assert recovered.accepted is True
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_budget_ledgers_reap_only_the_matching_budget(tmp_path, backend: str) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = (
+            InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
+            if backend == "memory"
+            else SQLiteBudgetLedger(
+                tmp_path / "budget.sqlite",
+                clock=clock,
+                reservation_ttl_seconds=60,
+            )
+        )
+        try:
+            first_limit = _reservation_budget_limit(max_cost="0.25", key="first")
+            second_limit = _reservation_budget_limit(max_cost="0.25", key="second")
+            first = await ledger.reserve(
+                limit=first_limit,
+                session_id="sess_first_expired",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            second = await ledger.reserve(
+                limit=second_limit,
+                session_id="sess_second_expired",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.record is not None
+            assert second.record is not None
+            clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+            replacement = await ledger.reserve(
+                limit=first_limit,
+                session_id="sess_first_replacement",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            untouched = await ledger.release(
+                reservation_id=second.record.reservation_id,
+                reason="manual cleanup",
+            )
+            return replacement, untouched
+        finally:
+            close = getattr(ledger, "close", None)
+            if close is not None:
+                await close()
+
+    replacement, untouched = asyncio.run(run())
+
+    assert replacement.accepted is True
+    assert untouched.reason == "manual cleanup"
+
+
 def test_in_memory_budget_ledger_release_tolerates_ttl_reaped_reservation() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
@@ -921,6 +1065,54 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
     assert recovered.actual == Decimal("0.22")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
+
+
+def test_sqlite_budget_ledger_heartbeat_keeps_live_reservation_active(tmp_path) -> None:
+    async def run():
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            first = await ledger.reserve(
+                limit=limit,
+                session_id="sess_live",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.record is not None
+            clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
+            assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
+            clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
+            blocked = await ledger.reserve(
+                limit=limit,
+                session_id="sess_blocked",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
+            late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
+            recovered = await ledger.reserve(
+                limit=limit,
+                session_id="sess_recovered",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            return blocked, late_heartbeat, recovered
+        finally:
+            await ledger.close()
+
+    blocked, late_heartbeat, recovered = asyncio.run(run())
+
+    assert blocked.accepted is False
+    assert late_heartbeat is False
+    assert recovered.accepted is True
 
 
 def test_sqlite_budget_ledger_release_tolerates_ttl_reaped_reservation(tmp_path) -> None:

@@ -1697,6 +1697,15 @@ hard-cap accounting, not observe-only alerts.
 With rolling or calendar budget windows, unresolved active reservations continue
 to consume capacity until they are reconciled or released; reconciled spend ages
 out by the reconciliation/model-completion timestamp.
+Built-in ledgers renew active reservations every one-third of their configured
+TTL while a provider step remains live, so a slow or silent call does not age out
+of the hard cap. The default TTL is one hour. Cayu validates the lease before
+starting provider work, so a reservation that expires during a paused event
+stream cannot start an unprotected call. If renewal is lost, Cayu fails the step
+closed and charges known actual usage or, when the outcome is uncertain, the full
+reserved amount. `reservation_ttl_seconds=None` disables automatic expiry
+and therefore requires manual cleanup after a crashed worker. Processes sharing
+a durable ledger must use the same TTL and synchronized clocks.
 `SQLiteBudgetLedger` is the built-in shared ledger for multi-worker apps.
 `InMemoryBudgetLedger` is the default and is suitable for tests, examples, and
 single-process apps only. `InMemoryBudgetStore` is also available for custom

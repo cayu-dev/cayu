@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -51,9 +52,10 @@ def _expected_revisions() -> list[tuple[int, str, int]]:
     return [(rev.revision, str(rev.kind), rev.compatible_from) for rev in schema.REVISIONS]
 
 
-def _reservation_budget_limit(max_cost: str) -> BudgetLimit:
+def _reservation_budget_limit(max_cost: str, *, key: str | None = None) -> BudgetLimit:
     return BudgetLimit(
-        scope="app",
+        scope="app" if key is None else "agent",
+        key=key,
         max_estimated_cost=Decimal(max_cost),
         window=BudgetWindow.all_time(),
         pricing=PricingCatalog(
@@ -75,6 +77,14 @@ def _reservation_budget_limit(max_cost: str) -> BudgetLimit:
             max_cache_write_input_tokens=8_000,
         ),
     )
+
+
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
 
 
 async def _reserve(ledger: PostgresBudgetLedger, limit: BudgetLimit, session_id: str):
@@ -396,6 +406,191 @@ def test_postgres_budget_ledger_concurrent_reservations_do_not_double_spend(
     assert len(rejected) == 1
     assert accepted[0].record is not None
     assert rejected[0].actual == Decimal("0.44")
+
+
+def test_postgres_budget_ledger_heartbeat_and_reconcile_serialize_same_reservation(
+    postgres_dsn: str,
+) -> None:
+    async def run():
+        import psycopg
+
+        await drop_cayu_tables(postgres_dsn)
+        setup = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        limit = _reservation_budget_limit("0.25")
+        try:
+            reserved = await _reserve(setup, limit, "sess_budget_race")
+            assert reserved.record is not None
+            reservation_id = reserved.record.reservation_id
+        finally:
+            await setup.close()
+
+        heartbeat_ledger = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        reconcile_ledger = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            await asyncio.gather(
+                heartbeat_ledger.ensure_schema(),
+                reconcile_ledger.ensure_schema(),
+            )
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as blocker:
+                async with blocker.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT reservation_id
+                        FROM cayu_budget_reservations
+                        WHERE reservation_id = %s
+                        FOR UPDATE
+                        """,
+                        (reservation_id,),
+                    )
+                    assert await cur.fetchone() == (reservation_id,)
+
+                    heartbeat_task = asyncio.create_task(
+                        heartbeat_ledger.heartbeat(reservation_id=reservation_id)
+                    )
+                    reconcile_task = asyncio.create_task(
+                        reconcile_ledger.reconcile(
+                            reservation_id=reservation_id,
+                            actual_amount=Decimal("0.01"),
+                            reason="model completed",
+                        )
+                    )
+                    await assert_waiting(heartbeat_task)
+                    await assert_waiting(reconcile_task)
+
+                await blocker.commit()
+
+                heartbeat_result, reconciled = await asyncio.wait_for(
+                    asyncio.gather(heartbeat_task, reconcile_task),
+                    timeout=5,
+                )
+
+            replacement = await _reserve(
+                heartbeat_ledger,
+                limit,
+                "sess_budget_replacement",
+            )
+            return heartbeat_result, reconciled, replacement
+        finally:
+            await heartbeat_ledger.close()
+            await reconcile_ledger.close()
+
+    heartbeat_result, reconciled, replacement = asyncio.run(run())
+
+    assert type(heartbeat_result) is bool
+    assert reconciled.status == "reconciled"
+    assert reconciled.actual_amount == Decimal("0.01")
+    assert replacement.accepted is True
+    assert replacement.actual == Decimal("0.23")
+
+
+def test_postgres_budget_ledger_reaps_only_the_advisory_locked_budget(
+    postgres_dsn: str,
+) -> None:
+    async def run():
+        await drop_cayu_tables(postgres_dsn)
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        ledger = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            clock=clock,
+            reservation_ttl_seconds=1,
+        )
+        try:
+            first_limit = _reservation_budget_limit("0.25", key="first")
+            second_limit = _reservation_budget_limit("0.25", key="second")
+            first = await _reserve(ledger, first_limit, "sess_first_expired")
+            second = await _reserve(ledger, second_limit, "sess_second_expired")
+            assert first.record is not None
+            assert second.record is not None
+            clock.value += timedelta(seconds=2)
+
+            replacement = await _reserve(ledger, first_limit, "sess_first_replacement")
+            untouched = await ledger.release(
+                reservation_id=second.record.reservation_id,
+                reason="manual cleanup",
+            )
+            return replacement, untouched
+        finally:
+            await ledger.close()
+
+    replacement, untouched = asyncio.run(run())
+
+    assert replacement.accepted is True
+    assert untouched.reason == "manual cleanup"
+
+
+def test_postgres_budget_ledger_concurrent_scoped_reaping_does_not_deadlock(
+    postgres_dsn: str,
+) -> None:
+    async def run():
+        await drop_cayu_tables(postgres_dsn)
+        clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        setup = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            clock=clock,
+            reservation_ttl_seconds=1,
+        )
+        first_limit = _reservation_budget_limit("0.25")
+        second_limit = _reservation_budget_limit("0.25", key="second")
+        try:
+            assert (await _reserve(setup, first_limit, "sess_first_expired")).accepted
+            assert (await _reserve(setup, second_limit, "sess_second_expired")).accepted
+        finally:
+            await setup.close()
+
+        clock.value += timedelta(seconds=2)
+        first = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            clock=clock,
+            reservation_ttl_seconds=1,
+        )
+        second = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            clock=clock,
+            reservation_ttl_seconds=1,
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.gather(
+                    _reserve(first, first_limit, "sess_first_replacement"),
+                    _reserve(second, second_limit, "sess_second_replacement"),
+                ),
+                timeout=5,
+            )
+        finally:
+            await first.close()
+            await second.close()
+
+    results = asyncio.run(run())
+
+    assert all(result.accepted for result in results)
+    assert all(result.actual == Decimal("0.22") for result in results)
 
 
 def test_postgres_store_schema_reconcile_waits_on_shared_advisory_lock(
