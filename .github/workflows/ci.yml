@@ -149,4 +149,10 @@ jobs:
       - run: npm run check:api
       - run: npm run build:package
       - name: Check packaged dashboard assets
-        run: test -z "$(git -C .. status --porcelain -- src/cayu/server/dashboard)"
+        run: |
+          status="$(git -C .. status --porcelain -- src/cayu/server/dashboard)"
+          if test -n "$status"; then
+            echo "$status"
+            git -C .. diff --stat -- src/cayu/server/dashboard
+            exit 1
+          fi
