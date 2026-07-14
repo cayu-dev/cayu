@@ -5,10 +5,15 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+    require_unicode_scalar_text,
+)
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, Runner, RunnerUnavailableError
-from cayu.tools._errors import structured_invalid_arguments
+from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
@@ -151,24 +156,29 @@ class ExecCommandTool(Tool):
                 content="No runner configured for this tool call.",
                 is_error=True,
             )
-        max_output_bytes = _optional_limited_int(
-            args,
-            "max_output_bytes",
-            default=DEFAULT_OUTPUT_LIMIT_BYTES,
-            maximum=MAX_OUTPUT_LIMIT_BYTES,
-        )
-        timeout_s = _optional_limited_int(
-            args,
-            "timeout_s",
-            default=DEFAULT_TIMEOUT_SECONDS,
-            maximum=MAX_TIMEOUT_SECONDS,
-        )
-        command = _command_from_args(args)
-        cwd = _optional_string(args, "cwd")
-        env = _optional_env(args)
-        stdin = _optional_string(args, "stdin", allow_blank=True)
-        if self._policy is not None:
+        with tool_argument_validation():
+            max_output_bytes = _optional_limited_int(
+                args,
+                "max_output_bytes",
+                default=DEFAULT_OUTPUT_LIMIT_BYTES,
+                maximum=MAX_OUTPUT_LIMIT_BYTES,
+            )
+            timeout_s = _optional_limited_int(
+                args,
+                "timeout_s",
+                default=DEFAULT_TIMEOUT_SECONDS,
+                maximum=MAX_TIMEOUT_SECONDS,
+            )
+            command = _command_from_args(args)
+            cwd = _optional_string(args, "cwd")
+            if cwd is not None:
+                _validate_command_text(cwd, "cwd")
+            env = _optional_env(args)
+            stdin = _optional_string(args, "stdin", allow_blank=True)
+            if stdin is not None:
+                require_unicode_scalar_text(stdin, "stdin")
             canonical_cwd = runner.resolve_cwd(cwd)
+        if self._policy is not None:
             verdict = await self._policy.evaluate(
                 ctx,
                 CommandRequest(
@@ -275,6 +285,7 @@ def _command_from_args(args: dict) -> ExecCommand:
         for item in argv:
             if type(item) is not str:
                 raise ValueError("Tool argument `argv` entries must be strings.")
+            _validate_command_text(item, "argv entry")
         return ExecCommand.process(*argv)
     if kind == "shell":
         if argv is not None:
@@ -283,6 +294,7 @@ def _command_from_args(args: dict) -> ExecCommand:
             raise ValueError("Tool argument `shell` is required when kind is `shell`.")
         if type(shell) is not str:
             raise ValueError("Tool argument `shell` must be a string.")
+        _validate_command_text(shell, "shell")
         return ExecCommand.bash(shell)
     raise ValueError("Tool argument `kind` must be `process` or `shell`.")
 
@@ -331,10 +343,26 @@ def _optional_env(args: dict) -> dict[str, str] | None:
         if type(key) is not str:
             raise ValueError("Tool argument `env` keys must be strings.")
         key = require_clean_nonblank(key, "env key")
+        _validate_command_text(key, "env key")
+        if "=" in key or "\n" in key or "\r" in key:
+            raise ValueError(
+                "Tool argument `env key` must not contain '=', carriage returns, or newlines."
+            )
         if type(item) is not str:
             raise ValueError("Tool argument `env` values must be strings.")
+        _validate_command_text(item, "env value")
+        if "\n" in item or "\r" in item:
+            raise ValueError(
+                "Tool argument `env value` must not contain carriage returns or newlines."
+            )
         copied[key] = item
     return copied
+
+
+def _validate_command_text(value: str, field_name: str) -> None:
+    require_unicode_scalar_text(value, field_name)
+    if "\0" in value:
+        raise ValueError(f"Tool argument `{field_name}` must not contain NUL characters.")
 
 
 def _require_runner(ctx: ToolContext) -> Runner | None:

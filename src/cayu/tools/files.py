@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import io
 import mimetypes
+import ntpath
+import posixpath
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Protocol
 
-from cayu._validation import require_nonblank
+from cayu._validation import require_nonblank, require_unicode_scalar_text
 from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     FILE_ATTACHMENT_IMAGE_CONTENT_TYPES,
@@ -18,12 +20,17 @@ from cayu.artifacts import (
     ArtifactScope,
     ArtifactStore,
     FileAttachmentKind,
+    InvalidArtifactIdError,
     copy_artifact_read_result,
     file_attachment,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-from cayu.tools._errors import structured_invalid_arguments
-from cayu.workspaces import Workspace, WorkspaceReadResult
+from cayu.tools._errors import (
+    invalid_tool_arguments_result,
+    structured_invalid_arguments,
+    tool_argument_validation,
+)
+from cayu.workspaces import Workspace, WorkspaceReadResult, validate_list_pattern
 
 DEFAULT_READ_LIMIT_BYTES = 256 * 1024
 MAX_READ_LIMIT_BYTES = 4 * 1024 * 1024
@@ -76,6 +83,10 @@ _BINARY_CONTENT_TYPES = {
     "application/x-tar",
     "application/zip",
 }
+
+
+class _InvalidPdfPageRange(ValueError):
+    """A model-supplied PDF page selection that cannot be satisfied."""
 
 
 @dataclass(frozen=True)
@@ -212,23 +223,28 @@ class ReadFileTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        path = _optional_arg_string(args, "path")
-        artifact_id = _optional_arg_string(args, "artifact_id")
-        if (path is None) == (artifact_id is None):
-            raise ValueError("Tool arguments must include exactly one of `path` or `artifact_id`.")
-        max_bytes = _optional_int(
-            args,
-            "max_bytes",
-            default=DEFAULT_READ_LIMIT_BYTES,
-            maximum=MAX_READ_LIMIT_BYTES,
-        )
-        max_attachment_bytes = _optional_int(
-            args,
-            "max_attachment_bytes",
-            default=self.default_attachment_limit_bytes,
-            maximum=self.max_attachment_limit_bytes,
-        )
-        pages = _optional_arg_string(args, "pages")
+        with tool_argument_validation():
+            path = _optional_arg_string(args, "path")
+            artifact_id = _optional_arg_string(args, "artifact_id")
+            if (path is None) == (artifact_id is None):
+                raise ValueError(
+                    "Tool arguments must include exactly one of `path` or `artifact_id`."
+                )
+            max_bytes = _optional_int(
+                args,
+                "max_bytes",
+                default=DEFAULT_READ_LIMIT_BYTES,
+                maximum=MAX_READ_LIMIT_BYTES,
+            )
+            max_attachment_bytes = _optional_int(
+                args,
+                "max_attachment_bytes",
+                default=self.default_attachment_limit_bytes,
+                maximum=self.max_attachment_limit_bytes,
+            )
+            pages = _optional_arg_string(args, "pages")
+            if path is not None:
+                path = _validate_workspace_path_argument(path)
         if path is not None:
             return await _read_workspace_file(
                 ctx,
@@ -285,7 +301,9 @@ async def _read_workspace_file(
             inspectable=False,
         )
     if pages is not None:
-        raise ValueError("Tool argument `pages` is only valid for PDF files.")
+        return invalid_tool_arguments_result(
+            ValueError("Tool argument `pages` is only valid for PDF files.")
+        )
     text = result.content.decode("utf-8", errors="replace")
     return ToolResult(
         content=f"{text}\n\n[file truncated]" if result.truncated else text,
@@ -552,11 +570,14 @@ async def _read_artifact(
     artifact_store = _require_artifact_store(ctx)
     if artifact_store is None:
         return _missing_artifact_store_result()
-    result = await _read_artifact_store(
-        artifact_store,
-        artifact_id,
-        max_bytes=max_bytes,
-    )
+    try:
+        result = await _read_artifact_store(
+            artifact_store,
+            artifact_id,
+            max_bytes=max_bytes,
+        )
+    except InvalidArtifactIdError as exc:
+        return invalid_tool_arguments_result(exc)
     artifact = result.metadata
     access_error = _artifact_access_error(ctx, artifact)
     if access_error is not None:
@@ -607,7 +628,9 @@ class TextArtifactReader:
 
     async def read(self, request: ArtifactReadRequest) -> ToolResult:
         if request.options.pages is not None:
-            raise ValueError("Tool argument `pages` is only valid for PDF artifacts.")
+            return invalid_tool_arguments_result(
+                ValueError("Tool argument `pages` is only valid for PDF artifacts.")
+            )
         text = request.initial_read.content.decode("utf-8", errors="replace")
         return ToolResult(
             content=f"{text}\n\n[file truncated]" if request.initial_read.truncated else text,
@@ -624,7 +647,9 @@ class ImageArtifactReader:
 
     async def read(self, request: ArtifactReadRequest) -> ToolResult:
         if request.options.pages is not None:
-            raise ValueError("Tool argument `pages` is only valid for PDF artifacts.")
+            return invalid_tool_arguments_result(
+                ValueError("Tool argument `pages` is only valid for PDF artifacts.")
+            )
         artifact_store = request.artifact_store
         artifact = request.artifact
         if artifact.size_bytes == 0:
@@ -842,6 +867,8 @@ class PdfArtifactReader:
             else:
                 try:
                     extracted = _extract_pdf_pages(source_content, request.options.pages)
+                except _InvalidPdfPageRange as exc:
+                    return invalid_tool_arguments_result(exc)
                 except Exception as exc:
                     return ToolResult(
                         content=f"PDF '{artifact.filename}' could not be inspected: {exc}",
@@ -988,15 +1015,16 @@ class WriteFileTool(Tool):
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
-        path = _require_arg_string(args, "path")
-        content = _require_arg_string(args, "content", allow_blank=True)
-        max_bytes = _optional_int(
-            args,
-            "max_bytes",
-            default=DEFAULT_WRITE_LIMIT_BYTES,
-            maximum=MAX_WRITE_LIMIT_BYTES,
-        )
-        encoded = content.encode("utf-8")
+        with tool_argument_validation():
+            path = _validate_workspace_path_argument(_require_arg_string(args, "path"))
+            content = _require_arg_string(args, "content", allow_blank=True)
+            max_bytes = _optional_int(
+                args,
+                "max_bytes",
+                default=DEFAULT_WRITE_LIMIT_BYTES,
+                maximum=MAX_WRITE_LIMIT_BYTES,
+            )
+            encoded = content.encode("utf-8")
         if len(encoded) > max_bytes:
             return ToolResult(
                 content=(
@@ -1049,16 +1077,20 @@ class ListFilesTool(Tool):
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
-        pattern = args.get("pattern", "**/*")
-        if type(pattern) is not str:
-            raise ValueError("Tool argument `pattern` must be a string.")
-        pattern = require_nonblank(pattern, "pattern")
-        limit = _optional_int(
-            args,
-            "limit",
-            default=DEFAULT_LIST_LIMIT,
-            maximum=MAX_LIST_LIMIT,
-        )
+        with tool_argument_validation():
+            pattern = args.get("pattern", "**/*")
+            if type(pattern) is not str:
+                raise ValueError("Tool argument `pattern` must be a string.")
+            pattern = require_unicode_scalar_text(pattern, "pattern")
+            if "\0" in pattern:
+                raise ValueError("Workspace list patterns must not contain NUL characters.")
+            pattern = validate_list_pattern(pattern)
+            limit = _optional_int(
+                args,
+                "limit",
+                default=DEFAULT_LIST_LIMIT,
+                maximum=MAX_LIST_LIMIT,
+            )
         result = await workspace.list(pattern, limit=limit)
         result_content = "\n".join(result.paths) if result.paths else "No files matched."
         if result.truncated:
@@ -1105,13 +1137,14 @@ class ListArtifactsTool(Tool):
         artifact_store = _require_artifact_store(ctx)
         if artifact_store is None:
             return _missing_artifact_store_result()
-        scope = _optional_scope(args, "scope", default=ArtifactScope.SESSION)
-        limit = _optional_int(
-            args,
-            "limit",
-            default=DEFAULT_LIST_LIMIT,
-            maximum=MAX_LIST_LIMIT,
-        )
+        with tool_argument_validation():
+            scope = _optional_scope(args, "scope", default=ArtifactScope.SESSION)
+            limit = _optional_int(
+                args,
+                "limit",
+                default=DEFAULT_LIST_LIMIT,
+                maximum=MAX_LIST_LIMIT,
+            )
         session_id = ctx.session_id if scope == ArtifactScope.SESSION else None
         environment_name = ctx.environment_name if scope == ArtifactScope.ENVIRONMENT else None
         if scope == ArtifactScope.ENVIRONMENT and environment_name is None:
@@ -1246,13 +1279,43 @@ def _require_arg_string(
     return require_nonblank(value, key)
 
 
+def _validate_workspace_path_argument(path: str) -> str:
+    # This is intentionally a tool-level, backend-independent validation boundary:
+    # private backend validators run too late to classify model input, while rejecting
+    # Windows roots/drives here keeps paths portable. Preserve the caller's spelling so
+    # custom Workspace implementations continue to receive the original relative path.
+    value = require_unicode_scalar_text(require_nonblank(path, "path"), "path")
+    if "\0" in value:
+        raise ValueError("Workspace paths must not contain NUL characters.")
+    windows_path = PureWindowsPath(value)
+    if (
+        posixpath.isabs(value)
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+    ):
+        raise ValueError("Workspace paths must be relative.")
+    normalized = posixpath.normpath(value)
+    windows_normalized = ntpath.normpath(value)
+    if normalized in {"", "."}:
+        raise ValueError("Workspace paths must reference a file.")
+    if (
+        normalized == ".."
+        or normalized.startswith("../")
+        or windows_normalized == ".."
+        or windows_normalized.startswith("..\\")
+    ):
+        raise ValueError("Workspace path escapes the workspace root.")
+    return value
+
+
 def _optional_arg_string(args: dict, key: str) -> str | None:
     value = args.get(key)
     if value is None:
         return None
     if type(value) is not str:
         raise ValueError(f"Tool argument `{key}` must be a string.")
-    return require_nonblank(value, key)
+    return require_unicode_scalar_text(require_nonblank(value, key), key)
 
 
 def _optional_int(
@@ -1464,23 +1527,26 @@ def _parse_pdf_page_range(pages: str | None, total_pages: int) -> tuple[int, int
         return 0, min(total_pages, MAX_PDF_PAGES_PER_READ)
     value = pages.strip()
     if not value:
-        raise ValueError("Tool argument `pages` cannot be blank.")
+        raise _InvalidPdfPageRange("Tool argument `pages` cannot be blank.")
     if "-" in value:
         start_text, end_text = value.split("-", 1)
     else:
         start_text = value
         end_text = value
     if not start_text.isdecimal() or not end_text.isdecimal():
-        raise ValueError("Tool argument `pages` must be a page number or range.")
-    start = int(start_text)
-    end = int(end_text)
+        raise _InvalidPdfPageRange("Tool argument `pages` must be a page number or range.")
+    try:
+        start = int(start_text)
+        end = int(end_text)
+    except ValueError as exc:
+        raise _InvalidPdfPageRange("Tool argument `pages` must be a page number or range.") from exc
     if start <= 0 or end <= 0 or end < start:
-        raise ValueError("Tool argument `pages` must be a valid 1-based page range.")
+        raise _InvalidPdfPageRange("Tool argument `pages` must be a valid 1-based page range.")
     if start > total_pages:
-        raise ValueError("Tool argument `pages` starts after the end of the PDF.")
+        raise _InvalidPdfPageRange("Tool argument `pages` starts after the end of the PDF.")
     end = min(end, total_pages)
     if end - start + 1 > MAX_PDF_PAGES_PER_READ:
-        raise ValueError(
+        raise _InvalidPdfPageRange(
             f"Tool argument `pages` may include at most {MAX_PDF_PAGES_PER_READ} pages."
         )
     return start - 1, end

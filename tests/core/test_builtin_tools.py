@@ -753,6 +753,34 @@ def test_read_file_caps_pages_for_small_many_page_pdf(tmp_path):
     assert len(pypdf.PdfReader(io.BytesIO(attachment.content)).pages) == 10
 
 
+@pytest.mark.parametrize(
+    ("pages", "message"),
+    [
+        ("not-a-page", "must be a page number or range"),
+        ("2-1", "must be a valid 1-based page range"),
+        ("1-11", "may include at most 10 pages"),
+        ("13", "starts after the end of the PDF"),
+    ],
+)
+def test_read_file_reports_invalid_pdf_page_ranges(tmp_path, pages, message):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(12),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": pdf.id, "pages": pages}))
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert message in result.content
+
+
 def test_read_file_dedupes_repeated_pdf_page_extraction(tmp_path):
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     pdf = asyncio.run(
@@ -1687,12 +1715,13 @@ def test_exec_command_tool_cannot_drift_after_authorizing_an_omitted_cwd():
     runner.default_cwd = "/workspace"
     policy = _ChangeRunnerDefaultPolicy(runner)
 
-    result = asyncio.run(
-        ExecCommandTool(policy=policy).run(
-            ToolContext(session_id="sess_1", runner=runner),
-            {"argv": ["pwd"]},
+    with pytest.raises(ValueError, match="outside the runner root"):
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
         )
-    )
 
     assert policy.request is not None
     assert policy.request.cwd is None
@@ -1700,8 +1729,65 @@ def test_exec_command_tool_cannot_drift_after_authorizing_an_omitted_cwd():
     assert runner.received_cwd == "/workspace"
     assert runner.executed_cwd is None
     assert runner.command is None
-    assert result.is_error is True
-    assert result.structured == {"error": "invalid_arguments"}
+
+
+class _FailingCommandPolicy(CommandPolicy):
+    async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+        del ctx, request
+        raise ValueError("policy backend changed")
+
+
+def test_exec_command_tool_does_not_classify_policy_value_error_as_invalid_arguments():
+    runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
+
+    with pytest.raises(ValueError, match="policy backend changed"):
+        asyncio.run(
+            ExecCommandTool(policy=_FailingCommandPolicy()).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+
+    assert runner.command is None
+
+
+class _FailingExecRunner(RecordingRunner):
+    async def exec(self, *args, **kwargs) -> ExecResult:
+        del args, kwargs
+        raise ValueError("runner state changed")
+
+
+def test_exec_command_tool_does_not_classify_runner_value_error_as_invalid_arguments():
+    runner = _FailingExecRunner()
+
+    with pytest.raises(ValueError, match="runner state changed"):
+        asyncio.run(
+            ExecCommandTool().run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+
+
+class _FailingWriteWorkspace(LocalWorkspace):
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        del path, content
+        raise ValueError("workspace backend changed")
+
+
+def test_write_file_tool_does_not_classify_workspace_value_error_as_invalid_arguments(tmp_path):
+    workspace = _FailingWriteWorkspace(tmp_path, workspace_id="failing-write")
+
+    with pytest.raises(ValueError, match="workspace backend changed"):
+        asyncio.run(
+            WriteFileTool().run(
+                ToolContext(session_id="sess_1", workspace=workspace),
+                {"path": "notes.txt", "content": "hello"},
+            )
+        )
+
+    assert (tmp_path / "notes.txt").exists() is False
 
 
 @pytest.mark.parametrize("requested_cwd", ["../etc", "/etc"])
@@ -1725,12 +1811,60 @@ def test_exec_command_tool_rejects_cwd_outside_runner_root_before_policy_or_exec
     assert runner.command is None
 
 
-def test_exec_command_tool_resolves_local_cwd_existence_before_policy_or_exec(tmp_path):
+def test_exec_command_tool_rejects_blank_cwd_before_policy_or_exec():
+    runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"], "cwd": "   "},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_rejects_initial_invalid_cwd_without_policy():
+    runner = RecordingRunner()
+    runner.default_cwd = "/workspace"
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"], "cwd": "../etc"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert runner.command is None
+
+
+@pytest.mark.parametrize(
+    ("requested_cwd", "error_type", "error_match"),
+    [
+        ("missing", FileNotFoundError, "does not exist"),
+        ("not-a-directory", NotADirectoryError, "not a directory"),
+    ],
+)
+def test_exec_command_tool_preserves_local_cwd_resolution_errors_before_policy_or_exec(
+    tmp_path,
+    requested_cwd,
+    error_type,
+    error_match,
+):
     runner = LocalRunner(tmp_path)
     policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
     marker = tmp_path / "executed"
+    if error_type is NotADirectoryError:
+        (tmp_path / requested_cwd).write_text("not a directory", encoding="utf-8")
 
-    with pytest.raises(FileNotFoundError, match="does not exist"):
+    with pytest.raises(error_type, match=error_match):
         asyncio.run(
             ExecCommandTool(policy=policy).run(
                 ToolContext(session_id="sess_1", runner=runner),
@@ -1740,7 +1874,7 @@ def test_exec_command_tool_resolves_local_cwd_existence_before_policy_or_exec(tm
                         "-c",
                         f"from pathlib import Path; Path({str(marker)!r}).touch()",
                     ],
-                    "cwd": "missing",
+                    "cwd": requested_cwd,
                 },
             )
         )

@@ -1391,6 +1391,16 @@ def test_read_knowledge_returns_tool_error_for_invalid_entry_id() -> None:
     assert result.structured == {"error": "invalid_arguments"}
     assert "entry_id" in result.content
 
+    result = asyncio.run(
+        ReadKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=InMemoryKnowledgeStore()),
+            {"entry_id": " policy "},
+        )
+    )
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "must not start or end with whitespace" in result.content
+
 
 def test_read_knowledge_returns_tool_error_for_invalid_window() -> None:
     async def run():
@@ -1408,6 +1418,21 @@ def test_read_knowledge_returns_tool_error_for_invalid_window() -> None:
     assert result.is_error is True
     assert result.structured == {"error": "invalid_arguments"}
     assert "around" in result.content
+
+
+def test_read_knowledge_preserves_operational_value_error() -> None:
+    class FailingReadStore(InMemoryKnowledgeStore):
+        async def read_chunks(self, entry_id: str, **kwargs):
+            raise ValueError("knowledge backend state is invalid")
+
+    async def run():
+        return await ReadKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=FailingReadStore()),
+            {"entry_id": "policy"},
+        )
+
+    with pytest.raises(ValueError, match="knowledge backend state is invalid"):
+        asyncio.run(run())
 
 
 class ReadOnlyKnowledgeStore:

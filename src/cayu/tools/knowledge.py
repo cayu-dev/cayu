@@ -4,13 +4,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
     require_nonblank,
+    require_unicode_scalar_text,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.storage.knowledge_indexer import (
@@ -37,7 +38,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeVisibility,
 )
-from cayu.tools._errors import invalid_tool_arguments_result
+from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 
 DEFAULT_KNOWLEDGE_TOOL_LIMIT = DEFAULT_KNOWLEDGE_LIMIT
 MAX_KNOWLEDGE_TOOL_LIMIT = 25
@@ -299,6 +300,7 @@ class SearchKnowledgeTool(Tool):
             self.spec = self.spec.model_copy(update={"input_schema": schema})
             self._validate_spec()
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
             ctx,
@@ -308,7 +310,7 @@ class SearchKnowledgeTool(Tool):
         if store is None:
             return _missing_knowledge_store_result()
         search_modes = _knowledge_search_modes_payload(store)
-        try:
+        with tool_argument_validation():
             if "min_score" in args and not self._allow_score_override:
                 raise ValueError(
                     "Tool argument `min_score` is not enabled for this search_knowledge tool."
@@ -359,8 +361,6 @@ class SearchKnowledgeTool(Tool):
                 default=DEFAULT_SEARCH_KNOWLEDGE_PREVIEW_BYTES,
                 maximum=MAX_KNOWLEDGE_TOOL_PREVIEW_BYTES,
             )
-        except (ValidationError, ValueError) as exc:
-            return _invalid_knowledge_arguments_result(exc)
         result = await store.search(query)
         filtered_hits = _filter_search_hits(result.hits, min_score=effective_min_score)
         hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in filtered_hits]
@@ -499,6 +499,7 @@ class RememberKnowledgeTool(Tool):
             maximum=MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
         )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
             ctx,
@@ -507,15 +508,13 @@ class RememberKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
-        try:
+        with tool_argument_validation():
             text = _require_arg_string(args, "text")
             if len(text.encode("utf-8")) > self._max_text_bytes:
                 raise ValueError(f"`text` must be at most {self._max_text_bytes} bytes.")
             kind = _optional_arg_string(args, "kind") or self._policy.default_kind
             self._validate_kind(kind)
             metadata = _remember_metadata(ctx)
-        except (ValidationError, ValueError) as exc:
-            return _invalid_knowledge_arguments_result(exc)
         source_hash = knowledge_source_hash(text)
         entry_id = content_knowledge_entry_id(
             namespace=self._policy.default_namespace,
@@ -547,7 +546,7 @@ class RememberKnowledgeTool(Tool):
                 # example a truncated-hash collision); write under a unique id
                 # instead of overwriting the existing entry.
                 entry_id = f"knowledge_{uuid4().hex}"
-        try:
+        with tool_argument_validation():
             request = KnowledgeIndexRequest(
                 text=text,
                 entry_id=entry_id,
@@ -572,8 +571,6 @@ class RememberKnowledgeTool(Tool):
             result = KnowledgeIndexer().build(request)
             if result.truncated:
                 raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
-        except (ValidationError, ValueError) as exc:
-            return _invalid_knowledge_arguments_result(exc)
         try:
             stored_entry = await store.put_entry_with_chunks(result.entry, result.chunks)
         except Exception as exc:
@@ -884,6 +881,7 @@ class ListKnowledgeTool(Tool):
         },
     )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
             ctx,
@@ -892,7 +890,7 @@ class ListKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
-        try:
+        with tool_argument_validation():
             query = KnowledgeListQuery(
                 namespace=_optional_arg_string(args, "namespace"),
                 labels=_optional_labels(args, "labels"),
@@ -929,8 +927,6 @@ class ListKnowledgeTool(Tool):
                 "include_entries",
                 default=not group_by,
             )
-        except (ValidationError, ValueError) as exc:
-            return _invalid_knowledge_arguments_result(exc)
         result = await store.list_entries(
             _list_query_with_group(query, group_by[0] if group_by else None)
         )
@@ -1023,6 +1019,7 @@ class ReadKnowledgeTool(Tool):
         },
     )
 
+    @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         store = _require_knowledge_store(
             ctx,
@@ -1031,8 +1028,11 @@ class ReadKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
-        try:
-            entry_id = _require_arg_string(args, "entry_id")
+        with tool_argument_validation():
+            entry_id = require_unicode_scalar_text(
+                require_clean_nonblank(_require_arg_string(args, "entry_id"), "entry_id"),
+                "entry_id",
+            )
             chunk_index = _optional_nonnegative_int(args, "chunk_index")
             around = _optional_nonnegative_int(
                 args,
@@ -1040,6 +1040,8 @@ class ReadKnowledgeTool(Tool):
                 default=DEFAULT_READ_KNOWLEDGE_AROUND,
                 maximum=MAX_READ_KNOWLEDGE_AROUND,
             )
+            if chunk_index is None and around != 0:
+                raise ValueError("`around` requires `chunk_index`.")
             max_chunks = _optional_positive_int(
                 args,
                 "max_chunks",
@@ -1052,15 +1054,13 @@ class ReadKnowledgeTool(Tool):
                 default=DEFAULT_KNOWLEDGE_TOOL_MAX_BYTES,
                 maximum=MAX_KNOWLEDGE_TOOL_MAX_BYTES,
             )
-            chunks = await store.read_chunks(
-                entry_id,
-                chunk_index=chunk_index,
-                around=around,
-                max_chunks=max_chunks,
-                max_bytes=max_bytes,
-            )
-        except (ValidationError, ValueError) as exc:
-            return _invalid_knowledge_arguments_result(exc)
+        chunks = await store.read_chunks(
+            entry_id,
+            chunk_index=chunk_index,
+            around=around,
+            max_chunks=max_chunks,
+            max_bytes=max_bytes,
+        )
         chunk_payloads = [_knowledge_chunk_payload(chunk) for chunk in chunks]
         if not chunk_payloads:
             content = f"No knowledge chunks found for entry_id {entry_id!r}."
@@ -1106,10 +1106,6 @@ def _missing_knowledge_store_result() -> ToolResult:
         structured={"error": "missing_knowledge_store"},
         is_error=True,
     )
-
-
-def _invalid_knowledge_arguments_result(exc: Exception) -> ToolResult:
-    return invalid_tool_arguments_result(exc)
 
 
 def _knowledge_write_failed_result(

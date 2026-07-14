@@ -12,9 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import (
     _RESERVED_LABEL_PREFIX,
+    copy_json_object,
     copy_json_value,
     require_clean_nonblank,
     require_nonblank,
+    require_unicode_scalar_json,
+    require_unicode_scalar_text,
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
@@ -31,7 +34,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
-from cayu.tools._errors import structured_invalid_arguments
+from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 
 logger = logging.getLogger(__name__)
 
@@ -291,19 +294,32 @@ class SubagentTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        agent_alias = _string_argument(args, "agent", clean=True)
-        task = _string_argument(args, "task", clean=False)
-        raw_metadata = args.get("metadata", {})
-        metadata = copy_json_value({} if raw_metadata is None else raw_metadata, "metadata")
-        # Never let the model seed cayu-reserved metadata via its own tool arguments (e.g. taint
-        # labels supplied authoritatively by the runtime through ctx.metadata below). Leaving a
-        # reserved key in model-controlled metadata would let an injected parent forge child state
-        # (or crash the child's policy read with a malformed value).
-        metadata = {
-            key: value
-            for key, value in metadata.items()
-            if not key.startswith(_RESERVED_LABEL_PREFIX)
-        }
+        with tool_argument_validation():
+            agent_alias = require_unicode_scalar_text(
+                _string_argument(args, "agent", clean=True),
+                "agent",
+            )
+            task = require_unicode_scalar_text(
+                _string_argument(args, "task", clean=False),
+                "task",
+            )
+            raw_metadata = args.get("metadata", {})
+            metadata = require_unicode_scalar_json(
+                copy_json_object(
+                    {} if raw_metadata is None else raw_metadata,
+                    "metadata",
+                ),
+                "metadata",
+            )
+            # Never let the model seed cayu-reserved metadata via its own tool arguments (e.g.
+            # taint labels supplied authoritatively by the runtime through ctx.metadata below).
+            # Leaving a reserved key in model-controlled metadata would let an injected parent
+            # forge child state (or crash the child's policy read with a malformed value).
+            metadata = {
+                key: value
+                for key, value in metadata.items()
+                if not key.startswith(_RESERVED_LABEL_PREFIX)
+            }
         spec = self._agents.get(agent_alias)
         if spec is None:
             return ToolResult(
@@ -553,43 +569,47 @@ class SubagentResultTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        all_children = _bool_argument(args, "all", default=False)
-        wait = _bool_argument(args, "wait", default=True)
-        timeout_s = _timeout_argument(
-            args,
-            "timeout_s",
-            default=self._default_timeout_s,
-        )
-        max_chars = _int_argument(
-            args,
-            "max_chars",
-            default=DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
-            minimum=1,
-            maximum=MAX_SUBAGENT_RESULT_MAX_CHARS,
-        )
-        child_session_id = args.get("child_session_id")
-        if all_children:
-            if child_session_id is not None:
-                return ToolResult(
-                    content="Use either child_session_id or all=true, not both.",
-                    structured={"all": all_children},
-                    is_error=True,
+        with tool_argument_validation():
+            all_children = _bool_argument(args, "all", default=False)
+            wait = _bool_argument(args, "wait", default=True)
+            timeout_s = _timeout_argument(
+                args,
+                "timeout_s",
+                default=self._default_timeout_s,
+            )
+            max_chars = _int_argument(
+                args,
+                "max_chars",
+                default=DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
+                minimum=1,
+                maximum=MAX_SUBAGENT_RESULT_MAX_CHARS,
+            )
+            child_session_id = args.get("child_session_id")
+            if all_children:
+                if child_session_id is not None:
+                    raise ValueError("Use either child_session_id or all=true, not both.")
+            else:
+                if type(child_session_id) is not str:
+                    raise ValueError("subagent_result requires child_session_id unless all=true.")
+                child_session_id = require_clean_nonblank(
+                    child_session_id,
+                    "child_session_id",
                 )
+                child_session_id = require_unicode_scalar_text(
+                    child_session_id,
+                    "child_session_id",
+                )
+        if all_children:
             return await self._run_all(
                 ctx=ctx,
                 wait=wait,
                 timeout_s=timeout_s,
                 max_chars=max_chars,
             )
-        if not isinstance(child_session_id, str):
-            return ToolResult(
-                content="subagent_result requires child_session_id unless all=true.",
-                structured={"all": all_children},
-                is_error=True,
-            )
+        assert isinstance(child_session_id, str)
         return await self._run_one(
             ctx=ctx,
-            child_session_id=require_clean_nonblank(child_session_id, "child_session_id"),
+            child_session_id=child_session_id,
             wait=wait,
             timeout_s=timeout_s,
             max_chars=max_chars,
