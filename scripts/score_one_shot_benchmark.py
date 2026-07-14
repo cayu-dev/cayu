@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import stat
 import tarfile
@@ -14,48 +15,45 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-_ARCHETYPES = ("rfp", "research_document", "coding_repository")
 _EVIDENCE_LAYERS = ("inspect", "check", "tests", "eval", "process_boundary", "live")
 _REQUIRED_PASS_LAYERS = frozenset({"inspect", "check", "tests", "eval", "process_boundary"})
-_CASE_REQUIREMENTS = {
-    "rfp": frozenset(
-        {
-            "domain_input",
-            "model_decision",
-            "explicit_effect_tool",
-            "approval_boundary",
-            "durable_state",
-            "deterministic_test",
-            "trajectory_eval",
-        }
-    ),
-    "research_document": frozenset(
-        {
-            "document_input",
-            "artifact_output",
-            "citations",
-            "deterministic_test",
-            "trajectory_eval",
-            "omits_unneeded_subsystems",
-        }
-    ),
-    "coding_repository": frozenset(
-        {
-            "isolated_workspace",
-            "narrow_command_policy",
-            "selector_argument_boundary",
-            "workspace_side_effect_containment",
-            "check_outcome_classification",
-            "selector_scope_reporting",
-            "patch_artifact",
-            "no_delivery_effect",
-            "deterministic_test",
-            "trajectory_eval",
-        }
-    ),
-}
-_SCHEMA_PATH = Path(__file__).parents[1] / "benchmarks" / "one_shot" / "trial-report.schema.json"
+_BENCHMARK_ROOT = Path(__file__).parents[1] / "benchmarks" / "one_shot"
+_SCHEMA_PATH = _BENCHMARK_ROOT / "trial-report.schema.json"
+_PROMPT_TOOL_ALIGNMENT_SCHEMA_PATH = _BENCHMARK_ROOT / "prompt-tool-alignment.schema.json"
+_CASE_REQUIREMENTS_PATH = _BENCHMARK_ROOT / "case-requirements.json"
 _REPOSITORY_ROOT = _SCHEMA_PATH.parents[2]
+
+
+def _load_case_requirements() -> dict[str, frozenset[str]]:
+    payload = json.loads(_CASE_REQUIREMENTS_PATH.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "1" or set(payload) != {
+        "schema_version",
+        "archetypes",
+    }:
+        raise RuntimeError("Invalid one-shot case-requirements manifest.")
+    archetypes = payload["archetypes"]
+    if type(archetypes) is not dict or not archetypes:
+        raise RuntimeError("One-shot case requirements must define archetypes.")
+    requirements: dict[str, frozenset[str]] = {}
+    for archetype, names in archetypes.items():
+        if (
+            type(archetype) is not str
+            or not archetype.strip()
+            or archetype != archetype.strip()
+            or type(names) is not list
+            or not names
+            or any(
+                type(name) is not str or not name.strip() or name != name.strip() for name in names
+            )
+            or len(names) != len(set(names))
+        ):
+            raise RuntimeError("Invalid one-shot case-requirements manifest.")
+        requirements[archetype] = frozenset(names)
+    return requirements
+
+
+CASE_REQUIREMENTS = _load_case_requirements()
+_ARCHETYPES = tuple(CASE_REQUIREMENTS)
 
 
 def score_report(
@@ -149,6 +147,14 @@ def score_report(
         for path in reused_paths:
             violations.append(f"{trial_id} evidence path is reused by multiple claims: {path}")
         evidence_index_passed = not reused_paths
+        evidence_content_passed = _score_prompt_tool_alignment_evidence(
+            trial_id,
+            archetype,
+            evidence=trial["evidence"],
+            acceptance=trial["case_acceptance"],
+            artifact_root=artifact_root,
+            violations=violations,
+        )
         if len(trial_failures) == trial_failure_start:
             if trial["first_submission_acceptance_passed"] is False:
                 trial_failures.append(f"{trial_id} declared first-submission acceptance failed")
@@ -166,6 +172,7 @@ def score_report(
             and evidence_passed
             and case_passed
             and evidence_index_passed
+            and evidence_content_passed
         )
         if passed:
             passed_trials.add(trial_id)
@@ -234,6 +241,157 @@ def _artifact_identity(relative_path: str, artifact_root: Path | None) -> str:
     if artifact_root is None:
         return PurePosixPath(relative_path).as_posix()
     return str((artifact_root.resolve() / relative_path).resolve())
+
+
+def _score_prompt_tool_alignment_evidence(
+    trial_id: str,
+    archetype: str,
+    *,
+    evidence: dict[str, dict[str, Any]],
+    acceptance: list[dict[str, Any]],
+    artifact_root: Path | None,
+    violations: list[str],
+) -> bool:
+    if archetype != "coding_repository" or artifact_root is None:
+        return True
+    alignment = next(
+        (item for item in acceptance if item["id"] == "prompt_tool_alignment"),
+        None,
+    )
+    if alignment is None:
+        return True
+    passed = _validate_prompt_tool_alignment_artifact(
+        trial_id,
+        alignment["evidence_path"],
+        artifact_root=artifact_root,
+        violations=violations,
+    )
+    alignment_digest = _canonical_artifact_digest(alignment["evidence_path"], artifact_root)
+    trajectory = next(
+        (item for item in acceptance if item["id"] == "trajectory_eval"),
+        None,
+    )
+    eval_paths = [evidence["eval"]["output_path"]]
+    if trajectory is not None:
+        eval_paths.append(trajectory["evidence_path"])
+    eval_digests = {
+        digest
+        for path in eval_paths
+        if (digest := _canonical_artifact_digest(path, artifact_root)) is not None
+    }
+    if alignment_digest is not None and alignment_digest in eval_digests:
+        violations.append(
+            f"{trial_id} prompt_tool_alignment evidence duplicates trajectory eval content"
+        )
+        passed = False
+    return passed
+
+
+def _validate_prompt_tool_alignment_artifact(
+    trial_id: str,
+    relative_path: str,
+    *,
+    artifact_root: Path,
+    violations: list[str],
+) -> bool:
+    content = _read_artifact_content(relative_path, artifact_root)
+    if content is None:
+        return False
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        violations.append(f"{trial_id} prompt_tool_alignment artifact is not valid JSON")
+        return False
+    schema = json.loads(_PROMPT_TOOL_ALIGNMENT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    errors = sorted(
+        Draft202012Validator(schema).iter_errors(payload),
+        key=lambda error: tuple(str(part) for part in error.absolute_path),
+    )
+    if errors:
+        error = errors[0]
+        path = ".".join(str(part) for part in error.absolute_path) or "artifact"
+        violations.append(
+            f"{trial_id} prompt_tool_alignment artifact schema error at {path}: {error.message}"
+        )
+        return False
+
+    agent = payload["agent"]
+    agent_name = agent["name"]
+    registered = agent["registered_tool_names"]
+    workflow = agent["workflow_tool_names"]
+    names = [agent_name, *registered, *workflow]
+    if any(name != name.strip() or not name.strip() for name in names):
+        violations.append(
+            f"{trial_id} prompt_tool_alignment artifact requires nonblank names "
+            "without surrounding whitespace"
+        )
+        return False
+    missing = sorted(set(workflow) - set(registered))
+    if missing:
+        violations.append(
+            f"{trial_id} prompt_tool_alignment workflow tools are not registered for "
+            f"agent {agent_name}: {', '.join(missing)}"
+        )
+        return False
+    diagnostic_codes = {
+        diagnostic["code"] for diagnostic in payload["check"]["result"]["diagnostics"]
+    }
+    if "AGENT_WORKFLOW_TOOL_NOT_REGISTERED" in diagnostic_codes:
+        violations.append(
+            f"{trial_id} prompt_tool_alignment artifact contains alignment diagnostic "
+            "AGENT_WORKFLOW_TOOL_NOT_REGISTERED"
+        )
+        return False
+    return True
+
+
+def _canonical_artifact_digest(
+    relative_path: str | None,
+    artifact_root: Path,
+) -> str | None:
+    content = _read_artifact_content(relative_path, artifact_root)
+    if content is None:
+        return None
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        canonical = content.rstrip()
+    else:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _read_artifact_content(
+    relative_path: str | None,
+    artifact_root: Path,
+) -> bytes | None:
+    resolved = _resolve_contained_artifact_path(relative_path, artifact_root)
+    if resolved is None or not resolved.is_file():
+        return None
+    try:
+        return resolved.read_bytes()
+    except OSError:
+        return None
+
+
+def _resolve_contained_artifact_path(
+    relative_path: str | None,
+    artifact_root: Path,
+) -> Path | None:
+    if relative_path is None:
+        return None
+    root = artifact_root.resolve()
+    try:
+        resolved = (root / relative_path).resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
 
 
 def _score_cross_trial_reuse(
@@ -381,13 +539,16 @@ def _score_case_acceptance(
     trial_failures: list[str],
 ) -> bool:
     by_id = Counter(item["id"] for item in acceptance)
-    expected = _CASE_REQUIREMENTS[archetype]
+    expected = CASE_REQUIREMENTS[archetype]
     observed = frozenset(by_id)
     passed = True
     if observed != expected or any(count != 1 for count in by_id.values()):
         violations.append(
             f"{trial_id} case acceptance ids differ: expected {', '.join(sorted(expected))}"
         )
+        missing = sorted(expected - observed)
+        if missing:
+            trial_failures.append(f"{trial_id} missing case requirements: {', '.join(missing)}")
         passed = False
     for item in acceptance:
         if item["passed"] is not True:
@@ -589,10 +750,8 @@ def _validate_artifact_path(
     scope_path: str | None = None,
 ) -> bool:
     root = artifact_root.resolve()
-    candidate = (root / relative_path).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
+    candidate = _resolve_contained_artifact_path(relative_path, artifact_root)
+    if candidate is None:
         violations.append(f"{trial_id} evidence path escapes the report root: {relative_path}")
         return False
     if scope_path is not None:

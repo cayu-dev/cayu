@@ -22,6 +22,9 @@ class AgentSpec(BaseModel):
     # default provider when unset; a RunRequest.provider_name overrides both.
     provider_name: str | None = None
     system_prompt: str | None = None
+    # Exact registered tool names used by the agent's machine-checkable workflow.
+    # Cayu checks these names against this agent's manifest without parsing prose.
+    workflow_tool_names: tuple[str, ...] = ()
     metadata: dict[str, Any] = Field(default_factory=dict)
     provider_options: dict[str, Any] = Field(default_factory=dict)
     thinking: ThinkingConfig | None = None
@@ -56,6 +59,17 @@ class AgentSpec(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("workflow_tool_names")
+    @classmethod
+    def validate_workflow_tool_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        validated = tuple(
+            require_clean_nonblank(name, f"workflow_tool_names[{index}]")
+            for index, name in enumerate(value)
+        )
+        if len(validated) != len(set(validated)):
+            raise ValueError("workflow_tool_names must be unique.")
+        return validated
 
 
 class Agent(ABC):

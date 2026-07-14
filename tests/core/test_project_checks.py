@@ -33,6 +33,21 @@ class _ExternalTool(Tool):
         return ToolResult(content="sent")
 
 
+class _ConfiguredTool(Tool):
+    def __init__(self, name: str, *, effect: ToolEffect, content: str) -> None:
+        super().__init__(
+            ToolSpec(
+                name=name,
+                effect=effect,
+                input_schema={"type": "object", "additionalProperties": False},
+            )
+        )
+        self._content = content
+
+    async def run(self, ctx, args):
+        return ToolResult(content=self._content)
+
+
 class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
     async def authorize(self, request):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
@@ -42,11 +57,59 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
     assert BUILTIN_DIAGNOSTIC_CODES == (
         "AGENT_PROVIDER_AMBIGUOUS",
         "AGENT_PROVIDER_NOT_FOUND",
+        "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
         "APP_NO_AGENTS",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
+
+
+def test_workflow_tool_references_must_match_that_agents_registered_tools() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="reviewer",
+            model="test-model",
+            workflow_tool_names=("read_file", "write_file"),
+        ),
+        tools=[
+            _ConfiguredTool("read_source", effect=ToolEffect.NONE, content="source"),
+            _ConfiguredTool("edit_file", effect=ToolEffect.IDEMPOTENT, content="edited"),
+        ],
+    )
+    app.register_agent(
+        AgentSpec(name="other", model="test-model"),
+        tools=[
+            _ConfiguredTool("read_file", effect=ToolEffect.NONE, content="source"),
+            _ConfiguredTool("write_file", effect=ToolEffect.IDEMPOTENT, content="edited"),
+        ],
+    )
+
+    manifest = app.describe()
+    report = check_manifest(manifest)
+    deploy_report = check_manifest(manifest, deploy_only=True)
+
+    reviewer = next(agent for agent in manifest.agents if agent.name == "reviewer")
+    assert reviewer.workflow_tool_names == ("read_file", "write_file")
+    assert [item.code for item in report.diagnostics] == [
+        "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+        "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+    ]
+    assert [item.parameters["workflow_tool"] for item in report.diagnostics] == [
+        "read_file",
+        "write_file",
+    ]
+    assert report.diagnostics[0].parameters["registered_tools"] == (
+        "edit_file",
+        "read_source",
+    )
+    assert report.diagnostics[0].verification_command == (
+        "cayu inspect --json && cayu check --json"
+    )
+    assert "exact registered tool name" in report.diagnostics[0].hint
+    assert deploy_report.diagnostics == report.diagnostics
 
 
 def test_check_tags_and_deploy_selection_are_orthogonal() -> None:
@@ -101,8 +164,24 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     unknown_codes = {item.code for item in check_manifest(unknown.describe()).diagnostics}
 
-    assert empty_codes | missing_codes | ambiguous_codes | unsafe_codes | unknown_codes == set(
-        BUILTIN_DIAGNOSTIC_CODES
+    misaligned = CayuApp(enable_logging=False)
+    misaligned.register_agent(
+        AgentSpec(
+            name="misaligned",
+            model="model",
+            workflow_tool_names=("missing_tool",),
+        )
+    )
+    misaligned_codes = {item.code for item in check_manifest(misaligned.describe()).diagnostics}
+
+    assert (
+        empty_codes
+        | missing_codes
+        | ambiguous_codes
+        | unsafe_codes
+        | unknown_codes
+        | misaligned_codes
+        == set(BUILTIN_DIAGNOSTIC_CODES)
     )
 
 

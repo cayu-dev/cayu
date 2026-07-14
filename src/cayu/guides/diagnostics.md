@@ -20,6 +20,14 @@ provider, correct `provider_name`, or define an unambiguous default route.
 matches the agent model. Make patterns disjoint or set the agent's
 `provider_name` explicitly.
 
+## agent-workflow-tool-not-registered
+
+`AGENT_WORKFLOW_TOOL_NOT_REGISTERED` means an agent's explicit
+`workflow_tool_names` contract names a tool that is not registered for that
+same agent. Use the exact registered name, update the machine-owned tool-name
+source after a rename, or register the intended tool. Cayu checks this explicit
+contract and does not parse arbitrary natural-language prompt text.
+
 ## external-tool-unguarded
 
 `EXTERNAL_TOOL_UNGUARDED` means a tool declaring `ToolEffect.EXTERNAL` is under

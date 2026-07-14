@@ -81,22 +81,28 @@ def build_app(
 
 _AGENT_PY = """from cayu import AgentSpec
 
+from tools.greet import GREET_TOOL_NAME
+
 
 ASSISTANT_AGENT = AgentSpec(
     name="assistant",
     model="gpt-5.4-mini",
-    system_prompt="Use the available tools when they directly help the user.",
+    system_prompt=f"Use {GREET_TOOL_NAME} when it directly helps the user.",
+    workflow_tool_names=(GREET_TOOL_NAME,),
 )
 """
 
 _TOOL_PY = '''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
+GREET_TOOL_NAME = "greet"
+
+
 class GreetTool(Tool):
     """Return a greeting without changing external state."""
 
     spec = ToolSpec(
-        name="greet",
+        name=GREET_TOOL_NAME,
         effect=ToolEffect.NONE,
         description="Return a friendly greeting for a name.",
         input_schema={
@@ -126,13 +132,14 @@ from cayu import (
 )
 
 from app import build_app
+from tools.greet import GREET_TOOL_NAME
 
 
 def test_assistant_uses_greet_tool_through_the_runtime() -> None:
     provider = ScriptedModelProvider(
         [
             [
-                ModelStreamEvent.tool_call(name="greet", arguments={"name": "Ada"}),
+                ModelStreamEvent.tool_call(name=GREET_TOOL_NAME, arguments={"name": "Ada"}),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
             [
@@ -179,13 +186,14 @@ _EVAL_PY = """from cayu import (
 )
 
 from app import build_app
+from tools.greet import GREET_TOOL_NAME
 
 
 def build_eval() -> EvalPlan:
     provider = ScriptedModelProvider(
         [
             [
-                ModelStreamEvent.tool_call(name="greet", arguments={"name": "Ada"}),
+                ModelStreamEvent.tool_call(name=GREET_TOOL_NAME, arguments={"name": "Ada"}),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
             [
@@ -211,7 +219,7 @@ def build_eval() -> EvalPlan:
                 ),
                 assertions=[
                     SessionCompleted(),
-                    ToolCalled("greet"),
+                    ToolCalled(GREET_TOOL_NAME),
                     FinalOutputContains("Ada"),
                 ],
             )
@@ -338,9 +346,25 @@ Every tool must declare `ToolEffect`. External-effect tools require an enforcing
 policy such as `AlwaysRequireApprovalToolPolicy`; never treat a comment or UI
 confirmation as authorization. Prefer closed JSON schemas.
 
+Use one constant for each exact tool name across `ToolSpec`, generated workflow
+instructions, `AgentSpec.workflow_tool_names`, tests, and evals. `cayu check`
+compares the explicit workflow names with that agent's registered tool manifest;
+it never infers names from arbitrary prose.
+
+For a coding-repository one-shot benchmark, write `prompt_tool_alignment` as
+structured JSON. Copy one agent's exact `name` and `workflow_tool_names` from
+`cayu inspect --json`, and derive `registered_tool_names` from that same agent's
+`tools[].name` values. Then record `command`, `exit_code`, `schema_version`,
+`manifest_fingerprint`, and `diagnostics` from a successful
+`cayu check --json`. Never substitute generic or case-specific trajectory-eval
+output; this proves the explicit contract, not prompt comprehension or live
+model tool choice.
+
 Report static inspection, hermetic runtime tests, process-boundary checks, and
 credential-gated live checks separately. Do not claim live verification from
-successful imports, construction, mocks, or scripted providers.
+successful imports, construction, mocks, or scripted providers. A
+`ScriptedModelProvider` proves handling of predetermined calls, not prompt
+comprehension or model tool choice.
 """
 
 _GITIGNORE = "data/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"

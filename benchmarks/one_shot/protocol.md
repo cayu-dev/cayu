@@ -63,9 +63,37 @@ Store each executed layer and each case requirement in a distinct file beneath
 one shared file cannot stand in for unrelated claims within or across trials.
 Every trial uses its own submission directory.
 
+For the coding-repository case, capture the manifest-visible registered tools,
+the explicit workflow tool references, and the deterministic check result in a
+dedicated `prompt_tool_alignment` JSON evidence file. It must match
+[`prompt-tool-alignment.schema.json`](prompt-tool-alignment.schema.json); start
+from [`prompt-tool-alignment.example.json`](prompt-tool-alignment.example.json).
+Populate it as follows:
+
+- `agent.name` and `agent.workflow_tool_names` come from one agent in
+  `cayu inspect --json`; derive `agent.registered_tool_names` from that same
+  agent's `tools[].name` values;
+- `check.command` is exactly `cayu check --json`, `check.exit_code` is `0`, and
+  `check.result` is that command's complete JSON result;
+- every agent and tool name is nonblank and exact, with no surrounding
+  whitespace; both tool-name arrays contain unique values, and every declared
+  workflow tool is registered for that agent;
+- the deterministic check result contains no
+  `AGENT_WORKFLOW_TOOL_NOT_REGISTERED` diagnostic.
+
+Ordinary JSON whitespace, indentation, and key order are not significant. Do
+not point this claim at the generic or case-specific trajectory-eval output: a
+scripted provider supplies predetermined tool calls without proving that the
+prompt can cause a model to select those names. As defense in depth, the scorer
+canonicalizes JSON and trims trailing whitespace from non-JSON evidence before
+rejecting content duplicated from either trajectory-eval artifact.
+
 Construction, inspection, scripted models, mocks, and local runners never count
-as live verification. Mark unavailable optional checks `not_run`; do not turn
-them into implied success.
+as live verification. `ScriptedModelProvider` proves runtime handling of its
+predetermined calls, not prompt comprehension, model tool choice, or
+live-provider behavior. Mark unavailable optional checks `not_run`; do not turn
+them into implied success. Live-provider prompt/tool evidence stays separately
+classified and optional for hermetic CI.
 
 ## Grade and publish
 

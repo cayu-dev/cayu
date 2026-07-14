@@ -32,6 +32,9 @@ The required cases are:
 - [`cases/research-document.md`](cases/research-document.md)
 - [`cases/coding-repository.md`](cases/coding-repository.md)
 
+Their exact machine-scored requirement sets live in the canonical
+[`case-requirements.json`](case-requirements.json) manifest.
+
 Record trials using [`trial-report.schema.json`](trial-report.schema.json), then
 score the combined report:
 
@@ -59,6 +62,18 @@ into aggregate scores.
 Scorer output separates ordinary `trial_failures`, which affect the published
 rates, from release-gate `violations` such as missing classifications, report
 integrity failures, human hints, private interfaces, and security violations.
+
+The coding-repository requirement set includes `prompt_tool_alignment` as a
+separate manifest-backed claim. Record it as structured JSON matching
+[`prompt-tool-alignment.schema.json`](prompt-tool-alignment.schema.json); see
+[`prompt-tool-alignment.example.json`](prompt-tool-alignment.example.json). The
+artifact identifies one agent, its manifest-registered tool names, its declared
+workflow tool names, and the successful deterministic `cayu check --json`
+result. Its evidence path must not reuse the generic or case-specific trajectory
+eval. The scorer canonicalizes JSON before comparing their contents, so copying
+an eval with changed whitespace or key order is also rejected. Scripted calls
+prove runtime handling of predetermined names, not prompt comprehension or
+model tool selection.
 
 Passing requires at least 80% aggregate first-submission success, at least two
 passes in every three trials for each archetype, zero framework-specific human

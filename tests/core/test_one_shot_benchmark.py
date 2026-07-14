@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import runpy
 from pathlib import Path
 
@@ -7,39 +9,11 @@ import pytest
 
 scorer = runpy.run_path(str(Path(__file__).parents[2] / "scripts" / "score_one_shot_benchmark.py"))
 score_report = scorer["score_report"]
-
-
-_CASE_REQUIREMENTS = {
-    "rfp": (
-        "domain_input",
-        "model_decision",
-        "explicit_effect_tool",
-        "approval_boundary",
-        "durable_state",
-        "deterministic_test",
-        "trajectory_eval",
-    ),
-    "research_document": (
-        "document_input",
-        "artifact_output",
-        "citations",
-        "deterministic_test",
-        "trajectory_eval",
-        "omits_unneeded_subsystems",
-    ),
-    "coding_repository": (
-        "isolated_workspace",
-        "narrow_command_policy",
-        "selector_argument_boundary",
-        "workspace_side_effect_containment",
-        "check_outcome_classification",
-        "selector_scope_reporting",
-        "patch_artifact",
-        "no_delivery_effect",
-        "deterministic_test",
-        "trajectory_eval",
-    ),
-}
+CASE_REQUIREMENTS = scorer["CASE_REQUIREMENTS"]
+BENCHMARK_ROOT = Path(__file__).parents[2] / "benchmarks" / "one_shot"
+PROMPT_TOOL_ALIGNMENT_EXAMPLE = json.loads(
+    (BENCHMARK_ROOT / "prompt-tool-alignment.example.json").read_text(encoding="utf-8")
+)
 
 
 def _run() -> dict:
@@ -100,9 +74,13 @@ def _trial(archetype: str, number: int, *, passed: bool = True) -> dict:
             {
                 "id": requirement,
                 "passed": passed,
-                "evidence_path": f"{submission}/evidence/case-{requirement}.txt",
+                "evidence_path": (
+                    f"{submission}/evidence/case-{requirement}.json"
+                    if requirement == "prompt_tool_alignment"
+                    else f"{submission}/evidence/case-{requirement}.txt"
+                ),
             }
-            for requirement in _CASE_REQUIREMENTS[archetype]
+            for requirement in sorted(CASE_REQUIREMENTS[archetype])
         ],
         "evidence": {
             "inspect": _evidence(f"{submission}/evidence/inspect.txt"),
@@ -136,10 +114,34 @@ def _materialize_trial(root: Path, trial: dict) -> None:
         if item["output_path"] is not None
     ]
     paths.extend(item["evidence_path"] for item in trial["case_acceptance"])
+    alignment = next(
+        (item for item in trial["case_acceptance"] if item["id"] == "prompt_tool_alignment"),
+        None,
+    )
     for relative in paths:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"evidence for {relative}\n", encoding="utf-8")
+        if alignment is not None and relative == alignment["evidence_path"]:
+            path.write_text(
+                json.dumps(_prompt_tool_alignment_artifact(), indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            path.write_text(f"evidence for {relative}\n", encoding="utf-8")
+
+
+def _prompt_tool_alignment_artifact() -> dict:
+    return copy.deepcopy(PROMPT_TOOL_ALIGNMENT_EXAMPLE)
+
+
+def test_case_requirements_are_loaded_from_the_published_manifest() -> None:
+    manifest = json.loads((BENCHMARK_ROOT / "case-requirements.json").read_text(encoding="utf-8"))
+    expected = {
+        archetype: frozenset(requirements)
+        for archetype, requirements in manifest["archetypes"].items()
+    }
+
+    assert expected == CASE_REQUIREMENTS
 
 
 def test_score_report_enforces_the_published_one_shot_gate() -> None:
@@ -194,7 +196,9 @@ def test_score_report_allows_one_honestly_classified_behavioral_failure() -> Non
         for archetype in ("rfp", "research_document", "coding_repository")
         for number in range(1, 4)
     ]
-    trials[0]["case_acceptance"][0]["passed"] = False
+    next(item for item in trials[0]["case_acceptance"] if item["id"] == "domain_input")[
+        "passed"
+    ] = False
     trials[0]["failures"] = [
         {
             "classification": "insufficient_module_depth_or_caller_lifecycle",
@@ -464,6 +468,207 @@ def test_score_report_rejects_empty_submissions_and_shared_dummy_evidence(
         for item in score["violations"]
     )
     assert any("evidence path is reused by multiple claims" in item for item in score["violations"])
+
+
+def test_coding_repository_prompt_tool_alignment_cannot_reuse_eval_evidence(
+    tmp_path: Path,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    alignment = next(
+        item for item in coding["case_acceptance"] if item["id"] == "prompt_tool_alignment"
+    )
+    alignment["evidence_path"] = coding["evidence"]["eval"]["output_path"]
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert any("evidence path is reused by multiple claims" in item for item in score["violations"])
+
+
+def test_coding_repository_prompt_tool_alignment_rejects_eval_copy_with_trailing_whitespace(
+    tmp_path: Path,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    alignment = next(
+        item for item in coding["case_acceptance"] if item["id"] == "prompt_tool_alignment"
+    )
+    eval_path = tmp_path / coding["evidence"]["eval"]["output_path"]
+    alignment_path = tmp_path / alignment["evidence_path"]
+    alignment_path.write_bytes(eval_path.read_bytes() + b"  \n")
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert (
+        f"{coding['id']} prompt_tool_alignment evidence duplicates trajectory eval content"
+        in score["violations"]
+    )
+
+
+def test_coding_repository_prompt_tool_alignment_rejects_case_eval_evidence_copy(
+    tmp_path: Path,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    by_id = {item["id"]: item for item in coding["case_acceptance"]}
+    alignment_path = tmp_path / by_id["prompt_tool_alignment"]["evidence_path"]
+    trajectory_path = tmp_path / by_id["trajectory_eval"]["evidence_path"]
+    trajectory_output = {"status": "passed", "cases": [{"id": "review"}]}
+    trajectory_path.write_text(
+        json.dumps(trajectory_output, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    alignment_path.write_text(json.dumps(trajectory_output, indent=2), encoding="utf-8")
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert (
+        f"{coding['id']} prompt_tool_alignment evidence duplicates trajectory eval content"
+        in score["violations"]
+    )
+
+
+def test_coding_repository_prompt_tool_alignment_rejects_arbitrary_text(
+    tmp_path: Path,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    alignment = next(
+        item for item in coding["case_acceptance"] if item["id"] == "prompt_tool_alignment"
+    )
+    (tmp_path / alignment["evidence_path"]).write_text(
+        "trajectory passed\n",
+        encoding="utf-8",
+    )
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert f"{coding['id']} prompt_tool_alignment artifact is not valid JSON" in score["violations"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("agent_name_type", "schema error"),
+        ("registered_duplicate", "schema error"),
+        ("workflow_surrounding_whitespace", "nonblank names without surrounding whitespace"),
+        ("workflow_not_registered", "workflow tools are not registered for agent reviewer"),
+        ("failed_check", "schema error"),
+        ("alignment_diagnostic", "contains alignment diagnostic"),
+    ],
+)
+def test_coding_repository_prompt_tool_alignment_validates_structured_fields(
+    tmp_path: Path,
+    mutation: str,
+    expected: str,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    alignment = next(
+        item for item in coding["case_acceptance"] if item["id"] == "prompt_tool_alignment"
+    )
+    artifact = copy.deepcopy(_prompt_tool_alignment_artifact())
+    if mutation == "agent_name_type":
+        artifact["agent"]["name"] = 7
+    elif mutation == "registered_duplicate":
+        artifact["agent"]["registered_tool_names"] = ["read_source", "read_source"]
+    elif mutation == "workflow_surrounding_whitespace":
+        artifact["agent"]["workflow_tool_names"] = [" read_source"]
+    elif mutation == "workflow_not_registered":
+        artifact["agent"]["workflow_tool_names"] = ["missing_tool"]
+    elif mutation == "failed_check":
+        artifact["check"]["exit_code"] = 1
+    elif mutation == "alignment_diagnostic":
+        artifact["check"]["result"]["diagnostics"] = [
+            {"code": "AGENT_WORKFLOW_TOOL_NOT_REGISTERED"}
+        ]
+    else:  # pragma: no cover - parameter list owns the cases
+        raise AssertionError(mutation)
+    (tmp_path / alignment["evidence_path"]).write_text(
+        json.dumps(artifact),
+        encoding="utf-8",
+    )
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert any(
+        expected in violation
+        for violation in score["violations"]
+        if "prompt_tool_alignment" in violation
+    )
+
+
+def test_coding_repository_prompt_tool_alignment_rejects_symlink_to_eval_copy(
+    tmp_path: Path,
+) -> None:
+    trials = _trials()
+    for trial in trials:
+        _materialize_trial(tmp_path, trial)
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    by_id = {item["id"]: item for item in coding["case_acceptance"]}
+    eval_path = tmp_path / coding["evidence"]["eval"]["output_path"]
+    alignment_path = tmp_path / by_id["prompt_tool_alignment"]["evidence_path"]
+    copied_eval = alignment_path.with_name("copied-eval.txt")
+    copied_eval.write_bytes(eval_path.read_bytes())
+    alignment_path.unlink()
+    alignment_path.symlink_to(copied_eval)
+
+    score = score_report(
+        {"schema_version": "1", "run": _run(), "trials": trials},
+        artifact_root=tmp_path,
+    )
+
+    assert score["passed"] is False
+    assert (
+        f"{coding['id']} prompt_tool_alignment evidence duplicates trajectory eval content"
+        in score["violations"]
+    )
+
+
+def test_coding_repository_requires_prompt_tool_alignment_evidence() -> None:
+    trials = _trials()
+    coding = next(trial for trial in trials if trial["archetype"] == "coding_repository")
+    coding["case_acceptance"] = [
+        item for item in coding["case_acceptance"] if item["id"] != "prompt_tool_alignment"
+    ]
+
+    score = score_report({"schema_version": "1", "run": _run(), "trials": trials})
+
+    assert score["passed"] is False
+    assert any(
+        "missing case requirements: prompt_tool_alignment" in item
+        for item in score["trial_failures"]
+    )
 
 
 def test_score_report_rejects_submission_and_evidence_reused_across_trials(

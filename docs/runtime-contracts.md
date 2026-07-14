@@ -100,11 +100,18 @@ Context overflow recovery is opt-in per agent through `register_agent(..., conte
 
 Cayu separates agent definition, execution environment, and session state:
 
-- `AgentSpec`: model, system prompt, tool declarations, and metadata.
+- `AgentSpec`: model, system prompt, explicit workflow tool references, and metadata.
 - `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `RunRequest` / `ResumeRequest` / `Session`: one run of an agent, optionally in a named environment, with messages, status, events, and checkpoints.
 
 This mirrors the useful Managed Agents separation of brain, hands, and durable run history without copying any one provider API. A run may omit an environment for simple provider/tool tests, but concrete file, command, sandbox, vault, or MCP-backed tools should hang off an environment.
+
+`AgentSpec.workflow_tool_names` is the machine-checkable subset of registered
+tools that the agent's workflow instructions explicitly expect to call.
+`CayuApp.describe()` exposes those names beside the agent's registered tools,
+and `check_manifest()` rejects any reference not registered for that same
+agent. It deliberately does not parse `system_prompt`: applications and
+generators own the exact-name declaration, while arbitrary prose remains prose.
 
 Environment-scoped `workspace_instructions` are optional operating guidance for the active workspace. They are rendered into the initial system/instruction message for a new session as a labeled workspace section, not as a user message. Apps can pass explicit instruction text or a `WorkspaceInstructionsConfig` that loads bounded UTF-8 files from the workspace root, such as `AGENTS.md`, `.cayu/AGENTS.md`, or app-configured paths like `CLAUDE.md`. Missing files are ignored; absolute paths and parent-directory escapes are rejected. Workspace instructions are stored in the session's initial transcript system message for reproducible resume/fork behavior.
 

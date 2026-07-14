@@ -157,6 +157,7 @@ class AgentManifest(_ManifestModel):
     resolved_provider: str | None
     provider_resolution: Literal["explicit", "model_pattern", "default", "missing", "ambiguous"]
     provider_candidates: tuple[str, ...] = ()
+    workflow_tool_names: tuple[str, ...] = ()
     tools: tuple[ToolManifest, ...] = ()
     tool_policy: str
     context_policy: str
@@ -370,6 +371,7 @@ def _describe_agent(
         resolved_provider=resolved,
         provider_resolution=resolution,
         provider_candidates=candidates,
+        workflow_tool_names=spec.workflow_tool_names,
         tools=tuple(
             ToolManifest(
                 name=tool_name,

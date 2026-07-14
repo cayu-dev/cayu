@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -118,7 +119,14 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     assert main(command) == 0
     assert capsys.readouterr().out.startswith("Applied analyst: ready")
     after_apply = _files(project)
-    assert "AlwaysRequireApprovalToolPolicy" in after_apply["app.py"].decode()
+    app_source = after_apply["app.py"].decode()
+    assert "AlwaysRequireApprovalToolPolicy" in app_source
+    assert (
+        "from tools.analyze_document import "
+        "AnalyzeDocumentTool, ANALYZE_DOCUMENT_TOOL_NAME" in app_source
+    )
+    assert "tools=[ANALYZE_DOCUMENT_TOOL_NAME]" in app_source
+    assert 'tools=["analyze_document"]' not in app_source
 
     assert main([*command, "--json"]) == 0
     repeated = json.loads(capsys.readouterr().out)
@@ -126,11 +134,27 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     assert repeated["edits"] == []
     assert _files(project) == after_apply
 
-    for module_name in ("app", "agents.analyst", "tools.analyze_document"):
+    for module_name in (
+        "app",
+        "agents.analyst",
+        "agents",
+        "tools.analyze_document",
+        "tools",
+    ):
         sys.modules.pop(module_name, None)
     assert main(["inspect", "--json"]) == 0
     manifest = json.loads(capsys.readouterr().out)
     assert [agent["name"] for agent in manifest["agents"]] == ["analyst", "assistant"]
+    analyst = next(agent for agent in manifest["agents"] if agent["name"] == "analyst")
+    assert analyst["workflow_tool_names"] == ["analyze_document"]
+    agent_source = after_apply["agents/analyst.py"].decode()
+    tool_source = after_apply["tools/analyze_document.py"].decode()
+    eval_source = after_apply["evals/analyst.py"].decode()
+    assert "from tools.analyze_document import ANALYZE_DOCUMENT_TOOL_NAME" in agent_source
+    assert "workflow_tool_names=(ANALYZE_DOCUMENT_TOOL_NAME,)" in agent_source
+    assert 'ANALYZE_DOCUMENT_TOOL_NAME = "analyze_document"' in tool_source
+    assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in tool_source
+    assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in eval_source
     assert main(["check", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["diagnostics"] == []
     eval_output = project / "analyst-eval.json"
@@ -151,6 +175,10 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/test_analyst.py", "-q"],
         cwd=project,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        },
         text=True,
         capture_output=True,
         check=False,

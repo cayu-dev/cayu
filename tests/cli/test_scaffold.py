@@ -62,6 +62,13 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "# <cayu:generated-imports>" in app_source
     assert "# <cayu:generated-registrations>" in app_source
     tool_source = (project / "tools" / "greet.py").read_text(encoding="utf-8")
+    agent_source = (project / "agents" / "assistant.py").read_text(encoding="utf-8")
+    eval_source = (project / "evals" / "assistant.py").read_text(encoding="utf-8")
+    assert 'GREET_TOOL_NAME = "greet"' in tool_source
+    assert "from tools.greet import GREET_TOOL_NAME" in agent_source
+    assert "workflow_tool_names=(GREET_TOOL_NAME,)" in agent_source
+    assert "name=GREET_TOOL_NAME" in tool_source
+    assert "ToolCalled(GREET_TOOL_NAME)" in eval_source
     assert "ToolEffect.NONE" in tool_source
     assert "ToolEffect.EXTERNAL" not in tool_source
 
@@ -71,6 +78,9 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "cayu generate slice" in instructions
     assert "pytest" in instructions
     assert "cayu eval run evals.assistant:build_eval" in instructions
+    assert "prompt_tool_alignment" in instructions
+    assert "registered_tool_names" in instructions
+    assert "manifest_fingerprint" in instructions
     assert "Do not claim live verification" in instructions
 
 

@@ -125,6 +125,7 @@ def run_generate(args: argparse.Namespace) -> int:
 def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     name = _identifier(name, "slice name")
     tool_name = _identifier(tool_name, "tool name")
+    tool_name_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
     if effect not in {"none", "idempotent", "external"}:
         raise ValueError("effect must be none, idempotent, or external.")
     project = resolve_project(command="cayu generate")
@@ -166,9 +167,12 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
                 }
             )
 
+    tool_imports = [_class_name(tool_name) + "Tool"]
+    if effect == "external":
+        tool_imports.append(tool_name_constant)
     import_lines = [
         f"from agents.{name} import {_constant_name(name)}_AGENT",
-        f"from tools.{tool_name} import {_class_name(tool_name)}Tool",
+        f"from tools.{tool_name} import {', '.join(tool_imports)}",
     ]
     if effect == "external":
         import_lines.append("from cayu import AlwaysRequireApprovalToolPolicy")
@@ -176,7 +180,9 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         f"app.register_agent({_constant_name(name)}_AGENT, tools=[{_class_name(tool_name)}Tool()]"
     )
     if effect == "external":
-        registration += f', tool_policy=AlwaysRequireApprovalToolPolicy(tools=["{tool_name}"])'
+        registration += (
+            f", tool_policy=AlwaysRequireApprovalToolPolicy(tools=[{tool_name_constant}])"
+        )
     registration += ")"
 
     missing_anchors = [
@@ -376,6 +382,7 @@ def _generated_path(root: Path, relative: str) -> Path:
 
 def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
     agent_constant = f"{_constant_name(name)}_AGENT"
+    tool_name_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
     tool_class = f"{_class_name(tool_name)}Tool"
     effect_constant = effect.upper()
     if effect == "external":
@@ -388,24 +395,30 @@ def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
     else:
         test_assertions = f'''    assert outcome.ok
     assert outcome.final_text == "{name} completed sample."'''
-        eval_assertions = f'''                        SessionCompleted(),
-                        ToolCalled("{tool_name}"),
-                        FinalOutputContains("sample"),'''
+        eval_assertions = f"""                        SessionCompleted(),
+                        ToolCalled({tool_name_constant}),
+                        FinalOutputContains("sample"),"""
     agent = f'''from cayu import AgentSpec
+
+from tools.{tool_name} import {tool_name_constant}
 
 
 {agent_constant} = AgentSpec(
     name="{name}",
     model="gpt-5.4-mini",
-    system_prompt="Use {tool_name} when it directly answers the user's request.",
+    system_prompt=f"Use {{{tool_name_constant}}} when it directly answers the user's request.",
+    workflow_tool_names=({tool_name_constant},),
 )
 '''
     tool = f'''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
+{tool_name_constant} = "{tool_name}"
+
+
 class {tool_class}(Tool):
     spec = ToolSpec(
-        name="{tool_name}",
+        name={tool_name_constant},
         effect=ToolEffect.{effect_constant},
         description="Process one explicit input for the {name} agent.",
         input_schema={{
@@ -436,6 +449,7 @@ from cayu import (
 )
 
 from app import build_app
+from tools.{tool_name} import {tool_name_constant}
 
 
 def test_{name}_slice_runs_through_public_runtime_seams() -> None:
@@ -443,7 +457,7 @@ def test_{name}_slice_runs_through_public_runtime_seams() -> None:
         [
             [
                 ModelStreamEvent.tool_call(
-                    name="{tool_name}", arguments={{"input": "sample"}}
+                    name={tool_name_constant}, arguments={{"input": "sample"}}
                 ),
                 ModelStreamEvent.completed({{"finish_reason": "tool_calls"}}),
             ],
@@ -489,6 +503,7 @@ def test_{name}_slice_runs_through_public_runtime_seams() -> None:
 )
 
 from app import build_app
+from tools.{tool_name} import {tool_name_constant}
 
 
 def build_eval() -> EvalPlan:
@@ -496,7 +511,7 @@ def build_eval() -> EvalPlan:
         [
             [
                 ModelStreamEvent.tool_call(
-                    name="{tool_name}", arguments={{"input": "sample"}}
+                    name={tool_name_constant}, arguments={{"input": "sample"}}
                 ),
                 ModelStreamEvent.completed({{"finish_reason": "tool_calls"}}),
             ],

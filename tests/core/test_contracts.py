@@ -1243,6 +1243,26 @@ def test_agent_spec_uses_explicit_system_prompt_field():
         AgentSpec(name="assistant", model="fake-model", prompt="too vague")  # type: ignore[call-arg]
 
 
+def test_agent_spec_declares_machine_checkable_workflow_tool_names() -> None:
+    names = ["read_source", "edit_file"]
+
+    spec = AgentSpec(
+        name="reviewer",
+        model="fake-model",
+        workflow_tool_names=names,
+    )
+    names.append("stale_name")
+
+    assert spec.workflow_tool_names == ("read_source", "edit_file")
+
+    with pytest.raises(ValidationError, match="workflow_tool_names.*unique"):
+        AgentSpec(
+            name="reviewer",
+            model="fake-model",
+            workflow_tool_names=("read_source", "read_source"),
+        )
+
+
 def test_agent_spec_copies_provider_options():
     options = {"openai": {"prompt_cache_key": "tenant-a-agent"}}
     spec = AgentSpec(

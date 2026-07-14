@@ -12,6 +12,7 @@ AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "provi
 BUILTIN_DIAGNOSTIC_CODES = (
     "AGENT_PROVIDER_AMBIGUOUS",
     "AGENT_PROVIDER_NOT_FOUND",
+    "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
     "APP_NO_AGENTS",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
@@ -122,6 +123,38 @@ def check_manifest(
                         "providers": list(agent.provider_candidates),
                     },
                     documentation_anchor="cayu guide diagnostics#agent-provider-ambiguous",
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+
+        registered_tool_names = tuple(tool.name for tool in agent.tools)
+        registered_tool_set = frozenset(registered_tool_names)
+        for workflow_tool_name in agent.workflow_tool_names:
+            if workflow_tool_name in registered_tool_set:
+                continue
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=(f"agents.{agent.name}.workflow_tool_names.{workflow_tool_name}"),
+                    message=(
+                        f"Agent '{agent.name}' declares workflow tool '{workflow_tool_name}', "
+                        "but that tool is not registered for the agent."
+                    ),
+                    hint=(
+                        "Use the exact registered tool name in the machine-checkable workflow "
+                        "contract, or register the intended tool for this agent."
+                    ),
+                    tags=("authoring", "configuration", "deploy"),
+                    parameters={
+                        "agent": agent.name,
+                        "workflow_tool": workflow_tool_name,
+                        "registered_tools": list(registered_tool_names),
+                    },
+                    documentation_anchor=(
+                        "cayu guide diagnostics#agent-workflow-tool-not-registered"
+                    ),
                     verification_command="cayu inspect --json && cayu check --json",
                 )
             )

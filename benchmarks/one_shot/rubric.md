@@ -16,6 +16,10 @@ present in the first submission.
 - Every tool has a closed schema and accurate `ToolEffect`.
 - External effects have an enforcing policy/approval boundary.
 - Evidence labels static, hermetic, process, and optional live proof honestly.
+- Explicit workflow tool references match the registered tools for that agent.
+  The `prompt_tool_alignment` claim uses schema-valid structured evidence with
+  a successful deterministic check and no alignment diagnostic;
+  scripted-provider output is not prompt/tool-alignment evidence.
 - No framework-specific human correction was given after the initial prompt.
 
 ## Framework leverage

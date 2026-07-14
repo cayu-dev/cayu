@@ -43,3 +43,10 @@ Record separate case evidence for:
 Use the deterministic executable fixture in `../fixtures/coding_repository/`
 when preparing this evidence. A zero process exit code or declared effect is not
 evidence by itself.
+
+Its machine-checkable workflow tool references match that agent's registered tool
+manifest. Record `prompt_tool_alignment` as distinct structured JSON matching
+[`../prompt-tool-alignment.schema.json`](../prompt-tool-alignment.schema.json),
+including the agent identity, manifest-registered names, declared workflow
+names, and successful deterministic check result. The scripted trajectory
+cannot serve as evidence for this requirement.
