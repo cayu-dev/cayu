@@ -132,6 +132,54 @@ Define what happens when an effect starts but completion cannot be proven.
 Never blindly retry an ambiguous external effect. Persist enough identity and
 checkpoint state for an operator or recovery path to reconcile it.
 
+### Keep model-controlled command selectors as data
+
+Model-controlled command selectors are untrusted argv input. A value described
+as a path, target, test node ID, or filter can still become a new option when
+application code appends it to an otherwise fixed command. For example,
+`--help` can exit zero without running a check, while an output option can write
+outside the workspace. A zero exit status alone is therefore not proof that the
+intended check ran.
+
+An executable allowlist does not authorize its argument protocol. For every
+allowed command, define and validate the exact selector grammar owned by the
+application. A file-selector recipe should:
+
+1. reject empty values, NULs, leading-option forms, absolute paths, traversal,
+   platform separators outside the supported grammar, and unsupported syntax;
+2. parse compound forms such as a test path plus node IDs before validating
+   each component;
+3. resolve the path against the authorized workspace and prove containment;
+4. construct argv as a sequence with no shell interpolation; and
+5. insert `--` only when the target executable's documented, tested semantics
+   treat it as an end-of-options delimiter at that exact position.
+
+For a tool that supports only Python test files and simple pytest node IDs, an
+application-owned validator can look like this:
+
+<!-- cayu-guide-include:pytest-selector -->
+
+The fixed prefix and validated selectors can then be passed directly to the
+runner without a shell. This example deliberately makes no claim that adding
+`--` is valid for every pytest invocation; confirm the installed executable's
+contract before doing so. Filters passed as values to an application-owned
+option need their own closed grammar rather than reuse of the path validator.
+
+Classify process outcomes using that executable's contract. Keep rejection,
+unavailable or non-executable command, timeout, check failure, and zero tests
+executed distinct from verified success. Preserve a structured cannot-run reason
+such as not found, permission denied, invalid executable format, or another OS
+launch error. Report whether the check used full discovery or an intentionally
+selected subset, including the exact validated selectors; a passing selected
+check verifies only that subset.
+
+Inventory writes made by representative success and adversarial runs, including
+caches and reports, and compare those observed effects with the tool's declared
+`ToolEffect`. Keep the process outcome and effect comparison orthogonal: a
+failed check that also writes remains a failed check with a separate effect
+mismatch. These controls do not replace container or microVM isolation when the
+command executes untrusted repository code.
+
 ## 7. Put state in the right place
 
 - Transcript/session state belongs in a `SessionStore`.

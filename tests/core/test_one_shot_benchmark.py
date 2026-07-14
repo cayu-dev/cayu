@@ -30,6 +30,10 @@ _CASE_REQUIREMENTS = {
     "coding_repository": (
         "isolated_workspace",
         "narrow_command_policy",
+        "selector_argument_boundary",
+        "workspace_side_effect_containment",
+        "check_outcome_classification",
+        "selector_scope_reporting",
         "patch_artifact",
         "no_delivery_effect",
         "deterministic_test",
@@ -151,6 +155,37 @@ def test_score_report_enforces_the_published_one_shot_gate() -> None:
     assert score["aggregate"] == {"passed": 9, "total": 9, "rate": 1.0}
     assert score["archetypes"]["rfp"] == {"passed": 3, "total": 3, "rate": 1.0}
     assert score["violations"] == []
+
+
+def test_score_report_requires_distinct_command_selector_evidence() -> None:
+    trials = _trials()
+    coding_trial = next(trial for trial in trials if trial["id"] == "coding_repository-1")
+    coding_trial["case_acceptance"] = [
+        item
+        for item in coding_trial["case_acceptance"]
+        if item["id"] != "workspace_side_effect_containment"
+    ]
+    coding_trial["failures"] = [
+        {
+            "classification": "unrealistic_test_boundary",
+            "disposition": "regression_fixture",
+            "reference": {
+                "kind": "repository_path",
+                "value": "tests/core/test_one_shot_benchmark.py",
+            },
+        }
+    ]
+
+    score = score_report({"schema_version": "1", "run": _run(), "trials": trials})
+
+    assert any(
+        violation.startswith("coding_repository-1 case acceptance ids differ:")
+        and "selector_argument_boundary" in violation
+        and "workspace_side_effect_containment" in violation
+        and "check_outcome_classification" in violation
+        and "selector_scope_reporting" in violation
+        for violation in score["violations"]
+    )
 
 
 def test_score_report_allows_one_honestly_classified_behavioral_failure() -> None:

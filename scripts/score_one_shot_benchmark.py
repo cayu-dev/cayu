@@ -43,6 +43,10 @@ _CASE_REQUIREMENTS = {
         {
             "isolated_workspace",
             "narrow_command_policy",
+            "selector_argument_boundary",
+            "workspace_side_effect_containment",
+            "check_outcome_classification",
+            "selector_scope_reporting",
             "patch_artifact",
             "no_delivery_effect",
             "deterministic_test",
