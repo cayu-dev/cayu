@@ -23,6 +23,8 @@ def test_inspect_json_discovers_nested_project_and_builds_factory_once(
         """from cayu import (
     AgentSpec,
     CayuApp,
+    Environment,
+    EnvironmentSpec,
     ScriptedModelProvider,
     Tool,
     ToolEffect,
@@ -50,6 +52,7 @@ def build_app():
     app = CayuApp(enable_logging=False)
     app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
     app.register_agent(AgentSpec(name="reviewer", model="test-model"), tools=[ReviewTool()])
+    app.register_environment(Environment(EnvironmentSpec(name="optional")), default=False)
     return app
 """,
         encoding="utf-8",
@@ -63,6 +66,9 @@ def build_app():
     assert output["schema_version"] == "1"
     assert output["agents"][0]["name"] == "reviewer"
     assert output["agents"][0]["resolved_provider"] == "scripted"
+    assert output["defaults"]["environment"] is None
+    assert output["environments"][0]["name"] == "optional"
+    assert output["environments"][0]["is_default"] is False
     assert output["agents"][0]["registration_provenance"]["location"] == "inspect_project.py"
     assert (
         output["agents"][0]["tools"][0]["implementation_provenance"]["location"]

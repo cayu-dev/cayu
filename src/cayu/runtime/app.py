@@ -1836,8 +1836,7 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        if default or self._default_environment_name is None:
-            self._default_environment_name = stored_spec.name
+        self._select_default_environment_if_requested(stored_spec.name, default=default)
         return environment
 
     def register_environment_factory(
@@ -1865,9 +1864,17 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        if default or self._default_environment_name is None:
-            self._default_environment_name = stored_spec.name
+        self._select_default_environment_if_requested(stored_spec.name, default=default)
         return factory
+
+    def _select_default_environment_if_requested(
+        self,
+        environment_name: str,
+        *,
+        default: bool,
+    ) -> None:
+        if default:
+            self._default_environment_name = environment_name
 
     def get_agent(self, name: str) -> runtime_records.RegisteredAgent:
         agent_name = require_clean_nonblank(name, "agent.name")

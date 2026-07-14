@@ -733,6 +733,107 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         )
 
 
+class ProvisionedTestRunner(Runner):
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        return ExecResult(stdout="unused")
+
+
+class RecordingWorkspaceAllocator:
+    def __init__(self) -> None:
+        self.requests: list[EnvironmentFactoryRequest] = []
+        self.workspaces: list[MemoryWorkspace] = []
+
+    def allocate(self, request: EnvironmentFactoryRequest) -> Workspace:
+        self.requests.append(request)
+        workspace = MemoryWorkspace(f"workspace-{request.session_id}")
+        self.workspaces.append(workspace)
+        return workspace
+
+
+class RecordingRunnerAllocator:
+    def __init__(self) -> None:
+        self.requests: list[EnvironmentFactoryRequest] = []
+        self.runners: list[ProvisionedTestRunner] = []
+
+    def allocate(self, request: EnvironmentFactoryRequest) -> Runner:
+        self.requests.append(request)
+        runner = ProvisionedTestRunner()
+        self.runners.append(runner)
+        return runner
+
+
+class RecordingBindingAllocator:
+    def __init__(self) -> None:
+        self.requests: list[EnvironmentFactoryRequest] = []
+        self.bindings: list[RecordingWorkspaceBinding] = []
+
+    def allocate(self, request: EnvironmentFactoryRequest) -> WorkspaceBinding:
+        self.requests.append(request)
+        binding = RecordingWorkspaceBinding()
+        self.bindings.append(binding)
+        return binding
+
+
+class AllocatingEnvironmentFactory(EnvironmentFactory):
+    def __init__(
+        self,
+        environment_name: str,
+        *,
+        workspace_allocator: RecordingWorkspaceAllocator,
+        runner_allocator: RecordingRunnerAllocator,
+        binding_allocator: RecordingBindingAllocator,
+    ) -> None:
+        self.environment_name = environment_name
+        self.workspace_allocator = workspace_allocator
+        self.runner_allocator = runner_allocator
+        self.binding_allocator = binding_allocator
+        self.requests: list[EnvironmentFactoryRequest] = []
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
+        return EnvironmentFactoryResult(
+            environment=Environment(
+                EnvironmentSpec(name=self.environment_name),
+                workspace=self.workspace_allocator.allocate(request),
+                runner=self.runner_allocator.allocate(request),
+                binding=self.binding_allocator.allocate(request),
+            ),
+            reconnect_metadata={"sandbox_id": "unexpected"},
+        )
+
+
+class EnvironmentProvisioningRecorder:
+    def __init__(self, environment_name: str) -> None:
+        self.workspace_allocator = RecordingWorkspaceAllocator()
+        self.runner_allocator = RecordingRunnerAllocator()
+        self.binding_allocator = RecordingBindingAllocator()
+        self.factory = AllocatingEnvironmentFactory(
+            environment_name,
+            workspace_allocator=self.workspace_allocator,
+            runner_allocator=self.runner_allocator,
+            binding_allocator=self.binding_allocator,
+        )
+
+
+def assert_environment_was_not_provisioned(recorder: EnvironmentProvisioningRecorder) -> None:
+    assert recorder.factory.requests == []
+    assert recorder.workspace_allocator.requests == []
+    assert recorder.workspace_allocator.workspaces == []
+    assert recorder.runner_allocator.requests == []
+    assert recorder.runner_allocator.runners == []
+    assert recorder.binding_allocator.requests == []
+    assert recorder.binding_allocator.bindings == []
+
+
 class RecordingSessionFailedHook(RuntimeHook):
     def __init__(self) -> None:
         self.contexts: list[RuntimeHookContext] = []
@@ -3014,6 +3115,153 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
     assert tool_events[0].payload["result"]["structured"] == {"workspace_id": workspace.id}
 
 
+def test_cayu_app_run_without_a_default_does_not_select_a_static_environment():
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="optional"),
+                workspace=MemoryWorkspace("optional-workspace"),
+            ),
+            default=False,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_without_default_static_environment",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_without_default_static_environment")
+        return events, session
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.environment_name is None
+    assert {event.environment_name for event in events} == {None}
+
+
+def test_cayu_app_run_without_a_default_does_not_invoke_environment_factory():
+    async def run():
+        store = InMemorySessionStore()
+        provisioning = EnvironmentProvisioningRecorder("optional")
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="optional"),
+            provisioning.factory,
+            default=False,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_without_default_factory",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_without_default_factory")
+        checkpoint = await store.load_checkpoint("sess_without_default_factory")
+        return events, session, checkpoint, provisioning
+
+    events, session, checkpoint, provisioning = asyncio.run(run())
+
+    assert_environment_was_not_provisioned(provisioning)
+    assert session is not None
+    assert session.environment_name is None
+    assert {event.environment_name for event in events} == {None}
+    assert not any(
+        event.type
+        in {
+            EventType.ENVIRONMENT_FACTORY_STARTED,
+            EventType.ENVIRONMENT_FACTORY_COMPLETED,
+            EventType.ENVIRONMENT_FACTORY_FAILED,
+            EventType.ENVIRONMENT_BINDING_STARTED,
+            EventType.ENVIRONMENT_BINDING_COMPLETED,
+            EventType.ENVIRONMENT_BINDING_FAILED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        }
+        for event in events
+    )
+    assert checkpoint is None or "environment_factory_reconnect" not in checkpoint
+
+
+def test_cayu_app_explicitly_named_non_default_factory_is_invoked_once():
+    async def run():
+        store = InMemorySessionStore()
+        provisioning = EnvironmentProvisioningRecorder("optional")
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="optional"),
+            provisioning.factory,
+            default=False,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                environment_name="optional",
+                session_id="sess_explicit_non_default_factory",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load("sess_explicit_non_default_factory")
+        return events, session, provisioning
+
+    events, session, provisioning = asyncio.run(run())
+
+    assert len(provisioning.factory.requests) == 1
+    factory_request = provisioning.factory.requests[0]
+    assert factory_request.environment_name == "optional"
+    assert provisioning.workspace_allocator.requests == [factory_request]
+    assert len(provisioning.workspace_allocator.workspaces) == 1
+    assert provisioning.runner_allocator.requests == [factory_request]
+    assert len(provisioning.runner_allocator.runners) == 1
+    assert provisioning.binding_allocator.requests == [factory_request]
+    assert len(provisioning.binding_allocator.bindings) == 1
+    assert len(provisioning.binding_allocator.bindings[0].bind_calls) == 1
+    assert len(provisioning.binding_allocator.bindings[0].finalize_calls) == 1
+    assert session is not None
+    assert session.environment_name == "optional"
+    assert [event.type for event in events[:2]] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_COMPLETED,
+    ]
+    assert events[1].payload["reconnect_metadata"] == {"sandbox_id": "unexpected"}
+    assert {event.environment_name for event in events} == {"optional"}
+
+
 def test_cayu_app_streams_out_of_band_events_from_environment_factory(tmp_path):
     async def run():
         store = InMemorySessionStore()
@@ -3803,7 +4051,7 @@ def test_cayu_app_resume_uses_stored_factory_backed_environment(tmp_path):
         app.register_environment_factory(
             EnvironmentSpec(name="dynamic"),
             factory,
-            default=True,
+            default=False,
         )
         app.register_environment(
             Environment(EnvironmentSpec(name="static"), workspace=static_workspace),
@@ -3852,6 +4100,170 @@ def test_cayu_app_resume_uses_stored_factory_backed_environment(tmp_path):
         dynamic_workspace.id,
         dynamic_workspace.id,
     ]
+
+
+def test_cayu_app_fork_preserves_an_explicit_non_default_environment():
+    async def run():
+        store = InMemorySessionStore()
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="optional")),
+            reconnect_metadata={"sandbox_id": "sbx_source"},
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("source done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("child done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="optional"),
+            factory,
+            default=False,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                environment_name="optional",
+                session_id="sess_non_default_environment_source",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        fork_events = await collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_non_default_environment_source",
+                session_id="sess_non_default_environment_child",
+            ),
+        )
+        child_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_non_default_environment_child",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        child = await store.load("sess_non_default_environment_child")
+        return fork_events, child_events, child, factory
+
+    fork_events, child_events, child, factory = asyncio.run(run())
+
+    assert len(factory.requests) == 2
+    assert factory.requests[1].session_id == "sess_non_default_environment_child"
+    assert factory.requests[1].parent_session_id == "sess_non_default_environment_source"
+    assert factory.requests[1].environment_name == "optional"
+    assert factory.requests[1].reconnect_metadata == {"sandbox_id": "sbx_source"}
+    assert child is not None
+    assert child.environment_name == "optional"
+    assert fork_events[0].environment_name == "optional"
+    assert child_events[0].type == EventType.ENVIRONMENT_FACTORY_STARTED
+    assert {event.environment_name for event in child_events} == {"optional"}
+
+
+def test_cayu_app_resume_and_fork_do_not_invent_a_later_default_environment():
+    async def run():
+        store = InMemorySessionStore()
+        provisioning = EnvironmentProvisioningRecorder("later-default")
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("source done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("source resumed"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("child resumed"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        source_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_without_environment_source",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="later-default"),
+            provisioning.factory,
+            default=True,
+        )
+        resumed_source_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_without_environment_source",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        fork_events = await collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_without_environment_source",
+                session_id="sess_without_environment_child",
+            ),
+        )
+        resumed_child_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_without_environment_child",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        source = await store.load("sess_without_environment_source")
+        child = await store.load("sess_without_environment_child")
+        return (
+            source_events,
+            resumed_source_events,
+            fork_events,
+            resumed_child_events,
+            source,
+            child,
+            provisioning,
+        )
+
+    (
+        source_events,
+        resumed_source_events,
+        fork_events,
+        resumed_child_events,
+        source,
+        child,
+        provisioning,
+    ) = asyncio.run(run())
+
+    assert_environment_was_not_provisioned(provisioning)
+    assert source is not None
+    assert source.environment_name is None
+    assert child is not None
+    assert child.environment_name is None
+    assert {
+        event.environment_name
+        for event in [
+            *source_events,
+            *resumed_source_events,
+            *fork_events,
+            *resumed_child_events,
+        ]
+    } == {None}
 
 
 def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(tmp_path):
@@ -4376,7 +4788,7 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
                 workspace=configured_workspace,
                 binding=binding,
             ),
-            default=True,
+            default=False,
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -4388,6 +4800,7 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
             app,
             RunRequest(
                 agent_name="assistant",
+                environment_name="local",
                 session_id="sess_binding_approval",
                 messages=[Message.text("user", "run tool")],
             ),
@@ -4654,7 +5067,7 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
         app.register_environment_factory(
             EnvironmentSpec(name="dynamic"),
             factory,
-            default=True,
+            default=False,
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -4666,6 +5079,7 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
             app,
             RunRequest(
                 agent_name="assistant",
+                environment_name="dynamic",
                 session_id="sess_factory_recovery",
                 messages=[Message.text("user", "use the tool")],
             ),
@@ -16232,6 +16646,7 @@ def test_cayu_app_recover_tool_round_taints_follow_up_rounds():
 
 def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_session():
     store = InMemorySessionStore()
+    later_default_provisioning = EnvironmentProvisioningRecorder("later-default")
     app = CayuApp(session_store=store)
     app.register_provider(FakeProvider([]), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -16246,6 +16661,11 @@ def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_sessio
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         await store.update_status("sess_abandoned_running", SessionStatus.RUNNING)
+        app.register_environment_factory(
+            EnvironmentSpec(name="later-default"),
+            later_default_provisioning.factory,
+            default=True,
+        )
         return await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="sess_abandoned_running",
@@ -16260,10 +16680,13 @@ def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_sessio
 
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+    assert session.environment_name is None
+    assert_environment_was_not_provisioned(later_default_provisioning)
     assert result.previous_status == SessionStatus.RUNNING
     assert result.status == SessionStatus.INTERRUPTED
     assert result.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
+    assert result.events[0].environment_name is None
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert interruption_payload_without_request_id(events[-1].payload) == {
         "reason": "worker restart",
@@ -17355,6 +17778,7 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
 def test_cayu_app_resolves_approved_tool_call_and_continues_session():
     store = InMemorySessionStore()
     tool = SideEffectTool()
+    later_default_provisioning = EnvironmentProvisioningRecorder("later-default")
     provider = FakeProvider(
         [
             [
@@ -17390,6 +17814,11 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
         )
     )
     approval_id = interrupt_events[4].payload["approval"]["approval_id"]
+    app.register_environment_factory(
+        EnvironmentSpec(name="later-default"),
+        later_default_provisioning.factory,
+        default=True,
+    )
 
     events = asyncio.run(
         collect_tool_approval_events(
@@ -17417,6 +17846,8 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
         EventType.SESSION_COMPLETED,
     ]
     assert tool.calls == [{"value": "secret"}]
+    assert_environment_was_not_provisioned(later_default_provisioning)
+    assert {event.environment_name for event in [*interrupt_events, *events]} == {None}
     assert provider.requests[1].messages[-2].role == "assistant"
     assert provider.requests[1].messages[-1].role == "tool"
     assert provider.requests[1].messages[-1].content[0].content == "recorded"
@@ -17424,6 +17855,7 @@ def test_cayu_app_resolves_approved_tool_call_and_continues_session():
     session = asyncio.run(store.load("sess_tool_approval_allow"))
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
+    assert session.environment_name is None
     assert asyncio.run(store.load_checkpoint("sess_tool_approval_allow")) == {}
 
 

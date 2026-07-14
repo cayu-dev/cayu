@@ -13,6 +13,7 @@ from cayu.core import (
     ToolResultPart,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -139,17 +140,28 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
         [("call_1", "ask_user", {"question": "Which env?"})],
         final_text="Deploying to prod.",
     )
+    app.register_environment(
+        Environment(EnvironmentSpec(name="optional")),
+        default=False,
+    )
     pause_events = asyncio.run(
         _collect(
             app,
             RunRequest(
-                agent_name="assistant", session_id="s_resume", messages=[Message.text("user", "go")]
+                agent_name="assistant",
+                environment_name="optional",
+                session_id="s_resume",
+                messages=[Message.text("user", "go")],
             ),
         )
     )
     input_id = next(
         e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
+    app.register_environment(
+        Environment(EnvironmentSpec(name="later-default")),
+        default=True,
+    )
 
     resume_events = asyncio.run(
         _drain(
@@ -160,6 +172,10 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     )
 
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    assert {event.environment_name for event in [*pause_events, *resume_events]} == {"optional"}
+    session = asyncio.run(store.load("s_resume"))
+    assert session is not None
+    assert session.environment_name == "optional"
     started = next(
         event
         for event in resume_events
@@ -247,6 +263,10 @@ def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
     input_id = next(
         e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
+    app.register_environment(
+        Environment(EnvironmentSpec(name="later-default")),
+        default=True,
+    )
 
     resume_events = asyncio.run(
         _drain(
@@ -263,6 +283,11 @@ def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
             )
         )
     )
+
+    assert {event.environment_name for event in [*pause_events, *resume_events]} == {None}
+    session = asyncio.run(store.load("s_actor"))
+    assert session is not None
+    assert session.environment_name is None
 
     # `claims` stay on the request and are excluded from event payloads.
     expected_actor = {

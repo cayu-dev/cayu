@@ -196,6 +196,12 @@ Use an environment only when tools need these execution capabilities. Bind and
 finalize workspaces explicitly. When recovery or reconnect matters, verify the
 same identity and naming contract used by the original run.
 
+Environment selection is opt-in. Pass `default=True` to
+`register_environment(...)` or `register_environment_factory(...)` only when
+unnamed `RunRequest`s should use that environment. Otherwise leave it
+non-default and set `RunRequest.environment_name` explicitly. Registering the
+first environment never makes it the default implicitly.
+
 ## 8. Prove behavior through public seams
 
 The default credential-free proof is:

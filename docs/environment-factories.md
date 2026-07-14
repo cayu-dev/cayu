@@ -84,6 +84,12 @@ Register it as the default (or under a name) instead of a static `register_envir
 app.register_environment_factory(EnvironmentSpec(name="local"), LocalNativeFactory(base), default=True)
 ```
 
+`default=True` is an explicit application-wide choice: a `RunRequest` without
+`environment_name` selects this factory. Omit it (or pass `default=False`) when
+the factory should be available only by name, then set
+`RunRequest.environment_name="local"` for runs that should provision it. The
+first registered environment is not made the default automatically.
+
 Notes:
 
 - `EnvironmentFactoryRequest` carries the durable session context: `session_id`,

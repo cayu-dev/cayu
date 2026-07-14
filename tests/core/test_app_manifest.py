@@ -158,6 +158,71 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     assert len(manifest.fingerprint) == 64
 
 
+def test_describe_reports_no_default_for_a_non_default_static_environment() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_environment(Environment(EnvironmentSpec(name="optional")), default=False)
+
+    manifest = app.describe()
+
+    assert manifest.defaults.environment is None
+    assert [(item.name, item.is_default) for item in manifest.environments] == [("optional", False)]
+
+
+def test_describe_reports_no_default_for_a_non_default_environment_factory() -> None:
+    app = CayuApp(enable_logging=False)
+    factory = _UncalledEnvironmentFactory()
+    app.register_environment_factory(
+        EnvironmentSpec(name="optional"),
+        factory,
+        default=False,
+    )
+
+    manifest = app.describe()
+
+    assert manifest.defaults.environment is None
+    assert [(item.name, item.is_default) for item in manifest.environments] == [("optional", False)]
+    assert factory.called is False
+
+
+def test_explicit_default_replaces_the_previous_default_and_non_default_does_not() -> None:
+    app = CayuApp(enable_logging=False)
+    optional_factory = _UncalledEnvironmentFactory()
+    replacement_factory = _UncalledEnvironmentFactory()
+    app.register_environment(
+        Environment(EnvironmentSpec(name="primary")),
+        default=True,
+    )
+    app.register_environment_factory(
+        EnvironmentSpec(name="optional"),
+        optional_factory,
+        default=False,
+    )
+
+    before_replacement = app.describe()
+
+    assert before_replacement.defaults.environment == "primary"
+    assert {item.name: item.is_default for item in before_replacement.environments} == {
+        "optional": False,
+        "primary": True,
+    }
+
+    app.register_environment_factory(
+        EnvironmentSpec(name="replacement"),
+        replacement_factory,
+        default=True,
+    )
+    after_replacement = app.describe()
+
+    assert after_replacement.defaults.environment == "replacement"
+    assert {item.name: item.is_default for item in after_replacement.environments} == {
+        "optional": False,
+        "primary": False,
+        "replacement": True,
+    }
+    assert optional_factory.called is False
+    assert replacement_factory.called is False
+
+
 def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Path) -> None:
     app = CayuApp(
         enable_logging=False,

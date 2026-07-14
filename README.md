@@ -118,6 +118,10 @@ app.register_agent(
 )
 ```
 
+`default=True` makes the environment available to runs that omit
+`RunRequest.environment_name`. Without it, the environment remains available
+only by name; even the first registration is never selected implicitly.
+
 ### Fresh Environments Per Session
 
 Static environments work for local development and trusted single-process apps.
