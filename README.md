@@ -150,6 +150,37 @@ reattach instead of guessing.
 
 ## Quickstart
 
+### Coding-agent path
+
+Start from the generated project when a coding agent is building with Cayu:
+
+```bash
+pip install 'cayu[console]' pytest
+cayu new myagent
+cd myagent
+cayu guide authoring
+cayu inspect --json
+cayu check --json
+pytest
+cayu eval run evals.assistant:build_eval
+```
+
+`cayu new` emits a concise vendor-neutral `AGENTS.md`, a process-scoped
+application factory, a safe explicit-effect tool, and credential-free runtime
+test/eval. The package-shipped [coding-agent authoring guide](src/cayu/guides/authoring.md)
+starts from desired behavior and explains when to omit unneeded workflow, task,
+environment, approval, memory, server, or multi-agent machinery. Use
+`cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json` to plan
+one reviewable vertical slice without importing or changing the project. Apply
+revalidates the plan's preimages and symlink-free project containment, stages
+every output, and rolls back the whole slice if any filesystem commit fails.
+
+The default proof distinguishes structural inspection, hermetic runtime tests,
+process-boundary checks, and optional live checks. It never treats successful
+construction or scripted providers as live provider/environment verification.
+
+### Hand-wired minimal runtime
+
 The minimal ceremony is four calls — create an app, register a provider, register
 an agent, and run it. An `Environment` is optional; you only need one when your
 agent uses tools that touch a workspace, runner, or sandbox.
@@ -158,8 +189,10 @@ agent uses tools that touch a workspace, runner, or sandbox.
 pip install cayu
 ```
 
-Scaffold a ready-to-edit project with `cayu new myagent` (an agent, a custom tool,
-and SQLite stores), or wire one up by hand:
+Scaffold a ready-to-edit project with `cayu new myagent`, or use the following
+module-global snippet only to understand the four primitive calls. Real projects
+should use the generated synchronous `build_app()` factory so imports stay inert
+and each process owns a fresh application graph:
 
 ```bash
 pip install 'cayu[console]'

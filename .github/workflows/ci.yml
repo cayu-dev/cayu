@@ -95,6 +95,21 @@ jobs:
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
       - run: .release-venv/bin/python -c "import cayu; assert cayu.__name__ == 'cayu'"
+      - name: Check built-wheel authoring contract
+        run: |
+          uv pip install --python .release-venv/bin/python pytest
+          project_root="$(mktemp -d)"
+          .release-venv/bin/cayu new proof --dir "$project_root"
+          cd "$project_root/proof"
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide authoring >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.assistant:build_eval >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.reviewer:build_eval >/dev/null
       - run: .release-venv/bin/cayu console --help
       - name: Check optional console dependency guidance
         run: |

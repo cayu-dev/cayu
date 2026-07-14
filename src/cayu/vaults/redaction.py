@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import collision_safe_json_object, copy_json_value, require_nonblank
 from cayu.vaults.base import ResolvedSecret
 
 REDACTED_SECRET = "[REDACTED_SECRET]"
@@ -58,7 +58,14 @@ class SecretRedactor:
         if type(value) is list:
             return [self._redact_copied_json(item) for item in value]
         if type(value) is dict:
-            return {key: self._redact_copied_json(item) for key, item in value.items()}
+            items: list[tuple[str, Any]] = []
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise AssertionError("copy_json_value returned a non-string object key.")
+                redacted_key = self.redact_text(key)
+                redacted_item = self._redact_copied_json(item)
+                items.append((redacted_key, redacted_item))
+            return collision_safe_json_object(items, preserve_input_order=True)
         raise AssertionError("copy_json_value returned non-JSON-compatible data.")
 
     @classmethod

@@ -30,6 +30,8 @@ _WHEEL_REQUIRED = {
     "cayu/cli/_targets.py",
     "cayu/cli/__init__.py",
     "cayu/cli/console.py",
+    "cayu/guides/authoring.md",
+    "cayu/guides/diagnostics.md",
     "cayu/server/dashboard/index.html",
 }
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}

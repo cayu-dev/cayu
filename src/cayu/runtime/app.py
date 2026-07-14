@@ -14,6 +14,7 @@ from decimal import Decimal
 from fnmatch import fnmatchcase
 from importlib.metadata import PackageNotFoundError, version
 from math import isfinite
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 from uuid import uuid4
@@ -211,6 +212,7 @@ from cayu.runtime.loop_policies import (
     copy_before_stop_decision,
     validate_loop_policies,
 )
+from cayu.runtime.manifest import AppManifest, describe_app
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
     McpManifestPolicyAction,
@@ -1470,10 +1472,11 @@ class CayuApp:
         self._loop_policies = tuple(policies)
         self._mcp_manifest_policy = manifest_policy
         self._context_counting = context_counting_config
+        self._event_sinks = tuple(sinks)
         self._event_writer = RuntimeEventWriter(
             session_store=self.session_store,
             budget_store=self.budget_store,
-            event_sinks=sinks,
+            event_sinks=self._event_sinks,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
@@ -1508,6 +1511,15 @@ class CayuApp:
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
+
+    def describe(self, *, project_root: str | Path | None = None) -> AppManifest:
+        """Return this application's deterministic public manifest.
+
+        Description is structural only: it never invokes providers, tools,
+        environment factories, stores, workers, watchers, or recovery paths.
+        """
+
+        return describe_app(self, project_root=project_root)
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         """Wait for accepted background interruption cascades to finish.
@@ -1760,6 +1772,7 @@ class CayuApp:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
 
+        registration_source, registration_symbol = _registration_site()
         self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
@@ -1768,6 +1781,8 @@ class CayuApp:
             tool_policy=stored_tool_policy,
             runtime_hooks=stored_runtime_hooks,
             loop_policies=stored_loop_policies,
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
         )
         return spec
 
@@ -1787,10 +1802,13 @@ class CayuApp:
         if provider.name in self._providers:
             raise ValueError(f"Provider already registered: {provider.name}")
 
+        registration_source, registration_symbol = _registration_site()
         self._providers[provider.name] = runtime_records.RegisteredProvider(
             name=provider.name,
             provider=provider,
             model_patterns=stored_model_patterns,
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
         )
         if default or self._default_provider_name is None:
             self._default_provider_name = provider.name
@@ -1811,9 +1829,12 @@ class CayuApp:
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
 
+        registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=stored_environment,
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
         )
         if default or self._default_environment_name is None:
             self._default_environment_name = stored_spec.name
@@ -1836,10 +1857,13 @@ class CayuApp:
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
 
+        registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
             environment=Environment(stored_spec),
             factory=factory,
+            registration_source=registration_source,
+            registration_symbol=registration_symbol,
         )
         if default or self._default_environment_name is None:
             self._default_environment_name = stored_spec.name
@@ -1888,6 +1912,8 @@ class CayuApp:
                     )
                     if registered_environment.binding_payload is not None
                     else None,
+                    registration_source=registered_environment.registration_source,
+                    registration_symbol=registered_environment.registration_symbol,
                 )
             )
         return tuple(registrations)
@@ -11020,6 +11046,23 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         effect=tool.effect,
         tool=tool.tool,
     )
+
+
+def _registration_site() -> tuple[str | None, str | None]:
+    """Capture the public call site without retaining a frame or live object."""
+
+    frame = inspect.currentframe()
+    caller = frame.f_back.f_back if frame is not None and frame.f_back is not None else None
+    try:
+        if caller is None:
+            return None, None
+        module = caller.f_globals.get("__name__")
+        symbol = caller.f_code.co_qualname
+        qualified = f"{module}:{symbol}" if isinstance(module, str) else symbol
+        return caller.f_code.co_filename, qualified
+    finally:
+        del frame
+        del caller
 
 
 def _validate_positive_int(value: int, field_name: str) -> int:

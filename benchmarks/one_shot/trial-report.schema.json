@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vertexkg/cayu/benchmarks/one-shot/trial-report.schema.json",
+  "title": "Cayu one-shot benchmark report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run", "trials"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cayu_version",
+        "wheel_sha256",
+        "source_commit",
+        "operating_system",
+        "python_version",
+        "agent",
+        "model",
+        "reasoning",
+        "agent_configuration",
+        "permissions",
+        "allowed_tools",
+        "network_policy",
+        "limits"
+      ],
+      "properties": {
+        "cayu_version": {"type": "string", "minLength": 1},
+        "wheel_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_commit": {"type": "string", "minLength": 1},
+        "operating_system": {"type": "string", "minLength": 1},
+        "python_version": {"type": "string", "minLength": 1},
+        "agent": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "reasoning": {"type": "string", "minLength": 1},
+        "agent_configuration": {"type": "object", "minProperties": 1},
+        "permissions": {"type": "object", "minProperties": 1},
+        "allowed_tools": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "network_policy": {"type": "string", "minLength": 1},
+        "limits": {"$ref": "#/$defs/run_limits"}
+      }
+    },
+    "trials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "archetype",
+          "submission_path",
+          "submission_artifact",
+          "first_submission_acceptance_passed",
+          "framework_specific_hints",
+          "public_interfaces_only",
+          "private_interface_violations",
+          "security_violations",
+          "clarification_count",
+          "clarifications",
+          "case_acceptance",
+          "evidence"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "archetype": {"enum": ["rfp", "research_document", "coding_repository"]},
+          "submission_path": {"type": "string", "minLength": 1},
+          "submission_artifact": {"type": "string", "minLength": 1},
+          "first_submission_acceptance_passed": {"type": "boolean"},
+          "framework_specific_hints": {"type": "integer", "minimum": 0},
+          "public_interfaces_only": {"type": "boolean"},
+          "private_interface_violations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "security_violations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "failures": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"$ref": "#/$defs/failure"}
+          },
+          "clarification_count": {"type": "integer", "minimum": 0},
+          "clarifications": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["question", "answer"],
+              "properties": {
+                "question": {"type": "string", "minLength": 1},
+                "answer": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          "case_acceptance": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "passed", "evidence_path"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "passed": {"type": "boolean"},
+                "evidence_path": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["inspect", "check", "tests", "eval", "process_boundary", "live"],
+            "properties": {
+              "inspect": {"$ref": "#/$defs/evidence"},
+              "check": {"$ref": "#/$defs/evidence"},
+              "tests": {"$ref": "#/$defs/evidence"},
+              "eval": {"$ref": "#/$defs/evidence"},
+              "process_boundary": {"$ref": "#/$defs/evidence"},
+              "live": {"$ref": "#/$defs/evidence"}
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {"first_submission_acceptance_passed": {"const": false}},
+              "required": ["first_submission_acceptance_passed"]
+            },
+            "then": {"required": ["failures"]}
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "no_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {"mode": {"const": "no_limit"}}
+    },
+    "run_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["elapsed_time", "cost"],
+      "properties": {
+        "elapsed_time": {"$ref": "#/$defs/elapsed_time_limit"},
+        "cost": {"$ref": "#/$defs/cost_limit"}
+      }
+    },
+    "elapsed_time_limit": {
+      "oneOf": [
+        {"$ref": "#/$defs/no_limit"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "seconds"],
+          "properties": {
+            "mode": {"const": "limited"},
+            "seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      ]
+    },
+    "cost_limit": {
+      "oneOf": [
+        {"$ref": "#/$defs/no_limit"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "amount", "currency"],
+          "properties": {
+            "mode": {"const": "limited"},
+            "amount": {"type": "number", "minimum": 0},
+            "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}
+          }
+        }
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "disposition", "reference"],
+      "properties": {
+        "classification": {
+          "enum": [
+            "missing_discoverability",
+            "insufficient_module_depth_or_caller_lifecycle",
+            "invalid_assembly_accepted",
+            "cryptic_or_unstructured_diagnostic",
+            "unrealistic_test_boundary",
+            "missing_capability"
+          ]
+        },
+        "disposition": {
+          "enum": [
+            "regression_fixture",
+            "authoring_or_diagnostic_improvement",
+            "linked_capability_issue"
+          ]
+        },
+        "reference": {"$ref": "#/$defs/failure_reference"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"disposition": {"const": "regression_fixture"}}},
+          "then": {"properties": {"reference": {"properties": {"kind": {"const": "repository_path"}}}}}
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "authoring_or_diagnostic_improvement"}}},
+          "then": {"properties": {"reference": {"properties": {"kind": {"enum": ["repository_path", "pull_request_url"]}}}}}
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "linked_capability_issue"}}},
+          "then": {"properties": {"reference": {"properties": {"kind": {"const": "issue_url"}}}}}
+        }
+      ]
+    },
+    "failure_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"enum": ["repository_path", "issue_url", "pull_request_url"]},
+        "value": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "repository_path"}}},
+          "then": {"properties": {"value": {"pattern": "^(?!/)(?!\\.\\.(?:/|$))(?!.*\\/\\.\\.(?:/|$))(?!.*//)[A-Za-z0-9._/-]+$"}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "issue_url"}}},
+          "then": {"properties": {"value": {"pattern": "^https://github\\.com/vertexkg/cayu/issues/[1-9][0-9]*$"}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "pull_request_url"}}},
+          "then": {"properties": {"value": {"pattern": "^https://github\\.com/vertexkg/cayu/pull/[1-9][0-9]*$"}}}
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "command", "exit_code", "output_path", "note"],
+      "properties": {
+        "status": {"enum": ["passed", "failed", "not_run"]},
+        "command": {"type": ["string", "null"], "minLength": 1},
+        "exit_code": {"type": ["integer", "null"]},
+        "output_path": {"type": ["string", "null"], "minLength": 1},
+        "note": {"type": ["string", "null"], "minLength": 1}
+      }
+    }
+  }
+}

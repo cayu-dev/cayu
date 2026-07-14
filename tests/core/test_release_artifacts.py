@@ -45,6 +45,8 @@ def test_validate_wheel_rejects_unexpected_top_level_paths(tmp_path) -> None:
         "cayu/cli/_targets.py": "",
         "cayu/cli/__init__.py": "",
         "cayu/cli/console.py": "",
+        "cayu/guides/authoring.md": "",
+        "cayu/guides/diagnostics.md": "",
         "cayu/server/dashboard/index.html": "",
         "cayu/server/dashboard/assets/app.js": "",
         "cayu/server/dashboard/assets/app.css": "",

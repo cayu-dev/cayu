@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from math import isfinite
 from types import MappingProxyType
@@ -316,6 +317,40 @@ def copy_json_object(value: Any, field_name: str) -> dict[str, Any]:
 
 def validate_json_value(value: Any, field_name: str) -> None:
     _copy_json_value(value, field_name, set())
+
+
+def collision_safe_json_object(
+    items: Iterable[tuple[str, Any]],
+    *,
+    preserve_input_order: bool,
+) -> dict[str, Any]:
+    """Build a deterministic JSON object without dropping transformed key collisions."""
+
+    indexed_items = [
+        (
+            index,
+            key,
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            value,
+        )
+        for index, (key, value) in enumerate(items)
+    ]
+    assigned: list[tuple[int, str, Any]] = []
+    counts: dict[str, int] = {}
+    used_keys: set[str] = set()
+    for index, key, _, value in sorted(indexed_items, key=lambda item: (item[1], item[2])):
+        count = counts.get(key, 0) + 1
+        candidate = key if count == 1 else f"{key}_{count}"
+        while candidate in used_keys:
+            count += 1
+            candidate = f"{key}_{count}"
+        counts[key] = count
+        used_keys.add(candidate)
+        assigned.append((index, candidate, value))
+
+    if preserve_input_order:
+        assigned.sort(key=lambda item: item[0])
+    return {key: value for _, key, value in assigned}
 
 
 def _copy_json_value(value: Any, field_name: str, seen: set[int]) -> Any:

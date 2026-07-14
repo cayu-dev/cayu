@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from enum import StrEnum
+from types import MappingProxyType
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from cayu.runtime.manifest import AppManifest, FrozenJsonObject
+
+CHECK_REPORT_SCHEMA_VERSION = "1"
+AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "providers", "security"})
+BUILTIN_DIAGNOSTIC_CODES = (
+    "AGENT_PROVIDER_AMBIGUOUS",
+    "AGENT_PROVIDER_NOT_FOUND",
+    "APP_NO_AGENTS",
+    "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
+    "EXTERNAL_TOOL_UNGUARDED",
+)
+
+
+class DiagnosticSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class ProjectDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str
+    severity: DiagnosticSeverity
+    subject: str
+    path: str
+    message: str
+    hint: str | None = None
+    tags: tuple[str, ...] = ()
+    parameters: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
+    documentation_anchor: str | None = None
+    verification_command: str
+
+
+class ProjectCheckReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str = CHECK_REPORT_SCHEMA_VERSION
+    manifest_fingerprint: str
+    diagnostics: tuple[ProjectDiagnostic, ...]
+
+
+def check_manifest(
+    manifest: AppManifest,
+    *,
+    tags: frozenset[str] | None = None,
+    deploy_only: bool = False,
+) -> ProjectCheckReport:
+    """Run deterministic, side-effect-free checks over an application manifest."""
+
+    if not isinstance(manifest, AppManifest):
+        raise TypeError("check_manifest requires an AppManifest.")
+    requested_tags = frozenset() if tags is None else frozenset(tags)
+    unknown = requested_tags - AVAILABLE_CHECK_TAGS
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown check tags: {names}.")
+
+    diagnostics: list[ProjectDiagnostic] = []
+    if not manifest.agents:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="APP_NO_AGENTS",
+                severity=DiagnosticSeverity.ERROR,
+                subject="application",
+                path="agents",
+                message="The application does not register an agent.",
+                hint="Register at least one AgentSpec with CayuApp.register_agent().",
+                tags=("authoring", "configuration"),
+                documentation_anchor="cayu guide diagnostics#app-no-agents",
+                verification_command="cayu check --json",
+            )
+        )
+
+    for agent in manifest.agents:
+        if agent.provider_resolution == "missing":
+            provider_name = agent.configured_provider or "<default>"
+            hint = (
+                f"Register provider '{provider_name}' or change {agent.name}.provider_name."
+                if agent.configured_provider is not None
+                else "Register a default provider or configure this agent's provider_name."
+            )
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_PROVIDER_NOT_FOUND",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=f"agents.{agent.name}.configured_provider",
+                    message=(
+                        f"Agent '{agent.name}' cannot resolve model provider '{provider_name}'."
+                    ),
+                    hint=hint,
+                    tags=("configuration", "providers"),
+                    parameters={"agent": agent.name, "provider": provider_name},
+                    documentation_anchor="cayu guide diagnostics#agent-provider-not-found",
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+        elif agent.provider_resolution == "ambiguous":
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_PROVIDER_AMBIGUOUS",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=f"agents.{agent.name}.model",
+                    message=(
+                        f"Agent '{agent.name}' model '{agent.model}' matches multiple providers: "
+                        f"{', '.join(agent.provider_candidates)}."
+                    ),
+                    hint=f"Set {agent.name}.provider_name explicitly or make model patterns disjoint.",
+                    tags=("configuration", "providers"),
+                    parameters={
+                        "agent": agent.name,
+                        "model": agent.model,
+                        "providers": list(agent.provider_candidates),
+                    },
+                    documentation_anchor="cayu guide diagnostics#agent-provider-ambiguous",
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+
+        for tool in agent.tools:
+            if tool.effect != "external" or tool.policy_coverage in {
+                "conditional",
+                "denied",
+                "approval_required",
+            }:
+                continue
+            coverage_unknown = tool.policy_coverage == "unknown"
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code=(
+                        "EXTERNAL_TOOL_COVERAGE_UNKNOWN"
+                        if coverage_unknown
+                        else "EXTERNAL_TOOL_UNGUARDED"
+                    ),
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"tool:{agent.name}/{tool.name}",
+                    path=f"agents.{agent.name}.tools.{tool.name}.policy_coverage",
+                    message=(
+                        f"External-effect tool '{tool.name}' uses {agent.tool_policy}, whose "
+                        "effective coverage cannot be verified statically."
+                        if coverage_unknown
+                        else f"External-effect tool '{tool.name}' has effective policy coverage "
+                        f"'{tool.policy_coverage}' under {agent.tool_policy}."
+                    ),
+                    hint=(
+                        "Register a statically describable policy with enforcing coverage for "
+                        "this tool; custom policy behavior remains fail-closed."
+                        if coverage_unknown
+                        else "Register an enforcing ToolPolicy, such as "
+                        "AlwaysRequireApprovalToolPolicy scoped to this tool."
+                    ),
+                    tags=("deploy", "security"),
+                    parameters={
+                        "agent": agent.name,
+                        "tool": tool.name,
+                        "policy": agent.tool_policy,
+                        "coverage": tool.policy_coverage,
+                    },
+                    documentation_anchor=(
+                        "cayu guide diagnostics#external-tool-coverage-unknown"
+                        if coverage_unknown
+                        else "cayu guide diagnostics#external-tool-unguarded"
+                    ),
+                    verification_command="cayu inspect --json && cayu check --deploy --json",
+                )
+            )
+
+    selected = [
+        diagnostic
+        for diagnostic in diagnostics
+        if (not requested_tags or requested_tags.intersection(diagnostic.tags))
+        and (not deploy_only or "deploy" in diagnostic.tags)
+    ]
+    unregistered_codes = {item.code for item in diagnostics} - set(BUILTIN_DIAGNOSTIC_CODES)
+    if unregistered_codes:
+        names = ", ".join(sorted(unregistered_codes))
+        raise RuntimeError(f"Built-in checks emitted unregistered diagnostic codes: {names}.")
+    selected.sort(key=lambda item: (item.code, item.path, item.subject))
+    return ProjectCheckReport(
+        manifest_fingerprint=manifest.fingerprint,
+        diagnostics=tuple(selected),
+    )
+
+
+def severity_at_least(value: DiagnosticSeverity, threshold: DiagnosticSeverity) -> bool:
+    rank = {
+        DiagnosticSeverity.INFO: 0,
+        DiagnosticSeverity.WARNING: 1,
+        DiagnosticSeverity.ERROR: 2,
+    }
+    return rank[value] >= rank[threshold]

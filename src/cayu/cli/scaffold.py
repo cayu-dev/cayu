@@ -1,8 +1,4 @@
-"""``cayu new`` — scaffold a runnable Cayu agent project.
-
-Files-only: writes a small project (an agent, a custom tool, SQLite stores) that a
-developer edits. No control-plane or deployment logic.
-"""
+"""``cayu new`` — scaffold a safe, verifiable Cayu agent project."""
 
 from __future__ import annotations
 
@@ -13,44 +9,91 @@ from pathlib import Path
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
-_APP_PY = '''"""__PROJECT_NAME__: a Cayu agent.
+GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
+GENERATED_IMPORTS_END = "# </cayu:generated-imports>"
+GENERATED_REGISTRATIONS_START = "# <cayu:generated-registrations>"
+GENERATED_REGISTRATIONS_END = "# </cayu:generated-registrations>"
 
-Run it:
-    export OPENAI_API_KEY=sk-...
-    python app.py
+_APP_PY = '''"""Application factory for __PROJECT_NAME__.
 
-Inspect it:
-    cayu console
+Every process calls ``build_app()`` and owns the returned CayuApp. Durable
+stores, not this Python object, coordinate state between processes.
 """
 
-import asyncio
-from pathlib import Path
+import os
 
 from cayu import (
-    AgentSpec,
     CayuApp,
-    Environment,
-    EnvironmentSpec,
-    ExecCommandTool,
-    # GitRepositoryBinding,  # uncomment with the checkout binding below
-    LocalRunner,
-    LocalWorkspace,
-    Message,
+    ModelProvider,
     OpenAIProvider,
-    RunRequest,
+    ScriptedModelProvider,
+    SessionStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
-    Tool,
-    ToolContext,
-    ToolEffect,
-    ToolResult,
-    ToolSpec,
-    run_to_completion,
+    TaskStore,
 )
+
+from agents.assistant import ASSISTANT_AGENT
+from tools.greet import GreetTool
+
+# Generated external-effect slices import AlwaysRequireApprovalToolPolicy and
+# register an enforcing policy. The safe starter tool below has no side effect.
+# <cayu:generated-imports>
+# </cayu:generated-imports>
+
+
+def configured_provider() -> ModelProvider:
+    """Resolve the live provider only when its credential is available.
+
+    The no-key placeholder is intentionally non-runnable; it lets public
+    inspection and checking describe the project without claiming a live check.
+    Tests and evals inject their own ScriptedModelProvider explicitly.
+    """
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return OpenAIProvider(api_key=api_key)
+    return ScriptedModelProvider([], name="openai-unconfigured")
+
+
+def build_app(
+    *,
+    provider: ModelProvider | None = None,
+    session_store: SessionStore | None = None,
+    task_store: TaskStore | None = None,
+) -> CayuApp:
+    """Construct a fresh process-scoped application graph.
+
+    Optional arguments are public test seams. Normal processes call build_app()
+    with no arguments and receive the configured durable local stores.
+    """
+
+    app = CayuApp(
+        session_store=session_store or SQLiteSessionStore("data/sessions.sqlite"),
+        task_store=task_store or SQLiteTaskStore("data/tasks.sqlite"),
+    )
+    app.register_provider(provider or configured_provider(), default=True)
+    app.register_agent(ASSISTANT_AGENT, tools=[GreetTool()])
+    # <cayu:generated-registrations>
+    # </cayu:generated-registrations>
+    return app
+'''
+
+_AGENT_PY = """from cayu import AgentSpec
+
+
+ASSISTANT_AGENT = AgentSpec(
+    name="assistant",
+    model="gpt-5.4-mini",
+    system_prompt="Use the available tools when they directly help the user.",
+)
+"""
+
+_TOOL_PY = '''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 
 class GreetTool(Tool):
-    """An example custom tool. Replace it with your own."""
+    """Return a greeting without changing external state."""
 
     spec = ToolSpec(
         name="greet",
@@ -66,49 +109,116 @@ class GreetTool(Tool):
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult(content=f"Hello, {args['name']}!")
-
-
-def build_app() -> CayuApp:
-    Path("data/workspace").mkdir(parents=True, exist_ok=True)
-    app = CayuApp(
-        session_store=SQLiteSessionStore("data/sessions.sqlite"),
-        task_store=SQLiteTaskStore("data/tasks.sqlite"),
-    )
-    app.register_provider(OpenAIProvider(), default=True)  # reads OPENAI_API_KEY
-    app.register_environment(
-        Environment(
-            EnvironmentSpec(name="local"),
-            workspace=LocalWorkspace("data/workspace", workspace_id="ws"),
-            runner=LocalRunner("data/workspace"),
-            # To review a repo, swap in a checkout:
-            # binding=GitRepositoryBinding(repo_url="https://github.com/OWNER/REPO.git", ref="main"),
-        ),
-        default=True,
-    )
-    app.register_agent(
-        AgentSpec(name="assistant", model="gpt-5.4-mini"),
-        tools=[GreetTool(), ExecCommandTool()],
-    )
-    return app
-
-
-async def main() -> None:
-    app = build_app()
-    outcome = await run_to_completion(
-        app,
-        RunRequest(
-            agent_name="assistant",
-            session_id="demo",
-            environment_name="local",
-            messages=[Message.text("user", "Greet Ada, then say what you did.")],
-        ),
-    )
-    print(outcome.final_text if outcome.ok else f"run failed: {outcome.error}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 '''
+
+_TEST_PY = """from __future__ import annotations
+
+import asyncio
+
+from cayu import (
+    InMemorySessionStore,
+    InMemoryTaskStore,
+    Message,
+    ModelStreamEvent,
+    RunRequest,
+    ScriptedModelProvider,
+    run_to_completion,
+)
+
+from app import build_app
+
+
+def test_assistant_uses_greet_tool_through_the_runtime() -> None:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(name="greet", arguments={"name": "Ada"}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Greeted Ada."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+
+    outcome = asyncio.run(
+        run_to_completion(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "Greet Ada")],
+                max_steps=2,
+            ),
+        )
+    )
+
+    assert outcome.ok
+    assert outcome.final_text == "Greeted Ada."
+    assert len(provider.requests) == 2
+"""
+
+_EVAL_PY = """from cayu import (
+    EvalCase,
+    EvalPlan,
+    EvalSuite,
+    FinalOutputContains,
+    InMemorySessionStore,
+    InMemoryTaskStore,
+    Message,
+    ModelStreamEvent,
+    RunRequest,
+    ScriptedModelProvider,
+    SessionCompleted,
+    ToolCalled,
+)
+
+from app import build_app
+
+
+def build_eval() -> EvalPlan:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(name="greet", arguments={"name": "Ada"}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Greeted Ada."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+    suite = EvalSuite(
+        id="assistant-trajectory",
+        cases=[
+            EvalCase(
+                id="greets-by-name",
+                request=RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Greet Ada")],
+                    max_steps=2,
+                ),
+                assertions=[
+                    SessionCompleted(),
+                    ToolCalled("greet"),
+                    FinalOutputContains("Ada"),
+                ],
+            )
+        ],
+    )
+    return EvalPlan(app=app, suite=suite)
+"""
 
 _PYPROJECT = """[project]
 name = "__PROJECT_NAME__"
@@ -118,69 +228,122 @@ dependencies = ["cayu"]
 
 [project.optional-dependencies]
 console = ["cayu[console]"]
+dev = ["pytest"]
 
 [tool.cayu]
 factory = "app:build_app"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 """
 
 _README = """# __PROJECT_NAME__
 
-A Cayu agent, scaffolded with `cayu new`.
+A safe, inspectable Cayu agent scaffold.
 
-## Run
+## Setup and prove the project
 
 ```bash
-pip install -e '.[console]' # or: uv sync --extra console
+pip install -e '.[console,dev]' # or: uv sync --extra console --extra dev
+cayu inspect --json
+cayu check --json
+pytest
+cayu eval run evals.assistant:build_eval
+```
+
+These commands require no model API key. They prove project construction,
+static wiring, a deterministic runtime tool trajectory, and its eval. They do
+not claim that a live provider or execution environment was verified.
+
+## Run with a live provider
+
+```bash
 export OPENAI_API_KEY=sk-...
-python app.py
+python run.py
 ```
 
-`app.py` registers one agent with a custom `GreetTool` and the built-in
-`exec_command` tool, backed by SQLite session/task stores under `data/`. Edit
-`build_app()` to add tools, swap the provider, or bind a git checkout.
+## Application structure
 
-## Console
+`build_app()` returns a fresh process-scoped `CayuApp`. Each script, console,
+server, worker, or test calls the factory for itself. Configured durable stores
+coordinate cross-process state; the Python application object is not a global
+registry or singleton. Importing the project does not construct the app or
+start workers, recovery, schedulers, sessions, models, or tools.
 
-Open a live IPython console with the same booted application:
-
-```bash
-cayu console
-```
-
-The console exposes `app`, `sessions`, `tasks`, `knowledge`, and the `cayu`
-package. It is connected to the configured stores, so changes are live.
-The `console` project extra is for development; production installs can omit it.
-
-## Layout
-
-```
-app.py            the agent + runtime wiring
-pyproject.toml    project metadata
-agents/           agent declarations as the project grows
-tools/            custom tools
-workflows/        orchestration code
-prompts/          prompt/instruction files
-memory/           curated project memory
-evals/            eval cases and suites
-config/           local configuration
-tests/            project tests
-data/             SQLite stores + workspace (gitignored)
-```
+The checked-in `AGENTS.md` is the canonical workflow for coding agents. Add a
+reviewable agent/tool/test/eval slice with
+`cayu generate slice NAME --tool TOOL --effect EFFECT`.
 """
 
-_GITIGNORE = "data/\n__pycache__/\n*.pyc\n"
+_RUN_PY = """import asyncio
+import os
 
-_PROJECT_DIRS = (
-    "agents",
-    "tools",
-    "workflows",
-    "prompts",
-    "memory",
-    "evals",
-    "config",
-    "tests",
-    "data",
-)
+from cayu import Message, RunRequest, run_to_completion
+
+from app import build_app
+
+
+async def main() -> None:
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit("Set OPENAI_API_KEY before live execution.")
+    outcome = await run_to_completion(
+        build_app(),
+        RunRequest(
+            agent_name="assistant",
+            messages=[Message.text("user", "Greet Ada, then say what you did.")],
+        ),
+    )
+    print(outcome.final_text if outcome.ok else f"run failed: {outcome.error}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+"""
+
+_AGENTS_MD = """# Coding-agent instructions
+
+Build desired behavior first; introduce only the Cayu subsystems the product
+needs. `app.py` is the application factory and explicit registration surface.
+
+## Project commands
+
+- Setup: `pip install -e '.[console,dev]'` or
+  `uv sync --extra console --extra dev`.
+- Inspect/check: `cayu inspect --json` and `cayu check --json`.
+- Safe generation: `cayu generate slice NAME --tool TOOL --effect EFFECT`.
+- Hermetic proof: `pytest` and `cayu eval run MODULE:build_eval`.
+- Interactive inspection: `cayu console` (constructs the app; starts no services).
+- Live execution: `python run.py` only when `OPENAI_API_KEY` is explicitly available.
+
+## Supported loop
+
+1. Clarify users, jobs, triggers, inputs/outputs, autonomy, state, effects,
+   approval boundaries, recovery, environments, artifacts, and eval cases.
+   Read `cayu guide authoring` when choosing Cayu concepts.
+2. Run `cayu inspect --json` and `cayu check --json` before editing.
+3. Plan generated edits with
+   `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.
+4. Apply with `cayu generate slice NAME --tool TOOL --effect EFFECT`; review every changed file.
+5. Run `cayu check --json`, `pytest`, and the relevant
+   `cayu eval run evals.assistant:build_eval` target.
+6. Exercise optional live boundaries only when credentials and infrastructure
+   are explicitly available, then report evidence by verification layer.
+
+Use public `cayu` imports and public CLI JSON only. Do not depend on Cayu source,
+private symbols, import-time application construction, or arbitrary Python
+rewriting. Edit user-owned code normally; generated commands may update only
+their delimited registration regions and independent generated files.
+
+Every tool must declare `ToolEffect`. External-effect tools require an enforcing
+policy such as `AlwaysRequireApprovalToolPolicy`; never treat a comment or UI
+confirmation as authorization. Prefer closed JSON schemas.
+
+Report static inspection, hermetic runtime tests, process-boundary checks, and
+credential-gated live checks separately. Do not claim live verification from
+successful imports, construction, mocks, or scripted providers.
+"""
+
+_GITIGNORE = "data/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
 
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -194,14 +357,23 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
-def _project_files(name: str) -> dict[str, str]:
+def project_files(name: str) -> dict[str, str]:
     def render(template: str) -> str:
         return template.replace("__PROJECT_NAME__", name)
 
     return {
         "app.py": render(_APP_PY),
+        "run.py": _RUN_PY,
+        "agents/__init__.py": "",
+        "agents/assistant.py": _AGENT_PY,
+        "tools/__init__.py": "",
+        "tools/greet.py": _TOOL_PY,
+        "tests/test_assistant.py": _TEST_PY,
+        "evals/__init__.py": "",
+        "evals/assistant.py": _EVAL_PY,
         "pyproject.toml": render(_PYPROJECT),
         "README.md": render(_README),
+        "AGENTS.md": _AGENTS_MD,
         ".gitignore": _GITIGNORE,
     }
 
@@ -224,22 +396,16 @@ def run_new(args: argparse.Namespace) -> int:
         print(f"error: {target} already exists and is not empty.", file=sys.stderr)
         return 1
 
-    for rel, content in _project_files(name).items():
+    for rel, content in project_files(name).items():
         path = target / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    for rel in _PROJECT_DIRS:
-        directory = target / rel
-        directory.mkdir(parents=True, exist_ok=True)
-        # git does not track empty directories; keep a .gitkeep so the structural
-        # layout survives the first commit. data/ is gitignored, so skip it.
-        if rel != "data":
-            (directory / ".gitkeep").write_text("", encoding="utf-8")
 
-    print(f"Scaffolded {target}/ — next steps:")
+    print(f"Scaffolded {target}/ — credential-free proof:")
     print(f"  cd {target}")
-    print("  pip install -e '.[console]'  # or: uv sync --extra console")
-    print("  export OPENAI_API_KEY=sk-...")
-    print("  cayu console")
-    print("  python app.py")
+    print("  pip install -e '.[console,dev]'  # or: uv sync --extra console --extra dev")
+    print("  cayu inspect --json")
+    print("  cayu check --json")
+    print("  pytest")
+    print("  cayu eval run evals.assistant:build_eval")
     return 0

@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 import cayu
+import cayu.runtime as cayu_runtime
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", re.DOTALL)
@@ -38,6 +39,30 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "MicrosandboxCleanupError",
 )
 
+ONE_SHOT_TOP_LEVEL_EXPORTS = (
+    "AppManifest",
+    "DiagnosticSeverity",
+    "ProjectCheckReport",
+    "ProjectDiagnostic",
+    "check_manifest",
+)
+
+ONE_SHOT_RUNTIME_ONLY_EXPORTS = (
+    "APP_MANIFEST_SCHEMA_VERSION",
+    "AVAILABLE_CHECK_TAGS",
+    "BUILTIN_DIAGNOSTIC_CODES",
+    "CHECK_REPORT_SCHEMA_VERSION",
+    "AgentManifest",
+    "ApplicationDefaultsManifest",
+    "CapabilityManifest",
+    "EnvironmentManifest",
+    "ProviderManifest",
+    "RegistrationProvenance",
+    "RuntimeManifest",
+    "StoreManifest",
+    "ToolManifest",
+)
+
 
 def test_required_names_are_importable_from_top_level() -> None:
     for name in REQUIRED_TOP_LEVEL_EXPORTS:
@@ -49,6 +74,16 @@ def test_required_names_are_declared_in_dunder_all() -> None:
     # to ``from cayu import *`` and to tooling that reads __all__ — pin both.
     for name in REQUIRED_TOP_LEVEL_EXPORTS:
         assert name in cayu.__all__, f"{name!r} missing from cayu.__all__"
+
+
+def test_one_shot_api_keeps_structural_types_out_of_the_root_namespace() -> None:
+    for name in ONE_SHOT_TOP_LEVEL_EXPORTS:
+        assert hasattr(cayu, name), f"cayu.{name} is a supported entry point"
+        assert name in cayu.__all__
+    for name in ONE_SHOT_RUNTIME_ONLY_EXPORTS:
+        assert hasattr(cayu_runtime, name), f"cayu.runtime.{name} must remain public"
+        assert not hasattr(cayu, name), f"cayu.{name} unnecessarily expands the root API"
+        assert name not in cayu.__all__
 
 
 def test_readme_recovery_snippet_imports_and_constructs() -> None:

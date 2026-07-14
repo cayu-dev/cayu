@@ -64,17 +64,20 @@ Default user projects should be Rails-like and easy to understand:
 invoice-agent/
   pyproject.toml
   app.py
+  run.py
+  AGENTS.md
   agents/
   tools/
-  workflows/
-  prompts/
-  memory/
   evals/
-  config/
   tests/
 ```
 
-`app.py` explicitly registers agents, tools, workflows, storage, and runtime config.
+`app.py` explicitly registers agents, tools, storage, and runtime config. The
+default scaffold creates only directories containing working source; add
+workflows, prompts, memory, configuration, environments, and domain packages
+when the requested behavior actually needs them. `AGENTS.md` is the generated
+project-local source of truth for inspection, safe generation, testing, evals,
+and evidence reporting.
 
 ## Large User Project
 

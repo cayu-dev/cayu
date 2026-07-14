@@ -4,12 +4,11 @@ import argparse
 import asyncio
 import inspect
 import sys
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from cayu.cli._targets import load_target
+from cayu.cli.project import project_context
 from cayu.evals import (
     EvalPlan,
     EvalStatus,
@@ -97,7 +96,7 @@ def run_eval_command(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    with _cwd_import_context():
+    with project_context(Path.cwd().resolve()):
         loaded = load_target(args.target, label="Eval target")
         if callable(loaded):
             loaded = loaded()
@@ -114,17 +113,6 @@ async def _run(args: argparse.Namespace) -> int:
         if args.html_output is not None:
             Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
         return 0 if run.status == EvalStatus.PASSED else 1
-
-
-@contextmanager
-def _cwd_import_context() -> Iterator[None]:
-    cwd = str(Path.cwd())
-    original_path = list(sys.path)
-    sys.path[:] = [cwd, *(entry for entry in original_path if entry != cwd)]
-    try:
-        yield
-    finally:
-        sys.path[:] = original_path
 
 
 def _report(args: argparse.Namespace) -> int:

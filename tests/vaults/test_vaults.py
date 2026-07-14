@@ -207,7 +207,7 @@ def test_environment_requires_vault_for_secret_resolution() -> None:
         asyncio.run(environment.resolve_secret(SecretRef(name="github_token")))
 
 
-def test_secret_redactor_redacts_strings_and_json_values() -> None:
+def test_secret_redactor_redacts_strings_and_json_keys_and_values() -> None:
     resolved = ResolvedSecret(name="github_token", value=SecretStr("ghp_secret"))
     redactor = SecretRedactor([resolved]).with_secret("npm_secret")
 
@@ -217,11 +217,14 @@ def test_secret_redactor_redacts_strings_and_json_values() -> None:
     assert redactor.redact_json(
         {
             "stdout": "ghp_secret",
-            "nested": ["npm_secret", {"safe": "ok"}],
+            "nested": ["npm_secret", {"safe": "ok", "npm_secret-key": "value"}],
         }
     ) == {
         "stdout": REDACTED_SECRET,
-        "nested": [REDACTED_SECRET, {"safe": "ok"}],
+        "nested": [
+            REDACTED_SECRET,
+            {"safe": "ok", f"{REDACTED_SECRET}-key": "value"},
+        ],
     }
 
 
@@ -236,6 +239,22 @@ def test_secret_redactor_accepts_single_secret_values() -> None:
         )
         == f"{REDACTED_SECRET} total"
     )
+
+
+def test_secret_redactor_preserves_values_when_redacted_keys_collide() -> None:
+    redactor = SecretRedactor("secret")
+
+    redacted = redactor.redact_json(
+        {
+            "secret": {"value": 2},
+            REDACTED_SECRET: {"value": 1},
+        }
+    )
+
+    assert redacted == {
+        f"{REDACTED_SECRET}_2": {"value": 2},
+        REDACTED_SECRET: {"value": 1},
+    }
 
 
 def test_secret_redactor_exposes_whether_it_has_values() -> None:

@@ -71,7 +71,7 @@ def main() -> None:
             child.expect_exact("Factory: app:build_app")
             child.expect_exact("Agents: assistant")
             child.expect_exact("Providers: openai")
-            child.expect_exact("Environments: local")
+            child.expect_exact("Environments: none")
             child.expect_exact("Session store: SQLiteSessionStore")
             child.expect_exact("Task store: SQLiteTaskStore")
             _expect_prompt(child)
@@ -113,8 +113,10 @@ def main() -> None:
                 f"exitstatus={child.exitstatus} signalstatus={child.signalstatus}"
             )
 
-        if not (project / "data" / "workspace").is_dir():
-            raise RuntimeError("scaffold factory did not create its project-root workspace")
+        if not (project / "data" / "sessions.sqlite").is_file():
+            raise RuntimeError("scaffold factory did not create its project-root session store")
+        if not (project / "data" / "tasks.sqlite").is_file():
+            raise RuntimeError("scaffold factory did not create its project-root task store")
         if (nested / "data").exists():
             raise RuntimeError("scaffold factory resolved relative state from the nested directory")
 

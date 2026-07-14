@@ -31,6 +31,8 @@ class RegisteredAgentState:
     tool_policy: ToolPolicy
     runtime_hooks: tuple[RuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]
+    registration_source: str | None = None
+    registration_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,8 @@ class RegisteredProvider:
     name: str
     provider: ModelProvider
     model_patterns: tuple[str, ...] = ()
+    registration_source: str | None = None
+    registration_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,8 @@ class RegisteredEnvironment:
     factory: EnvironmentFactory | None = None
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
+    registration_source: str | None = None
+    registration_symbol: str | None = None
 
 
 @dataclass(frozen=True)
