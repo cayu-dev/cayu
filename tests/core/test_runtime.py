@@ -11141,7 +11141,12 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
             0.005,
         )
         store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
+        fixed_now = datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: fixed_now,
+        )
         identity = SessionIdentity(provider_name="fake", model="fake-model")
         parent_id = "sess_transient_heartbeat_parent"
         child_id = "sess_transient_heartbeat_child"
@@ -11160,8 +11165,10 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
                 identity=identity,
             )
 
-        async def delayed_interrupt(request):
-            await asyncio.sleep(0.04)
+        renewal_succeeded = asyncio.Event()
+
+        async def interrupt_after_renewal(request):
+            await asyncio.wait_for(renewal_succeeded.wait(), timeout=1)
             await store.update_status(request.session_id, SessionStatus.INTERRUPTED)
             yield Event(
                 type=EventType.SESSION_INTERRUPTED,
@@ -11170,7 +11177,9 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
             )
 
         monkeypatch.setattr(
-            app._background_interruption_coordinator, "_interrupt_session", delayed_interrupt
+            app._background_interruption_coordinator,
+            "_interrupt_session",
+            interrupt_after_renewal,
         )
         original_renew = app._renew_pending_interruption_cascade_claim
         renew_attempts = 0
@@ -11180,7 +11189,10 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
             renew_attempts += 1
             if renew_attempts == 1:
                 raise RuntimeError("temporary store outage")
-            return await original_renew(*args)
+            renewed = await original_renew(*args)
+            if renewed:
+                renewal_succeeded.set()
+            return renewed
 
         monkeypatch.setattr(
             app._background_interruption_coordinator,
@@ -11196,11 +11208,12 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
                 "interruption_type": "operator_requested",
             },
         )
-        await app.drain_background_interruptions(timeout_s=1)
-        return renew_attempts, await store.load_checkpoint(parent_id)
+        drained = await app.drain_background_interruptions(timeout_s=1)
+        return drained, renew_attempts, await store.load_checkpoint(parent_id)
 
-    renew_attempts, checkpoint = asyncio.run(run())
+    drained, renew_attempts, checkpoint = asyncio.run(run())
 
+    assert drained is True
     assert renew_attempts >= 2
     assert "pending_interruption_cascade" not in checkpoint
 
